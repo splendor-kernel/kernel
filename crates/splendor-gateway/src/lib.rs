@@ -39,7 +39,7 @@ use splendor_types::{
     Action, AgentId, ApprovalActionScope, ApprovalDecision, ApprovalEvidence, ApprovalId,
     ApprovalPolicy, ApprovalTraceContext, CircuitBreaker, CircuitBreakerScope,
     IdentityValidationError, QuotaUsage, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
-    VerificationResult,
+    VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
 };
 use std::collections::HashMap;
 use std::future::{ready, Future, Ready};
@@ -245,23 +245,40 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
         now: OffsetDateTime,
     ) -> ApprovalVerification {
         let scope = approval_scope(action, adapter);
-        let Some(policy) = self
+        let mut first_matching_policy = None;
+        for policy in self
             .policies
             .iter()
-            .find(|policy| policy.matches_action(&scope, now))
-        else {
+            .filter(|policy| policy.matches_action(&scope, now))
+        {
+            if first_matching_policy.is_none() {
+                first_matching_policy = Some(policy);
+            }
+
+            if policy.schema_version != APPROVAL_POLICY_SCHEMA_VERSION {
+                return ApprovalVerification::NeedsIntervention(approval_result(
+                    false,
+                    "approval_policy_schema_unsupported",
+                    "policy_schema_unsupported",
+                    ApprovalTraceContext::requested(policy, &scope, ApprovalId::new()),
+                    Some(policy.policy_id.clone()),
+                ));
+            }
+
+            if policy.is_expired(now) {
+                return ApprovalVerification::NeedsIntervention(approval_result(
+                    false,
+                    "approval_policy_expired",
+                    "intervention_required",
+                    ApprovalTraceContext::requested(policy, &scope, ApprovalId::new()),
+                    Some(policy.policy_id.clone()),
+                ));
+            }
+        }
+
+        let Some(policy) = first_matching_policy else {
             return ApprovalVerification::NotRequired;
         };
-
-        if policy.is_expired(now) {
-            return ApprovalVerification::NeedsIntervention(approval_result(
-                false,
-                "approval_policy_expired",
-                "intervention_required",
-                ApprovalTraceContext::requested(policy, &scope, ApprovalId::new()),
-                Some(policy.policy_id.clone()),
-            ));
-        }
 
         let Some(evidence) = action.approval_evidence.as_ref() else {
             return ApprovalVerification::Required(approval_result(
@@ -274,6 +291,16 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
         };
 
         let context = ApprovalTraceContext::from_evidence(evidence, &scope);
+        if evidence.schema_version != APPROVAL_EVIDENCE_SCHEMA_VERSION {
+            return ApprovalVerification::Denied(approval_result(
+                false,
+                "approval_evidence_schema_unsupported",
+                "schema_unsupported",
+                context,
+                Some(policy.policy_id.clone()),
+            ));
+        }
+
         if (evidence.action_id.is_none() && evidence.action_name.is_none())
             || (adapter.is_some() && evidence.adapter.is_none())
         {

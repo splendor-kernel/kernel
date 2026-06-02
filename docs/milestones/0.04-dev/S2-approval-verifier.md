@@ -5,7 +5,8 @@
 Implement the minimal approval verifier path for Splendor0.04-dev: actions that
 match an approval policy pause before adapter execution, runs enter a trace-linked
 waiting state, valid scoped approval grants permit re-evaluation, and denial,
-expiry, revocation, wrong scope, or verifier uncertainty fails closed.
+expiry, revocation, wrong scope, unsupported schema versions, or verifier
+uncertainty fails closed.
 
 ## 2. Functional scope
 
@@ -87,13 +88,13 @@ The gateway now calls `ApprovalVerifier` before adapter execution:
 
 - missing required approval returns `NeedsApproval`;
 - valid scoped grant allows normal verifier checks to continue;
-- explicit denial, wrong scope, expired evidence, or revoked evidence returns
-  `Denied`;
-- verifier uncertainty returns `NeedsIntervention`;
+- explicit denial, wrong scope, unsupported evidence schema, expired evidence, or
+  revoked evidence returns `Denied`;
+- unsupported policy schema or verifier uncertainty returns `NeedsIntervention`;
 - all non-grant outcomes stop before adapter execution.
 
 Approval evidence scopes tenant, agent, run, optional action ID, optional action
-name, optional adapter, expiry, and revocation state.
+name, optional adapter, expiry, revocation state, and supported schema version.
 
 ## 9. Replay behavior
 
@@ -108,6 +109,8 @@ approval services, verifiers, gateways, or adapters.
 - Missing approval evidence on resume from `waiting_for_approval` returns
   `403 approval_required`.
 - Wrong tenant, agent, run, action, or adapter evidence denies.
+- Unsupported approval evidence schema denies; unsupported approval policy schema
+  fails closed as intervention.
 - Denied or revoked evidence sets a denied action outcome and terminal denied run
   state.
 - Expired evidence sets a denied action outcome and terminal expired run state.
@@ -119,13 +122,16 @@ Targeted tests added/updated:
 
 - Gateway approval required path skips adapter execution.
 - Gateway valid grant executes after re-verification.
-- Gateway wrong scope, denial, expiry, revocation, and verifier uncertainty fail
-  closed without adapter execution.
+- Gateway wrong tenant/agent/run/action/action-id/adapter scope, unsupported schema,
+  denial, expiry, revocation, and verifier uncertainty fail closed without adapter
+  execution.
 - Daemon approval-required run enters `waiting_for_approval` and records trace
   linkage.
 - Daemon valid scoped grant resumes and executes one adapter call.
-- Daemon denial, expiry, wrong scope, and revocation do not execute adapters.
-- Replay reports `requested` and `granted` approval events.
+- Daemon denial, expiry, wrong scope, unsupported schema, and revocation do not
+  execute adapters.
+- Replay reports `requested`, `granted`, `denied`, `expired`, and `revoked`
+  approval events.
 - OpenAPI/TypeScript schema parity covers new fields and statuses.
 
 ## 12. Example commands or fixtures

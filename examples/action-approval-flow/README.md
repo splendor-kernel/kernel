@@ -12,8 +12,8 @@ resume with scoped approval evidence, and replay the approval trace events.
 - The run enters `waiting_for_approval` with trace linkage.
 - A valid approval grant scoped to tenant, agent, run, action, and adapter permits
   re-evaluation and execution through the gateway.
-- Denied, expired, revoked, or wrong-scope approval evidence fails closed and does
-  not execute the adapter.
+- Denied, expired, revoked, wrong-scope, or unsupported-schema approval evidence
+  fails closed and does not execute the adapter.
 - Replay explains approval request/grant/denial/expiry/revocation events without
   replaying side effects.
 
@@ -32,6 +32,8 @@ Run the gateway approval verifier tests:
 cargo test -p splendor-gateway approval_required_action_pauses_without_adapter_execution
 cargo test -p splendor-gateway valid_scoped_approval_grant_allows_execution
 cargo test -p splendor-gateway approval_wrong_scope_is_denied_without_adapter_execution
+cargo test -p splendor-gateway approval_run_and_action_id_scope_mismatches_are_denied_without_adapter_execution
+cargo test -p splendor-gateway approval_schema_version_mismatches_fail_closed_without_adapter_execution
 cargo test -p splendor-gateway approval_denial_expiry_and_revocation_fail_closed
 cargo test -p splendor-gateway approval_verifier_uncertainty_needs_intervention_without_adapter_execution
 ```
