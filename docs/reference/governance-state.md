@@ -43,6 +43,20 @@ Supporting types:
 - `GovernanceTransitionRejection`
 - status enums for approval, escalation, intervention, circuit breaker, and kill switch
 
+Sprint `0.04-S6` adds external governance adapter contracts in
+`crates/splendor-types/src/external_governance.rs` and `@splendor/types`:
+
+- `ExternalGovernanceAdapterContract` / `ExternalGovernanceEndpoints`
+- `ExternalGovernanceWorkOrderBridge`
+- `ExternalApprovalDecision` / `ExternalApprovalMapping`
+- `ExternalGovernanceAdapterFailure`
+- `GovernedArtifactRef`
+
+These contracts are documented in
+[`docs/integrations/governance-adapter.md`](../integrations/governance-adapter.md).
+They are provider-neutral boundary schemas; they do not grant runtime authority,
+execute adapters, or replace signed work-order and Action Gateway enforcement.
+
 ## Required fields
 
 Every governance object has:

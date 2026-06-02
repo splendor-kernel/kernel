@@ -27,13 +27,16 @@
   daemon policy sync, local policy cache/degraded mode, policy TTL/revocation
   denial, trace-safe policy metadata, and Rust/TypeScript/OpenAPI contract
   coverage.
+- Added 0.04-S6 external governance adapter contracts for provider-neutral
+  Harmony-compatible work-order bridging, approval grant/denial mapping,
+  fail-closed adapter failure records, and trace-linked artifact references.
 
 ### Explicitly not included
 
 - No approval UI, enterprise IAM integration, broad workflow language, ticketing
   integration, notification platform, approval workflow engine, escalation
-  automation, kill-switch propagation, external control-plane adapter,
-  monitoring platform, UI dashboard, enterprise policy authoring product,
+  automation, kill-switch propagation, monitoring platform, UI dashboard,
+  enterprise policy authoring product, Harmony admin/product implementation,
   global policy consensus, production PKI/key management, or side-effect path
   outside the Action Gateway.
 

@@ -7,9 +7,18 @@ import {
   CANONICAL_SCHEMA_FIELDS,
   ENDPOINT_SCOPE_LABELS,
   ENDPOINT_SCOPE_VALUES,
+  EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION,
+  GOVERNED_ARTIFACT_REF_SCHEMA_VERSION,
   TRACE_EVENT_KIND_VARIANTS
 } from "@splendor/types";
-import type { ApprovalDenial, ApprovalGrant, ApprovalRequest } from "@splendor/types";
+import type {
+  ApprovalDenial,
+  ApprovalGrant,
+  ApprovalRequest,
+  ExternalApprovalMapping,
+  ExternalGovernanceAdapterContract,
+  GovernedArtifactRef
+} from "@splendor/types";
 
 const repoRoot = process.cwd();
 
@@ -66,6 +75,7 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   const message = readRepoFile("crates/splendor-types/src/message.rs");
   const primitives = readRepoFile("crates/splendor-types/src/primitives.rs");
   const governance = readRepoFile("crates/splendor-types/src/governance.rs");
+  const externalGovernance = readRepoFile("crates/splendor-types/src/external_governance.rs");
   const trace = readRepoFile("crates/splendor-types/src/trace.rs");
   const gateway = readRepoFile("crates/splendor-gateway/src/lib.rs");
   const daemon = readRepoFile("crates/splendor-daemon/src/lib.rs");
@@ -75,6 +85,38 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_event, extractStructFields(trace, "TraceEvent"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.action_request, extractStructFields(gateway, "ActionRequest"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.action_outcome, extractStructFields(gateway, "ActionOutcome"));
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_governance_reference,
+    extractStructFields(externalGovernance, "ExternalGovernanceReference")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_governance_endpoints,
+    extractStructFields(externalGovernance, "ExternalGovernanceEndpoints")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_governance_adapter_contract,
+    extractStructFields(externalGovernance, "ExternalGovernanceAdapterContract")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_governance_work_order_bridge,
+    extractStructFields(externalGovernance, "ExternalGovernanceWorkOrderBridge")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_approval_decision,
+    extractStructFields(externalGovernance, "ExternalApprovalDecision")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_governance_adapter_failure,
+    extractStructFields(externalGovernance, "ExternalGovernanceAdapterFailure")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.external_trace_range,
+    extractStructFields(externalGovernance, "ExternalTraceRange")
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.governed_artifact_ref,
+    extractStructFields(externalGovernance, "GovernedArtifactRef")
+  );
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.circuit_breaker, extractStructFields(governance, "CircuitBreaker"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.state_head, extractStructFields(daemon, "StateHeadResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.create_run_request, extractStructFields(daemon, "CreateRunRequest"));
@@ -115,6 +157,68 @@ test("TypeScript governance approval statuses mirror Rust object validators", ()
     [invalidRequestStatus, invalidGrantStatus, invalidDenialStatus],
     ["denied", "requested", "granted"]
   );
+});
+
+test("TypeScript external governance adapter contracts are provider-neutral and fail closed", () => {
+  const contract: ExternalGovernanceAdapterContract = {
+    schema_version: EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION,
+    provider: "customer_console",
+    endpoints: {
+      work_orders: "/governed/work-orders/{work_order_id}",
+      action_gateway: "/governed/action-gateway",
+      approvals: "/governed/approval-decisions",
+      traces: "/governed/runtime-traces",
+      state_commits: "/governed/state-commits",
+      artifact_refs: "/governed/artifact-refs"
+    }
+  };
+  const artifact: GovernedArtifactRef = {
+    schema_version: GOVERNED_ARTIFACT_REF_SCHEMA_VERSION,
+    artifact_id: "artifact_weekly_dashboard",
+    version: "v2",
+    source_refs: ["dataset:finance.revenue_monthly_v4"],
+    run_id: "run_456",
+    state_node_id: "blake3:abc123",
+    trace_range: {
+      start_trace_event_id: "trace_start",
+      end_trace_event_id: "trace_end"
+    },
+    approval_state: "granted",
+    approval_id: "approval_123",
+    external_ref: {
+      provider: "customer_console",
+      reference_id: "artifact-ext-123",
+      endpoint: "/governed/artifact-refs"
+    },
+    export_targets: ["customer_console:artifact-registry"]
+  };
+  const failure: ExternalApprovalMapping = {
+    mapping: "adapter_failure",
+    failure: {
+      schema_version: EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION,
+      external_ref: {
+        provider: "customer_console",
+        reference_id: "approval-ext-123"
+      },
+      scope: {
+        scope_type: "action",
+        tenant_id: "tenant_1",
+        agent_id: "agent_1",
+        run_id: "run_456",
+        action_id: "action_1"
+      },
+      occurred_at: "2026-06-01T00:00:00Z",
+      reason: "external approval endpoint unavailable",
+      issuer: { issuer_id: "customer_console", source: "external_adapter" },
+      trace: { trace_event_id: "trace_failure", run_id: "run_456" }
+    }
+  };
+
+  assert.equal(contract.schema_version, EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION);
+  assert.equal(artifact.schema_version, GOVERNED_ARTIFACT_REF_SCHEMA_VERSION);
+  assert.equal(artifact.source_refs.length, 1);
+  assert.equal(failure.mapping, "adapter_failure");
+  assert.ok(!("approval" in failure), "adapter failure must not carry approval by default");
 });
 
 test("OpenAPI documents S5 daemon request and response schemas", () => {
