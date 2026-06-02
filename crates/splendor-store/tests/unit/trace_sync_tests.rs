@@ -9,6 +9,18 @@ fn scope_for(run_id: &RunId) -> TraceSyncScope {
     TraceSyncScope::new(run_id.to_string())
 }
 
+fn rich_scope_for(run_id: &RunId) -> TraceSyncScope {
+    TraceSyncScope {
+        fleet_id: Some("fleet-alpha".to_string()),
+        node_id: Some("node-a".to_string()),
+        instance_id: Some("instance-a".to_string()),
+        tenant_id: Some("tenant-a".to_string()),
+        agent_id: Some("agent-a".to_string()),
+        run_id: run_id.to_string(),
+        work_order_id: Some("wo-a".to_string()),
+    }
+}
+
 fn append_event(store: &InMemoryTraceStore, run_id: &RunId, sequence: u64, kind: TraceEventKind) {
     let event = TraceEvent::new(run_id.clone(), sequence, OffsetDateTime::now_utc(), kind);
     let stored = TraceStore::append(
@@ -43,6 +55,8 @@ fn append_basic_run(store: &InMemoryTraceStore, run_id: &RunId) {
         TraceEventKind::LoopTickStarted { tick_id: 2 },
     );
 }
+
+type ScopeMutation = (&'static str, fn(&mut TraceSyncScope));
 
 fn action(name: &str) -> Action {
     Action {
@@ -280,6 +294,53 @@ fn mismatched_run_identity_is_rejected_and_quarantined() {
 }
 
 #[test]
+fn scope_mismatch_for_existing_run_is_rejected_and_quarantined() {
+    let cases: [ScopeMutation; 6] = [
+        ("fleet_id", |scope: &mut TraceSyncScope| {
+            scope.fleet_id = Some("fleet-beta".to_string())
+        }),
+        ("node_id", |scope: &mut TraceSyncScope| {
+            scope.node_id = Some("node-b".to_string())
+        }),
+        ("instance_id", |scope: &mut TraceSyncScope| {
+            scope.instance_id = Some("instance-b".to_string())
+        }),
+        ("tenant_id", |scope: &mut TraceSyncScope| {
+            scope.tenant_id = Some("tenant-b".to_string())
+        }),
+        ("agent_id", |scope: &mut TraceSyncScope| {
+            scope.agent_id = Some("agent-b".to_string())
+        }),
+        ("work_order_id", |scope: &mut TraceSyncScope| {
+            scope.work_order_id = Some("wo-b".to_string())
+        }),
+    ];
+    for (field, mutate) in cases {
+        let run_id = RunId::new();
+        let local = InMemoryTraceStore::default();
+        append_basic_run(&local, &run_id);
+        let index = InMemoryCentralTraceIndex::default();
+        let first =
+            TraceSyncBatch::from_store(rich_scope_for(&run_id), &local, 0, 1).expect("batch");
+        index.sync_batch(first).expect("first sync");
+
+        let mut mismatched_scope = rich_scope_for(&run_id);
+        mutate(&mut mismatched_scope);
+        let second = TraceSyncBatch::from_store(mismatched_scope, &local, 1, 2).expect("batch");
+        let error = index.sync_batch(second).expect_err("scope mismatch");
+
+        assert!(matches!(
+            error,
+            TraceSyncError::ScopeMismatch { field: actual, .. } if actual == field
+        ));
+        let quarantine = index.quarantined().expect("quarantine");
+        assert_eq!(quarantine.len(), 1);
+        assert!(quarantine[0].reason.contains("trace sync scope mismatch"));
+        assert_eq!(index.latest_sequence(&run_id.to_string()).unwrap(), Some(0));
+    }
+}
+
+#[test]
 fn central_index_queries_available_identity_dimensions() {
     let run_id = RunId::new();
     let local = InMemoryTraceStore::default();
@@ -307,15 +368,7 @@ fn central_index_queries_available_identity_dimensions() {
         },
     );
 
-    let scope = TraceSyncScope {
-        fleet_id: Some("fleet-alpha".to_string()),
-        node_id: Some("node-a".to_string()),
-        instance_id: Some("instance-a".to_string()),
-        tenant_id: Some("tenant-a".to_string()),
-        agent_id: Some("agent-a".to_string()),
-        run_id: run_id.to_string(),
-        work_order_id: Some("wo-a".to_string()),
-    };
+    let scope = rich_scope_for(&run_id);
     let batch = TraceSyncBatch::from_store(scope, &local, 0, 3).expect("batch");
     let index = InMemoryCentralTraceIndex::default();
     index.sync_batch(batch).expect("sync");

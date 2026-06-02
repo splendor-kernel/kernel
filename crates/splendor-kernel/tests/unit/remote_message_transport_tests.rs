@@ -1,10 +1,11 @@
 use super::*;
 use crate::{KernelRuntime, KernelRuntimeConfig, MessageRouter, TraceError, TraceSink};
 use splendor_types::{
-    AgentId, DelegatedAuthority, EndpointScope, Message, MessageDeliveryStatus, MessageEnvelope,
-    MessageId, RemoteMessageEnvelope, RemoteMessageRetryPolicy, RevocationStatus, RunId,
-    TaskRequest, TenantId, TraceEvent, TraceId, WorkOrderAuthorization, WorkOrderSignature,
-    TASK_REQUEST_SCHEMA,
+    AgentId, DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope, MessageId,
+    RemoteMessageEnvelope, RemoteMessageRetryPolicy, RemoteMessageValidationError,
+    RevocationStatus, RunId, TaskRequest, TenantId, TraceEvent, TraceId, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    WorkOrderValidationError, TASK_REQUEST_SCHEMA, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::sync::{Arc, Barrier, Mutex};
 use time::{Duration, OffsetDateTime};
@@ -65,20 +66,34 @@ fn work_order(
     agent_id: AgentId,
     run_id: RunId,
     now: OffsetDateTime,
-) -> WorkOrderAuthorization {
-    WorkOrderAuthorization {
-        work_order_id: "wo_remote".to_string(),
+) -> WorkOrderEnvelope {
+    let work_order = WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_remote").expect("work order id"),
         tenant_id,
         agent_id,
         run_id: Some(run_id),
-        allowed_scopes: vec![EndpointScope::MessagesSend],
-        signature: Some(WorkOrderSignature {
-            key_id: "key_remote".to_string(),
-            signature: "sig_remote".to_string(),
-        }),
+        objective: "remote message".to_string(),
+        allowed_actions: vec!["message.send".to_string()],
+        allowed_adapters: vec!["remote.message".to_string()],
+        allowed_permissions: Vec::new(),
+        data_refs: Vec::new(),
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement::default(),
+        issued_at: now - Duration::minutes(1),
         expires_at: now + Duration::hours(1),
         revocation: RevocationStatus::Active,
-    }
+    };
+    WorkOrderEnvelope::signed_with_shared_secret(work_order, "key_remote", b"remote-secret")
+        .expect("signed remote work order")
+}
+
+fn remote_keyring() -> WorkOrderKeyring {
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret("key_remote", b"remote-secret")
+        .expect("remote keyring");
+    keyring
 }
 
 fn remote_envelope(
@@ -135,7 +150,8 @@ fn sends_between_two_instances_with_remote_and_local_trace_events() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::new(&receiver, &target_runtime);
 
     let remote = remote_envelope(
@@ -209,7 +225,8 @@ fn receiver_rejects_wrong_instance_and_does_not_deliver() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_other", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_other", &target_router, remote_keyring());
     let remote = remote_envelope(
         source_agent,
         target_agent.clone(),
@@ -251,7 +268,8 @@ fn source_rejects_invalid_remote_envelope_before_receiver_delivery() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::new(&receiver, &target_runtime);
     let mut remote = remote_envelope(
         source_agent,
@@ -261,7 +279,7 @@ fn source_rejects_invalid_remote_envelope_before_receiver_delivery() {
         now,
         RemoteMessageRetryPolicy::Never,
     );
-    remote.work_order.signature = None;
+    remote.target_instance_id = " ".to_string();
 
     let error = send_remote_message(&transport, &source_runtime, remote, now)
         .expect_err("invalid envelope rejected at source");
@@ -282,6 +300,65 @@ fn source_rejects_invalid_remote_envelope_before_receiver_delivery() {
 }
 
 #[test]
+fn receiver_rejects_bad_signature_before_delivery() {
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let source_agent = AgentId::new();
+    let target_agent = AgentId::new();
+    let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+    let (source_runtime, source_events) = runtime_for(run_id.clone());
+    let (target_runtime, target_events) = runtime_for(run_id.clone());
+    let target_router = LocalMessageRouter::new();
+    target_router
+        .register_agent(target_agent.clone())
+        .expect("target registered");
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
+    let transport = InMemoryRemoteMessageTransport::new(&receiver, &target_runtime);
+    let mut remote = remote_envelope(
+        source_agent,
+        target_agent.clone(),
+        run_id.clone(),
+        tenant_id,
+        now,
+        RemoteMessageRetryPolicy::Never,
+    );
+    remote
+        .work_order
+        .signature
+        .as_mut()
+        .expect("signed")
+        .signature = "bad-signature".to_string();
+
+    let error = send_remote_message(&transport, &source_runtime, remote, now)
+        .expect_err("bad signature rejected by receiver");
+    assert!(matches!(
+        error,
+        RemoteMessageTransportError::InvalidEnvelope(
+            RemoteMessageValidationError::WorkOrderValidation(
+                WorkOrderValidationError::BadSignature
+            )
+        )
+    ));
+    assert!(target_router
+        .inbox(&target_agent, &run_id)
+        .expect("inbox")
+        .is_empty());
+    let source_recorded = source_events.lock().expect("source events");
+    assert_eq!(source_recorded.len(), 1);
+    assert!(matches!(
+        source_recorded[0].kind,
+        TraceEventKind::RemoteMessageSent { .. }
+    ));
+    let target_recorded = target_events.lock().expect("target events");
+    assert_eq!(target_recorded.len(), 1);
+    assert!(matches!(
+        target_recorded[0].kind,
+        TraceEventKind::RemoteMessageRejected { .. }
+    ));
+}
+
+#[test]
 fn duplicate_remote_message_records_duplicate_and_delivers_once() {
     let run_id = RunId::new();
     let tenant_id = TenantId::new();
@@ -294,7 +371,8 @@ fn duplicate_remote_message_records_duplicate_and_delivers_once() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::new(&receiver, &target_runtime);
     let remote = remote_envelope(
         source_agent,
@@ -339,7 +417,8 @@ fn concurrent_duplicates_reserve_message_id_atomically() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let remote = remote_envelope(
         source_agent,
         target_agent.clone(),
@@ -400,7 +479,8 @@ fn remote_delivered_trace_failure_fails_closed_without_inbox_mutation() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::new(&receiver, &target_runtime);
     let remote = remote_envelope(
         source_agent,
@@ -449,7 +529,8 @@ fn transport_failure_is_traced_and_not_silently_dropped() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::with_faults(
         &receiver,
         &target_runtime,
@@ -501,7 +582,8 @@ fn retry_only_occurs_with_safe_idempotent_policy() {
     target_router
         .register_agent(target_agent.clone())
         .expect("target registered");
-    let receiver = RemoteMessageReceiver::new("instance_target", &target_router);
+    let receiver =
+        RemoteMessageReceiver::with_keyring("instance_target", &target_router, remote_keyring());
     let transport = InMemoryRemoteMessageTransport::with_faults(
         &receiver,
         &target_runtime,

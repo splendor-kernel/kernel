@@ -9,7 +9,7 @@ import type {
   Percept,
   SubmitActionRequest,
   TraceRecord,
-  WorkOrderAuthorization
+  WorkOrderEnvelope
 } from "@splendor/types";
 
 const tenantId = "00000000-0000-0000-0000-000000000001";
@@ -26,12 +26,35 @@ const audit: AuditAttribution = {
   requested_at: "2026-05-25T00:00:00Z"
 };
 
-const workOrder: WorkOrderAuthorization = {
+const workOrder: WorkOrderEnvelope = {
+  schema_version: "splendor.work_order.v1",
   work_order_id: "wo_test",
   tenant_id: tenantId,
   agent_id: agentId,
   run_id: null,
-  allowed_scopes: ["runs_create"],
+  objective: "test daemon run",
+  allowed_actions: ["noop"],
+  allowed_adapters: ["daemon.local"],
+  allowed_permissions: [],
+  data_refs: [],
+  quotas: {
+    max_actions_per_tick: null,
+    max_action_duration_ms: null,
+    max_filesystem_read_bytes: null,
+    max_filesystem_write_bytes: null,
+    max_network_read_bytes: null,
+    max_network_write_bytes: null,
+    max_http_requests_per_minute: null
+  },
+  placement: {
+    target: "local_resident",
+    data_locality: null,
+    requires_gpu: false,
+    dedicated_instance: false,
+    required_capabilities: [],
+    max_runtime_ms: null
+  },
+  issued_at: "2026-05-25T00:00:00Z",
   signature: { key_id: "test-key", signature: "test-signature" },
   expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
   revocation: "active"
@@ -125,8 +148,8 @@ test("client reports unavailable fetch implementation", () => {
   }
 });
 
-test("createRun posts run config with work-order authorization and audit attribution", async () => {
-  const { fetcher, calls } = makeFetch({ run_id: runId, status: "created" });
+test("createRun posts run config with work-order envelope and audit attribution", async () => {
+  const { fetcher, calls } = makeFetch({ run_id: runId, status: "pending" });
   const client = new SplendorClient({ baseUrl: "https://daemon.example/v1", token: "token", fetch: fetcher });
 
   const response = await client.createRun(createRunRequest);
@@ -204,8 +227,8 @@ test("createRun rejects structurally invalid work-order authority before daemon 
     /signature/
   );
   await assert.rejects(
-    () => client.createRun({ ...createRunRequest, work_order: { ...workOrder, allowed_scopes: [] } }),
-    /runs_create/
+    () => client.createRun({ ...createRunRequest, work_order: { ...workOrder, allowed_actions: [] } }),
+    /allowed actions/
   );
   await assert.rejects(
     () =>

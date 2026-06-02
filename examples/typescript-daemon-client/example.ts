@@ -1,5 +1,5 @@
 import { SplendorClient } from "@splendor/client";
-import type { AuditAttribution, CreateRunRequest, LifecycleRequest, Percept, WorkOrderAuthorization } from "@splendor/types";
+import type { AuditAttribution, CreateRunRequest, LifecycleRequest, Percept, WorkOrderEnvelope } from "@splendor/types";
 
 const tenantId = "00000000-0000-0000-0000-000000000001";
 const agentId = "00000000-0000-0000-0000-000000000002";
@@ -14,12 +14,35 @@ const audit: AuditAttribution = {
   requested_at: new Date().toISOString()
 };
 
-const workOrder: WorkOrderAuthorization = {
+const workOrder: WorkOrderEnvelope = {
+  schema_version: "splendor.work_order.v1",
   work_order_id: "wo_example",
   tenant_id: tenantId,
   agent_id: agentId,
   run_id: null,
-  allowed_scopes: ["runs_create"],
+  objective: "Run the local TypeScript daemon example",
+  allowed_actions: ["example.noop"],
+  allowed_adapters: ["daemon.local"],
+  allowed_permissions: [],
+  data_refs: [],
+  quotas: {
+    max_actions_per_tick: null,
+    max_action_duration_ms: null,
+    max_filesystem_read_bytes: null,
+    max_filesystem_write_bytes: null,
+    max_network_read_bytes: null,
+    max_network_write_bytes: null,
+    max_http_requests_per_minute: null
+  },
+  placement: {
+    target: "local_resident",
+    data_locality: null,
+    requires_gpu: false,
+    dedicated_instance: false,
+    required_capabilities: [],
+    max_runtime_ms: null
+  },
+  issued_at: new Date().toISOString(),
   signature: { key_id: "example-key", signature: "example-signature" },
   expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
   revocation: "active"
@@ -31,11 +54,14 @@ const createRunRequest: CreateRunRequest = {
   work_order: workOrder,
   credential: null,
   audit_attribution: audit,
-  allowed_actions: [],
+  allowed_actions: ["example.noop"],
   allowed_adapters: ["daemon.local"],
   allowed_permissions: [],
   policy_actions: [],
+  policy_bundle_required: false,
+  policy_bundle: null,
   registered_actions: [],
+  approval_policies: [],
   allowed_percept_schemas: ["splendor.percept.example.v1"],
   allowed_percept_sources: ["typescript-example"],
   initial_state: { example: true },
@@ -46,7 +72,8 @@ const lifecycle: LifecycleRequest = {
   credential: null,
   work_order: null,
   audit_attribution: audit,
-  reason: "typescript daemon client example"
+  reason: "typescript daemon client example",
+  approval_evidence: null
 };
 
 const percept: Percept = {

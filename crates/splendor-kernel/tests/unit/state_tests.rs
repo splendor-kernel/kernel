@@ -1,6 +1,9 @@
 use super::*;
 use splendor_store::InMemoryStateStore;
-use splendor_types::{TraceId, WorkOrderSignature};
+use splendor_types::{
+    EndpointScope, RevocationStatus, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
+    WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
+};
 use time::OffsetDateTime;
 
 fn metadata(label: Option<&str>) -> StateMetadata {
@@ -42,22 +45,43 @@ fn work_order(
     tenant_id: TenantId,
     agent_id: AgentId,
     run_id: RunId,
-    scopes: Vec<EndpointScope>,
+    _scopes: Vec<EndpointScope>,
     now: OffsetDateTime,
-) -> WorkOrderAuthorization {
-    WorkOrderAuthorization {
-        work_order_id: "wo_state".to_string(),
+) -> WorkOrderEnvelope {
+    let order = WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_state").expect("work order id"),
         tenant_id,
         agent_id,
         run_id: Some(run_id),
-        allowed_scopes: scopes,
-        signature: Some(WorkOrderSignature {
-            key_id: "key_state".to_string(),
-            signature: "sig_state".to_string(),
-        }),
+        objective: "state handoff".to_string(),
+        allowed_actions: vec!["state.handoff".to_string()],
+        allowed_adapters: vec!["state".to_string()],
+        allowed_permissions: vec!["state.read".to_string()],
+        data_refs: Vec::new(),
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement::default(),
+        issued_at: now - time::Duration::minutes(1),
         expires_at: now + time::Duration::hours(1),
         revocation: RevocationStatus::Active,
-    }
+    };
+    WorkOrderEnvelope::signed_with_shared_secret(order, "key_state", b"state-secret")
+        .expect("signed work order")
+}
+
+fn keyring() -> WorkOrderKeyring {
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret("key_state", b"state-secret")
+        .expect("state keyring");
+    keyring
+}
+
+fn resign_work_order(envelope: &mut WorkOrderEnvelope) {
+    envelope.signature.as_mut().expect("signature").signature = envelope
+        .work_order
+        .signature_for_shared_secret(b"state-secret")
+        .expect("resigned work order");
 }
 
 fn exported_handoff(
@@ -195,7 +219,14 @@ fn state_graph_imports_valid_handoff_with_work_order_authority() {
     let scope = scope(tenant_id, agent_id, run_id);
 
     let commit = receiver
-        .import_handoff(&handoff, &work_order, &scope, now, metadata(Some("import")))
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(Some("import")),
+        )
         .expect("import");
 
     assert_eq!(receiver.head(), Some(&commit.node_id));
@@ -218,7 +249,14 @@ fn state_graph_rejects_mismatched_handoff_authority() {
     let wrong_scope = scope(tenant_id, AgentId::new(), run_id);
 
     let error = receiver
-        .import_handoff(&handoff, &work_order, &wrong_scope, now, metadata(None))
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &wrong_scope,
+            now,
+            metadata(None),
+        )
         .expect_err("authority denial");
 
     assert!(matches!(error, StateGraphError::IncompatibleWorkOrder));
@@ -243,8 +281,40 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&handoff, &unsigned, &scope, now, metadata(None)),
-        Err(StateGraphError::UnsignedWorkOrder)
+        receiver.import_handoff(&handoff, &unsigned, &keyring(), &scope, now, metadata(None)),
+        Err(StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::Unsigned
+        ))
+    ));
+
+    let mut bad_signature = work_order(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec![EndpointScope::RunsResume],
+        now,
+    );
+    bad_signature
+        .signature
+        .as_mut()
+        .expect("signature")
+        .signature = "bad-signature".to_string();
+    let mut receiver = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    assert!(matches!(
+        receiver.import_handoff(
+            &handoff,
+            &bad_signature,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None)
+        ),
+        Err(StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::BadSignature
+        ))
     ));
 
     let mut expired = work_order(
@@ -254,14 +324,17 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         vec![EndpointScope::RunsResume],
         now,
     );
-    expired.expires_at = now;
+    expired.work_order.expires_at = now;
+    resign_work_order(&mut expired);
     let mut receiver = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&handoff, &expired, &scope, now, metadata(None)),
-        Err(StateGraphError::ExpiredWorkOrder)
+        receiver.import_handoff(&handoff, &expired, &keyring(), &scope, now, metadata(None)),
+        Err(StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::Expired
+        ))
     ));
 
     let mut revoked = work_order(
@@ -271,21 +344,24 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         vec![EndpointScope::RunsResume],
         now,
     );
-    revoked.revocation = RevocationStatus::Revoked {
+    revoked.work_order.revocation = RevocationStatus::Revoked {
         reason: "test revocation".to_string(),
     };
+    resign_work_order(&mut revoked);
     let mut receiver = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&handoff, &revoked, &scope, now, metadata(None)),
-        Err(StateGraphError::RevokedWorkOrder { .. })
+        receiver.import_handoff(&handoff, &revoked, &keyring(), &scope, now, metadata(None)),
+        Err(StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::Revoked { .. }
+        ))
     ));
 
     let wrong_scope = work_order(
         tenant_id.clone(),
-        agent_id.clone(),
+        AgentId::new(),
         run_id.clone(),
         vec![EndpointScope::StateRead],
         now,
@@ -295,8 +371,17 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&handoff, &wrong_scope, &scope, now, metadata(None)),
-        Err(StateGraphError::IncompatibleWorkOrder)
+        receiver.import_handoff(
+            &handoff,
+            &wrong_scope,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None)
+        ),
+        Err(StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::Incompatible { .. }
+        ))
     ));
 
     let mut wrong_work_order = work_order(
@@ -306,13 +391,21 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         vec![EndpointScope::RunsResume],
         now,
     );
-    wrong_work_order.work_order_id = "wo_other".to_string();
+    wrong_work_order.work_order.work_order_id = WorkOrderId::try_new("wo_other").unwrap();
+    resign_work_order(&mut wrong_work_order);
     let mut receiver = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&handoff, &wrong_work_order, &scope, now, metadata(None)),
+        receiver.import_handoff(
+            &handoff,
+            &wrong_work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None)
+        ),
         Err(StateGraphError::IncompatibleWorkOrder)
     ));
 
@@ -330,7 +423,14 @@ fn state_graph_rejects_invalid_handoff_work_orders_and_schema() {
         SnapshotPolicy::default(),
     );
     assert!(matches!(
-        receiver.import_handoff(&unsupported, &valid, &scope, now, metadata(None)),
+        receiver.import_handoff(
+            &unsupported,
+            &valid,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None)
+        ),
         Err(StateGraphError::UnsupportedHandoffSchema { .. })
     ));
 }
@@ -351,7 +451,14 @@ fn state_graph_rejects_stale_handoff_head() {
     let scope = scope(tenant_id, agent_id, run_id);
 
     let error = receiver
-        .import_handoff(&handoff, &work_order, &scope, now, metadata(None))
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None),
+        )
         .expect_err("stale head");
 
     assert!(matches!(error, StateGraphError::StaleStateHead { .. }));
@@ -379,7 +486,14 @@ fn state_graph_failed_handoff_import_leaves_receiver_head_unchanged() {
     let scope = scope(tenant_id, agent_id, run_id);
 
     let error = receiver
-        .import_handoff(&handoff, &work_order, &scope, now, metadata(None))
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None),
+        )
         .expect_err("corrupt snapshot");
 
     assert!(matches!(error, StateGraphError::Store(_)));
@@ -401,7 +515,14 @@ fn state_graph_rejects_handoff_without_source_trace() {
     let scope = scope(tenant_id, agent_id, run_id);
 
     let error = receiver
-        .import_handoff(&handoff, &work_order, &scope, now, metadata(None))
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None),
+        )
         .expect_err("missing trace");
 
     assert!(matches!(error, StateGraphError::MissingTraceContinuity));
@@ -436,7 +557,7 @@ fn read_only_state_reference_cannot_be_mutated_by_receiver() {
     let scope = scope(tenant_id, agent_id, run_id);
 
     receiver
-        .attach_read_only_reference(reference, &work_order, &scope, now)
+        .attach_read_only_reference(reference, &work_order, &keyring(), &scope, now)
         .expect("attach");
     let before = receiver.head().cloned();
     let error = receiver
@@ -449,4 +570,45 @@ fn read_only_state_reference_cannot_be_mutated_by_receiver() {
     ));
     assert_eq!(receiver.read_only_references().len(), 1);
     assert_eq!(receiver.head().cloned(), before);
+}
+
+#[test]
+fn read_only_state_reference_rejects_bad_signature_work_order() {
+    let now = OffsetDateTime::now_utc();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let reference = StateReference {
+        reference_id: "ref_bad_signature".to_string(),
+        mode: StateReferenceMode::ReadOnlyReference,
+        authority: authority(tenant_id.clone(), agent_id.clone(), run_id.clone()),
+        state_node_id: "blake3:source".to_string(),
+        snapshot_id: None,
+        state_hash: None,
+        source_trace_id: Some(TraceId::from_run_sequence(&run_id, 2)),
+        created_at: now,
+    };
+    let store = Arc::new(InMemoryStateStore::default());
+    let mut receiver = StateGraph::new(store, SnapshotPolicy::default());
+    let mut work_order = work_order(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec![EndpointScope::StateRead],
+        now,
+    );
+    work_order.signature.as_mut().expect("signature").signature = "bad-signature".to_string();
+    let scope = scope(tenant_id, agent_id, run_id);
+
+    let error = receiver
+        .attach_read_only_reference(reference, &work_order, &keyring(), &scope, now)
+        .expect_err("bad signature");
+
+    assert!(matches!(
+        error,
+        StateGraphError::WorkOrderValidation(
+            splendor_types::WorkOrderValidationError::BadSignature
+        )
+    ));
+    assert!(receiver.read_only_references().is_empty());
 }

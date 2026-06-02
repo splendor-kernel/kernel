@@ -2,15 +2,16 @@ use super::*;
 use crate::{
     ActionId, AgentId, ApprovalDecision, ApprovalId, AuditAttribution, CircuitBreaker,
     CircuitBreakerId, CircuitBreakerScope, CircuitBreakerState, ClientPrincipal,
-    DelegatedAuthority, EndpointScope, EscalationContext, EscalationDecision, EscalationId,
-    EscalationScope, EscalationTrigger, FleetId, GovernanceExtensions, GovernanceIssuer,
-    GovernanceObjectRef, GovernanceScope, GovernanceState, GovernanceTraceLink,
-    GovernanceTransition, GovernanceTransitionError, InstanceId, InterventionId, KillSwitchId,
+    DelegatedAuthority, EscalationContext, EscalationDecision, EscalationId, EscalationScope,
+    EscalationTrigger, FleetId, GovernanceExtensions, GovernanceIssuer, GovernanceObjectRef,
+    GovernanceScope, GovernanceState, GovernanceTraceLink, GovernanceTransition,
+    GovernanceTransitionError, InstanceId, InterventionId, KillSwitchId,
     LocalDelegationTraceContext, Message, MessageEnvelope, MessageId, MessageTraceContext, NodeId,
     Percept, PerceptProvenance, RemoteMessageEnvelope, RemoteMessageRetryPolicy,
     RemoteMessageTraceContext, RevocationStatus, SideEffectClass, SnapshotId,
     StateHandoffTraceContext, StateReferenceMode, TaskFailure, TaskRequest, TenantId, TraceId,
-    WorkOrderAuthorization, WorkOrderSignature, TASK_REQUEST_SCHEMA,
+    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    TASK_REQUEST_SCHEMA, WORK_ORDER_SCHEMA_VERSION,
 };
 
 #[test]
@@ -265,23 +266,29 @@ fn remote_message_trace_events_round_trip_with_causal_linkage() {
     )
     .expect("valid message");
     let message_envelope = MessageEnvelope::new(message).expect("valid envelope");
+    let work_order = WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_remote_trace").expect("work order id"),
+        tenant_id: tenant_id.clone(),
+        agent_id: target,
+        run_id: Some(run_id.clone()),
+        objective: "trace remote message".to_string(),
+        allowed_actions: vec!["message.send".to_string()],
+        allowed_adapters: vec!["remote.message".to_string()],
+        allowed_permissions: Vec::new(),
+        data_refs: Vec::new(),
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement::default(),
+        issued_at: now - time::Duration::minutes(1),
+        expires_at: now + time::Duration::hours(1),
+        revocation: RevocationStatus::Active,
+    };
     let remote = RemoteMessageEnvelope::new(
         tenant_id.clone(),
         "instance_a",
         "instance_b",
-        WorkOrderAuthorization {
-            work_order_id: "wo_remote_trace".to_string(),
-            tenant_id,
-            agent_id: target,
-            run_id: Some(run_id.clone()),
-            allowed_scopes: vec![EndpointScope::MessagesSend],
-            signature: Some(WorkOrderSignature {
-                key_id: "key".to_string(),
-                signature: "sig".to_string(),
-            }),
-            expires_at: now + time::Duration::hours(1),
-            revocation: RevocationStatus::Active,
-        },
+        WorkOrderEnvelope::signed_with_shared_secret(work_order, "key", b"trace-secret")
+            .expect("signed work order"),
         message_envelope,
         RemoteMessageRetryPolicy::Idempotent {
             max_attempts: 2,
