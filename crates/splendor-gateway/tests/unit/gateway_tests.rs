@@ -2,7 +2,8 @@ use super::*;
 use splendor_types::{
     AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, CircuitBreaker,
     CircuitBreakerId, CircuitBreakerScope, FleetId, InstanceId, NodeId, QuotaUsage, RunId,
-    RuntimeIdentityContext, SideEffectClass, TenantId,
+    RuntimeIdentityContext, SideEffectClass, TenantId, APPROVAL_EVIDENCE_SCHEMA_VERSION,
+    APPROVAL_POLICY_SCHEMA_VERSION,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -579,6 +580,124 @@ fn approval_wrong_scope_is_denied_without_adapter_execution() {
             .contains(&"approval_scope_mismatch".to_string()));
         assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
     }
+}
+
+#[test]
+fn approval_run_and_action_id_scope_mismatches_are_denied_without_adapter_execution() {
+    for (mut evidence, mismatch) in [
+        {
+            let request = base_request();
+            let mut evidence = approval_evidence_for(&request);
+            evidence.run_id = RunId::new();
+            (evidence, "run_id")
+        },
+        {
+            let request = base_request();
+            let mut evidence = approval_evidence_for(&request);
+            evidence.action_id = Some(ActionId::new());
+            (evidence, "action_id")
+        },
+    ] {
+        let mut request = base_request();
+        evidence.tenant_id = request.tenant_id.clone();
+        evidence.agent_id = request.agent_id.clone();
+        if mismatch != "run_id" {
+            evidence.run_id = request.run_id.clone();
+        }
+        evidence.action_name = Some(request.action.name.clone());
+        evidence.adapter = Some("adapter".to_string());
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = approval_gateway(&request, adapter.clone());
+        request.approval_evidence = Some(evidence);
+
+        let outcome = gateway.submit(request).expect("outcome");
+
+        assert!(
+            matches!(outcome.status, ActionStatus::Denied),
+            "{mismatch} mismatch must deny"
+        );
+        assert!(outcome
+            .verification
+            .reasons
+            .contains(&"approval_scope_mismatch".to_string()));
+        assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    }
+}
+
+#[test]
+fn approval_schema_version_mismatches_fail_closed_without_adapter_execution() {
+    assert_eq!(
+        APPROVAL_EVIDENCE_SCHEMA_VERSION,
+        "splendor.approval_evidence.v1"
+    );
+    assert_eq!(
+        APPROVAL_POLICY_SCHEMA_VERSION,
+        "splendor.approval_policy.v1"
+    );
+
+    let mut request = base_request();
+    let adapter = Arc::new(CountingAdapter::default());
+    let gateway = approval_gateway(&request, adapter.clone());
+    let mut evidence = approval_evidence_for(&request);
+    evidence.schema_version = "splendor.approval_evidence.v0".to_string();
+    request.approval_evidence = Some(evidence);
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_evidence_schema_unsupported".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+
+    let request = base_request();
+    let mut policy = approval_policy_for(&request);
+    policy.schema_version = "splendor.approval_policy.v0".to_string();
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+    gateway.set_approval_verifier(Arc::new(PolicyApprovalVerifier::new(vec![policy])));
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_policy_schema_unsupported".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+
+    let mut request = base_request();
+    let supported_policy = approval_policy_for(&request);
+    let mut unsupported_later_policy = approval_policy_for(&request);
+    unsupported_later_policy.policy_id = "approval_policy_legacy".to_string();
+    unsupported_later_policy.schema_version = "splendor.approval_policy.v0".to_string();
+    request.approval_evidence = Some(approval_evidence_for(&request));
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+    gateway.set_approval_verifier(Arc::new(PolicyApprovalVerifier::new(vec![
+        supported_policy,
+        unsupported_later_policy,
+    ])));
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_policy_schema_unsupported".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }
 
 #[test]

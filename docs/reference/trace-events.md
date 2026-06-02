@@ -338,7 +338,7 @@ gateway/verifier path.
 | `ActionNeedsApproval` | `action.needs_approval` | The approval verifier paused the action before adapter execution. |
 | `ApprovalRequested` | `approval.requested` | A policy-created approval request was recorded. |
 | `ApprovalGranted` | `approval.granted` | Scoped approval grant evidence was presented. |
-| `ApprovalDenied` | `approval.denied` | Approval denial or wrong-scope evidence was rejected. |
+| `ApprovalDenied` | `approval.denied` | Approval denial, unsupported schema, or wrong-scope evidence was rejected. |
 | `ApprovalExpired` | `approval.expired` | Expired approval evidence was rejected. |
 | `ApprovalRevoked` | `approval.revoked` | Revoked approval evidence was rejected. |
 

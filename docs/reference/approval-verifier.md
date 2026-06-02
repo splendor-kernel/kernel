@@ -65,19 +65,22 @@ For each `ActionRequest`, the gateway calls `ApprovalVerifier` before adapter
 execution:
 
 1. If no policy matches, approval is `NotRequired` and the normal verifier chain
-   continues.
+   continues. If more than one policy matches, all matching policies are scanned
+   for unsupported schema or expiry before any grant can allow execution.
 2. If a policy matches and no valid evidence is present, the gateway returns
    `ActionStatus::NeedsApproval` with reason `approval_required` and does not call
    the adapter.
-3. If evidence is present with `decision = Granted`, it must include action scope
-   (`action_id` or `action_name`) and adapter scope for adapter-backed actions.
-   Tenant, agent, run, action, adapter, expiry, and revocation scope must match.
-   Only then does the rest of the gateway pipeline continue.
-4. Evidence with the wrong tenant, agent, run, action, adapter, expiry, revoked
-   flag, or explicit denial returns `ActionStatus::Denied` and does not call the
-   adapter.
-5. If the verifier cannot safely complete, such as an expired approval policy, it
-   returns `ActionStatus::NeedsIntervention` and does not call the adapter.
+3. If evidence is present with `decision = Granted`, it must use the supported
+   evidence schema, include action scope (`action_id` or `action_name`) and adapter
+   scope for adapter-backed actions. Tenant, agent, run, action, adapter, expiry,
+   and revocation scope must match. Only then does the rest of the gateway
+   pipeline continue.
+4. Evidence with an unsupported schema version, wrong tenant, agent, run, action,
+   adapter, expiry, revoked flag, or explicit denial returns `ActionStatus::Denied`
+   and does not call the adapter.
+5. If the verifier cannot safely complete, such as an expired or unsupported-schema
+   approval policy, it returns `ActionStatus::NeedsIntervention` and does not call
+   the adapter.
 
 ## Daemon pause/resume behavior
 
@@ -105,7 +108,7 @@ Approval transitions are trace events, not out-of-band logs:
 | `ActionNeedsApproval` | `action.needs_approval` | Action paused before adapter execution. |
 | `ApprovalRequested` | `approval.requested` | Policy-created approval request scope. |
 | `ApprovalGranted` | `approval.granted` | Scoped approval grant was presented to the verifier. |
-| `ApprovalDenied` | `approval.denied` | Denial or wrong-scope evidence was rejected. |
+| `ApprovalDenied` | `approval.denied` | Denial, unsupported schema, or wrong-scope evidence was rejected. |
 | `ApprovalExpired` | `approval.expired` | Expired approval evidence was rejected. |
 | `ApprovalRevoked` | `approval.revoked` | Revoked approval evidence was rejected. |
 
@@ -127,6 +130,8 @@ approval verifier, re-check revocation, resume the run, or execute adapters.
 - Missing approval evidence on daemon resume from `waiting_for_approval` returns
   `403 approval_required`.
 - Wrong tenant, agent, run, action, or adapter scope denies.
+- Unsupported approval evidence schema denies; unsupported approval policy schema
+  requires intervention.
 - Expired evidence marks the run `expired` and does not execute adapters.
 - Denied or revoked evidence marks the run `denied` and does not execute adapters.
 - Approval verifier uncertainty fails closed as `NeedsIntervention`.

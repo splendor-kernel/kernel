@@ -1838,7 +1838,7 @@ fn update_status_for_approval_denial(slot: &mut RunSlot, outcome: &ActionOutcome
     };
     slot.status = match status.as_str() {
         "expired" => RunStatus::Expired,
-        "denied" | "revoked" => RunStatus::Denied,
+        "denied" | "revoked" | "schema_unsupported" => RunStatus::Denied,
         _ => slot.status.clone(),
     };
 }
@@ -1890,6 +1890,14 @@ fn approval_trace_kind(status: &str, approval: ApprovalTraceContext) -> TraceEve
         "intervention_required" => TraceEventKind::ApprovalDenied {
             approval,
             reason: "approval_policy_expired".to_string(),
+        },
+        "policy_schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_policy_schema_unsupported".to_string(),
+        },
+        "schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_evidence_schema_unsupported".to_string(),
         },
         _ => TraceEventKind::ApprovalDenied {
             approval,
@@ -2203,6 +2211,16 @@ mod tests {
                 "intervention_required",
                 "denied",
                 Some("approval_policy_expired"),
+            ),
+            (
+                "policy_schema_unsupported",
+                "denied",
+                Some("approval_policy_schema_unsupported"),
+            ),
+            (
+                "schema_unsupported",
+                "denied",
+                Some("approval_evidence_schema_unsupported"),
             ),
             ("denied", "denied", Some("approval_denied")),
         ]

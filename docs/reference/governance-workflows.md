@@ -15,8 +15,8 @@ marks later governance features as future work.
 - Resume from `waiting_for_approval` requires a signed resume work order and
   approval evidence.
 - Valid grants allow the action to be re-evaluated by the gateway.
-- Denial, expiry, revocation, wrong-scope evidence, or verifier uncertainty fails
-  closed without adapter execution.
+- Denial, expiry, revocation, wrong-scope evidence, unsupported approval schema,
+  or verifier uncertainty fails closed without adapter execution.
 - Approval evidence must include action scope (`action_id` or `action_name`) and
   adapter scope for adapter-backed actions; omitted action/adapter scope is not a
   wildcard grant.
@@ -90,7 +90,8 @@ through `TraceIdentityContext` and `ApprovalTraceContext`.
 Replay explains the approval path from trace records:
 
 - why approval was requested;
-- which approval grant, denial, expiry, or revocation was presented;
+- which approval grant, denial, unsupported schema, expiry, or revocation was
+  presented;
 - the trace event ID and sequence for each approval lifecycle event;
 - whether adapter execution remained suppressed until a grant was accepted.
 

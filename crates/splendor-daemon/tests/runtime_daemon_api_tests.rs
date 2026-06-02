@@ -9,12 +9,12 @@ use splendor_daemon::{
     StateHeadResponse, SubmitActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_types::{
-    Action, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
+    Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
     AuditAttribution, ClientPrincipal, CredentialAudience, EndpointScope, Percept,
     PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
     QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
     WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -967,10 +967,13 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         "expired",
         "wrong_tenant",
         "wrong_agent",
+        "wrong_run",
         "wrong_action",
+        "wrong_action_id",
         "wrong_adapter",
         "incomplete_action_scope",
         "incomplete_adapter_scope",
+        "unsupported_schema",
         "revoked",
     ] {
         let app = router(DaemonState::local_dev());
@@ -1029,13 +1032,22 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
             }
             "wrong_tenant" => evidence.tenant_id = TenantId::new(),
             "wrong_agent" => evidence.agent_id = AgentId::new(),
+            "wrong_run" => evidence.run_id = RunId::new(),
             "wrong_action" => evidence.action_name = Some("different_action".to_string()),
+            "wrong_action_id" => evidence.action_id = Some(ActionId::new()),
             "wrong_adapter" => evidence.adapter = Some("different_adapter".to_string()),
             "incomplete_action_scope" => {
                 evidence.action_id = None;
                 evidence.action_name = None;
             }
             "incomplete_adapter_scope" => evidence.adapter = None,
+            "unsupported_schema" => {
+                assert_eq!(
+                    APPROVAL_EVIDENCE_SCHEMA_VERSION,
+                    "splendor.approval_evidence.v1"
+                );
+                evidence.schema_version = "splendor.approval_evidence.v0".to_string();
+            }
             "revoked" => evidence.revoked = true,
             _ => unreachable!(),
         }
@@ -1077,6 +1089,34 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(inspected.adapter_executions, 0);
+
+        let (status, replay): (StatusCode, ReplayResponse) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/replay", created.run_id),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            replay
+                .approval_events
+                .iter()
+                .any(|event| event.lifecycle == "requested"),
+            "{scenario} should preserve approval request for replay"
+        );
+        let expected_lifecycle = match scenario {
+            "expired" => "expired",
+            "revoked" => "revoked",
+            _ => "denied",
+        };
+        assert!(
+            replay
+                .approval_events
+                .iter()
+                .any(|event| event.lifecycle == expected_lifecycle),
+            "{scenario} should replay approval {expected_lifecycle} lifecycle"
+        );
     }
 }
 

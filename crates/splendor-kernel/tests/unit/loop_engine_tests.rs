@@ -1035,6 +1035,8 @@ fn approval_artifact_and_trace_kind_cover_lifecycle_variants() {
         ("expired", "expired"),
         ("revoked", "revoked"),
         ("intervention_required", "policy_expired"),
+        ("policy_schema_unsupported", "policy_schema_unsupported"),
+        ("schema_unsupported", "evidence_schema_unsupported"),
         ("denied", "denied"),
     ] {
         let kind = approval_trace_kind(status, approval.clone());
@@ -1049,6 +1051,12 @@ fn approval_artifact_and_trace_kind_cover_lifecycle_variants() {
             }
             ("policy_expired", TraceEventKind::ApprovalDenied { reason, .. }) => {
                 assert_eq!(reason, "approval_policy_expired")
+            }
+            ("policy_schema_unsupported", TraceEventKind::ApprovalDenied { reason, .. }) => {
+                assert_eq!(reason, "approval_policy_schema_unsupported")
+            }
+            ("evidence_schema_unsupported", TraceEventKind::ApprovalDenied { reason, .. }) => {
+                assert_eq!(reason, "approval_evidence_schema_unsupported")
             }
             ("denied", TraceEventKind::ApprovalDenied { reason, .. }) => {
                 assert_eq!(reason, "approval_denied")

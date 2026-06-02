@@ -172,8 +172,8 @@ database, webhook, shell, or external-service side effects.
 
 `approval_events` reports approval lifecycle events with lifecycle label,
 approval context, optional reason, trace event ID, and sequence. It explains why
-approval was required and what grant, denial, expiry, or revocation changed the
-outcome without resuming the run or executing an adapter.
+approval was required and what grant, denial, unsupported schema, expiry, or
+revocation changed the outcome without resuming the run or executing an adapter.
 
 ## Structured errors
 

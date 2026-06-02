@@ -1015,6 +1015,14 @@ fn approval_trace_kind(status: &str, approval: ApprovalTraceContext) -> TraceEve
             approval,
             reason: "approval_policy_expired".to_string(),
         },
+        "policy_schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_policy_schema_unsupported".to_string(),
+        },
+        "schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_evidence_schema_unsupported".to_string(),
+        },
         _ => TraceEventKind::ApprovalDenied {
             approval,
             reason: "approval_denied".to_string(),
