@@ -27,7 +27,9 @@ Governance objects:
 - `ApprovalDenial`
 - `Escalation`
 - `Intervention`
-- `CircuitBreaker`
+- `GovernanceCircuitBreaker` (the 0.04-S1 governance-state schema; separate
+  `CircuitBreaker` enforcement controls are introduced by the later 0.04-S4
+  circuit-breaker sprint)
 - `KillSwitch`
 
 Supporting types:
@@ -188,9 +190,10 @@ This is an additive `0.04-dev` schema extension. Existing traces and runtime loo
 remain valid. Consumers that exhaustively match `TraceEventKind` must add arms for
 the governance event variants. The 0.1 stable schema line is not frozen yet.
 
-The TypeScript package exposes schema-aligned inspection types only. Rust
-validation remains authoritative for lifecycle transitions, reserved extension
-keys, and scope/trace run consistency.
+The TypeScript package exposes schema-aligned inspection types only. Its approval
+request/grant/denial status unions mirror the Rust object-specific lifecycle
+validators, while Rust validation remains authoritative for lifecycle
+transitions, reserved extension keys, and scope/trace run consistency.
 
 ## Non-goals
 

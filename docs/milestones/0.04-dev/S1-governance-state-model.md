@@ -12,7 +12,7 @@ propagation, or external control-plane adapter.
 
 - Added canonical `splendor-types` governance schemas:
   `ApprovalRequest`, `ApprovalGrant`, `ApprovalDenial`, `Escalation`,
-  `Intervention`, `CircuitBreaker`, and `KillSwitch`.
+  `Intervention`, `GovernanceCircuitBreaker`, and `KillSwitch`.
 - Added typed IDs for governance lifecycle objects:
   `ApprovalId`, `EscalationId`, `InterventionId`, `CircuitBreakerId`, and
   `KillSwitchId`.
@@ -72,8 +72,9 @@ propagation, or external control-plane adapter.
   `GovernanceApprovalRevoked`, `EscalationOpened`, `EscalationResolved`,
   `EscalationExpired`, `EscalationRevoked`, `InterventionRequested`,
   `InterventionResolved`, `InterventionCancelled`, `InterventionExpired`,
-  `InterventionRevoked`, `CircuitBreakerTripped`, `CircuitBreakerCleared`,
-  `CircuitBreakerExpired`, `CircuitBreakerRevoked`, `KillSwitchActivated`,
+  `InterventionRevoked`, `GovernanceCircuitBreakerTripped`,
+  `GovernanceCircuitBreakerCleared`, `GovernanceCircuitBreakerExpired`,
+  `GovernanceCircuitBreakerRevoked`, `KillSwitchActivated`,
   `KillSwitchCleared`, `KillSwitchExpired`, and `KillSwitchRevoked`.
 - Added fail-closed rejection event:
   `GovernanceTransitionRejected`.
@@ -150,7 +151,9 @@ propagation, or external control-plane adapter.
   approval verifier without changing the scope model.
 - 0.04-S3 can use `Escalation` and `Intervention` as deterministic escalation
   state without introducing an enterprise workflow engine.
-- 0.04-S4 can enforce `CircuitBreaker` scopes in the gateway/verifier path.
+- 0.04-S4 can enforce governance circuit-breaker scopes in the gateway/verifier
+  path by mapping `GovernanceCircuitBreaker` state into explicit
+  `CircuitBreaker` control objects.
 - 0.04-S5 can add policy TTL state while preserving the governance trace pattern.
 - 0.04-S6 can bridge an external control plane by issuing these schemas rather
   than owning kernel state.

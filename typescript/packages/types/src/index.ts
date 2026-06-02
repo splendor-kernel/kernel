@@ -346,6 +346,9 @@ export interface GovernanceRevocation {
 }
 
 export type ApprovalStatus = "requested" | "granted" | "denied" | "expired" | "revoked";
+export type ApprovalRequestStatus = Extract<ApprovalStatus, "requested" | "expired" | "revoked">;
+export type ApprovalGrantStatus = Extract<ApprovalStatus, "granted" | "expired" | "revoked">;
+export type ApprovalDenialStatus = Extract<ApprovalStatus, "denied" | "revoked">;
 export type EscalationStatus = "open" | "resolved" | "expired" | "revoked";
 export type InterventionStatus = "requested" | "resolved" | "cancelled" | "expired" | "revoked";
 export type CircuitBreakerStatus = "active" | "cleared" | "expired" | "revoked";
@@ -400,7 +403,7 @@ export interface ApprovalRequest {
   schema_version: string;
   approval_id: ApprovalId;
   scope: GovernanceScope;
-  status: ApprovalStatus;
+  status: ApprovalRequestStatus;
   created_at: ISODateTime;
   expires_at: ISODateTime | null;
   reason: string;
@@ -410,8 +413,13 @@ export interface ApprovalRequest {
   extensions?: GovernanceExtensions;
 }
 
-export interface ApprovalGrant extends ApprovalRequest {}
-export interface ApprovalDenial extends ApprovalRequest {}
+export interface ApprovalGrant extends Omit<ApprovalRequest, "status"> {
+  status: ApprovalGrantStatus;
+}
+
+export interface ApprovalDenial extends Omit<ApprovalRequest, "status"> {
+  status: ApprovalDenialStatus;
+}
 
 export interface Escalation {
   schema_version: string;

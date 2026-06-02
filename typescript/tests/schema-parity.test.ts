@@ -9,6 +9,7 @@ import {
   ENDPOINT_SCOPE_VALUES,
   TRACE_EVENT_KIND_VARIANTS
 } from "@splendor/types";
+import type { ApprovalDenial, ApprovalGrant, ApprovalRequest } from "@splendor/types";
 
 const repoRoot = process.cwd();
 
@@ -80,6 +81,31 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.submit_action_request, extractStructFields(daemon, "SubmitActionRequest"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.health_response, extractStructFields(daemon, "HealthResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.capabilities_response, extractStructFields(daemon, "CapabilitiesResponse"));
+});
+
+test("TypeScript governance approval statuses mirror Rust object validators", () => {
+  const requestStatus: ApprovalRequest["status"] = "requested";
+  const expiredRequestStatus: ApprovalRequest["status"] = "expired";
+  const grantStatus: ApprovalGrant["status"] = "granted";
+  const revokedGrantStatus: ApprovalGrant["status"] = "revoked";
+  const denialStatus: ApprovalDenial["status"] = "denied";
+
+  assert.deepEqual(
+    [requestStatus, expiredRequestStatus, grantStatus, revokedGrantStatus, denialStatus],
+    ["requested", "expired", "granted", "revoked", "denied"]
+  );
+
+  // @ts-expect-error Rust ApprovalRequest::validate rejects denied request states.
+  const invalidRequestStatus: ApprovalRequest["status"] = "denied";
+  // @ts-expect-error Rust ApprovalGrant::validate rejects requested grant states.
+  const invalidGrantStatus: ApprovalGrant["status"] = "requested";
+  // @ts-expect-error Rust ApprovalDenial::validate rejects granted denial states.
+  const invalidDenialStatus: ApprovalDenial["status"] = "granted";
+
+  assert.deepEqual(
+    [invalidRequestStatus, invalidGrantStatus, invalidDenialStatus],
+    ["denied", "requested", "granted"]
+  );
 });
 
 test("OpenAPI documents S5 daemon request and response schemas", () => {
