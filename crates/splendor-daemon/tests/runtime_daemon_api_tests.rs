@@ -1239,6 +1239,36 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error.code, "work_order_scope_widening");
 
+    let mut widened_adapter =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    widened_adapter
+        .allowed_adapters
+        .push("extra.adapter".to_string());
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_adapter).expect("widened adapter request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_permission =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    widened_permission
+        .allowed_permissions
+        .push("extra.permission".to_string());
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_permission).expect("widened permission request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
     let mut widened_policy = create_request(
         tenant_id.clone(),
         agent_id.clone(),
@@ -1256,6 +1286,72 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         Method::POST,
         "/runs",
         serde_json::to_value(widened_policy).expect("widened policy request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_policy_adapter = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action: action("allowed_action"),
+            adapter: Some("extra.adapter".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    widened_policy_adapter.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_policy_adapter).expect("widened policy adapter request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut action_with_permission = action("allowed_action");
+    action_with_permission.required_permissions = vec!["extra.permission".to_string()];
+    let mut widened_policy_permission = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action: action_with_permission,
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    widened_policy_permission.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_policy_permission).expect("widened policy permission request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_registration_name = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "extra_action".to_string(),
+            adapter: "daemon.local".to_string(),
+        }],
+    );
+    widened_registration_name.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_registration_name).expect("widened registration name request"),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
