@@ -17,7 +17,7 @@ import type {
   TickResponse,
   TracePageResponse,
   TraceRecord,
-  WorkOrderAuthorization
+  WorkOrderEnvelope
 } from "@splendor/types";
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -118,7 +118,7 @@ export class SplendorClient {
 
   async createRun(request: CreateRunRequest): Promise<CreateRunResponse> {
     if (!request?.work_order) {
-      throw new TypeError("createRun requires a signed, scoped work order authorization");
+      throw new TypeError("createRun requires a signed, scoped work order envelope");
     }
     this.validateCreateRunWorkOrder(request.work_order);
     if (!request.audit_attribution) {
@@ -238,12 +238,18 @@ export class SplendorClient {
     return attribution;
   }
 
-  private validateCreateRunWorkOrder(workOrder: WorkOrderAuthorization): void {
+  private validateCreateRunWorkOrder(workOrder: WorkOrderEnvelope): void {
     if (!workOrder.signature?.key_id.trim() || !workOrder.signature.signature.trim()) {
       throw new TypeError("createRun requires signed work order signature metadata");
     }
-    if (!workOrder.allowed_scopes.includes("runs_create")) {
-      throw new TypeError("createRun work order must allow the runs_create scope");
+    if (!workOrder.schema_version.trim() || !workOrder.work_order_id.trim() || !workOrder.objective.trim()) {
+      throw new TypeError("createRun work order must include schema_version, work_order_id, and objective");
+    }
+    if (!workOrder.allowed_actions.length || !workOrder.allowed_adapters.length) {
+      throw new TypeError("createRun work order must scope allowed actions and adapters");
+    }
+    if (!workOrder.placement?.target?.trim()) {
+      throw new TypeError("createRun work order must include a placement target");
     }
     if (workOrder.revocation !== "active") {
       throw new TypeError("createRun work order must not be revoked");
