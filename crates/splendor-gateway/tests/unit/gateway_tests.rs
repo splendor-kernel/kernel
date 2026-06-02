@@ -909,6 +909,137 @@ fn action_class_breaker_uses_effective_adapter_side_effect_class() {
 }
 
 #[test]
+fn static_breaker_evaluator_denies_all_supported_action_scopes() {
+    let mut request = base_request();
+    request.action.name = "artifact.publish".to_string();
+    request.action.side_effect_class = SideEffectClass::External;
+    request.adapter = Some("artifact-store".to_string());
+
+    let fleet_id = FleetId::new();
+    let node_id = NodeId::new();
+    let instance_id = InstanceId::new();
+    let identity = RuntimeIdentityContext {
+        fleet_id: Some(fleet_id.clone()),
+        node_id: Some(node_id.clone()),
+        instance_id: Some(instance_id.clone()),
+        tenant_id: Some(request.tenant_id.clone()),
+        agent_id: Some(request.agent_id.clone()),
+    };
+
+    let cases = vec![
+        ("global", CircuitBreakerScope::Global),
+        ("fleet", CircuitBreakerScope::Fleet(fleet_id)),
+        ("node", CircuitBreakerScope::Node(node_id)),
+        ("instance", CircuitBreakerScope::Instance(instance_id)),
+        (
+            "tenant",
+            CircuitBreakerScope::Tenant(request.tenant_id.clone()),
+        ),
+        (
+            "agent",
+            CircuitBreakerScope::Agent(request.agent_id.clone()),
+        ),
+        (
+            "adapter",
+            CircuitBreakerScope::Adapter("artifact-store".to_string()),
+        ),
+        (
+            "action",
+            CircuitBreakerScope::Action("artifact.publish".to_string()),
+        ),
+        (
+            "action_class",
+            CircuitBreakerScope::ActionClass(SideEffectClass::External),
+        ),
+    ];
+
+    for (scope_label, scope) in cases {
+        let breaker = CircuitBreaker::tripped(
+            CircuitBreakerId::try_new(format!("cb_{scope_label}")).expect("id"),
+            scope,
+            format!("{scope_label} disabled"),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("breaker");
+        let evaluator = StaticCircuitBreakerEvaluator::new(vec![breaker]);
+
+        let result = evaluator.verify_action(&request, request.adapter.as_deref(), &identity);
+
+        assert!(
+            !result.allowed,
+            "scope {scope_label} must deny matching action"
+        );
+        assert!(result
+            .reasons
+            .contains(&"circuit_breaker_tripped".to_string()));
+        assert_eq!(
+            result.artifacts["circuit_breaker"]["scope"].as_str(),
+            Some(scope_label),
+            "scope artifact should identify {scope_label}"
+        );
+    }
+}
+
+#[test]
+fn static_breaker_evaluator_denies_new_work_for_runtime_scopes() {
+    let fleet_id = FleetId::new();
+    let node_id = NodeId::new();
+    let instance_id = InstanceId::new();
+    let identity = RuntimeIdentityContext {
+        fleet_id: Some(fleet_id.clone()),
+        node_id: Some(node_id.clone()),
+        instance_id: Some(instance_id.clone()),
+        tenant_id: Some(TenantId::new()),
+        agent_id: Some(AgentId::new()),
+    };
+
+    let runtime_cases = vec![
+        ("global", CircuitBreakerScope::Global),
+        ("fleet", CircuitBreakerScope::Fleet(fleet_id)),
+        ("node", CircuitBreakerScope::Node(node_id)),
+        ("instance", CircuitBreakerScope::Instance(instance_id)),
+    ];
+
+    for (scope_label, scope) in runtime_cases {
+        let breaker = CircuitBreaker::tripped(
+            CircuitBreakerId::try_new(format!("cb_admission_{scope_label}")).expect("id"),
+            scope,
+            format!("{scope_label} admission disabled"),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("breaker");
+        let evaluator = StaticCircuitBreakerEvaluator::new(vec![breaker]);
+
+        let result = evaluator.verify_runtime_admission(&identity);
+
+        assert!(
+            !result.allowed,
+            "runtime scope {scope_label} must deny new work admission"
+        );
+        assert!(result
+            .reasons
+            .contains(&"circuit_breaker_tripped".to_string()));
+        assert_eq!(
+            result.artifacts["circuit_breaker"]["scope"].as_str(),
+            Some(scope_label)
+        );
+    }
+
+    let action_only_breaker = CircuitBreaker::tripped(
+        CircuitBreakerId::try_new("cb_action_only_admission").expect("id"),
+        CircuitBreakerScope::Action("artifact.publish".to_string()),
+        "action disabled",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("breaker");
+    let evaluator = StaticCircuitBreakerEvaluator::new(vec![action_only_breaker]);
+    assert!(
+        evaluator.verify_runtime_admission(&identity).allowed,
+        "action-scoped breakers wait for action context and must not reject unrelated new work"
+    );
+}
+
+#[test]
 fn runtime_admission_fails_closed_when_node_scope_identity_is_missing() {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
