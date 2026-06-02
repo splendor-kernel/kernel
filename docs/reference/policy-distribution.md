@@ -67,7 +67,7 @@ signature:
 | `policy_bundle_id` | Central-manager-issued policy bundle identity. Distinct from run, action, state, trace, message, work-order, and approval IDs. |
 | `version` | Operator/audit version label. |
 | `tenant_id` | Tenant authority boundary governed by the bundle. |
-| `agent_id` | Optional agent binding. `null` means tenant-wide for the receiving run context. |
+| `agent_id` | Optional agent binding. `null` means tenant-wide for the receiving run context; a non-null agent-scoped bundle is valid only when the receiving validation context names the same agent. |
 | `issued_at` / `expires_at` | TTL window. `expires_at` must be after `issued_at`. |
 | `revocation` | `active` or `{ revoked: { reason } }`. Revoked bundles fail closed. |
 | `degraded_mode.allow_low_risk_cached` | Whether disconnected runtimes may allow read-only/low-risk actions from an expired cached bundle. |
@@ -96,10 +96,10 @@ sources without changing the policy bundle payload contract.
 2. detached signature presence;
 3. known verification key;
 4. signature correctness;
-5. TTL expiry;
-6. revocation marker;
-7. tenant compatibility;
-8. optional agent compatibility.
+5. tenant compatibility;
+6. optional agent compatibility;
+7. TTL expiry;
+8. revocation marker.
 
 Any failed or unavailable check returns `PolicyBundleValidationError` and denies
 installation. Invalid bundles are rejected before policy invocation.
