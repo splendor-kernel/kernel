@@ -230,10 +230,17 @@ Governance success events carry `GovernanceTransition`:
 | `trace` | Causal trace linkage. |
 | `extensions` | Optional non-authoritative metadata. |
 
+Runtime code should convert accepted governance transitions with
+`GovernanceTransition::into_trace_event_kind()` before persistence. The mapping
+helper rejects invalid lifecycle transitions or unsupported object/state pairs
+with `GovernanceTraceEventKindError` instead of allowing emitters to record a
+malformed transition under the wrong governance event variant.
+
 `GovernanceTransitionRejected` carries `GovernanceTransitionRejection` with the
 same object, scope, issuer, and trace linkage plus `attempted`, `from`,
 `rejected_at`, and a stable rejection reason. Rejections do not become implicit
-allows and do not execute side effects.
+allows and do not execute side effects. Rejections should be converted with
+`GovernanceTransitionRejection::into_trace_event_kind()`.
 
 ## Message Events
 

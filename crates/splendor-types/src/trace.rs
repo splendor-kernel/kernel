@@ -21,13 +21,15 @@
 
 use crate::{
     Action, AgentId, ApprovalTraceContext, AuditAttribution, CircuitBreakerTraceContext,
-    Constraint, ContentHash, EscalationContext, Feedback, GovernanceScope, GovernanceTransition,
+    Constraint, ContentHash, EscalationContext, Feedback, GovernanceObjectKind, GovernanceScope,
+    GovernanceState, GovernanceTransition, GovernanceTransitionError,
     GovernanceTransitionRejection, IdentityValidationError, MessageId, MessageTraceContext,
     PolicyBundleId, PolicyBundleTraceContext, RemoteMessageTraceContext, Reward, RunId, SnapshotId,
     StateHandoffTraceContext, TaskFailure, TenantId, TickId, TraceEventId, TraceId,
     TraceIdentityContext, VerificationResult, WorkOrderId,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::OffsetDateTime;
 
 /// Immutable record describing a single kernel trace event.
@@ -779,6 +781,118 @@ pub enum TraceEventKind {
         tick_id: u64,
         /// Optional integrity chain metadata for audit validation.
         integrity: Option<TraceIntegrity>,
+    },
+}
+
+impl GovernanceTransition {
+    /// Converts a validated governance transition into the canonical trace event
+    /// kind for its object and target state.
+    ///
+    /// Runtime emitters should use this helper instead of independently mapping
+    /// governance states to trace variants. This keeps invalid or unsupported
+    /// governance transitions from being silently recorded as the wrong event.
+    pub fn into_trace_event_kind(self) -> Result<TraceEventKind, GovernanceTraceEventKindError> {
+        self.validate()
+            .map_err(GovernanceTraceEventKindError::InvalidTransition)?;
+        let object_kind = self.object.kind();
+        let target_state = self.to;
+        match (object_kind, target_state) {
+            (GovernanceObjectKind::Approval, GovernanceState::Requested) => {
+                Ok(TraceEventKind::GovernanceApprovalRequested { transition: self })
+            }
+            (GovernanceObjectKind::Approval, GovernanceState::Granted) => {
+                Ok(TraceEventKind::GovernanceApprovalGranted { transition: self })
+            }
+            (GovernanceObjectKind::Approval, GovernanceState::Denied) => {
+                Ok(TraceEventKind::GovernanceApprovalDenied { transition: self })
+            }
+            (GovernanceObjectKind::Approval, GovernanceState::Expired) => {
+                Ok(TraceEventKind::GovernanceApprovalExpired { transition: self })
+            }
+            (GovernanceObjectKind::Approval, GovernanceState::Revoked) => {
+                Ok(TraceEventKind::GovernanceApprovalRevoked { transition: self })
+            }
+            (GovernanceObjectKind::Escalation, GovernanceState::Open) => {
+                Ok(TraceEventKind::EscalationOpened { transition: self })
+            }
+            (GovernanceObjectKind::Escalation, GovernanceState::Resolved) => {
+                Ok(TraceEventKind::EscalationResolved { transition: self })
+            }
+            (GovernanceObjectKind::Escalation, GovernanceState::Expired) => {
+                Ok(TraceEventKind::EscalationExpired { transition: self })
+            }
+            (GovernanceObjectKind::Escalation, GovernanceState::Revoked) => {
+                Ok(TraceEventKind::EscalationRevoked { transition: self })
+            }
+            (GovernanceObjectKind::Intervention, GovernanceState::Requested) => {
+                Ok(TraceEventKind::InterventionRequested { transition: self })
+            }
+            (GovernanceObjectKind::Intervention, GovernanceState::Resolved) => {
+                Ok(TraceEventKind::InterventionResolved { transition: self })
+            }
+            (GovernanceObjectKind::Intervention, GovernanceState::Cancelled) => {
+                Ok(TraceEventKind::InterventionCancelled { transition: self })
+            }
+            (GovernanceObjectKind::Intervention, GovernanceState::Expired) => {
+                Ok(TraceEventKind::InterventionExpired { transition: self })
+            }
+            (GovernanceObjectKind::Intervention, GovernanceState::Revoked) => {
+                Ok(TraceEventKind::InterventionRevoked { transition: self })
+            }
+            (GovernanceObjectKind::CircuitBreaker, GovernanceState::Active) => {
+                Ok(TraceEventKind::GovernanceCircuitBreakerTripped { transition: self })
+            }
+            (GovernanceObjectKind::CircuitBreaker, GovernanceState::Cleared) => {
+                Ok(TraceEventKind::GovernanceCircuitBreakerCleared { transition: self })
+            }
+            (GovernanceObjectKind::CircuitBreaker, GovernanceState::Expired) => {
+                Ok(TraceEventKind::GovernanceCircuitBreakerExpired { transition: self })
+            }
+            (GovernanceObjectKind::CircuitBreaker, GovernanceState::Revoked) => {
+                Ok(TraceEventKind::GovernanceCircuitBreakerRevoked { transition: self })
+            }
+            (GovernanceObjectKind::KillSwitch, GovernanceState::Active) => {
+                Ok(TraceEventKind::KillSwitchActivated { transition: self })
+            }
+            (GovernanceObjectKind::KillSwitch, GovernanceState::Cleared) => {
+                Ok(TraceEventKind::KillSwitchCleared { transition: self })
+            }
+            (GovernanceObjectKind::KillSwitch, GovernanceState::Expired) => {
+                Ok(TraceEventKind::KillSwitchExpired { transition: self })
+            }
+            (GovernanceObjectKind::KillSwitch, GovernanceState::Revoked) => {
+                Ok(TraceEventKind::KillSwitchRevoked { transition: self })
+            }
+            _ => Err(GovernanceTraceEventKindError::UnsupportedTransition {
+                object_kind,
+                target_state,
+            }),
+        }
+    }
+}
+
+impl GovernanceTransitionRejection {
+    /// Converts a rejected governance transition into the canonical fail-closed
+    /// trace event kind.
+    pub fn into_trace_event_kind(self) -> TraceEventKind {
+        TraceEventKind::GovernanceTransitionRejected { rejection: self }
+    }
+}
+
+/// Errors produced when a governance transition cannot map to a governance trace
+/// event variant.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum GovernanceTraceEventKindError {
+    /// The transition failed schema, scope, or lifecycle validation.
+    #[error(transparent)]
+    InvalidTransition(#[from] GovernanceTransitionError),
+    /// The object/target-state pair has no 0.04-S1 governance trace event.
+    #[error("unsupported governance trace event mapping for {object_kind:?} -> {target_state:?}")]
+    UnsupportedTransition {
+        /// Governance object kind.
+        object_kind: GovernanceObjectKind,
+        /// Target lifecycle state.
+        target_state: GovernanceState,
     },
 }
 

@@ -95,8 +95,14 @@ recorded in trace. Creation transitions use `from = None`.
 
 Invalid transitions return `GovernanceTransitionError::Rejected` containing a
 `GovernanceTransitionRejection`. That rejection is trace-ready and should be
-recorded with `TraceEventKind::GovernanceTransitionRejected` by runtime code that
-attempts the transition.
+converted with `GovernanceTransitionRejection::into_trace_event_kind()` by runtime
+code that attempts the transition.
+
+Accepted transitions can be converted with
+`GovernanceTransition::into_trace_event_kind()`. The helper fails closed with
+`GovernanceTraceEventKindError` if a deserialized or otherwise malformed
+transition has no canonical 0.04-S1 governance trace event mapping. Runtime
+emitters should use the helper instead of independently choosing a trace variant.
 
 ## Trace events
 
@@ -108,6 +114,10 @@ the complete event list. All governance events carry either:
 
 - `transition: GovernanceTransition`, or
 - `rejection: GovernanceTransitionRejection`.
+
+The Rust contract includes `into_trace_event_kind()` helpers for both successful
+transitions and rejected transitions so governance state changes map to one
+canonical trace variant before persistence.
 
 When a governance scope includes tenant, agent, or action identity, trace event
 identity context is populated with those IDs so replay/audit can locate the
