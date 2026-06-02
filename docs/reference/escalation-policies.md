@@ -76,11 +76,12 @@ first matching trigger/scope whose observed count reaches the threshold.
 
 1. A verifier/gateway/runtime path produces an explicit `ActionOutcome` or
    `EscalationObservation` with trigger evidence.
-2. `EscalationEvaluator` checks the observation against `EscalationPolicy`.
-3. If a threshold is reached, the engine creates `EscalationContext`.
-4. The loop records `EscalationTriggered` with trigger, threshold, scope,
+2. The loop validates the `EscalationPolicy` before installing the evaluator.
+3. `EscalationEvaluator` checks the observation against `EscalationPolicy`.
+4. If a threshold is reached, the engine creates `EscalationContext`.
+5. The loop records `EscalationTriggered` with trigger, threshold, scope,
    action/run references, evidence, and decision.
-5. If the decision requires intervention, the action outcome is marked
+6. If the decision requires intervention, the action outcome is marked
    `NeedsIntervention` and the tick `needs_intervention` flag is set.
 
 Adapter execution still depends on the Action Gateway. Escalation never creates a
@@ -114,6 +115,8 @@ New trace event classes:
 - Zero thresholds are rejected by `EscalationPolicy::validate`.
 - Missing matching rule means no escalation; the original gateway/verifier outcome
   remains authoritative.
+- `LoopEngine::set_escalation_policy` rejects invalid schema versions or zero
+  thresholds before installing the evaluator.
 - Verifier uncertainty should be supplied as a fail-closed denial or intervention
   fact. It must not be converted into allow.
 - Quota pressure is read from quota denial artifacts and does not mutate the quota
@@ -142,7 +145,7 @@ let policy = EscalationPolicy::with_rules(vec![EscalationRule::new(
 )]);
 
 // Existing local loop setup omitted.
-// engine.set_escalation_policy(policy);
+// engine.set_escalation_policy(policy).expect("valid escalation policy");
 ```
 
 See [`examples/escalation-basic/README.md`](../../examples/escalation-basic/README.md)
@@ -150,7 +153,8 @@ for a runnable test command and expected trace behavior.
 
 ## Compatibility notes
 
-0.04-S3 adds a public `ActionStatus::NeedsIntervention` variant and two trace
-event variants. Existing `Executed`, `Denied`, and `Failed` semantics are
-unchanged. Consumers that exhaustively match action statuses or trace kinds must
-handle the new variants.
+0.04-S3 adds a public `ActionStatus::NeedsIntervention` variant, two trace event
+variants, and a fallible `LoopEngine::set_escalation_policy` install path.
+Existing `Executed`, `Denied`, and `Failed` semantics are unchanged. Consumers
+that exhaustively match action statuses or trace kinds must handle the new
+variants.

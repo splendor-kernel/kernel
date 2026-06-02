@@ -17,6 +17,9 @@
 - Added the 0.04-S3 escalation engine with versioned escalation policy rules,
   deterministic threshold evaluation, `NeedsIntervention` action outcomes,
   escalation trace events, and inspect-only replay reconstruction.
+- Hardened the 0.04-S3 escalation install path so invalid policy schema versions
+  or zero thresholds fail closed before evaluator installation, and repeated
+  adapter denials can use explicit denial counts as escalation evidence.
 - Added 0.04-S4 circuit-breaker schemas, scoped gateway enforcement, local
   `splendorctl run` config support, trip/clear trace event variants, and
   inspect-only replay output for breaker-denied actions.

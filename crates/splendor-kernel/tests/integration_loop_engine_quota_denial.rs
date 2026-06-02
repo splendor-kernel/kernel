@@ -74,12 +74,14 @@ fn quota_pressure_escalates_without_consuming_denied_usage() {
     )
     .expect("engine");
     engine.add_perceptor(EmptyPerceptor);
-    engine.set_escalation_policy(EscalationPolicy::with_rules(vec![EscalationRule::new(
-        EscalationTrigger::QuotaPressure,
-        EscalationScope::Action,
-        1,
-        EscalationDecision::Pause,
-    )]));
+    engine
+        .set_escalation_policy(EscalationPolicy::with_rules(vec![EscalationRule::new(
+            EscalationTrigger::QuotaPressure,
+            EscalationScope::Action,
+            1,
+            EscalationDecision::Pause,
+        )]))
+        .expect("valid escalation policy");
 
     let outcome = engine.tick(1).expect("tick");
     assert!(outcome.needs_intervention);

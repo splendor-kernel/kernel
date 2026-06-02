@@ -488,6 +488,58 @@ fn loop_engine_emits_ordered_trace_events() {
 }
 
 #[test]
+fn loop_engine_rejects_invalid_escalation_policy_before_installing() {
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store, SnapshotPolicy::default());
+    let initial_state = StateData {
+        bytes: vec![1],
+        content_type: None,
+    };
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let gateway = Arc::new(StubGateway);
+    let mut engine = LoopEngine::new(agent, graph, initial_state, Box::new(StaticPolicy), gateway);
+    let mut policy =
+        splendor_types::EscalationPolicy::with_rules(vec![splendor_types::EscalationRule::new(
+            splendor_types::EscalationTrigger::VerifierUncertainty,
+            splendor_types::EscalationScope::Action,
+            1,
+            splendor_types::EscalationDecision::NeedsIntervention,
+        )]);
+    policy.schema_version = "future.escalation".to_string();
+
+    let err = engine
+        .set_escalation_policy(policy)
+        .expect_err("invalid escalation policy must fail closed");
+    assert!(matches!(
+        err,
+        LoopError::EscalationPolicy(
+            splendor_types::EscalationPolicyError::UnsupportedSchemaVersion { .. }
+        )
+    ));
+
+    let zero_threshold =
+        splendor_types::EscalationPolicy::with_rules(vec![splendor_types::EscalationRule::new(
+            splendor_types::EscalationTrigger::QuotaPressure,
+            splendor_types::EscalationScope::Action,
+            0,
+            splendor_types::EscalationDecision::Deny,
+        )]);
+    let err = engine
+        .set_escalation_policy(zero_threshold)
+        .expect_err("zero threshold escalation policy must fail closed");
+    assert!(matches!(
+        err,
+        LoopError::EscalationPolicy(splendor_types::EscalationPolicyError::ZeroThreshold {
+            rule_index: 0
+        })
+    ));
+}
+
+#[test]
 fn loop_engine_state_commit_failure_does_not_complete_tick() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = CapturingTraceSink {

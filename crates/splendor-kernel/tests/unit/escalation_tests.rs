@@ -201,6 +201,53 @@ fn failed_adapter_outcome_keeps_failed_status_after_escalation() {
 }
 
 #[test]
+fn repeated_adapter_denial_reaches_threshold_and_denies() {
+    let policy = EscalationPolicy::with_rules(vec![EscalationRule::new(
+        EscalationTrigger::RepeatedAdapterFailure,
+        EscalationScope::Adapter,
+        2,
+        EscalationDecision::Deny,
+    )]);
+    let evaluator = EscalationEvaluator::new(policy);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let action_id = ActionId::new();
+    let action = action(SideEffectClass::Network);
+    let mut outcome = denied_outcome(
+        "adapter_denied",
+        serde_json::json!({"adapter": {"denial_count": 2, "name": "http"}}),
+    );
+    let input = EscalationOutcomeInput {
+        tenant_id: &tenant_id,
+        agent_id: &agent_id,
+        run_id: &run_id,
+        action_id: &action_id,
+        action: &action,
+        adapter: Some("http"),
+        outcome: &outcome,
+    };
+
+    let escalations = evaluator.evaluate_outcome(&input);
+    assert_eq!(escalations.len(), 1);
+    assert_eq!(
+        escalations[0].trigger,
+        EscalationTrigger::RepeatedAdapterFailure
+    );
+    assert_eq!(escalations[0].threshold, 2);
+    assert_eq!(escalations[0].observed_count, 2);
+    assert_eq!(escalations[0].decision, EscalationDecision::Deny);
+
+    apply_escalation_to_outcome(&mut outcome, &escalations[0]);
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(!outcome.verification.allowed);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"escalation:repeated_adapter_failure".to_string()));
+}
+
+#[test]
 fn approval_timeout_denies_by_explicit_policy() {
     let policy = EscalationPolicy::with_rules(vec![EscalationRule::new(
         EscalationTrigger::ApprovalTimeout,
@@ -269,6 +316,7 @@ fn policy_expiry_only_escalates_high_risk_actions() {
     assert!(no_escalation.is_empty());
 
     let external = action(SideEffectClass::External);
+    let mut high_risk_outcome = expired.clone();
     let input = EscalationOutcomeInput {
         tenant_id: &tenant_id,
         agent_id: &agent_id,
@@ -276,11 +324,18 @@ fn policy_expiry_only_escalates_high_risk_actions() {
         action_id: &action_id,
         action: &external,
         adapter: None,
-        outcome: &expired,
+        outcome: &high_risk_outcome,
     };
     let escalation = evaluator.evaluate_outcome(&input);
     assert_eq!(escalation.len(), 1);
     assert_eq!(escalation[0].trigger, EscalationTrigger::PolicyExpired);
+
+    apply_escalation_to_outcome(&mut high_risk_outcome, &escalation[0]);
+    assert_eq!(high_risk_outcome.status, ActionStatus::NeedsIntervention);
+    assert!(high_risk_outcome
+        .verification
+        .reasons
+        .contains(&"escalation:policy_expired".to_string()));
 }
 
 #[test]
