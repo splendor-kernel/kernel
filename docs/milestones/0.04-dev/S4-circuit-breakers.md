@@ -125,8 +125,8 @@ and causal-graph replay output.
 | Test | Purpose | Evidence |
 | --- | --- | --- |
 | `cargo test -p splendor-types` | Schema and trace serialization | `CircuitBreaker` round trips; trip/clear trace events round trip; reset requires authority. |
-| `cargo test -p splendor-gateway` | Gateway denial and scope matching | Adapter/tenant/action-class/node/instance tests prove scoped denial and no adapter execution. |
-| `cargo test -p splendorctl` | Local config + replay | Configured breaker denies filesystem action; replay reports breaker ID/scope. |
+| `cargo test -p splendor-gateway` | Gateway denial and scope matching | Table-driven coverage proves every supported scope can deny matching actions; runtime-scope admission tests cover global/fleet/node/instance. |
+| `cargo test -p splendorctl` | Local config + replay | Configured breaker denies filesystem action; node and instance config breakers reject new work; replay reports UUID-backed breaker ID/scope from nested gateway artifacts. |
 
 ## Example or fixture
 
