@@ -13,6 +13,8 @@ deny/pause/intervention decisions without creating a general workflow engine.
 - Added a Rust `EscalationEvaluator` for deterministic first-match threshold
   evaluation.
 - Added loop-engine integration behind explicit `set_escalation_policy`.
+- `set_escalation_policy` validates policy schema version and rule thresholds
+  before installing the evaluator.
 - Added `ActionStatus::NeedsIntervention`, `ActionNeedsIntervention`, and
   `EscalationTriggered` trace events.
 - Added inspect-only replay reconstruction of escalation contexts.
@@ -31,6 +33,8 @@ deny/pause/intervention decisions without creating a general workflow engine.
   EscalationTrigger, EscalationScope, EscalationDecision, EscalationObservation,
   EscalationContext}`.
 - Rust: `splendor_gateway::ActionStatus::NeedsIntervention`.
+- Rust: `LoopEngine::set_escalation_policy` returns `Result<(), LoopError>` and
+  fails closed on invalid escalation policies.
 - Rust trace: `TraceEventKind::EscalationTriggered` and
   `TraceEventKind::ActionNeedsIntervention`.
 - TypeScript: `ActionStatus`, `TraceEventKind`, and escalation context types were
@@ -65,8 +69,9 @@ deny/pause/intervention decisions without creating a general workflow engine.
 ## State behavior
 
 - Escalation does not introduce hidden state in the local loop.
-- Repeated failure thresholds are evaluated from explicit observed counts supplied
-  by the caller/runtime trace context, not from an implicit global counter.
+- Repeated failure/denial thresholds are evaluated from explicit observed counts
+  supplied by the caller/runtime trace context, not from an implicit global
+  counter.
 - State commits continue through the existing state graph; state commit failure
   still prevents `StateCommitted` and `LoopTickCompleted`.
 
@@ -88,8 +93,10 @@ deny/pause/intervention decisions without creating a general workflow engine.
 
 ## Failure behavior
 
-- Invalid escalation policy schema versions fail validation.
-- Zero thresholds fail validation.
+- Invalid escalation policy schema versions fail validation and are rejected by
+  `LoopEngine::set_escalation_policy`.
+- Zero thresholds fail validation and are rejected by
+  `LoopEngine::set_escalation_policy`.
 - No matching rule means the original gateway/verifier decision remains
   authoritative.
 - Verifier uncertainty, quota pressure, policy expiry, and safety risks fail
@@ -101,7 +108,8 @@ deny/pause/intervention decisions without creating a general workflow engine.
 | --- | --- | --- |
 | `cargo test -p splendor-types escalation` | schema validation, matching, trace fields | `crates/splendor-types/tests/unit/escalation_tests.rs` |
 | `cargo test -p splendor-types trace` | escalation trace round-trip and action identity | `crates/splendor-types/tests/unit/trace_tests.rs` |
-| `cargo test -p splendor-kernel escalation` | evaluator trigger behavior | `crates/splendor-kernel/tests/unit/escalation_tests.rs` |
+| `cargo test -p splendor-kernel escalation` | evaluator trigger behavior, repeated adapter failure/denial, policy-expiry final outcome | `crates/splendor-kernel/tests/unit/escalation_tests.rs` |
+| `cargo test -p splendor-kernel loop_engine_rejects_invalid_escalation_policy_before_installing` | fail-closed invalid policy install | `crates/splendor-kernel/tests/unit/loop_engine_tests.rs` |
 | `cargo test -p splendor-kernel quota_pressure_escalates_without_consuming_denied_usage` | quota pressure intervention trace and ledger safety | `crates/splendor-kernel/tests/integration_loop_engine_quota_denial.rs` |
 
 ## Example or fixture
