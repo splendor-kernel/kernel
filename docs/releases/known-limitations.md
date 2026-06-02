@@ -17,14 +17,17 @@
 - Circuit breakers are limited to the 0.04-S4 local config/gateway reference path;
   there is no monitoring automation or UI dashboard.
 - No kill-switch propagation.
-- No policy bundle TTL/revocation distribution.
+- 0.04-S5 includes run-scoped signed policy bundle distribution, TTL checks,
+  revocation handling, and degraded cached-policy enforcement. There is still no
+  fleet-wide policy distribution service, authoring UI, or production PKI/key
+  management.
 
 ## Physical/edge not included
 
 - No device node profiles.
 - No robotics adapter contract.
 - No safety verifier API.
-- No offline policy cache or local trace reconnect sync.
+- No full physical/edge offline policy cache or local trace reconnect sync.
 - No production robotics safety certification claim.
 
 ## Adapter maturity

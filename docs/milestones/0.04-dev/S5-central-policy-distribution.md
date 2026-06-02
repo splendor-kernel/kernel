@@ -104,6 +104,8 @@ cache.
   mode applies to a read-only action.
 - Revoked policy denies with `policy_revoked`.
 - Invalid bundle signature/schema/scope fails closed before installation.
+- Agent-scoped bundles require a matching run/agent validation context; a
+  tenant-only context cannot install an agent-specific policy by accident.
 - Denied actions do not reach adapters.
 
 ## Replay behavior
