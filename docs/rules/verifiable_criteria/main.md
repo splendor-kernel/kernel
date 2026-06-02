@@ -251,6 +251,33 @@ docs/development/kernel-e2e-integration-tests.md
 The 0.03 E2E gate is blocked if any required scenario lacks positive, denial,
 failure, trace, state, replay, quota/permission, and compatibility evidence.
 
+### 3.5 Post-implementation use-case acceptance gate through 0.1
+
+Sprint-local and 0.03 kernel E2E tests remain necessary, but the full
+post-implementation acceptance gate is defined by:
+
+```text
+docs/rules/verifiable_criteria/use-case-e2e-through-0.1.md
+docs/rules/verifiable_criteria/use-case-e2e-traceability-matrix.md
+docs/development/containerized-use-case-e2e-harness.md
+docs/reference/management-communication-api-acceptance-contract.md
+```
+
+Those documents are proposed acceptance criteria for validating realistic use cases
+after the implementation sprints through `0.1-dev` are complete. They must not be
+used to claim that unimplemented future milestones already pass, and they must not
+pull 0.04 governance or 0.05 physical/edge behavior into earlier sprint scopes.
+
+The required aggregate command for the post-implementation use-case gate is:
+
+```bash
+bash scripts/e2e/verify-use-case-acceptance.sh --all
+```
+
+Until that command and harness exist, docs and PRs must treat the use-case pack as a
+contract for future acceptance implementation rather than executable completion
+evidence.
+
 ---
 
 ## 4. Sprint index
