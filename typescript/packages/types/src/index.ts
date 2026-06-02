@@ -477,6 +477,89 @@ export interface KillSwitch {
   extensions?: GovernanceExtensions;
 }
 
+export const EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION = "splendor.external_governance_adapter.v1" as const;
+export const GOVERNED_ARTIFACT_REF_SCHEMA_VERSION = "splendor.governed_artifact_ref.v1" as const;
+
+export interface ExternalGovernanceReference {
+  provider: string;
+  reference_id: string;
+  endpoint?: string | null;
+}
+
+export interface ExternalGovernanceEndpoints {
+  work_orders: string;
+  action_gateway: string;
+  approvals: string;
+  traces: string;
+  state_commits: string;
+  artifact_refs: string;
+}
+
+export interface ExternalGovernanceAdapterContract {
+  schema_version: string;
+  provider: string;
+  endpoints: ExternalGovernanceEndpoints;
+}
+
+export interface ExternalGovernanceWorkOrderBridge {
+  schema_version: string;
+  external_ref: ExternalGovernanceReference;
+  work_order: WorkOrderEnvelope;
+  issuer: GovernanceIssuer;
+  trace: GovernanceTraceLink;
+  context?: GovernanceExtensions;
+}
+
+export type ExternalApprovalDecisionKind = "granted" | "denied";
+
+export interface ExternalApprovalDecision {
+  schema_version: string;
+  external_ref: ExternalGovernanceReference;
+  approval_id: ApprovalId;
+  scope: GovernanceScope;
+  decision: ExternalApprovalDecisionKind;
+  created_at: ISODateTime;
+  expires_at: ISODateTime;
+  reason: string;
+  issuer: GovernanceIssuer;
+  trace: GovernanceTraceLink;
+  extensions?: GovernanceExtensions;
+}
+
+export interface ExternalGovernanceAdapterFailure {
+  schema_version: string;
+  external_ref: ExternalGovernanceReference;
+  scope: GovernanceScope;
+  occurred_at: ISODateTime;
+  reason: string;
+  issuer: GovernanceIssuer;
+  trace: GovernanceTraceLink;
+}
+
+export type ExternalApprovalMapping =
+  | { mapping: "grant"; approval: ApprovalGrant }
+  | { mapping: "denial"; approval: ApprovalDenial }
+  | { mapping: "adapter_failure"; failure: ExternalGovernanceAdapterFailure };
+
+export interface ExternalTraceRange {
+  start_trace_event_id: TraceEventId;
+  end_trace_event_id: TraceEventId;
+}
+
+export interface GovernedArtifactRef {
+  schema_version: string;
+  artifact_id: string;
+  version?: string | null;
+  source_refs: string[];
+  run_id: RunId;
+  state_node_id: StateNodeId;
+  trace_range: ExternalTraceRange;
+  approval_state: ApprovalStatus;
+  approval_id?: ApprovalId | null;
+  external_ref?: ExternalGovernanceReference | null;
+  export_targets: string[];
+}
+
 export interface TraceIdentityContext {
   fleet_id?: FleetId | null;
   node_id?: NodeId | null;
@@ -1102,6 +1185,53 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "approval_evidence"
   ],
   action_outcome: ["action_id", "status", "verification", "post_verification", "output", "error", "completed_at"],
+  external_governance_reference: ["provider", "reference_id", "endpoint"],
+  external_governance_endpoints: [
+    "work_orders",
+    "action_gateway",
+    "approvals",
+    "traces",
+    "state_commits",
+    "artifact_refs"
+  ],
+  external_governance_adapter_contract: ["schema_version", "provider", "endpoints"],
+  external_governance_work_order_bridge: ["schema_version", "external_ref", "work_order", "issuer", "trace", "context"],
+  external_approval_decision: [
+    "schema_version",
+    "external_ref",
+    "approval_id",
+    "scope",
+    "decision",
+    "created_at",
+    "expires_at",
+    "reason",
+    "issuer",
+    "trace",
+    "extensions"
+  ],
+  external_governance_adapter_failure: [
+    "schema_version",
+    "external_ref",
+    "scope",
+    "occurred_at",
+    "reason",
+    "issuer",
+    "trace"
+  ],
+  external_trace_range: ["start_trace_event_id", "end_trace_event_id"],
+  governed_artifact_ref: [
+    "schema_version",
+    "artifact_id",
+    "version",
+    "source_refs",
+    "run_id",
+    "state_node_id",
+    "trace_range",
+    "approval_state",
+    "approval_id",
+    "external_ref",
+    "export_targets"
+  ],
   circuit_breaker: ["schema_version", "breaker_id", "scope", "state", "reason", "created_at", "updated_at"],
   trace_event: ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"],
   state_head: ["run_id", "state_node_id", "parent_state_node_ids", "data_hash", "created_at", "label"],
@@ -1171,6 +1301,14 @@ export const CANONICAL_SCHEMA_FIELDS = {
   percept: readonly (keyof Percept)[];
   action_request: readonly (keyof ActionRequest)[];
   action_outcome: readonly (keyof ActionOutcome)[];
+  external_governance_reference: readonly (keyof ExternalGovernanceReference)[];
+  external_governance_endpoints: readonly (keyof ExternalGovernanceEndpoints)[];
+  external_governance_adapter_contract: readonly (keyof ExternalGovernanceAdapterContract)[];
+  external_governance_work_order_bridge: readonly (keyof ExternalGovernanceWorkOrderBridge)[];
+  external_approval_decision: readonly (keyof ExternalApprovalDecision)[];
+  external_governance_adapter_failure: readonly (keyof ExternalGovernanceAdapterFailure)[];
+  external_trace_range: readonly (keyof ExternalTraceRange)[];
+  governed_artifact_ref: readonly (keyof GovernedArtifactRef)[];
   circuit_breaker: readonly (keyof CircuitBreaker)[];
   trace_event: readonly (keyof TraceEvent)[];
   state_head: readonly (keyof StateHead)[];
