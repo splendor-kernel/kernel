@@ -31,7 +31,7 @@ Define governance state in `splendor-types` as additive primitive schemas:
 - typed IDs: `ApprovalId`, `EscalationId`, `InterventionId`,
   `CircuitBreakerId`, and `KillSwitchId`;
 - object schemas: `ApprovalRequest`, `ApprovalGrant`, `ApprovalDenial`,
-  `Escalation`, `Intervention`, `CircuitBreaker`, and `KillSwitch`;
+  `Escalation`, `Intervention`, `GovernanceCircuitBreaker`, and `KillSwitch`;
 - `GovernanceScope`, an internally tagged enum with global, fleet, node,
   instance, tenant, agent, run, action, and adapter variants;
 - `GovernanceIssuer` carrying `issuer_id` and `source` attribution;

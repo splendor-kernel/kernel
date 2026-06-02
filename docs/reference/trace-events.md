@@ -174,10 +174,10 @@ trace and do not authorize adapter execution outside the gateway.
 - `InterventionCancelled { transition: GovernanceTransition }`
 - `InterventionExpired { transition: GovernanceTransition }`
 - `InterventionRevoked { transition: GovernanceTransition }`
-- `CircuitBreakerTripped { transition: GovernanceTransition }`
-- `CircuitBreakerCleared { transition: GovernanceTransition }`
-- `CircuitBreakerExpired { transition: GovernanceTransition }`
-- `CircuitBreakerRevoked { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerTripped { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerCleared { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerExpired { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerRevoked { transition: GovernanceTransition }`
 - `KillSwitchActivated { transition: GovernanceTransition }`
 - `KillSwitchCleared { transition: GovernanceTransition }`
 - `KillSwitchExpired { transition: GovernanceTransition }`
@@ -205,10 +205,10 @@ trace and do not authorize adapter execution outside the gateway.
 | `InterventionCancelled` | `intervention.cancelled` | Intervention was cancelled. |
 | `InterventionExpired` | `intervention.expired` | Intervention state expired explicitly. |
 | `InterventionRevoked` | `intervention.revoked` | Intervention state was revoked explicitly. |
-| `CircuitBreakerTripped` | `circuit_breaker.tripped` | Circuit-breaker state became active/tripped. |
-| `CircuitBreakerCleared` | `circuit_breaker.cleared` | Circuit-breaker state was cleared. |
-| `CircuitBreakerExpired` | `circuit_breaker.expired` | Circuit-breaker state expired explicitly. |
-| `CircuitBreakerRevoked` | `circuit_breaker.revoked` | Circuit-breaker state was revoked explicitly. |
+| `GovernanceCircuitBreakerTripped` | `governance.circuit_breaker.tripped` | Governance circuit-breaker state became active/tripped. |
+| `GovernanceCircuitBreakerCleared` | `governance.circuit_breaker.cleared` | Governance circuit-breaker state was cleared. |
+| `GovernanceCircuitBreakerExpired` | `governance.circuit_breaker.expired` | Governance circuit-breaker state expired explicitly. |
+| `GovernanceCircuitBreakerRevoked` | `governance.circuit_breaker.revoked` | Governance circuit-breaker state was revoked explicitly. |
 | `KillSwitchActivated` | `kill_switch.activated` | Kill-switch state became active. |
 | `KillSwitchCleared` | `kill_switch.cleared` | Kill-switch state was cleared. |
 | `KillSwitchExpired` | `kill_switch.expired` | Kill-switch state expired explicitly. |
