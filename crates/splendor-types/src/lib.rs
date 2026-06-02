@@ -123,7 +123,10 @@ pub use state_handoff::{
     StateHandoff, StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext,
     StateReference, StateReferenceMode,
 };
-pub use trace::{LocalDelegationTraceContext, TraceEvent, TraceEventKind, TraceIntegrity};
+pub use trace::{
+    GovernanceTraceEventKindError, LocalDelegationTraceContext, TraceEvent, TraceEventKind,
+    TraceIntegrity,
+};
 pub use work_order::{
     validate_work_order, ValidatedWorkOrder, WorkOrder, WorkOrderEnvelope, WorkOrderKeyring,
     WorkOrderPlacement, WorkOrderQuotaPolicy, WorkOrderValidationContext, WorkOrderValidationError,

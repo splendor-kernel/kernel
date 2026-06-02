@@ -247,6 +247,26 @@ fn malformed_scope_and_context_mismatches_report_stable_codes() {
         })
     );
 
+    let mut missing_run_binding = work_order(now);
+    let expected_run = missing_run_binding.run_id.clone().expect("run binding");
+    missing_run_binding.run_id = None;
+    let missing_run_context = WorkOrderValidationContext {
+        tenant_id: missing_run_binding.tenant_id.clone(),
+        agent_id: missing_run_binding.agent_id.clone(),
+        run_id: Some(expected_run),
+        expected_placement_target: Some(missing_run_binding.placement.target.clone()),
+        now,
+    };
+    let missing_run_binding =
+        WorkOrderEnvelope::signed_with_shared_secret(missing_run_binding.clone(), KEY_ID, SECRET)
+            .expect("signed");
+    assert_eq!(
+        validate_work_order(&missing_run_binding, &missing_run_context, &keyring()),
+        Err(WorkOrderValidationError::Incompatible {
+            reason: "missing_run_binding".to_string()
+        })
+    );
+
     let mut placement_mismatch = context(&order, now);
     placement_mismatch.expected_placement_target = Some("other_target".to_string());
     assert_eq!(

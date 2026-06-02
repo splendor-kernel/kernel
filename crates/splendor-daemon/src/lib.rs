@@ -31,7 +31,8 @@ use splendor_types::{
     DaemonSecurityError, DaemonSecurityRequest, GatewayVerificationState, InsecureDevMode,
     LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
     PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError, TenantId,
-    TraceEvent, TraceId, WorkOrderAuthorization,
+    TraceEvent, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, WorkOrderValidationError,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,6 +50,7 @@ struct DaemonInner {
     expected_audience: CredentialAudience,
     insecure_dev_mode: Option<InsecureDevMode>,
     policy_bundle_keyring: PolicyBundleKeyring,
+    work_order_keyring: WorkOrderKeyring,
     runtime_available: AtomicBool,
 }
 
@@ -71,6 +73,7 @@ impl DaemonState {
                 expected_audience: config.expected_audience,
                 insecure_dev_mode: config.insecure_dev_mode,
                 policy_bundle_keyring: config.policy_bundle_keyring,
+                work_order_keyring: config.work_order_keyring,
                 runtime_available: AtomicBool::new(true),
             }),
         }
@@ -124,6 +127,8 @@ pub struct DaemonConfig {
     pub insecure_dev_mode: Option<InsecureDevMode>,
     /// Verification keys for centrally distributed policy bundles.
     pub policy_bundle_keyring: PolicyBundleKeyring,
+    /// Verification keys for signed work orders accepted by this daemon.
+    pub work_order_keyring: WorkOrderKeyring,
 }
 
 impl DaemonConfig {
@@ -133,6 +138,10 @@ impl DaemonConfig {
         policy_bundle_keyring
             .insert_shared_secret("policy-local-key", b"splendor-local-policy-secret")
             .expect("local policy keyring");
+        let mut work_order_keyring = WorkOrderKeyring::new();
+        work_order_keyring
+            .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
+            .expect("local work-order keyring");
         Self {
             expected_audience: CredentialAudience::Daemon {
                 daemon_id: "daemon_local".to_string(),
@@ -146,6 +155,7 @@ impl DaemonConfig {
                 warning_issued: true,
             }),
             policy_bundle_keyring,
+            work_order_keyring,
         }
     }
 }
@@ -173,14 +183,17 @@ pub fn router(state: DaemonState) -> Router {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
-    Created,
+    Pending,
     Running,
-    WaitingForApproval,
     Paused,
+    WaitingForApproval,
+    Interrupted,
+    Resuming,
+    Completed,
+    Failed,
+    Cancelled,
     Denied,
     Expired,
-    Stopped,
-    Failed,
 }
 
 struct RunSlot {
@@ -347,7 +360,7 @@ pub struct SecurityFields {
 pub struct CreateRunRequest {
     pub tenant_id: TenantId,
     pub agent_id: splendor_types::AgentId,
-    pub work_order: WorkOrderAuthorization,
+    pub work_order: WorkOrderEnvelope,
     pub credential: Option<CallerCredential>,
     pub audit_attribution: Option<AuditAttribution>,
     #[serde(default)]
@@ -418,7 +431,7 @@ pub struct CreateRunResponse {
 #[serde(rename_all = "snake_case")]
 pub struct LifecycleRequest {
     pub credential: Option<CallerCredential>,
-    pub work_order: Option<WorkOrderAuthorization>,
+    pub work_order: Option<WorkOrderEnvelope>,
     pub audit_attribution: Option<AuditAttribution>,
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,41 +664,178 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn validate_daemon_work_order(
+    state: &DaemonState,
+    envelope: &WorkOrderEnvelope,
+    tenant_id: &TenantId,
+    agent_id: &splendor_types::AgentId,
+    run_id: Option<RunId>,
+    expected_placement_target: Option<String>,
+) -> Result<WorkOrder, ApiError> {
+    let validated = splendor_types::validate_work_order(
+        envelope,
+        &WorkOrderValidationContext {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id,
+            expected_placement_target,
+            now: OffsetDateTime::now_utc(),
+        },
+        &state.inner.work_order_keyring,
+    )
+    .map_err(work_order_error)?;
+    Ok(validated.into_work_order())
+}
+
+fn work_order_authorization_for_endpoint(
+    envelope: &WorkOrderEnvelope,
+    allowed_scopes: Vec<splendor_types::EndpointScope>,
+) -> WorkOrderAuthorization {
+    WorkOrderAuthorization {
+        work_order_id: envelope.work_order.work_order_id.to_string(),
+        tenant_id: envelope.work_order.tenant_id.clone(),
+        agent_id: envelope.work_order.agent_id.clone(),
+        run_id: envelope.work_order.run_id.clone(),
+        allowed_scopes,
+        signature: envelope.signature.clone(),
+        expires_at: envelope.work_order.expires_at,
+        revocation: envelope.work_order.revocation.clone(),
+    }
+}
+
+fn ensure_request_does_not_widen_work_order(
+    request: &CreateRunRequest,
+    work_order: &WorkOrder,
+) -> Result<(), ApiError> {
+    ensure_optional_subset(
+        "allowed_actions",
+        &request.allowed_actions,
+        &work_order.allowed_actions,
+    )?;
+    ensure_optional_subset(
+        "allowed_adapters",
+        &request.allowed_adapters,
+        &work_order.allowed_adapters,
+    )?;
+    ensure_optional_subset(
+        "allowed_permissions",
+        &request.allowed_permissions,
+        &work_order.allowed_permissions,
+    )?;
+
+    for registration in &request.registered_actions {
+        ensure_member(
+            "registered_action.name",
+            &registration.name,
+            &work_order.allowed_actions,
+        )?;
+        ensure_member(
+            "registered_action.adapter",
+            &registration.adapter,
+            &work_order.allowed_adapters,
+        )?;
+    }
+
+    for candidate in &request.policy_actions {
+        ensure_member(
+            "policy_action.name",
+            &candidate.action.name,
+            &work_order.allowed_actions,
+        )?;
+        if let Some(adapter) = &candidate.adapter {
+            ensure_member(
+                "policy_action.adapter",
+                adapter,
+                &work_order.allowed_adapters,
+            )?;
+        }
+        for permission in &candidate.action.required_permissions {
+            ensure_member(
+                "policy_action.required_permission",
+                permission,
+                &work_order.allowed_permissions,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_optional_subset(
+    field: &str,
+    requested: &[String],
+    allowed: &[String],
+) -> Result<(), ApiError> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    for value in requested {
+        ensure_member(field, value, allowed)?;
+    }
+    Ok(())
+}
+
+fn ensure_member(field: &str, value: &str, allowed: &[String]) -> Result<(), ApiError> {
+    if allowed.iter().any(|item| item == value) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "work_order_scope_widening",
+        format!("{field} `{value}` is not authorized by the signed work order"),
+    ))
+}
+
+fn work_order_error(error: WorkOrderValidationError) -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        error.reason_code(),
+        error.to_string(),
+    )
+}
+
 async fn create_run(
     State(state): State<DaemonState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    let validated_work_order = validate_daemon_work_order(
+        &state,
+        &request.work_order,
+        &request.tenant_id,
+        &request.agent_id,
+        request.work_order.work_order.run_id.clone(),
+        None,
+    )?;
+    ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
+    let work_order_authorization = work_order_authorization_for_endpoint(
+        &request.work_order,
+        vec![splendor_types::EndpointScope::RunsCreate],
+    );
     let security = state.validate_security(
         DaemonEndpoint::RunCreate {
             tenant_id: request.tenant_id.clone(),
         },
         request.credential.clone(),
-        Some(request.work_order.clone()),
+        Some(work_order_authorization),
         request.audit_attribution.clone(),
     )?;
-    if request.work_order.agent_id != request.agent_id
-        || request.work_order.tenant_id != request.tenant_id
-    {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "incompatible_work_order",
-            "work order tenant or agent does not match the run request",
-        ));
-    }
 
-    let run_id = request.work_order.run_id.clone().unwrap_or_else(RunId::new);
+    let run_id = validated_work_order
+        .run_id
+        .clone()
+        .unwrap_or_else(RunId::new);
     let trace_store: Arc<dyn TraceStore> = Arc::new(InMemoryTraceStore::default());
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
     let tenant_registry = TenantRegistry::new();
     tenant_registry.insert(TenantContext::new(
         request.tenant_id.clone(),
         TenantPolicy {
-            allowed_actions: request.allowed_actions.clone(),
-            allowed_adapters: request.allowed_adapters.clone(),
-            allowed_permissions: request.allowed_permissions.clone(),
+            allowed_actions: validated_work_order.allowed_actions.clone(),
+            allowed_adapters: validated_work_order.allowed_adapters.clone(),
+            allowed_permissions: validated_work_order.allowed_permissions.clone(),
         },
-        QuotaPolicy::default(),
+        QuotaPolicy::default().constrain_to_work_order(&validated_work_order),
     ));
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
@@ -695,7 +845,7 @@ async fn create_run(
             request.approval_policies.clone(),
         )));
     }
-    let registrations = registrations_for_request(&request);
+    let registrations = registrations_for_request(&request, &validated_work_order);
     for registration in registrations {
         gateway.register_adapter(
             registration.name,
@@ -765,7 +915,8 @@ async fn create_run(
         request.tenant_id.clone(),
         AgentRuntimeConfig::default(),
     );
-    let mut run_context = RunTraceContext::new(Some(run_id.clone()));
+    let mut run_context =
+        RunTraceContext::new(Some(run_id.clone())).with_work_order(validated_work_order.clone());
     if let Some(policy_bundle) = policy_bundle.clone() {
         run_context = run_context.with_policy_bundle(policy_bundle);
     }
@@ -799,7 +950,7 @@ async fn create_run(
         run_id: run_id.clone(),
         tenant_id: request.tenant_id,
         agent_id: request.agent_id,
-        status: RunStatus::Created,
+        status: RunStatus::Pending,
         scheduler,
         state_store,
         trace_store,
@@ -829,7 +980,7 @@ async fn create_run(
     runs.insert(run_id.clone(), slot);
     Ok(Json(CreateRunResponse {
         run_id,
-        status: RunStatus::Created,
+        status: RunStatus::Pending,
     }))
 }
 
@@ -935,7 +1086,7 @@ async fn stop_run(
             reason: request.reason,
         },
     )?;
-    slot.status = RunStatus::Stopped;
+    slot.status = RunStatus::Cancelled;
     slot.updated_at = OffsetDateTime::now_utc();
     Ok(Json(inspect_response(slot)))
 }
@@ -1454,25 +1605,35 @@ async fn run_lifecycle_tick(
             run_id: run_id.clone(),
         },
     };
-    let resume_work_order_agent_id = request
-        .work_order
-        .as_ref()
-        .map(|work_order| work_order.agent_id.clone());
+    let security_work_order = if matches!(kind, LifecycleKind::Resume) {
+        let envelope = request.work_order.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "missing_work_order",
+                "resume requires a signed work order envelope",
+            )
+        })?;
+        validate_daemon_work_order(
+            &state,
+            envelope,
+            &slot.tenant_id,
+            &slot.agent_id,
+            Some(run_id.clone()),
+            None,
+        )?;
+        Some(work_order_authorization_for_endpoint(
+            envelope,
+            vec![splendor_types::EndpointScope::RunsResume],
+        ))
+    } else {
+        None
+    };
     let security = state.validate_security(
         endpoint,
         request.credential,
-        request.work_order,
+        security_work_order,
         request.audit_attribution,
     )?;
-    if matches!(kind, LifecycleKind::Resume)
-        && resume_work_order_agent_id.as_ref() != Some(&slot.agent_id)
-    {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "incompatible_work_order",
-            "resume work order agent does not match the run agent",
-        ));
-    }
     if matches!(kind, LifecycleKind::Resume)
         && !matches!(
             slot.status,
@@ -1497,7 +1658,11 @@ async fn run_lifecycle_tick(
     }
     if matches!(
         slot.status,
-        RunStatus::Stopped | RunStatus::Failed | RunStatus::Denied | RunStatus::Expired
+        RunStatus::Completed
+            | RunStatus::Cancelled
+            | RunStatus::Failed
+            | RunStatus::Denied
+            | RunStatus::Expired
     ) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1568,14 +1733,17 @@ async fn run_lifecycle_tick(
     }))
 }
 
-fn registrations_for_request(request: &CreateRunRequest) -> Vec<RegisteredAction> {
+fn registrations_for_request(
+    request: &CreateRunRequest,
+    work_order: &WorkOrder,
+) -> Vec<RegisteredAction> {
     let mut registrations = request.registered_actions.clone();
-    let fallback_adapter = request
+    let fallback_adapter = work_order
         .allowed_adapters
         .first()
         .cloned()
         .unwrap_or_else(|| "daemon.local".to_string());
-    for action_name in &request.allowed_actions {
+    for action_name in &work_order.allowed_actions {
         if registrations.iter().all(|entry| &entry.name != action_name) {
             registrations.push(RegisteredAction {
                 name: action_name.clone(),
@@ -1670,7 +1838,7 @@ fn update_status_for_approval_denial(slot: &mut RunSlot, outcome: &ActionOutcome
     };
     slot.status = match status.as_str() {
         "expired" => RunStatus::Expired,
-        "denied" | "revoked" => RunStatus::Denied,
+        "denied" | "revoked" | "schema_unsupported" => RunStatus::Denied,
         _ => slot.status.clone(),
     };
 }
@@ -1722,6 +1890,14 @@ fn approval_trace_kind(status: &str, approval: ApprovalTraceContext) -> TraceEve
         "intervention_required" => TraceEventKind::ApprovalDenied {
             approval,
             reason: "approval_policy_expired".to_string(),
+        },
+        "policy_schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_policy_schema_unsupported".to_string(),
+        },
+        "schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_evidence_schema_unsupported".to_string(),
         },
         _ => TraceEventKind::ApprovalDenied {
             approval,
@@ -2036,6 +2212,16 @@ mod tests {
                 "denied",
                 Some("approval_policy_expired"),
             ),
+            (
+                "policy_schema_unsupported",
+                "denied",
+                Some("approval_policy_schema_unsupported"),
+            ),
+            (
+                "schema_unsupported",
+                "denied",
+                Some("approval_evidence_schema_unsupported"),
+            ),
             ("denied", "denied", Some("approval_denied")),
         ]
         .into_iter()
@@ -2067,22 +2253,33 @@ mod tests {
     fn registration_defaults_and_trace_recording_fail_closed_paths_are_stable() {
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
+        let work_order = WorkOrder {
+            schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+            work_order_id: splendor_types::WorkOrderId::try_new("wo_unit").expect("work order id"),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: None,
+            objective: "unit registration".to_string(),
+            allowed_actions: vec!["policy_only".to_string()],
+            allowed_adapters: vec!["daemon.local".to_string()],
+            allowed_permissions: Vec::new(),
+            data_refs: Vec::new(),
+            quotas: splendor_types::WorkOrderQuotaPolicy::default(),
+            placement: splendor_types::WorkOrderPlacement::default(),
+            issued_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+            revocation: splendor_types::RevocationStatus::Active,
+        };
+        let work_order_envelope = WorkOrderEnvelope::signed_with_shared_secret(
+            work_order.clone(),
+            "key",
+            b"unit-work-order-secret",
+        )
+        .expect("signed work order");
         let request = CreateRunRequest {
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
-            work_order: WorkOrderAuthorization {
-                work_order_id: "wo_unit".to_string(),
-                tenant_id: tenant_id.clone(),
-                agent_id: agent_id.clone(),
-                run_id: None,
-                allowed_scopes: vec![splendor_types::EndpointScope::RunsCreate],
-                signature: Some(splendor_types::WorkOrderSignature {
-                    key_id: "key".to_string(),
-                    signature: "sig".to_string(),
-                }),
-                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
-                revocation: splendor_types::RevocationStatus::Active,
-            },
+            work_order: work_order_envelope,
             credential: None,
             audit_attribution: None,
             allowed_actions: Vec::new(),
@@ -2111,7 +2308,7 @@ mod tests {
             initial_state: None,
             snapshot_interval: None,
         };
-        let registrations = registrations_for_request(&request);
+        let registrations = registrations_for_request(&request, &work_order);
         assert_eq!(registrations.len(), 1);
         assert_eq!(registrations[0].name, "policy_only");
         assert_eq!(registrations[0].adapter, "daemon.local");
@@ -2124,7 +2321,7 @@ mod tests {
             run_id: RunId::new(),
             tenant_id,
             agent_id: agent_id.clone(),
-            status: RunStatus::Created,
+            status: RunStatus::Pending,
             scheduler: Scheduler::new(SchedulerConfig::default()),
             state_store: Arc::new(InMemoryStateStore::default()),
             trace_store: Arc::new(InMemoryTraceStore::default()),

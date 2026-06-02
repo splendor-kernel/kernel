@@ -1359,6 +1359,49 @@ fn run_from_config_circuit_breaker_denies_adapter_action() {
     assert_eq!(tripped.breaker_id.to_string(), expected_breaker_id);
     assert_eq!(tripped.state, CircuitBreakerState::Tripped);
     assert_eq!(tripped.authorized_by, "operator:alice");
+
+    let replay_outputs =
+        replay_outputs_from_stores(&trace_path, &state_path, &run_uuid.to_string(), None, false)
+            .expect("replay outputs");
+    let replay_values = replay_outputs
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("json replay values");
+    let replay_start = replay_values
+        .iter()
+        .find(|value| value["type"] == "replay_start")
+        .expect("replay start output");
+    assert_eq!(replay_start["side_effects_replayed"].as_bool(), Some(false));
+    let replay_tick = replay_values
+        .iter()
+        .find(|value| value["type"] == "tick")
+        .expect("tick replay output");
+    let denials = replay_tick["circuit_breaker_denials"]
+        .as_array()
+        .expect("breaker denials");
+    assert_eq!(denials.len(), 1);
+    assert_eq!(
+        denials[0]["breaker_id"].as_str(),
+        Some(expected_breaker_id.as_str())
+    );
+    assert_eq!(denials[0]["scope"].as_str(), Some("adapter"));
+    assert_eq!(denials[0]["scope_value"].as_str(), Some("filesystem"));
+    assert_eq!(
+        denials[0]["reason"].as_str(),
+        Some("filesystem disabled for incident")
+    );
+    let replay_graph = replay_values
+        .iter()
+        .find(|value| value["type"] == "causal_graph")
+        .expect("causal graph replay output");
+    assert_eq!(
+        replay_graph["circuit_breaker_denials"]
+            .as_array()
+            .expect("graph breaker denials")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -1446,6 +1489,43 @@ fn run_from_config_rejects_node_circuit_breaker_before_new_work() {
     assert!(!fs_base
         .join(tenant_uuid.to_string())
         .join("node-blocked.txt")
+        .exists());
+}
+
+#[test]
+fn run_from_config_rejects_instance_circuit_breaker_before_new_work() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let fs_base = dir.path().join("fs");
+    let tenant_uuid = Uuid::new_v4();
+    let agent_uuid = Uuid::new_v4();
+    let run_uuid = Uuid::new_v4();
+    let instance_uuid = Uuid::new_v4();
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nallow_unsigned_local_run: true\nruntime_identity:\n  instance_id: {}\ntenants:\n  - id: {}\n    allowed_actions: [\"write_file\"]\n    allowed_adapters: [\"filesystem\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    policy:\n      type: static\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          params:\n            path: \"instance-blocked.txt\"\n            contents: \"blocked\"\nadapters:\n  filesystem:\n    base_dir: {}\ncircuit_breakers:\n  - id: cb_instance_admission\n    scope: instance\n    value: {}\n    state: tripped\n    reason: instance drained for maintenance\n    authorized_by: operator:instance\n",
+        trace_path.display(),
+        state_path.display(),
+        run_uuid,
+        instance_uuid,
+        tenant_uuid,
+        agent_uuid,
+        tenant_uuid,
+        run_uuid,
+        fs_base.display(),
+        instance_uuid,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    let error =
+        run_from_config(&config_path, Some(1), false).expect_err("instance breaker admission");
+
+    assert!(error.contains("Circuit breaker denied new work"));
+    assert!(error.contains("circuit_breaker_tripped"));
+    assert!(!fs_base
+        .join(tenant_uuid.to_string())
+        .join("instance-blocked.txt")
         .exists());
 }
 

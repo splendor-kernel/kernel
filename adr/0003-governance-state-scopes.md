@@ -31,7 +31,7 @@ Define governance state in `splendor-types` as additive primitive schemas:
 - typed IDs: `ApprovalId`, `EscalationId`, `InterventionId`,
   `CircuitBreakerId`, and `KillSwitchId`;
 - object schemas: `ApprovalRequest`, `ApprovalGrant`, `ApprovalDenial`,
-  `Escalation`, `Intervention`, `CircuitBreaker`, and `KillSwitch`;
+  `Escalation`, `Intervention`, `GovernanceCircuitBreaker`, and `KillSwitch`;
 - `GovernanceScope`, an internally tagged enum with global, fleet, node,
   instance, tenant, agent, run, action, and adapter variants;
 - `GovernanceIssuer` carrying `issuer_id` and `source` attribution;
@@ -39,6 +39,13 @@ Define governance state in `splendor-types` as additive primitive schemas:
 - `GovernanceRevocation` as an explicit revocation marker;
 - `GovernanceTransition` and `GovernanceTransitionRejection` as trace-ready
   lifecycle records.
+
+`GovernanceTransition::into_trace_event_kind()` and
+`GovernanceTransitionRejection::into_trace_event_kind()` provide the canonical
+mapping from state-machine records to trace event variants. Unsupported
+object/state pairs and invalid lifecycle transitions fail closed with
+`GovernanceTraceEventKindError` rather than letting emitters record a malformed
+governance state change under the wrong variant.
 
 Governance trace events are run-scoped `TraceEventKind` variants that carry the
 transition or rejection payload. Scope identity is copied into the trace identity
@@ -53,6 +60,8 @@ resume, or propagate anything by itself.
   boundaries.
 - Invalid lifecycle transitions fail closed and produce a structured rejection
   payload suitable for trace/audit/replay.
+- Runtime emitters have one schema-owned mapping from governance transitions to
+  trace event kinds, reducing drift between state validation and trace emission.
 - TypeScript clients can inspect governance state without owning kernel runtime
   semantics.
 - Extension fields can carry non-authoritative metadata, but recursive validation

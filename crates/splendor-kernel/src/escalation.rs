@@ -8,12 +8,22 @@
 use splendor_gateway::{ActionOutcome, ActionStatus};
 use splendor_types::{
     Action, ActionId, AgentId, EscalationContext, EscalationDecision, EscalationObservation,
-    EscalationPolicy, EscalationScope, EscalationTrigger, RunId, SideEffectClass, TenantId,
-    VerificationResult,
+    EscalationPolicy, EscalationPolicyError, EscalationScope, EscalationTrigger, RunId,
+    SideEffectClass, TenantId, VerificationResult,
 };
 
 /// Source label attached to escalation artifacts.
 pub const ESCALATION_ENGINE_SOURCE: &str = "escalation_engine";
+
+const ADAPTER_FAILURE_OR_DENIAL_REASONS: &[&str] = &[
+    "adapter_denied",
+    "adapter_denial",
+    "adapter_error",
+    "adapter_failed",
+    "adapter_failure",
+    "repeated_adapter_denial",
+    "repeated_adapter_failure",
+];
 
 /// Deterministic evaluator for 0.04-S3 escalation policies.
 #[derive(Clone, Debug)]
@@ -40,10 +50,16 @@ pub struct EscalationOutcomeInput<'a> {
 }
 
 impl EscalationEvaluator {
-    /// Creates an evaluator with a validated policy. Empty policies are valid and
-    /// never produce escalation decisions.
+    /// Creates an evaluator from a policy that the caller has already validated.
+    /// Empty policies are valid and never produce escalation decisions.
     pub fn new(policy: EscalationPolicy) -> Self {
         Self { policy }
+    }
+
+    /// Validates a policy before creating an evaluator.
+    pub fn try_new(policy: EscalationPolicy) -> Result<Self, EscalationPolicyError> {
+        policy.validate()?;
+        Ok(Self::new(policy))
     }
 
     /// Returns the policy used by this evaluator.
@@ -139,7 +155,7 @@ pub fn observations_for_outcome(input: &EscalationOutcomeInput<'_>) -> Vec<Escal
         ));
     }
 
-    if input.outcome.status == ActionStatus::Failed {
+    if adapter_failure_or_denial(input.outcome) {
         observations.push(action_observation(
             EscalationTrigger::RepeatedAdapterFailure,
             EscalationScope::Adapter,
@@ -285,6 +301,16 @@ fn quota_pressure(result: &VerificationResult) -> bool {
             "quota_ledger",
         ],
     )
+}
+
+fn adapter_failure_or_denial(outcome: &ActionOutcome) -> bool {
+    outcome.status == ActionStatus::Failed
+        || verification_mentions(&outcome.verification, ADAPTER_FAILURE_OR_DENIAL_REASONS)
+        || outcome
+            .post_verification
+            .as_ref()
+            .map(|result| verification_mentions(result, ADAPTER_FAILURE_OR_DENIAL_REASONS))
+            .unwrap_or(false)
 }
 
 fn high_risk_action(action: &Action) -> bool {

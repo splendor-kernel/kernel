@@ -15,8 +15,9 @@ use splendor_gateway::{
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ApprovalTraceContext, Constraint, ContentHash, EscalationContext, EscalationPolicy,
-    Feedback, Percept, PolicyBundleTraceContext, QuotaUsage, Reward, RunId, SnapshotId, TickId,
-    TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext, VerificationResult, WorkOrder,
+    EscalationPolicyError, Feedback, Percept, PolicyBundleTraceContext, QuotaUsage, Reward, RunId,
+    SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
+    VerificationResult, WorkOrder,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -270,6 +271,9 @@ pub enum LoopError {
     /// Perceptor callback failed.
     #[error("perceptor error: {0}")]
     Perceptor(String),
+    /// Escalation policy validation failed.
+    #[error("escalation policy error: {0}")]
+    EscalationPolicy(#[from] EscalationPolicyError),
 }
 
 /// Kernel loop engine for a single agent.
@@ -525,8 +529,9 @@ impl LoopEngine {
     /// Enables deterministic 0.04-S3 escalation evaluation for this loop. The
     /// evaluator consumes explicit verifier/runtime facts and only emits
     /// escalation trace events when a configured threshold is reached.
-    pub fn set_escalation_policy(&mut self, policy: EscalationPolicy) {
-        self.escalation_evaluator = Some(EscalationEvaluator::new(policy));
+    pub fn set_escalation_policy(&mut self, policy: EscalationPolicy) -> Result<(), LoopError> {
+        self.escalation_evaluator = Some(EscalationEvaluator::try_new(policy)?);
+        Ok(())
     }
 
     /// Sets a policy runtime authority that can fail closed before policy
@@ -1014,6 +1019,14 @@ fn approval_trace_kind(status: &str, approval: ApprovalTraceContext) -> TraceEve
         "intervention_required" => TraceEventKind::ApprovalDenied {
             approval,
             reason: "approval_policy_expired".to_string(),
+        },
+        "policy_schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_policy_schema_unsupported".to_string(),
+        },
+        "schema_unsupported" => TraceEventKind::ApprovalDenied {
+            approval,
+            reason: "approval_evidence_schema_unsupported".to_string(),
         },
         _ => TraceEventKind::ApprovalDenied {
             approval,

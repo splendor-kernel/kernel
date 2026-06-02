@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    RevocationStatus, WorkOrder, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    WORK_ORDER_SCHEMA_VERSION,
+};
 use uuid::Uuid;
 
 fn valid_message() -> Message {
@@ -36,20 +40,41 @@ fn signed_remote_work_order(
     agent_id: AgentId,
     run_id: RunId,
     now: OffsetDateTime,
-) -> WorkOrderAuthorization {
-    WorkOrderAuthorization {
-        work_order_id: "wo_remote_test".to_string(),
+) -> WorkOrderEnvelope {
+    let work_order = WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_remote_test").expect("work order id"),
         tenant_id,
         agent_id,
         run_id: Some(run_id),
-        allowed_scopes: vec![EndpointScope::MessagesSend],
-        signature: Some(crate::WorkOrderSignature {
-            key_id: "key_remote".to_string(),
-            signature: "sig_remote".to_string(),
-        }),
+        objective: "remote message".to_string(),
+        allowed_actions: vec!["message.send".to_string()],
+        allowed_adapters: vec!["remote.message".to_string()],
+        allowed_permissions: Vec::new(),
+        data_refs: Vec::new(),
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement::default(),
+        issued_at: now - time::Duration::minutes(1),
         expires_at: now + time::Duration::hours(1),
         revocation: RevocationStatus::Active,
-    }
+    };
+    WorkOrderEnvelope::signed_with_shared_secret(work_order, "key_remote", b"remote-secret")
+        .expect("signed remote work order")
+}
+
+fn remote_keyring() -> WorkOrderKeyring {
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret("key_remote", b"remote-secret")
+        .expect("remote keyring");
+    keyring
+}
+
+fn resign_remote_work_order(envelope: &mut WorkOrderEnvelope) {
+    envelope.signature.as_mut().expect("signature").signature = envelope
+        .work_order
+        .signature_for_shared_secret(b"remote-secret")
+        .expect("resigned remote work order");
 }
 
 fn valid_remote_envelope(now: OffsetDateTime) -> RemoteMessageEnvelope {
@@ -535,7 +560,9 @@ fn remote_message_envelope_wraps_canonical_message_without_mutating_payload() {
     let decoded: RemoteMessageEnvelope =
         serde_json::from_slice(&payload).expect("deserialize remote envelope");
 
-    decoded.validate_at(now).expect("decoded remains valid");
+    decoded
+        .validate_at_with_keyring(now, &remote_keyring())
+        .expect("decoded remains valid");
     assert_eq!(decoded.message_envelope, remote.message_envelope);
     assert_eq!(
         serde_json::to_value(&decoded.message_envelope.message).expect("canonical message"),
@@ -555,30 +582,55 @@ fn remote_message_validation_rejects_unsigned_expired_or_incompatible_work_order
     let mut unsigned = remote.clone();
     unsigned.work_order.signature = None;
     assert_eq!(
-        unsigned.validate_at(now),
-        Err(RemoteMessageValidationError::UnsignedWorkOrder)
+        unsigned.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::Unsigned
+        ))
+    );
+
+    let mut bad_signature = remote.clone();
+    bad_signature
+        .work_order
+        .signature
+        .as_mut()
+        .expect("signature")
+        .signature = "bad-signature".to_string();
+    assert_eq!(
+        bad_signature.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::BadSignature
+        ))
     );
 
     let mut expired = remote.clone();
-    expired.work_order.expires_at = now;
+    expired.work_order.work_order.expires_at = now;
+    resign_remote_work_order(&mut expired.work_order);
     assert_eq!(
-        expired.validate_at(now),
-        Err(RemoteMessageValidationError::ExpiredWorkOrder)
+        expired.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::Expired
+        ))
     );
 
     let mut wrong_agent = remote.clone();
-    wrong_agent.work_order.agent_id = AgentId::new();
-    assert_eq!(
-        wrong_agent.validate_at(now),
-        Err(RemoteMessageValidationError::IncompatibleWorkOrder)
-    );
+    wrong_agent.work_order.work_order.agent_id = AgentId::new();
+    resign_remote_work_order(&mut wrong_agent.work_order);
+    assert!(matches!(
+        wrong_agent.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::Incompatible { reason }
+        )) if reason == "agent_mismatch"
+    ));
 
     let mut missing_scope = remote;
-    missing_scope.work_order.allowed_scopes = vec![EndpointScope::RunsCreate];
-    assert_eq!(
-        missing_scope.validate_at(now),
-        Err(RemoteMessageValidationError::IncompatibleWorkOrder)
-    );
+    missing_scope.work_order.work_order.run_id = Some(RunId::new());
+    resign_remote_work_order(&mut missing_scope.work_order);
+    assert!(matches!(
+        missing_scope.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::Incompatible { reason }
+        )) if reason == "run_mismatch"
+    ));
 }
 
 #[test]
@@ -665,13 +717,14 @@ fn remote_message_validation_rejects_identity_expiry_and_revocation_failures() {
     );
 
     let mut revoked = remote;
-    revoked.work_order.revocation = RevocationStatus::Revoked {
+    revoked.work_order.work_order.revocation = RevocationStatus::Revoked {
         reason: "operator".to_string(),
     };
-    assert_eq!(
-        revoked.validate_at(now),
-        Err(RemoteMessageValidationError::RevokedWorkOrder {
-            reason: "operator".to_string()
-        })
-    );
+    resign_remote_work_order(&mut revoked.work_order);
+    assert!(matches!(
+        revoked.validate_at_with_keyring(now, &remote_keyring()),
+        Err(RemoteMessageValidationError::WorkOrderValidation(
+            WorkOrderValidationError::Revoked { reason }
+        )) if reason == "operator"
+    ));
 }

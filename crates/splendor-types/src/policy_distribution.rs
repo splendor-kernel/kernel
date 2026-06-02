@@ -347,12 +347,18 @@ pub fn validate_policy_bundle(
             reason: "tenant_mismatch".to_string(),
         });
     }
-    if let (Some(expected), Some(actual)) = (&context.agent_id, &envelope.bundle.agent_id) {
-        if expected != actual {
+    match (&context.agent_id, &envelope.bundle.agent_id) {
+        (Some(expected), Some(actual)) if expected != actual => {
             return Err(PolicyBundleValidationError::Incompatible {
                 reason: "agent_mismatch".to_string(),
             });
         }
+        (None, Some(_)) => {
+            return Err(PolicyBundleValidationError::Incompatible {
+                reason: "agent_context_missing".to_string(),
+            });
+        }
+        _ => {}
     }
     if envelope.bundle.expires_at <= context.now {
         return Err(PolicyBundleValidationError::Expired);

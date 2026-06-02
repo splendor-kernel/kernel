@@ -6,8 +6,9 @@
 //! changing the canonical message payload.
 
 use crate::{
-    AgentId, EndpointScope, MessageId, RevocationStatus, RunId, TenantId, TraceEventId, TraceId,
-    VerificationResult, WorkOrderAuthorization,
+    validate_work_order, AgentId, MessageId, RunId, TenantId, TraceEventId, TraceId,
+    VerificationResult, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -707,7 +708,7 @@ pub struct RemoteMessageEnvelope {
     /// Destination Splendor instance identity.
     pub target_instance_id: String,
     /// Signed scoped work order authorizing the target agent/run boundary.
-    pub work_order: WorkOrderAuthorization,
+    pub work_order: WorkOrderEnvelope,
     /// Canonical transport-neutral local message envelope.
     pub message_envelope: MessageEnvelope,
     /// 1-based transport attempt counter.
@@ -728,7 +729,7 @@ impl RemoteMessageEnvelope {
         tenant_id: TenantId,
         source_instance_id: impl Into<String>,
         target_instance_id: impl Into<String>,
-        work_order: WorkOrderAuthorization,
+        work_order: WorkOrderEnvelope,
         message_envelope: MessageEnvelope,
         retry_policy: RemoteMessageRetryPolicy,
         sent_at: OffsetDateTime,
@@ -746,7 +747,7 @@ impl RemoteMessageEnvelope {
             sent_at,
             expires_at,
         };
-        envelope.validate_at(sent_at)?;
+        envelope.validate_transport_at(sent_at)?;
         Ok(envelope)
     }
 
@@ -755,8 +756,28 @@ impl RemoteMessageEnvelope {
         &self.message_envelope.message
     }
 
-    /// Validates the remote wrapper and signed work-order authority at `now`.
+    /// Validates the remote wrapper shape at `now` without accepting it as
+    /// authority. Receivers must call [`Self::validate_at_with_keyring`] before
+    /// delivery so bad signatures fail closed at the target boundary.
     pub fn validate_at(&self, now: OffsetDateTime) -> Result<(), RemoteMessageValidationError> {
+        self.validate_transport_at(now)
+    }
+
+    /// Validates the remote wrapper and cryptographic signed-work-order authority
+    /// at `now` with the receiver's keyring.
+    pub fn validate_at_with_keyring(
+        &self,
+        now: OffsetDateTime,
+        keyring: &WorkOrderKeyring,
+    ) -> Result<(), RemoteMessageValidationError> {
+        self.validate_transport_at(now)?;
+        validate_remote_work_order(self, now, keyring)
+    }
+
+    fn validate_transport_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(), RemoteMessageValidationError> {
         self.message_envelope
             .validate()
             .map_err(RemoteMessageValidationError::InvalidMessage)?;
@@ -782,7 +803,7 @@ impl RemoteMessageEnvelope {
             }
         }
         self.retry_policy.validate()?;
-        validate_remote_work_order(self, now)
+        Ok(())
     }
 
     /// Returns true if this envelope may be retried after its current attempt.
@@ -818,7 +839,7 @@ impl RemoteMessageTraceContext {
             tenant_id: envelope.tenant_id.clone(),
             source_instance_id: envelope.source_instance_id.clone(),
             target_instance_id: envelope.target_instance_id.clone(),
-            work_order_id: envelope.work_order.work_order_id.clone(),
+            work_order_id: envelope.work_order.work_order.work_order_id.to_string(),
             attempt: envelope.attempt,
             idempotency_key: envelope
                 .retry_policy
@@ -853,21 +874,12 @@ pub enum RemoteMessageValidationError {
     /// Remote envelope expired before receive.
     #[error("remote message envelope has expired")]
     ExpiredEnvelope,
-    /// Work order signature metadata is absent or empty.
-    #[error("remote message work order is unsigned")]
-    UnsignedWorkOrder,
-    /// Work order expired before receive.
-    #[error("remote message work order has expired")]
-    ExpiredWorkOrder,
-    /// Work order was revoked before receive.
-    #[error("remote message work order has been revoked: {reason}")]
-    RevokedWorkOrder {
-        /// Revocation reason.
-        reason: String,
-    },
     /// Work order does not authorize this tenant/agent/run/message scope.
     #[error("remote message work order is incompatible with the message target")]
     IncompatibleWorkOrder,
+    /// Cryptographic work-order validation failed.
+    #[error("remote message work order validation failed: {0}")]
+    WorkOrderValidation(WorkOrderValidationError),
     /// Retry policy is malformed.
     #[error("remote message retry policy must allow at least two attempts")]
     InvalidRetryPolicy,
@@ -879,32 +891,22 @@ pub enum RemoteMessageValidationError {
 fn validate_remote_work_order(
     envelope: &RemoteMessageEnvelope,
     now: OffsetDateTime,
+    keyring: &WorkOrderKeyring,
 ) -> Result<(), RemoteMessageValidationError> {
-    match &envelope.work_order.signature {
-        Some(signature)
-            if !signature.key_id.trim().is_empty() && !signature.signature.trim().is_empty() => {}
-        _ => return Err(RemoteMessageValidationError::UnsignedWorkOrder),
-    }
-
-    if envelope.work_order.expires_at <= now {
-        return Err(RemoteMessageValidationError::ExpiredWorkOrder);
-    }
-
-    if let RevocationStatus::Revoked { reason } = &envelope.work_order.revocation {
-        return Err(RemoteMessageValidationError::RevokedWorkOrder {
-            reason: reason.clone(),
-        });
-    }
-
     let message = envelope.message();
-    if envelope.work_order.tenant_id != envelope.tenant_id
-        || envelope.work_order.agent_id != message.target_agent_id
-        || envelope.work_order.run_id.as_ref() != Some(&message.run_id)
-        || !envelope
-            .work_order
-            .allowed_scopes
-            .contains(&EndpointScope::MessagesSend)
-    {
+    let validated = validate_work_order(
+        &envelope.work_order,
+        &WorkOrderValidationContext {
+            tenant_id: envelope.tenant_id.clone(),
+            agent_id: message.target_agent_id.clone(),
+            run_id: Some(message.run_id.clone()),
+            expected_placement_target: None,
+            now,
+        },
+        keyring,
+    )
+    .map_err(RemoteMessageValidationError::WorkOrderValidation)?;
+    if validated.work_order().work_order_id != envelope.work_order.work_order.work_order_id {
         return Err(RemoteMessageValidationError::IncompatibleWorkOrder);
     }
 

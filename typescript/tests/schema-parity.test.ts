@@ -9,6 +9,7 @@ import {
   ENDPOINT_SCOPE_VALUES,
   TRACE_EVENT_KIND_VARIANTS
 } from "@splendor/types";
+import type { ApprovalDenial, ApprovalGrant, ApprovalRequest } from "@splendor/types";
 
 const repoRoot = process.cwd();
 
@@ -52,6 +53,15 @@ function extractOpenApiStringEnum(source: string, schema: string): string[] {
   return Array.from(block.slice(enumIndex).matchAll(/^        - ([a-z_]+)$/gm), (entry) => entry[1]);
 }
 
+function extractOpenApiSchemaBlock(source: string, schema: string): string {
+  const schemaMatch = new RegExp(`\n    ${schema}:\n`).exec(source);
+  assert.ok(schemaMatch, `OpenAPI schema ${schema} must exist`);
+  const start = schemaMatch.index;
+  const remainder = source.slice(start + 1);
+  const nextSchema = /\n    [A-Za-z][A-Za-z0-9]+:\n/.exec(remainder.slice(1));
+  return nextSchema ? remainder.slice(0, nextSchema.index + 1) : remainder;
+}
+
 test("TypeScript primitive field contracts match canonical Rust structs", () => {
   const message = readRepoFile("crates/splendor-types/src/message.rs");
   const primitives = readRepoFile("crates/splendor-types/src/primitives.rs");
@@ -82,12 +92,41 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.capabilities_response, extractStructFields(daemon, "CapabilitiesResponse"));
 });
 
+test("TypeScript governance approval statuses mirror Rust object validators", () => {
+  const requestStatus: ApprovalRequest["status"] = "requested";
+  const expiredRequestStatus: ApprovalRequest["status"] = "expired";
+  const grantStatus: ApprovalGrant["status"] = "granted";
+  const revokedGrantStatus: ApprovalGrant["status"] = "revoked";
+  const denialStatus: ApprovalDenial["status"] = "denied";
+
+  assert.deepEqual(
+    [requestStatus, expiredRequestStatus, grantStatus, revokedGrantStatus, denialStatus],
+    ["requested", "expired", "granted", "revoked", "denied"]
+  );
+
+  // @ts-expect-error Rust ApprovalRequest::validate rejects denied request states.
+  const invalidRequestStatus: ApprovalRequest["status"] = "denied";
+  // @ts-expect-error Rust ApprovalGrant::validate rejects requested grant states.
+  const invalidGrantStatus: ApprovalGrant["status"] = "requested";
+  // @ts-expect-error Rust ApprovalDenial::validate rejects granted denial states.
+  const invalidDenialStatus: ApprovalDenial["status"] = "granted";
+
+  assert.deepEqual(
+    [invalidRequestStatus, invalidGrantStatus, invalidDenialStatus],
+    ["denied", "requested", "granted"]
+  );
+});
+
 test("OpenAPI documents S5 daemon request and response schemas", () => {
   const openapi = readRepoFile("openapi/splendor-runtime-daemon.yaml");
   for (const schema of [
     "CreateRunRequest",
     "CreateRunResponse",
     "LifecycleRequest",
+    "WorkOrderEnvelope",
+    "WorkOrderSignature",
+    "WorkOrderQuotaPolicy",
+    "WorkOrderPlacement",
     "RunInspectResponse",
     "TickResponse",
     "AppendPerceptRequest",
@@ -118,6 +157,53 @@ test("OpenAPI documents S5 daemon request and response schemas", () => {
     "submitAction"
   ]) {
     assert.match(openapi, new RegExp(`operationId: ${operation}[\\s\\S]*?requestBody:`), `${operation} must document a request body`);
+  }
+});
+
+test("OpenAPI work-order envelope and run status contracts stay canonical", () => {
+  const openapi = readRepoFile("openapi/splendor-runtime-daemon.yaml");
+
+  assert.deepEqual(extractOpenApiStringEnum(openapi, "RunStatus"), [
+    "pending",
+    "running",
+    "paused",
+    "waiting_for_approval",
+    "interrupted",
+    "resuming",
+    "completed",
+    "failed",
+    "cancelled",
+    "denied",
+    "expired"
+  ]);
+
+  const createRun = extractOpenApiSchemaBlock(openapi, "CreateRunRequest");
+  assert.match(createRun, /work_order:[\s\S]*\$ref: '#\/components\/schemas\/WorkOrderEnvelope'/);
+  assert.doesNotMatch(createRun, /WorkOrderAuthorization/);
+
+  const lifecycle = extractOpenApiSchemaBlock(openapi, "LifecycleRequest");
+  assert.match(lifecycle, /work_order:[\s\S]*\$ref: '#\/components\/schemas\/WorkOrderEnvelope'/);
+
+  const workOrder = extractOpenApiSchemaBlock(openapi, "WorkOrderEnvelope");
+  for (const field of [
+    "schema_version",
+    "work_order_id",
+    "tenant_id",
+    "agent_id",
+    "run_id",
+    "objective",
+    "allowed_actions",
+    "allowed_adapters",
+    "allowed_permissions",
+    "data_refs",
+    "quotas",
+    "placement",
+    "issued_at",
+    "expires_at",
+    "revocation",
+    "signature"
+  ]) {
+    assert.match(workOrder, new RegExp(`- ${field}`), `WorkOrderEnvelope must require ${field}`);
   }
 });
 

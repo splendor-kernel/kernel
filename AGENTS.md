@@ -55,6 +55,17 @@ AGENTS.md
 /docs/rules/verifiable_criteria/sprints/<sprint-id>-<slug>.md
 ```
 
+Required for kernel E2E, acceptance, conformance, or release-completion claims:
+
+```text
+/docs/rules/verifiable_criteria/kernel-e2e-through-0.03.md
+/docs/rules/verifiable_criteria/use-case-e2e-through-0.1.md
+/docs/rules/verifiable_criteria/use-case-e2e-traceability-matrix.md
+/docs/development/kernel-e2e-integration-tests.md
+/docs/development/containerized-use-case-e2e-harness.md
+/docs/reference/management-communication-api-acceptance-contract.md
+```
+
 Required for primitive or API changes:
 
 ```text
@@ -76,7 +87,7 @@ If a required document conflicts with another document, follow this priority ord
 ```text
 1. AGENTS.md
 2. /docs/rules/splendor_dev_model.md
-3. /docs/rules/verifiable_criteria/main.md and the applicable sprint criteria file
+3. /docs/rules/verifiable_criteria/main.md and the applicable sprint criteria or acceptance rule pack
 4. /docs/rules/sprints_frs_milestones.md
 5. /docs/reference/*
 6. /docs/guides/*

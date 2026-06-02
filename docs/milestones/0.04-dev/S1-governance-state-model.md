@@ -12,7 +12,7 @@ propagation, or external control-plane adapter.
 
 - Added canonical `splendor-types` governance schemas:
   `ApprovalRequest`, `ApprovalGrant`, `ApprovalDenial`, `Escalation`,
-  `Intervention`, `CircuitBreaker`, and `KillSwitch`.
+  `Intervention`, `GovernanceCircuitBreaker`, and `KillSwitch`.
 - Added typed IDs for governance lifecycle objects:
   `ApprovalId`, `EscalationId`, `InterventionId`, `CircuitBreakerId`, and
   `KillSwitchId`.
@@ -21,6 +21,8 @@ propagation, or external control-plane adapter.
 - Added explicit expiry and revocation representation.
 - Added `GovernanceTransition` and `GovernanceTransitionRejection` with a narrow
   transition table.
+- Added governance transition-to-trace helpers so accepted and rejected
+  transitions map to canonical trace event variants before persistence.
 - Added governance trace event variants and TypeScript schema surface parity.
 
 ## Non-goals
@@ -39,6 +41,9 @@ propagation, or external control-plane adapter.
 - Rust `splendor-types` exports governance IDs, schemas, status enums, scope,
   issuer/source attribution, trace links, transition records, and validation
   errors.
+- Rust `splendor-types` exports `GovernanceTraceEventKindError` and
+  `into_trace_event_kind()` helpers on `GovernanceTransition` and
+  `GovernanceTransitionRejection`.
 - `TraceEventKind` adds governance event variants for approval, escalation,
   intervention, circuit breaker, kill switch, and rejected transitions.
 - `@splendor/types` adds schema-aligned governance TypeScript types and extends
@@ -72,11 +77,14 @@ propagation, or external control-plane adapter.
   `GovernanceApprovalRevoked`, `EscalationOpened`, `EscalationResolved`,
   `EscalationExpired`, `EscalationRevoked`, `InterventionRequested`,
   `InterventionResolved`, `InterventionCancelled`, `InterventionExpired`,
-  `InterventionRevoked`, `CircuitBreakerTripped`, `CircuitBreakerCleared`,
-  `CircuitBreakerExpired`, `CircuitBreakerRevoked`, `KillSwitchActivated`,
+  `InterventionRevoked`, `GovernanceCircuitBreakerTripped`,
+  `GovernanceCircuitBreakerCleared`, `GovernanceCircuitBreakerExpired`,
+  `GovernanceCircuitBreakerRevoked`, `KillSwitchActivated`,
   `KillSwitchCleared`, `KillSwitchExpired`, and `KillSwitchRevoked`.
 - Added fail-closed rejection event:
   `GovernanceTransitionRejected`.
+- Added transition mapping helpers so runtime emitters do not independently guess
+  the governance trace event variant for a state change.
 - Governance trace events populate trace identity context with tenant, agent, and
   action identity when those are present in `GovernanceScope`.
 - Governance events do not replace required tick ordering and do not authorize
@@ -98,6 +106,9 @@ propagation, or external control-plane adapter.
   sprint.
 - The type-layer transition validator rejects invalid governance lifecycle
   changes and returns a trace-ready rejection payload.
+- The transition-to-trace helper rejects invalid lifecycle transitions and
+  unsupported object/state mappings instead of recording malformed transitions
+  under the wrong governance event kind.
 - Future verifier/gateway sprints can consume `GovernanceScope` without broadening
   permissions or adding enterprise UI assumptions.
 
@@ -136,6 +147,7 @@ propagation, or external control-plane adapter.
 | negative | Expiry/revocation markers are explicit and validated | `cargo test -p splendor-types expiry_and_revocation_are_explicit` |
 | negative/trace | Run-scope and trace-link run mismatches are rejected | `cargo test -p splendor-types run_scoped_governance_transition_rejects_trace_run_mismatch`; `cargo test -p splendor-types governance_trace_event_rejects_scope_run_mismatch_with_explicit_identity` |
 | schema | Extensions allow future metadata but reject authority escalation | `cargo test -p splendor-types extensions_are_forward_compatible_but_non_authoritative` |
+| trace | Accepted and rejected governance transitions map to canonical trace event variants | `cargo test -p splendor-types governance_transitions_map_to_canonical_trace_event_kinds` |
 | trace/schema parity | Governance trace variants round-trip and TypeScript variant list stays aligned | `cargo test -p splendor-types governance_trace_events_round_trip_and_apply_scope_identity`; `npm test --workspaces` |
 
 ## Example or fixture
@@ -150,7 +162,9 @@ propagation, or external control-plane adapter.
   approval verifier without changing the scope model.
 - 0.04-S3 can use `Escalation` and `Intervention` as deterministic escalation
   state without introducing an enterprise workflow engine.
-- 0.04-S4 can enforce `CircuitBreaker` scopes in the gateway/verifier path.
+- 0.04-S4 can enforce governance circuit-breaker scopes in the gateway/verifier
+  path by mapping `GovernanceCircuitBreaker` state into explicit
+  `CircuitBreaker` control objects.
 - 0.04-S5 can add policy TTL state while preserving the governance trace pattern.
 - 0.04-S6 can bridge an external control plane by issuing these schemas rather
   than owning kernel state.

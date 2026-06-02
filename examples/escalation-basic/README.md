@@ -36,9 +36,9 @@ let policy = EscalationPolicy::with_rules(vec![EscalationRule::new(
 )]);
 ```
 
-The local loop uses `LoopEngine::set_escalation_policy(policy)` to enable the
-evaluator. Without this explicit call, escalation is disabled and existing
-gateway outcomes remain unchanged.
+The local loop uses `LoopEngine::set_escalation_policy(policy).expect("valid escalation policy")`
+to validate and enable the evaluator. Without this explicit call, escalation is
+disabled and existing gateway outcomes remain unchanged.
 
 ## Expected trace behavior
 

@@ -23,9 +23,9 @@
 use splendor_store::SnapshotId;
 use splendor_store::{StateData, StateMetadata, StateNodeId, StateStore, StateStoreError};
 use splendor_types::{
-    AgentId, ContentHash, EndpointScope, RevocationStatus, RunId, StateHandoff,
-    StateHandoffAuthority, StateReference, StateReferenceMode, TenantId, TraceEventId,
-    WorkOrderAuthorization,
+    validate_work_order, AgentId, ContentHash, RunId, StateHandoff, StateHandoffAuthority,
+    StateReference, StateReferenceMode, TenantId, TraceEventId, WorkOrderEnvelope,
+    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
 };
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -195,7 +195,8 @@ impl StateGraph {
     pub fn import_handoff(
         &mut self,
         handoff: &StateHandoff,
-        work_order: &WorkOrderAuthorization,
+        work_order: &WorkOrderEnvelope,
+        keyring: &WorkOrderKeyring,
         scope: &StateHandoffScope,
         now: OffsetDateTime,
         metadata: StateMetadata,
@@ -211,13 +212,7 @@ impl StateGraph {
                 schema_version: handoff.schema_version.clone(),
             });
         }
-        validate_handoff_authority(
-            &handoff.authority,
-            work_order,
-            scope,
-            EndpointScope::RunsResume,
-            now,
-        )?;
+        validate_handoff_authority(&handoff.authority, work_order, keyring, scope, now)?;
         if handoff.source_trace_id.is_none() {
             return Err(StateGraphError::MissingTraceContinuity);
         }
@@ -248,7 +243,8 @@ impl StateGraph {
     pub fn attach_read_only_reference(
         &mut self,
         reference: StateReference,
-        work_order: &WorkOrderAuthorization,
+        work_order: &WorkOrderEnvelope,
+        keyring: &WorkOrderKeyring,
         scope: &StateHandoffScope,
         now: OffsetDateTime,
     ) -> Result<(), StateGraphError> {
@@ -258,13 +254,7 @@ impl StateGraph {
                 actual: reference.mode,
             });
         }
-        validate_handoff_authority(
-            &reference.authority,
-            work_order,
-            scope,
-            EndpointScope::StateRead,
-            now,
-        )?;
+        validate_handoff_authority(&reference.authority, work_order, keyring, scope, now)?;
         if reference.source_trace_id.is_none() {
             return Err(StateGraphError::MissingTraceContinuity);
         }
@@ -363,6 +353,9 @@ pub enum StateGraphError {
     /// Handoff work order did not match the receiver authority scope.
     #[error("state handoff work order is incompatible with receiver authority")]
     IncompatibleWorkOrder,
+    /// Handoff work order failed cryptographic validation.
+    #[error("state handoff work order validation failed: {0}")]
+    WorkOrderValidation(WorkOrderValidationError),
     /// Handoff work order signature metadata was missing.
     #[error("state handoff work order is unsigned")]
     UnsignedWorkOrder,
@@ -404,32 +397,25 @@ pub enum StateGraphError {
 
 fn validate_handoff_authority(
     authority: &StateHandoffAuthority,
-    work_order: &WorkOrderAuthorization,
+    work_order: &WorkOrderEnvelope,
+    keyring: &WorkOrderKeyring,
     scope: &StateHandoffScope,
-    required_scope: EndpointScope,
     now: OffsetDateTime,
 ) -> Result<(), StateGraphError> {
-    match &work_order.signature {
-        Some(signature)
-            if !signature.key_id.trim().is_empty() && !signature.signature.trim().is_empty() => {}
-        _ => return Err(StateGraphError::UnsignedWorkOrder),
-    }
+    let validated = validate_work_order(
+        work_order,
+        &WorkOrderValidationContext {
+            tenant_id: authority.tenant_id.clone(),
+            agent_id: authority.agent_id.clone(),
+            run_id: Some(authority.run_id.clone()),
+            expected_placement_target: None,
+            now,
+        },
+        keyring,
+    )
+    .map_err(StateGraphError::WorkOrderValidation)?;
 
-    if work_order.expires_at <= now {
-        return Err(StateGraphError::ExpiredWorkOrder);
-    }
-
-    if let RevocationStatus::Revoked { reason } = &work_order.revocation {
-        return Err(StateGraphError::RevokedWorkOrder {
-            reason: reason.clone(),
-        });
-    }
-
-    if work_order.work_order_id != authority.work_order_id
-        || work_order.tenant_id != authority.tenant_id
-        || work_order.agent_id != authority.agent_id
-        || work_order.run_id.as_ref() != Some(&authority.run_id)
-        || !work_order.allowed_scopes.contains(&required_scope)
+    if validated.work_order().work_order_id.as_str() != authority.work_order_id
         || scope.tenant_id != authority.tenant_id
         || scope.agent_id != authority.agent_id
         || scope.run_id != authority.run_id

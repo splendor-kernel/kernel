@@ -9,11 +9,12 @@ use splendor_daemon::{
     StateHeadResponse, SubmitActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_types::{
-    Action, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
+    Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
     AuditAttribution, ClientPrincipal, CredentialAudience, EndpointScope, Percept,
     PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
     QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
-    WorkOrderAuthorization, WorkOrderSignature, POLICY_BUNDLE_SCHEMA_VERSION,
+    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -34,21 +35,48 @@ fn signed_work_order(
     tenant_id: TenantId,
     agent_id: AgentId,
     run_id: Option<RunId>,
-    scopes: Vec<EndpointScope>,
-) -> WorkOrderAuthorization {
-    WorkOrderAuthorization {
-        work_order_id: "wo_test".to_string(),
+    _scopes: Vec<EndpointScope>,
+) -> WorkOrderEnvelope {
+    signed_work_order_with_id("wo_test", tenant_id, agent_id, run_id)
+}
+
+fn signed_work_order_with_id(
+    work_order_id: &str,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    run_id: Option<RunId>,
+) -> WorkOrderEnvelope {
+    let now = OffsetDateTime::now_utc();
+    let work_order = WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new(work_order_id).expect("work order id"),
         tenant_id,
         agent_id,
         run_id,
-        allowed_scopes: scopes,
-        signature: Some(WorkOrderSignature {
-            key_id: "key_test".to_string(),
-            signature: "sig_test".to_string(),
-        }),
-        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        objective: "daemon integration run".to_string(),
+        allowed_actions: vec!["allowed_action".to_string(), "failing_action".to_string()],
+        allowed_adapters: vec!["daemon.local".to_string()],
+        allowed_permissions: Vec::new(),
+        data_refs: Vec::new(),
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement::default(),
+        issued_at: now - time::Duration::minutes(1),
+        expires_at: now + time::Duration::hours(1),
         revocation: RevocationStatus::Active,
-    }
+    };
+    WorkOrderEnvelope::signed_with_shared_secret(
+        work_order,
+        "work-order-local-key",
+        b"splendor-local-work-order-secret",
+    )
+    .expect("signed work order")
+}
+
+fn resign_work_order(envelope: &mut WorkOrderEnvelope) {
+    envelope.signature.as_mut().expect("signature").signature = envelope
+        .work_order
+        .signature_for_shared_secret(b"splendor-local-work-order-secret")
+        .expect("resigned work order");
 }
 
 fn action(name: &str) -> Action {
@@ -251,7 +279,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(created.status, RunStatus::Created);
+    assert_eq!(created.status, RunStatus::Pending);
 
     let append = AppendPerceptRequest {
         credential: None,
@@ -295,6 +323,56 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(paused.status, RunStatus::Paused);
+
+    let mut bad_signature_work_order = signed_work_order(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Some(created.run_id.clone()),
+        vec![EndpointScope::RunsResume],
+    );
+    bad_signature_work_order
+        .signature
+        .as_mut()
+        .expect("signature")
+        .signature = "bad-signature".to_string();
+    let bad_signature_resume = LifecycleRequest {
+        credential: None,
+        work_order: Some(bad_signature_work_order),
+        audit_attribution: Some(attribution()),
+        reason: Some("bad-signature".to_string()),
+        approval_evidence: None,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(bad_signature_resume).expect("bad signature resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "bad_signature");
+
+    let missing_run_binding_resume = LifecycleRequest {
+        credential: None,
+        work_order: Some(signed_work_order(
+            tenant_id.clone(),
+            agent_id.clone(),
+            None,
+            vec![EndpointScope::RunsResume],
+        )),
+        audit_attribution: Some(attribution()),
+        reason: Some("missing-run-binding".to_string()),
+        approval_evidence: None,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(missing_run_binding_resume).expect("missing run resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "incompatible_work_order");
 
     let wrong_agent_resume = LifecycleRequest {
         credential: None,
@@ -348,7 +426,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(stopped.status, RunStatus::Stopped);
+    assert_eq!(stopped.status, RunStatus::Cancelled);
 
     let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
@@ -889,10 +967,13 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         "expired",
         "wrong_tenant",
         "wrong_agent",
+        "wrong_run",
         "wrong_action",
+        "wrong_action_id",
         "wrong_adapter",
         "incomplete_action_scope",
         "incomplete_adapter_scope",
+        "unsupported_schema",
         "revoked",
     ] {
         let app = router(DaemonState::local_dev());
@@ -951,13 +1032,22 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
             }
             "wrong_tenant" => evidence.tenant_id = TenantId::new(),
             "wrong_agent" => evidence.agent_id = AgentId::new(),
+            "wrong_run" => evidence.run_id = RunId::new(),
             "wrong_action" => evidence.action_name = Some("different_action".to_string()),
+            "wrong_action_id" => evidence.action_id = Some(ActionId::new()),
             "wrong_adapter" => evidence.adapter = Some("different_adapter".to_string()),
             "incomplete_action_scope" => {
                 evidence.action_id = None;
                 evidence.action_name = None;
             }
             "incomplete_adapter_scope" => evidence.adapter = None,
+            "unsupported_schema" => {
+                assert_eq!(
+                    APPROVAL_EVIDENCE_SCHEMA_VERSION,
+                    "splendor.approval_evidence.v1"
+                );
+                evidence.schema_version = "splendor.approval_evidence.v0".to_string();
+            }
             "revoked" => evidence.revoked = true,
             _ => unreachable!(),
         }
@@ -999,6 +1089,34 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(inspected.adapter_executions, 0);
+
+        let (status, replay): (StatusCode, ReplayResponse) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/replay", created.run_id),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            replay
+                .approval_events
+                .iter()
+                .any(|event| event.lifecycle == "requested"),
+            "{scenario} should preserve approval request for replay"
+        );
+        let expected_lifecycle = match scenario {
+            "expired" => "expired",
+            "revoked" => "revoked",
+            _ => "denied",
+        };
+        assert!(
+            replay
+                .approval_events
+                .iter()
+                .any(|event| event.lifecycle == expected_lifecycle),
+            "{scenario} should replay approval {expected_lifecycle} lifecycle"
+        );
     }
 }
 
@@ -1010,7 +1128,12 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
 
     let mut incompatible =
         create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
-    incompatible.work_order.agent_id = AgentId::new();
+    incompatible.work_order = signed_work_order(
+        tenant_id.clone(),
+        AgentId::new(),
+        None,
+        vec![EndpointScope::RunsCreate],
+    );
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
         Method::POST,
@@ -1023,8 +1146,12 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
 
     let duplicate_run_id = RunId::new();
     let mut duplicate = create_request(tenant_id, agent_id, Vec::new(), Vec::new());
-    duplicate.work_order.run_id = Some(duplicate_run_id.clone());
-    duplicate.work_order.work_order_id = "wo_duplicate".to_string();
+    duplicate.work_order = signed_work_order_with_id(
+        "wo_duplicate",
+        duplicate.tenant_id.clone(),
+        duplicate.agent_id.clone(),
+        Some(duplicate_run_id.clone()),
+    );
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
         Method::POST,
@@ -1047,20 +1174,257 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
 }
 
 #[tokio::test]
+async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+
+    let unsigned_run_id = RunId::new();
+    let mut unsigned = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    unsigned.work_order.work_order.run_id = Some(unsigned_run_id.clone());
+    resign_work_order(&mut unsigned.work_order);
+    unsigned.work_order.signature = None;
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(unsigned).expect("unsigned request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "unsigned_work_order");
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{unsigned_run_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error.code, "invalid_run");
+
+    let bad_signature_run_id = RunId::new();
+    let mut bad_signature =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    bad_signature.work_order.work_order.run_id = Some(bad_signature_run_id.clone());
+    resign_work_order(&mut bad_signature.work_order);
+    bad_signature
+        .work_order
+        .signature
+        .as_mut()
+        .expect("signature")
+        .signature = "bad-signature".to_string();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(bad_signature).expect("bad signature request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "bad_signature");
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{bad_signature_run_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error.code, "invalid_run");
+
+    let expired_run_id = RunId::new();
+    let mut expired = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    expired.work_order.work_order.run_id = Some(expired_run_id.clone());
+    expired.work_order.work_order.expires_at =
+        OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    resign_work_order(&mut expired.work_order);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(expired).expect("expired request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "expired_work_order");
+
+    let revoked_run_id = RunId::new();
+    let mut revoked = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    revoked.work_order.work_order.run_id = Some(revoked_run_id.clone());
+    revoked.work_order.work_order.revocation = RevocationStatus::Revoked {
+        reason: "operator".to_string(),
+    };
+    resign_work_order(&mut revoked.work_order);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(revoked).expect("revoked request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "revoked_work_order");
+
+    let mut widened_action =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    widened_action
+        .allowed_actions
+        .push("extra_action".to_string());
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_action).expect("widened action request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_adapter =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    widened_adapter
+        .allowed_adapters
+        .push("extra.adapter".to_string());
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_adapter).expect("widened adapter request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_permission =
+        create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    widened_permission
+        .allowed_permissions
+        .push("extra.permission".to_string());
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_permission).expect("widened permission request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_policy = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action: action("extra_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    widened_policy.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_policy).expect("widened policy request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_policy_adapter = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action: action("allowed_action"),
+            adapter: Some("extra.adapter".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    widened_policy_adapter.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_policy_adapter).expect("widened policy adapter request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut action_with_permission = action("allowed_action");
+    action_with_permission.required_permissions = vec!["extra.permission".to_string()];
+    let mut widened_policy_permission = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action: action_with_permission,
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    widened_policy_permission.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_policy_permission).expect("widened policy permission request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_registration_name = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "extra_action".to_string(),
+            adapter: "daemon.local".to_string(),
+        }],
+    );
+    widened_registration_name.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_registration_name).expect("widened registration name request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+
+    let mut widened_registration = create_request(
+        tenant_id,
+        agent_id,
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "allowed_action".to_string(),
+            adapter: "extra.adapter".to_string(),
+        }],
+    );
+    widened_registration.allowed_actions.clear();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app,
+        Method::POST,
+        "/runs",
+        serde_json::to_value(widened_registration).expect("widened registration request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_scope_widening");
+}
+
+#[tokio::test]
 async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     let state = DaemonState::local_dev();
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
-    let create = create_request(
-        tenant_id.clone(),
-        agent_id.clone(),
-        Vec::new(),
-        vec![RegisteredAction {
-            name: "denied_action".to_string(),
-            adapter: "daemon.local".to_string(),
-        }],
-    );
+    let create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
         Method::POST,
@@ -1086,6 +1450,9 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    let mut denied_action = action("allowed_action");
+    denied_action.required_permissions = vec!["not.allowed".to_string()];
+
     let unlinked_submit = SubmitActionRequest {
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
@@ -1093,7 +1460,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         credential: None,
         audit_attribution: Some(attribution()),
         causal_trace_id: None,
-        action: action("denied_action"),
+        action: denied_action.clone(),
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
@@ -1129,7 +1496,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         credential: None,
         audit_attribution: Some(attribution()),
         causal_trace_id,
-        action: action("denied_action"),
+        action: denied_action,
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
@@ -1148,7 +1515,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         .verification
         .reasons
         .iter()
-        .any(|reason| reason == "action_not_allowed"));
+        .any(|reason| reason == "permission_denied"));
     let (status, traces): (StatusCode, TracePageResponse) = call_empty(
         app,
         Method::GET,
@@ -1531,7 +1898,7 @@ async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(stopped.status, RunStatus::Stopped);
+    assert_eq!(stopped.status, RunStatus::Cancelled);
 
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
@@ -1762,6 +2129,7 @@ async fn health_and_capabilities_remain_local_dev_only_without_credentials() {
         },
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
     }));
     let (status, error): (StatusCode, ApiErrorBody) =
         call_empty(locked_app.clone(), Method::GET, "/health").await;

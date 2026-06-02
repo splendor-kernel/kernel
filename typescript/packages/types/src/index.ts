@@ -346,6 +346,9 @@ export interface GovernanceRevocation {
 }
 
 export type ApprovalStatus = "requested" | "granted" | "denied" | "expired" | "revoked";
+export type ApprovalRequestStatus = Extract<ApprovalStatus, "requested" | "expired" | "revoked">;
+export type ApprovalGrantStatus = Extract<ApprovalStatus, "granted" | "expired" | "revoked">;
+export type ApprovalDenialStatus = Extract<ApprovalStatus, "denied" | "revoked">;
 export type EscalationStatus = "open" | "resolved" | "expired" | "revoked";
 export type InterventionStatus = "requested" | "resolved" | "cancelled" | "expired" | "revoked";
 export type CircuitBreakerStatus = "active" | "cleared" | "expired" | "revoked";
@@ -400,7 +403,7 @@ export interface ApprovalRequest {
   schema_version: string;
   approval_id: ApprovalId;
   scope: GovernanceScope;
-  status: ApprovalStatus;
+  status: ApprovalRequestStatus;
   created_at: ISODateTime;
   expires_at: ISODateTime | null;
   reason: string;
@@ -410,8 +413,13 @@ export interface ApprovalRequest {
   extensions?: GovernanceExtensions;
 }
 
-export interface ApprovalGrant extends ApprovalRequest {}
-export interface ApprovalDenial extends ApprovalRequest {}
+export interface ApprovalGrant extends Omit<ApprovalRequest, "status"> {
+  status: ApprovalGrantStatus;
+}
+
+export interface ApprovalDenial extends Omit<ApprovalRequest, "status"> {
+  status: ApprovalDenialStatus;
+}
 
 export interface Escalation {
   schema_version: string;
@@ -694,7 +702,18 @@ export interface StateHead {
   label: string | null;
 }
 
-export type RunStatus = "created" | "running" | "waiting_for_approval" | "paused" | "denied" | "expired" | "stopped" | "failed";
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "paused"
+  | "waiting_for_approval"
+  | "interrupted"
+  | "resuming"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "denied"
+  | "expired";
 
 export interface RunConfig {
   trace_db: string;
@@ -861,6 +880,44 @@ export interface WorkOrderAuthorization {
   revocation: RevocationStatus;
 }
 
+export interface WorkOrderQuotaPolicy {
+  max_actions_per_tick: number | null;
+  max_action_duration_ms: number | null;
+  max_filesystem_read_bytes: number | null;
+  max_filesystem_write_bytes: number | null;
+  max_network_read_bytes: number | null;
+  max_network_write_bytes: number | null;
+  max_http_requests_per_minute: number | null;
+}
+
+export interface WorkOrderPlacement {
+  target: string;
+  data_locality: string | null;
+  requires_gpu: boolean | null;
+  dedicated_instance: boolean | null;
+  required_capabilities: string[];
+  max_runtime_ms: number | null;
+}
+
+export interface WorkOrderEnvelope {
+  schema_version: string;
+  work_order_id: string;
+  tenant_id: TenantId;
+  agent_id: AgentId;
+  run_id: RunId | null;
+  objective: string;
+  allowed_actions: string[];
+  allowed_adapters: string[];
+  allowed_permissions: string[];
+  data_refs: string[];
+  quotas: WorkOrderQuotaPolicy;
+  placement: WorkOrderPlacement;
+  issued_at: ISODateTime;
+  expires_at: ISODateTime;
+  revocation: RevocationStatus;
+  signature: WorkOrderSignature | null;
+}
+
 export interface AuditAttribution {
   principal: ClientPrincipal;
   credential_id: string | null;
@@ -870,7 +927,7 @@ export interface AuditAttribution {
 export interface CreateRunRequest {
   tenant_id: TenantId;
   agent_id: AgentId;
-  work_order: WorkOrderAuthorization;
+  work_order: WorkOrderEnvelope;
   credential: CallerCredential | null;
   audit_attribution: AuditAttribution | null;
   allowed_actions: string[];
@@ -894,7 +951,7 @@ export interface CreateRunResponse {
 
 export interface LifecycleRequest {
   credential: CallerCredential | null;
-  work_order: WorkOrderAuthorization | null;
+  work_order: WorkOrderEnvelope | null;
   audit_attribution: AuditAttribution | null;
   reason: string | null;
   approval_evidence: ApprovalEvidence | null;

@@ -270,6 +270,9 @@ fn plan_sync(
         .get(&batch.scope.run_id)
         .cloned()
         .unwrap_or_default();
+    if let Some(first_existing) = existing.first() {
+        validate_scope_continuity(&batch.scope, &first_existing.scope)?;
+    }
     let existing_by_sequence = existing
         .iter()
         .map(|record| (record.record.sequence, record.record.clone()))
@@ -330,6 +333,55 @@ fn plan_sync(
         duplicate_records,
         records_to_insert,
     })
+}
+
+fn validate_scope_continuity(
+    incoming: &TraceSyncScope,
+    existing: &TraceSyncScope,
+) -> Result<(), TraceSyncError> {
+    for (field, incoming_value, existing_value) in [
+        (
+            "fleet_id",
+            incoming.fleet_id.as_deref(),
+            existing.fleet_id.as_deref(),
+        ),
+        (
+            "node_id",
+            incoming.node_id.as_deref(),
+            existing.node_id.as_deref(),
+        ),
+        (
+            "instance_id",
+            incoming.instance_id.as_deref(),
+            existing.instance_id.as_deref(),
+        ),
+        (
+            "tenant_id",
+            incoming.tenant_id.as_deref(),
+            existing.tenant_id.as_deref(),
+        ),
+        (
+            "agent_id",
+            incoming.agent_id.as_deref(),
+            existing.agent_id.as_deref(),
+        ),
+        (
+            "work_order_id",
+            incoming.work_order_id.as_deref(),
+            existing.work_order_id.as_deref(),
+        ),
+    ] {
+        if incoming_value != existing_value {
+            return Err(TraceSyncError::ScopeMismatch {
+                run_id: existing.run_id.clone(),
+                field: field.to_string(),
+                existing: existing_value.map(ToOwned::to_owned),
+                incoming: incoming_value.map(ToOwned::to_owned),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_record_identity(
@@ -525,6 +577,18 @@ pub enum TraceSyncError {
         existing_hash: ContentHash,
         incoming_hash: ContentHash,
     },
+    /// Incoming batch changed source identity scope for an already indexed run.
+    #[error("trace sync scope mismatch for run {run_id}: field {field} existing {existing:?}, incoming {incoming:?}")]
+    ScopeMismatch {
+        /// Run whose scope changed.
+        run_id: String,
+        /// Scope field that differed.
+        field: String,
+        /// Scope value already indexed centrally.
+        existing: Option<String>,
+        /// Incoming scope value.
+        incoming: Option<String>,
+    },
     /// Sequence arithmetic overflowed.
     #[error("trace sequence overflow for run {run_id} at sequence {sequence}")]
     SequenceOverflow { run_id: String, sequence: u64 },
@@ -542,6 +606,7 @@ impl TraceSyncError {
             self,
             Self::RunIdentityMismatch { .. }
                 | Self::PayloadRunIdentityMismatch { .. }
+                | Self::ScopeMismatch { .. }
                 | Self::ChainMismatch { .. }
                 | Self::HashMismatch { .. }
                 | Self::CentralConflict { .. }

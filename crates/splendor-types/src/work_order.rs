@@ -367,11 +367,19 @@ pub fn validate_work_order(
             reason: "agent_mismatch".to_string(),
         });
     }
-    if let (Some(expected), Some(actual)) = (&context.run_id, &envelope.work_order.run_id) {
-        if expected != actual {
-            return Err(WorkOrderValidationError::Incompatible {
-                reason: "run_mismatch".to_string(),
-            });
+    if let Some(expected) = &context.run_id {
+        match &envelope.work_order.run_id {
+            Some(actual) if actual == expected => {}
+            Some(_) => {
+                return Err(WorkOrderValidationError::Incompatible {
+                    reason: "run_mismatch".to_string(),
+                })
+            }
+            None => {
+                return Err(WorkOrderValidationError::Incompatible {
+                    reason: "missing_run_binding".to_string(),
+                })
+            }
         }
     }
     if let Some(expected_target) = &context.expected_placement_target {

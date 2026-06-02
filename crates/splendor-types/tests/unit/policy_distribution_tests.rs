@@ -206,7 +206,21 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     assert_eq!(error.reason_code(), "incompatible_policy_bundle");
 
     let mut agent_scoped = bundle();
-    agent_scoped.agent_id = Some(AgentId::new());
+    let agent_id = AgentId::new();
+    agent_scoped.agent_id = Some(agent_id.clone());
+
+    let tenant_only_context = PolicyBundleValidationContext {
+        tenant_id: agent_scoped.tenant_id.clone(),
+        agent_id: None,
+        now: OffsetDateTime::now_utc(),
+    };
+    let envelope =
+        PolicyBundleEnvelope::signed_with_shared_secret(agent_scoped.clone(), KEY_ID, SECRET)
+            .expect("signed agent-scoped policy bundle");
+    let error = validate_policy_bundle(&envelope, &tenant_only_context, &keyring())
+        .expect_err("agent-scoped bundle needs an agent context");
+    assert_eq!(error.reason_code(), "incompatible_policy_bundle");
+
     let wrong_agent_context = PolicyBundleValidationContext {
         tenant_id: agent_scoped.tenant_id.clone(),
         agent_id: Some(AgentId::new()),
@@ -218,6 +232,14 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     let error = validate_policy_bundle(&envelope, &wrong_agent_context, &keyring())
         .expect_err("wrong agent denied");
     assert_eq!(error.reason_code(), "incompatible_policy_bundle");
+
+    let matching_agent_context = PolicyBundleValidationContext {
+        tenant_id: agent_scoped.tenant_id.clone(),
+        agent_id: Some(agent_id),
+        now: OffsetDateTime::now_utc(),
+    };
+    validate_policy_bundle(&envelope, &matching_agent_context, &keyring())
+        .expect("matching agent-scoped bundle is accepted");
 }
 
 #[test]

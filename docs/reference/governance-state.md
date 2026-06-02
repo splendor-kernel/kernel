@@ -27,7 +27,9 @@ Governance objects:
 - `ApprovalDenial`
 - `Escalation`
 - `Intervention`
-- `CircuitBreaker`
+- `GovernanceCircuitBreaker` (the 0.04-S1 governance-state schema; separate
+  `CircuitBreaker` enforcement controls are introduced by the later 0.04-S4
+  circuit-breaker sprint)
 - `KillSwitch`
 
 Supporting types:
@@ -93,8 +95,14 @@ recorded in trace. Creation transitions use `from = None`.
 
 Invalid transitions return `GovernanceTransitionError::Rejected` containing a
 `GovernanceTransitionRejection`. That rejection is trace-ready and should be
-recorded with `TraceEventKind::GovernanceTransitionRejected` by runtime code that
-attempts the transition.
+converted with `GovernanceTransitionRejection::into_trace_event_kind()` by runtime
+code that attempts the transition.
+
+Accepted transitions can be converted with
+`GovernanceTransition::into_trace_event_kind()`. The helper fails closed with
+`GovernanceTraceEventKindError` if a deserialized or otherwise malformed
+transition has no canonical 0.04-S1 governance trace event mapping. Runtime
+emitters should use the helper instead of independently choosing a trace variant.
 
 ## Trace events
 
@@ -106,6 +114,10 @@ the complete event list. All governance events carry either:
 
 - `transition: GovernanceTransition`, or
 - `rejection: GovernanceTransitionRejection`.
+
+The Rust contract includes `into_trace_event_kind()` helpers for both successful
+transitions and rejected transitions so governance state changes map to one
+canonical trace variant before persistence.
 
 When a governance scope includes tenant, agent, or action identity, trace event
 identity context is populated with those IDs so replay/audit can locate the
@@ -188,9 +200,10 @@ This is an additive `0.04-dev` schema extension. Existing traces and runtime loo
 remain valid. Consumers that exhaustively match `TraceEventKind` must add arms for
 the governance event variants. The 0.1 stable schema line is not frozen yet.
 
-The TypeScript package exposes schema-aligned inspection types only. Rust
-validation remains authoritative for lifecycle transitions, reserved extension
-keys, and scope/trace run consistency.
+The TypeScript package exposes schema-aligned inspection types only. Its approval
+request/grant/denial status unions mirror the Rust object-specific lifecycle
+validators, while Rust validation remains authoritative for lifecycle
+transitions, reserved extension keys, and scope/trace run consistency.
 
 ## Non-goals
 

@@ -60,12 +60,13 @@ Approval verification outcomes:
   `ActionStatus::NeedsApproval` and does not call the adapter.
 - `Granted`: valid scoped evidence was supplied; normal gateway checks continue
   and the adapter may execute only after all other verifiers pass.
-- `Denied`: supplied evidence denied the action, expired, was revoked, or did not
-  match tenant, agent, run, action, or adapter scope. The gateway returns
-  `ActionStatus::Denied` and does not call the adapter.
+- `Denied`: supplied evidence denied the action, expired, was revoked, used an
+  unsupported schema version, or did not match tenant, agent, run, action, or
+  adapter scope. The gateway returns `ActionStatus::Denied` and does not call the
+  adapter.
 - `NeedsIntervention`: the approval verifier cannot safely decide, such as an
-  expired approval policy. The gateway returns `ActionStatus::NeedsIntervention`
-  and does not call the adapter.
+  expired or unsupported-schema approval policy. The gateway returns
+  `ActionStatus::NeedsIntervention` and does not call the adapter.
 
 ## ActionAdapter
 
@@ -95,7 +96,7 @@ checks before executing adapters and evaluates postconditions after execution. I
 first validates `action_id`, `tenant_id`, `agent_id`, and `run_id`; missing or nil
 identity returns a denied `ActionOutcome` with reason `identity_invalid` and does
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope, or
-uncertain approval decisions also stop before adapter execution.
+unsupported-schema approval decisions also stop before adapter execution.
 
 0.04-S3 escalation handling may convert a denied verifier result into
 `NeedsIntervention` after the gateway has failed closed. This preserves the

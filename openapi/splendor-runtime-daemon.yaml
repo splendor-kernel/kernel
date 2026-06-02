@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
-  version: 0.02-S5
-  description: Local-only runtime daemon API for Splendor 0.02-S5.
+  version: 0.03-dev
+  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage.
 servers:
   - url: http://127.0.0.1:8077
     description: Explicit local development listener only.
@@ -138,7 +138,7 @@ paths:
               $ref: '#/components/schemas/LifecycleRequest'
       responses:
         '200':
-          description: Run stopped.
+          description: Run cancelled.
           content:
             application/json:
               schema:
@@ -380,7 +380,18 @@ components:
         details: true
     RunStatus:
       type: string
-      enum: [created, running, waiting_for_approval, paused, denied, expired, stopped, failed]
+      enum:
+        - pending
+        - running
+        - paused
+        - waiting_for_approval
+        - interrupted
+        - resuming
+        - completed
+        - failed
+        - cancelled
+        - denied
+        - expired
     EndpointScope:
       type: string
       enum:
@@ -486,6 +497,125 @@ components:
           format: date-time
         revocation:
           $ref: '#/components/schemas/RevocationStatus'
+    WorkOrderSignature:
+      type: object
+      required: [key_id, signature]
+      properties:
+        key_id:
+          type: string
+        signature:
+          type: string
+    WorkOrderQuotaPolicy:
+      type: object
+      required: []
+      properties:
+        max_actions_per_tick:
+          type: [integer, 'null']
+          minimum: 0
+        max_action_duration_ms:
+          type: [integer, 'null']
+          minimum: 0
+        max_filesystem_read_bytes:
+          type: [integer, 'null']
+          minimum: 0
+        max_filesystem_write_bytes:
+          type: [integer, 'null']
+          minimum: 0
+        max_network_read_bytes:
+          type: [integer, 'null']
+          minimum: 0
+        max_network_write_bytes:
+          type: [integer, 'null']
+          minimum: 0
+        max_http_requests_per_minute:
+          type: [integer, 'null']
+          minimum: 0
+    WorkOrderPlacement:
+      type: object
+      required: [target, data_locality, requires_gpu, dedicated_instance, required_capabilities, max_runtime_ms]
+      properties:
+        target:
+          type: string
+        data_locality:
+          type: [string, 'null']
+        requires_gpu:
+          type: [boolean, 'null']
+        dedicated_instance:
+          type: [boolean, 'null']
+        required_capabilities:
+          type: array
+          items:
+            type: string
+        max_runtime_ms:
+          type: [integer, 'null']
+          minimum: 0
+    WorkOrderEnvelope:
+      type: object
+      required:
+        - schema_version
+        - work_order_id
+        - tenant_id
+        - agent_id
+        - run_id
+        - objective
+        - allowed_actions
+        - allowed_adapters
+        - allowed_permissions
+        - data_refs
+        - quotas
+        - placement
+        - issued_at
+        - expires_at
+        - revocation
+        - signature
+      properties:
+        schema_version:
+          type: string
+        work_order_id:
+          type: string
+        tenant_id:
+          type: string
+          format: uuid
+        agent_id:
+          type: string
+          format: uuid
+        run_id:
+          type: [string, 'null']
+          format: uuid
+        objective:
+          type: string
+        allowed_actions:
+          type: array
+          items:
+            type: string
+        allowed_adapters:
+          type: array
+          items:
+            type: string
+        allowed_permissions:
+          type: array
+          items:
+            type: string
+        data_refs:
+          type: array
+          items:
+            type: string
+        quotas:
+          $ref: '#/components/schemas/WorkOrderQuotaPolicy'
+        placement:
+          $ref: '#/components/schemas/WorkOrderPlacement'
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revocation:
+          $ref: '#/components/schemas/RevocationStatus'
+        signature:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/WorkOrderSignature'
     AuditAttribution:
       type: object
       required: [principal, credential_id, requested_at]
@@ -845,7 +975,7 @@ components:
           type: string
           format: uuid
         work_order:
-          $ref: '#/components/schemas/WorkOrderAuthorization'
+          $ref: '#/components/schemas/WorkOrderEnvelope'
         credential:
           oneOf:
             - type: 'null'
@@ -917,7 +1047,7 @@ components:
         work_order:
           oneOf:
             - type: 'null'
-            - $ref: '#/components/schemas/WorkOrderAuthorization'
+            - $ref: '#/components/schemas/WorkOrderEnvelope'
         audit_attribution:
           oneOf:
             - type: 'null'

@@ -80,7 +80,7 @@ The `ActionDenied` event includes breaker evidence similar to:
   "artifacts": {
     "circuit_breaker": {
       "circuit_breaker": {
-        "breaker_id": "cb_filesystem_adapter",
+        "breaker_id": "<uuid-derived-from-cb_filesystem_adapter>",
         "scope": "adapter",
         "scope_value": "filesystem",
         "state": "tripped",
@@ -101,6 +101,9 @@ splendorctl replay --db ./trace.db --state-db ./state.db --run <run-id>
 
 Replay remains inspect-only and emits `side_effects_replayed: false`. The tick
 output includes `circuit_breaker_denials` with the breaker ID, scope, and reason.
+The local config label `cb_filesystem_adapter` is deterministically converted to
+a UUID-backed `CircuitBreakerId`, so replay shows the typed ID rather than the raw
+label.
 
 ## Non-goals
 

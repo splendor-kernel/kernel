@@ -174,10 +174,10 @@ trace and do not authorize adapter execution outside the gateway.
 - `InterventionCancelled { transition: GovernanceTransition }`
 - `InterventionExpired { transition: GovernanceTransition }`
 - `InterventionRevoked { transition: GovernanceTransition }`
-- `CircuitBreakerTripped { transition: GovernanceTransition }`
-- `CircuitBreakerCleared { transition: GovernanceTransition }`
-- `CircuitBreakerExpired { transition: GovernanceTransition }`
-- `CircuitBreakerRevoked { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerTripped { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerCleared { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerExpired { transition: GovernanceTransition }`
+- `GovernanceCircuitBreakerRevoked { transition: GovernanceTransition }`
 - `KillSwitchActivated { transition: GovernanceTransition }`
 - `KillSwitchCleared { transition: GovernanceTransition }`
 - `KillSwitchExpired { transition: GovernanceTransition }`
@@ -205,10 +205,10 @@ trace and do not authorize adapter execution outside the gateway.
 | `InterventionCancelled` | `intervention.cancelled` | Intervention was cancelled. |
 | `InterventionExpired` | `intervention.expired` | Intervention state expired explicitly. |
 | `InterventionRevoked` | `intervention.revoked` | Intervention state was revoked explicitly. |
-| `CircuitBreakerTripped` | `circuit_breaker.tripped` | Circuit-breaker state became active/tripped. |
-| `CircuitBreakerCleared` | `circuit_breaker.cleared` | Circuit-breaker state was cleared. |
-| `CircuitBreakerExpired` | `circuit_breaker.expired` | Circuit-breaker state expired explicitly. |
-| `CircuitBreakerRevoked` | `circuit_breaker.revoked` | Circuit-breaker state was revoked explicitly. |
+| `GovernanceCircuitBreakerTripped` | `governance.circuit_breaker.tripped` | Governance circuit-breaker state became active/tripped. |
+| `GovernanceCircuitBreakerCleared` | `governance.circuit_breaker.cleared` | Governance circuit-breaker state was cleared. |
+| `GovernanceCircuitBreakerExpired` | `governance.circuit_breaker.expired` | Governance circuit-breaker state expired explicitly. |
+| `GovernanceCircuitBreakerRevoked` | `governance.circuit_breaker.revoked` | Governance circuit-breaker state was revoked explicitly. |
 | `KillSwitchActivated` | `kill_switch.activated` | Kill-switch state became active. |
 | `KillSwitchCleared` | `kill_switch.cleared` | Kill-switch state was cleared. |
 | `KillSwitchExpired` | `kill_switch.expired` | Kill-switch state expired explicitly. |
@@ -230,10 +230,17 @@ Governance success events carry `GovernanceTransition`:
 | `trace` | Causal trace linkage. |
 | `extensions` | Optional non-authoritative metadata. |
 
+Runtime code should convert accepted governance transitions with
+`GovernanceTransition::into_trace_event_kind()` before persistence. The mapping
+helper rejects invalid lifecycle transitions or unsupported object/state pairs
+with `GovernanceTraceEventKindError` instead of allowing emitters to record a
+malformed transition under the wrong governance event variant.
+
 `GovernanceTransitionRejected` carries `GovernanceTransitionRejection` with the
 same object, scope, issuer, and trace linkage plus `attempted`, `from`,
 `rejected_at`, and a stable rejection reason. Rejections do not become implicit
-allows and do not execute side effects.
+allows and do not execute side effects. Rejections should be converted with
+`GovernanceTransitionRejection::into_trace_event_kind()`.
 
 ## Message Events
 
@@ -331,7 +338,7 @@ gateway/verifier path.
 | `ActionNeedsApproval` | `action.needs_approval` | The approval verifier paused the action before adapter execution. |
 | `ApprovalRequested` | `approval.requested` | A policy-created approval request was recorded. |
 | `ApprovalGranted` | `approval.granted` | Scoped approval grant evidence was presented. |
-| `ApprovalDenied` | `approval.denied` | Approval denial or wrong-scope evidence was rejected. |
+| `ApprovalDenied` | `approval.denied` | Approval denial, unsupported schema, or wrong-scope evidence was rejected. |
 | `ApprovalExpired` | `approval.expired` | Expired approval evidence was rejected. |
 | `ApprovalRevoked` | `approval.revoked` | Revoked approval evidence was rejected. |
 

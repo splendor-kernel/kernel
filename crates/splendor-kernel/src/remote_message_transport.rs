@@ -7,7 +7,7 @@
 use crate::{LocalMessageRouter, MessageRouterError, MessageTraceRecorder};
 use splendor_types::{
     MessageEnvelope, MessageId, RemoteMessageEnvelope, RemoteMessageTraceContext,
-    RemoteMessageValidationError, TraceEventKind,
+    RemoteMessageValidationError, TraceEventKind, WorkOrderKeyring,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -98,15 +98,27 @@ pub fn send_remote_message<T: RemoteMessageTransport>(
 pub struct RemoteMessageReceiver<'a> {
     local_instance_id: String,
     router: &'a LocalMessageRouter,
+    work_order_keyring: WorkOrderKeyring,
     seen_messages: Mutex<HashSet<MessageId>>,
 }
 
 impl<'a> RemoteMessageReceiver<'a> {
     /// Creates a receiver for one local Splendor instance boundary.
     pub fn new(local_instance_id: impl Into<String>, router: &'a LocalMessageRouter) -> Self {
+        Self::with_keyring(local_instance_id, router, WorkOrderKeyring::new())
+    }
+
+    /// Creates a receiver with the work-order keyring required for cryptographic
+    /// remote authority validation.
+    pub fn with_keyring(
+        local_instance_id: impl Into<String>,
+        router: &'a LocalMessageRouter,
+        work_order_keyring: WorkOrderKeyring,
+    ) -> Self {
         Self {
             local_instance_id: local_instance_id.into(),
             router,
+            work_order_keyring,
             seen_messages: Mutex::new(HashSet::new()),
         }
     }
@@ -124,7 +136,7 @@ impl<'a> RemoteMessageReceiver<'a> {
         envelope: RemoteMessageEnvelope,
         now: OffsetDateTime,
     ) -> Result<MessageEnvelope, RemoteMessageTransportError> {
-        if let Err(error) = envelope.validate_at(now) {
+        if let Err(error) = envelope.validate_at_with_keyring(now, &self.work_order_keyring) {
             record_remote_rejected(target_recorder, &envelope, &error.to_string())?;
             return Err(RemoteMessageTransportError::InvalidEnvelope(error));
         }
