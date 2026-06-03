@@ -9,7 +9,8 @@
 use crate::{TraceRecord, TraceStore, TraceStoreError};
 use serde::{Deserialize, Serialize};
 use splendor_types::{
-    ContentHash, OfflineTraceIntervalTraceContext, TraceSyncBoundaryTraceContext,
+    ContentHash, OfflineTraceIntervalTraceContext, RunId, TraceEvent, TraceEventKind,
+    TraceSyncBoundaryTraceContext,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -181,6 +182,24 @@ impl<S: TraceStore> LocalTraceBuffer<S> {
         self.store.append(run_id, payload).map_err(Into::into)
     }
 
+    /// Appends a canonical trace event through the local buffer boundary.
+    pub fn append_event(
+        &self,
+        event: &TraceEvent,
+        mode: TraceBufferAppendMode,
+    ) -> Result<u64, LocalTraceBufferError> {
+        let run_id = event.run_id.to_string();
+        let payload = serde_json::to_value(event).map_err(LocalTraceBufferError::Serialization)?;
+        let sequence = self.append(&run_id, payload, mode)?;
+        if sequence != event.sequence {
+            return Err(LocalTraceBufferError::SequenceMismatch {
+                expected: event.sequence,
+                actual: sequence,
+            });
+        }
+        Ok(sequence)
+    }
+
     /// Starts an offline interval and appends a typed trace payload marker.
     pub fn begin_offline_interval(
         &self,
@@ -196,11 +215,15 @@ impl<S: TraceStore> LocalTraceBuffer<S> {
             end_sequence: None,
             reason,
         };
-        self.append(
-            &scope.run_id,
-            offline_interval_payload(&scope.run_id, "OfflineTraceIntervalStarted", &interval),
-            TraceBufferAppendMode::ReadOnly,
-        )?;
+        let event = TraceEvent::new(
+            parse_run_id(&scope.run_id)?,
+            start_sequence,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::OfflineTraceIntervalStarted {
+                interval: interval.clone(),
+            },
+        );
+        self.append_event(&event, TraceBufferAppendMode::ReadOnly)?;
         self.active_intervals
             .lock()
             .map_err(|_| LocalTraceBufferError::Poisoned)?
@@ -224,12 +247,80 @@ impl<S: TraceStore> LocalTraceBuffer<S> {
         })?;
         interval.end_sequence = Some(self.next_sequence(run_id)?);
         drop(intervals);
-        self.append(
-            run_id,
-            offline_interval_payload(run_id, "OfflineTraceIntervalEnded", &interval),
-            TraceBufferAppendMode::ReadOnly,
-        )?;
+        let event = TraceEvent::new(
+            parse_run_id(run_id)?,
+            interval.end_sequence.expect("end sequence just set"),
+            OffsetDateTime::now_utc(),
+            TraceEventKind::OfflineTraceIntervalEnded {
+                interval: interval.clone(),
+            },
+        );
+        self.append_event(&event, TraceBufferAppendMode::ReadOnly)?;
         Ok(interval)
+    }
+
+    /// Appends a canonical reconnect sync-start marker and returns its boundary.
+    pub fn record_sync_started(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+        offline_interval_id: Option<String>,
+    ) -> Result<TraceSyncBoundaryTraceContext, LocalTraceBufferError> {
+        let sequence = self.next_sequence(run_id)?;
+        let boundary = TraceSyncBoundaryTraceContext {
+            sync_batch_id: format!("sync-{run_id}-{start}-{end}"),
+            offline_interval_id,
+            start_sequence: start,
+            end_sequence: end,
+            accepted_records: None,
+            duplicate_records: None,
+        };
+        let event = TraceEvent::new(
+            parse_run_id(run_id)?,
+            sequence,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::TraceSyncStarted {
+                boundary: boundary.clone(),
+            },
+        );
+        self.append_event(&event, TraceBufferAppendMode::ReadOnly)?;
+        Ok(boundary)
+    }
+
+    /// Appends a canonical reconnect sync-completed marker.
+    pub fn record_sync_completed(
+        &self,
+        run_id: &str,
+        boundary: TraceSyncBoundaryTraceContext,
+    ) -> Result<(), LocalTraceBufferError> {
+        let sequence = self.next_sequence(run_id)?;
+        let event = TraceEvent::new(
+            parse_run_id(run_id)?,
+            sequence,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::TraceSyncCompleted { boundary },
+        );
+        self.append_event(&event, TraceBufferAppendMode::ReadOnly)?;
+        Ok(())
+    }
+
+    /// Appends a canonical reconnect sync-failed marker.
+    pub fn record_sync_failed(
+        &self,
+        run_id: &str,
+        boundary: TraceSyncBoundaryTraceContext,
+        reason: String,
+    ) -> Result<(), LocalTraceBufferError> {
+        let sequence = self.next_sequence(run_id)?;
+        let event = TraceEvent::new(
+            parse_run_id(run_id)?,
+            sequence,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::TraceSyncFailed { boundary, reason },
+        );
+        self.append_event(&event, TraceBufferAppendMode::ReadOnly)?;
+        Ok(())
     }
 
     /// Builds a reconnect batch with replay-visible boundary metadata.
@@ -502,19 +593,8 @@ fn record_count(store: &dyn TraceStore, run_id: &str) -> Result<usize, TraceStor
     }
 }
 
-fn offline_interval_payload(
-    run_id: &str,
-    kind: &str,
-    interval: &OfflineTraceIntervalTraceContext,
-) -> serde_json::Value {
-    serde_json::json!({
-        "run_id": run_id,
-        "kind": {
-            kind: {
-                "interval": interval,
-            }
-        }
-    })
+fn parse_run_id(run_id: &str) -> Result<RunId, LocalTraceBufferError> {
+    RunId::parse(run_id).map_err(|_| LocalTraceBufferError::InvalidRunId(run_id.to_string()))
 }
 
 fn insert_unique_interval(
@@ -896,6 +976,15 @@ pub enum TraceSyncError {
 /// Errors returned by the local/offline trace buffer boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalTraceBufferError {
+    /// Run ID could not be parsed into the canonical typed identity.
+    #[error("invalid run id for local trace buffer: {0}")]
+    InvalidRunId(String),
+    /// Trace event payload serialization failed.
+    #[error("failed to serialize trace event: {0}")]
+    Serialization(#[from] serde_json::Error),
+    /// Local store assigned a different sequence than the canonical event.
+    #[error("local trace sequence mismatch: expected {expected} but stored {actual}")]
+    SequenceMismatch { expected: u64, actual: u64 },
     /// The local buffer reached configured capacity without dropping records.
     #[error("local trace buffer full for run {run_id}: max_records={max_records}, side_effectful={side_effectful}")]
     BufferFull {

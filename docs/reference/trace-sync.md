@@ -101,11 +101,16 @@ inserted again.
 0.05-S3 extends trace sync for disconnected physical/edge nodes without changing
 the `TraceRecord` format. Local runtimes use `LocalTraceBuffer` at the storage
 boundary and keep writing the same append-only trace payloads while offline.
+Offline interval and sync marker records emitted by `LocalTraceBuffer` are
+canonical serialized `TraceEvent` values, not device-specific JSON markers.
 
 Offline/reconnect metadata is explicit:
 
 - `OfflineTraceIntervalTraceContext` identifies local offline execution periods.
 - `TraceSyncBoundaryTraceContext` identifies reconnect sync batches.
+- `TraceEventKind::{OfflineTraceIntervalStarted, OfflineTraceIntervalEnded,
+  TraceSyncStarted, TraceSyncCompleted, TraceSyncFailed}` records the local
+  runtime boundaries.
 - `TraceSyncBatch.offline_interval` and `TraceSyncBatch.sync_boundary` carry this
   metadata to the central index.
 - `CentralTraceIndex::offline_intervals(run_id)` and

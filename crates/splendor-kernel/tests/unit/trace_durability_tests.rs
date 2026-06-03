@@ -2,6 +2,9 @@ use super::*;
 use splendor_gateway::{
     ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus, GatewayError,
 };
+use splendor_store::{
+    InMemoryTraceStore, LocalTraceBuffer, LocalTraceBufferConfig, TraceBufferAppendMode,
+};
 use splendor_types::{
     Action, AgentId, QuotaUsage, RunId, SideEffectClass, TenantId, VerificationResult,
 };
@@ -171,12 +174,34 @@ fn policy_can_leave_central_sync_non_blocking() {
 #[test]
 fn side_effectful_action_is_denied_when_local_trace_buffer_is_full() {
     let calls = Arc::new(Mutex::new(0));
+    let run_id = RunId::new();
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig {
+            max_records_per_run: Some(1),
+        },
+    );
+    buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "already-buffered"}),
+            TraceBufferAppendMode::ReadOnly,
+        )
+        .expect("prime buffer");
+    let local_error = buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "side-effect-boundary"}),
+            TraceBufferAppendMode::SideEffectful,
+        )
+        .expect_err("side-effect trace durability cannot be preserved")
+        .to_string();
     let gateway = gateway_with_state(
         TraceDurabilityState {
             local_latest_sequence: Some(5),
             central_latest_sequence: Some(5),
             last_sync_error: None,
-            last_local_buffer_error: Some("local trace buffer full".to_string()),
+            last_local_buffer_error: Some(local_error.clone()),
         },
         true,
         calls.clone(),
@@ -190,6 +215,6 @@ fn side_effectful_action_is_denied_when_local_trace_buffer_is_full() {
     assert_eq!(*calls.lock().expect("calls lock"), 0);
     assert_eq!(
         outcome.verification.artifacts["last_local_buffer_error"],
-        serde_json::json!("local trace buffer full")
+        serde_json::json!(local_error)
     );
 }

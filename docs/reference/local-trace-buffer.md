@@ -12,6 +12,9 @@ Implemented in `crates/splendor-store`:
 - `LocalTraceBuffer<S: TraceStore>`
 - `LocalTraceBufferConfig { max_records_per_run }`
 - `TraceBufferAppendMode::{ReadOnly, SideEffectful}`
+- `LocalTraceBuffer::append_event`, `begin_offline_interval`,
+  `end_offline_interval`, `record_sync_started`, `record_sync_completed`, and
+  `record_sync_failed`
 - `LocalTraceBufferError::{BufferFull, NoActiveOfflineInterval, Poisoned, Store}`
 - `TraceSyncBatch.offline_interval`
 - `TraceSyncBatch.sync_boundary`
@@ -33,9 +36,20 @@ Implemented in `crates/splendor-types`:
 1. When a physical/edge node loses connectivity, call
    `LocalTraceBuffer::begin_offline_interval(scope, reason)`.
 2. Continue appending normal tick/action/denial/safety/operator/policy trace
-   payloads through the same local `TraceStore`.
+   events through `LocalTraceBuffer::append_event`.
 3. Before reconnect sync, call `end_offline_interval(run_id)`.
-4. Build a `reconnect_batch(scope, start, end, interval)` and sync it to the
+4. Record `record_sync_started(...)` and build a
+   `reconnect_batch(scope, start, end, interval)` for the covered range.
+5. After the central attempt, record `record_sync_completed(...)` or
+   `record_sync_failed(...)` locally and sync that marker in a later batch if
+   needed.
+
+All marker records written by `LocalTraceBuffer` serialize canonical
+`splendor_types::TraceEvent` values, including `trace_event_id`, `run_id`,
+`sequence`, `timestamp`, `identity`, and typed `TraceEventKind` variants. They
+are not ad-hoc JSON markers.
+
+Build the reconnect batch and sync it to the
    central index.
 
 The interval and sync boundary are replay-visible metadata. Sync never renumbers,

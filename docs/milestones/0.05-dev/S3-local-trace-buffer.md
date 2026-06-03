@@ -9,6 +9,7 @@ after reconnect.
 
 - Adds a thin `LocalTraceBuffer` boundary around existing `TraceStore`.
 - Adds replay-visible offline interval and sync boundary metadata.
+- Writes offline/sync markers as canonical `TraceEvent` records.
 - Adds central index queries for offline intervals and sync boundaries.
 - Adds storage-pressure fail-closed signal for side-effectful actions.
 
@@ -40,6 +41,9 @@ after reconnect.
 
 - Added `OfflineTraceIntervalStarted`, `OfflineTraceIntervalEnded`,
   `TraceSyncStarted`, `TraceSyncCompleted`, and `TraceSyncFailed` taxonomy.
+- Local buffer marker records serialize full `TraceEvent` payloads with
+  deterministic trace event identity, run identity, sequence, timestamp, and
+  typed kind.
 - Local records remain ordered by `TraceRecord.sequence` and hash chain.
 - Corruption and central conflicts quarantine/reject instead of repairing.
 

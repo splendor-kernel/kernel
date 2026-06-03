@@ -41,12 +41,9 @@ let buffer = LocalTraceBuffer::new(
 );
 
 let _started = buffer.begin_offline_interval(&scope, Some("network_disconnected".to_string()))?;
-buffer.append(
-    run_id,
-    serde_json::json!({"run_id": run_id, "kind": {"LoopTickStarted": {"tick_id": 1}}}),
-    TraceBufferAppendMode::ReadOnly,
-)?;
+// Append canonical TraceEvent values via buffer.append_event(...).
 let ended = buffer.end_offline_interval(run_id)?;
+let _boundary = buffer.record_sync_started(run_id, 0, 3, Some(ended.offline_interval_id.clone()))?;
 
 let central = InMemoryCentralTraceIndex::default();
 let batch = buffer.reconnect_batch(scope, 0, 3, Some(ended))?;
