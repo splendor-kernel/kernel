@@ -119,6 +119,16 @@ fn simulated_adapter_rejects_unknown_and_forbidden_actions() {
 }
 
 #[test]
+fn default_adapter_exposes_only_allowed_high_level_actions() {
+    let adapter = SimulatedRoboticsAdapter::default();
+    assert_eq!(adapter.supported_actions(), ALLOWED_PHYSICAL_ACTIONS);
+    assert!(adapter
+        .supported_actions()
+        .iter()
+        .all(|action| is_allowed_physical_action(action)));
+}
+
+#[test]
 fn gateway_executes_allowed_action_after_safety_allow() {
     let adapter = Arc::new(SimulatedRoboticsAdapter::new());
     let gateway = gateway(adapter.clone(), safe_snapshot());

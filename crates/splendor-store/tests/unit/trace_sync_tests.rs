@@ -379,6 +379,41 @@ fn offline_trace_buffer_records_interval_and_reconnect_boundary() {
 }
 
 #[test]
+fn local_trace_buffer_records_sync_failed_boundary() {
+    let run_id = RunId::new();
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig::default(),
+    );
+    let boundary = buffer
+        .record_sync_started(&run_id.to_string(), 0, 1, Some("offline-a".to_string()))
+        .expect("sync started marker");
+
+    buffer
+        .record_sync_failed(
+            &run_id.to_string(),
+            boundary.clone(),
+            "central_trace_index_unavailable".to_string(),
+        )
+        .expect("sync failed marker");
+
+    let records = TraceStore::read(buffer.store(), &run_id.to_string()).expect("records");
+    assert_eq!(records.len(), 2);
+    let failed_event: TraceEvent =
+        serde_json::from_value(records[1].payload.clone()).expect("canonical failed event");
+    match failed_event.kind {
+        TraceEventKind::TraceSyncFailed {
+            boundary: failed_boundary,
+            reason,
+        } => {
+            assert_eq!(failed_boundary.sync_batch_id, boundary.sync_batch_id);
+            assert_eq!(reason, "central_trace_index_unavailable");
+        }
+        other => panic!("unexpected trace sync event: {other:?}"),
+    }
+}
+
+#[test]
 fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
     let run_id = RunId::new();
     let scope = rich_scope_for(&run_id);

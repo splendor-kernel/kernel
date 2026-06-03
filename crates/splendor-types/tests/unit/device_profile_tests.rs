@@ -103,6 +103,111 @@ fn profile_examples_cover_supported_device_kinds() {
 }
 
 #[test]
+fn device_profile_schema_duplicates_and_offline_ttl_fail_closed() {
+    let mut missing_schema = profile(DeviceNodeKind::Robot, &["dock"]);
+    missing_schema.schema.clear();
+    assert_eq!(
+        missing_schema.validate(),
+        Err(DeviceProfileValidationError::MissingSchema)
+    );
+
+    let mut unsupported_schema = profile(DeviceNodeKind::Robot, &["dock"]);
+    unsupported_schema.schema = "splendor.device_profile.v0".to_string();
+    assert_eq!(
+        unsupported_schema.validate(),
+        Err(DeviceProfileValidationError::UnsupportedSchema {
+            schema: "splendor.device_profile.v0".to_string()
+        })
+    );
+
+    let mut duplicate = profile(DeviceNodeKind::Robot, &["dock"]);
+    duplicate
+        .capabilities
+        .push(DeviceCapability::bounded_action("dock"));
+    assert_eq!(
+        duplicate.validate(),
+        Err(DeviceProfileValidationError::DuplicateCapability {
+            name: "dock".to_string()
+        })
+    );
+
+    let mut invalid_capability = profile(DeviceNodeKind::Robot, &["dock"]);
+    invalid_capability.capabilities.push(DeviceCapability {
+        category: DeviceCapabilityCategory::Sensor,
+        name: " camera raw ".to_string(),
+    });
+    assert!(matches!(
+        invalid_capability.validate(),
+        Err(DeviceProfileValidationError::InvalidCapabilityName { .. })
+    ));
+
+    let mut invalid_constraint = profile(DeviceNodeKind::Robot, &["dock"]);
+    invalid_constraint
+        .safety_constraints
+        .push(DeviceSafetyConstraint {
+            name: " geofence ".to_string(),
+            value: serde_json::json!(true),
+        });
+    assert!(matches!(
+        invalid_constraint.validate(),
+        Err(DeviceProfileValidationError::InvalidSafetyConstraint { .. })
+    ));
+
+    let mut missing_ttl = profile(DeviceNodeKind::Robot, &["dock"]);
+    missing_ttl.local_policy.max_offline_policy_ttl_seconds = None;
+    assert_eq!(
+        missing_ttl.validate(),
+        Err(DeviceProfileValidationError::MissingOfflinePolicyTtl)
+    );
+}
+
+#[test]
+fn capability_document_tokens_cover_all_device_kinds_and_categories() {
+    let profile = DeviceProfile::new(
+        DeviceNodeKind::IndustrialDevice,
+        vec![
+            DeviceCapability {
+                category: DeviceCapabilityCategory::Sensor,
+                name: "sensor.summary".to_string(),
+            },
+            DeviceCapability::bounded_action("pause_mission"),
+            DeviceCapability {
+                category: DeviceCapabilityCategory::LocalCompute,
+                name: "model.small".to_string(),
+            },
+            DeviceCapability {
+                category: DeviceCapabilityCategory::Network,
+                name: "network.restricted".to_string(),
+            },
+            DeviceCapability {
+                category: DeviceCapabilityCategory::Power,
+                name: "battery.status".to_string(),
+            },
+            DeviceCapability {
+                category: DeviceCapabilityCategory::SafetyStatus,
+                name: "emergency_stop.status".to_string(),
+            },
+        ],
+        safety_constraints(),
+        local_policy(),
+    )
+    .expect("profile covers all categories");
+    let document = profile.to_capability_document().expect("document");
+
+    for expected in [
+        "device.kind.industrial_device",
+        "device.sensor.sensor.summary",
+        "physical.action.pause_mission",
+        "device.local_compute.model.small",
+        "device.network.network.restricted",
+        "device.power.battery.status",
+        "device.safety_status.emergency_stop.status",
+    ] {
+        assert!(document.capabilities.contains(&expected.to_string()));
+    }
+}
+
+#[test]
 fn rejects_raw_motor_and_actuator_advertisements() {
     for action in [
         "set_motor_pwm",

@@ -172,6 +172,50 @@ fn policy_can_leave_central_sync_non_blocking() {
 }
 
 #[test]
+fn durability_state_handles_empty_and_unsynced_watermarks() {
+    assert!(TraceDurabilityState {
+        local_latest_sequence: None,
+        central_latest_sequence: None,
+        last_sync_error: None,
+        last_local_buffer_error: None,
+    }
+    .is_durable());
+
+    assert!(!TraceDurabilityState {
+        local_latest_sequence: Some(1),
+        central_latest_sequence: None,
+        last_sync_error: None,
+        last_local_buffer_error: None,
+    }
+    .is_durable());
+}
+
+#[test]
+fn monitor_updates_sync_error_watermarks_and_clears() {
+    let monitor = TraceDurabilityMonitor::default();
+    monitor.update_watermarks(Some(7), Some(6));
+    assert_eq!(
+        monitor.trace_durability_state(),
+        TraceDurabilityState {
+            local_latest_sequence: Some(7),
+            central_latest_sequence: Some(6),
+            last_sync_error: None,
+            last_local_buffer_error: None,
+        }
+    );
+    assert!(!monitor.trace_durability_state().is_durable());
+
+    monitor.report_sync_error("central trace sync failed");
+    assert_eq!(
+        monitor.trace_durability_state().last_sync_error.as_deref(),
+        Some("central trace sync failed")
+    );
+    monitor.update_watermarks(Some(7), Some(7));
+    monitor.clear_errors();
+    assert!(monitor.trace_durability_state().is_durable());
+}
+
+#[test]
 fn side_effectful_action_is_denied_when_local_trace_buffer_is_full() {
     let calls = Arc::new(Mutex::new(0));
     let run_id = RunId::new();

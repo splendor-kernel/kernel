@@ -579,6 +579,121 @@ fn safety_uncertainty_needs_intervention_without_adapter_execution() {
 }
 
 #[test]
+fn safety_remaining_denial_branches_prevent_adapter_execution() {
+    for (snapshot, reason, threshold_name) in [
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.altitude_m = Some(40.0);
+            (snapshot, "altitude_limit_exceeded", Some("max_altitude_m"))
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.privacy_zone_active = Some(true);
+            (snapshot, "privacy_zone_active", None)
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.proximity_m = Some(0.5);
+            (snapshot, "proximity_below_minimum", Some("min_proximity_m"))
+        },
+    ] {
+        let tenant_access = Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        });
+        let mut gateway = VerifiedActionGateway::new(tenant_access);
+        let adapter = Arc::new(CountingAdapter::default());
+        gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+        gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+        let outcome = gateway.submit(physical_request()).expect("outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert!(outcome.verification.reasons.contains(&reason.to_string()));
+        if let Some(threshold_name) = threshold_name {
+            assert_eq!(
+                outcome.verification.artifacts["evidence"]["thresholds"][0]["name"].as_str(),
+                Some(threshold_name)
+            );
+        }
+        assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    }
+}
+
+#[test]
+fn safety_uncertain_battery_and_geofence_fail_closed_before_adapter_execution() {
+    for (snapshot, check_name, zone_count) in [
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.battery_percent = None;
+            (snapshot, "battery", 0)
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.current_zone = None;
+            (snapshot, "geofence", 1)
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.emergency_stop_engaged = None;
+            (snapshot, "emergency_stop", 0)
+        },
+    ] {
+        let tenant_access = Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        });
+        let mut gateway = VerifiedActionGateway::new(tenant_access);
+        let adapter = Arc::new(CountingAdapter::default());
+        gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+        gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+        let outcome = gateway.submit(physical_request()).expect("outcome");
+
+        assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+        assert!(outcome
+            .verification
+            .reasons
+            .contains(&"verifier_uncertainty".to_string()));
+        assert_eq!(
+            outcome.verification.artifacts["evidence"]["check"].as_str(),
+            Some(check_name)
+        );
+        assert_eq!(
+            outcome.verification.artifacts["evidence"]["zone_refs"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            zone_count
+        );
+        assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    }
+}
+
+#[test]
+fn unknown_high_level_physical_action_is_denied_before_adapter_lookup() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let gateway = VerifiedActionGateway::new(tenant_access);
+    let mut request = physical_request();
+    request.action.name = "spin_in_place".to_string();
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"unknown_physical_action".to_string()));
+    assert_eq!(
+        outcome.verification.artifacts["matched_policy"].as_str(),
+        Some("high_level_physical_actions_only")
+    );
+}
+
+#[test]
 fn missing_required_safety_verifier_fails_closed_without_adapter_execution() {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
