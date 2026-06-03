@@ -30,6 +30,13 @@
 - Added 0.04-S6 external governance adapter contracts for provider-neutral
   Harmony-compatible work-order bridging, approval grant/denial mapping,
   fail-closed adapter failure records, and trace-linked artifact references.
+- Added 0.04-S7 governance replay/audit support: inspect-only replay now
+  explains approval lifecycle events and `needs_approval` outcomes, and
+  `splendorctl audit export` emits a redacted `0.04-dev` audit package from
+  trace/state primitives with identity, work-order, policy, verifier, action,
+  state-node, trace-range, and scope-filter evidence. Replay/audit inspection
+  now recomputes trace payload hashes, validates referenced state evidence, and
+  redacts credential-shaped replay output before emission.
 
 ### Explicitly not included
 
@@ -37,8 +44,9 @@
   integration, notification platform, approval workflow engine, escalation
   automation, kill-switch propagation, monitoring platform, UI dashboard,
   enterprise policy authoring product, Harmony admin/product implementation,
-  global policy consensus, production PKI/key management, or side-effect path
-  outside the Action Gateway.
+  global policy consensus, production PKI/key management, compliance
+  certification, long-term archival product, or side-effect path outside the
+  Action Gateway.
 
 ## 0.03-dev — Resident nodes + fleet execution foundation
 

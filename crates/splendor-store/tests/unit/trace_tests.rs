@@ -82,6 +82,22 @@ fn sqlite_trace_store_persists_records() {
 }
 
 #[test]
+fn sqlite_trace_store_read_only_opens_without_write_authority() {
+    let temp = NamedTempFile::new().expect("temp");
+    let store = SqliteTraceStore::open(temp.path()).expect("open");
+    TraceStore::append(&store, "run-1", serde_json::json!({"event": 1})).expect("append");
+    drop(store);
+
+    let read_only = SqliteTraceStore::open_read_only(temp.path()).expect("read only open");
+    let records = TraceStore::read(&read_only, "run-1").expect("read");
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        TraceStore::append(&read_only, "run-1", serde_json::json!({"event": 2})),
+        Err(TraceStoreError::Sqlite(_))
+    ));
+}
+
+#[test]
 fn sqlite_trace_store_missing_run() {
     let temp = NamedTempFile::new().expect("temp");
     let store = SqliteTraceStore::open(temp.path()).expect("open");

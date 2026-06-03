@@ -1,11 +1,14 @@
 use super::*;
 use splendor_store::{SqliteStateStore, StateData, StateMetadata, StateStore};
 use splendor_types::{
-    Action, ActionId, AgentId, CircuitBreakerState, ContentHash, EscalationContext,
-    EscalationDecision, EscalationScope, EscalationTrigger, Feedback, MessageId,
+    Action, ActionId, AgentId, ApprovalDecision, ApprovalId, ApprovalTraceContext,
+    CircuitBreakerId, CircuitBreakerState, ContentHash, EscalationContext, EscalationDecision,
+    EscalationId, EscalationScope, EscalationTrigger, Feedback, GovernanceIssuer,
+    GovernanceObjectRef, GovernanceScope, GovernanceState, GovernanceTraceLink,
+    GovernanceTransition, GovernanceTransitionRejection, InterventionId, KillSwitchId, MessageId,
     MessageTraceContext, Percept, PerceptProvenance, Reward, RunId, SideEffectClass, SnapshotId,
-    StateHandoffTraceContext, StateReferenceMode, TenantId, TraceEvent, TraceEventId,
-    TraceEventKind, TraceId, VerificationResult,
+    StateHandoffTraceContext, StateReferenceMode, TenantId, TickId, TraceEvent, TraceEventId,
+    TraceEventKind, TraceId, TraceIdentityContext, VerificationResult,
 };
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
@@ -111,6 +114,55 @@ fn fixed_agent_id(value: u128) -> AgentId {
 
 fn fixed_message_id(value: u128) -> MessageId {
     Uuid::from_u128(value).into()
+}
+
+fn fixed_action_id(value: u128) -> ActionId {
+    Uuid::from_u128(value).into()
+}
+
+fn fixed_approval_id(value: u128) -> ApprovalId {
+    Uuid::from_u128(value).into()
+}
+
+fn fixed_escalation_id(value: u128) -> EscalationId {
+    Uuid::from_u128(value).into()
+}
+
+fn fixed_intervention_id(value: u128) -> InterventionId {
+    Uuid::from_u128(value).into()
+}
+
+fn fixed_circuit_breaker_id(value: u128) -> CircuitBreakerId {
+    Uuid::from_u128(value).into()
+}
+
+fn fixed_kill_switch_id(value: u128) -> KillSwitchId {
+    Uuid::from_u128(value).into()
+}
+
+fn governance_transition(
+    object: GovernanceObjectRef,
+    scope: GovernanceScope,
+    from: Option<GovernanceState>,
+    to: GovernanceState,
+    run_id: &RunId,
+    sequence: u64,
+) -> GovernanceTransition {
+    GovernanceTransition::try_new(
+        object,
+        scope,
+        from,
+        to,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(sequence as i64),
+        format!("governance transition {sequence}"),
+        GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        GovernanceTraceLink::new(
+            TraceEventId::from_run_sequence(run_id, sequence),
+            Some(run_id.clone()),
+        ),
+        Default::default(),
+    )
+    .expect("governance transition")
 }
 
 fn message_context(
@@ -331,6 +383,55 @@ fn parse_args_accepts_replay() {
 }
 
 #[test]
+fn parse_args_accepts_audit_export_filters() {
+    let command = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--state-db".to_string(),
+        "/tmp/state.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+        "--tenant".to_string(),
+        "tenant-1".to_string(),
+        "--agent".to_string(),
+        "agent-1".to_string(),
+        "--action".to_string(),
+        "action-1".to_string(),
+        "--adapter".to_string(),
+        "adapter-1".to_string(),
+        "--node".to_string(),
+        "node-1".to_string(),
+        "--instance".to_string(),
+        "instance-1".to_string(),
+        "--fleet".to_string(),
+        "fleet-1".to_string(),
+    ])
+    .expect("parse args");
+    match command {
+        Command::AuditExport {
+            trace_db_path,
+            state_db_path,
+            run_id,
+            filters,
+        } => {
+            assert_eq!(trace_db_path, PathBuf::from("/tmp/trace.db"));
+            assert_eq!(state_db_path, PathBuf::from("/tmp/state.db"));
+            assert_eq!(run_id, "run-1");
+            assert_eq!(filters.tenant.as_deref(), Some("tenant-1"));
+            assert_eq!(filters.agent.as_deref(), Some("agent-1"));
+            assert_eq!(filters.action.as_deref(), Some("action-1"));
+            assert_eq!(filters.adapter.as_deref(), Some("adapter-1"));
+            assert_eq!(filters.node.as_deref(), Some("node-1"));
+            assert_eq!(filters.instance.as_deref(), Some("instance-1"));
+            assert_eq!(filters.fleet.as_deref(), Some("fleet-1"));
+        }
+        _ => panic!("unexpected command"),
+    }
+}
+
+#[test]
 fn parse_args_accepts_run() {
     let command = parse_args(vec![
         "run".to_string(),
@@ -399,6 +500,49 @@ fn parse_args_rejects_unknown_state_subcommand() {
 }
 
 #[test]
+fn parse_args_rejects_state_and_trace_help_or_unknown_arguments() {
+    let error = parse_args(vec!["state".to_string()]).expect_err("missing state subcommand");
+    assert!(error.contains("splendorctl"));
+    let error = parse_args(vec![
+        "state".to_string(),
+        "head".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("state help");
+    assert!(error.contains("splendorctl"));
+    let error = parse_args(vec![
+        "state".to_string(),
+        "head".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+        "--unknown".to_string(),
+    ])
+    .expect_err("unknown state arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(vec![
+        "trace".to_string(),
+        "export".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("trace help");
+    assert!(error.contains("splendorctl"));
+    let error = parse_args(vec![
+        "trace".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+        "--unknown".to_string(),
+    ])
+    .expect_err("unknown trace arg");
+    assert!(error.contains("Unknown argument"));
+}
+
+#[test]
 fn parse_args_rejects_unknown_replay_argument() {
     let error = parse_args(vec![
         "replay".to_string(),
@@ -412,6 +556,92 @@ fn parse_args_rejects_unknown_replay_argument() {
     ])
     .expect_err("error");
     assert!(error.contains("Unknown argument"));
+}
+
+#[test]
+fn parse_args_rejects_audit_export_error_paths() {
+    let error = parse_args(vec!["audit".to_string()]).expect_err("missing subcommand");
+    assert!(error.contains("splendorctl"));
+
+    let error = parse_args(vec!["audit".to_string(), "nope".to_string()])
+        .expect_err("unknown audit subcommand");
+    assert!(error.contains("Unknown audit subcommand"));
+
+    let error = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("audit help");
+    assert!(error.contains("splendorctl"));
+
+    let error = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--state-db".to_string(),
+        "/tmp/state.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+        "--unknown".to_string(),
+    ])
+    .expect_err("unknown audit argument");
+    assert!(error.contains("Unknown argument"));
+
+    for flag in [
+        "--db",
+        "--state-db",
+        "--run",
+        "--tenant",
+        "--agent",
+        "--action",
+        "--adapter",
+        "--node",
+        "--instance",
+        "--fleet",
+    ] {
+        let error = parse_args(vec![
+            "audit".to_string(),
+            "export".to_string(),
+            flag.to_string(),
+        ])
+        .expect_err("missing audit flag value");
+        assert!(error.contains(&format!("Missing value for {flag}")));
+    }
+
+    let error = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--state-db".to_string(),
+        "/tmp/state.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+    ])
+    .expect_err("missing audit db");
+    assert!(error.contains("Missing required --db"));
+
+    let error = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--run".to_string(),
+        "run-1".to_string(),
+    ])
+    .expect_err("missing audit state db");
+    assert!(error.contains("Missing required --state-db"));
+
+    let error = parse_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        "/tmp/trace.db".to_string(),
+        "--state-db".to_string(),
+        "/tmp/state.db".to_string(),
+    ])
+    .expect_err("missing audit run");
+    assert!(error.contains("Missing required --run"));
 }
 
 #[test]
@@ -505,6 +735,77 @@ fn replay_errors_when_missing_db() {
     let state_db = PathBuf::from("/tmp/missing-state.db");
     let error = replay_run(&trace_db, &state_db, "run-1", None, false).expect_err("error");
     assert!(error.contains("Trace database not found"));
+}
+
+#[test]
+fn replay_errors_when_state_store_or_requested_snapshot_is_missing() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let missing_state_path = dir.path().join("missing-state.db");
+    let trace_store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let run_id = RunId::new();
+    for event in [
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            OffsetDateTime::UNIX_EPOCH,
+            TraceEventKind::LoopTickStarted { tick_id: 1 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            OffsetDateTime::UNIX_EPOCH,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 1,
+                integrity: None,
+            },
+        ),
+    ] {
+        TraceStore::append(
+            &trace_store,
+            &run_id.to_string(),
+            serde_json::to_value(event).unwrap(),
+        )
+        .expect("append");
+    }
+
+    let error = replay_outputs_from_stores(
+        &trace_path,
+        &missing_state_path,
+        &run_id.to_string(),
+        None,
+        false,
+    )
+    .expect_err("missing state db");
+    assert!(error.contains("State database not found"));
+
+    let state_path = dir.path().join("state.db");
+    SqliteStateStore::open(&state_path).expect("state store");
+    let missing_snapshot = SnapshotId::from_hash(ContentHash::blake3(b"not-in-trace"));
+    let error = replay_outputs_from_stores(
+        &trace_path,
+        &state_path,
+        &run_id.to_string(),
+        Some(&missing_snapshot.to_string()),
+        false,
+    )
+    .expect_err("missing snapshot");
+    assert!(error.contains("not found in trace history"));
+}
+
+#[test]
+fn audit_export_errors_when_required_stores_are_missing() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_db = dir.path().join("missing-trace.db");
+    let state_db = dir.path().join("missing-state.db");
+    let error = audit_export_from_stores(&trace_db, &state_db, "run-1", AuditFilters::default())
+        .expect_err("missing trace db");
+    assert!(error.contains("Trace database not found"));
+
+    SqliteTraceStore::open(&trace_db).expect("trace store");
+    let error = audit_export_from_stores(&trace_db, &state_db, "run-1", AuditFilters::default())
+        .expect_err("missing state db");
+    assert!(error.contains("State database not found"));
 }
 
 #[test]
@@ -1008,6 +1309,1485 @@ fn replay_reports_circuit_breaker_denial_scope() {
 }
 
 #[test]
+fn replay_explains_approval_lifecycle_and_final_outcomes_without_side_effects() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x140);
+    let tenant_id = TenantId::from(Uuid::from_u128(0x240));
+    let agent_id = fixed_agent_id(0x241);
+    let action_id = fixed_action_id(0x340);
+    let approval_id = fixed_approval_id(0x440);
+    let action = Action {
+        name: "artifact.publish".to_string(),
+        params: serde_json::json!({"artifact_id": "artifact:weekly"}),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: vec!["artifact.publish".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let approval = ApprovalTraceContext {
+        approval_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: action.name.clone(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("CFO approval required".to_string()),
+        policy_id: Some("approval_high_risk_publish".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let required = VerificationResult {
+        allowed: false,
+        reasons: vec!["approval_required".to_string()],
+        artifacts: serde_json::json!({
+            "approval": {"policy_id": "approval_high_risk_publish"},
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "run_id": run_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": action.name,
+                "adapter": "artifact-store"
+            }
+        }),
+    };
+    let denied = VerificationResult {
+        allowed: false,
+        reasons: vec!["approval_denied".to_string()],
+        artifacts: serde_json::json!({"context": {"adapter": "artifact-store"}}),
+    };
+    let action_identity = TraceIdentityContext::new(run_id.clone())
+        .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+        .with_tick_id(TickId::from(1))
+        .with_action_id(action_id.clone());
+    let timestamp = OffsetDateTime::UNIX_EPOCH;
+    let events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 1 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            timestamp,
+            TraceEventKind::ApprovalRequested {
+                approval: approval.clone(),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            2,
+            timestamp,
+            TraceEventKind::ActionNeedsApproval {
+                action: action.clone(),
+                result: required.clone(),
+            },
+        )
+        .expect("needs approval identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            3,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 1,
+                integrity: None,
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            4,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 2 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            5,
+            timestamp,
+            TraceEventKind::ApprovalGranted {
+                approval: ApprovalTraceContext {
+                    decision: Some(ApprovalDecision::Granted),
+                    reason: Some("approved by CFO".to_string()),
+                    issued_at: Some(timestamp),
+                    ..approval.clone()
+                },
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone().with_tick_id(TickId::from(2)),
+            6,
+            timestamp,
+            TraceEventKind::ActionExecuted {
+                action: action.clone(),
+                outcome: serde_json::json!({"published": true}),
+            },
+        )
+        .expect("executed identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            7,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 2,
+                integrity: None,
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            8,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 3 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            9,
+            timestamp,
+            TraceEventKind::ApprovalDenied {
+                approval: ApprovalTraceContext {
+                    decision: Some(ApprovalDecision::Denied),
+                    reason: Some("denied by CFO".to_string()),
+                    issued_at: Some(timestamp),
+                    ..approval.clone()
+                },
+                reason: "denied by CFO".to_string(),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone().with_tick_id(TickId::from(3)),
+            10,
+            timestamp,
+            TraceEventKind::ActionDenied {
+                action: action.clone(),
+                result: denied.clone(),
+            },
+        )
+        .expect("denied identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            11,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 3,
+                integrity: None,
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            12,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 4 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            13,
+            timestamp,
+            TraceEventKind::ApprovalExpired {
+                approval: approval.clone(),
+                reason: "approval evidence expired".to_string(),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.with_tick_id(TickId::from(4)),
+            14,
+            timestamp,
+            TraceEventKind::ActionDenied {
+                action,
+                result: VerificationResult {
+                    allowed: false,
+                    reasons: vec!["approval_expired".to_string()],
+                    artifacts: serde_json::json!({"context": {"adapter": "artifact-store"}}),
+                },
+            },
+        )
+        .expect("expired denial identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            15,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 4,
+                integrity: None,
+            },
+        ),
+    ];
+
+    let outputs = collect_replay_outputs(
+        &events,
+        &state_store,
+        &run_id.to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("replay outputs");
+    let values = outputs
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("json values");
+    let replay_start = values
+        .iter()
+        .find(|value| value["type"] == "replay_start")
+        .expect("replay start");
+    assert_eq!(replay_start["side_effects_replayed"].as_bool(), Some(false));
+    let ticks = values
+        .iter()
+        .filter(|value| value["type"] == "tick")
+        .collect::<Vec<_>>();
+    assert_eq!(ticks.len(), 4);
+    assert_eq!(ticks[0]["actions"][0]["status"], "needs_approval");
+    assert_eq!(ticks[1]["actions"][0]["status"], "executed");
+    assert_eq!(ticks[2]["actions"][0]["status"], "denied");
+    assert_eq!(ticks[3]["actions"][0]["status"], "denied");
+    let lifecycles = values
+        .iter()
+        .find(|value| value["type"] == "causal_graph")
+        .expect("causal graph")["approval_events"]
+        .as_array()
+        .expect("approval events")
+        .iter()
+        .map(|value| value["lifecycle"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycles,
+        vec!["requested", "granted", "denied", "expired"]
+    );
+}
+
+#[test]
+fn replay_output_redacts_sensitive_values_and_snapshot_bytes() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x141);
+    let tenant_id = TenantId::from(Uuid::from_u128(0x242));
+    let agent_id = fixed_agent_id(0x243);
+    let action_id = fixed_action_id(0x341);
+    let approval_id = fixed_approval_id(0x441);
+    let timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(1);
+    let action = Action {
+        name: "artifact.publish".to_string(),
+        params: serde_json::json!({
+            "artifact_id": "artifact:weekly",
+            "authorization": "Bearer raw-replay-action-token",
+            "nested": {"client_secret": "raw-replay-secret"}
+        }),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: vec!["artifact.publish".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let approval = ApprovalTraceContext {
+        approval_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: action.name.clone(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("token=raw-replay-approval-token".to_string()),
+        policy_id: Some("approval_publish_high".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: Some(timestamp + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let verification = VerificationResult {
+        allowed: false,
+        reasons: vec!["approval_required".to_string()],
+        artifacts: serde_json::json!({
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "run_id": run_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": action.name,
+                "adapter": "artifact-store"
+            },
+            "credential": "raw-replay-verifier-token"
+        }),
+    };
+    let state_ref = StateStore::put_state(
+        &state_store,
+        StateData {
+            bytes: b"state contains raw-replay-state-secret".to_vec(),
+            content_type: Some("text/plain".to_string()),
+        },
+    )
+    .expect("put state");
+    let state_node_id = StateStore::commit_node(
+        &state_store,
+        Vec::new(),
+        state_ref,
+        StateMetadata {
+            created_at: timestamp,
+            label: Some("state token=raw-replay-metadata-token".to_string()),
+            tenant_id: Some(tenant_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            run_id: Some(run_id.clone()),
+            trace_event_id: Some(TraceEventId::from_run_sequence(&run_id, 3)),
+        },
+    )
+    .expect("commit state");
+    let snapshot_id = StateStore::snapshot(&state_store, &state_node_id).expect("snapshot");
+    let action_identity = TraceIdentityContext::new(run_id.clone())
+        .with_tenant_agent(tenant_id, agent_id)
+        .with_tick_id(TickId::from(1))
+        .with_action_id(action_id);
+    let events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 1 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            timestamp,
+            TraceEventKind::ApprovalRequested { approval },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity,
+            2,
+            timestamp,
+            TraceEventKind::ActionNeedsApproval {
+                action,
+                result: verification,
+            },
+        )
+        .expect("action identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            3,
+            timestamp,
+            TraceEventKind::StateCommitted {
+                state_hash: state_node_id.hash().clone(),
+                snapshot_id: Some(snapshot_id),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            4,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 1,
+                integrity: None,
+            },
+        ),
+    ];
+
+    let outputs = collect_replay_outputs(
+        &events,
+        &state_store,
+        &run_id.to_string(),
+        None,
+        None,
+        None,
+        true,
+    )
+    .expect("replay outputs");
+    let encoded = outputs
+        .iter()
+        .map(redacted_replay_output_value)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("redacted replay values")
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).expect("encoded value"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!encoded.contains("raw-replay-action-token"));
+    assert!(!encoded.contains("raw-replay-secret"));
+    assert!(!encoded.contains("raw-replay-approval-token"));
+    assert!(!encoded.contains("raw-replay-verifier-token"));
+    assert!(!encoded.contains("raw-replay-state-secret"));
+    assert!(!encoded.contains("raw-replay-metadata-token"));
+    assert!(encoded.contains("[REDACTED]"));
+}
+
+#[test]
+fn audit_export_includes_governance_fields_redacts_secrets_and_filters_scope() {
+    let trace_temp = NamedTempFile::new().expect("trace db");
+    let state_temp = NamedTempFile::new().expect("state db");
+    let trace_store = SqliteTraceStore::open(trace_temp.path()).expect("trace store");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x150);
+    let tenant_id = TenantId::from(Uuid::from_u128(0x250));
+    let agent_id = fixed_agent_id(0x251);
+    let action_id = fixed_action_id(0x350);
+    let approval_id = fixed_approval_id(0x450);
+    let fleet_id = splendor_types::FleetId::from(Uuid::from_u128(0x550));
+    let node_id = splendor_types::NodeId::from(Uuid::from_u128(0x551));
+    let instance_id = splendor_types::InstanceId::from(Uuid::from_u128(0x552));
+    let timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+    let action = Action {
+        name: "artifact.publish".to_string(),
+        params: serde_json::json!({
+            "artifact_id": "artifact:weekly",
+            "api_token": "raw-token-value",
+            "nested": {"client_secret": "super-secret"}
+        }),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: vec!["artifact.publish".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let state_ref = StateStore::put_state(
+        &state_store,
+        StateData {
+            bytes: b"published".to_vec(),
+            content_type: Some("text/plain".to_string()),
+        },
+    )
+    .expect("put state");
+    let state_metadata = StateMetadata {
+        created_at: timestamp,
+        label: Some("audit-state".to_string()),
+        tenant_id: Some(tenant_id.clone()),
+        agent_id: Some(agent_id.clone()),
+        run_id: Some(run_id.clone()),
+        trace_event_id: Some(TraceEventId::from_run_sequence(&run_id, 7)),
+    };
+    let state_node_id =
+        StateStore::commit_node(&state_store, Vec::new(), state_ref, state_metadata)
+            .expect("commit state");
+    let snapshot_id = StateStore::snapshot(&state_store, &state_node_id).expect("snapshot");
+
+    let mut scoped_identity = TraceIdentityContext::new(run_id.clone())
+        .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+        .with_tick_id(TickId::from(1));
+    scoped_identity.fleet_id = Some(fleet_id.clone());
+    scoped_identity.node_id = Some(node_id.clone());
+    scoped_identity.instance_id = Some(instance_id.clone());
+    let action_identity = scoped_identity.clone().with_action_id(action_id.clone());
+    let state_identity = scoped_identity
+        .clone()
+        .with_state_node_id(state_node_id.clone());
+    let approval = ApprovalTraceContext {
+        approval_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: action.name.clone(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("publication requires approval".to_string()),
+        policy_id: Some("approval_publish_high".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: Some(timestamp + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let verification = VerificationResult {
+        allowed: true,
+        reasons: Vec::new(),
+        artifacts: serde_json::json!({
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "run_id": run_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": action.name,
+                "adapter": "artifact-store"
+            },
+            "verifier_results": [
+                {"verifier": "approval", "allowed": true, "reason": "approval_granted"}
+            ],
+            "credential": {"bearer_token": "raw-token-value"}
+        }),
+    };
+    let events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            timestamp,
+            TraceEventKind::WorkOrderAccepted {
+                work_order_id: splendor_types::WorkOrderId::try_new("wo_audit")
+                    .expect("work order id"),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: Some(run_id.clone()),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            scoped_identity.clone(),
+            1,
+            timestamp,
+            TraceEventKind::PolicyBundleAccepted {
+                bundle: splendor_types::PolicyBundleTraceContext {
+                    policy_bundle_id: splendor_types::PolicyBundleId::try_new(
+                        "policy_bundle_finance",
+                    )
+                    .expect("policy id"),
+                    version: "policy-v7".to_string(),
+                    tenant_id: tenant_id.clone(),
+                    agent_id: Some(agent_id.clone()),
+                    expires_at: timestamp + time::Duration::hours(1),
+                    degraded_mode: splendor_types::PolicyDegradedMode::default(),
+                },
+            },
+        )
+        .expect("policy identity"),
+        TraceEvent::try_new_with_identity(
+            scoped_identity.clone(),
+            2,
+            timestamp,
+            TraceEventKind::LoopTickStarted { tick_id: 1 },
+        )
+        .expect("tick start identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            3,
+            timestamp,
+            TraceEventKind::ApprovalRequested {
+                approval: approval.clone(),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            4,
+            timestamp,
+            TraceEventKind::ActionVerificationCompleted {
+                action: action.clone(),
+                result: verification.clone(),
+            },
+        )
+        .expect("verification identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            5,
+            timestamp,
+            TraceEventKind::ApprovalGranted {
+                approval: ApprovalTraceContext {
+                    decision: Some(ApprovalDecision::Granted),
+                    reason: Some("approved by CFO".to_string()),
+                    issued_at: Some(timestamp),
+                    ..approval
+                },
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity,
+            6,
+            timestamp,
+            TraceEventKind::ActionExecuted {
+                action,
+                outcome: serde_json::json!({
+                    "published": true,
+                    "publication_token": "raw-token-value"
+                }),
+            },
+        )
+        .expect("executed identity"),
+        TraceEvent::try_new_with_identity(
+            state_identity,
+            7,
+            timestamp,
+            TraceEventKind::StateCommitted {
+                state_hash: state_node_id.hash().clone(),
+                snapshot_id: Some(snapshot_id),
+            },
+        )
+        .expect("state identity"),
+        TraceEvent::try_new_with_identity(
+            scoped_identity,
+            8,
+            timestamp,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 1,
+                integrity: None,
+            },
+        )
+        .expect("tick completed identity"),
+    ];
+    for event in events {
+        TraceStore::append(
+            &trace_store,
+            &run_id.to_string(),
+            serde_json::to_value(event).unwrap(),
+        )
+        .expect("append");
+    }
+
+    audit_export(
+        &trace_temp.path().to_path_buf(),
+        &state_temp.path().to_path_buf(),
+        &run_id.to_string(),
+        AuditFilters::default(),
+    )
+    .expect("audit export command");
+    run_with_args(vec![
+        "audit".to_string(),
+        "export".to_string(),
+        "--db".to_string(),
+        trace_temp.path().display().to_string(),
+        "--state-db".to_string(),
+        state_temp.path().display().to_string(),
+        "--run".to_string(),
+        run_id.to_string(),
+    ])
+    .expect("audit export through command parser");
+
+    let export = audit_export_from_stores(
+        &trace_temp.path().to_path_buf(),
+        &state_temp.path().to_path_buf(),
+        &run_id.to_string(),
+        AuditFilters::default(),
+    )
+    .expect("audit export");
+    let value = serde_json::to_value(&export).expect("audit json");
+    assert_eq!(value["schema_version"], "splendor.audit_export.v0.04-dev");
+    assert_eq!(value["side_effects_replayed"].as_bool(), Some(false));
+    assert_eq!(value["work_orders"][0]["work_order_id"], "wo_audit");
+    assert_eq!(value["policies"][0]["version"], "policy-v7");
+    assert_eq!(value["actions"][0]["status"], "executed");
+    assert_eq!(value["actions"][0]["adapter"], "artifact-store");
+    assert_eq!(
+        value["actions"][0]["verification_result"]["artifacts"]["verifier_results"][0]["verifier"],
+        "approval"
+    );
+    assert_eq!(
+        value["state_nodes"][0]["state_node_id"],
+        state_node_id.to_string()
+    );
+    assert_eq!(value["trace_range"]["first_sequence"].as_u64(), Some(0));
+    assert_eq!(value["trace_range"]["last_sequence"].as_u64(), Some(8));
+    let encoded = serde_json::to_string(&value).expect("encoded audit");
+    assert!(!encoded.contains("raw-token-value"));
+    assert!(!encoded.contains("super-secret"));
+    assert!(value["redaction"]["applied"].as_bool().unwrap());
+
+    let filtered = audit_export_from_stores(
+        &trace_temp.path().to_path_buf(),
+        &state_temp.path().to_path_buf(),
+        &run_id.to_string(),
+        AuditFilters {
+            tenant: Some(tenant_id.to_string()),
+            agent: Some(agent_id.to_string()),
+            action: Some(action_id.to_string()),
+            adapter: Some("artifact-store".to_string()),
+            node: Some(node_id.to_string()),
+            instance: Some(instance_id.to_string()),
+            fleet: Some(fleet_id.to_string()),
+            run: None,
+        },
+    )
+    .expect("filtered audit export");
+    let filtered_value = serde_json::to_value(&filtered).expect("filtered json");
+    assert_eq!(filtered_value["event_count"].as_u64(), Some(2));
+    assert_eq!(filtered_value["actions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        filtered_value["actions"][0]["action_name"],
+        "artifact.publish"
+    );
+}
+
+#[test]
+fn audit_export_covers_governance_event_matrix_and_filter_helpers() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x160);
+    let tenant_id = TenantId::from(Uuid::from_u128(0x260));
+    let agent_id = fixed_agent_id(0x261);
+    let action_id = fixed_action_id(0x360);
+    let approval_id = fixed_approval_id(0x460);
+    let timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(3);
+    let action = Action {
+        name: "write_file".to_string(),
+        params: serde_json::json!({
+            "path": "audit.txt",
+            "password": "do-not-export",
+            "privateKey": "raw-private-key",
+            "note": "raw-note-token"
+        }),
+        side_effect_class: SideEffectClass::Filesystem,
+        cost_estimate: None,
+        required_permissions: vec!["fs.write".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let action_identity = TraceIdentityContext::new(run_id.clone())
+        .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+        .with_tick_id(TickId::from(1))
+        .with_action_id(action_id.clone());
+    let approval = ApprovalTraceContext {
+        approval_id: approval_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: action.name.clone(),
+        adapter: Some("filesystem".to_string()),
+        decision: None,
+        reason: Some("operator approval required".to_string()),
+        policy_id: Some("approval_filesystem".to_string()),
+        risk_level: Some("medium".to_string()),
+        issued_at: None,
+        expires_at: Some(timestamp + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let verification = VerificationResult {
+        allowed: false,
+        reasons: vec!["approval_required".to_string()],
+        artifacts: serde_json::json!({
+            "requested": "filesystem",
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "run_id": run_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": action.name,
+                "adapter": "filesystem"
+            },
+            "authorization": "Bearer raw-secret"
+        }),
+    };
+    let denied_result = VerificationResult {
+        allowed: false,
+        reasons: vec!["policy_denied".to_string()],
+        artifacts: serde_json::json!({"context": {"adapter": "filesystem"}}),
+    };
+    let intervention_result = VerificationResult {
+        allowed: false,
+        reasons: vec!["needs_operator".to_string()],
+        artifacts: serde_json::json!({"context": {"adapter": "filesystem"}}),
+    };
+    let failed_result = VerificationResult {
+        allowed: true,
+        reasons: Vec::new(),
+        artifacts: serde_json::json!({"context": {"adapter": "filesystem"}}),
+    };
+
+    let state_ref = StateStore::put_state(
+        &state_store,
+        StateData {
+            bytes: b"audit-matrix".to_vec(),
+            content_type: None,
+        },
+    )
+    .expect("put state");
+    let state_node = StateStore::commit_node(
+        &state_store,
+        Vec::new(),
+        state_ref,
+        StateMetadata {
+            created_at: timestamp,
+            label: Some("raw-state-token".to_string()),
+            tenant_id: Some(tenant_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            run_id: Some(run_id.clone()),
+            trace_event_id: Some(TraceEventId::from_run_sequence(&run_id, 11)),
+        },
+    )
+    .expect("commit state");
+    let snapshot_id = StateStore::snapshot(&state_store, &state_node).expect("snapshot");
+
+    let policy_id =
+        splendor_types::PolicyBundleId::try_new("policy_matrix").expect("policy bundle id");
+    let breaker_context = splendor_types::CircuitBreakerTraceContext::try_new(
+        fixed_circuit_breaker_id(0x461),
+        splendor_types::CircuitBreakerScope::Adapter("filesystem".to_string()),
+        CircuitBreakerState::Tripped,
+        "filesystem outage",
+        "operator:test",
+        timestamp,
+    )
+    .expect("breaker tripped context");
+    let breaker_cleared = splendor_types::CircuitBreakerTraceContext::try_new(
+        fixed_circuit_breaker_id(0x462),
+        splendor_types::CircuitBreakerScope::Adapter("filesystem".to_string()),
+        CircuitBreakerState::Cleared,
+        "filesystem restored",
+        "operator:test",
+        timestamp,
+    )
+    .expect("breaker cleared context");
+    let escalation = EscalationContext {
+        trigger: EscalationTrigger::VerifierUncertainty,
+        threshold: 1,
+        observed_count: 1,
+        scope: EscalationScope::Action,
+        decision: EscalationDecision::Pause,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: Some("write_file".to_string()),
+        adapter: Some("filesystem".to_string()),
+        reason: "verifier unavailable".to_string(),
+        evidence: serde_json::json!({"source": "unit-test"}),
+        decided_at: timestamp,
+    };
+
+    let action_scope = GovernanceScope::Action {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: action_id.clone(),
+    };
+    let run_scope = GovernanceScope::Run {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+    };
+    let adapter_scope = GovernanceScope::Adapter {
+        tenant_id: Some(tenant_id.clone()),
+        adapter: "filesystem".to_string(),
+    };
+    let approval_ref = GovernanceObjectRef::Approval {
+        approval_id: fixed_approval_id(0x470),
+    };
+    let escalation_ref = GovernanceObjectRef::Escalation {
+        escalation_id: fixed_escalation_id(0x471),
+    };
+    let intervention_ref = GovernanceObjectRef::Intervention {
+        intervention_id: fixed_intervention_id(0x472),
+    };
+    let breaker_ref = GovernanceObjectRef::CircuitBreaker {
+        circuit_breaker_id: fixed_circuit_breaker_id(0x473),
+    };
+    let kill_ref = GovernanceObjectRef::KillSwitch {
+        kill_switch_id: fixed_kill_switch_id(0x474),
+    };
+
+    let mut events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            timestamp,
+            TraceEventKind::WorkOrderRejected {
+                work_order_id: Some(
+                    splendor_types::WorkOrderId::try_new("wo_rejected").expect("work order id"),
+                ),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(agent_id.clone()),
+                run_id: Some(run_id.clone()),
+                reason: "authorization=Bearer raw-work-order-secret".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            timestamp,
+            TraceEventKind::PolicyBundleRejected {
+                policy_bundle_id: Some(policy_id.clone()),
+                version: Some("v1".to_string()),
+                reason: "signature=raw-policy-signature".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            2,
+            timestamp,
+            TraceEventKind::PolicySyncFailed {
+                policy_bundle_id: Some(policy_id.clone()),
+                version: Some("v2".to_string()),
+                reason: "token=raw-sync-token".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            3,
+            timestamp,
+            TraceEventKind::PolicyExpired {
+                policy_bundle_id: policy_id.clone(),
+                version: "v3".to_string(),
+                action: Some("write_file".to_string()),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            4,
+            timestamp,
+            TraceEventKind::PolicyRevoked {
+                policy_bundle_id: policy_id,
+                version: "v4".to_string(),
+                reason: "secret=raw-revocation-secret".to_string(),
+            },
+        ),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            5,
+            timestamp,
+            TraceEventKind::ActionVerificationCompleted {
+                action: action.clone(),
+                result: verification.clone(),
+            },
+        )
+        .expect("verification identity"),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            6,
+            timestamp,
+            TraceEventKind::ActionNeedsApproval {
+                action: action.clone(),
+                result: verification.clone(),
+            },
+        )
+        .expect("needs approval identity"),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            7,
+            timestamp,
+            TraceEventKind::ActionDenied {
+                action: action.clone(),
+                result: denied_result.clone(),
+            },
+        )
+        .expect("denied identity"),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            8,
+            timestamp,
+            TraceEventKind::ActionNeedsIntervention {
+                action: action.clone(),
+                result: intervention_result.clone(),
+            },
+        )
+        .expect("intervention identity"),
+        TraceEvent::try_new_with_identity(
+            action_identity.clone(),
+            9,
+            timestamp,
+            TraceEventKind::ActionFailed {
+                action: action.clone(),
+                error: "Bearer raw-error-token".to_string(),
+                result: failed_result.clone(),
+            },
+        )
+        .expect("failed identity"),
+        TraceEvent::new(
+            run_id.clone(),
+            10,
+            timestamp,
+            TraceEventKind::StateCommitted {
+                state_hash: state_node.hash().clone(),
+                snapshot_id: Some(snapshot_id),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            11,
+            timestamp,
+            TraceEventKind::StateCommitted {
+                state_hash: ContentHash::blake3(b"metadata-less-state"),
+                snapshot_id: None,
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            12,
+            timestamp,
+            TraceEventKind::ApprovalDenied {
+                approval: ApprovalTraceContext {
+                    decision: Some(ApprovalDecision::Denied),
+                    reason: Some("token=raw-approval-token".to_string()),
+                    issued_at: Some(timestamp),
+                    ..approval.clone()
+                },
+                reason: "token=raw-approval-token".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            13,
+            timestamp,
+            TraceEventKind::ApprovalExpired {
+                approval: approval.clone(),
+                reason: "approval expired".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            14,
+            timestamp,
+            TraceEventKind::ApprovalRevoked {
+                approval: approval.clone(),
+                reason: "approval revoked".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            15,
+            timestamp,
+            TraceEventKind::RunPaused {
+                reason: Some("waiting for approval".to_string()),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            16,
+            timestamp,
+            TraceEventKind::RunResumed {
+                reason: Some("approval granted".to_string()),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            17,
+            timestamp,
+            TraceEventKind::EscalationTriggered { escalation },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            18,
+            timestamp,
+            TraceEventKind::CircuitBreakerTripped {
+                breaker: breaker_context,
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            19,
+            timestamp,
+            TraceEventKind::CircuitBreakerCleared {
+                breaker: breaker_cleared,
+            },
+        ),
+    ];
+
+    let transition_kinds = vec![
+        TraceEventKind::GovernanceApprovalRequested {
+            transition: governance_transition(
+                approval_ref.clone(),
+                action_scope.clone(),
+                None,
+                GovernanceState::Requested,
+                &run_id,
+                20,
+            ),
+        },
+        TraceEventKind::GovernanceApprovalGranted {
+            transition: governance_transition(
+                approval_ref.clone(),
+                action_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Granted,
+                &run_id,
+                21,
+            ),
+        },
+        TraceEventKind::GovernanceApprovalDenied {
+            transition: governance_transition(
+                approval_ref.clone(),
+                action_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Denied,
+                &run_id,
+                22,
+            ),
+        },
+        TraceEventKind::GovernanceApprovalExpired {
+            transition: governance_transition(
+                approval_ref.clone(),
+                action_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Expired,
+                &run_id,
+                23,
+            ),
+        },
+        TraceEventKind::GovernanceApprovalRevoked {
+            transition: governance_transition(
+                approval_ref,
+                action_scope,
+                Some(GovernanceState::Requested),
+                GovernanceState::Revoked,
+                &run_id,
+                24,
+            ),
+        },
+        TraceEventKind::EscalationOpened {
+            transition: governance_transition(
+                escalation_ref.clone(),
+                run_scope.clone(),
+                None,
+                GovernanceState::Open,
+                &run_id,
+                25,
+            ),
+        },
+        TraceEventKind::EscalationResolved {
+            transition: governance_transition(
+                escalation_ref.clone(),
+                run_scope.clone(),
+                Some(GovernanceState::Open),
+                GovernanceState::Resolved,
+                &run_id,
+                26,
+            ),
+        },
+        TraceEventKind::EscalationExpired {
+            transition: governance_transition(
+                escalation_ref.clone(),
+                run_scope.clone(),
+                Some(GovernanceState::Open),
+                GovernanceState::Expired,
+                &run_id,
+                27,
+            ),
+        },
+        TraceEventKind::EscalationRevoked {
+            transition: governance_transition(
+                escalation_ref,
+                run_scope.clone(),
+                Some(GovernanceState::Open),
+                GovernanceState::Revoked,
+                &run_id,
+                28,
+            ),
+        },
+        TraceEventKind::InterventionRequested {
+            transition: governance_transition(
+                intervention_ref.clone(),
+                run_scope.clone(),
+                None,
+                GovernanceState::Requested,
+                &run_id,
+                29,
+            ),
+        },
+        TraceEventKind::InterventionResolved {
+            transition: governance_transition(
+                intervention_ref.clone(),
+                run_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Resolved,
+                &run_id,
+                30,
+            ),
+        },
+        TraceEventKind::InterventionCancelled {
+            transition: governance_transition(
+                intervention_ref.clone(),
+                run_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Cancelled,
+                &run_id,
+                31,
+            ),
+        },
+        TraceEventKind::InterventionExpired {
+            transition: governance_transition(
+                intervention_ref.clone(),
+                run_scope.clone(),
+                Some(GovernanceState::Requested),
+                GovernanceState::Expired,
+                &run_id,
+                32,
+            ),
+        },
+        TraceEventKind::InterventionRevoked {
+            transition: governance_transition(
+                intervention_ref,
+                run_scope,
+                Some(GovernanceState::Requested),
+                GovernanceState::Revoked,
+                &run_id,
+                33,
+            ),
+        },
+        TraceEventKind::GovernanceCircuitBreakerTripped {
+            transition: governance_transition(
+                breaker_ref.clone(),
+                adapter_scope.clone(),
+                None,
+                GovernanceState::Active,
+                &run_id,
+                34,
+            ),
+        },
+        TraceEventKind::GovernanceCircuitBreakerCleared {
+            transition: governance_transition(
+                breaker_ref.clone(),
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Cleared,
+                &run_id,
+                35,
+            ),
+        },
+        TraceEventKind::GovernanceCircuitBreakerExpired {
+            transition: governance_transition(
+                breaker_ref.clone(),
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Expired,
+                &run_id,
+                36,
+            ),
+        },
+        TraceEventKind::GovernanceCircuitBreakerRevoked {
+            transition: governance_transition(
+                breaker_ref,
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Revoked,
+                &run_id,
+                37,
+            ),
+        },
+        TraceEventKind::KillSwitchActivated {
+            transition: governance_transition(
+                kill_ref.clone(),
+                adapter_scope.clone(),
+                None,
+                GovernanceState::Active,
+                &run_id,
+                38,
+            ),
+        },
+        TraceEventKind::KillSwitchCleared {
+            transition: governance_transition(
+                kill_ref.clone(),
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Cleared,
+                &run_id,
+                39,
+            ),
+        },
+        TraceEventKind::KillSwitchExpired {
+            transition: governance_transition(
+                kill_ref.clone(),
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Expired,
+                &run_id,
+                40,
+            ),
+        },
+        TraceEventKind::KillSwitchRevoked {
+            transition: governance_transition(
+                kill_ref.clone(),
+                adapter_scope.clone(),
+                Some(GovernanceState::Active),
+                GovernanceState::Revoked,
+                &run_id,
+                41,
+            ),
+        },
+        TraceEventKind::GovernanceTransitionRejected {
+            rejection: GovernanceTransitionRejection {
+                schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+                object: kill_ref,
+                scope: adapter_scope,
+                from: Some(GovernanceState::Revoked),
+                attempted: GovernanceState::Active,
+                reason: "invalid_governance_transition".to_string(),
+                rejected_at: timestamp,
+                issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+                trace: GovernanceTraceLink::new(
+                    TraceEventId::from_run_sequence(&run_id, 42),
+                    Some(run_id.clone()),
+                ),
+            },
+        },
+    ];
+    for (index, kind) in transition_kinds.into_iter().enumerate() {
+        events.push(TraceEvent::new(
+            run_id.clone(),
+            20 + index as u64,
+            timestamp,
+            kind,
+        ));
+    }
+
+    let export = collect_audit_export(
+        &events,
+        &state_store,
+        &run_id.to_string(),
+        AuditFilters::default(),
+    )
+    .expect("audit export");
+    let value = serde_json::to_value(&export).expect("audit json");
+    assert_eq!(value["work_orders"].as_array().unwrap().len(), 1);
+    assert_eq!(value["policies"].as_array().unwrap().len(), 4);
+    assert_eq!(value["actions"].as_array().unwrap().len(), 4);
+    assert_eq!(value["state_nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["state_nodes"][0]["state_node_id"],
+        state_node.to_string()
+    );
+
+    let governance_names = value["governance_events"]
+        .as_array()
+        .expect("governance events")
+        .iter()
+        .map(|event| event["event"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "approval.denied",
+        "approval.expired",
+        "approval.revoked",
+        "run.paused",
+        "run.resumed",
+        "action.denied",
+        "action.needs_approval",
+        "action.needs_intervention",
+        "escalation.triggered",
+        "circuit_breaker.tripped",
+        "circuit_breaker.cleared",
+        "governance.approval.requested",
+        "governance.approval.granted",
+        "governance.approval.denied",
+        "governance.approval.expired",
+        "governance.approval.revoked",
+        "governance.escalation.opened",
+        "governance.escalation.resolved",
+        "governance.escalation.expired",
+        "governance.escalation.revoked",
+        "governance.intervention.requested",
+        "governance.intervention.resolved",
+        "governance.intervention.cancelled",
+        "governance.intervention.expired",
+        "governance.intervention.revoked",
+        "governance.circuit_breaker.tripped",
+        "governance.circuit_breaker.cleared",
+        "governance.circuit_breaker.expired",
+        "governance.circuit_breaker.revoked",
+        "governance.kill_switch.activated",
+        "governance.kill_switch.cleared",
+        "governance.kill_switch.expired",
+        "governance.kill_switch.revoked",
+        "governance.transition.rejected",
+    ] {
+        assert!(governance_names.contains(expected), "missing {expected}");
+    }
+    let encoded = serde_json::to_string(&value).expect("encoded audit");
+    assert!(!encoded.contains("do-not-export"));
+    assert!(!encoded.contains("raw-secret"));
+    assert!(!encoded.contains("raw-private-key"));
+    assert!(!encoded.contains("raw-note-token"));
+    assert!(!encoded.contains("raw-work-order-secret"));
+    assert!(!encoded.contains("raw-policy-signature"));
+    assert!(!encoded.contains("raw-sync-token"));
+    assert!(!encoded.contains("raw-revocation-secret"));
+    assert!(!encoded.contains("raw-error-token"));
+    assert!(!encoded.contains("raw-state-token"));
+    assert!(!encoded.contains("raw-approval-token"));
+
+    let adapter_by_action = audit_adapter_index(&events);
+    assert!(AuditFilters {
+        tenant: Some(tenant_id.to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[5], &adapter_by_action));
+    assert!(AuditFilters {
+        agent: Some(agent_id.to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[5], &adapter_by_action));
+    assert!(AuditFilters {
+        action: Some(action_id.to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[12], &adapter_by_action));
+    assert!(AuditFilters {
+        adapter: Some("filesystem".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[13], &adapter_by_action));
+    assert!(!AuditFilters {
+        run: Some("other-run".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[0], &adapter_by_action));
+    assert!(!AuditFilters {
+        tenant: Some("other-tenant".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[5], &adapter_by_action));
+    assert!(!AuditFilters {
+        agent: Some("other-agent".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[5], &adapter_by_action));
+    assert!(!AuditFilters {
+        adapter: Some("http".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[7], &adapter_by_action));
+    assert!(!AuditFilters {
+        node: Some("missing-node".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[0], &adapter_by_action));
+    assert!(!AuditFilters {
+        instance: Some("missing-instance".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[0], &adapter_by_action));
+    assert!(!AuditFilters {
+        fleet: Some("missing-fleet".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&events[0], &adapter_by_action));
+
+    let started = TraceEvent::new(
+        run_id.clone(),
+        90,
+        timestamp,
+        TraceEventKind::ActionVerificationStarted {
+            action: action.clone(),
+        },
+    );
+    assert!(action_for_event(&started).is_some());
+    assert_eq!(audit_action_key(&started, &action), "action:write_file");
+    assert_eq!(
+        adapter_from_action_name("http.fetch").as_deref(),
+        Some("http")
+    );
+    assert!(adapter_from_action_name("unknown.action").is_none());
+    let fallback_event = TraceEvent::new(
+        run_id.clone(),
+        91,
+        timestamp,
+        TraceEventKind::ActionExecuted {
+            action: action.clone(),
+            outcome: serde_json::json!({}),
+        },
+    );
+    assert!(AuditFilters {
+        adapter: Some("filesystem".to_string()),
+        ..AuditFilters::default()
+    }
+    .matches(&fallback_event, &BTreeMap::new()));
+    let revoked_event = TraceEvent::new(
+        run_id,
+        92,
+        timestamp,
+        TraceEventKind::ApprovalRevoked {
+            approval,
+            reason: "revoked".to_string(),
+        },
+    );
+    assert_eq!(
+        replay_approval_event(&revoked_event)
+            .expect("approval validation")
+            .expect("revoked approval replay")
+            .lifecycle,
+        "revoked"
+    );
+    assert!(!is_permission_laundering_denial(&VerificationResult {
+        allowed: true,
+        reasons: Vec::new(),
+        artifacts: serde_json::json!({}),
+    }));
+}
+
+#[test]
 fn replay_rejects_message_context_run_mismatch() {
     let state_temp = NamedTempFile::new().expect("state db");
     let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
@@ -1074,6 +2854,464 @@ fn replay_rejects_child_run_parent_mismatch() {
 }
 
 #[test]
+fn replay_rejects_approval_context_run_mismatch() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let event_run_id = fixed_run_id(0x142);
+    let approval_run_id = fixed_run_id(0x143);
+    let approval = ApprovalTraceContext {
+        approval_id: fixed_approval_id(0x442),
+        tenant_id: TenantId::from(Uuid::from_u128(0x244)),
+        agent_id: fixed_agent_id(0x245),
+        run_id: approval_run_id,
+        action_id: Some(fixed_action_id(0x342)),
+        action_name: "artifact.publish".to_string(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("approval required".to_string()),
+        policy_id: Some("approval_publish_high".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: None,
+        revoked: false,
+    };
+    let event = TraceEvent::new(
+        event_run_id.clone(),
+        0,
+        OffsetDateTime::UNIX_EPOCH,
+        TraceEventKind::ApprovalRequested { approval },
+    );
+
+    let error = collect_replay_outputs(
+        &[event],
+        &state_store,
+        &event_run_id.to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect_err("approval run mismatch should fail");
+    assert!(error.contains("Approval trace run mismatch"));
+}
+
+#[test]
+fn audit_export_rejects_approval_context_run_mismatch() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let event_run_id = fixed_run_id(0x144);
+    let approval_run_id = fixed_run_id(0x145);
+    let approval = ApprovalTraceContext {
+        approval_id: fixed_approval_id(0x443),
+        tenant_id: TenantId::from(Uuid::from_u128(0x246)),
+        agent_id: fixed_agent_id(0x247),
+        run_id: approval_run_id,
+        action_id: None,
+        action_name: "artifact.publish".to_string(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("approval required".to_string()),
+        policy_id: Some("approval_publish_high".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: None,
+        revoked: false,
+    };
+    let event = TraceEvent::new(
+        event_run_id.clone(),
+        0,
+        OffsetDateTime::UNIX_EPOCH,
+        TraceEventKind::ApprovalRequested { approval },
+    );
+
+    let error = collect_audit_export(
+        &[event],
+        &state_store,
+        &event_run_id.to_string(),
+        AuditFilters::default(),
+    )
+    .expect_err("approval run mismatch should fail");
+    assert!(error.contains("Approval trace run mismatch"));
+}
+
+#[test]
+fn replay_and_audit_reject_state_snapshot_hash_mismatch() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x146);
+    let state_ref = StateStore::put_state(
+        &state_store,
+        StateData {
+            bytes: b"verified-state".to_vec(),
+            content_type: None,
+        },
+    )
+    .expect("put state");
+    let state_node_id = StateStore::commit_node(
+        &state_store,
+        Vec::new(),
+        state_ref,
+        StateMetadata::new(OffsetDateTime::UNIX_EPOCH, Some("state".to_string())),
+    )
+    .expect("commit state");
+    let snapshot_id = StateStore::snapshot(&state_store, &state_node_id).expect("snapshot");
+    let events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            0,
+            OffsetDateTime::UNIX_EPOCH,
+            TraceEventKind::LoopTickStarted { tick_id: 1 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            OffsetDateTime::UNIX_EPOCH,
+            TraceEventKind::StateCommitted {
+                state_hash: ContentHash::blake3(b"wrong-state-node"),
+                snapshot_id: Some(snapshot_id),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            2,
+            OffsetDateTime::UNIX_EPOCH,
+            TraceEventKind::LoopTickCompleted {
+                tick_id: 1,
+                integrity: None,
+            },
+        ),
+    ];
+
+    let replay_error = collect_replay_outputs(
+        &events,
+        &state_store,
+        &run_id.to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect_err("state hash mismatch should fail replay");
+    assert!(replay_error.contains("State commit hash mismatch"));
+
+    let audit_error = collect_audit_export(
+        &events,
+        &state_store,
+        &run_id.to_string(),
+        AuditFilters::default(),
+    )
+    .expect_err("state hash mismatch should fail audit");
+    assert!(audit_error.contains("State commit hash mismatch"));
+}
+
+#[test]
+fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
+    let state_temp = NamedTempFile::new().expect("state db");
+    let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
+    let run_id = fixed_run_id(0x147);
+    let other_run_id = fixed_run_id(0x148);
+    let tenant_id = TenantId::from(Uuid::from_u128(0x248));
+    let agent_id = fixed_agent_id(0x249);
+    let action_id = fixed_action_id(0x343);
+    let timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(2);
+    let state_ref = StateStore::put_state(
+        &state_store,
+        StateData {
+            bytes: b"verified-state".to_vec(),
+            content_type: None,
+        },
+    )
+    .expect("put state");
+    let state_node_id = StateStore::commit_node(
+        &state_store,
+        Vec::new(),
+        state_ref,
+        StateMetadata::new(timestamp, Some("verified".to_string())),
+    )
+    .expect("commit state");
+    let snapshot_id = StateStore::snapshot(&state_store, &state_node_id).expect("snapshot");
+    assert_eq!(
+        load_verified_state_snapshot(&state_store, &snapshot_id, Some(state_node_id.hash()))
+            .expect("verified snapshot")
+            .node_id,
+        state_node_id
+    );
+    assert_eq!(
+        load_verified_state_node(&state_store, &state_node_id, Some(state_node_id.hash()))
+            .expect("verified node")
+            .id,
+        state_node_id
+    );
+    let missing_snapshot_id = SnapshotId::from_bytes(b"missing-snapshot");
+    assert!(
+        load_verified_state_snapshot(&state_store, &missing_snapshot_id, None)
+            .expect_err("missing snapshot")
+            .contains("Failed to load state snapshot")
+    );
+    let missing_state_node =
+        splendor_types::StateNodeId::from_hash(ContentHash::blake3(b"missing"));
+    assert!(
+        load_verified_state_node(&state_store, &missing_state_node, None)
+            .expect_err("missing state node")
+            .contains("Failed to load state node")
+    );
+
+    let approval = ApprovalTraceContext {
+        approval_id: fixed_approval_id(0x444),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: "artifact.publish".to_string(),
+        adapter: Some("artifact-store".to_string()),
+        decision: None,
+        reason: Some("approval required".to_string()),
+        policy_id: Some("approval_publish_high".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: None,
+        expires_at: None,
+        revoked: false,
+    };
+    let identity = TraceIdentityContext::new(run_id.clone())
+        .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+        .with_action_id(action_id.clone());
+    let event = TraceEvent::try_new_with_identity(
+        identity.clone(),
+        0,
+        timestamp,
+        TraceEventKind::ApprovalRequested {
+            approval: approval.clone(),
+        },
+    )
+    .expect("approval event");
+    validate_approval_trace_context(&event, &approval).expect("approval identity matches");
+    validate_run_match(&event, &run_id, "Approval").expect("run matches");
+    assert!(validate_run_match(&event, &other_run_id, "Approval")
+        .expect_err("run mismatch")
+        .contains("Approval trace run mismatch"));
+
+    let tenant_mismatch = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(TenantId::from(Uuid::from_u128(0x999)), agent_id.clone()),
+        1,
+        timestamp,
+        TraceEventKind::ApprovalRequested {
+            approval: approval.clone(),
+        },
+    )
+    .expect("tenant mismatch event");
+    assert!(validate_approval_trace_context(&tenant_mismatch, &approval)
+        .expect_err("tenant mismatch")
+        .contains("Approval trace tenant mismatch"));
+
+    let agent_mismatch = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(tenant_id.clone(), fixed_agent_id(0x998)),
+        2,
+        timestamp,
+        TraceEventKind::ApprovalRequested {
+            approval: approval.clone(),
+        },
+    )
+    .expect("agent mismatch event");
+    assert!(validate_approval_trace_context(&agent_mismatch, &approval)
+        .expect_err("agent mismatch")
+        .contains("Approval trace agent mismatch"));
+
+    let action_mismatch = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+            .with_action_id(fixed_action_id(0x997)),
+        3,
+        timestamp,
+        TraceEventKind::ApprovalRequested {
+            approval: approval.clone(),
+        },
+    )
+    .expect("action mismatch event");
+    assert!(validate_approval_trace_context(&action_mismatch, &approval)
+        .expect_err("action mismatch")
+        .contains("Approval trace action mismatch"));
+
+    let transition = governance_transition(
+        GovernanceObjectRef::Approval {
+            approval_id: fixed_approval_id(0x445),
+        },
+        GovernanceScope::Run {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: other_run_id.clone(),
+        },
+        None,
+        GovernanceState::Requested,
+        &other_run_id,
+        4,
+    );
+    let transition_event = TraceEvent::new(
+        run_id.clone(),
+        4,
+        timestamp,
+        TraceEventKind::GovernanceApprovalRequested { transition },
+    );
+    assert!(validate_governance_trace_context(&transition_event)
+        .expect_err("transition run mismatch")
+        .contains("Governance transition trace run mismatch"));
+
+    let scope_only_transition = splendor_types::GovernanceTransition {
+        schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+        object: GovernanceObjectRef::Approval {
+            approval_id: fixed_approval_id(0x447),
+        },
+        scope: GovernanceScope::Run {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: other_run_id.clone(),
+        },
+        from: None,
+        to: GovernanceState::Requested,
+        occurred_at: timestamp,
+        reason: "scope-only run mismatch".to_string(),
+        issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        trace: GovernanceTraceLink::new(TraceEventId::from_run_sequence(&run_id, 6), None),
+        extensions: Default::default(),
+    };
+    let scope_only_event = TraceEvent::new(
+        run_id.clone(),
+        6,
+        timestamp,
+        TraceEventKind::GovernanceApprovalRequested {
+            transition: scope_only_transition,
+        },
+    );
+    assert!(validate_governance_trace_context(&scope_only_event)
+        .expect_err("scope run mismatch")
+        .contains("Governance transition trace run mismatch"));
+
+    let tenant_scope_mismatch = splendor_types::GovernanceTransition {
+        schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+        object: GovernanceObjectRef::Approval {
+            approval_id: fixed_approval_id(0x449),
+        },
+        scope: GovernanceScope::Tenant {
+            tenant_id: TenantId::from(Uuid::from_u128(0x995)),
+        },
+        from: None,
+        to: GovernanceState::Requested,
+        occurred_at: timestamp,
+        reason: "tenant mismatch".to_string(),
+        issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        trace: GovernanceTraceLink::new(TraceEventId::from_run_sequence(&run_id, 8), None),
+        extensions: Default::default(),
+    };
+    let tenant_scope_event = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(tenant_id.clone(), agent_id.clone()),
+        8,
+        timestamp,
+        TraceEventKind::GovernanceApprovalRequested {
+            transition: tenant_scope_mismatch,
+        },
+    )
+    .expect("tenant scope event");
+    assert!(validate_governance_trace_context(&tenant_scope_event)
+        .expect_err("scope tenant mismatch")
+        .contains("Governance transition tenant mismatch"));
+
+    let agent_scope_mismatch = splendor_types::GovernanceTransition {
+        schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+        object: GovernanceObjectRef::Approval {
+            approval_id: fixed_approval_id(0x450),
+        },
+        scope: GovernanceScope::Agent {
+            tenant_id: tenant_id.clone(),
+            agent_id: fixed_agent_id(0x994),
+        },
+        from: None,
+        to: GovernanceState::Requested,
+        occurred_at: timestamp,
+        reason: "agent mismatch".to_string(),
+        issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        trace: GovernanceTraceLink::new(TraceEventId::from_run_sequence(&run_id, 9), None),
+        extensions: Default::default(),
+    };
+    let agent_scope_event = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(tenant_id.clone(), agent_id.clone()),
+        9,
+        timestamp,
+        TraceEventKind::GovernanceApprovalRequested {
+            transition: agent_scope_mismatch,
+        },
+    )
+    .expect("agent scope event");
+    assert!(validate_governance_trace_context(&agent_scope_event)
+        .expect_err("scope agent mismatch")
+        .contains("Governance transition agent mismatch"));
+
+    let action_scope_mismatch = splendor_types::GovernanceTransition {
+        schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+        object: GovernanceObjectRef::Approval {
+            approval_id: fixed_approval_id(0x448),
+        },
+        scope: GovernanceScope::Action {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            action_id: fixed_action_id(0x996),
+        },
+        from: None,
+        to: GovernanceState::Requested,
+        occurred_at: timestamp,
+        reason: "action mismatch".to_string(),
+        issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        trace: GovernanceTraceLink::new(
+            TraceEventId::from_run_sequence(&run_id, 7),
+            Some(run_id.clone()),
+        ),
+        extensions: Default::default(),
+    };
+    let action_scope_event = TraceEvent::try_new_with_identity(
+        identity,
+        7,
+        timestamp,
+        TraceEventKind::GovernanceApprovalRequested {
+            transition: action_scope_mismatch,
+        },
+    )
+    .expect("action scope event");
+    assert!(validate_governance_trace_context(&action_scope_event)
+        .expect_err("scope action mismatch")
+        .contains("Governance transition action mismatch"));
+
+    let rejection = GovernanceTransitionRejection {
+        schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
+        object: GovernanceObjectRef::KillSwitch {
+            kill_switch_id: fixed_kill_switch_id(0x446),
+        },
+        scope: GovernanceScope::Run {
+            tenant_id,
+            agent_id,
+            run_id: other_run_id.clone(),
+        },
+        from: None,
+        attempted: GovernanceState::Active,
+        reason: "invalid_governance_transition".to_string(),
+        rejected_at: timestamp,
+        issuer: GovernanceIssuer::new("operator:test", "unit-test").expect("issuer"),
+        trace: GovernanceTraceLink::new(TraceEventId::from_run_sequence(&other_run_id, 5), None),
+    };
+    let rejection_event = TraceEvent::new(
+        run_id,
+        5,
+        timestamp,
+        TraceEventKind::GovernanceTransitionRejected { rejection },
+    );
+    assert!(validate_governance_trace_context(&rejection_event)
+        .expect_err("rejection run mismatch")
+        .contains("Governance transition rejection trace run mismatch"));
+}
+
+#[test]
 fn replay_errors_on_corrupted_trace_sequence() {
     let trace_temp = NamedTempFile::new().expect("trace db");
     let state_temp = NamedTempFile::new().expect("state db");
@@ -1136,6 +3374,25 @@ fn decode_trace_records_rejects_prev_hash_mismatch() {
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("prev hash mismatch");
     assert!(error.contains("Trace integrity chain mismatch"));
+}
+
+#[test]
+fn decode_trace_records_rejects_payload_hash_mismatch() {
+    let run_id = RunId::new();
+    let mut records = valid_trace_records_for(&run_id);
+    let event = TraceEvent::new(
+        run_id.clone(),
+        0,
+        OffsetDateTime::now_utc(),
+        TraceEventKind::PolicyInvoked {
+            policy: "tampered-policy".to_string(),
+        },
+    );
+    records[0].payload = serde_json::to_value(event).expect("event");
+
+    let error = decode_and_validate_trace_records(&records, &run_id.to_string())
+        .expect_err("payload hash mismatch");
+    assert!(error.contains("Trace payload hash mismatch"));
 }
 
 #[test]
@@ -1211,6 +3468,15 @@ fn state_head_succeeds_with_state_committed_trace() {
     }
 
     state_head(&trace_temp.path().to_path_buf(), &run_id.to_string()).expect("state head");
+    run_with_args(vec![
+        "state".to_string(),
+        "head".to_string(),
+        "--db".to_string(),
+        trace_temp.path().display().to_string(),
+        "--run".to_string(),
+        run_id.to_string(),
+    ])
+    .expect("state head through command parser");
 }
 
 #[test]
@@ -1264,6 +3530,7 @@ fn usage_mentions_trace_export() {
     assert!(text.contains("trace export"));
     assert!(text.contains("state head"));
     assert!(text.contains("replay"));
+    assert!(text.contains("audit export"));
     assert!(text.contains("run"));
     assert!(text.contains("--version"));
 }
@@ -1822,7 +4089,7 @@ fn run_from_config_bad_work_order_signature_records_audit_without_starting_run()
     }
     let encoded = serde_json::to_string(&records[0].payload).expect("encoded audit");
     assert!(!encoded.contains("local-work-order-secret"));
-    assert!(!encoded.contains("bad-"));
+    assert!(!encoded.contains("\"signature\""));
 }
 
 #[test]
