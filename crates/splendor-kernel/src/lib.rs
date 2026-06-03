@@ -120,3 +120,7 @@ pub use trace_durability::{
 #[cfg(test)]
 #[path = "../tests/unit/cloud_helper_tests.rs"]
 mod cloud_helper_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/physical_simulation_harness_tests.rs"]
+mod physical_simulation_harness_tests;
