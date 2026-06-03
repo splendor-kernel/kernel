@@ -76,7 +76,7 @@
 
 ## Validation log
 
-- Pending: baseline compile/test on loop branch after tracker commit.
+- 2026-06-03: baseline `cargo test --workspace` on loop branch passed after tracker commit (all workspace/unit/integration/doc tests completed successfully; full output captured by tooling at `/Users/db/.local/share/opencode/tool-output/tool_e8ded165a001qEHhzwbsgWJVGm`).
 - Pending: per-sub-agent validation before merging each PR.
 - Pending: integrated 0.05 validation after sub-agent merges.
 
