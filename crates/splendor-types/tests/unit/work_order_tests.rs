@@ -29,6 +29,7 @@ fn work_order(now: OffsetDateTime) -> WorkOrder {
             dedicated_instance: Some(false),
             required_capabilities: vec!["filesystem".to_string()],
             max_runtime_ms: Some(30_000),
+            ..WorkOrderPlacement::default()
         },
         issued_at: now - Duration::minutes(1),
         expires_at: now + Duration::hours(1),

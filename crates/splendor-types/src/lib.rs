@@ -32,6 +32,7 @@
 
 mod approval;
 mod capabilities;
+mod cloud_helper;
 mod daemon_security;
 mod device_profile;
 mod escalation;
@@ -56,6 +57,13 @@ pub use approval::{
 pub use capabilities::{
     is_valid_capability_name, CapabilityDocument, CapabilityValidationError,
     CAPABILITY_DOCUMENT_SCHEMA,
+};
+pub use cloud_helper::{
+    cloud_helper_failure_validation, validate_cloud_helper_work_order,
+    validate_route_plan_for_local_execution, CloudHelperAuthority, CloudHelperValidationError,
+    LocalRoutePlanValidation, RoutePlanProposal, RouteWaypointProposal, CLOUD_HELPER_ADAPTER_ID,
+    CLOUD_HELPER_UNAVAILABLE_REASON, MISSION_PLAN_PROPOSE_ACTION, ROUTE_PLAN_PROPOSAL_SCHEMA,
+    ROUTE_PLAN_PROPOSE_ACTION,
 };
 pub use daemon_security::{
     validate_client_connection_policy, validate_daemon_request, validate_insecure_dev_mode,
