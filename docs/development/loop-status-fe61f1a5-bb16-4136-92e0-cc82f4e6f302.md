@@ -6,7 +6,7 @@
 - Master loop branch: `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`
 - Master loop worktree: `/Users/db/dev/Splendor Kernel-loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`
 - Base branch: latest `origin/dev` at loop creation (`e7d7ed3`)
-- Final integration PR: source `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`, base `dev`
+- Final integration PR: [#105](https://github.com/splendor-os/kernel/pull/105), source `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`, base `dev`
 
 ## Sprint scope
 
@@ -102,4 +102,4 @@
 
 ## Final PR readiness
 
-- Ready to open final integration PR from `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302` to `dev`.
+- Final integration PR opened: [#105](https://github.com/splendor-os/kernel/pull/105).
