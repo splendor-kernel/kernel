@@ -1400,6 +1400,7 @@ fn signed_work_order_envelope(
                 .map(ToString::to_string)
                 .collect(),
             max_runtime_ms: Some(60_000),
+            ..WorkOrderPlacement::default()
         },
         issued_at,
         expires_at: issued_at + Duration::hours(1),
