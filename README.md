@@ -12,11 +12,12 @@ without dictating the model or planner stack.
 
 ## Project status
 
-Splendor0.02-dev scope is implemented and integrated as the local multi-agent
-runtime plus daemon-control release. The original 0.01 local kernel baseline
-remains the foundation; the runnable quickstart and 0.02 sprint evidence live in
+Splendor0.04-dev scope is implemented and integrated as the governance-workflows
+release. The original 0.01 local kernel baseline, 0.02 local multi-agent/daemon
+surface, and 0.03 resident/fleet foundation remain the substrate; runnable
+quickstarts and sprint evidence live in
 [`docs/getting-started/local-runtime.md`](docs/getting-started/local-runtime.md)
-and [`docs/milestones/0.02-dev/`](docs/milestones/0.02-dev/).
+and [`docs/milestones/`](docs/milestones/).
 
 Current capabilities:
 
@@ -41,33 +42,40 @@ Current capabilities:
   without duplicating Rust runtime semantics.
 - Multi-agent replay causal graph reconstruction for messages, child run links,
   and isolation denials without re-executing side effects.
-- Docker deployment image for the 0.02-dev local runtime surface, including
-  `splendorctl`, `splendor-daemon`, the Python SDK, and local smoke-test
-  examples.
+- Resident/fleet foundation primitives: distributed identity, node/instance
+  registry, signed work orders, placement v0, remote message transport,
+  trace aggregation, state handoff, and fleet telemetry reference paths.
+- Governance workflows: first-class governance state, approval verifier,
+  deterministic escalation, circuit breakers, policy bundle TTL/revocation,
+  provider-neutral external governance adapter contracts, and governance
+  replay/audit export.
+- Docker deployment image for the 0.04-dev governed local runtime surface,
+  including `splendorctl`, `splendor-daemon`, the Python SDK, and local
+  smoke-test/governance examples.
 - Example: `examples/single_agent_loop` with config-driven execution.
 - Unit and integration test coverage with CI gates.
 
 ## Docker install
 
 Once the GitHub Container Registry package is public, install and verify the
-0.02-dev deployment image with Docker. Published release images support
+0.04-dev deployment image with Docker. Published release images support
 `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull ghcr.io/splendor-os/kernel:0.02-dev
-docker run --rm ghcr.io/splendor-os/kernel:0.02-dev
+docker pull ghcr.io/splendor-os/kernel:0.04-dev
+docker run --rm ghcr.io/splendor-os/kernel:0.04-dev
 ```
 
 Expected shape:
 
 ```text
-splendorctl 0.1.0 (Splendor0.02-dev)
+splendorctl 0.1.0 (Splendor0.04-dev)
 ```
 
 For local builds and smoke tests from a checkout:
 
 ```bash
-docker build -t splendor:0.02-dev .
+docker build -t splendor:0.04-dev .
 bash scripts/container-tests.sh
 ```
 
@@ -79,13 +87,10 @@ notes.
 
 ## Next steps
 
-Planned beyond 0.02-dev:
+Planned beyond 0.04-dev:
 
-1. Distributed execution, identity continuity, and fleet telemetry (0.03-dev).
-2. Governance workflows such as approval gates, escalation policies, and circuit
-   breakers (0.04-dev).
-3. Physical/edge orchestration and device safety verifier APIs (0.05-dev).
-4. Stable compatibility guarantees and adapter maturity levels (0.1-dev).
+1. Physical/edge orchestration and device safety verifier APIs (0.05-dev).
+2. Stable compatibility guarantees and adapter maturity levels (0.1-dev).
 
 ## Why
 
@@ -122,11 +127,11 @@ Splendor provides the missing **kernel-level primitives for agents**, so autonom
 
 ## What
 
-Unless a capability appears in the 0.02-dev "Current capabilities" list above,
-roadmap terms in the sections below (remote transport, fleet scheduling,
-distributed coordination, governance workflows, kill switches, and broad adapter
-ecosystem work) are planned future surfaces and are not available in the 0.02
-local multi-agent release.
+Unless a capability appears in the 0.04-dev "Current capabilities" list above,
+roadmap terms in the sections below (physical/edge orchestration, production
+governance products, stable compatibility guarantees, and broad adapter ecosystem
+work) are planned future surfaces and are not available in the 0.04 governance
+release.
 
 ### What Splendor is
 
@@ -135,12 +140,13 @@ A systems layer that augments modern neural AI systems by enforcing primitives f
 - **Kernel-grade runtime primitives** for autonomous agents
 - **Rust runtime core** for tenancy, state graphs, scheduling, local action
   verification, audit/observability, typed local messaging, per-agent isolation,
-  and scoped local delegation. Multi-host execution remains planned for 0.03-dev.
+  scoped local delegation, resident/fleet identity foundations, and governance
+  enforcement.
 - **Managed interpreters** as first-class compute (e.g., sandboxed Python instances per agent/tenant)
 - **Closed-loop autonomy**: percepts → policies → (constraints) → verified actions, with feedback routed back into state/learning
 - **Distributed by design**: the primitive model preserves future distributed
-  identity and constraints, but multi-host execution is planned for 0.03-dev and
-  is not available in 0.01-dev.
+  identity and constraints. 0.03-dev provides resident/fleet reference
+  foundations; broad fleet scheduling and consensus remain outside 0.04-dev.
 - **Boundary-aware safety**: actions are mediated at execution edges before side effects occur
 
 ### What Splendor is not
@@ -212,10 +218,11 @@ Responsibilities:
 - **Tenancy** and isolation contexts per agent/tenant
 - **State graphs** (explicit state; versioned snapshots; replay)
 - **Scheduling** (agent-loop execution policies; fairness; quotas)
-- **Messaging** (typed, traceable local message passing; remote transport is
-  planned for 0.03-dev)
-- **Governance & audit** (0.01 provides append-only traces and reproducibility;
-  approval/circuit-breaker workflows are planned for 0.04-dev)
+- **Messaging** (typed, traceable local message passing and 0.03 remote
+  transport foundation)
+- **Governance & audit** (0.04-dev adds approval gating, escalation,
+  circuit-breakers, policy TTL/revocation, external governance contracts, and
+  inspect-only audit/replay)
 - **Action verification** (pre/post gates; invariants; budgets; permissions)
 
 ### Managed compute (Python interfaces)
@@ -224,13 +231,14 @@ Responsibilities:
 - Hosts: model calls, tools, planners, domain code
 - Kernel enforces limits and records traces
 
-### Distributed by default *(planned beyond 0.02-dev)*
+### Distributed by default *(foundation implemented through 0.03-dev)*
 
-- Multi-device identity and trust boundaries are planned for 0.03-dev.
-- Structured messaging across machines is planned for 0.03-dev.
-- Fleet telemetry aggregation is planned for 0.03-dev.
-- Constraints and action gates are local-only in 0.02-dev and are designed to
-  remain enforceable across future fleet boundaries.
+- Multi-device identity and trust boundaries have reference primitives through
+  0.03-dev.
+- Structured remote messaging, trace aggregation, state handoff, and fleet
+  telemetry reference paths exist for resident/fleet foundation work.
+- Broad fleet scheduling, distributed consensus, arbitrary shared mutable state,
+  and production physical/edge orchestration remain future scope.
 
 ### Core runtime flow:
 
@@ -345,10 +353,11 @@ Stable traits/interfaces for:
 - `StateStore` (state graph + snapshots)
 - `TraceStore` (append-only)
 - `LocalMessageRouter` / `MessageBus` (local in-process routing implemented for
-  0.02-dev; remote transport planned for 0.03-dev)
+  0.02-dev; remote transport reference path added in 0.03-dev)
 - `Scheduler`
-- `GovernancePolicy` (0.01 covers tenancy, quotas, and permissions; kill switch
-  is planned for governance/fleet milestones)
+- `GovernancePolicy` / governance objects (0.04-dev covers approval gating,
+  escalation, circuit breakers, policy TTL/revocation, and audit/replay;
+  central kill-switch propagation remains future fleet/governance scope)
 
 ### Python SDK (public ergonomics surface)
 
@@ -382,6 +391,12 @@ Expose:
   - `local-specialist-scoped-delegation/`, `local-orchestrator-specialists/`,
     `local-multi-agent-replay/`, `daemon-client-local/`,
     `typescript-daemon-client/` — 0.02 local multi-agent and daemon examples
+  - `resident-node-registration/`, `signed-work-order-local-resident/`,
+    `two-instance-message/`, `resident-trace-sync/`, `state-handoff-basic/`,
+    `fleet-telemetry-basic/` — 0.03 resident/fleet foundation examples
+  - `action-approval-flow/`, `escalation-basic/`, `circuit-breaker-basic/`,
+    `policy-cache-degraded-mode/`, `harmony-governance-bridge/`,
+    `governance-audit-export/` — 0.04 governance examples
   - `verified_tools/` — planned for later milestones
 - `docs/`
   - `concepts/` — system space vs AI space, primitives, neuro-symbolic runtime property
@@ -432,8 +447,8 @@ Expose:
 
 - **Splendor0.01-dev:** local runtime + gateway + Python SDK + trace + state graph + replay
 - **Splendor0.02-dev:** local multi-agent runtime + daemon control, including typed messages, per-agent isolation, local delegation, runtime daemon API, TypeScript types/client, and multi-agent replay
-- **Splendor0.03-dev:** multi-host distributed execution; identity continuity; fleet telemetry aggregation
-- **Splendor0.04-dev:** governance workflows (approval gates, escalation policies, circuit breakers)
+- **Splendor0.03-dev:** resident nodes + fleet execution foundation, including distributed identity, node/instance registry, signed work orders, placement v0, remote messages, trace aggregation, state handoff, and fleet telemetry
+- **Splendor0.04-dev:** governance workflows, including approval gates, escalation policies, circuit breakers, policy TTL/revocation, external governance adapter contracts, and governance replay/audit export
 - **Splendor0.1-dev:** stable primitives spec + compatibility guarantees + adapter ecosystem maturity
 
 ## Docs Model

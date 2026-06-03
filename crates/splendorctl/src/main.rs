@@ -41,7 +41,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.02-dev";
+const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.04-dev";
 
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -3683,7 +3683,7 @@ fn usage() -> String {
         "  replay         Replay a run from trace + state stores.",
         "  audit export   Export a redacted governance audit from trace + state stores.",
         "  run            Run a local agent loop from config.",
-        "  --version      Print package and 0.01 baseline identifiers.",
+        "  --version      Print package and milestone release identifiers.",
         "",
         "Options:",
         "  --db <path>          Path to the SQLite trace database.",

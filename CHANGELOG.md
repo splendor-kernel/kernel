@@ -37,6 +37,9 @@
   state-node, trace-range, and scope-filter evidence. Replay/audit inspection
   now recomputes trace payload hashes, validates referenced state evidence, and
   redacts credential-shaped replay output before emission.
+- Added 0.04-dev release notes and Docker image packaging updates for the
+  governed runtime deployment image, including `linux/amd64` and `linux/arm64`
+  release tags.
 
 ### Explicitly not included
 

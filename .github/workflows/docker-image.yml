@@ -14,6 +14,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish_0_04_dev:
+        description: Publish the 0.04-dev and v0.04-dev image tags from this ref.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -49,7 +54,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.title=Splendor Kernel
-            org.opencontainers.image.description=Splendor 0.02-dev local runtime deployment image
+            org.opencontainers.image.description=Splendor 0.04-dev governed runtime deployment image
             org.opencontainers.image.licenses=Apache-2.0 OR MIT
 
       - name: Build image for smoke test
@@ -60,9 +65,9 @@ jobs:
           tags: splendor:publish-smoke
           labels: |
             ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.version=${{ (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
+            org.opencontainers.image.version=${{ (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
           build-args: |
-            SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
+            SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.created }}
 
@@ -115,7 +120,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.title=Splendor Kernel
-            org.opencontainers.image.description=Splendor 0.02-dev local runtime deployment image
+            org.opencontainers.image.description=Splendor 0.04-dev governed runtime deployment image
             org.opencontainers.image.licenses=Apache-2.0 OR MIT
 
       - name: Build and push platform image by digest
@@ -126,10 +131,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.version=${{ (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
+            org.opencontainers.image.version=${{ (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
+            SPLENDOR_IMAGE_VERSION=${{ (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && 'v0.02-dev' || github.ref_name }}
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ steps.build-date.outputs.created }}
 
@@ -176,6 +181,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=raw,value=0.04-dev,enable=${{ startsWith(github.ref, 'refs/tags/v0.04') }}
+            type=raw,value=0.04-dev,enable=${{ inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true' }}
+            type=raw,value=v0.04-dev,enable=${{ inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true' }}
             type=raw,value=0.02-dev,enable=${{ startsWith(github.ref, 'refs/tags/v0.02') }}
             type=raw,value=0.02-dev,enable=${{ inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true' }}
             type=raw,value=v0.02-dev,enable=${{ inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true' }}
@@ -202,7 +210,7 @@ jobs:
 
       - name: Inspect published image
         env:
-          INSPECT_TAG: ${{ (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && '0.02-dev' || github.ref_name }}
+          INSPECT_TAG: ${{ (inputs.publish_0_04_dev == true || inputs.publish_0_04_dev == 'true') && '0.04-dev' || (inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') && '0.02-dev' || github.ref_name }}
         run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${INSPECT_TAG}"
 
       - name: Optionally make GHCR package public
