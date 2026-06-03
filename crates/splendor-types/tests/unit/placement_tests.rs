@@ -184,6 +184,66 @@ fn covers_cloud_vpc_on_prem_edge_physical_and_desktop_targets() {
 }
 
 #[test]
+fn distinguishes_physical_cloud_helper_simulation_and_desktop_sidecar_targets() {
+    let physical = candidate(
+        "drone-017",
+        PlacementTarget::PhysicalRobot,
+        &["physical.action.move_to_waypoint"],
+    );
+    let physical_decision = select_placement(
+        &request(
+            PlacementTarget::PhysicalRobot,
+            &["physical.action.move_to_waypoint"],
+        ),
+        &[physical],
+    );
+    assert_eq!(physical_decision.status, PlacementDecisionStatus::Selected);
+    assert_eq!(physical_decision.target, PlacementTarget::PhysicalRobot);
+
+    let mut simulation_request = request(PlacementTarget::PhysicalRobot, &["route.simulate"]);
+    simulation_request.execution_mode = PlacementExecutionMode::Simulation;
+    simulation_request.data_locality = Some(DataLocality::Cloud);
+    let mut simulation = candidate(
+        "sim-cloud",
+        PlacementTarget::EphemeralCloud,
+        &["route.simulate"],
+    );
+    simulation.data_locality = Some(DataLocality::Cloud);
+    simulation.supported_execution_modes = vec![PlacementExecutionMode::Simulation];
+    let simulation_decision = select_placement(&simulation_request, &[simulation]);
+    assert_eq!(
+        simulation_decision.status,
+        PlacementDecisionStatus::Selected
+    );
+    assert_eq!(simulation_decision.target, PlacementTarget::EphemeralCloud);
+
+    let mut helper_request = request(PlacementTarget::PhysicalRobot, &["route.optimize"]);
+    helper_request.execution_mode = PlacementExecutionMode::CloudHelper;
+    helper_request.data_locality = Some(DataLocality::Cloud);
+    let mut helper = candidate(
+        "route-helper",
+        PlacementTarget::ResidentCloudPool,
+        &["route.optimize"],
+    );
+    helper.data_locality = Some(DataLocality::Cloud);
+    helper.supported_execution_modes = vec![PlacementExecutionMode::CloudHelper];
+    let helper_decision = select_placement(&helper_request, &[helper]);
+    assert_eq!(helper_decision.status, PlacementDecisionStatus::Selected);
+    assert_eq!(helper_decision.target, PlacementTarget::ResidentCloudPool);
+
+    let desktop_decision = select_placement(
+        &request(PlacementTarget::DesktopSidecar, &["file.read"]),
+        &[candidate(
+            "desktop-sidecar",
+            PlacementTarget::DesktopSidecar,
+            &["file.read"],
+        )],
+    );
+    assert_eq!(desktop_decision.status, PlacementDecisionStatus::Selected);
+    assert_eq!(desktop_decision.target, PlacementTarget::DesktopSidecar);
+}
+
+#[test]
 fn preserves_data_locality_in_decision_and_trace_audit_output() {
     let mut request = request(PlacementTarget::CustomerVpc, &["sql.read"]);
     request.data_locality = Some(DataLocality::Vpc);

@@ -33,6 +33,7 @@
 mod approval;
 mod capabilities;
 mod daemon_security;
+mod device_profile;
 mod escalation;
 mod external_governance;
 mod fleet_telemetry;
@@ -63,6 +64,13 @@ pub use daemon_security::{
     DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
     InsecureDevMode, LocalTransportBinding, RevocationStatus, WorkOrderAuthorization,
     WorkOrderSignature,
+};
+pub use device_profile::{
+    is_allowed_physical_action, physical_action_capability, validate_physical_capability_document,
+    DeviceCapability, DeviceCapabilityCategory, DeviceLocalPolicyIndicators, DeviceNodeKind,
+    DeviceProfile, DeviceProfileValidationError, DeviceSafetyConstraint, ALLOWED_PHYSICAL_ACTIONS,
+    DEVICE_KIND_CAPABILITY_PREFIX, DEVICE_PROFILE_SCHEMA, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    PHYSICAL_ACTION_CAPABILITY_PREFIX,
 };
 pub use escalation::{
     EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
