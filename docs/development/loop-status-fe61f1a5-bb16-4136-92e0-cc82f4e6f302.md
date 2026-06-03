@@ -61,24 +61,29 @@
 
 | Issue | Sprint | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| #28 | 0.05-S1 | `agent/28-0.05-S1` | `/Users/db/dev/Splendor Kernel-28-0.05-S1` | planned | pending | pending | Device profiles/capabilities foundation. |
-| #29 | 0.05-S2 | `agent/29-0.05-S2` | `/Users/db/dev/Splendor Kernel-29-0.05-S2` | planned | pending | pending | Offline policy cache/degraded mode. |
-| #30 | 0.05-S3 | `agent/30-0.05-S3` | `/Users/db/dev/Splendor Kernel-30-0.05-S3` | planned | pending | pending | Local trace buffer/reconnect sync. |
-| #31 | 0.05-S4 | `agent/31-0.05-S4` | `/Users/db/dev/Splendor Kernel-31-0.05-S4` | planned | pending | pending | Robotics adapter after #28/#32 contracts. |
-| #32 | 0.05-S5 | `agent/32-0.05-S5` | `/Users/db/dev/Splendor Kernel-32-0.05-S5` | planned | pending | pending | Safety verifier API. |
-| #33 | 0.05-S6 | `agent/33-0.05-S6` | `/Users/db/dev/Splendor Kernel-33-0.05-S6` | planned | pending | pending | Cloud helper advisory pattern. |
-| #34 | 0.05-S7 | `agent/34-0.05-S7` | `/Users/db/dev/Splendor Kernel-34-0.05-S7` | planned | pending | pending | Final physical simulation harness. |
+| #28 | 0.05-S1 | `agent/28-0.05-S1` | `/Users/db/dev/Splendor Kernel-28-0.05-S1` | merged | [#99](https://github.com/splendor-os/kernel/pull/99) merged | `cargo test -p splendor-types`; code-review approve after fixes | Device profiles/capabilities foundation; physical capability validation integrated with node registration. |
+| #29 | 0.05-S2 | `agent/29-0.05-S2` | `/Users/db/dev/Splendor Kernel-29-0.05-S2` | merged | [#101](https://github.com/splendor-os/kernel/pull/101) merged | `cargo test -p splendor-kernel policy_cache`; `cargo test -p splendor-types policy_distribution`; daemon policy tests; code-review approve after fixes | Offline policy cache/degraded mode; expired policy fails closed and connectivity transitions trace. |
+| #30 | 0.05-S3 | `agent/30-0.05-S3` | `/Users/db/dev/Splendor Kernel-30-0.05-S3` | merged | [#100](https://github.com/splendor-os/kernel/pull/100) merged | `cargo test -p splendor-store trace_sync`; `cargo test -p splendor-kernel trace_durability`; `cargo test -p splendor-store`; code-review approve after fixes | Local trace buffer/reconnect sync; canonical trace events, durability monitor, replay-visible offline boundaries. |
+| #31 | 0.05-S4 | `agent/31-0.05-S4` | `/Users/db/dev/Splendor Kernel-31-0.05-S4` | merged | [#102](https://github.com/splendor-os/kernel/pull/102) merged | `cargo test -p splendor-adapter-robotics`; `cargo test -p splendor-gateway`; code-review approve | Robotics adapter interface and simulated adapter behind gateway/safety verifier. |
+| #32 | 0.05-S5 | `agent/32-0.05-S5` | `/Users/db/dev/Splendor Kernel-32-0.05-S5` | merged | [#98](https://github.com/splendor-os/kernel/pull/98) merged | `cargo test -p splendor-gateway`; code-review approve | Safety verifier API integrated into existing gateway chain. |
+| #33 | 0.05-S6 | `agent/33-0.05-S6` | `/Users/db/dev/Splendor Kernel-33-0.05-S6` | merged | [#103](https://github.com/splendor-os/kernel/pull/103) merged | `cargo test -p splendor-types cloud_helper`; `cargo test -p splendor-types work_order`; `cargo test -p splendor-kernel cloud_helper`; code-review approve after fixes | Cloud helper advisory pattern; canonical work-order path rejects helper actuator authority. |
+| #34 | 0.05-S7 | `agent/34-0.05-S7` | `/Users/db/dev/Splendor Kernel-34-0.05-S7` | merged | [#104](https://github.com/splendor-os/kernel/pull/104) merged | `cargo test -p splendor-kernel physical_harness --no-default-features`; `cargo test -p splendor-kernel --no-default-features`; code-review approve after fixes | Final physical simulation harness across 0.05 primitives. |
 
 ## QA findings
 
 - Initial scope issue: GitHub issue bodies still point to old `docs/rules/verifiable_criteria.md`; current source of truth is the split `docs/rules/verifiable_criteria/main.md` plus per-sprint files under `docs/rules/verifiable_criteria/sprints/`.
 - No repo-local `.agents/skills/*/SKILL.md` files were present; no available global skill matched this task.
+- PR #99 initially left physical capability validation as an opt-in helper only; fixed before merge by integrating validation into `NodeRegistration::validate()` for physical/device capability documents.
+- PR #101 initially allowed expired disconnected low-risk cached actions and missed daemon connectivity trace emission; fixed before merge so policy TTL fails closed and disconnect/reconnect emits `PolicyConnectivityChanged`.
+- PR #100 initially used ad-hoc offline marker payloads and weak durability wiring; fixed before merge with canonical `TraceEvent` markers, `TraceDurabilityMonitor`, and operator-intervention replay evidence.
+- PR #103 initially relied on caller-side cloud-helper authority validation; fixed before merge by enforcing cloud-helper restrictions inside canonical signed work-order validation.
+- PR #104 initially split intervention and override request across separate runs; fixed before merge with a single trace-linked operator intervention/override flow and replay no-side-effect assertion.
 
 ## Validation log
 
 - 2026-06-03: baseline `cargo test --workspace` on loop branch passed after tracker commit (all workspace/unit/integration/doc tests completed successfully; full output captured by tooling at `/Users/db/.local/share/opencode/tool-output/tool_e8ded165a001qEHhzwbsgWJVGm`).
-- Pending: per-sub-agent validation before merging each PR.
-- Pending: integrated 0.05 validation after sub-agent merges.
+- 2026-06-03: per-sub-agent focused validation completed before each merge; see assignment table for commands and PR evidence.
+- 2026-06-03: integration validation after all sub-agent merges passed: `cargo test --workspace && git diff --check` (full output captured by tooling at `/Users/db/.local/share/opencode/tool-output/tool_e8e2f2c5c0014vuE476k1XG3PL`).
 
 ## Integration risks
 
@@ -93,9 +98,8 @@
 
 ## Remaining blockers
 
-- Sub-agent work not started.
-- Final integration PR not ready.
+- None known for 0.05 integration PR readiness.
 
 ## Final PR readiness
 
-- Not ready. Requires validated sub-agent PRs, integrated loop branch tests, docs/examples, and issue acceptance evidence.
+- Ready to open final integration PR from `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302` to `dev`.
