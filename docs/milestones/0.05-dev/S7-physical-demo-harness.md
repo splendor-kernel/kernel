@@ -80,7 +80,7 @@ Provide a runnable, contract-focused physical simulation harness that proves the
 | `physical_harness_successful_mission_uses_only_high_level_actions` | successful mission and forbidden action denial | gateway traces, executed high-level actions only, state head |
 | `physical_harness_safety_denial_never_reaches_adapter` | safety verifier denial | `ActionDenied`, adapter call count `0`, state head |
 | `physical_harness_offline_interval_syncs_without_duplicates` | offline interval and reconnect trace sync | offline trace events, central sync metadata, duplicate count |
-| `physical_harness_operator_intervention_then_override_request_is_traced` | intervention/override flow | `ActionNeedsIntervention` plus executed `request_operator_override` |
+| `physical_harness_operator_intervention_then_override_request_is_traced` | same-run intervention/override flow | ordered `ActionNeedsIntervention` before executed `request_operator_override`, final state includes both statuses, replay has no adapter calls |
 | `physical_harness_cloud_helper_proposal_is_locally_validated_before_action` | cloud-helper proposal local validation | remote message trace, local validation, safe action, unsafe denial |
 
 Run the focused harness tests:

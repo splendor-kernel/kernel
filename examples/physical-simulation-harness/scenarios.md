@@ -16,7 +16,7 @@ Starts a canonical offline trace interval, records policy connectivity loss, all
 
 ## 4. Operator intervention / override request
 
-Uses unknown collision risk to produce `ActionNeedsIntervention` before adapter execution. A separate safe override request submits `request_operator_override` through the same gateway/adapter path and records the executed override request outcome.
+Uses cached-policy high-risk offline behavior to produce `ActionNeedsIntervention` before adapter execution. The same harness/run then reconnects and submits `request_operator_override` through the same gateway/adapter path. Replay asserts the intervention trace precedes the override execution trace, final state includes both statuses, and trace inspection does not increase adapter call count.
 
 ## 5. Cloud-helper proposal validated locally
 

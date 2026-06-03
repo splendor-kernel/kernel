@@ -532,13 +532,15 @@ fn physical_harness_offline_interval_syncs_without_duplicates() {
 
 #[test]
 fn physical_harness_operator_intervention_then_override_request_is_traced() {
-    let mut harness = PhysicalSimulationHarness::new(
-        SimulatedSafetySnapshot {
-            collision_risk: Some(SimulatedRiskLevel::Unknown),
-            ..safe_snapshot()
-        },
-        None,
+    let cache = Arc::new(PolicyCache::new(PolicyCacheConfig {
+        enforcement_required: true,
+    }));
+    let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone());
+    cache.install_validated(
+        policy_bundle(harness.tenant_id.clone(), harness.agent_id.clone()),
+        OffsetDateTime::now_utc(),
     );
+    cache.set_disconnected(true);
 
     let intervention = harness.submit_physical_action(
         "move_to_waypoint",
@@ -548,36 +550,61 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
     );
     assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
     assert_eq!(harness.adapter.call_count(), 0);
-    harness.commit_state(
-        "operator intervention required",
-        serde_json::json!({"intervention": intervention.status}),
-    );
 
-    let mut override_harness = PhysicalSimulationHarness::safe();
-    let override_request = override_harness.submit_physical_action(
+    cache.set_disconnected(false);
+    let override_request = harness.submit_physical_action(
         "request_operator_override",
         SideEffectClass::Custom("physical.high_level".to_string()),
         serde_json::json!({"reason": "safety_verifier_uncertain"}),
         vec![],
     );
-    override_harness.commit_state(
+    let final_head = harness.commit_state(
         "operator override requested",
-        serde_json::json!({"override": override_request.status}),
+        serde_json::json!({
+            "intervention": intervention.status,
+            "override": override_request.status,
+        }),
     );
 
     assert_eq!(override_request.status, ActionStatus::Executed);
-    assert_eq!(override_harness.adapter.call_count(), 1);
-    assert!(harness
-        .replay_trace()
+    assert_eq!(harness.adapter.call_count(), 1);
+    let calls_before_replay = harness.adapter.call_count();
+    let replay = harness.replay_trace();
+    let intervention_index = replay
         .iter()
-        .any(|event| matches!(event.kind, TraceEventKind::ActionNeedsIntervention { .. })));
-    assert!(override_harness.replay_trace().iter().any(|event| matches!(
-        &event.kind,
-        TraceEventKind::ActionExecuted { action, .. }
-            if action.name == "request_operator_override"
-    )));
+        .position(|event| matches!(event.kind, TraceEventKind::ActionNeedsIntervention { .. }))
+        .expect("intervention trace");
+    let override_index = replay
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                TraceEventKind::ActionExecuted { action, .. }
+                    if action.name == "request_operator_override"
+            )
+        })
+        .expect("override execution trace");
+    assert!(intervention_index < override_index);
+    assert_eq!(harness.adapter.call_count(), calls_before_replay);
+
+    let node = harness
+        .state
+        .get_node(&final_head)
+        .expect("final state node");
+    let state = harness
+        .state
+        .get_state(&node.data_ref)
+        .expect("final state bytes");
+    let summary: serde_json::Value = serde_json::from_slice(&state.bytes).expect("state json");
+    assert_eq!(
+        summary["status"]["intervention"],
+        serde_json::json!(ActionStatus::NeedsIntervention)
+    );
+    assert_eq!(
+        summary["status"]["override"],
+        serde_json::json!(ActionStatus::Executed)
+    );
     assert_replayable_with_state_head(&harness);
-    assert_replayable_with_state_head(&override_harness);
 }
 
 #[test]
