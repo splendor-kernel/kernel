@@ -23,6 +23,8 @@ planning or analysis without granting direct actuator authority.
 ## Public contracts changed
 
 - `WorkOrderPlacement.execution_mode` now records `PlacementExecutionMode`.
+- Canonical `validate_work_order(...)` invokes cloud-helper authority validation
+  after signature verification when `execution_mode = CloudHelper`.
 - New exports: `validate_cloud_helper_work_order`, `RoutePlanProposal`,
   `RouteWaypointProposal`, `validate_route_plan_for_local_execution`,
   `cloud_helper_failure_validation`, and `ROUTE_PLAN_PROPOSAL_SCHEMA`.
@@ -54,8 +56,8 @@ state.
 
 ## Gateway and verifier behavior
 
-- Helper work-order validation denies robotics adapter authority and physical or
-  low-level actuator action authority.
+- Canonical work-order validation denies cloud-helper robotics adapter authority
+  and physical or low-level actuator action authority.
 - Local route-plan validation denies missing/unknown zones and returns no action
   candidates.
 - Accepted plans produce `move_to_waypoint` candidates with physical high-level

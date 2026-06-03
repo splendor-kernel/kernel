@@ -7,8 +7,8 @@
 //! incompatibility.
 
 use crate::{
-    AgentId, PlacementExecutionMode, RevocationStatus, RunId, TenantId, WorkOrderId,
-    WorkOrderSignature,
+    cloud_helper::validate_cloud_helper_work_order, AgentId, PlacementExecutionMode,
+    RevocationStatus, RunId, TenantId, WorkOrderId, WorkOrderSignature,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -356,6 +356,14 @@ pub fn validate_work_order(
 ) -> Result<ValidatedWorkOrder, WorkOrderValidationError> {
     envelope.work_order.validate_shape()?;
     keyring.verify(envelope)?;
+
+    if envelope.work_order.placement.execution_mode == PlacementExecutionMode::CloudHelper {
+        validate_cloud_helper_work_order(&envelope.work_order).map_err(|error| {
+            WorkOrderValidationError::Malformed {
+                reason: format!("cloud_helper_{}", error.reason_code()),
+            }
+        })?;
+    }
 
     if envelope.work_order.expires_at <= context.now {
         return Err(WorkOrderValidationError::Expired);

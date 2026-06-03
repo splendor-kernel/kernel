@@ -15,6 +15,18 @@ contracts; they do not get a separate authority system.
 - Route proposals use `splendor.message.route_plan_proposal.v1` with
   `proposal_id`, scoped `data_refs`, and bounded `waypoint_ref`/`zone_ref` pairs.
 
+`placement.execution_mode` defaults to `"live"`. Live mode is omitted from
+serialized work-order payloads for backward compatibility with older signed live
+work orders. Non-live modes, including `"cloud_helper"`, are serialized and are
+part of the signed work-order authority. Changing a signed live work order into a
+cloud-helper work order, or changing a cloud-helper work order back to live,
+invalidates the detached signature.
+
+Canonical `validate_work_order(...)` enforces the helper authority boundary when
+`execution_mode = "cloud_helper"`; callers do not need a separate validator to
+reject robotics adapter authority, direct high-level physical action authority, or
+low-level actuator action authority.
+
 ## Local device flow
 
 ```text
