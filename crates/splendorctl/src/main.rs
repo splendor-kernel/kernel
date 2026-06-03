@@ -20,16 +20,19 @@ use splendor_kernel::{
     SchedulerConfig, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
 };
 use splendor_store::{
-    SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord, TraceStore, TraceStoreError,
+    compute_trace_event_hash, SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord,
+    TraceStore, TraceStoreError,
 };
 use splendor_types::{
     validate_work_order, Action, AgentId, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
-    CircuitBreakerState, CircuitBreakerTraceContext, ContentHash, FleetId, HashAlgorithm,
-    InstanceId, MessageId, NodeId, Percept, PerceptProvenance, QuotaUsage, RunId,
+    CircuitBreakerState, CircuitBreakerTraceContext, ContentHash, FleetId, GovernanceScope,
+    HashAlgorithm, InstanceId, MessageId, NodeId, Percept, PerceptProvenance, QuotaUsage, RunId,
     RuntimeIdentityContext, SideEffectClass, SnapshotId, StateHandoffTraceContext, TenantId,
-    TraceEvent, TraceEventId, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
-    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
+    TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -78,6 +81,12 @@ where
             from_snapshot.as_deref(),
             include_state,
         )?,
+        Command::AuditExport {
+            trace_db_path,
+            state_db_path,
+            run_id,
+            filters,
+        } => audit_export(&trace_db_path, &state_db_path, &run_id, filters)?,
         Command::Run {
             config_path,
             cycles,
@@ -118,6 +127,13 @@ enum Command {
         from_snapshot: Option<String>,
         include_state: bool,
     },
+    /// Export a governance audit view derived from trace and state stores.
+    AuditExport {
+        trace_db_path: PathBuf,
+        state_db_path: PathBuf,
+        run_id: String,
+        filters: AuditFilters,
+    },
     /// Run a local agent loop from configuration.
     Run {
         config_path: PathBuf,
@@ -147,6 +163,9 @@ where
     }
     if command == "replay" {
         return parse_replay_command(args);
+    }
+    if command == "audit" {
+        return parse_audit_command(args);
     }
     if command == "run" {
         return parse_run_command(args);
@@ -288,6 +307,102 @@ where
     })
 }
 
+/// Parses `splendorctl audit export ...` command args.
+fn parse_audit_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    if subcommand != "export" {
+        return Err(format!(
+            "Unknown audit subcommand: {subcommand}\n\n{}",
+            usage()
+        ));
+    }
+
+    let mut trace_db_path: Option<PathBuf> = None;
+    let mut state_db_path: Option<PathBuf> = None;
+    let mut run_id: Option<String> = None;
+    let mut filters = AuditFilters::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--db" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --db".to_string())?;
+                trace_db_path = Some(PathBuf::from(value));
+            }
+            "--state-db" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --state-db".to_string())?;
+                state_db_path = Some(PathBuf::from(value));
+            }
+            "--run" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --run".to_string())?;
+                run_id = Some(value);
+            }
+            "--tenant" => {
+                filters.tenant = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --tenant".to_string())?,
+                );
+            }
+            "--agent" => {
+                filters.agent = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --agent".to_string())?,
+                );
+            }
+            "--action" => {
+                filters.action = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --action".to_string())?,
+                );
+            }
+            "--adapter" => {
+                filters.adapter = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --adapter".to_string())?,
+                );
+            }
+            "--node" => {
+                filters.node = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --node".to_string())?,
+                );
+            }
+            "--instance" => {
+                filters.instance = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --instance".to_string())?,
+                );
+            }
+            "--fleet" => {
+                filters.fleet = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --fleet".to_string())?,
+                );
+            }
+            "--help" | "-h" => return Err(usage()),
+            _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+        }
+    }
+    let trace_db_path = trace_db_path.ok_or_else(|| "Missing required --db".to_string())?;
+    let state_db_path = state_db_path.ok_or_else(|| "Missing required --state-db".to_string())?;
+    let run_id = run_id.ok_or_else(|| "Missing required --run".to_string())?;
+    Ok(Command::AuditExport {
+        trace_db_path,
+        state_db_path,
+        run_id,
+        filters,
+    })
+}
+
 /// Parses `splendorctl run ...` command args.
 fn parse_run_command<I>(mut args: I) -> Result<Command, String>
 where
@@ -340,7 +455,7 @@ fn export_trace(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
     if !db_path.exists() {
         return Err(format!("Trace database not found: {}", db_path.display()));
     }
-    let store = SqliteTraceStore::open(db_path)
+    let store = SqliteTraceStore::open_read_only(db_path)
         .map_err(|error| format!("Failed to open trace store: {error}"))?;
     let records = TraceStore::read(&store, run_id)
         .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
@@ -374,7 +489,7 @@ fn state_head(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
     if !db_path.exists() {
         return Err(format!("Trace database not found: {}", db_path.display()));
     }
-    let store = SqliteTraceStore::open(db_path)
+    let store = SqliteTraceStore::open_read_only(db_path)
         .map_err(|error| format!("Failed to open trace store: {error}"))?;
     let records = TraceStore::read(&store, run_id)
         .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
@@ -402,6 +517,1372 @@ fn state_head(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
         .map_err(|error| format!("Failed to encode state head output: {error}"))?;
     println!("{line}");
     Ok(())
+}
+
+const AUDIT_EXPORT_SCHEMA_VERSION: &str = "splendor.audit_export.v0.04-dev";
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct AuditFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fleet: Option<String>,
+}
+
+impl AuditFilters {
+    fn with_run(mut self, run_id: &str) -> Self {
+        self.run = Some(run_id.to_string());
+        self
+    }
+
+    fn matches(&self, event: &TraceEvent, adapter_by_action: &BTreeMap<String, String>) -> bool {
+        if let Some(filter) = &self.run {
+            if event.run_id.to_string() != *filter {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.tenant {
+            if !event_has_tenant(event, filter) {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.agent {
+            if !event_has_agent(event, filter) {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.action {
+            if !event_has_action(event, filter) {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.adapter {
+            if !event_has_adapter(event, filter, adapter_by_action) {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.node {
+            if event.identity.node_id.as_ref().map(ToString::to_string) != Some(filter.clone()) {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.instance {
+            if event.identity.instance_id.as_ref().map(ToString::to_string) != Some(filter.clone())
+            {
+                return false;
+            }
+        }
+        if let Some(filter) = &self.fleet {
+            if event.identity.fleet_id.as_ref().map(ToString::to_string) != Some(filter.clone()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditExport {
+    schema_version: String,
+    run_id: String,
+    generated_at: OffsetDateTime,
+    source: String,
+    replay_mode: String,
+    side_effects_replayed: bool,
+    filters: AuditFilters,
+    trace_range: Option<AuditTraceRange>,
+    event_count: usize,
+    work_orders: Vec<AuditWorkOrderRecord>,
+    policies: Vec<AuditPolicyRecord>,
+    actions: Vec<AuditActionRecord>,
+    governance_events: Vec<AuditGovernanceRecord>,
+    state_nodes: Vec<AuditStateNodeRecord>,
+    redaction: AuditRedactionSummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditTraceRange {
+    first_sequence: u64,
+    last_sequence: u64,
+    first_trace_event_id: TraceEventId,
+    last_trace_event_id: TraceEventId,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditWorkOrderRecord {
+    trace_event_id: TraceEventId,
+    sequence: u64,
+    accepted: bool,
+    work_order_id: Option<WorkOrderId>,
+    tenant_id: Option<TenantId>,
+    agent_id: Option<AgentId>,
+    run_id: Option<RunId>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditPolicyRecord {
+    trace_event_id: TraceEventId,
+    sequence: u64,
+    lifecycle: String,
+    policy_bundle_id: Option<String>,
+    version: Option<String>,
+    action: Option<String>,
+    reason: Option<String>,
+    bundle: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditActionRecord {
+    trace_event_id: TraceEventId,
+    sequence: u64,
+    identity: TraceIdentityContext,
+    action_name: String,
+    adapter: Option<String>,
+    status: String,
+    action: serde_json::Value,
+    verification_result: Option<serde_json::Value>,
+    outcome: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+struct AuditActionRecordInput<'a> {
+    event: &'a TraceEvent,
+    action: &'a Action,
+    status: &'a str,
+    result: Option<&'a splendor_types::VerificationResult>,
+    outcome: Option<&'a serde_json::Value>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditGovernanceRecord {
+    trace_event_id: TraceEventId,
+    sequence: u64,
+    identity: TraceIdentityContext,
+    event: String,
+    object_id: Option<String>,
+    scope: Option<serde_json::Value>,
+    reason: Option<String>,
+    details: serde_json::Value,
+}
+
+type GovernanceRecordParts = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+    serde_json::Value,
+);
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditStateNodeRecord {
+    trace_event_id: TraceEventId,
+    sequence: u64,
+    identity: TraceIdentityContext,
+    state_node_id: Option<String>,
+    parent_state_node_ids: Vec<String>,
+    state_hash: ContentHash,
+    snapshot_id: Option<SnapshotId>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuditRedactionSummary {
+    applied: bool,
+    redacted_keys: Vec<String>,
+}
+
+#[derive(Default)]
+struct RedactionTracker {
+    keys: BTreeSet<String>,
+}
+
+impl RedactionTracker {
+    fn record(&mut self, key: &str) {
+        self.keys.insert(key.to_string());
+    }
+
+    fn summary(&self) -> AuditRedactionSummary {
+        AuditRedactionSummary {
+            applied: !self.keys.is_empty(),
+            redacted_keys: self.keys.iter().cloned().collect(),
+        }
+    }
+}
+
+/// Emits a governance audit export derived only from trace and state data.
+fn audit_export(
+    trace_db_path: &PathBuf,
+    state_db_path: &PathBuf,
+    run_id: &str,
+    filters: AuditFilters,
+) -> Result<(), String> {
+    let export = audit_export_from_stores(trace_db_path, state_db_path, run_id, filters)?;
+    let line = serde_json::to_string(&export)
+        .map_err(|error| format!("Failed to encode audit export: {error}"))?;
+    println!("{line}");
+    Ok(())
+}
+
+fn audit_export_from_stores(
+    trace_db_path: &PathBuf,
+    state_db_path: &PathBuf,
+    run_id: &str,
+    filters: AuditFilters,
+) -> Result<AuditExport, String> {
+    if !trace_db_path.exists() {
+        return Err(format!(
+            "Trace database not found: {}",
+            trace_db_path.display()
+        ));
+    }
+    if !state_db_path.exists() {
+        return Err(format!(
+            "State database not found: {}",
+            state_db_path.display()
+        ));
+    }
+    let trace_store = SqliteTraceStore::open_read_only(trace_db_path)
+        .map_err(|error| format!("Failed to open trace store: {error}"))?;
+    let state_store = SqliteStateStore::open_read_only(state_db_path)
+        .map_err(|error| format!("Failed to open state store: {error}"))?;
+    let records = TraceStore::read(&trace_store, run_id)
+        .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
+    let events = decode_and_validate_trace_records(&records, run_id)?;
+    collect_audit_export(&events, &state_store, run_id, filters)
+}
+
+fn collect_audit_export(
+    events: &[TraceEvent],
+    state_store: &SqliteStateStore,
+    run_id: &str,
+    filters: AuditFilters,
+) -> Result<AuditExport, String> {
+    let filters = filters.with_run(run_id);
+    let adapter_by_action = audit_adapter_index(events);
+    let filtered_events = events
+        .iter()
+        .filter(|event| filters.matches(event, &adapter_by_action))
+        .collect::<Vec<_>>();
+    let trace_range = audit_trace_range(&filtered_events);
+    let mut redaction = RedactionTracker::default();
+    let mut verification_by_action: BTreeMap<String, (Option<String>, serde_json::Value)> =
+        BTreeMap::new();
+    let mut work_orders = Vec::new();
+    let mut policies = Vec::new();
+    let mut actions = Vec::new();
+    let mut governance_events = Vec::new();
+    let mut state_nodes = Vec::new();
+
+    for event in &filtered_events {
+        match &event.kind {
+            TraceEventKind::WorkOrderAccepted {
+                work_order_id,
+                tenant_id,
+                agent_id,
+                run_id,
+            } => work_orders.push(AuditWorkOrderRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                accepted: true,
+                work_order_id: Some(work_order_id.clone()),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(agent_id.clone()),
+                run_id: run_id.clone(),
+                reason: None,
+            }),
+            TraceEventKind::WorkOrderRejected {
+                work_order_id,
+                tenant_id,
+                agent_id,
+                run_id,
+                reason,
+            } => work_orders.push(AuditWorkOrderRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                accepted: false,
+                work_order_id: work_order_id.clone(),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                reason: Some(redact_sensitive_text(reason, &mut redaction)),
+            }),
+            TraceEventKind::PolicyBundleAccepted { bundle } => {
+                let bundle_value = sanitized_value(bundle, &mut redaction)?;
+                policies.push(AuditPolicyRecord {
+                    trace_event_id: event.trace_event_id.clone(),
+                    sequence: event.sequence,
+                    lifecycle: "accepted".to_string(),
+                    policy_bundle_id: string_value(&bundle_value, "policy_bundle_id"),
+                    version: string_value(&bundle_value, "version"),
+                    action: None,
+                    reason: None,
+                    bundle: Some(bundle_value),
+                });
+            }
+            TraceEventKind::PolicyBundleRejected {
+                policy_bundle_id,
+                version,
+                reason,
+            } => policies.push(AuditPolicyRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                lifecycle: "rejected".to_string(),
+                policy_bundle_id: policy_bundle_id.as_ref().map(ToString::to_string),
+                version: version
+                    .as_ref()
+                    .map(|value| redact_sensitive_text(value, &mut redaction)),
+                action: None,
+                reason: Some(redact_sensitive_text(reason, &mut redaction)),
+                bundle: None,
+            }),
+            TraceEventKind::PolicySyncFailed {
+                policy_bundle_id,
+                version,
+                reason,
+            } => policies.push(AuditPolicyRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                lifecycle: "sync_failed".to_string(),
+                policy_bundle_id: policy_bundle_id.as_ref().map(ToString::to_string),
+                version: version
+                    .as_ref()
+                    .map(|value| redact_sensitive_text(value, &mut redaction)),
+                action: None,
+                reason: Some(redact_sensitive_text(reason, &mut redaction)),
+                bundle: None,
+            }),
+            TraceEventKind::PolicyExpired {
+                policy_bundle_id,
+                version,
+                action,
+            } => policies.push(AuditPolicyRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                lifecycle: "expired".to_string(),
+                policy_bundle_id: Some(policy_bundle_id.to_string()),
+                version: Some(redact_sensitive_text(version, &mut redaction)),
+                action: action
+                    .as_ref()
+                    .map(|value| redact_sensitive_text(value, &mut redaction)),
+                reason: Some("policy_expired".to_string()),
+                bundle: None,
+            }),
+            TraceEventKind::PolicyRevoked {
+                policy_bundle_id,
+                version,
+                reason,
+            } => policies.push(AuditPolicyRecord {
+                trace_event_id: event.trace_event_id.clone(),
+                sequence: event.sequence,
+                lifecycle: "revoked".to_string(),
+                policy_bundle_id: Some(policy_bundle_id.to_string()),
+                version: Some(redact_sensitive_text(version, &mut redaction)),
+                action: None,
+                reason: Some(redact_sensitive_text(reason, &mut redaction)),
+                bundle: None,
+            }),
+            TraceEventKind::ActionVerificationCompleted { action, result } => {
+                let key = audit_action_key(event, action);
+                let adapter = adapter_from_result(result);
+                let sanitized = sanitized_value(result, &mut redaction)?;
+                verification_by_action.insert(key, (adapter, sanitized));
+            }
+            TraceEventKind::ActionNeedsApproval { action, result } => {
+                actions.push(audit_action_record(
+                    AuditActionRecordInput {
+                        event,
+                        action,
+                        status: "needs_approval",
+                        result: Some(result),
+                        outcome: None,
+                        error: None,
+                    },
+                    &verification_by_action,
+                    &mut redaction,
+                )?);
+            }
+            TraceEventKind::ActionDenied { action, result } => {
+                actions.push(audit_action_record(
+                    AuditActionRecordInput {
+                        event,
+                        action,
+                        status: "denied",
+                        result: Some(result),
+                        outcome: None,
+                        error: None,
+                    },
+                    &verification_by_action,
+                    &mut redaction,
+                )?);
+            }
+            TraceEventKind::ActionNeedsIntervention { action, result } => {
+                actions.push(audit_action_record(
+                    AuditActionRecordInput {
+                        event,
+                        action,
+                        status: "needs_intervention",
+                        result: Some(result),
+                        outcome: None,
+                        error: None,
+                    },
+                    &verification_by_action,
+                    &mut redaction,
+                )?);
+            }
+            TraceEventKind::ActionFailed {
+                action,
+                error,
+                result,
+            } => {
+                actions.push(audit_action_record(
+                    AuditActionRecordInput {
+                        event,
+                        action,
+                        status: "failed",
+                        result: Some(result),
+                        outcome: None,
+                        error: Some(error.clone()),
+                    },
+                    &verification_by_action,
+                    &mut redaction,
+                )?);
+            }
+            TraceEventKind::ActionExecuted { action, outcome } => {
+                actions.push(audit_action_record(
+                    AuditActionRecordInput {
+                        event,
+                        action,
+                        status: "executed",
+                        result: None,
+                        outcome: Some(outcome),
+                        error: None,
+                    },
+                    &verification_by_action,
+                    &mut redaction,
+                )?);
+            }
+            TraceEventKind::StateCommitted {
+                state_hash,
+                snapshot_id,
+            } => state_nodes.push(audit_state_node_record(
+                event,
+                state_store,
+                state_hash,
+                snapshot_id,
+                &mut redaction,
+            )?),
+            _ => {}
+        }
+
+        if let Some(record) = audit_governance_record(event, &mut redaction)? {
+            governance_events.push(record);
+        }
+    }
+
+    Ok(AuditExport {
+        schema_version: AUDIT_EXPORT_SCHEMA_VERSION.to_string(),
+        run_id: run_id.to_string(),
+        generated_at: OffsetDateTime::now_utc(),
+        source: "trace_state_governance_primitives".to_string(),
+        replay_mode: "inspect_only".to_string(),
+        side_effects_replayed: false,
+        filters,
+        trace_range,
+        event_count: filtered_events.len(),
+        work_orders,
+        policies,
+        actions,
+        governance_events,
+        state_nodes,
+        redaction: redaction.summary(),
+    })
+}
+
+fn audit_trace_range(events: &[&TraceEvent]) -> Option<AuditTraceRange> {
+    let first = events.first()?;
+    let last = events.last()?;
+    Some(AuditTraceRange {
+        first_sequence: first.sequence,
+        last_sequence: last.sequence,
+        first_trace_event_id: first.trace_event_id.clone(),
+        last_trace_event_id: last.trace_event_id.clone(),
+    })
+}
+
+fn audit_action_record(
+    input: AuditActionRecordInput<'_>,
+    verification_by_action: &BTreeMap<String, (Option<String>, serde_json::Value)>,
+    redaction: &mut RedactionTracker,
+) -> Result<AuditActionRecord, String> {
+    let key = audit_action_key(input.event, input.action);
+    let prior = verification_by_action.get(&key);
+    let adapter = input
+        .result
+        .and_then(adapter_from_result)
+        .or_else(|| prior.and_then(|(adapter, _)| adapter.clone()))
+        .or_else(|| adapter_from_action_name(&input.action.name));
+    let verification_result = match input.result {
+        Some(result) => Some(sanitized_value(result, redaction)?),
+        None => prior.map(|(_, value)| value.clone()),
+    };
+    Ok(AuditActionRecord {
+        trace_event_id: input.event.trace_event_id.clone(),
+        sequence: input.event.sequence,
+        identity: input.event.identity.clone(),
+        action_name: input.action.name.clone(),
+        adapter,
+        status: input.status.to_string(),
+        action: sanitized_value(input.action, redaction)?,
+        verification_result,
+        outcome: input
+            .outcome
+            .map(|value| redact_value(value.clone(), redaction)),
+        error: input
+            .error
+            .map(|value| redact_sensitive_text(&value, redaction)),
+    })
+}
+
+fn audit_state_node_record(
+    event: &TraceEvent,
+    state_store: &SqliteStateStore,
+    state_hash: &ContentHash,
+    snapshot_id: &Option<SnapshotId>,
+    redaction: &mut RedactionTracker,
+) -> Result<AuditStateNodeRecord, String> {
+    let state_node_id = if let Some(state_node_id) = event.identity.state_node_id.clone() {
+        Some(state_node_id)
+    } else if let Some(snapshot_id) = snapshot_id {
+        Some(load_verified_state_snapshot(state_store, snapshot_id, Some(state_hash))?.node_id)
+    } else {
+        None
+    };
+    let node = if let Some(state_node_id) = &state_node_id {
+        Some(load_verified_state_node(
+            state_store,
+            state_node_id,
+            Some(state_hash),
+        )?)
+    } else {
+        None
+    };
+    Ok(AuditStateNodeRecord {
+        trace_event_id: event.trace_event_id.clone(),
+        sequence: event.sequence,
+        identity: event.identity.clone(),
+        state_node_id: state_node_id.as_ref().map(ToString::to_string),
+        parent_state_node_ids: node
+            .as_ref()
+            .map(|node| node.parent_ids.iter().map(ToString::to_string).collect())
+            .unwrap_or_default(),
+        state_hash: state_hash.clone(),
+        snapshot_id: snapshot_id.clone(),
+        metadata: node
+            .map(|node| sanitized_value(&node.metadata, redaction))
+            .transpose()?,
+    })
+}
+
+fn audit_governance_record(
+    event: &TraceEvent,
+    redaction: &mut RedactionTracker,
+) -> Result<Option<AuditGovernanceRecord>, String> {
+    validate_governance_trace_context(event)?;
+    let (event_name, reason, object_id, scope, details) = match &event.kind {
+        TraceEventKind::ApprovalRequested { approval } => {
+            validate_approval_trace_context(event, approval)?;
+            (
+                "approval.requested",
+                approval.reason.clone(),
+                Some(approval.approval_id.to_string()),
+                None,
+                sanitized_value(approval, redaction)?,
+            )
+        }
+        TraceEventKind::ApprovalGranted { approval } => {
+            validate_approval_trace_context(event, approval)?;
+            (
+                "approval.granted",
+                approval.reason.clone(),
+                Some(approval.approval_id.to_string()),
+                None,
+                sanitized_value(approval, redaction)?,
+            )
+        }
+        TraceEventKind::ApprovalDenied { approval, reason } => {
+            validate_approval_trace_context(event, approval)?;
+            (
+                "approval.denied",
+                Some(reason.clone()),
+                Some(approval.approval_id.to_string()),
+                None,
+                sanitized_value(approval, redaction)?,
+            )
+        }
+        TraceEventKind::ApprovalExpired { approval, reason } => {
+            validate_approval_trace_context(event, approval)?;
+            (
+                "approval.expired",
+                Some(reason.clone()),
+                Some(approval.approval_id.to_string()),
+                None,
+                sanitized_value(approval, redaction)?,
+            )
+        }
+        TraceEventKind::ApprovalRevoked { approval, reason } => {
+            validate_approval_trace_context(event, approval)?;
+            (
+                "approval.revoked",
+                Some(reason.clone()),
+                Some(approval.approval_id.to_string()),
+                None,
+                sanitized_value(approval, redaction)?,
+            )
+        }
+        TraceEventKind::RunPaused { reason } => (
+            "run.paused",
+            reason.clone(),
+            None,
+            None,
+            serde_json::json!({ "reason": reason }),
+        ),
+        TraceEventKind::RunResumed { reason } => (
+            "run.resumed",
+            reason.clone(),
+            None,
+            None,
+            serde_json::json!({ "reason": reason }),
+        ),
+        TraceEventKind::ActionDenied { action, result } => (
+            "action.denied",
+            result.reasons.first().cloned(),
+            event.identity.action_id.as_ref().map(ToString::to_string),
+            None,
+            serde_json::json!({
+                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+            }),
+        ),
+        TraceEventKind::ActionNeedsApproval { action, result } => (
+            "action.needs_approval",
+            result.reasons.first().cloned(),
+            event.identity.action_id.as_ref().map(ToString::to_string),
+            None,
+            serde_json::json!({
+                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+            }),
+        ),
+        TraceEventKind::ActionNeedsIntervention { action, result } => (
+            "action.needs_intervention",
+            result.reasons.first().cloned(),
+            event.identity.action_id.as_ref().map(ToString::to_string),
+            None,
+            serde_json::json!({
+                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+            }),
+        ),
+        TraceEventKind::EscalationTriggered { escalation } => {
+            validate_run_match(event, &escalation.run_id, "Escalation")?;
+            (
+                "escalation.triggered",
+                Some(escalation.reason.clone()),
+                escalation.action_id.as_ref().map(ToString::to_string),
+                None,
+                sanitized_value(escalation, redaction)?,
+            )
+        }
+        TraceEventKind::CircuitBreakerTripped { breaker } => (
+            "circuit_breaker.tripped",
+            Some(breaker.reason.clone()),
+            Some(breaker.breaker_id.to_string()),
+            Some(serde_json::json!({
+                "scope": breaker.scope.label(),
+                "value": breaker.scope.value(),
+            })),
+            sanitized_value(breaker, redaction)?,
+        ),
+        TraceEventKind::CircuitBreakerCleared { breaker } => (
+            "circuit_breaker.cleared",
+            Some(breaker.reason.clone()),
+            Some(breaker.breaker_id.to_string()),
+            Some(serde_json::json!({
+                "scope": breaker.scope.label(),
+                "value": breaker.scope.value(),
+            })),
+            sanitized_value(breaker, redaction)?,
+        ),
+        TraceEventKind::GovernanceApprovalRequested { transition } => {
+            governance_transition_record("governance.approval.requested", transition, redaction)?
+        }
+        TraceEventKind::GovernanceApprovalGranted { transition } => {
+            governance_transition_record("governance.approval.granted", transition, redaction)?
+        }
+        TraceEventKind::GovernanceApprovalDenied { transition } => {
+            governance_transition_record("governance.approval.denied", transition, redaction)?
+        }
+        TraceEventKind::GovernanceApprovalExpired { transition } => {
+            governance_transition_record("governance.approval.expired", transition, redaction)?
+        }
+        TraceEventKind::GovernanceApprovalRevoked { transition } => {
+            governance_transition_record("governance.approval.revoked", transition, redaction)?
+        }
+        TraceEventKind::EscalationOpened { transition } => {
+            governance_transition_record("governance.escalation.opened", transition, redaction)?
+        }
+        TraceEventKind::EscalationResolved { transition } => {
+            governance_transition_record("governance.escalation.resolved", transition, redaction)?
+        }
+        TraceEventKind::EscalationExpired { transition } => {
+            governance_transition_record("governance.escalation.expired", transition, redaction)?
+        }
+        TraceEventKind::EscalationRevoked { transition } => {
+            governance_transition_record("governance.escalation.revoked", transition, redaction)?
+        }
+        TraceEventKind::InterventionRequested { transition } => governance_transition_record(
+            "governance.intervention.requested",
+            transition,
+            redaction,
+        )?,
+        TraceEventKind::InterventionResolved { transition } => {
+            governance_transition_record("governance.intervention.resolved", transition, redaction)?
+        }
+        TraceEventKind::InterventionCancelled { transition } => governance_transition_record(
+            "governance.intervention.cancelled",
+            transition,
+            redaction,
+        )?,
+        TraceEventKind::InterventionExpired { transition } => {
+            governance_transition_record("governance.intervention.expired", transition, redaction)?
+        }
+        TraceEventKind::InterventionRevoked { transition } => {
+            governance_transition_record("governance.intervention.revoked", transition, redaction)?
+        }
+        TraceEventKind::GovernanceCircuitBreakerTripped { transition } => {
+            governance_transition_record(
+                "governance.circuit_breaker.tripped",
+                transition,
+                redaction,
+            )?
+        }
+        TraceEventKind::GovernanceCircuitBreakerCleared { transition } => {
+            governance_transition_record(
+                "governance.circuit_breaker.cleared",
+                transition,
+                redaction,
+            )?
+        }
+        TraceEventKind::GovernanceCircuitBreakerExpired { transition } => {
+            governance_transition_record(
+                "governance.circuit_breaker.expired",
+                transition,
+                redaction,
+            )?
+        }
+        TraceEventKind::GovernanceCircuitBreakerRevoked { transition } => {
+            governance_transition_record(
+                "governance.circuit_breaker.revoked",
+                transition,
+                redaction,
+            )?
+        }
+        TraceEventKind::KillSwitchActivated { transition } => {
+            governance_transition_record("governance.kill_switch.activated", transition, redaction)?
+        }
+        TraceEventKind::KillSwitchCleared { transition } => {
+            governance_transition_record("governance.kill_switch.cleared", transition, redaction)?
+        }
+        TraceEventKind::KillSwitchExpired { transition } => {
+            governance_transition_record("governance.kill_switch.expired", transition, redaction)?
+        }
+        TraceEventKind::KillSwitchRevoked { transition } => {
+            governance_transition_record("governance.kill_switch.revoked", transition, redaction)?
+        }
+        TraceEventKind::GovernanceTransitionRejected { rejection } => (
+            "governance.transition.rejected",
+            Some(rejection.reason.clone()),
+            Some(rejection.object.object_id().to_string()),
+            Some(sanitized_value(&rejection.scope, redaction)?),
+            sanitized_value(rejection, redaction)?,
+        ),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(AuditGovernanceRecord {
+        trace_event_id: event.trace_event_id.clone(),
+        sequence: event.sequence,
+        identity: event.identity.clone(),
+        event: event_name.to_string(),
+        object_id,
+        scope,
+        reason: reason.map(|value| redact_sensitive_text(&value, redaction)),
+        details,
+    }))
+}
+
+fn governance_transition_record(
+    event_name: &'static str,
+    transition: &splendor_types::GovernanceTransition,
+    redaction: &mut RedactionTracker,
+) -> Result<GovernanceRecordParts, String> {
+    Ok((
+        event_name,
+        Some(transition.reason.clone()),
+        Some(transition.object.object_id().to_string()),
+        Some(sanitized_value(&transition.scope, redaction)?),
+        sanitized_value(transition, redaction)?,
+    ))
+}
+
+fn load_verified_state_snapshot(
+    state_store: &SqliteStateStore,
+    snapshot_id: &SnapshotId,
+    expected_state_hash: Option<&ContentHash>,
+) -> Result<splendor_store::StateSnapshot, String> {
+    let snapshot = state_store
+        .load_snapshot(snapshot_id)
+        .map_err(|error| format!("Failed to load state snapshot: {error}"))?;
+    let recomputed_snapshot_id = SnapshotId::from_bytes(&snapshot.state.bytes);
+    if recomputed_snapshot_id != *snapshot_id {
+        return Err(format!(
+            "State snapshot integrity mismatch: expected '{snapshot_id}' but loaded bytes hash to '{recomputed_snapshot_id}'"
+        ));
+    }
+
+    let node = load_verified_state_node(state_store, &snapshot.node_id, expected_state_hash)?;
+    let data_hash = ContentHash::blake3(&snapshot.state.bytes);
+    if node.data_hash != data_hash {
+        return Err(format!(
+            "State snapshot node data hash mismatch for node '{}'",
+            snapshot.node_id
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn load_verified_state_node(
+    state_store: &SqliteStateStore,
+    state_node_id: &splendor_types::StateNodeId,
+    expected_state_hash: Option<&ContentHash>,
+) -> Result<splendor_store::StateNode, String> {
+    let node = state_store
+        .get_node(state_node_id)
+        .map_err(|error| format!("Failed to load state node: {error}"))?;
+    if node.id != *state_node_id {
+        return Err(format!(
+            "State node identity mismatch: requested '{state_node_id}' but loaded '{}'",
+            node.id
+        ));
+    }
+    if let Some(expected_state_hash) = expected_state_hash {
+        if node.id.hash() != expected_state_hash {
+            return Err(format!(
+                "State commit hash mismatch for node '{state_node_id}': expected '{expected_state_hash}' but node hash is '{}'",
+                node.id.hash()
+            ));
+        }
+    }
+    let state = state_store
+        .get_state(&node.data_ref)
+        .map_err(|error| format!("Failed to load state data: {error}"))?;
+    let data_hash = ContentHash::blake3(&state.bytes);
+    if node.data_hash != data_hash {
+        return Err(format!(
+            "State node data hash mismatch for node '{state_node_id}'"
+        ));
+    }
+    Ok(node)
+}
+
+fn validate_approval_trace_context(
+    event: &TraceEvent,
+    approval: &splendor_types::ApprovalTraceContext,
+) -> Result<(), String> {
+    validate_run_match(event, &approval.run_id, "Approval")?;
+    if let Some(tenant_id) = &event.identity.tenant_id {
+        if tenant_id != &approval.tenant_id {
+            return Err(format!(
+                "Approval trace tenant mismatch at sequence {}: event tenant '{}' but approval tenant '{}'",
+                event.sequence, tenant_id, approval.tenant_id
+            ));
+        }
+    }
+    if let Some(agent_id) = &event.identity.agent_id {
+        if agent_id != &approval.agent_id {
+            return Err(format!(
+                "Approval trace agent mismatch at sequence {}: event agent '{}' but approval agent '{}'",
+                event.sequence, agent_id, approval.agent_id
+            ));
+        }
+    }
+    if let (Some(event_action_id), Some(approval_action_id)) =
+        (&event.identity.action_id, &approval.action_id)
+    {
+        if event_action_id != approval_action_id {
+            return Err(format!(
+                "Approval trace action mismatch at sequence {}: event action '{}' but approval action '{}'",
+                event.sequence, event_action_id, approval_action_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_governance_trace_context(event: &TraceEvent) -> Result<(), String> {
+    match &event.kind {
+        TraceEventKind::GovernanceApprovalRequested { transition }
+        | TraceEventKind::GovernanceApprovalGranted { transition }
+        | TraceEventKind::GovernanceApprovalDenied { transition }
+        | TraceEventKind::GovernanceApprovalExpired { transition }
+        | TraceEventKind::GovernanceApprovalRevoked { transition }
+        | TraceEventKind::EscalationOpened { transition }
+        | TraceEventKind::EscalationResolved { transition }
+        | TraceEventKind::EscalationExpired { transition }
+        | TraceEventKind::EscalationRevoked { transition }
+        | TraceEventKind::InterventionRequested { transition }
+        | TraceEventKind::InterventionResolved { transition }
+        | TraceEventKind::InterventionCancelled { transition }
+        | TraceEventKind::InterventionExpired { transition }
+        | TraceEventKind::InterventionRevoked { transition }
+        | TraceEventKind::GovernanceCircuitBreakerTripped { transition }
+        | TraceEventKind::GovernanceCircuitBreakerCleared { transition }
+        | TraceEventKind::GovernanceCircuitBreakerExpired { transition }
+        | TraceEventKind::GovernanceCircuitBreakerRevoked { transition }
+        | TraceEventKind::KillSwitchActivated { transition }
+        | TraceEventKind::KillSwitchCleared { transition }
+        | TraceEventKind::KillSwitchExpired { transition }
+        | TraceEventKind::KillSwitchRevoked { transition } => {
+            validate_governance_scope_context(event, &transition.scope, "Governance transition")?;
+            if let Some(run_id) = &transition.trace.run_id {
+                validate_run_match(event, run_id, "Governance transition")?;
+            }
+        }
+        TraceEventKind::GovernanceTransitionRejected { rejection } => {
+            validate_governance_scope_context(
+                event,
+                &rejection.scope,
+                "Governance transition rejection",
+            )?;
+            if let Some(run_id) = &rejection.trace.run_id {
+                validate_run_match(event, run_id, "Governance transition rejection")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_governance_scope_context(
+    event: &TraceEvent,
+    scope: &GovernanceScope,
+    label: &str,
+) -> Result<(), String> {
+    if let Some(run_id) = scope.run_id() {
+        validate_run_match(event, run_id, label)?;
+    }
+    if let (Some(event_tenant_id), Some(scope_tenant_id)) =
+        (&event.identity.tenant_id, scope.tenant_id())
+    {
+        if event_tenant_id != scope_tenant_id {
+            return Err(format!(
+                "{label} tenant mismatch at sequence {}: event tenant '{}' but scope tenant '{}'",
+                event.sequence, event_tenant_id, scope_tenant_id
+            ));
+        }
+    }
+    if let (Some(event_agent_id), Some(scope_agent_id)) =
+        (&event.identity.agent_id, scope.agent_id())
+    {
+        if event_agent_id != scope_agent_id {
+            return Err(format!(
+                "{label} agent mismatch at sequence {}: event agent '{}' but scope agent '{}'",
+                event.sequence, event_agent_id, scope_agent_id
+            ));
+        }
+    }
+    if let (Some(event_action_id), Some(scope_action_id)) =
+        (&event.identity.action_id, scope.action_id())
+    {
+        if event_action_id != scope_action_id {
+            return Err(format!(
+                "{label} action mismatch at sequence {}: event action '{}' but scope action '{}'",
+                event.sequence, event_action_id, scope_action_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_run_match(
+    event: &TraceEvent,
+    actual_run_id: &RunId,
+    label: &str,
+) -> Result<(), String> {
+    if actual_run_id != &event.run_id {
+        return Err(format!(
+            "{label} trace run mismatch at sequence {}: event run '{}' but embedded run '{}'",
+            event.sequence, event.run_id, actual_run_id
+        ));
+    }
+    Ok(())
+}
+
+fn sanitized_value<T: Serialize>(
+    value: &T,
+    redaction: &mut RedactionTracker,
+) -> Result<serde_json::Value, String> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| format!("Failed to encode audit value: {error}"))?;
+    Ok(redact_value(value, redaction))
+}
+
+fn redact_value(value: serde_json::Value, redaction: &mut RedactionTracker) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_value(item, redaction))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                if is_sensitive_key(&key) {
+                    redaction.record(&key);
+                    redacted.insert(key, serde_json::Value::String("[REDACTED]".to_string()));
+                } else {
+                    redacted.insert(key, redact_value(value, redaction));
+                }
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::String(value) => {
+            serde_json::Value::String(redact_sensitive_text(&value, redaction))
+        }
+        other => other,
+    }
+}
+
+fn redact_sensitive_text(value: &str, redaction: &mut RedactionTracker) -> String {
+    if is_sensitive_text(value) {
+        redaction.record("sensitive_text");
+        "[REDACTED]".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn is_sensitive_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let compact = compact_sensitive_match_text(&normalized);
+    [
+        "authorization:",
+        "authorization=",
+        "bearer ",
+        "token:",
+        "token=",
+        "secret:",
+        "secret=",
+        "password:",
+        "password=",
+        "credential:",
+        "credential=",
+        "api_key:",
+        "api_key=",
+        "apikey:",
+        "apikey=",
+        "signature:",
+        "signature=",
+        "private_key:",
+        "private_key=",
+        "private key",
+        "-----begin",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || [
+            "authorization",
+            "bearer",
+            "token",
+            "secret",
+            "password",
+            "credential",
+            "apikey",
+            "signature",
+            "privatekey",
+        ]
+        .iter()
+        .any(|needle| compact.contains(needle))
+        || looks_like_jwt(value)
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let token = value.trim();
+    let mut parts = token.split('.');
+    let Some(header) = parts.next() else {
+        return false;
+    };
+    let Some(payload) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    [header, payload, signature].iter().all(|part| {
+        part.len() >= 8
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    let compact = compact_sensitive_match_text(&normalized);
+    [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "signature",
+        "private_key",
+        "snapshot_bytes",
+        "state_bytes",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "apikey",
+            "authorization",
+            "bearer",
+            "signature",
+            "privatekey",
+            "snapshotbytes",
+            "statebytes",
+        ]
+        .iter()
+        .any(|needle| compact.contains(needle))
+}
+
+fn compact_sensitive_match_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn audit_action_key(event: &TraceEvent, action: &Action) -> String {
+    event.identity.action_id.as_ref().map_or_else(
+        || format!("action:{}", action.name),
+        |action_id| format!("action_id:{action_id}"),
+    )
+}
+
+fn event_has_tenant(event: &TraceEvent, expected: &str) -> bool {
+    if event.identity.tenant_id.as_ref().map(ToString::to_string) == Some(expected.to_string()) {
+        return true;
+    }
+    match &event.kind {
+        TraceEventKind::WorkOrderAccepted { tenant_id, .. } => tenant_id.to_string() == expected,
+        TraceEventKind::WorkOrderRejected { tenant_id, .. } => {
+            tenant_id.as_ref().map(ToString::to_string).as_deref() == Some(expected)
+        }
+        TraceEventKind::ApprovalRequested { approval }
+        | TraceEventKind::ApprovalGranted { approval }
+        | TraceEventKind::ApprovalDenied { approval, .. }
+        | TraceEventKind::ApprovalExpired { approval, .. }
+        | TraceEventKind::ApprovalRevoked { approval, .. } => {
+            approval.tenant_id.to_string() == expected
+        }
+        TraceEventKind::ActionVerificationCompleted { result, .. }
+        | TraceEventKind::ActionNeedsApproval { result, .. }
+        | TraceEventKind::ActionDenied { result, .. }
+        | TraceEventKind::ActionNeedsIntervention { result, .. }
+        | TraceEventKind::ActionFailed { result, .. } => {
+            string_json_pointer(&result.artifacts, "/context/tenant_id").as_deref()
+                == Some(expected)
+        }
+        _ => false,
+    }
+}
+
+fn event_has_agent(event: &TraceEvent, expected: &str) -> bool {
+    if event.identity.agent_id.as_ref().map(ToString::to_string) == Some(expected.to_string()) {
+        return true;
+    }
+    match &event.kind {
+        TraceEventKind::WorkOrderAccepted { agent_id, .. } => agent_id.to_string() == expected,
+        TraceEventKind::WorkOrderRejected { agent_id, .. } => {
+            agent_id.as_ref().map(ToString::to_string).as_deref() == Some(expected)
+        }
+        TraceEventKind::ApprovalRequested { approval }
+        | TraceEventKind::ApprovalGranted { approval }
+        | TraceEventKind::ApprovalDenied { approval, .. }
+        | TraceEventKind::ApprovalExpired { approval, .. }
+        | TraceEventKind::ApprovalRevoked { approval, .. } => {
+            approval.agent_id.to_string() == expected
+        }
+        TraceEventKind::ActionVerificationCompleted { result, .. }
+        | TraceEventKind::ActionNeedsApproval { result, .. }
+        | TraceEventKind::ActionDenied { result, .. }
+        | TraceEventKind::ActionNeedsIntervention { result, .. }
+        | TraceEventKind::ActionFailed { result, .. } => {
+            string_json_pointer(&result.artifacts, "/context/agent_id").as_deref() == Some(expected)
+        }
+        _ => false,
+    }
+}
+
+fn event_has_action(event: &TraceEvent, expected: &str) -> bool {
+    if event.identity.action_id.as_ref().map(ToString::to_string) == Some(expected.to_string()) {
+        return true;
+    }
+    if action_for_event(event).is_some_and(|action| action.name == expected) {
+        return true;
+    }
+    match &event.kind {
+        TraceEventKind::ApprovalRequested { approval }
+        | TraceEventKind::ApprovalGranted { approval }
+        | TraceEventKind::ApprovalDenied { approval, .. }
+        | TraceEventKind::ApprovalExpired { approval, .. }
+        | TraceEventKind::ApprovalRevoked { approval, .. } => {
+            approval.action_id.as_ref().map(ToString::to_string) == Some(expected.to_string())
+                || approval.action_name == expected
+        }
+        TraceEventKind::EscalationTriggered { escalation } => {
+            escalation.action_id.as_ref().map(ToString::to_string) == Some(expected.to_string())
+                || escalation.action_name.as_deref() == Some(expected)
+        }
+        TraceEventKind::ActionVerificationCompleted { result, .. }
+        | TraceEventKind::ActionNeedsApproval { result, .. }
+        | TraceEventKind::ActionDenied { result, .. }
+        | TraceEventKind::ActionNeedsIntervention { result, .. }
+        | TraceEventKind::ActionFailed { result, .. } => {
+            string_json_pointer(&result.artifacts, "/context/action_id").as_deref()
+                == Some(expected)
+                || string_json_pointer(&result.artifacts, "/context/action").as_deref()
+                    == Some(expected)
+        }
+        _ => false,
+    }
+}
+
+fn audit_adapter_index(events: &[TraceEvent]) -> BTreeMap<String, String> {
+    let mut adapters = BTreeMap::new();
+    for event in events {
+        if let TraceEventKind::ActionVerificationCompleted { action, result } = &event.kind {
+            if let Some(adapter) = adapter_from_result(result) {
+                adapters.insert(audit_action_key(event, action), adapter);
+            }
+        }
+    }
+    adapters
+}
+
+fn event_has_adapter(
+    event: &TraceEvent,
+    expected: &str,
+    adapter_by_action: &BTreeMap<String, String>,
+) -> bool {
+    match &event.kind {
+        TraceEventKind::ApprovalRequested { approval }
+        | TraceEventKind::ApprovalGranted { approval }
+        | TraceEventKind::ApprovalDenied { approval, .. }
+        | TraceEventKind::ApprovalExpired { approval, .. }
+        | TraceEventKind::ApprovalRevoked { approval, .. } => {
+            approval.adapter.as_deref() == Some(expected)
+        }
+        TraceEventKind::EscalationTriggered { escalation } => {
+            escalation.adapter.as_deref() == Some(expected)
+        }
+        TraceEventKind::CircuitBreakerTripped { breaker }
+        | TraceEventKind::CircuitBreakerCleared { breaker } => {
+            breaker.scope.label() == "adapter" && breaker.scope.value().as_deref() == Some(expected)
+        }
+        TraceEventKind::ActionVerificationCompleted { result, .. }
+        | TraceEventKind::ActionNeedsApproval { result, .. }
+        | TraceEventKind::ActionDenied { result, .. }
+        | TraceEventKind::ActionNeedsIntervention { result, .. }
+        | TraceEventKind::ActionFailed { result, .. } => {
+            adapter_from_result(result).as_deref() == Some(expected)
+        }
+        _ => action_for_event(event)
+            .and_then(|action| adapter_by_action.get(&audit_action_key(event, action)))
+            .map(|adapter| adapter == expected)
+            .unwrap_or_else(|| {
+                action_for_event(event)
+                    .and_then(|action| adapter_from_action_name(&action.name))
+                    .as_deref()
+                    == Some(expected)
+            }),
+    }
+}
+
+fn action_for_event(event: &TraceEvent) -> Option<&Action> {
+    match &event.kind {
+        TraceEventKind::ActionVerificationStarted { action }
+        | TraceEventKind::ActionVerificationCompleted { action, .. }
+        | TraceEventKind::ActionNeedsApproval { action, .. }
+        | TraceEventKind::ActionExecuted { action, .. }
+        | TraceEventKind::ActionDenied { action, .. }
+        | TraceEventKind::ActionFailed { action, .. }
+        | TraceEventKind::ActionNeedsIntervention { action, .. } => Some(action),
+        _ => None,
+    }
+}
+
+fn adapter_from_result(result: &splendor_types::VerificationResult) -> Option<String> {
+    string_json_pointer(&result.artifacts, "/context/adapter")
+        .or_else(|| string_json_pointer(&result.artifacts, "/requested"))
+        .or_else(|| {
+            let breaker = circuit_breaker_artifact(&result.artifacts)?;
+            if string_artifact(breaker, "scope").as_deref() == Some("adapter") {
+                return string_artifact(breaker, "scope_value");
+            }
+            None
+        })
+}
+
+fn adapter_from_action_name(action_name: &str) -> Option<String> {
+    match action_name {
+        "write_file" | "read_file" | "list_dir" | "delete_file" => Some("filesystem".to_string()),
+        "http.fetch" | "http_fetch" => Some("http".to_string()),
+        _ => None,
+    }
+}
+
+fn string_json_pointer(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value.pointer(pointer)?.as_str().map(str::to_string)
+}
+
+fn string_value(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_string)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -432,6 +1913,7 @@ enum ReplayOutput {
         parent_child_runs: Vec<ReplayParentChildRun>,
         isolation_denials: Vec<ReplayIsolationDenial>,
         escalations: Vec<ReplayEscalation>,
+        approval_events: Vec<ReplayApprovalEvent>,
         circuit_breaker_denials: Vec<ReplayCircuitBreakerDenial>,
     },
     CausalGraph {
@@ -441,6 +1923,7 @@ enum ReplayOutput {
         messages: Vec<ReplayMessageEvent>,
         parent_child_runs: Vec<ReplayParentChildRun>,
         isolation_denials: Vec<ReplayIsolationDenial>,
+        approval_events: Vec<ReplayApprovalEvent>,
         circuit_breaker_denials: Vec<ReplayCircuitBreakerDenial>,
     },
     HandoffBoundary {
@@ -504,6 +1987,15 @@ struct ReplayEscalation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+struct ReplayApprovalEvent {
+    lifecycle: String,
+    trace_event_id: TraceEventId,
+    approval: splendor_types::ApprovalTraceContext,
+    reason: Option<String>,
+    side_effects_replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct ReplayCircuitBreakerDenial {
     trace_event_id: TraceEventId,
     action: splendor_types::Action,
@@ -534,6 +2026,7 @@ struct ReplayTick {
     parent_child_runs: Vec<ReplayParentChildRun>,
     isolation_denials: Vec<ReplayIsolationDenial>,
     escalations: Vec<ReplayEscalation>,
+    approval_events: Vec<ReplayApprovalEvent>,
     circuit_breaker_denials: Vec<ReplayCircuitBreakerDenial>,
 }
 
@@ -542,6 +2035,7 @@ struct ReplayCausalGraph {
     messages: Vec<ReplayMessageEvent>,
     parent_child_runs: Vec<ReplayParentChildRun>,
     isolation_denials: Vec<ReplayIsolationDenial>,
+    approval_events: Vec<ReplayApprovalEvent>,
     circuit_breaker_denials: Vec<ReplayCircuitBreakerDenial>,
 }
 
@@ -584,9 +2078,9 @@ fn replay_outputs_from_stores(
             state_db_path.display()
         ));
     }
-    let trace_store = SqliteTraceStore::open(trace_db_path)
+    let trace_store = SqliteTraceStore::open_read_only(trace_db_path)
         .map_err(|error| format!("Failed to open trace store: {error}"))?;
-    let state_store = SqliteStateStore::open(state_db_path)
+    let state_store = SqliteStateStore::open_read_only(state_db_path)
         .map_err(|error| format!("Failed to open state store: {error}"))?;
     let records = TraceStore::read(&trace_store, run_id)
         .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
@@ -605,9 +2099,7 @@ fn replay_outputs_from_stores(
     };
 
     let snapshot_len = if let Some(snapshot_id) = &from_snapshot_id {
-        let snapshot = state_store
-            .load_snapshot(snapshot_id)
-            .map_err(|error| format!("Failed to load snapshot: {error}"))?;
+        let snapshot = load_verified_state_snapshot(&state_store, snapshot_id, None)?;
         Some(snapshot.state.bytes.len())
     } else {
         None
@@ -697,6 +2189,7 @@ fn collect_replay_outputs(
                         parent_child_runs: tick.parent_child_runs,
                         isolation_denials: tick.isolation_denials,
                         escalations: tick.escalations,
+                        approval_events: tick.approval_events,
                         circuit_breaker_denials: tick.circuit_breaker_denials,
                     });
                 }
@@ -711,6 +2204,7 @@ fn collect_replay_outputs(
                 let message_event = replay_message_event(event)?;
                 let parent_child_run = replay_parent_child_run(event)?;
                 let isolation_denial = replay_isolation_denial(event);
+                let approval_event = replay_approval_event(event)?;
                 let circuit_breaker_denial = replay_circuit_breaker_denial(event);
 
                 if let Some(tick) = current_tick.as_mut() {
@@ -724,6 +2218,9 @@ fn collect_replay_outputs(
                     if let Some(circuit_breaker_denial) = circuit_breaker_denial.clone() {
                         tick.circuit_breaker_denials.push(circuit_breaker_denial);
                     }
+                    if let Some(approval_event) = approval_event.clone() {
+                        tick.approval_events.push(approval_event);
+                    }
                 }
 
                 if let Some(message_event) = message_event {
@@ -734,6 +2231,9 @@ fn collect_replay_outputs(
                 }
                 if let Some(isolation_denial) = isolation_denial {
                     causal_graph.isolation_denials.push(isolation_denial);
+                }
+                if let Some(approval_event) = approval_event {
+                    causal_graph.approval_events.push(approval_event);
                 }
                 if let Some(circuit_breaker_denial) = circuit_breaker_denial {
                     causal_graph
@@ -750,6 +2250,7 @@ fn collect_replay_outputs(
         messages: causal_graph.messages,
         parent_child_runs: causal_graph.parent_child_runs,
         isolation_denials: causal_graph.isolation_denials,
+        approval_events: causal_graph.approval_events,
         circuit_breaker_denials: causal_graph.circuit_breaker_denials,
     });
     Ok(outputs)
@@ -801,6 +2302,14 @@ fn decode_and_validate_trace_records(
             return Err(format!(
                 "Trace id mismatch at sequence {} for run '{run_id}'",
                 event.sequence
+            ));
+        }
+        let expected_event_hash = compute_trace_event_hash(prev_hash.as_ref(), &record.payload)
+            .map_err(|error| format!("Failed to recompute trace hash: {error}"))?;
+        if record.event_hash != expected_event_hash {
+            return Err(format!(
+                "Trace payload hash mismatch at sequence {} for run '{run_id}'",
+                record.sequence
             ));
         }
 
@@ -886,6 +2395,31 @@ fn replay_isolation_denial(event: &TraceEvent) -> Option<ReplayIsolationDenial> 
         });
     }
     None
+}
+
+fn replay_approval_event(event: &TraceEvent) -> Result<Option<ReplayApprovalEvent>, String> {
+    let (lifecycle, approval, reason) = match &event.kind {
+        TraceEventKind::ApprovalRequested { approval } => ("requested", approval, None),
+        TraceEventKind::ApprovalGranted { approval } => ("granted", approval, None),
+        TraceEventKind::ApprovalDenied { approval, reason } => {
+            ("denied", approval, Some(reason.clone()))
+        }
+        TraceEventKind::ApprovalExpired { approval, reason } => {
+            ("expired", approval, Some(reason.clone()))
+        }
+        TraceEventKind::ApprovalRevoked { approval, reason } => {
+            ("revoked", approval, Some(reason.clone()))
+        }
+        _ => return Ok(None),
+    };
+    validate_approval_trace_context(event, approval)?;
+    Ok(Some(ReplayApprovalEvent {
+        lifecycle: lifecycle.to_string(),
+        trace_event_id: event.trace_event_id.clone(),
+        approval: approval.clone(),
+        reason,
+        side_effects_replayed: false,
+    }))
 }
 
 fn replay_circuit_breaker_denial(event: &TraceEvent) -> Option<ReplayCircuitBreakerDenial> {
@@ -974,6 +2508,14 @@ fn apply_event_to_tick(
                 result: Some(result.clone()),
             });
         }
+        TraceEventKind::ActionNeedsApproval { action, result } => {
+            tick.actions.push(ReplayAction {
+                action: action.clone(),
+                status: "needs_approval".to_string(),
+                outcome: None,
+                result: Some(result.clone()),
+            });
+        }
         TraceEventKind::ActionFailed { action, result, .. } => {
             tick.actions.push(ReplayAction {
                 action: action.clone(),
@@ -1027,9 +2569,8 @@ fn apply_event_to_tick(
         } => {
             tick.state_hash = Some(state_hash.clone());
             if let Some(snapshot_id) = snapshot_id.clone() {
-                let snapshot = state_store
-                    .load_snapshot(&snapshot_id)
-                    .map_err(|error| format!("Failed to load snapshot: {error}"))?;
+                let snapshot =
+                    load_verified_state_snapshot(state_store, &snapshot_id, Some(state_hash))?;
                 tick.snapshot_bytes_len = Some(snapshot.state.bytes.len());
                 if include_state {
                     tick.snapshot_bytes = Some(snapshot.state.bytes);
@@ -1059,10 +2600,18 @@ fn emit_handoff_replay_output(
 }
 
 fn emit_replay_output(output: ReplayOutput) -> Result<(), String> {
-    let line = serde_json::to_string(&output)
+    let value = redacted_replay_output_value(&output)?;
+    let line = serde_json::to_string(&value)
         .map_err(|error| format!("Failed to encode replay output: {error}"))?;
     println!("{line}");
     Ok(())
+}
+
+fn redacted_replay_output_value(output: &ReplayOutput) -> Result<serde_json::Value, String> {
+    let value = serde_json::to_value(output)
+        .map_err(|error| format!("Failed to encode replay output: {error}"))?;
+    let mut redaction = RedactionTracker::default();
+    Ok(redact_value(value, &mut redaction))
 }
 
 fn parse_snapshot_id(value: &str) -> Result<SnapshotId, String> {
@@ -2124,6 +3673,7 @@ fn usage() -> String {
         "splendorctl trace export --db <path> --run <run-id>",
         "splendorctl state head --db <trace-path> --run <run-id>",
         "splendorctl replay --db <trace-path> --state-db <state-path> --run <run-id> [--from-snapshot <id>] [--include-state]",
+        "splendorctl audit export --db <trace-path> --state-db <state-path> --run <run-id> [--tenant <id>] [--agent <id>] [--action <id-or-name>] [--adapter <id>] [--node <id>] [--instance <id>] [--fleet <id>]",
         "splendorctl run --config <path> [--cycles <n> | --forever]",
         "splendorctl --version",
         "",
@@ -2131,6 +3681,7 @@ fn usage() -> String {
         "  trace export   Export trace records as JSON lines.",
         "  state head     Print the latest state head recorded in the trace.",
         "  replay         Replay a run from trace + state stores.",
+        "  audit export   Export a redacted governance audit from trace + state stores.",
         "  run            Run a local agent loop from config.",
         "  --version      Print package and 0.01 baseline identifiers.",
         "",
@@ -2140,6 +3691,8 @@ fn usage() -> String {
         "  --run <id>           Run identifier to export or replay.",
         "  --from-snapshot <id> Snapshot identifier to start replay.",
         "  --include-state      Include snapshot bytes in replay output.",
+        "  --tenant/--agent/--action/--adapter/--node/--instance/--fleet <value>",
+        "                      Filter audit events by scoped identity where present.",
         "  --config <path>      Path to a run config (yaml/json).",
         "  --cycles <n>         Number of cycles to run.",
         "  --forever            Run until interrupted.",

@@ -18,7 +18,7 @@
 //! assert!(!node_id.to_string().is_empty());
 //! ```
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use splendor_types::{
     AgentId, ContentHash, HashAlgorithm, RunId, SnapshotId, StateHandoffSnapshot, StateNodeId,
@@ -563,6 +563,17 @@ impl SqliteStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateStoreError> {
         let connection = Connection::open(path)?;
         Self::init_schema(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    /// Opens an existing SQLite-backed state store read-only.
+    ///
+    /// This path deliberately avoids schema creation so inspect-only replay and
+    /// audit export cannot mutate the state database while reading evidence.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StateStoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })

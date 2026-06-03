@@ -15,7 +15,7 @@
 //! assert_eq!(records.len(), 1);
 //! ```
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use splendor_types::{ContentHash, HashAlgorithm};
 use std::collections::HashMap;
@@ -93,7 +93,7 @@ impl TraceStore for InMemoryTraceStore {
         let mut inner = self.inner.lock().map_err(|_| TraceStoreError::Poisoned)?;
         let records = inner.entry(run_id.to_string()).or_default();
         let prev_hash = records.last().map(|record| record.event_hash.clone());
-        let event_hash = compute_event_hash(prev_hash.as_ref(), &payload)?;
+        let event_hash = compute_trace_event_hash(prev_hash.as_ref(), &payload)?;
         let sequence = records.len() as u64;
         records.push(TraceRecord {
             run_id: run_id.to_string(),
@@ -177,6 +177,17 @@ impl SqliteTraceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
         let connection = Connection::open(path)?;
         Self::init_schema(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    /// Opens an existing SQLite-backed trace store read-only.
+    ///
+    /// This path deliberately avoids schema creation so inspect-only replay and
+    /// audit export cannot mutate the trace database while reading evidence.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, TraceStoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -421,7 +432,7 @@ impl AsyncTraceStore for SqliteTraceStore {
 }
 
 /// Computes a deterministic event hash for a payload.
-pub(crate) fn compute_event_hash(
+pub fn compute_trace_event_hash(
     prev_hash: Option<&ContentHash>,
     payload: &serde_json::Value,
 ) -> Result<ContentHash, TraceStoreError> {
@@ -433,6 +444,13 @@ pub(crate) fn compute_event_hash(
     }
     bytes.extend_from_slice(&payload_bytes);
     Ok(ContentHash::blake3(bytes))
+}
+
+pub(crate) fn compute_event_hash(
+    prev_hash: Option<&ContentHash>,
+    payload: &serde_json::Value,
+) -> Result<ContentHash, TraceStoreError> {
+    compute_trace_event_hash(prev_hash, payload)
 }
 
 fn normalize_payload_for_hash(payload: &serde_json::Value) -> serde_json::Value {

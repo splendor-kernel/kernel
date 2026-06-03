@@ -233,6 +233,33 @@ fn sqlite_store_persists_state() {
 }
 
 #[test]
+fn sqlite_state_store_read_only_opens_without_write_authority() {
+    let temp = NamedTempFile::new().expect("temp file");
+    let path = temp.path().to_path_buf();
+    let store = SqliteStateStore::open(&path).expect("open store");
+    let state = StateData {
+        bytes: vec![4, 5, 6],
+        content_type: Some("application/octet-stream".to_string()),
+    };
+    let data_ref = StateStore::put_state(&store, state.clone()).expect("put state");
+    drop(store);
+
+    let read_only = SqliteStateStore::open_read_only(&path).expect("read only open");
+    let stored = StateStore::get_state(&read_only, &data_ref).expect("get state");
+    assert_eq!(stored.bytes, state.bytes);
+    assert!(matches!(
+        StateStore::put_state(
+            &read_only,
+            StateData {
+                bytes: vec![7],
+                content_type: None,
+            },
+        ),
+        Err(StateStoreError::Sqlite(_))
+    ));
+}
+
+#[test]
 fn async_state_store_round_trip() {
     let store = InMemoryStateStore::default();
     let state_data = StateData {
