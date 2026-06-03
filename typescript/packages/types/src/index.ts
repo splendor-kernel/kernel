@@ -287,6 +287,24 @@ export interface PolicyBundleTraceContext {
   degraded_mode: PolicyDegradedMode;
 }
 
+export interface OfflineTraceIntervalTraceContext {
+  offline_interval_id: string;
+  node_id: string | null;
+  instance_id: string | null;
+  start_sequence: number;
+  end_sequence: number | null;
+  reason: string | null;
+}
+
+export interface TraceSyncBoundaryTraceContext {
+  sync_batch_id: string;
+  offline_interval_id: string | null;
+  start_sequence: number;
+  end_sequence: number;
+  accepted_records: number | null;
+  duplicate_records: number | null;
+}
+
 export type StateReferenceMode = "snapshot_import" | "read_only_reference";
 
 export interface StateHandoffTraceContext {
@@ -640,6 +658,18 @@ export type TraceEventKind =
         policy_bundle_id: PolicyBundleId | null;
         version: string | null;
         reason: string;
+      };
+    }
+  | { OfflineTraceIntervalStarted: { interval: OfflineTraceIntervalTraceContext } }
+  | { OfflineTraceIntervalEnded: { interval: OfflineTraceIntervalTraceContext } }
+  | { TraceSyncStarted: { boundary: TraceSyncBoundaryTraceContext } }
+  | { TraceSyncCompleted: { boundary: TraceSyncBoundaryTraceContext } }
+  | { TraceSyncFailed: { boundary: TraceSyncBoundaryTraceContext; reason: string } }
+  | {
+      PolicyConnectivityChanged: {
+        disconnected: boolean;
+        observed_at: ISODateTime;
+        bundle: PolicyBundleTraceContext | null;
       };
     }
   | {
@@ -1334,6 +1364,12 @@ export const TRACE_EVENT_KIND_VARIANTS = [
   "PolicyBundleAccepted",
   "PolicyBundleRejected",
   "PolicySyncFailed",
+  "OfflineTraceIntervalStarted",
+  "OfflineTraceIntervalEnded",
+  "TraceSyncStarted",
+  "TraceSyncCompleted",
+  "TraceSyncFailed",
+  "PolicyConnectivityChanged",
   "PolicyExpired",
   "PolicyRevoked",
   "RunPaused",

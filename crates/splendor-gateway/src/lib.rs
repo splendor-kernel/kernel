@@ -1406,7 +1406,7 @@ fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerifi
             "safety_passed",
         )
         .with_sensor_refs(snapshot.sensor_refs.clone())
-        .with_zone_refs(snapshot.current_zone.clone().into_iter())
+        .with_zone_refs(snapshot.current_zone.clone())
         .into_verification(),
     )
 }
