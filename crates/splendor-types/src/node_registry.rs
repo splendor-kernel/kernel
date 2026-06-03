@@ -6,6 +6,10 @@
 //! remain isolated future sprint scope.
 
 use crate::capabilities::{empty_object, is_valid_capability_name};
+use crate::device_profile::{
+    validate_physical_capability_document, DeviceProfileValidationError,
+    DEVICE_KIND_CAPABILITY_PREFIX, PHYSICAL_ACTION_CAPABILITY_PREFIX,
+};
 use crate::{CapabilityDocument, CapabilityValidationError, FleetId, InstanceId, NodeId, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -199,6 +203,18 @@ impl NodeRegistration {
         self.kind.validate()?;
         self.scope.validate()?;
         self.capability_document.validate()?;
+        if self.kind.as_str().starts_with("physical.")
+            || self
+                .capability_document
+                .capabilities
+                .iter()
+                .any(|capability| {
+                    capability.starts_with(PHYSICAL_ACTION_CAPABILITY_PREFIX)
+                        || capability.starts_with(DEVICE_KIND_CAPABILITY_PREFIX)
+                })
+        {
+            validate_physical_capability_document(&self.capability_document)?;
+        }
         if self.runtime_version.trim().is_empty() {
             return Err(NodeRegistryValidationError::MissingRuntimeVersion);
         }
@@ -427,6 +443,9 @@ pub enum NodeRegistryValidationError {
     /// Capability document validation failed.
     #[error("invalid capability document: {0}")]
     InvalidCapabilityDocument(#[from] CapabilityValidationError),
+    /// Physical capability validation failed.
+    #[error("invalid physical capability document: {0}")]
+    InvalidPhysicalCapabilityDocument(#[from] DeviceProfileValidationError),
 }
 
 fn validate_health_metadata(

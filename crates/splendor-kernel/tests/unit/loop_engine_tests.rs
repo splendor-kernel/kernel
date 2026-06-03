@@ -297,6 +297,7 @@ fn policy_bundle_for(
         revocation: RevocationStatus::Active,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached,
+            ..PolicyDegradedMode::default()
         },
     }
 }
@@ -1331,6 +1332,7 @@ fn event_kind_label(kind: &TraceEventKind) -> &'static str {
         TraceEventKind::TraceSyncStarted { .. } => "TraceSyncStarted",
         TraceEventKind::TraceSyncCompleted { .. } => "TraceSyncCompleted",
         TraceEventKind::TraceSyncFailed { .. } => "TraceSyncFailed",
+        TraceEventKind::PolicyConnectivityChanged { .. } => "PolicyConnectivityChanged",
         TraceEventKind::PolicyExpired { .. } => "PolicyExpired",
         TraceEventKind::PolicyRevoked { .. } => "PolicyRevoked",
         TraceEventKind::RunPaused { .. } => "RunPaused",

@@ -205,6 +205,38 @@ fn base_request() -> ActionRequest {
     }
 }
 
+fn physical_request() -> ActionRequest {
+    let mut request = base_request();
+    request.action.name = "move_to_waypoint".to_string();
+    request.action.side_effect_class = SideEffectClass::Custom("physical.high_level".to_string());
+    request.action.params = serde_json::json!({
+        "waypoint_ref": "waypoint:A3",
+        "physical_action": true,
+    });
+    request
+}
+
+fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
+    SimulatedSafetySnapshot {
+        current_zone: Some("zone:A".to_string()),
+        allowed_zones: vec!["zone:A".to_string()],
+        battery_percent: Some(80.0),
+        min_battery_percent: Some(30.0),
+        emergency_stop_engaged: Some(false),
+        collision_risk: Some(SimulatedRiskLevel::Low),
+        altitude_m: Some(10.0),
+        max_altitude_m: Some(30.0),
+        privacy_zone_active: Some(false),
+        proximity_m: Some(5.0),
+        min_proximity_m: Some(1.0),
+        sensor_refs: vec![
+            "status:battery.latest".to_string(),
+            "status:estop.latest".to_string(),
+            "status:collision.summary".to_string(),
+        ],
+    }
+}
+
 fn approval_policy_for(request: &ActionRequest) -> ApprovalPolicy {
     let mut policy = ApprovalPolicy::new(
         "approval_policy_test",
@@ -415,6 +447,188 @@ fn verified_gateway_reports_postcondition_failure() {
     assert!(matches!(outcome.status, ActionStatus::Failed));
     assert!(outcome.post_verification.is_some());
     assert!(!outcome.post_verification.expect("post").allowed);
+}
+
+#[test]
+fn safety_geofence_denial_prevents_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+    let mut snapshot = safe_safety_snapshot();
+    snapshot.current_zone = Some("zone:restricted".to_string());
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"geofence_violation".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    assert_eq!(
+        outcome.verification.artifacts["evidence"]["zone_refs"][0].as_str(),
+        Some("zone:restricted")
+    );
+}
+
+#[test]
+fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+    let mut snapshot = safe_safety_snapshot();
+    snapshot.battery_percent = Some(12.0);
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"battery_below_minimum".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    assert_eq!(
+        outcome.verification.artifacts["evidence"]["thresholds"][0]["name"].as_str(),
+        Some("min_battery_percent")
+    );
+    assert!(outcome
+        .verification
+        .artifacts
+        .to_string()
+        .contains("status:battery.latest"));
+    assert!(!outcome.verification.artifacts.to_string().contains("raw"));
+}
+
+#[test]
+fn safety_emergency_stop_denial_prevents_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+    let mut snapshot = safe_safety_snapshot();
+    snapshot.emergency_stop_engaged = Some(true);
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"emergency_stop_engaged".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn safety_collision_risk_denial_prevents_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+    let mut snapshot = safe_safety_snapshot();
+    snapshot.collision_risk = Some(SimulatedRiskLevel::High);
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"collision_risk_high".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn safety_uncertainty_needs_intervention_without_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+    let mut snapshot = safe_safety_snapshot();
+    snapshot.collision_risk = Some(SimulatedRiskLevel::Unknown);
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"verifier_uncertainty".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn missing_required_safety_verifier_fails_closed_without_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"safety_verifier_missing".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn safety_postcondition_failure_marks_physical_outcome_failed() {
+    struct UnsafeAdapter;
+
+    impl ActionAdapter for UnsafeAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            Ok(AdapterResult {
+                output: serde_json::json!({"safety_status": "unsafe", "summary_ref": "status:mission.latest"}),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    gateway.register_adapter("move_to_waypoint", "robotics", Arc::new(UnsafeAdapter));
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
+        safe_safety_snapshot(),
+    )));
+
+    let outcome = gateway.submit(physical_request()).expect("outcome");
+
+    assert!(matches!(outcome.status, ActionStatus::Failed));
+    let post = outcome.post_verification.expect("post verification");
+    assert!(!post.allowed);
+    assert!(post
+        .reasons
+        .contains(&"safety_postcondition_failed".to_string()));
 }
 
 #[test]

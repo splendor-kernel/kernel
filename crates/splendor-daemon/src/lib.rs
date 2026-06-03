@@ -1160,11 +1160,16 @@ async fn sync_policy(
     )?;
     record_daemon_audit(slot, "splendor.policies.sync", security.audit_attribution)?;
 
+    let now = OffsetDateTime::now_utc();
     if let Some(disconnected) = request.disconnected {
-        slot.policy_cache.set_disconnected(disconnected);
+        if let Some(event) = slot
+            .policy_cache
+            .set_disconnected_with_trace(disconnected, now)
+        {
+            record_run_event(slot, event)?;
+        }
     }
 
-    let now = OffsetDateTime::now_utc();
     if let Some(sync_error) = request.sync_error.filter(|value| !value.trim().is_empty()) {
         let failure = slot.policy_cache.record_sync_failure(sync_error, now);
         let snapshot = slot.policy_cache.snapshot();
