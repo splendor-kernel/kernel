@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    DeviceCapability, DeviceCapabilityCategory, DeviceLocalPolicyIndicators, DeviceNodeKind,
+    DeviceProfile, DeviceProfileValidationError, DeviceSafetyConstraint,
+};
 use uuid::Uuid;
 
 fn now() -> OffsetDateTime {
@@ -83,6 +87,74 @@ fn node_registration_rejects_invalid_capability_document_before_registry_use() {
             }
         ))
     );
+}
+
+#[test]
+fn physical_device_profile_capability_document_validates_through_node_registration() {
+    let profile = DeviceProfile::new(
+        DeviceNodeKind::Drone,
+        vec![
+            DeviceCapability::bounded_action("move_to_waypoint"),
+            DeviceCapability::bounded_action("dock"),
+            DeviceCapability::bounded_action("inspect_zone"),
+            DeviceCapability {
+                category: DeviceCapabilityCategory::Sensor,
+                name: "camera.rgb".to_string(),
+            },
+            DeviceCapability {
+                category: DeviceCapabilityCategory::Power,
+                name: "battery.status".to_string(),
+            },
+            DeviceCapability {
+                category: DeviceCapabilityCategory::SafetyStatus,
+                name: "emergency_stop.status".to_string(),
+            },
+        ],
+        vec![DeviceSafetyConstraint {
+            name: "geofence.required".to_string(),
+            value: serde_json::json!(true),
+        }],
+        DeviceLocalPolicyIndicators {
+            supports_local_policy_cache: true,
+            supports_offline_operation: true,
+            supports_local_operator_intervention: true,
+            max_offline_policy_ttl_seconds: Some(300),
+        },
+    )
+    .expect("safe device profile");
+
+    let mut registration = node_registration();
+    registration.kind = NodeKind::new("physical.robot.drone").expect("physical node kind");
+    registration.capability_document = profile
+        .to_capability_document()
+        .expect("compatible capability document");
+
+    registration
+        .validate()
+        .expect("safe physical node registration validates");
+}
+
+#[test]
+fn unsafe_physical_capability_document_is_rejected_through_node_registration() {
+    let mut registration = node_registration();
+    registration.kind = NodeKind::new("physical.robot.drone").expect("physical node kind");
+    registration.capability_document = CapabilityDocument::new(
+        vec![
+            "runtime.resident".to_string(),
+            "physical.action.set_motor_pwm".to_string(),
+        ],
+        serde_json::json!({"device_kind": "drone"}),
+    )
+    .expect("base capability syntax is valid");
+
+    assert!(matches!(
+        registration.validate(),
+        Err(
+            NodeRegistryValidationError::InvalidPhysicalCapabilityDocument(
+                DeviceProfileValidationError::ForbiddenPhysicalAction { .. }
+            )
+        )
+    ));
 }
 
 #[test]

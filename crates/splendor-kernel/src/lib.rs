@@ -74,29 +74,33 @@ pub use remote_message_transport::{
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
 pub use splendor_types::{
-    Action, ActionId, AgentId, CapabilityDocument, CapabilityValidationError, Constraint,
+    cloud_helper_failure_validation, validate_cloud_helper_work_order,
+    validate_route_plan_for_local_execution, Action, ActionId, AgentId, CapabilityDocument,
+    CapabilityValidationError, CloudHelperAuthority, CloudHelperValidationError, Constraint,
     ConstraintKind, ConstraintScope, ContentHash, CostEstimate, DelegatedAuthority, DenialSignal,
     EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
     EscalationPolicyError, EscalationRule, EscalationScope, EscalationTrigger, FailureCategory,
     FailureSignal, Feedback, FleetId, FleetTelemetrySnapshot, HashAlgorithm, HealthStatus,
     IdentityValidationError, InstanceHealth, InstanceHeartbeat, InstanceId, InstanceRegistration,
-    InstanceTelemetry, LocalDelegationTraceContext, ManagementAuditEvent, ManagementAuditEventKind,
-    Message, MessageDeliveryStatus, MessageEnvelope, MessageId, MessageSchemaVersion,
-    MessageTraceContext, MessageTraceLinks, MessageValidationError, NodeHealth, NodeHeartbeat,
-    NodeId, NodeKind, NodeOnlineState, NodeRegistration, NodeRegistryValidationError,
-    NodeTelemetry, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
-    PolicyBundleValidationError, PolicyDegradedMode, QueueTelemetry, QuotaSignal, QuotaUsage,
-    RegistryScope, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion, RemoteMessageRetryPolicy,
-    RemoteMessageTraceContext, RemoteMessageValidationError, Reward, RunId, RunStatus,
-    RunStatusCount, RunStatusCounts, RunTelemetry, RuntimeIdentityContext, RuntimeMode,
-    SideEffectClass, SnapshotId, StateHandoff, StateHandoffAuthority, StateHandoffSnapshot,
-    StateHandoffTraceContext, StateNodeId, StateReference, StateReferenceMode, TaskFailure,
-    TaskRequest, TaskResponse, TaskResponseStatus, TelemetryAuthority, TelemetryRuntimeMode,
-    TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext,
-    TraceSyncFailure, TraceSyncTelemetry, VerificationResult, ESCALATION_POLICY_SCHEMA_VERSION,
-    FLEET_TELEMETRY_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION,
-    POLICY_BUNDLE_SIGNATURE_ALGORITHM, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    InstanceTelemetry, LocalDelegationTraceContext, LocalRoutePlanValidation, ManagementAuditEvent,
+    ManagementAuditEventKind, Message, MessageDeliveryStatus, MessageEnvelope, MessageId,
+    MessageSchemaVersion, MessageTraceContext, MessageTraceLinks, MessageValidationError,
+    NodeHealth, NodeHeartbeat, NodeId, NodeKind, NodeOnlineState, NodeRegistration,
+    NodeRegistryValidationError, NodeTelemetry, Percept, PerceptProvenance, PolicyBundle,
+    PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring, PolicyBundleTraceContext,
+    PolicyBundleValidationContext, PolicyBundleValidationError, PolicyDegradedMode, QueueTelemetry,
+    QuotaSignal, QuotaUsage, RegistryScope, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion,
+    RemoteMessageRetryPolicy, RemoteMessageTraceContext, RemoteMessageValidationError, Reward,
+    RoutePlanProposal, RouteWaypointProposal, RunId, RunStatus, RunStatusCount, RunStatusCounts,
+    RunTelemetry, RuntimeIdentityContext, RuntimeMode, SideEffectClass, SnapshotId, StateHandoff,
+    StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext, StateNodeId,
+    StateReference, StateReferenceMode, TaskFailure, TaskRequest, TaskResponse, TaskResponseStatus,
+    TelemetryAuthority, TelemetryRuntimeMode, TenantId, TickId, TraceEvent, TraceEventId,
+    TraceEventKind, TraceId, TraceIdentityContext, TraceSyncFailure, TraceSyncTelemetry,
+    VerificationResult, CLOUD_HELPER_ADAPTER_ID, CLOUD_HELPER_UNAVAILABLE_REASON,
+    ESCALATION_POLICY_SCHEMA_VERSION, FLEET_TELEMETRY_SCHEMA_VERSION, MISSION_PLAN_PROPOSE_ACTION,
+    POLICY_BUNDLE_SCHEMA_VERSION, POLICY_BUNDLE_SIGNATURE_ALGORITHM, ROUTE_PLAN_PROPOSAL_SCHEMA,
+    ROUTE_PLAN_PROPOSE_ACTION, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
 };
 pub use state::{
     SnapshotPolicy, StateCommit, StateGraph, StateGraphError, StateHandoffExportRequest,
@@ -109,5 +113,14 @@ pub use tenancy::{
 };
 pub use trace::{AsyncTraceSink, StdoutTraceSink, TraceError, TraceSink, TraceStoreSink};
 pub use trace_durability::{
-    TraceDurabilityGateway, TraceDurabilityPolicy, TraceDurabilityState, TraceDurabilityStatus,
+    TraceDurabilityGateway, TraceDurabilityMonitor, TraceDurabilityPolicy, TraceDurabilityState,
+    TraceDurabilityStatus,
 };
+
+#[cfg(test)]
+#[path = "../tests/unit/cloud_helper_tests.rs"]
+mod cloud_helper_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/physical_simulation_harness_tests.rs"]
+mod physical_simulation_harness_tests;

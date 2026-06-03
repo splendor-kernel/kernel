@@ -15,4 +15,5 @@ splendor-store = { path = "../splendor-store" }
 serde = { workspace = true }
 splendor-adapter-filesystem = { path = "../../adapters/filesystem" }
 splendor-adapter-http = { path = "../../adapters/http" }
+splendor-adapter-robotics = { path = "../../adapters/robotics" }
 tempfile = "3"

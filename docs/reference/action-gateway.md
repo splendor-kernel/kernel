@@ -98,6 +98,11 @@ identity returns a denied `ActionOutcome` with reason `identity_invalid` and doe
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope, or
 unsupported-schema approval decisions also stop before adapter execution.
 
+For physical actions, the gateway rejects forbidden low-level action names such
+as motor PWM, raw actuator writes, firmware safety bypass, flight-controller
+internals, collision-avoidance bypass, or emergency-stop bypass before adapter
+execution. Unknown actions marked as physical are also denied before execution.
+
 0.04-S3 escalation handling may convert a denied verifier result into
 `NeedsIntervention` after the gateway has failed closed. This preserves the
 gateway invariant: uncertain verifier results must not silently allow adapter
@@ -114,6 +119,17 @@ breaker denials.
 `VerifiedActionGateway::verify_runtime_admission()` can be used by local config
 or management paths to reject new work for global, fleet, node, or instance
 breakers before local agents are registered.
+
+0.05-S5 adds a local physical safety verifier stage. For high-level physical
+actions, `VerifiedActionGateway::set_safety_verifier(...)` installs a
+`SafetyVerifier` that runs after approval/quota verification and before adapter
+execution. Safety denial returns `Denied`; safety uncertainty or a missing
+required safety verifier returns `NeedsIntervention`. In both cases adapter
+execution is skipped. Post-execution safety verification can mark an already
+executed physical action `Failed` via `post_verification` when the adapter result
+reports an unsafe physical outcome. Safety evidence uses
+`splendor.safety_evidence.v1` and records status references, thresholds, zones,
+and reason codes without raw sensor blobs.
 
 ## ActionGateway
 

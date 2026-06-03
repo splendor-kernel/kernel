@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.05-dev — Physical and edge orchestration
+
+### Implemented primitives
+
+- Added the 0.05-S4 middleware-agnostic robotics adapter contract and simulated
+  robot/drone adapter for high-level physical actions behind the gateway and
+  local safety verifier.
+- Hardened gateway physical-action validation so forbidden low-level physical
+  control names are denied before adapter execution.
+
+### Explicitly not included
+
+- No ROS/native package, live hardware path, motor controller, direct
+  cloud-to-actuator path, or robotics safety certification claim.
+
 ## 0.04-dev — Governance workflows
 
 ### Implemented primitives

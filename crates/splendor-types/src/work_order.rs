@@ -6,7 +6,10 @@
 //! bad signatures, expiry, revocation, malformed scope, or tenant/agent/run
 //! incompatibility.
 
-use crate::{AgentId, RevocationStatus, RunId, TenantId, WorkOrderId, WorkOrderSignature};
+use crate::{
+    cloud_helper::validate_cloud_helper_work_order, AgentId, PlacementExecutionMode,
+    RevocationStatus, RunId, TenantId, WorkOrderId, WorkOrderSignature,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -200,6 +203,10 @@ pub struct WorkOrderPlacement {
     /// Optional maximum runtime bound.
     #[serde(default)]
     pub max_runtime_ms: Option<u64>,
+    /// Execution intent for this work order. Cloud helpers are advisory and must
+    /// not receive direct physical action authority.
+    #[serde(default, skip_serializing_if = "is_live_execution_mode")]
+    pub execution_mode: PlacementExecutionMode,
 }
 
 impl Default for WorkOrderPlacement {
@@ -211,6 +218,7 @@ impl Default for WorkOrderPlacement {
             dedicated_instance: None,
             required_capabilities: Vec::new(),
             max_runtime_ms: None,
+            execution_mode: PlacementExecutionMode::Live,
         }
     }
 }
@@ -349,6 +357,14 @@ pub fn validate_work_order(
     envelope.work_order.validate_shape()?;
     keyring.verify(envelope)?;
 
+    if envelope.work_order.placement.execution_mode == PlacementExecutionMode::CloudHelper {
+        validate_cloud_helper_work_order(&envelope.work_order).map_err(|error| {
+            WorkOrderValidationError::Malformed {
+                reason: format!("cloud_helper_{}", error.reason_code()),
+            }
+        })?;
+    }
+
     if envelope.work_order.expires_at <= context.now {
         return Err(WorkOrderValidationError::Expired);
     }
@@ -441,6 +457,10 @@ fn default_schema_version() -> String {
 
 fn active_revocation() -> RevocationStatus {
     RevocationStatus::Active
+}
+
+fn is_live_execution_mode(mode: &PlacementExecutionMode) -> bool {
+    *mode == PlacementExecutionMode::Live
 }
 
 #[cfg(test)]

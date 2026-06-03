@@ -7,8 +7,9 @@
 //! effect path.
 
 use splendor_gateway::{ActionGateway, ActionOutcome, ActionRequest, ActionStatus, GatewayError};
+use splendor_store::LocalTraceBufferError;
 use splendor_types::{SideEffectClass, VerificationResult};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 /// Local policy for enforcing trace sync durability before side effects.
@@ -28,12 +29,14 @@ pub struct TraceDurabilityState {
     pub central_latest_sequence: Option<u64>,
     /// Last trace sync error, if the most recent sync failed.
     pub last_sync_error: Option<String>,
+    /// Last local buffer/durability error, including storage pressure.
+    pub last_local_buffer_error: Option<String>,
 }
 
 impl TraceDurabilityState {
     /// Returns true when the central index is caught up with local trace state.
     pub fn is_durable(&self) -> bool {
-        if self.last_sync_error.is_some() {
+        if self.last_sync_error.is_some() || self.last_local_buffer_error.is_some() {
             return false;
         }
         match (self.local_latest_sequence, self.central_latest_sequence) {
@@ -48,6 +51,71 @@ impl TraceDurabilityState {
 pub trait TraceDurabilityStatus: Send + Sync {
     /// Returns the latest trace durability state for a run/action submission.
     fn trace_durability_state(&self) -> TraceDurabilityState;
+}
+
+/// Production-facing trace durability status updated by local buffer/sync paths.
+///
+/// Physical/edge harnesses can share this monitor with `TraceDurabilityGateway`
+/// and report local trace buffer failures as they occur, without manufacturing a
+/// status object only for tests.
+#[derive(Default)]
+pub struct TraceDurabilityMonitor {
+    state: Mutex<TraceDurabilityState>,
+}
+
+impl TraceDurabilityMonitor {
+    /// Creates a monitor with an initial durability state.
+    pub fn new(state: TraceDurabilityState) -> Self {
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
+    /// Updates local and central trace watermarks.
+    pub fn update_watermarks(
+        &self,
+        local_latest_sequence: Option<u64>,
+        central_latest_sequence: Option<u64>,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            state.local_latest_sequence = local_latest_sequence;
+            state.central_latest_sequence = central_latest_sequence;
+        }
+    }
+
+    /// Records a sync failure visible to the gateway durability guard.
+    pub fn report_sync_error(&self, error: impl Into<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_sync_error = Some(error.into());
+        }
+    }
+
+    /// Records a local buffer failure visible to the gateway durability guard.
+    pub fn report_local_buffer_error(&self, error: &LocalTraceBufferError) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_local_buffer_error = Some(error.to_string());
+        }
+    }
+
+    /// Clears durability errors after successful local persistence and sync.
+    pub fn clear_errors(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_sync_error = None;
+            state.last_local_buffer_error = None;
+        }
+    }
+}
+
+impl TraceDurabilityStatus for TraceDurabilityMonitor {
+    fn trace_durability_state(&self) -> TraceDurabilityState {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| TraceDurabilityState {
+                last_local_buffer_error: Some("trace_durability_monitor_poisoned".to_string()),
+                ..TraceDurabilityState::default()
+            })
+    }
 }
 
 /// Gateway wrapper that fails closed when trace durability is required but stale.
@@ -102,6 +170,7 @@ fn denied_for_trace_durability(
             "local_latest_sequence": state.local_latest_sequence,
             "central_latest_sequence": state.central_latest_sequence,
             "last_sync_error": state.last_sync_error,
+            "last_local_buffer_error": state.last_local_buffer_error,
             "action": request.action.name,
         }),
     };

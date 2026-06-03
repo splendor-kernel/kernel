@@ -49,6 +49,8 @@ placement:
   dedicated_instance: false
   required_capabilities: []
   max_runtime_ms: null
+  # omitted when live; serialized and signed for non-live modes
+  execution_mode: cloud_helper
 issued_at: "2026-05-25T00:00:00Z"
 expires_at: "2026-05-25T01:00:00Z"
 revocation: active
@@ -73,7 +75,9 @@ signature:
 - `quotas`: optional per-field limits. A missing field does not increase tenant
   quota.
 - `placement`: compatibility hints only in 0.03-S3. Placement decisions remain
-  0.03-S4 scope.
+  0.03-S4 scope. `placement.execution_mode` defaults to `live`; live is omitted
+  from serialization for older signed-payload compatibility. Non-live modes such
+  as `cloud_helper` are serialized and are signed authority-bearing fields.
 - `issued_at`, `expires_at`: RFC3339 timestamps. `expires_at` must be after
   `issued_at`, and expired work orders fail closed.
 - `revocation`: `active` or a revoked marker from a revocation list,
@@ -107,6 +111,12 @@ without changing the WorkOrder payload contract.
 5. expiry;
 6. revocation marker;
 7. tenant, agent, run, and placement target compatibility.
+
+For `placement.execution_mode = cloud_helper`, canonical validation also rejects
+helper authority that includes the `robotics` adapter, high-level physical action
+execution authority, low-level actuator action names, or missing scoped data
+references. These failures are returned as stable fail-closed malformed reason
+codes prefixed with `cloud_helper_`.
 
 Any failed or unavailable check returns a `WorkOrderValidationError` and denies
 run ingestion.
@@ -162,5 +172,7 @@ Validation fails closed for:
 - expired work order;
 - revoked work order;
 - malformed schema or empty allowlists;
+- malformed `cloud_helper` authority, including robotics adapter authority,
+  direct physical actions, low-level actuator actions, or missing scoped data refs;
 - tenant, agent, run, or placement incompatibility;
 - trace persistence failure while writing rejection audit records.

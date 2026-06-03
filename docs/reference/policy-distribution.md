@@ -54,6 +54,9 @@ expires_at: "2026-05-29T13:00:00Z"
 revocation: active
 degraded_mode:
   allow_low_risk_cached: true
+  disconnected_low_risk_actions: [read_battery, read_sensor_summary]
+  disconnected_high_risk_actions: [move_to_waypoint, inspect_zone]
+  high_risk_disconnected_behavior: needs_local_intervention
 signature:
   key_id: policy-local-key
   signature: <detached-signature>
@@ -70,7 +73,10 @@ signature:
 | `agent_id` | Optional agent binding. `null` means tenant-wide for the receiving run context; a non-null agent-scoped bundle is valid only when the receiving validation context names the same agent. |
 | `issued_at` / `expires_at` | TTL window. `expires_at` must be after `issued_at`. |
 | `revocation` | `active` or `{ revoked: { reason } }`. Revoked bundles fail closed. |
-| `degraded_mode.allow_low_risk_cached` | Whether disconnected runtimes may allow read-only/low-risk actions from an expired cached bundle. |
+| `degraded_mode.allow_low_risk_cached` | Compatibility flag for degraded mode. In 0.05-S2 it does not authorize action forwarding after TTL expiry. |
+| `degraded_mode.disconnected_low_risk_actions` | Explicit action names that may continue while disconnected when the action is `read_only`. |
+| `degraded_mode.disconnected_high_risk_actions` | Explicit high-risk action names that cannot execute autonomously while disconnected. |
+| `degraded_mode.high_risk_disconnected_behavior` | `deny` or `needs_local_intervention` for disconnected high-risk actions. |
 | `signature` | Detached signature metadata. Missing or empty signature metadata fails closed. |
 
 ## Signature envelope
@@ -192,7 +198,7 @@ This preserves the invariant that no side effect bypasses the action gateway.
 | Missing or bad signature | Reject bundle with `unsigned_policy_bundle` or `bad_policy_signature`. |
 | Unknown key | Reject bundle with `unknown_policy_signature_key`. |
 | Expired bundle at installation | Reject bundle with `expired_policy_bundle`. |
-| Expired cached bundle at runtime | Deny policy invocation and side-effectful actions unless disconnected low-risk cached mode applies to read-only actions. |
+| Expired cached bundle at runtime | Deny policy invocation and actions; no action is forwarded to adapters from an expired bundle. |
 | Revoked bundle | Reject installation or deny future policy/action authority with `policy_revoked`. |
 | Sync failure | Record `PolicySyncFailed`; keep prior cached authority unchanged. |
 

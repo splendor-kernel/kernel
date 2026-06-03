@@ -1,0 +1,12 @@
+[package]
+name = "splendor-adapter-robotics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+splendor-gateway = { path = "../../crates/splendor-gateway" }
+splendor-types = { path = "../../crates/splendor-types" }

@@ -173,6 +173,8 @@ fn rejects_empty_gap_conflict_payload_and_hash_mismatches_without_mutation() {
         .sync_batch(TraceSyncBatch {
             scope: scope_for(&run_id),
             records: Vec::new(),
+            offline_interval: None,
+            sync_boundary: None,
         })
         .expect_err("empty sync batch is rejected");
     assert!(matches!(empty_error, TraceSyncError::EmptyBatch { .. }));
@@ -272,6 +274,330 @@ fn rejects_empty_gap_conflict_payload_and_hash_mismatches_without_mutation() {
 }
 
 #[test]
+fn offline_trace_buffer_records_interval_and_reconnect_boundary() {
+    let run_id = RunId::new();
+    let scope = rich_scope_for(&run_id);
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig::default(),
+    );
+
+    let started = buffer
+        .begin_offline_interval(&scope, Some("network_disconnected".to_string()))
+        .expect("begin offline interval");
+    assert_eq!(started.start_sequence, 0);
+    buffer
+        .append_event(
+            &TraceEvent::new(
+                run_id.clone(),
+                1,
+                OffsetDateTime::now_utc(),
+                TraceEventKind::LoopTickStarted { tick_id: 1 },
+            ),
+            TraceBufferAppendMode::ReadOnly,
+        )
+        .expect("append tick");
+    buffer
+        .append_event(
+            &TraceEvent::new(
+                run_id.clone(),
+                2,
+                OffsetDateTime::now_utc(),
+                TraceEventKind::ActionDenied {
+                    action: action("move_to_waypoint"),
+                    result: VerificationResult::deny("safety_check_failed"),
+                },
+            ),
+            TraceBufferAppendMode::SideEffectful,
+        )
+        .expect("append denial");
+    let ended = buffer
+        .end_offline_interval(&run_id.to_string())
+        .expect("end offline interval");
+    assert_eq!(ended.end_sequence, Some(3));
+
+    let local_records = TraceStore::read(buffer.store(), &run_id.to_string()).expect("records");
+    let start_event: TraceEvent = serde_json::from_value(local_records[0].payload.clone())
+        .expect("canonical offline start event");
+    assert_eq!(start_event.sequence, 0);
+    assert!(matches!(
+        start_event.kind,
+        TraceEventKind::OfflineTraceIntervalStarted { .. }
+    ));
+    let end_event: TraceEvent = serde_json::from_value(local_records[3].payload.clone())
+        .expect("canonical offline end event");
+    assert_eq!(end_event.sequence, 3);
+    assert!(matches!(
+        end_event.kind,
+        TraceEventKind::OfflineTraceIntervalEnded { .. }
+    ));
+
+    let batch = buffer
+        .reconnect_batch(scope.clone(), 0, 4, Some(ended.clone()))
+        .expect("reconnect batch");
+    assert_eq!(batch.records.len(), 4);
+    assert_eq!(
+        batch
+            .offline_interval
+            .as_ref()
+            .expect("offline interval")
+            .offline_interval_id,
+        ended.offline_interval_id
+    );
+    let index = InMemoryCentralTraceIndex::default();
+    let report = index.sync_batch(batch.clone()).expect("sync offline batch");
+
+    assert_eq!(report.accepted_records, 4);
+    assert_eq!(report.offline_intervals.len(), 1);
+    assert_eq!(report.sync_boundaries.len(), 1);
+    assert_eq!(report.sync_boundaries[0].accepted_records, Some(4));
+    assert_eq!(
+        index
+            .offline_intervals(&run_id.to_string())
+            .expect("intervals")
+            .len(),
+        1
+    );
+    assert_eq!(
+        index
+            .sync_boundaries(&run_id.to_string())
+            .expect("boundaries")
+            .len(),
+        1
+    );
+
+    let duplicate = index.sync_batch(batch).expect("duplicate sync");
+    assert_eq!(duplicate.accepted_records, 0);
+    assert_eq!(duplicate.duplicate_records, 4);
+    assert_eq!(
+        index
+            .sync_boundaries(&run_id.to_string())
+            .expect("deduped boundaries")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn local_trace_buffer_records_sync_failed_boundary() {
+    let run_id = RunId::new();
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig::default(),
+    );
+    let boundary = buffer
+        .record_sync_started(&run_id.to_string(), 0, 1, Some("offline-a".to_string()))
+        .expect("sync started marker");
+
+    buffer
+        .record_sync_failed(
+            &run_id.to_string(),
+            boundary.clone(),
+            "central_trace_index_unavailable".to_string(),
+        )
+        .expect("sync failed marker");
+
+    let records = TraceStore::read(buffer.store(), &run_id.to_string()).expect("records");
+    assert_eq!(records.len(), 2);
+    let failed_event: TraceEvent =
+        serde_json::from_value(records[1].payload.clone()).expect("canonical failed event");
+    match failed_event.kind {
+        TraceEventKind::TraceSyncFailed {
+            boundary: failed_boundary,
+            reason,
+        } => {
+            assert_eq!(failed_boundary.sync_batch_id, boundary.sync_batch_id);
+            assert_eq!(reason, "central_trace_index_unavailable");
+        }
+        other => panic!("unexpected trace sync event: {other:?}"),
+    }
+}
+
+#[test]
+fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
+    let run_id = RunId::new();
+    let scope = rich_scope_for(&run_id);
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig::default(),
+    );
+    let interval = buffer
+        .begin_offline_interval(&scope, Some("network_disconnected".to_string()))
+        .expect("offline start");
+
+    let events = vec![
+        TraceEvent::new(
+            run_id.clone(),
+            1,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::LoopTickStarted { tick_id: 7 },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            2,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::PolicySyncFailed {
+                policy_bundle_id: None,
+                version: None,
+                reason: "central_unavailable".to_string(),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            3,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::ActionVerificationStarted {
+                action: action("inspect_zone"),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            4,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::ActionDenied {
+                action: action("move_to_waypoint"),
+                result: VerificationResult::deny("safety_verifier_geofence"),
+            },
+        ),
+        TraceEvent::new(
+            run_id.clone(),
+            5,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::ActionNeedsIntervention {
+                action: action("request_operator_override"),
+                result: VerificationResult::deny("operator_intervention_required"),
+            },
+        ),
+    ];
+    for event in &events {
+        buffer
+            .append_event(event, TraceBufferAppendMode::SideEffectful)
+            .expect("append canonical event");
+    }
+    let ended = buffer
+        .end_offline_interval(&run_id.to_string())
+        .expect("offline end");
+    let boundary = buffer
+        .record_sync_started(
+            &run_id.to_string(),
+            0,
+            8,
+            Some(interval.offline_interval_id.clone()),
+        )
+        .expect("sync started");
+
+    let batch = buffer
+        .reconnect_batch(scope.clone(), 0, 8, Some(ended.clone()))
+        .expect("batch");
+    let index = InMemoryCentralTraceIndex::default();
+    let report = index.sync_batch(batch.clone()).expect("sync");
+    assert_eq!(report.accepted_records, 8);
+    assert_eq!(report.latest_sequence, Some(7));
+    assert_eq!(
+        index.offline_intervals(&run_id.to_string()).unwrap()[0],
+        ended
+    );
+    assert_eq!(
+        index.sync_boundaries(&run_id.to_string()).unwrap()[0].offline_interval_id,
+        Some(interval.offline_interval_id)
+    );
+
+    let central = index
+        .query(&TraceIndexQuery {
+            run_id: Some(run_id.to_string()),
+            ..TraceIndexQuery::default()
+        })
+        .expect("central query");
+    let sequences = central
+        .iter()
+        .map(|record| record.record.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    let replay_events = central
+        .iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.record.payload.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("canonical replay events");
+    assert!(matches!(
+        replay_events[0].kind,
+        TraceEventKind::OfflineTraceIntervalStarted { .. }
+    ));
+    assert!(matches!(
+        replay_events[2].kind,
+        TraceEventKind::PolicySyncFailed { .. }
+    ));
+    assert!(matches!(
+        replay_events[4].kind,
+        TraceEventKind::ActionDenied { .. }
+    ));
+    assert!(matches!(
+        replay_events[5].kind,
+        TraceEventKind::ActionNeedsIntervention { .. }
+    ));
+    assert!(matches!(
+        replay_events[7].kind,
+        TraceEventKind::TraceSyncStarted { .. }
+    ));
+
+    let duplicate = index.sync_batch(batch).expect("duplicate");
+    assert_eq!(duplicate.accepted_records, 0);
+    assert_eq!(duplicate.duplicate_records, 8);
+    buffer
+        .record_sync_completed(&run_id.to_string(), boundary)
+        .expect("sync completed marker");
+    let completed_record = TraceStore::read(buffer.store(), &run_id.to_string())
+        .expect("local records")
+        .pop()
+        .expect("completed marker");
+    let completed_event: TraceEvent = serde_json::from_value(completed_record.payload).unwrap();
+    assert!(matches!(
+        completed_event.kind,
+        TraceEventKind::TraceSyncCompleted { .. }
+    ));
+}
+
+#[test]
+fn local_trace_buffer_rejects_side_effectful_append_when_full() {
+    let run_id = RunId::new();
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig {
+            max_records_per_run: Some(1),
+        },
+    );
+
+    buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "one"}),
+            TraceBufferAppendMode::ReadOnly,
+        )
+        .expect("first append");
+    let error = buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "side_effect"}),
+            TraceBufferAppendMode::SideEffectful,
+        )
+        .expect_err("buffer full");
+
+    assert!(matches!(
+        error,
+        LocalTraceBufferError::BufferFull {
+            side_effectful: true,
+            max_records: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        TraceStore::read(buffer.store(), &run_id.to_string())
+            .expect("records")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn mismatched_run_identity_is_rejected_and_quarantined() {
     let record_run_id = RunId::new();
     let scope_run_id = RunId::new();
@@ -283,6 +609,8 @@ fn mismatched_run_identity_is_rejected_and_quarantined() {
                 scope: scope_for(&scope_run_id),
                 records: TraceStore::read_range(&local, &record_run_id.to_string(), 0, 1)
                     .expect("range"),
+                offline_interval: None,
+                sync_boundary: None,
             }
         });
     let index = InMemoryCentralTraceIndex::default();

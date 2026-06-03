@@ -6,9 +6,9 @@
 //! changing the canonical message payload.
 
 use crate::{
-    validate_work_order, AgentId, MessageId, RunId, TenantId, TraceEventId, TraceId,
-    VerificationResult, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
-    WorkOrderValidationError,
+    validate_work_order, AgentId, MessageId, RoutePlanProposal, RunId, TenantId, TraceEventId,
+    TraceId, VerificationResult, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError, ROUTE_PLAN_PROPOSAL_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -979,6 +979,15 @@ fn validate_schema_payload(message: &Message) -> Result<(), MessageValidationErr
         }
         TASK_RESPONSE_SCHEMA => {
             TaskResponse::from_payload(&message.payload)?.validate_message_scope(message)
+        }
+        ROUTE_PLAN_PROPOSAL_SCHEMA => {
+            RoutePlanProposal::from_payload(&message.payload).map_err(|error| {
+                MessageValidationError::PayloadValidationFailed {
+                    schema: ROUTE_PLAN_PROPOSAL_SCHEMA.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+            Ok(())
         }
         _ => Ok(()),
     }
