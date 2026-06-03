@@ -115,6 +115,17 @@ breaker denials.
 or management paths to reject new work for global, fleet, node, or instance
 breakers before local agents are registered.
 
+0.05-S5 adds a local physical safety verifier stage. For high-level physical
+actions, `VerifiedActionGateway::set_safety_verifier(...)` installs a
+`SafetyVerifier` that runs after approval/quota verification and before adapter
+execution. Safety denial returns `Denied`; safety uncertainty or a missing
+required safety verifier returns `NeedsIntervention`. In both cases adapter
+execution is skipped. Post-execution safety verification can mark an already
+executed physical action `Failed` via `post_verification` when the adapter result
+reports an unsafe physical outcome. Safety evidence uses
+`splendor.safety_evidence.v1` and records status references, thresholds, zones,
+and reason codes without raw sensor blobs.
+
 ## ActionGateway
 
 Synchronous gateway interface:
