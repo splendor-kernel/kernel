@@ -424,6 +424,15 @@ fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
                 result: VerificationResult::deny("safety_verifier_geofence"),
             },
         ),
+        TraceEvent::new(
+            run_id.clone(),
+            5,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::ActionNeedsIntervention {
+                action: action("request_operator_override"),
+                result: VerificationResult::deny("operator_intervention_required"),
+            },
+        ),
     ];
     for event in &events {
         buffer
@@ -437,18 +446,18 @@ fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
         .record_sync_started(
             &run_id.to_string(),
             0,
-            7,
+            8,
             Some(interval.offline_interval_id.clone()),
         )
         .expect("sync started");
 
     let batch = buffer
-        .reconnect_batch(scope.clone(), 0, 7, Some(ended.clone()))
+        .reconnect_batch(scope.clone(), 0, 8, Some(ended.clone()))
         .expect("batch");
     let index = InMemoryCentralTraceIndex::default();
     let report = index.sync_batch(batch.clone()).expect("sync");
-    assert_eq!(report.accepted_records, 7);
-    assert_eq!(report.latest_sequence, Some(6));
+    assert_eq!(report.accepted_records, 8);
+    assert_eq!(report.latest_sequence, Some(7));
     assert_eq!(
         index.offline_intervals(&run_id.to_string()).unwrap()[0],
         ended
@@ -468,7 +477,7 @@ fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
         .iter()
         .map(|record| record.record.sequence)
         .collect::<Vec<_>>();
-    assert_eq!(sequences, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(sequences, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     let replay_events = central
         .iter()
         .map(|record| serde_json::from_value::<TraceEvent>(record.record.payload.clone()))
@@ -487,13 +496,17 @@ fn realistic_offline_reconnect_replay_reconstructs_canonical_events() {
         TraceEventKind::ActionDenied { .. }
     ));
     assert!(matches!(
-        replay_events[6].kind,
+        replay_events[5].kind,
+        TraceEventKind::ActionNeedsIntervention { .. }
+    ));
+    assert!(matches!(
+        replay_events[7].kind,
         TraceEventKind::TraceSyncStarted { .. }
     ));
 
     let duplicate = index.sync_batch(batch).expect("duplicate");
     assert_eq!(duplicate.accepted_records, 0);
-    assert_eq!(duplicate.duplicate_records, 7);
+    assert_eq!(duplicate.duplicate_records, 8);
     buffer
         .record_sync_completed(&run_id.to_string(), boundary)
         .expect("sync completed marker");

@@ -109,5 +109,6 @@ pub use tenancy::{
 };
 pub use trace::{AsyncTraceSink, StdoutTraceSink, TraceError, TraceSink, TraceStoreSink};
 pub use trace_durability::{
-    TraceDurabilityGateway, TraceDurabilityPolicy, TraceDurabilityState, TraceDurabilityStatus,
+    TraceDurabilityGateway, TraceDurabilityMonitor, TraceDurabilityPolicy, TraceDurabilityState,
+    TraceDurabilityStatus,
 };

@@ -49,9 +49,6 @@ All marker records written by `LocalTraceBuffer` serialize canonical
 `sequence`, `timestamp`, `identity`, and typed `TraceEventKind` variants. They
 are not ad-hoc JSON markers.
 
-Build the reconnect batch and sync it to the
-   central index.
-
 The interval and sync boundary are replay-visible metadata. Sync never renumbers,
 repairs, or mutates original trace records.
 
