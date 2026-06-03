@@ -140,8 +140,8 @@ pub use state_handoff::{
     StateReference, StateReferenceMode,
 };
 pub use trace::{
-    GovernanceTraceEventKindError, LocalDelegationTraceContext, TraceEvent, TraceEventKind,
-    TraceIntegrity,
+    GovernanceTraceEventKindError, LocalDelegationTraceContext, OfflineTraceIntervalTraceContext,
+    TraceEvent, TraceEventKind, TraceIntegrity, TraceSyncBoundaryTraceContext,
 };
 pub use work_order::{
     validate_work_order, ValidatedWorkOrder, WorkOrder, WorkOrderEnvelope, WorkOrderKeyring,
