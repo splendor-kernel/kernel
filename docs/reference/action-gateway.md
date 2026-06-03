@@ -98,6 +98,11 @@ identity returns a denied `ActionOutcome` with reason `identity_invalid` and doe
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope, or
 unsupported-schema approval decisions also stop before adapter execution.
 
+For physical actions, the gateway rejects forbidden low-level action names such
+as motor PWM, raw actuator writes, firmware safety bypass, flight-controller
+internals, collision-avoidance bypass, or emergency-stop bypass before adapter
+execution. Unknown actions marked as physical are also denied before execution.
+
 0.04-S3 escalation handling may convert a denied verifier result into
 `NeedsIntervention` after the gateway has failed closed. This preserves the
 gateway invariant: uncertain verifier results must not silently allow adapter

@@ -1687,3 +1687,26 @@ fn gateway_effective_side_effect_and_artifact_helpers_cover_edge_shapes() {
     );
     assert!(denied_with_detail.artifacts["context"].is_object());
 }
+
+#[test]
+fn verified_gateway_rejects_forbidden_physical_action_before_adapter_execution() {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("disable_firmware_safety", "robotics", adapter.clone());
+    gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
+        safe_safety_snapshot(),
+    )));
+
+    let mut request = physical_request();
+    request.action.name = "disable_firmware_safety".to_string();
+    request.adapter = Some("robotics".to_string());
+
+    let outcome = gateway.submit(request).expect("outcome");
+    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert_eq!(outcome.error.as_deref(), Some("forbidden_physical_action"));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
