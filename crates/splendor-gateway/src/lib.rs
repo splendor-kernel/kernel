@@ -137,6 +137,233 @@ pub struct AdapterResult {
     pub satisfied_postconditions: Vec<String>,
 }
 
+/// Trace-safe schema version for physical safety verifier evidence.
+pub const SAFETY_EVIDENCE_SCHEMA_VERSION: &str = "splendor.safety_evidence.v1";
+
+/// Local physical safety check status recorded without raw sensor payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SafetyCheckStatus {
+    /// Check passed.
+    Pass,
+    /// Check denied the action.
+    Deny,
+    /// Check could not be completed and must fail closed.
+    Uncertain,
+}
+
+/// Trace-safe threshold used by safety verifier evidence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SafetyThresholdEvidence {
+    /// Threshold name, such as `min_battery_percent`.
+    pub name: String,
+    /// Observed value, when available without raw sensor data.
+    pub observed: Option<f64>,
+    /// Required maximum, when applicable.
+    pub max: Option<f64>,
+    /// Required minimum, when applicable.
+    pub min: Option<f64>,
+    /// Unit label for observed/min/max values.
+    pub unit: Option<String>,
+}
+
+/// Trace-safe local physical safety verifier evidence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SafetyEvidence {
+    /// Evidence schema version.
+    pub schema_version: String,
+    /// Verifier implementation name.
+    pub verifier: String,
+    /// Safety check name.
+    pub check: String,
+    /// Check status.
+    pub status: SafetyCheckStatus,
+    /// Stable reason code, not raw sensor text.
+    pub reason_code: String,
+    /// Sensor/status references used by the verifier; no raw sensor blobs.
+    pub sensor_refs: Vec<String>,
+    /// Zone references used by geofence/privacy checks.
+    pub zone_refs: Vec<String>,
+    /// Thresholds evaluated by the verifier.
+    pub thresholds: Vec<SafetyThresholdEvidence>,
+}
+
+impl SafetyEvidence {
+    /// Builds trace-safe safety evidence.
+    pub fn new(
+        verifier: impl Into<String>,
+        check: impl Into<String>,
+        status: SafetyCheckStatus,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: SAFETY_EVIDENCE_SCHEMA_VERSION.to_string(),
+            verifier: verifier.into(),
+            check: check.into(),
+            status,
+            reason_code: reason_code.into(),
+            sensor_refs: Vec::new(),
+            zone_refs: Vec::new(),
+            thresholds: Vec::new(),
+        }
+    }
+
+    /// Adds sensor/status references without embedding raw sensor data.
+    pub fn with_sensor_refs(mut self, refs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.sensor_refs = refs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds zone references without embedding raw maps or camera frames.
+    pub fn with_zone_refs(mut self, refs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.zone_refs = refs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds evaluated thresholds.
+    pub fn with_thresholds(mut self, thresholds: Vec<SafetyThresholdEvidence>) -> Self {
+        self.thresholds = thresholds;
+        self
+    }
+
+    fn into_verification(self) -> VerificationResult {
+        let allowed = self.status == SafetyCheckStatus::Pass;
+        let reason = self.reason_code.clone();
+        VerificationResult {
+            allowed,
+            reasons: if allowed { Vec::new() } else { vec![reason] },
+            artifacts: serde_json::json!({
+                "source": "safety_verifier",
+                "evidence": self,
+            }),
+        }
+    }
+}
+
+/// Outcome of a local physical safety verifier stage.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SafetyVerification {
+    /// No safety check applies to this non-physical action.
+    NotRequired,
+    /// Safety check passed and normal gateway verification may continue.
+    Allowed(VerificationResult),
+    /// Safety check denied the action.
+    Denied(VerificationResult),
+    /// Safety check could not complete and requires fail-closed intervention.
+    NeedsIntervention(VerificationResult),
+}
+
+/// Verifies local physical safety constraints before and after high-level physical actions.
+pub trait SafetyVerifier: Send + Sync {
+    /// Pre-execution safety verification. Denial/intervention prevents adapter execution.
+    fn verify_pre(&self, action: &ActionRequest, adapter: Option<&str>) -> SafetyVerification;
+
+    /// Post-execution safety verification. Denial marks the outcome failed after execution.
+    fn verify_post(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+        result: &AdapterResult,
+    ) -> SafetyVerification {
+        let _ = (action, adapter, result);
+        SafetyVerification::NotRequired
+    }
+}
+
+/// Coarse simulated risk level for reference safety verifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SimulatedRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+    Unknown,
+}
+
+/// Trace-safe local status snapshot consumed by reference simulated safety verifiers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SimulatedSafetySnapshot {
+    pub current_zone: Option<String>,
+    pub allowed_zones: Vec<String>,
+    pub battery_percent: Option<f64>,
+    pub min_battery_percent: Option<f64>,
+    pub emergency_stop_engaged: Option<bool>,
+    pub collision_risk: Option<SimulatedRiskLevel>,
+    pub altitude_m: Option<f64>,
+    pub max_altitude_m: Option<f64>,
+    pub privacy_zone_active: Option<bool>,
+    pub proximity_m: Option<f64>,
+    pub min_proximity_m: Option<f64>,
+    pub sensor_refs: Vec<String>,
+}
+
+/// Reference simulated safety verifier for high-level physical actions.
+#[derive(Clone, Debug)]
+pub struct SimulatedSafetyVerifier {
+    snapshot: SimulatedSafetySnapshot,
+}
+
+impl SimulatedSafetyVerifier {
+    /// Creates a simulated verifier from a trace-safe status snapshot.
+    pub fn new(snapshot: SimulatedSafetySnapshot) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl SafetyVerifier for SimulatedSafetyVerifier {
+    fn verify_pre(&self, action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        if !is_physical_action(&action.action) {
+            return SafetyVerification::NotRequired;
+        }
+
+        match simulated_safety_evidence(&self.snapshot) {
+            SafetyVerification::Allowed(result) => SafetyVerification::Allowed(result),
+            SafetyVerification::Denied(result) => SafetyVerification::Denied(result),
+            SafetyVerification::NeedsIntervention(result) => {
+                SafetyVerification::NeedsIntervention(result)
+            }
+            SafetyVerification::NotRequired => SafetyVerification::NotRequired,
+        }
+    }
+
+    fn verify_post(
+        &self,
+        action: &ActionRequest,
+        _adapter: Option<&str>,
+        result: &AdapterResult,
+    ) -> SafetyVerification {
+        if !is_physical_action(&action.action) {
+            return SafetyVerification::NotRequired;
+        }
+        if result
+            .output
+            .get("safety_status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status == "unsafe" || status == "failed")
+        {
+            return SafetyVerification::Denied(
+                SafetyEvidence::new(
+                    "simulated_safety_verifier",
+                    "postcondition",
+                    SafetyCheckStatus::Deny,
+                    "safety_postcondition_failed",
+                )
+                .with_sensor_refs(self.snapshot.sensor_refs.clone())
+                .into_verification(),
+            );
+        }
+        SafetyVerification::Allowed(
+            SafetyEvidence::new(
+                "simulated_safety_verifier",
+                "postcondition",
+                SafetyCheckStatus::Pass,
+                "safety_postcondition_passed",
+            )
+            .with_sensor_refs(self.snapshot.sensor_refs.clone())
+            .into_verification(),
+        )
+    }
+}
+
 /// Action adapter interface for side-effectful execution.
 pub trait ActionAdapter: Send + Sync {
     /// Executes the action request and returns the adapter result.
@@ -497,6 +724,7 @@ pub struct VerifiedActionGateway {
     tenant_access: Arc<dyn TenantAccess>,
     invariant_evaluator: Arc<dyn InvariantEvaluator>,
     approval_verifier: Arc<dyn ApprovalVerifier>,
+    safety_verifier: Option<Arc<dyn SafetyVerifier>>,
     circuit_breaker_evaluator: Arc<dyn CircuitBreakerEvaluator>,
     runtime_identity: RuntimeIdentityContext,
 }
@@ -509,6 +737,7 @@ impl VerifiedActionGateway {
             tenant_access,
             invariant_evaluator: Arc::new(SimpleInvariantEvaluator),
             approval_verifier: Arc::new(NoApprovalVerifier),
+            safety_verifier: None,
             circuit_breaker_evaluator: Arc::new(NoopCircuitBreakerEvaluator),
             runtime_identity: RuntimeIdentityContext::default(),
         }
@@ -538,6 +767,11 @@ impl VerifiedActionGateway {
     /// Overrides the approval verifier used by the gateway.
     pub fn set_approval_verifier(&mut self, verifier: Arc<dyn ApprovalVerifier>) {
         self.approval_verifier = verifier;
+    }
+
+    /// Overrides the local physical safety verifier used by the gateway.
+    pub fn set_safety_verifier(&mut self, verifier: Arc<dyn SafetyVerifier>) {
+        self.safety_verifier = Some(verifier);
     }
 
     /// Overrides the circuit-breaker evaluator used by the gateway.
@@ -665,6 +899,21 @@ impl ActionGateway for VerifiedActionGateway {
             attach_allowed_artifact(&mut verification, "approval", approval_grant.artifacts);
         }
 
+        match verify_safety_pre(&self.safety_verifier, &action, Some(adapter_id)) {
+            SafetyVerification::NotRequired => {}
+            SafetyVerification::Allowed(safety_result) => {
+                attach_allowed_artifact(&mut verification, "safety", safety_result.artifacts);
+            }
+            SafetyVerification::Denied(mut safety_result) => {
+                attach_request_context(&mut safety_result, &action);
+                return Ok(denied_outcome(action.action_id, safety_result));
+            }
+            SafetyVerification::NeedsIntervention(mut safety_result) => {
+                attach_request_context(&mut safety_result, &action);
+                return Ok(needs_intervention_outcome(action.action_id, safety_result));
+            }
+        }
+
         let adapter_result = match registration.adapter.execute(&action) {
             Ok(result) => result,
             Err(error) => {
@@ -683,6 +932,13 @@ impl ActionGateway for VerifiedActionGateway {
         let post_verification = self
             .invariant_evaluator
             .verify_post(&action.action, &adapter_result.satisfied_postconditions);
+        let post_safety = verify_safety_post(
+            &self.safety_verifier,
+            &action,
+            Some(adapter_id),
+            &adapter_result,
+        );
+        let post_verification = combine_post_verifications(post_verification, post_safety);
         let status = if post_verification.allowed {
             ActionStatus::Executed
         } else {
@@ -826,6 +1082,349 @@ fn combine_verifications(
             artifacts: serde_json::Value::Object(artifacts),
         }
     }
+}
+
+fn combine_post_verifications(
+    invariant: VerificationResult,
+    safety: SafetyVerification,
+) -> VerificationResult {
+    match safety {
+        SafetyVerification::NotRequired => invariant,
+        SafetyVerification::Allowed(safety_result) if invariant.allowed => {
+            let mut combined = VerificationResult::allow();
+            attach_allowed_artifact(&mut combined, "safety", safety_result.artifacts);
+            combined
+        }
+        SafetyVerification::Allowed(safety_result) => {
+            let mut combined = combine_verifications([("invariant", invariant)]);
+            attach_allowed_artifact(&mut combined, "safety", safety_result.artifacts);
+            combined
+        }
+        SafetyVerification::Denied(safety_result)
+        | SafetyVerification::NeedsIntervention(safety_result) => {
+            combine_verifications([("invariant", invariant), ("safety", safety_result)])
+        }
+    }
+}
+
+fn verify_safety_pre(
+    verifier: &Option<Arc<dyn SafetyVerifier>>,
+    action: &ActionRequest,
+    adapter: Option<&str>,
+) -> SafetyVerification {
+    if !is_physical_action(&action.action) {
+        return SafetyVerification::NotRequired;
+    }
+    let Some(verifier) = verifier else {
+        return SafetyVerification::NeedsIntervention(missing_safety_verifier_result(action));
+    };
+    match verifier.verify_pre(action, adapter) {
+        SafetyVerification::NotRequired => {
+            SafetyVerification::NeedsIntervention(missing_safety_verifier_result(action))
+        }
+        other => normalize_safety_verification(other),
+    }
+}
+
+fn verify_safety_post(
+    verifier: &Option<Arc<dyn SafetyVerifier>>,
+    action: &ActionRequest,
+    adapter: Option<&str>,
+    result: &AdapterResult,
+) -> SafetyVerification {
+    if !is_physical_action(&action.action) {
+        return SafetyVerification::NotRequired;
+    }
+    let Some(verifier) = verifier else {
+        return SafetyVerification::NeedsIntervention(missing_safety_verifier_result(action));
+    };
+    match verifier.verify_post(action, adapter, result) {
+        SafetyVerification::NotRequired => {
+            SafetyVerification::NeedsIntervention(missing_safety_verifier_result(action))
+        }
+        other => normalize_safety_verification(other),
+    }
+}
+
+fn normalize_safety_verification(result: SafetyVerification) -> SafetyVerification {
+    match result {
+        SafetyVerification::Allowed(mut verification) if !verification.allowed => {
+            if !verification
+                .reasons
+                .iter()
+                .any(|reason| reason == "safety_verifier_inconsistent")
+            {
+                verification
+                    .reasons
+                    .push("safety_verifier_inconsistent".to_string());
+            }
+            SafetyVerification::NeedsIntervention(verification)
+        }
+        SafetyVerification::Denied(mut verification) => {
+            verification.allowed = false;
+            SafetyVerification::Denied(verification)
+        }
+        SafetyVerification::NeedsIntervention(mut verification) => {
+            verification.allowed = false;
+            if !verification
+                .reasons
+                .iter()
+                .any(|reason| reason == "verifier_uncertainty")
+            {
+                verification
+                    .reasons
+                    .push("verifier_uncertainty".to_string());
+            }
+            SafetyVerification::NeedsIntervention(verification)
+        }
+        other => other,
+    }
+}
+
+fn missing_safety_verifier_result(action: &ActionRequest) -> VerificationResult {
+    VerificationResult {
+        allowed: false,
+        reasons: vec![
+            "safety_verifier_missing".to_string(),
+            "verifier_uncertainty".to_string(),
+        ],
+        artifacts: serde_json::json!({
+            "source": "safety_verifier",
+            "required": true,
+            "action": action.action.name,
+            "side_effect_class": side_effect_class_label(&action.action.side_effect_class),
+            "evidence": SafetyEvidence::new(
+                "missing_safety_verifier",
+                "required_safety_verifier",
+                SafetyCheckStatus::Uncertain,
+                "safety_verifier_missing",
+            ),
+        }),
+    }
+}
+
+/// Returns true for high-level physical actions that require local safety verification.
+pub fn is_physical_action(action: &Action) -> bool {
+    matches!(
+        action.side_effect_class,
+        SideEffectClass::Custom(ref class)
+            if class == "physical" || class == "physical.high_level" || class.starts_with("physical.")
+    ) || matches!(
+        action.name.as_str(),
+        "read_battery"
+            | "read_sensor_summary"
+            | "read_map"
+            | "move_to_waypoint"
+            | "return_to_base"
+            | "dock"
+            | "inspect_zone"
+            | "capture_image"
+            | "pause_mission"
+            | "resume_mission"
+            | "request_operator_override"
+            | "notify_operator"
+            | "upload_trace_summary"
+    ) || action
+        .params
+        .get("physical_action")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerification {
+    let verifier = "simulated_safety_verifier";
+    if snapshot.emergency_stop_engaged.is_none() {
+        return simulated_uncertain(verifier, "emergency_stop", snapshot, Vec::new(), Vec::new());
+    }
+    if snapshot.emergency_stop_engaged == Some(true) {
+        return simulated_deny(
+            verifier,
+            "emergency_stop",
+            "emergency_stop_engaged",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if snapshot.battery_percent.is_none() || snapshot.min_battery_percent.is_none() {
+        return simulated_uncertain(
+            verifier,
+            "battery",
+            snapshot,
+            Vec::new(),
+            battery_threshold(snapshot),
+        );
+    }
+    if snapshot.battery_percent < snapshot.min_battery_percent {
+        return simulated_deny(
+            verifier,
+            "battery",
+            "battery_below_minimum",
+            snapshot,
+            Vec::new(),
+            battery_threshold(snapshot),
+        );
+    }
+    if snapshot.collision_risk.is_none()
+        || snapshot.collision_risk == Some(SimulatedRiskLevel::Unknown)
+    {
+        return simulated_uncertain(verifier, "collision", snapshot, Vec::new(), Vec::new());
+    }
+    if matches!(
+        snapshot.collision_risk,
+        Some(SimulatedRiskLevel::High | SimulatedRiskLevel::Critical)
+    ) {
+        return simulated_deny(
+            verifier,
+            "collision",
+            "collision_risk_high",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if snapshot.current_zone.is_none() || snapshot.allowed_zones.is_empty() {
+        return simulated_uncertain(
+            verifier,
+            "geofence",
+            snapshot,
+            snapshot.allowed_zones.clone(),
+            Vec::new(),
+        );
+    }
+    let current_zone = snapshot
+        .current_zone
+        .as_ref()
+        .expect("checked current zone");
+    if !snapshot
+        .allowed_zones
+        .iter()
+        .any(|zone| zone == current_zone)
+    {
+        return simulated_deny(
+            verifier,
+            "geofence",
+            "geofence_violation",
+            snapshot,
+            vec![current_zone.clone()],
+            Vec::new(),
+        );
+    }
+    if snapshot.altitude_m.is_some()
+        && snapshot.max_altitude_m.is_some()
+        && snapshot.altitude_m > snapshot.max_altitude_m
+    {
+        return simulated_deny(
+            verifier,
+            "altitude",
+            "altitude_limit_exceeded",
+            snapshot,
+            Vec::new(),
+            altitude_threshold(snapshot),
+        );
+    }
+    if snapshot.privacy_zone_active == Some(true) {
+        return simulated_deny(
+            verifier,
+            "privacy",
+            "privacy_zone_active",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if snapshot.proximity_m.is_some()
+        && snapshot.min_proximity_m.is_some()
+        && snapshot.proximity_m < snapshot.min_proximity_m
+    {
+        return simulated_deny(
+            verifier,
+            "proximity",
+            "proximity_below_minimum",
+            snapshot,
+            Vec::new(),
+            proximity_threshold(snapshot),
+        );
+    }
+    SafetyVerification::Allowed(
+        SafetyEvidence::new(
+            verifier,
+            "simulated_safety",
+            SafetyCheckStatus::Pass,
+            "safety_passed",
+        )
+        .with_sensor_refs(snapshot.sensor_refs.clone())
+        .with_zone_refs(snapshot.current_zone.clone().into_iter())
+        .into_verification(),
+    )
+}
+
+fn simulated_deny(
+    verifier: &str,
+    check: &str,
+    reason: &str,
+    snapshot: &SimulatedSafetySnapshot,
+    zone_refs: Vec<String>,
+    thresholds: Vec<SafetyThresholdEvidence>,
+) -> SafetyVerification {
+    SafetyVerification::Denied(
+        SafetyEvidence::new(verifier, check, SafetyCheckStatus::Deny, reason)
+            .with_sensor_refs(snapshot.sensor_refs.clone())
+            .with_zone_refs(zone_refs)
+            .with_thresholds(thresholds)
+            .into_verification(),
+    )
+}
+
+fn simulated_uncertain(
+    verifier: &str,
+    check: &str,
+    snapshot: &SimulatedSafetySnapshot,
+    zone_refs: Vec<String>,
+    thresholds: Vec<SafetyThresholdEvidence>,
+) -> SafetyVerification {
+    SafetyVerification::NeedsIntervention(
+        SafetyEvidence::new(
+            verifier,
+            check,
+            SafetyCheckStatus::Uncertain,
+            "safety_verifier_uncertain",
+        )
+        .with_sensor_refs(snapshot.sensor_refs.clone())
+        .with_zone_refs(zone_refs)
+        .with_thresholds(thresholds)
+        .into_verification(),
+    )
+}
+
+fn battery_threshold(snapshot: &SimulatedSafetySnapshot) -> Vec<SafetyThresholdEvidence> {
+    vec![SafetyThresholdEvidence {
+        name: "min_battery_percent".to_string(),
+        observed: snapshot.battery_percent,
+        min: snapshot.min_battery_percent,
+        max: None,
+        unit: Some("percent".to_string()),
+    }]
+}
+
+fn altitude_threshold(snapshot: &SimulatedSafetySnapshot) -> Vec<SafetyThresholdEvidence> {
+    vec![SafetyThresholdEvidence {
+        name: "max_altitude_m".to_string(),
+        observed: snapshot.altitude_m,
+        min: None,
+        max: snapshot.max_altitude_m,
+        unit: Some("m".to_string()),
+    }]
+}
+
+fn proximity_threshold(snapshot: &SimulatedSafetySnapshot) -> Vec<SafetyThresholdEvidence> {
+    vec![SafetyThresholdEvidence {
+        name: "min_proximity_m".to_string(),
+        observed: snapshot.proximity_m,
+        min: snapshot.min_proximity_m,
+        max: None,
+        unit: Some("m".to_string()),
+    }]
 }
 
 fn evaluate_breakers(
