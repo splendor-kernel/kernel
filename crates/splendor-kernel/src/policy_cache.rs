@@ -329,9 +329,7 @@ impl PolicyRuntimeAuthority for PolicyCache {
                 trace_event: Some(policy_revoked_event(bundle, reason.clone())),
             };
         }
-        if bundle.expires_at <= now
-            && !(guard.disconnected && bundle.degraded_mode.allow_low_risk_cached)
-        {
+        if bundle.expires_at <= now {
             return PolicyRuntimeDecision {
                 verification: policy_expired(bundle, None, guard.disconnected),
                 trace_event: Some(policy_expired_event(bundle, None)),
@@ -359,16 +357,11 @@ impl PolicyDistributionStatus for PolicyCache {
             return policy_revoked(bundle, reason);
         }
         if bundle.expires_at <= now {
-            let low_risk_cached = is_explicit_low_risk_offline_action(bundle, request)
-                && guard.disconnected
-                && bundle.degraded_mode.allow_low_risk_cached;
-            if !low_risk_cached {
-                return policy_expired(
-                    bundle,
-                    Some(request.action.name.as_str()),
-                    guard.disconnected,
-                );
-            }
+            return policy_expired(
+                bundle,
+                Some(request.action.name.as_str()),
+                guard.disconnected,
+            );
         }
         if guard.disconnected {
             if is_high_risk_offline_action(bundle, request) {

@@ -67,9 +67,8 @@ pub enum PolicyBundleIdError {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PolicyDegradedMode {
-    /// Allows read-only/low-risk actions to continue from a cached expired policy
-    /// only while the runtime is explicitly disconnected. Side-effectful actions
-    /// remain denied.
+    /// Compatibility flag for degraded mode. In 0.05-S2, expired bundles still
+    /// fail closed and do not authorize policy invocation or gateway forwarding.
     #[serde(default)]
     pub allow_low_risk_cached: bool,
     /// Explicit action names that may continue while disconnected. These actions

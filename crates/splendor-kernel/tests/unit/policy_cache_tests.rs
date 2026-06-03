@@ -134,7 +134,7 @@ fn missing_required_policy_fails_closed_before_inner_gateway() {
 }
 
 #[test]
-fn expired_policy_denies_high_risk_but_allows_disconnected_low_risk_when_configured() {
+fn expired_policy_denies_even_disconnected_explicit_low_risk_actions() {
     let now = OffsetDateTime::now_utc();
     let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
     cache.set_disconnected(true);
@@ -143,11 +143,12 @@ fn expired_policy_denies_high_risk_but_allows_disconnected_low_risk_when_configu
     assert!(!denied.allowed);
     assert_eq!(denied.reasons, vec!["policy_expired"]);
 
-    let allowed = cache.verify_policy_action(
+    let low_risk_denied = cache.verify_policy_action(
         &named_request("read_battery", SideEffectClass::ReadOnly),
         now,
     );
-    assert!(allowed.allowed);
+    assert!(!low_risk_denied.allowed);
+    assert_eq!(low_risk_denied.reasons, vec!["policy_expired"]);
 }
 
 #[test]
@@ -223,6 +224,28 @@ fn disconnected_high_risk_can_require_local_intervention() {
 }
 
 #[test]
+fn expired_disconnected_low_risk_action_does_not_reach_inner_gateway() {
+    let now = OffsetDateTime::now_utc();
+    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
+    cache.set_disconnected(true);
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+
+    let outcome = gateway
+        .submit(named_request("read_battery", SideEffectClass::ReadOnly))
+        .expect("gateway outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(outcome.verification.reasons, vec!["policy_expired"]);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
 fn expired_policy_blocks_policy_invocation_when_not_in_degraded_offline_mode() {
     let now = OffsetDateTime::now_utc();
     let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), false), now);
@@ -238,15 +261,19 @@ fn expired_policy_blocks_policy_invocation_when_not_in_degraded_offline_mode() {
 }
 
 #[test]
-fn expired_policy_allows_policy_invocation_only_in_disconnected_degraded_mode() {
+fn expired_policy_blocks_policy_invocation_even_in_disconnected_degraded_mode() {
     let now = OffsetDateTime::now_utc();
     let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
     cache.set_disconnected(true);
 
     let decision = cache.verify_policy_invocation("static", now);
 
-    assert!(decision.verification.allowed);
-    assert_eq!(decision.trace_event, None);
+    assert!(!decision.verification.allowed);
+    assert_eq!(decision.verification.reasons, vec!["policy_expired"]);
+    assert!(matches!(
+        decision.trace_event,
+        Some(TraceEventKind::PolicyExpired { .. })
+    ));
 }
 
 #[test]

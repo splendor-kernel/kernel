@@ -49,7 +49,8 @@ visible through `PolicyCacheSnapshot`.
 ## Gateway and verifier behavior
 
 Disconnected operation forwards only explicit low-risk read-only actions to the
-wrapped gateway. High-risk and unspecified actions do not reach adapters.
+wrapped gateway while the cached policy is still within TTL. High-risk,
+unspecified, and expired-policy actions do not reach adapters.
 
 ## Replay behavior
 

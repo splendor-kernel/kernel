@@ -25,8 +25,8 @@ degraded_mode:
 3. `read_battery` with `SideEffectClass::ReadOnly` proceeds to the normal gateway
    and verifier chain while within TTL.
 4. `move_to_waypoint` returns `NeedsIntervention`; the adapter is not called.
-5. After TTL expiry, only explicit low-risk read-only cached actions can continue
-   when `allow_low_risk_cached` is true. Other actions deny `policy_expired`.
+5. After TTL expiry, even explicit low-risk read-only cached actions deny
+   `policy_expired`; no action is forwarded to adapters from an expired bundle.
 6. Reconnect emits `PolicyConnectivityChanged { disconnected: false, ... }`; a
    new validated bundle can update cache `last_sync_at` without breaking trace
    continuity.

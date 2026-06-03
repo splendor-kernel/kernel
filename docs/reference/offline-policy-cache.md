@@ -47,7 +47,7 @@ and sync failure state. It does not expose detached signatures or secrets.
 
 | Field | Purpose |
 | --- | --- |
-| `allow_low_risk_cached` | Allows explicitly listed low-risk read-only actions after TTL expiry only while disconnected. |
+| `allow_low_risk_cached` | Compatibility flag for degraded mode. In 0.05-S2 it does not authorize action forwarding after TTL expiry. |
 | `disconnected_low_risk_actions` | Explicit action names allowed to continue while disconnected. The action must also be `SideEffectClass::ReadOnly`. |
 | `disconnected_high_risk_actions` | Explicit action names that cannot execute autonomously while disconnected. |
 | `high_risk_disconnected_behavior` | `deny` or `needs_local_intervention` for disconnected high-risk actions. |
@@ -60,8 +60,7 @@ and sync failure state. It does not expose detached signatures or secrets.
 | Disconnected, within TTL | Explicit low-risk read-only action | Forward to wrapped gateway and normal verifiers. |
 | Disconnected, within TTL | Explicit high-risk action | Deny or `NeedsIntervention`; adapter not called. |
 | Disconnected, within TTL | Any other action | Deny `offline_action_not_allowed`; adapter not called. |
-| Disconnected, expired bundle | Explicit low-risk read-only + `allow_low_risk_cached` | Forward to wrapped gateway and normal verifiers. |
-| Disconnected, expired bundle | Any other action | Deny `policy_expired`; adapter not called. |
+| Disconnected, expired bundle | Any action, including explicit low-risk read-only | Deny `policy_expired`; adapter not called. |
 | Missing or revoked bundle | Any action/policy invocation | Fail closed. |
 
 This makes low-risk cached behavior explicit and avoids inferring broad authority
@@ -101,8 +100,7 @@ refresh bundles, invoke policy code, or execute adapters.
 | --- | --- |
 | Required policy missing | Deny with `policy_unavailable`. |
 | Bundle expired while connected | Deny policy invocation/actions with `policy_expired`. |
-| Bundle expired while disconnected and low-risk cached disabled | Deny. |
-| Bundle expired while disconnected and action is explicitly low-risk read-only | Continue only if `allow_low_risk_cached` is true. |
+| Bundle expired while disconnected | Deny/pause/needs intervention according to policy; the reference cache denies `policy_expired` and does not forward to adapters. |
 | Disconnected high-risk action | Deny or `NeedsIntervention` according to policy. |
 | Disconnected unspecified action | Deny `offline_action_not_allowed`. |
 | Bundle revoked | Deny with `policy_revoked`. |

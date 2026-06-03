@@ -15,9 +15,9 @@ connectivity is unavailable.
 - High-risk operation is explicit: action names in
   `degraded_mode.disconnected_high_risk_actions` are denied or returned as
   `NeedsIntervention` according to `high_risk_disconnected_behavior`.
-- Expired/revoked/missing policy fails closed. Expired cached policy can only
-  allow explicit low-risk read-only actions when disconnected and
-  `allow_low_risk_cached` is true.
+- Expired/revoked/missing policy fails closed. Expired cached policy does not
+  authorize policy invocation or gateway forwarding, even for explicit low-risk
+  read-only actions.
 
 ## Trace and telemetry
 

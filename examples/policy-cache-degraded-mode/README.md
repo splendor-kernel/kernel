@@ -9,9 +9,9 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
 - A signed policy bundle is validated before run authority changes.
 - The runtime records policy bundle ID/version in run and trace metadata.
 - Central sync failure is trace-visible and does not replace cached authority.
-- An expired cached policy denies side-effectful actions.
-- A disconnected runtime may continue read-only/low-risk cached operation only
-  when the bundle explicitly sets `degraded_mode.allow_low_risk_cached = true`.
+- An expired cached policy denies policy invocation and all actions.
+- A disconnected runtime may continue explicit read-only/low-risk cached
+  operation only while the cached bundle is still within TTL.
 - Replay can inspect these events without re-running policies or adapters.
 
 ## Scenario
@@ -63,12 +63,9 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
 
    The runtime records `PolicySyncFailed` and keeps the prior validated bundle.
 
-5. If the cached bundle expires while disconnected:
-
-    - explicitly listed `read_only` actions may continue to normal gateway
-      verification only when `allow_low_risk_cached` is true;
-   - `filesystem`, `network`, `external`, and other side-effectful actions are
-     denied with `policy_expired` before adapters execute.
+5. If the cached bundle expires while disconnected, `read_only`, `filesystem`,
+   `network`, `external`, and other actions are denied with `policy_expired`
+   before adapters execute.
 
 ## Smoke commands
 
