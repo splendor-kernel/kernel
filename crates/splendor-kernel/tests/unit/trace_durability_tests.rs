@@ -84,6 +84,7 @@ fn side_effectful_action_is_denied_when_trace_sync_required_and_stale() {
             local_latest_sequence: Some(5),
             central_latest_sequence: Some(4),
             last_sync_error: Some("central index unavailable".to_string()),
+            last_local_buffer_error: None,
         },
         true,
         calls.clone(),
@@ -109,6 +110,7 @@ fn read_only_action_is_allowed_even_when_sync_is_stale() {
             local_latest_sequence: Some(5),
             central_latest_sequence: Some(4),
             last_sync_error: Some("central index unavailable".to_string()),
+            last_local_buffer_error: None,
         },
         true,
         calls.clone(),
@@ -130,6 +132,7 @@ fn side_effectful_action_is_allowed_when_trace_sync_is_current() {
             local_latest_sequence: Some(5),
             central_latest_sequence: Some(5),
             last_sync_error: None,
+            last_local_buffer_error: None,
         },
         true,
         calls.clone(),
@@ -151,6 +154,7 @@ fn policy_can_leave_central_sync_non_blocking() {
             local_latest_sequence: Some(5),
             central_latest_sequence: None,
             last_sync_error: Some("not synced".to_string()),
+            last_local_buffer_error: None,
         },
         false,
         calls.clone(),
@@ -162,4 +166,30 @@ fn policy_can_leave_central_sync_non_blocking() {
 
     assert_eq!(outcome.status, ActionStatus::Executed);
     assert_eq!(*calls.lock().expect("calls lock"), 1);
+}
+
+#[test]
+fn side_effectful_action_is_denied_when_local_trace_buffer_is_full() {
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = gateway_with_state(
+        TraceDurabilityState {
+            local_latest_sequence: Some(5),
+            central_latest_sequence: Some(5),
+            last_sync_error: None,
+            last_local_buffer_error: Some("local trace buffer full".to_string()),
+        },
+        true,
+        calls.clone(),
+    );
+
+    let outcome = gateway
+        .submit(request(SideEffectClass::Filesystem))
+        .expect("gateway outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+    assert_eq!(
+        outcome.verification.artifacts["last_local_buffer_error"],
+        serde_json::json!("local trace buffer full")
+    );
 }

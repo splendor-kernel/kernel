@@ -8,7 +8,9 @@
 
 use crate::{TraceRecord, TraceStore, TraceStoreError};
 use serde::{Deserialize, Serialize};
-use splendor_types::ContentHash;
+use splendor_types::{
+    ContentHash, OfflineTraceIntervalTraceContext, TraceSyncBoundaryTraceContext,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -53,6 +55,12 @@ pub struct TraceSyncBatch {
     pub scope: TraceSyncScope,
     /// Ordered records read from a local trace buffer.
     pub records: Vec<TraceRecord>,
+    /// Offline execution interval covered by this reconnect batch, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_interval: Option<OfflineTraceIntervalTraceContext>,
+    /// Replay-visible sync boundary metadata for this batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_boundary: Option<TraceSyncBoundaryTraceContext>,
 }
 
 impl TraceSyncBatch {
@@ -64,7 +72,23 @@ impl TraceSyncBatch {
         end: u64,
     ) -> Result<Self, TraceSyncError> {
         let records = store.read_range(&scope.run_id, start, end)?;
-        Ok(Self { scope, records })
+        Ok(Self {
+            scope,
+            records,
+            offline_interval: None,
+            sync_boundary: None,
+        })
+    }
+
+    /// Attaches offline interval and reconnect sync boundary metadata.
+    pub fn with_offline_sync_metadata(
+        mut self,
+        offline_interval: Option<OfflineTraceIntervalTraceContext>,
+        sync_boundary: Option<TraceSyncBoundaryTraceContext>,
+    ) -> Self {
+        self.offline_interval = offline_interval;
+        self.sync_boundary = sync_boundary;
+        self
     }
 }
 
@@ -106,6 +130,151 @@ pub struct TraceIndexRecord {
     pub action_id: Option<String>,
     /// Action name extracted from the payload when present.
     pub action_name: Option<String>,
+}
+
+/// Local trace buffer durability mode for an append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TraceBufferAppendMode {
+    /// Read-only trace durability failure is reported but does not imply adapter side effects.
+    ReadOnly,
+    /// Side-effectful action/event durability must fail closed if the buffer is full.
+    SideEffectful,
+}
+
+/// Configuration for the reference local/offline trace buffer boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalTraceBufferConfig {
+    /// Maximum records per run before appends are rejected. `None` means unbounded.
+    pub max_records_per_run: Option<usize>,
+}
+
+/// Thin local buffer boundary around the existing `TraceStore` contract.
+pub struct LocalTraceBuffer<S: TraceStore> {
+    store: S,
+    config: LocalTraceBufferConfig,
+    active_intervals: Mutex<HashMap<String, OfflineTraceIntervalTraceContext>>,
+}
+
+impl<S: TraceStore> LocalTraceBuffer<S> {
+    /// Creates a local trace buffer around an existing trace store.
+    pub fn new(store: S, config: LocalTraceBufferConfig) -> Self {
+        Self {
+            store,
+            config,
+            active_intervals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the wrapped store for read/sync operations.
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Appends a payload if storage pressure allows preserving trace durability.
+    pub fn append(
+        &self,
+        run_id: &str,
+        payload: serde_json::Value,
+        mode: TraceBufferAppendMode,
+    ) -> Result<u64, LocalTraceBufferError> {
+        self.ensure_capacity(run_id, mode)?;
+        self.store.append(run_id, payload).map_err(Into::into)
+    }
+
+    /// Starts an offline interval and appends a typed trace payload marker.
+    pub fn begin_offline_interval(
+        &self,
+        scope: &TraceSyncScope,
+        reason: Option<String>,
+    ) -> Result<OfflineTraceIntervalTraceContext, LocalTraceBufferError> {
+        let start_sequence = self.next_sequence(&scope.run_id)?;
+        let interval = OfflineTraceIntervalTraceContext {
+            offline_interval_id: format!("offline-{}-{start_sequence}", scope.run_id),
+            node_id: scope.node_id.clone(),
+            instance_id: scope.instance_id.clone(),
+            start_sequence,
+            end_sequence: None,
+            reason,
+        };
+        self.append(
+            &scope.run_id,
+            offline_interval_payload(&scope.run_id, "OfflineTraceIntervalStarted", &interval),
+            TraceBufferAppendMode::ReadOnly,
+        )?;
+        self.active_intervals
+            .lock()
+            .map_err(|_| LocalTraceBufferError::Poisoned)?
+            .insert(scope.run_id.clone(), interval.clone());
+        Ok(interval)
+    }
+
+    /// Ends an offline interval and appends a typed trace payload marker.
+    pub fn end_offline_interval(
+        &self,
+        run_id: &str,
+    ) -> Result<OfflineTraceIntervalTraceContext, LocalTraceBufferError> {
+        let mut intervals = self
+            .active_intervals
+            .lock()
+            .map_err(|_| LocalTraceBufferError::Poisoned)?;
+        let mut interval = intervals.remove(run_id).ok_or_else(|| {
+            LocalTraceBufferError::NoActiveOfflineInterval {
+                run_id: run_id.to_string(),
+            }
+        })?;
+        interval.end_sequence = Some(self.next_sequence(run_id)?);
+        drop(intervals);
+        self.append(
+            run_id,
+            offline_interval_payload(run_id, "OfflineTraceIntervalEnded", &interval),
+            TraceBufferAppendMode::ReadOnly,
+        )?;
+        Ok(interval)
+    }
+
+    /// Builds a reconnect batch with replay-visible boundary metadata.
+    pub fn reconnect_batch(
+        &self,
+        scope: TraceSyncScope,
+        start: u64,
+        end: u64,
+        offline_interval: Option<OfflineTraceIntervalTraceContext>,
+    ) -> Result<TraceSyncBatch, TraceSyncError> {
+        let boundary = TraceSyncBoundaryTraceContext {
+            sync_batch_id: format!("sync-{}-{start}-{end}", scope.run_id),
+            offline_interval_id: offline_interval
+                .as_ref()
+                .map(|interval| interval.offline_interval_id.clone()),
+            start_sequence: start,
+            end_sequence: end,
+            accepted_records: None,
+            duplicate_records: None,
+        };
+        Ok(TraceSyncBatch::from_store(scope, &self.store, start, end)?
+            .with_offline_sync_metadata(offline_interval, Some(boundary)))
+    }
+
+    fn ensure_capacity(
+        &self,
+        run_id: &str,
+        mode: TraceBufferAppendMode,
+    ) -> Result<(), LocalTraceBufferError> {
+        if let Some(max_records) = self.config.max_records_per_run {
+            let current = record_count(&self.store, run_id)?;
+            if current >= max_records {
+                return Err(LocalTraceBufferError::BufferFull {
+                    run_id: run_id.to_string(),
+                    max_records,
+                    side_effectful: mode == TraceBufferAppendMode::SideEffectful,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn next_sequence(&self, run_id: &str) -> Result<u64, LocalTraceBufferError> {
+        Ok(record_count(&self.store, run_id)? as u64)
+    }
 }
 
 impl TraceIndexRecord {
@@ -150,6 +319,10 @@ pub struct TraceSyncReport {
     pub duplicate_records: usize,
     /// Latest central sequence for this run after sync.
     pub latest_sequence: Option<u64>,
+    /// Offline intervals accepted or deduplicated with this batch.
+    pub offline_intervals: Vec<OfflineTraceIntervalTraceContext>,
+    /// Sync boundaries accepted or deduplicated with this batch.
+    pub sync_boundaries: Vec<TraceSyncBoundaryTraceContext>,
 }
 
 /// Rejected trace segment retained for inspection.
@@ -175,6 +348,16 @@ pub trait CentralTraceIndex: Send + Sync {
     fn latest_sequence(&self, run_id: &str) -> Result<Option<u64>, TraceSyncError>;
     /// Returns quarantined batches for audit/debugging.
     fn quarantined(&self) -> Result<Vec<TraceQuarantineEntry>, TraceSyncError>;
+    /// Returns replay-visible offline intervals indexed centrally.
+    fn offline_intervals(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<OfflineTraceIntervalTraceContext>, TraceSyncError>;
+    /// Returns replay-visible sync boundaries indexed centrally.
+    fn sync_boundaries(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TraceSyncBoundaryTraceContext>, TraceSyncError>;
 }
 
 /// In-memory reference central trace index.
@@ -187,6 +370,8 @@ pub struct InMemoryCentralTraceIndex {
 struct CentralTraceIndexState {
     records_by_run: HashMap<String, Vec<TraceIndexRecord>>,
     quarantine: Vec<TraceQuarantineEntry>,
+    offline_intervals_by_run: HashMap<String, Vec<OfflineTraceIntervalTraceContext>>,
+    sync_boundaries_by_run: HashMap<String, Vec<TraceSyncBoundaryTraceContext>>,
 }
 
 impl CentralTraceIndex for InMemoryCentralTraceIndex {
@@ -208,18 +393,53 @@ impl CentralTraceIndex for InMemoryCentralTraceIndex {
             }
         };
 
-        let run_records = state
-            .records_by_run
-            .entry(batch.scope.run_id.clone())
-            .or_default();
-        for record in plan.records_to_insert {
-            run_records.push(TraceIndexRecord::from_record(&batch.scope, record));
+        let latest_sequence = {
+            let run_records = state
+                .records_by_run
+                .entry(batch.scope.run_id.clone())
+                .or_default();
+            for record in plan.records_to_insert {
+                run_records.push(TraceIndexRecord::from_record(&batch.scope, record));
+            }
+            run_records.sort_by_key(|record| record.record.sequence);
+            run_records.last().map(|record| record.record.sequence)
+        };
+        if let Some(interval) = batch.offline_interval.clone() {
+            insert_unique_interval(
+                state
+                    .offline_intervals_by_run
+                    .entry(batch.scope.run_id.clone())
+                    .or_default(),
+                interval,
+            );
         }
-        run_records.sort_by_key(|record| record.record.sequence);
+        if let Some(mut boundary) = batch.sync_boundary.clone() {
+            boundary.accepted_records = Some(plan.accepted_records);
+            boundary.duplicate_records = Some(plan.duplicate_records);
+            insert_unique_boundary(
+                state
+                    .sync_boundaries_by_run
+                    .entry(batch.scope.run_id.clone())
+                    .or_default(),
+                boundary,
+            );
+        }
+        let offline_intervals = state
+            .offline_intervals_by_run
+            .get(&batch.scope.run_id)
+            .cloned()
+            .unwrap_or_default();
+        let sync_boundaries = state
+            .sync_boundaries_by_run
+            .get(&batch.scope.run_id)
+            .cloned()
+            .unwrap_or_default();
         Ok(TraceSyncReport {
             accepted_records: plan.accepted_records,
             duplicate_records: plan.duplicate_records,
-            latest_sequence: run_records.last().map(|record| record.record.sequence),
+            latest_sequence,
+            offline_intervals,
+            sync_boundaries,
         })
     }
 
@@ -247,6 +467,79 @@ impl CentralTraceIndex for InMemoryCentralTraceIndex {
     fn quarantined(&self) -> Result<Vec<TraceQuarantineEntry>, TraceSyncError> {
         let state = self.inner.lock().map_err(|_| TraceSyncError::Poisoned)?;
         Ok(state.quarantine.clone())
+    }
+
+    fn offline_intervals(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<OfflineTraceIntervalTraceContext>, TraceSyncError> {
+        let state = self.inner.lock().map_err(|_| TraceSyncError::Poisoned)?;
+        Ok(state
+            .offline_intervals_by_run
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn sync_boundaries(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TraceSyncBoundaryTraceContext>, TraceSyncError> {
+        let state = self.inner.lock().map_err(|_| TraceSyncError::Poisoned)?;
+        Ok(state
+            .sync_boundaries_by_run
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+fn record_count(store: &dyn TraceStore, run_id: &str) -> Result<usize, TraceStoreError> {
+    match store.read(run_id) {
+        Ok(records) => Ok(records.len()),
+        Err(TraceStoreError::RunNotFound) => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+fn offline_interval_payload(
+    run_id: &str,
+    kind: &str,
+    interval: &OfflineTraceIntervalTraceContext,
+) -> serde_json::Value {
+    serde_json::json!({
+        "run_id": run_id,
+        "kind": {
+            kind: {
+                "interval": interval,
+            }
+        }
+    })
+}
+
+fn insert_unique_interval(
+    intervals: &mut Vec<OfflineTraceIntervalTraceContext>,
+    interval: OfflineTraceIntervalTraceContext,
+) {
+    if !intervals
+        .iter()
+        .any(|existing| existing.offline_interval_id == interval.offline_interval_id)
+    {
+        intervals.push(interval);
+        intervals.sort_by_key(|interval| interval.start_sequence);
+    }
+}
+
+fn insert_unique_boundary(
+    boundaries: &mut Vec<TraceSyncBoundaryTraceContext>,
+    boundary: TraceSyncBoundaryTraceContext,
+) {
+    if !boundaries
+        .iter()
+        .any(|existing| existing.sync_batch_id == boundary.sync_batch_id)
+    {
+        boundaries.push(boundary);
+        boundaries.sort_by_key(|boundary| boundary.start_sequence);
     }
 }
 
@@ -596,6 +889,30 @@ pub enum TraceSyncError {
     #[error("central trace index mutex was poisoned")]
     Poisoned,
     /// Local trace store failed while building a batch.
+    #[error("trace store error: {0}")]
+    Store(#[from] TraceStoreError),
+}
+
+/// Errors returned by the local/offline trace buffer boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalTraceBufferError {
+    /// The local buffer reached configured capacity without dropping records.
+    #[error("local trace buffer full for run {run_id}: max_records={max_records}, side_effectful={side_effectful}")]
+    BufferFull {
+        /// Run whose local buffer is full.
+        run_id: String,
+        /// Configured maximum records.
+        max_records: usize,
+        /// Whether this append was required for a side-effectful action boundary.
+        side_effectful: bool,
+    },
+    /// End was requested without an active offline interval.
+    #[error("no active offline interval for run {run_id}")]
+    NoActiveOfflineInterval { run_id: String },
+    /// Backing interval mutex was poisoned.
+    #[error("local trace buffer mutex was poisoned")]
+    Poisoned,
+    /// Backing trace store failed.
     #[error("trace store error: {0}")]
     Store(#[from] TraceStoreError),
 }

@@ -28,12 +28,14 @@ pub struct TraceDurabilityState {
     pub central_latest_sequence: Option<u64>,
     /// Last trace sync error, if the most recent sync failed.
     pub last_sync_error: Option<String>,
+    /// Last local buffer/durability error, including storage pressure.
+    pub last_local_buffer_error: Option<String>,
 }
 
 impl TraceDurabilityState {
     /// Returns true when the central index is caught up with local trace state.
     pub fn is_durable(&self) -> bool {
-        if self.last_sync_error.is_some() {
+        if self.last_sync_error.is_some() || self.last_local_buffer_error.is_some() {
             return false;
         }
         match (self.local_latest_sequence, self.central_latest_sequence) {
@@ -102,6 +104,7 @@ fn denied_for_trace_durability(
             "local_latest_sequence": state.local_latest_sequence,
             "central_latest_sequence": state.central_latest_sequence,
             "last_sync_error": state.last_sync_error,
+            "last_local_buffer_error": state.last_local_buffer_error,
             "action": request.action.name,
         }),
     };

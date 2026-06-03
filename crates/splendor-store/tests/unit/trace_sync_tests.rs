@@ -173,6 +173,8 @@ fn rejects_empty_gap_conflict_payload_and_hash_mismatches_without_mutation() {
         .sync_batch(TraceSyncBatch {
             scope: scope_for(&run_id),
             records: Vec::new(),
+            offline_interval: None,
+            sync_boundary: None,
         })
         .expect_err("empty sync batch is rejected");
     assert!(matches!(empty_error, TraceSyncError::EmptyBatch { .. }));
@@ -272,6 +274,140 @@ fn rejects_empty_gap_conflict_payload_and_hash_mismatches_without_mutation() {
 }
 
 #[test]
+fn offline_trace_buffer_records_interval_and_reconnect_boundary() {
+    let run_id = RunId::new();
+    let scope = rich_scope_for(&run_id);
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig::default(),
+    );
+
+    let started = buffer
+        .begin_offline_interval(&scope, Some("network_disconnected".to_string()))
+        .expect("begin offline interval");
+    assert_eq!(started.start_sequence, 0);
+    buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::to_value(TraceEvent::new(
+                run_id.clone(),
+                1,
+                OffsetDateTime::now_utc(),
+                TraceEventKind::LoopTickStarted { tick_id: 1 },
+            ))
+            .unwrap(),
+            TraceBufferAppendMode::ReadOnly,
+        )
+        .expect("append tick");
+    buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::to_value(TraceEvent::new(
+                run_id.clone(),
+                2,
+                OffsetDateTime::now_utc(),
+                TraceEventKind::ActionDenied {
+                    action: action("move_to_waypoint"),
+                    result: VerificationResult::deny("safety_check_failed"),
+                },
+            ))
+            .unwrap(),
+            TraceBufferAppendMode::SideEffectful,
+        )
+        .expect("append denial");
+    let ended = buffer
+        .end_offline_interval(&run_id.to_string())
+        .expect("end offline interval");
+    assert_eq!(ended.end_sequence, Some(3));
+
+    let batch = buffer
+        .reconnect_batch(scope.clone(), 0, 4, Some(ended.clone()))
+        .expect("reconnect batch");
+    assert_eq!(batch.records.len(), 4);
+    assert_eq!(
+        batch
+            .offline_interval
+            .as_ref()
+            .expect("offline interval")
+            .offline_interval_id,
+        ended.offline_interval_id
+    );
+    let index = InMemoryCentralTraceIndex::default();
+    let report = index.sync_batch(batch.clone()).expect("sync offline batch");
+
+    assert_eq!(report.accepted_records, 4);
+    assert_eq!(report.offline_intervals.len(), 1);
+    assert_eq!(report.sync_boundaries.len(), 1);
+    assert_eq!(report.sync_boundaries[0].accepted_records, Some(4));
+    assert_eq!(
+        index
+            .offline_intervals(&run_id.to_string())
+            .expect("intervals")
+            .len(),
+        1
+    );
+    assert_eq!(
+        index
+            .sync_boundaries(&run_id.to_string())
+            .expect("boundaries")
+            .len(),
+        1
+    );
+
+    let duplicate = index.sync_batch(batch).expect("duplicate sync");
+    assert_eq!(duplicate.accepted_records, 0);
+    assert_eq!(duplicate.duplicate_records, 4);
+    assert_eq!(
+        index
+            .sync_boundaries(&run_id.to_string())
+            .expect("deduped boundaries")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn local_trace_buffer_rejects_side_effectful_append_when_full() {
+    let run_id = RunId::new();
+    let buffer = LocalTraceBuffer::new(
+        InMemoryTraceStore::default(),
+        LocalTraceBufferConfig {
+            max_records_per_run: Some(1),
+        },
+    );
+
+    buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "one"}),
+            TraceBufferAppendMode::ReadOnly,
+        )
+        .expect("first append");
+    let error = buffer
+        .append(
+            &run_id.to_string(),
+            serde_json::json!({"run_id": run_id.to_string(), "event": "side_effect"}),
+            TraceBufferAppendMode::SideEffectful,
+        )
+        .expect_err("buffer full");
+
+    assert!(matches!(
+        error,
+        LocalTraceBufferError::BufferFull {
+            side_effectful: true,
+            max_records: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        TraceStore::read(buffer.store(), &run_id.to_string())
+            .expect("records")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn mismatched_run_identity_is_rejected_and_quarantined() {
     let record_run_id = RunId::new();
     let scope_run_id = RunId::new();
@@ -283,6 +419,8 @@ fn mismatched_run_identity_is_rejected_and_quarantined() {
                 scope: scope_for(&scope_run_id),
                 records: TraceStore::read_range(&local, &record_run_id.to_string(), 0, 1)
                     .expect("range"),
+                offline_interval: None,
+                sync_boundary: None,
             }
         });
     let index = InMemoryCentralTraceIndex::default();
