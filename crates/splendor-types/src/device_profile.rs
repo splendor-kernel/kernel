@@ -266,7 +266,7 @@ pub fn physical_action_capability(action: &str) -> String {
 }
 
 /// Structured device-profile validation failures.
-#[derive(Clone, Debug, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum DeviceProfileValidationError {
     #[error("device profile schema is required")]
     MissingSchema,

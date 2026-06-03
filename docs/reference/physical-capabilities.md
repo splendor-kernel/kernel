@@ -27,6 +27,7 @@ read_sensor_summary
 read_map
 move_to_waypoint
 return_to_base
+dock
 inspect_zone
 capture_image
 pause_mission
