@@ -1,8 +1,8 @@
 use super::*;
 use splendor_gateway::{ActionGateway, ActionId, ActionOutcome, ActionRequest, GatewayError};
 use splendor_types::{
-    Action, AgentId, PolicyBundle, PolicyBundleId, PolicyDegradedMode, QuotaUsage,
-    RevocationStatus, RunId, SideEffectClass, TenantId,
+    Action, AgentId, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
+    PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId,
 };
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
@@ -38,18 +38,21 @@ fn bundle(expires_at: OffsetDateTime, allow_low_risk_cached: bool) -> PolicyBund
         revocation: RevocationStatus::Active,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached,
+            disconnected_low_risk_actions: vec!["read_battery".to_string()],
+            disconnected_high_risk_actions: vec!["move_to_waypoint".to_string()],
+            high_risk_disconnected_behavior: OfflineHighRiskBehavior::Deny,
         },
     }
 }
 
-fn request(side_effect_class: SideEffectClass) -> ActionRequest {
+fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionRequest {
     ActionRequest {
         action_id: ActionId::new(),
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
         action: Action {
-            name: "file.write".to_string(),
+            name: name.to_string(),
             params: serde_json::json!({}),
             side_effect_class,
             cost_estimate: None,
@@ -63,6 +66,10 @@ fn request(side_effect_class: SideEffectClass) -> ActionRequest {
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
     }
+}
+
+fn request(side_effect_class: SideEffectClass) -> ActionRequest {
+    named_request("file.write", side_effect_class)
 }
 
 #[test]
@@ -136,8 +143,83 @@ fn expired_policy_denies_high_risk_but_allows_disconnected_low_risk_when_configu
     assert!(!denied.allowed);
     assert_eq!(denied.reasons, vec!["policy_expired"]);
 
-    let allowed = cache.verify_policy_action(&request(SideEffectClass::ReadOnly), now);
+    let allowed = cache.verify_policy_action(
+        &named_request("read_battery", SideEffectClass::ReadOnly),
+        now,
+    );
     assert!(allowed.allowed);
+}
+
+#[test]
+fn disconnected_within_ttl_allows_only_explicit_low_risk_actions() {
+    let now = OffsetDateTime::now_utc();
+    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+    cache.set_disconnected(true);
+
+    let allowed = cache.verify_policy_action(
+        &named_request("read_battery", SideEffectClass::ReadOnly),
+        now,
+    );
+    assert!(allowed.allowed);
+
+    let denied =
+        cache.verify_policy_action(&named_request("file.read", SideEffectClass::ReadOnly), now);
+    assert!(!denied.allowed);
+    assert_eq!(denied.reasons, vec!["offline_action_not_allowed"]);
+}
+
+#[test]
+fn disconnected_high_risk_action_fails_closed_before_inner_gateway() {
+    let now = OffsetDateTime::now_utc();
+    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+    cache.set_disconnected(true);
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+
+    let outcome = gateway
+        .submit(named_request("move_to_waypoint", SideEffectClass::External))
+        .expect("gateway outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.verification.reasons,
+        vec!["offline_high_risk_denied"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn disconnected_high_risk_can_require_local_intervention() {
+    let now = OffsetDateTime::now_utc();
+    let mut high_risk_intervention = bundle(now + Duration::hours(1), true);
+    high_risk_intervention
+        .degraded_mode
+        .high_risk_disconnected_behavior = OfflineHighRiskBehavior::NeedsLocalIntervention;
+    let cache = PolicyCache::with_bundle(high_risk_intervention, now);
+    cache.set_disconnected(true);
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+
+    let outcome = gateway
+        .submit(named_request("move_to_waypoint", SideEffectClass::External))
+        .expect("gateway outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert_eq!(
+        outcome.verification.reasons,
+        vec!["offline_high_risk_needs_local_intervention"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
 }
 
 #[test]
@@ -165,6 +247,85 @@ fn expired_policy_allows_policy_invocation_only_in_disconnected_degraded_mode() 
 
     assert!(decision.verification.allowed);
     assert_eq!(decision.trace_event, None);
+}
+
+#[test]
+fn cache_snapshot_records_ttl_scope_validation_and_last_sync() {
+    let now = OffsetDateTime::now_utc();
+    let mut envelope = PolicyBundleEnvelope {
+        bundle: bundle(now + Duration::hours(1), true),
+        signature: None,
+    };
+    envelope.signature = Some(splendor_types::WorkOrderSignature {
+        key_id: "policy-key-a".to_string(),
+        signature: "trace-redacted".to_string(),
+    });
+    let cache = PolicyCache::new(PolicyCacheConfig {
+        enforcement_required: true,
+    });
+    cache.install_validated_envelope(envelope, now);
+
+    let snapshot = cache.snapshot();
+
+    assert_eq!(snapshot.last_sync_at, Some(now));
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Connected);
+    assert_eq!(
+        snapshot.validation.expect("validation").signature_key_id,
+        Some("policy-key-a".to_string())
+    );
+    let bundle = snapshot.bundle.expect("bundle");
+    assert_eq!(bundle.version, "v1");
+    assert_eq!(bundle.expires_at, now + Duration::hours(1));
+}
+
+#[test]
+fn expired_policy_snapshot_reports_expired_or_degraded_status() {
+    let now = OffsetDateTime::now_utc();
+    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
+
+    assert_eq!(
+        cache.snapshot().offline_status,
+        PolicyOfflineStatus::Expired
+    );
+    cache.set_disconnected(true);
+    assert_eq!(
+        cache.snapshot().offline_status,
+        PolicyOfflineStatus::DegradedExpired
+    );
+}
+
+#[test]
+fn disconnected_reconnect_transition_is_trace_visible() {
+    let now = OffsetDateTime::now_utc();
+    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+
+    let offline = cache
+        .set_disconnected_with_trace(true, now)
+        .expect("offline transition");
+    assert!(matches!(
+        offline,
+        TraceEventKind::PolicyConnectivityChanged {
+            disconnected: true,
+            bundle: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        cache.snapshot().offline_status,
+        PolicyOfflineStatus::DisconnectedWithinTtl
+    );
+
+    let reconnected = cache
+        .set_disconnected_with_trace(false, now + Duration::minutes(1))
+        .expect("reconnect transition");
+    assert!(matches!(
+        reconnected,
+        TraceEventKind::PolicyConnectivityChanged {
+            disconnected: false,
+            bundle: Some(_),
+            ..
+        }
+    ));
 }
 
 #[test]

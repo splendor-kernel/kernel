@@ -72,6 +72,30 @@ pub struct PolicyDegradedMode {
     /// remain denied.
     #[serde(default)]
     pub allow_low_risk_cached: bool,
+    /// Explicit action names that may continue while disconnected. These actions
+    /// still pass through the action gateway and normal verifiers.
+    #[serde(default)]
+    pub disconnected_low_risk_actions: Vec<String>,
+    /// Explicit action names that are high-risk while central connectivity is
+    /// unavailable. These cannot execute autonomously while disconnected.
+    #[serde(default)]
+    pub disconnected_high_risk_actions: Vec<String>,
+    /// Whether disconnected high-risk actions are denied or paused for local
+    /// operator intervention.
+    #[serde(default)]
+    pub high_risk_disconnected_behavior: OfflineHighRiskBehavior,
+}
+
+/// Fail-closed behavior for high-risk actions while central policy connectivity
+/// is unavailable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineHighRiskBehavior {
+    /// Deny without adapter execution.
+    #[default]
+    Deny,
+    /// Pause before adapter execution for local operator intervention.
+    NeedsLocalIntervention,
 }
 
 /// Signed policy bundle payload. The detached signature lives in

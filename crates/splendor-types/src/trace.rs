@@ -317,6 +317,16 @@ pub enum TraceEventKind {
         /// Sanitized failure reason code.
         reason: String,
     },
+    /// Records explicit central policy connectivity transitions for offline or
+    /// reconnect operation without changing cached authority.
+    PolicyConnectivityChanged {
+        /// True when the runtime is disconnected from central policy authority.
+        disconnected: bool,
+        /// When the connectivity state was observed.
+        observed_at: OffsetDateTime,
+        /// Current cached bundle metadata, when present.
+        bundle: Option<PolicyBundleTraceContext>,
+    },
     /// Records policy TTL expiry affecting policy invocation or side effects.
     PolicyExpired {
         /// Policy bundle identity that expired.

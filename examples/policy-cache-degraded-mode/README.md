@@ -27,8 +27,13 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
    issued_at: "2026-05-29T12:00:00Z"
    expires_at: "2026-05-29T13:00:00Z"
    revocation: active
-   degraded_mode:
-     allow_low_risk_cached: true
+    degraded_mode:
+      allow_low_risk_cached: true
+      disconnected_low_risk_actions:
+        - read_battery
+      disconnected_high_risk_actions:
+        - move_to_waypoint
+      high_risk_disconnected_behavior: deny
    signature:
      key_id: policy-local-key
      signature: <detached-signature>
@@ -60,8 +65,8 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
 
 5. If the cached bundle expires while disconnected:
 
-   - `read_only` actions may continue to normal gateway verification only when
-     `allow_low_risk_cached` is true;
+    - explicitly listed `read_only` actions may continue to normal gateway
+      verification only when `allow_low_risk_cached` is true;
    - `filesystem`, `network`, `external`, and other side-effectful actions are
      denied with `policy_expired` before adapters execute.
 
@@ -98,7 +103,7 @@ distributor, policy host, action gateway, verifier chain, or adapter.
 
 ## Non-goals
 
-- No physical device policy cache or trace reconnect sync.
+- No physical safety certification or raw actuator control.
 - No central policy authoring UI.
 - No production key-management or PKI implementation.
 - No global consensus or fleet-wide policy state.

@@ -153,6 +153,7 @@ fn signed_policy_bundle(
         revocation,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached: true,
+            ..PolicyDegradedMode::default()
         },
     };
     PolicyBundleEnvelope::signed_with_shared_secret(
