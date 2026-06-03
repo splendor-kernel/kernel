@@ -1130,6 +1130,7 @@ dependencies = [
  "serde_json",
  "splendor-adapter-filesystem",
  "splendor-adapter-http",
+ "splendor-adapter-robotics",
  "splendor-gateway",
  "splendor-store",
  "splendor-types",
