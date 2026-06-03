@@ -36,10 +36,11 @@
 
 use serde::{Deserialize, Serialize};
 use splendor_types::{
-    Action, AgentId, ApprovalActionScope, ApprovalDecision, ApprovalEvidence, ApprovalId,
-    ApprovalPolicy, ApprovalTraceContext, CircuitBreaker, CircuitBreakerScope,
-    IdentityValidationError, QuotaUsage, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
-    VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
+    ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, CircuitBreaker,
+    CircuitBreakerScope, IdentityValidationError, QuotaUsage, RunId, RuntimeIdentityContext,
+    SideEffectClass, TenantId, VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION,
+    APPROVAL_POLICY_SCHEMA_VERSION, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::HashMap;
 use std::future::{ready, Future, Ready};
@@ -797,6 +798,11 @@ impl ActionGateway for VerifiedActionGateway {
             return Ok(identity_denied_outcome(action.action_id, error));
         }
 
+        if let Some(mut verification) = verify_physical_action_boundary(&action) {
+            attach_request_context(&mut verification, &action);
+            return Ok(denied_outcome(action.action_id, verification));
+        }
+
         let registration = self
             .adapters
             .get(&action.action.name)
@@ -1229,6 +1235,52 @@ pub fn is_physical_action(action: &Action) -> bool {
         .get("physical_action")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn verify_physical_action_boundary(action: &ActionRequest) -> Option<VerificationResult> {
+    let normalized = normalize_physical_token(&action.action.name);
+    if FORBIDDEN_PHYSICAL_ACTION_PATTERNS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+    {
+        return Some(VerificationResult {
+            allowed: false,
+            reasons: vec!["forbidden_physical_action".to_string()],
+            artifacts: serde_json::json!({
+                "source": "physical_action_boundary",
+                "action": action.action.name,
+                "matched_policy": "forbidden_low_level_physical_action",
+            }),
+        });
+    }
+
+    if is_physical_action(&action.action) && !is_allowed_physical_action(&action.action.name) {
+        return Some(VerificationResult {
+            allowed: false,
+            reasons: vec!["unknown_physical_action".to_string()],
+            artifacts: serde_json::json!({
+                "source": "physical_action_boundary",
+                "action": action.action.name,
+                "matched_policy": "high_level_physical_actions_only",
+            }),
+        });
+    }
+
+    None
+}
+
+fn normalize_physical_token(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerification {
