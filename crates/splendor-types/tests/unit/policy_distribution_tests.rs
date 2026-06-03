@@ -25,6 +25,9 @@ fn bundle() -> PolicyBundle {
         revocation: RevocationStatus::Active,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached: true,
+            disconnected_low_risk_actions: vec!["read_battery".to_string()],
+            disconnected_high_risk_actions: vec!["move_to_waypoint".to_string()],
+            high_risk_disconnected_behavior: OfflineHighRiskBehavior::NeedsLocalIntervention,
         },
     }
 }
@@ -51,6 +54,10 @@ fn signed_policy_bundle_validates_and_preserves_trace_metadata() {
     assert_eq!(trace.policy_bundle_id.as_str(), "pol_test");
     assert_eq!(trace.version, "2026.05.29");
     assert!(trace.degraded_mode.allow_low_risk_cached);
+    assert_eq!(
+        trace.degraded_mode.disconnected_low_risk_actions,
+        vec!["read_battery"]
+    );
 }
 
 #[test]
@@ -257,6 +264,18 @@ fn policy_bundle_serde_defaults_are_stable_and_trace_safe() {
     assert_eq!(decoded.agent_id, None);
     assert_eq!(decoded.revocation, RevocationStatus::Active);
     assert!(!decoded.degraded_mode.allow_low_risk_cached);
+    assert!(decoded
+        .degraded_mode
+        .disconnected_low_risk_actions
+        .is_empty());
+    assert!(decoded
+        .degraded_mode
+        .disconnected_high_risk_actions
+        .is_empty());
+    assert_eq!(
+        decoded.degraded_mode.high_risk_disconnected_behavior,
+        OfflineHighRiskBehavior::Deny
+    );
 
     let envelope = PolicyBundleEnvelope::signed_with_shared_secret(decoded.clone(), KEY_ID, SECRET)
         .expect("signed defaulted bundle");

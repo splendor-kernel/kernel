@@ -153,6 +153,7 @@ fn signed_policy_bundle(
         revocation,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached: true,
+            ..PolicyDegradedMode::default()
         },
     };
     PolicyBundleEnvelope::signed_with_shared_secret(
@@ -770,6 +771,28 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
         Some("policy_reason_redacted")
     );
 
+    let reconnect = PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: Some(signed_policy_bundle(
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            RevocationStatus::Active,
+        )),
+        sync_error: None,
+        disconnected: Some(false),
+    };
+    let (status, reconnected): (StatusCode, PolicySyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(reconnect).expect("policy reconnect request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(reconnected.accepted);
+    assert!(!reconnected.cache_status.disconnected);
+
     let (status, traces): (StatusCode, TracePageResponse) = call_empty(
         app,
         Method::GET,
@@ -787,8 +810,36 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
             .map(|event| matches!(event.kind, TraceEventKind::PolicySyncFailed { .. }))
             .unwrap_or(false)
     });
+    let saw_disconnect = traces.records.iter().any(|record| {
+        serde_json::from_value::<TraceEvent>(record.payload.clone())
+            .map(|event| {
+                matches!(
+                    event.kind,
+                    TraceEventKind::PolicyConnectivityChanged {
+                        disconnected: true,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or(false)
+    });
+    let saw_reconnect = traces.records.iter().any(|record| {
+        serde_json::from_value::<TraceEvent>(record.payload.clone())
+            .map(|event| {
+                matches!(
+                    event.kind,
+                    TraceEventKind::PolicyConnectivityChanged {
+                        disconnected: false,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or(false)
+    });
     assert!(saw_policy_bundle);
     assert!(saw_sync_failure);
+    assert!(saw_disconnect);
+    assert!(saw_reconnect);
     let serialized = serde_json::to_string(&traces.records).expect("serialized traces");
     assert!(!serialized.contains("raw-secret"));
     assert!(!serialized.contains("token="));

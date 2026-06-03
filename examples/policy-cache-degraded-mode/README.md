@@ -9,9 +9,9 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
 - A signed policy bundle is validated before run authority changes.
 - The runtime records policy bundle ID/version in run and trace metadata.
 - Central sync failure is trace-visible and does not replace cached authority.
-- An expired cached policy denies side-effectful actions.
-- A disconnected runtime may continue read-only/low-risk cached operation only
-  when the bundle explicitly sets `degraded_mode.allow_low_risk_cached = true`.
+- An expired cached policy denies policy invocation and all actions.
+- A disconnected runtime may continue explicit read-only/low-risk cached
+  operation only while the cached bundle is still within TTL.
 - Replay can inspect these events without re-running policies or adapters.
 
 ## Scenario
@@ -27,8 +27,13 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
    issued_at: "2026-05-29T12:00:00Z"
    expires_at: "2026-05-29T13:00:00Z"
    revocation: active
-   degraded_mode:
-     allow_low_risk_cached: true
+    degraded_mode:
+      allow_low_risk_cached: true
+      disconnected_low_risk_actions:
+        - read_battery
+      disconnected_high_risk_actions:
+        - move_to_waypoint
+      high_risk_disconnected_behavior: deny
    signature:
      key_id: policy-local-key
      signature: <detached-signature>
@@ -58,12 +63,9 @@ policy distribution, policy cache, loop engine, and daemon tests listed below.
 
    The runtime records `PolicySyncFailed` and keeps the prior validated bundle.
 
-5. If the cached bundle expires while disconnected:
-
-   - `read_only` actions may continue to normal gateway verification only when
-     `allow_low_risk_cached` is true;
-   - `filesystem`, `network`, `external`, and other side-effectful actions are
-     denied with `policy_expired` before adapters execute.
+5. If the cached bundle expires while disconnected, `read_only`, `filesystem`,
+   `network`, `external`, and other actions are denied with `policy_expired`
+   before adapters execute.
 
 ## Smoke commands
 
@@ -98,7 +100,7 @@ distributor, policy host, action gateway, verifier chain, or adapter.
 
 ## Non-goals
 
-- No physical device policy cache or trace reconnect sync.
+- No physical safety certification or raw actuator control.
 - No central policy authoring UI.
 - No production key-management or PKI implementation.
 - No global consensus or fleet-wide policy state.

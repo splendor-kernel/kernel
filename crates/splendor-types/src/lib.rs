@@ -126,8 +126,8 @@ pub use placement::{
     PLACEMENT_DECISION_SCHEMA,
 };
 pub use policy_distribution::{
-    validate_policy_bundle, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyBundleIdError, PolicyBundleKeyring, PolicyBundleTraceContext,
+    validate_policy_bundle, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope,
+    PolicyBundleId, PolicyBundleIdError, PolicyBundleKeyring, PolicyBundleTraceContext,
     PolicyBundleValidationContext, PolicyBundleValidationError, PolicyDegradedMode,
     ValidatedPolicyBundle, POLICY_BUNDLE_SCHEMA_VERSION, POLICY_BUNDLE_SIGNATURE_ALGORITHM,
 };

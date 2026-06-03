@@ -100,8 +100,8 @@ cache.
 ## Gateway and verifier behavior
 
 - Missing required policy denies with `policy_unavailable`.
-- Expired policy denies with `policy_expired` unless disconnected low-risk cached
-  mode applies to a read-only action.
+- Expired policy denies with `policy_expired`; 0.05 offline low-risk behavior is
+  limited to within-TTL cached policy.
 - Revoked policy denies with `policy_revoked`.
 - Invalid bundle signature/schema/scope fails closed before installation.
 - Agent-scoped bundles require a matching run/agent validation context; a
