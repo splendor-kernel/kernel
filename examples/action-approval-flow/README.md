@@ -51,24 +51,66 @@ authority.
 {
   "tenant_id": "<tenant-id>",
   "agent_id": "<agent-id>",
-  "work_order": { "...": "signed scoped work order" },
+  "work_order": {
+    "schema_version": "splendor.work_order.v1",
+    "work_order_id": "wo_approval_create",
+    "tenant_id": "<tenant-id>",
+    "agent_id": "<agent-id>",
+    "run_id": null,
+    "objective": "Create approval-gated artifact publish run",
+    "allowed_actions": ["artifact.publish"],
+    "allowed_adapters": ["artifact-store"],
+    "allowed_permissions": ["artifact.publish"],
+    "data_refs": [],
+    "quotas": {
+      "max_actions_per_tick": 1,
+      "max_action_duration_ms": null,
+      "max_filesystem_read_bytes": null,
+      "max_filesystem_write_bytes": null,
+      "max_network_read_bytes": null,
+      "max_network_write_bytes": null,
+      "max_http_requests_per_minute": null
+    },
+    "placement": {
+      "target": "local_resident",
+      "data_locality": null,
+      "requires_gpu": false,
+      "dedicated_instance": false,
+      "required_capabilities": [],
+      "max_runtime_ms": null
+    },
+    "issued_at": "2026-05-29T00:00:00Z",
+    "expires_at": "2026-05-29T00:10:00Z",
+    "revocation": "active",
+    "signature": { "key_id": "approval-local-key", "signature": "signed-create-work-order" }
+  },
   "credential": {
-    "credential_id": "<credential-id>",
-    "principal": { "...": "client principal" },
+    "credential_id": "cred_approval_operator",
+    "principal": {
+      "app": { "app_principal_id": "app_approval_console", "label": "Approval console" },
+      "client_principal_id": "client_approval_operator",
+      "label": "Approval operator"
+    },
     "scopes": ["runs_create"],
     "binding": { "tenant": { "tenant_id": "<tenant-id>" } },
     "audience": { "daemon": { "daemon_id": "<daemon-id>" } },
-    "expires_at": "<rfc3339>",
+    "expires_at": "2026-05-29T00:10:00Z",
     "revocation": "active"
   },
   "audit_attribution": {
-    "principal": { "...": "same client principal" },
-    "credential_id": "<credential-id>",
-    "requested_at": "<rfc3339>"
+    "principal": {
+      "app": { "app_principal_id": "app_approval_console", "label": "Approval console" },
+      "client_principal_id": "client_approval_operator",
+      "label": "Approval operator"
+    },
+    "credential_id": "cred_approval_operator",
+    "requested_at": "2026-05-29T00:00:00Z"
   },
   "allowed_actions": ["artifact.publish"],
   "allowed_adapters": ["artifact-store"],
   "allowed_permissions": ["artifact.publish"],
+  "policy_bundle_required": false,
+  "policy_bundle": null,
   "policy_actions": [
     {
       "action": {
@@ -133,8 +175,61 @@ The adapter execution counter remains `0`.
 
 ```json
 {
-  "work_order": { "...": "signed resume work order scoped to the run" },
-  "audit_attribution": { "principal": "dev", "credential_id": null, "request_id": "req-approval-resume" },
+  "credential": {
+    "credential_id": "cred_approval_operator",
+    "principal": {
+      "app": { "app_principal_id": "app_approval_console", "label": "Approval console" },
+      "client_principal_id": "client_approval_operator",
+      "label": "Approval operator"
+    },
+    "scopes": ["runs_resume"],
+    "binding": { "tenant": { "tenant_id": "<tenant-id>" } },
+    "audience": { "daemon": { "daemon_id": "<daemon-id>" } },
+    "expires_at": "2026-05-29T00:10:00Z",
+    "revocation": "active"
+  },
+  "work_order": {
+    "schema_version": "splendor.work_order.v1",
+    "work_order_id": "wo_approval_resume",
+    "tenant_id": "<tenant-id>",
+    "agent_id": "<agent-id>",
+    "run_id": "<run-id>",
+    "objective": "Resume approval-gated artifact publish run",
+    "allowed_actions": ["artifact.publish"],
+    "allowed_adapters": ["artifact-store"],
+    "allowed_permissions": ["artifact.publish"],
+    "data_refs": [],
+    "quotas": {
+      "max_actions_per_tick": 1,
+      "max_action_duration_ms": null,
+      "max_filesystem_read_bytes": null,
+      "max_filesystem_write_bytes": null,
+      "max_network_read_bytes": null,
+      "max_network_write_bytes": null,
+      "max_http_requests_per_minute": null
+    },
+    "placement": {
+      "target": "local_resident",
+      "data_locality": null,
+      "requires_gpu": false,
+      "dedicated_instance": false,
+      "required_capabilities": [],
+      "max_runtime_ms": null
+    },
+    "issued_at": "2026-05-29T00:00:00Z",
+    "expires_at": "2026-05-29T00:10:00Z",
+    "revocation": "active",
+    "signature": { "key_id": "approval-local-key", "signature": "signed-resume-work-order" }
+  },
+  "audit_attribution": {
+    "principal": {
+      "app": { "app_principal_id": "app_approval_console", "label": "Approval console" },
+      "client_principal_id": "client_approval_operator",
+      "label": "Approval operator"
+    },
+    "credential_id": "cred_approval_operator",
+    "requested_at": "2026-05-29T00:00:00Z"
+  },
   "reason": "approval granted",
   "approval_evidence": {
     "schema_version": "splendor.approval_evidence.v1",

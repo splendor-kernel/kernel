@@ -34,10 +34,16 @@ depending on undocumented internals.
 - Added `docs/sdk/typescript/stable-0.1.md`.
 - Updated `docs/reference/runtime-daemon-api.md` with 0.1 compatibility headers,
   stable error-shape guidance, and explicit negotiation limitation.
-- Updated SDK and example docs to point stable users at 0.1 surfaces.
+- Updated SDK docs, stable examples, and legacy-example notes to point stable users
+  at 0.1 surfaces and avoid teaching daemon auth bypass.
+- Updated `openapi/splendor-runtime-daemon.yaml` metadata with a 0.1
+  compatibility extension while preserving the current runtime API version.
+- Updated `examples/typescript-daemon-client/example.ts` to use stable 0.1 client
+  headers and explicit caller credential/work-order/audit shapes.
 
-No schema fields, trace event names, daemon endpoints, gateway outcomes, Rust
-public types, Python source, TypeScript source, or OpenAPI schemas were changed.
+No runtime behavior, trace event names, daemon endpoints, gateway outcome enum
+values, Rust source, Python source, or TypeScript package source were changed.
+The PR does update OpenAPI metadata and a TypeScript example source file.
 
 ## Runtime Primitives Touched
 
@@ -99,13 +105,10 @@ Stable failure handling is documented for:
 | Test | Purpose | Evidence |
 | --- | --- | --- |
 | conformance | Validate 0.1 stable primitive fixture compatibility and fail-closed/replay expectations | `python conformance/0.1/run-conformance.py` |
+| TypeScript package tests | Validate TypeScript types/client, OpenAPI parity, and client error/security behavior | `npm test` |
+| Python runtime tests | Validate Python local SDK runtime behavior and Python-local statuses | `python -m pytest python/tests/test_runtime.py -q` |
+| TypeScript example compile | Validate the changed stable daemon-client example source | `npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/typescript-daemon-client/example.ts` |
 | docs whitespace | Validate patch cleanliness | `git diff --check` |
-
-`npm test` was not required for this sprint change because TypeScript source,
-package tests, and generated type fixtures were not modified.
-
-`python -m pytest python/tests/test_runtime.py -q` was not required for this
-sprint change because Python source and Python SDK constants were not modified.
 
 ## Example Commands Or Fixtures
 
