@@ -1,5 +1,9 @@
 # Local Basic Loop
 
+Stability note: this is a legacy dev quickstart, not a stable 0.1 SDK/API
+example. Use `examples/python-sdk-basic/`, `examples/typescript-daemon-client/`,
+and `examples/daemon-client-local/` for stable 0.1 API-surface examples.
+
 This is the 0.01-dev reference quickstart. It runs one local agent tick through:
 
 ```text

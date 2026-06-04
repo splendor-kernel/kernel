@@ -1,5 +1,9 @@
 # Kernel E2E Through 0.03 Fixture
 
+Stability note: this is an aggregate legacy dev E2E fixture, not a stable 0.1
+SDK/API example. Stable 0.1 compatibility evidence is the conformance suite under
+`conformance/0.1/`.
+
 This example directory documents the required end-to-end fixture for the
 Splendor0.03 final kernel integration gate.
 
