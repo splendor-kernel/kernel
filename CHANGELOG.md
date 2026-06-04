@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1-dev — Stable primitive compatibility line
+
+### Release and migration artifacts
+
+- Added 0.1-dev release notes that list stable primitives, stable SDK/API
+  surfaces, local and daemon example entry points, release validation commands,
+  known limitations, and human-only tagging checklist.
+- Added the 0.1 migration guide mapping development-era field/API changes to
+  stable replacements or removal reasons, including `trace_id` to
+  `trace_event_id`, `WorkOrderAuthorization.allowed_scopes` to explicit
+  `WorkOrderEnvelope` fields, daemon version metadata limitations,
+  daemon/Python status casing, and local-only insecure credential behavior.
+- Added the 0.1 compatibility policy defining patch/minor expectations,
+  deprecation requirements, validation baseline, and surfaces that remain
+  experimental or future work.
+- Added the 0.1-S6 milestone evidence document for migration/release validation
+  and sprint-scoped non-goals.
+
+### Explicitly not included
+
+- No actual release tag was created by this documentation sprint.
+- No 1.0 production claim, production fleet scheduler, production remote daemon,
+  enterprise support policy, marketplace, adapter certification, production
+  robotics safety certification, or hard real-time control claim.
+
 ## 0.05-dev — Physical and edge orchestration
 
 ### Implemented primitives
