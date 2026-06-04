@@ -10,7 +10,7 @@
 - There is no daemon API or TypeScript client in 0.01-dev.
 - Replay is inspect-only and local; there is no cross-instance replay.
 
-## Governance limitations through 0.04-dev
+## Governance limitations through 0.05-dev
 
 - 0.04-dev includes approval gating, deterministic escalation, circuit breakers,
   policy TTL/revocation checks, external governance adapter contracts, and
@@ -28,13 +28,24 @@
 - The external governance adapter is a provider-neutral contract boundary. It does
   not make Harmony or any other product the source of runtime enforcement.
 
-## Physical/edge not included
+## Physical/edge limitations through 0.05-dev
 
-- No device node profiles.
-- No robotics adapter contract.
-- No safety verifier API.
-- No full physical/edge offline policy cache or local trace reconnect sync.
-- No production robotics safety certification claim.
+- 0.05-dev includes development primitives for physical/edge orchestration:
+  device profiles, physical capability validation, offline policy cache behavior,
+  local trace buffer and reconnect sync, a high-level robotics adapter contract,
+  safety verifier API, advisory cloud-helper pattern, and a physical simulation
+  harness.
+- The 0.05 physical/edge surface is contract and simulation focused. It does not
+  certify production robot, drone, humanoid, industrial, or edge-device readiness.
+- Physical actions remain high-level, bounded, and mediated by the Action Gateway
+  and local safety verifier chain before adapter execution.
+- There is no hard real-time robot control, motor control, raw actuator write,
+  firmware safety bypass, flight-controller replacement, PLC replacement,
+  low-level sensor-fusion system, ROS/native device-driver implementation, live
+  flight testing, or production robotics safety certification claim.
+- Cloud helpers are advisory by default. They may return proposals, artifacts, or
+  typed messages, but they do not receive direct actuator authority; local device
+  Splendor validation and gateway/safety checks remain authoritative.
 
 ## Adapter maturity
 
@@ -43,5 +54,5 @@
 
 ## Compatibility
 
-- 0.01-dev through 0.04-dev schemas are provisional development contracts.
+- 0.01-dev through 0.05-dev schemas are provisional development contracts.
 - 0.1-dev will define the first stable primitive compatibility line.
