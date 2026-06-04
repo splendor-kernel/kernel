@@ -50,7 +50,13 @@
 ## Adapter maturity
 
 - 0.01 includes filesystem and HTTP adapters as local baseline adapters.
-- Broad adapter ecosystem and adapter certification levels are not included.
+- 0.1-S3 adds an evidence-based adapter maturity model with levels for
+  `experimental`, `local-safe`, `network-safe`, `governance-aware`, and
+  `device-safe` adapters. This is a technical documentation and metadata model,
+  not a marketplace, vendor approval workflow, legal certification, production
+  support promise, or physical safety certification claim.
+- Broad adapter ecosystem mechanics, adapter marketplace workflows, and legal or
+  product certification processes are not included.
 
 ## Compatibility
 

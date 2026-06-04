@@ -1,0 +1,120 @@
+{
+  "schema_version": "splendor.adapter_manifest.v1",
+  "adapter": {
+    "id": "robotics",
+    "name": "Simulated Robotics Adapter",
+    "version": "0.1-dev",
+    "crate": "splendor-adapter-robotics",
+    "owner": "splendor-runtime",
+    "description": "Simulated high-level physical action adapter for device-safe contract evidence without live hardware."
+  },
+  "maturity_level": "device-safe",
+  "supported_actions": [
+    {"name": "read_battery", "side_effect_class": "physical.high_level.read", "required_permissions": ["device.read"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.read_battery.acknowledged"], "params_scope": "bounded local device status request", "risk": "low_physical_read"},
+    {"name": "read_sensor_summary", "side_effect_class": "physical.high_level.read", "required_permissions": ["device.read"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.read_sensor_summary.acknowledged"], "params_scope": "summary reference only; no raw sensor blobs", "risk": "low_physical_read"},
+    {"name": "read_map", "side_effect_class": "physical.high_level.read", "required_permissions": ["device.read"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.read_map.acknowledged"], "params_scope": "map reference only; no raw map dump required", "risk": "bounded_physical_read"},
+    {"name": "move_to_waypoint", "side_effect_class": "physical.high_level.motion", "required_permissions": ["device.motion.waypoint"], "required_preconditions": ["local_safety_verifier_available", "geofence_ok", "battery_ok", "collision_risk_clear"], "postconditions": ["robotics.move_to_waypoint.acknowledged"], "params_scope": "bounded waypoint command to local middleware", "risk": "high_physical_motion"},
+    {"name": "return_to_base", "side_effect_class": "physical.high_level.motion", "required_permissions": ["device.motion.return_to_base"], "required_preconditions": ["local_safety_verifier_available", "battery_ok", "route_safe"], "postconditions": ["robotics.return_to_base.acknowledged"], "params_scope": "bounded local return-to-base command", "risk": "high_physical_motion"},
+    {"name": "dock", "side_effect_class": "physical.high_level.motion", "required_permissions": ["device.motion.dock"], "required_preconditions": ["local_safety_verifier_available", "dock_available", "collision_risk_clear"], "postconditions": ["robotics.dock.acknowledged"], "params_scope": "bounded local dock command", "risk": "high_physical_motion"},
+    {"name": "inspect_zone", "side_effect_class": "physical.high_level.mission", "required_permissions": ["device.inspect"], "required_preconditions": ["local_safety_verifier_available", "zone_allowed", "privacy_zone_clear"], "postconditions": ["robotics.inspect_zone.acknowledged"], "params_scope": "declared zone reference", "risk": "bounded_physical_mission"},
+    {"name": "capture_image", "side_effect_class": "physical.high_level.capture", "required_permissions": ["device.capture.image"], "required_preconditions": ["local_safety_verifier_available", "privacy_zone_clear"], "postconditions": ["robotics.capture_image.acknowledged"], "params_scope": "image capture request with trace-safe artifact reference", "risk": "privacy_sensitive_capture"},
+    {"name": "pause_mission", "side_effect_class": "physical.high_level.control", "required_permissions": ["device.mission.pause"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.pause_mission.acknowledged"], "params_scope": "bounded mission pause request", "risk": "safety_preserving_control"},
+    {"name": "resume_mission", "side_effect_class": "physical.high_level.control", "required_permissions": ["device.mission.resume"], "required_preconditions": ["local_safety_verifier_available", "operator_or_policy_allows_resume"], "postconditions": ["robotics.resume_mission.acknowledged"], "params_scope": "bounded mission resume request", "risk": "high_physical_control"},
+    {"name": "request_operator_override", "side_effect_class": "physical.high_level.intervention", "required_permissions": ["device.operator.request_override"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.request_operator_override.acknowledged"], "params_scope": "override request only; does not grant approval", "risk": "operator_intervention_request"},
+    {"name": "notify_operator", "side_effect_class": "physical.high_level.notification", "required_permissions": ["device.operator.notify"], "required_preconditions": ["local_safety_verifier_available"], "postconditions": ["robotics.notify_operator.acknowledged"], "params_scope": "trace-safe operator notification payload", "risk": "operator_notification"},
+    {"name": "upload_trace_summary", "side_effect_class": "physical.high_level.network", "required_permissions": ["device.trace.upload"], "required_preconditions": ["local_safety_verifier_available", "network_policy_allows_upload"], "postconditions": ["robotics.upload_trace_summary.acknowledged"], "params_scope": "trace summary reference only", "risk": "bounded_network_upload"}
+  ],
+  "required_verifiers": [
+    "tenant",
+    "agent_permission",
+    "adapter",
+    "quota",
+    "precondition",
+    "data_scope",
+    "safety",
+    "approval",
+    "policy_ttl",
+    "postcondition"
+  ],
+  "quota_dimensions": [
+    "actions",
+    "action_duration_ms",
+    "device_commands",
+    "network_write_bytes"
+  ],
+  "trace_behavior": {
+    "required_events": [
+      "verification.started",
+      "verification.completed",
+      "action.executed",
+      "action.denied",
+      "action.failed",
+      "action.needs_approval",
+      "action.needs_intervention",
+      "outcome.recorded"
+    ],
+    "evidence": "Trace-safe middleware command refs, safety status refs, thresholds, zones, reason codes, and postcondition refs only. No raw sensor blobs, camera frames, lidar packets, or controller internals."
+  },
+  "replay_behavior": {
+    "default_mode": "inspect_only",
+    "side_effects_replayed": false,
+    "notes": "Replay reconstructs physical decisions and safety evidence from trace/state and does not call robotics middleware or execute device commands."
+  },
+  "scopes": {
+    "tenant_scope": "required tenant_id policy and work-order scope",
+    "agent_scope": "required agent_id permission and quota scope",
+    "run_scope": "required run_id trace scope",
+    "data_scope": "declared device status, zone, waypoint, artifact, or trace-summary references",
+    "filesystem_scope": "not_applicable",
+    "network_scope": "only for upload_trace_summary when network policy allows upload",
+    "credential_scope": "no direct cloud actuator credentials; local middleware authority remains device-local and gateway-mediated"
+  },
+  "governance_support": {
+    "approval": "required by policy for high-risk physical actions or operator override/resume flows",
+    "circuit_breakers": ["adapter", "action", "action_class", "tenant", "agent", "node", "instance", "fleet"],
+    "policy_ttl": "required for offline or cached physical policy",
+    "audit_attribution": "via gateway trace identity and safety evidence"
+  },
+  "physical_device_safety": {
+    "status": "device-safe simulated contract only",
+    "allowed_actions": [
+      "read_battery",
+      "read_sensor_summary",
+      "read_map",
+      "move_to_waypoint",
+      "return_to_base",
+      "dock",
+      "inspect_zone",
+      "capture_image",
+      "pause_mission",
+      "resume_mission",
+      "request_operator_override",
+      "notify_operator",
+      "upload_trace_summary"
+    ],
+    "forbidden_actions": [
+      "set_motor_pwm",
+      "raw actuator writes",
+      "disable_firmware_safety",
+      "bypass_collision_avoidance",
+      "modify flight-controller internals",
+      "ignore emergency stop"
+    ],
+    "safety_verifier": "required local SafetyVerifier before adapter execution; missing or uncertain verifier fails closed",
+    "cloud_helper_boundary": "cloud helpers may propose routes or artifacts only; local device gateway and safety verifier remain authoritative"
+  },
+  "limitations": [
+    "Device-safe here means simulated high-level contract evidence, not production robotics safety certification.",
+    "No live hardware integration, ROS/native driver, motor controller, firmware mutation, PLC replacement, hard real-time control, or flight certification claim.",
+    "No cloud direct actuator authority or cloud teleoperation claim.",
+    "No marketplace, legal certification, or production support claim."
+  ],
+  "evidence": [
+    {"type": "doc", "ref": "docs/reference/physical-actions.md"},
+    {"type": "doc", "ref": "docs/reference/robotics-adapter.md"},
+    {"type": "doc", "ref": "docs/reference/safety-verifiers.md"},
+    {"type": "doc", "ref": "docs/releases/0.05-dev.md"},
+    {"type": "test", "ref": "adapters/robotics/tests/unit/robotics_adapter_tests.rs"},
+    {"type": "source", "ref": "adapters/robotics/src/lib.rs"}
+  ]
+}
