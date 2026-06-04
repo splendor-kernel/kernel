@@ -69,15 +69,15 @@
 | #37 | 0.1-S3 | `agent/37-0.1-S3` | `/Users/db/dev/Splendor Kernel-37-0.1-S3` | merged | [#111](https://github.com/splendor-os/kernel/pull/111) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python scripts/validate-adapter-manifests.py`; JSON syntax checks in PR; `git diff --check origin/dev..HEAD` | Adapter maturity model, review checklist, manifests, and stricter lightweight validator accepted after review polish. |
 | #36 | 0.1-S2 | `agent/36-0.1-S2` | `/Users/db/dev/Splendor Kernel-36-0.1-S2` | merged | [#113](https://github.com/splendor-os/kernel/pull/113) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; JSON report generation; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Initial code-review blocked trace-order blind spot, missing trace primitive case, missing gateway positive path, and missing S1 example integration; fixed before merge. |
 | #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | merged | [#114](https://github.com/splendor-os/kernel/pull/114) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `npm ci && npm test`; `python -m pytest python/tests/test_runtime.py -q`; TS example typecheck; `git diff --check origin/dev..HEAD` | Initial reviews blocked stale status casing, invalid stable examples/security shape, OpenAPI version risk, and inaccurate milestone evidence; fixed before merge. |
-| #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | ready to assign | not opened | pending | Operations guides can now use S1 schemas, S2 conformance, S3 maturity, and S4 stable API terminology. |
-| #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | blocked on #35-#39 | not opened | pending | Release, migration, compatibility policy, changelog. |
+| #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | merged | [#115](https://github.com/splendor-os/kernel/pull/115) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Operational guides accepted; code-review noted optional future normalization of wire event/Rust enum naming and docs index linking. |
+| #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | ready to assign | not opened | pending | Release, migration, compatibility policy, changelog can now consume #35-#39 integrated outputs. |
 
 ## GitHub issue management
 
 - Open issues #35-#40 are the active 0.1 sprint issues.
 - No 0.1 issues have been closed by this loop.
-- PR #112, PR #111, PR #113, and PR #114 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
-- Pending: add/update comments for #39 when its sub-agent branch/PR is active.
+- PR #112, PR #111, PR #113, PR #114, and PR #115 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
+- Pending: add/update comments for #40 when its sub-agent branch/PR is active.
 
 ## Validation log
 
@@ -106,6 +106,11 @@
 - 2026-06-04: Integrated loop validation after #114 merge passed: `python -m pytest python/tests/test_runtime.py -q` (24 tests).
 - 2026-06-04: Integrated loop validation after #114 merge passed: `npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/typescript-daemon-client/example.ts`.
 - 2026-06-04: Integrated loop validation after #114 merge passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: PR #115 opened for #39; code-review `APPROVE WITH NOTES`; PR CI passed rust/python/typescript/docker.
+- 2026-06-04: PR #115 merged into loop.
+- 2026-06-04: Integrated loop validation after #115 merge passed: `python conformance/0.1/run-conformance.py` (24 cases).
+- 2026-06-04: Integrated loop validation after #115 merge passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
+- 2026-06-04: Integrated loop validation after #115 merge passed: `git diff --check origin/dev..HEAD`.
 
 ## QA findings
 
@@ -117,6 +122,7 @@
 - S2 conformance runner is intentionally fixture/contract-level for governance escalation/circuit-breaker and adapter certification; runtime E2E acceptance remains separate.
 - Code-review noted future hardening should make trace verification action-id-specific; non-blocking for S2 but should be considered during later conformance expansion.
 - S4 exposed stale example risk: stable docs must not mark old local/dev examples stable until request shapes, caller credentials, audit attribution, and WorkOrderEnvelope fields are current.
+- S5 docs are operational guidance only; release/migration must still avoid treating operation docs as production certification or broad deployment support.
 
 ## Human-sync decisions
 
@@ -132,9 +138,8 @@
 
 ## Remaining blockers
 
-- No blocker to assigning #39.
-- #40 remains blocked on #35-#39 integrated outputs.
+- No blocker to assigning #40.
 
 ## Final PR readiness
 
-- Not ready. PRs #112, #111, #113, and #114 are merged and validated, but #39 and #40 remain pending.
+- Not ready. PRs #112, #111, #113, #114, and #115 are merged and validated, but #40 remains pending.
