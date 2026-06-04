@@ -70,14 +70,13 @@
 | #36 | 0.1-S2 | `agent/36-0.1-S2` | `/Users/db/dev/Splendor Kernel-36-0.1-S2` | merged | [#113](https://github.com/splendor-os/kernel/pull/113) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; JSON report generation; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Initial code-review blocked trace-order blind spot, missing trace primitive case, missing gateway positive path, and missing S1 example integration; fixed before merge. |
 | #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | merged | [#114](https://github.com/splendor-os/kernel/pull/114) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `npm ci && npm test`; `python -m pytest python/tests/test_runtime.py -q`; TS example typecheck; `git diff --check origin/dev..HEAD` | Initial reviews blocked stale status casing, invalid stable examples/security shape, OpenAPI version risk, and inaccurate milestone evidence; fixed before merge. |
 | #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | merged | [#115](https://github.com/splendor-os/kernel/pull/115) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Operational guides accepted; code-review noted optional future normalization of wire event/Rust enum naming and docs index linking. |
-| #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | ready to assign | not opened | pending | Release, migration, compatibility policy, changelog can now consume #35-#39 integrated outputs. |
+| #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | merged | [#116](https://github.com/splendor-os/kernel/pull/116) merged into loop | PR CI rust/python/typescript/docker passed; integrated final validation commands listed below | Release notes, migration guide, compatibility policy, changelog, README, and known limitations accepted; no tag created pending human authorization. |
 
 ## GitHub issue management
 
 - Open issues #35-#40 are the active 0.1 sprint issues.
 - No 0.1 issues have been closed by this loop.
-- PR #112, PR #111, PR #113, PR #114, and PR #115 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
-- Pending: add/update comments for #40 when its sub-agent branch/PR is active.
+- PR #112, PR #111, PR #113, PR #114, PR #115, and PR #116 are merged into the loop branch. Issues remain open until final integration PR policy is satisfied; no issue was closed by this loop.
 
 ## Validation log
 
@@ -111,6 +110,17 @@
 - 2026-06-04: Integrated loop validation after #115 merge passed: `python conformance/0.1/run-conformance.py` (24 cases).
 - 2026-06-04: Integrated loop validation after #115 merge passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
 - 2026-06-04: Integrated loop validation after #115 merge passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: PR #116 opened for #40; code-review `APPROVE WITH NOTES`; polish commit addressed endpoint-scope wording and docs/examples review evidence; final code-review `APPROVE`.
+- 2026-06-04: PR #116 merged into loop after PR CI passed rust/python/typescript/docker.
+- 2026-06-04: Final integrated validation passed: `cargo fmt --all -- --check`.
+- 2026-06-04: Final integrated validation passed: `cargo test --workspace`.
+- 2026-06-04: Final integrated validation passed: `python -m pytest python/tests -q` (24 tests).
+- 2026-06-04: Final integrated validation passed: `npm ci && npm test` (22 TypeScript tests).
+- 2026-06-04: Final integrated validation passed: `python conformance/0.1/run-conformance.py` (24 cases, 0 failed).
+- 2026-06-04: Final integrated validation passed: `python conformance/0.1/run-conformance.py --format json --output target/conformance-0.1-report.json`.
+- 2026-06-04: Final integrated validation passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
+- 2026-06-04: Final integrated validation passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: Final integrated validation passed: `bash scripts/verify-0.01-baseline.sh && bash scripts/verify-0.03-kernel-e2e.sh`.
 
 ## QA findings
 
@@ -123,6 +133,8 @@
 - Code-review noted future hardening should make trace verification action-id-specific; non-blocking for S2 but should be considered during later conformance expansion.
 - S4 exposed stale example risk: stable docs must not mark old local/dev examples stable until request shapes, caller credentials, audit attribution, and WorkOrderEnvelope fields are current.
 - S5 docs are operational guidance only; release/migration must still avoid treating operation docs as production certification or broad deployment support.
+- S6 intentionally did not create a release tag. Release docs require human authorization before tagging.
+- The use-case E2E acceptance harness `scripts/e2e/verify-use-case-acceptance.sh --all` is not present on this branch; per `docs/rules/verifiable_criteria/main.md`, the use-case pack remains a post-implementation acceptance contract rather than executable completion evidence.
 
 ## Human-sync decisions
 
@@ -138,8 +150,8 @@
 
 ## Remaining blockers
 
-- No blocker to assigning #40.
+- None known for final integration PR readiness.
 
 ## Final PR readiness
 
-- Not ready. PRs #112, #111, #113, #114, and #115 are merged and validated, but #40 remains pending.
+- Ready to open final integration PR from `agent/loop-3164a904-0337-4a54-aaf6-e42ef8c3da4d` into `dev`. Do not merge final PR into `dev` without project policy/human authorization.
