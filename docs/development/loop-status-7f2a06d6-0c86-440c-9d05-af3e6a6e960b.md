@@ -14,6 +14,7 @@
 - Milestone: `Splendor0.05-dev`
 - Sprint objective: make the already-implemented physical/edge primitive work release-ready by aligning release-facing docs, version labels, packaging surfaces, and QA evidence without weakening the kernel boundary that Splendor is not a hard real-time robot controller.
 - Issues in scope:
+  - #106 — `0.05 release readiness — align docs and package labels`
   - #28 — `0.05-S1 — Device profile schema`
   - #29 — `0.05-S2 — Offline policy cache`
   - #30 — `0.05-S3 — Local trace buffer`
@@ -70,12 +71,13 @@
 
 | Task | Issue scope | Sprint scope | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Release docs alignment | #28-#34 | 0.05* | `agent/release-docs-0.05` | `/Users/db/dev/Splendor Kernel-release-docs-0.05` | planned | pending | pending | Create 0.05 release notes and align README/known limitations/Docker docs without overclaiming robotics readiness. |
-| Release/package label alignment | #28-#34 | 0.05* | `agent/release-labels-0.05` | `/Users/db/dev/Splendor Kernel-release-labels-0.05` | planned | pending | pending | Update release-facing labels/tests/workflow defaults from 0.04-dev to 0.05-dev where appropriate; preserve 0.04 schema constants. |
+| Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | planned | pending | pending | Create 0.05 release notes and align README/known limitations/Docker docs without overclaiming robotics readiness. |
+| Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | planned | pending | pending | Update release-facing labels/tests/workflow defaults from 0.04-dev to 0.05-dev where appropriate; preserve 0.04 schema constants. |
 | QA/release-readiness review | #28-#34 | 0.05* | n/a | n/a | planned | n/a | pending | Review sub-agent diffs for contradictions, scope creep, tests, and integration behavior before merge. |
 
 ## GitHub issue management
 
+- Created #106 to track the release-readiness no-go across docs and package labels.
 - Pending: comment on #28-#34 that functional primitives are present but release-readiness is blocked by docs/version contradictions until this loop lands.
 - Pending: close #28-#34 only after integrated loop validation proves release-facing readiness and final PR is accepted/merged according to project policy.
 
