@@ -12,11 +12,13 @@ without dictating the model or planner stack.
 
 ## Project status
 
-Splendor0.05-dev scope is implemented and integrated as the physical/edge
-orchestration development release. The original 0.01 local kernel baseline,
-0.02 local multi-agent/daemon surface, 0.03 resident/fleet foundation, and
-0.04 governance workflows remain the substrate; runnable quickstarts and sprint
-evidence live in
+Splendor0.1-dev is the first stable primitive compatibility line for the
+documented runtime primitives, SDK/API boundaries, conformance fixtures, adapter
+maturity metadata, operational guides, migration policy, and compatibility policy.
+It builds on the implemented 0.01 local kernel baseline, 0.02 local
+multi-agent/daemon surface, 0.03 resident/fleet foundation, 0.04 governance
+workflows, and 0.05 physical/edge development primitives. Runnable quickstarts
+and sprint evidence live in
 [`docs/getting-started/local-runtime.md`](docs/getting-started/local-runtime.md)
 and [`docs/milestones/`](docs/milestones/).
 
@@ -57,6 +59,10 @@ Current capabilities:
 - Physical actions remain high-level, bounded, and gateway/safety-verifier
   mediated; Splendor does not provide hard real-time robot control, motor
   control, firmware safety bypass, or production robotics certification.
+- 0.1 stable docs: `docs/spec/0.1/primitives.md`,
+  `docs/spec/0.1/api-stability.md`, `docs/releases/0.1-dev.md`,
+  `docs/releases/0.1-migration.md`, and
+  `docs/releases/compatibility-policy.md`.
 - Docker deployment image for the 0.05-dev local runtime smoke-test surface,
   including `splendorctl`, `splendor-daemon`, the Python SDK, and local
   smoke-test examples. The image is not production physical hardware deployment.
@@ -95,10 +101,11 @@ notes.
 
 ## Next steps
 
-Planned beyond 0.05-dev:
+Planned beyond 0.1-dev:
 
-1. Stable compatibility guarantees, schema freeze, conformance tests, and adapter
-   maturity levels (0.1-dev).
+1. Production remote auth rollout, fleet scheduling, adapter certification
+   workflow, and physical hardware claims only when future milestones implement
+   and validate those surfaces explicitly.
 
 ## Why
 
@@ -135,11 +142,11 @@ Splendor provides the missing **kernel-level primitives for agents**, so autonom
 
 ## What
 
-Unless a capability appears in the 0.05-dev "Current capabilities" list above,
-roadmap terms in the sections below (physical/edge orchestration, production
-governance products, stable compatibility guarantees, and broad adapter ecosystem
-work) are planned future surfaces and are not available in the 0.05 physical/edge
-development release.
+Unless a capability appears in the current capabilities list above or in the
+stable 0.1 documents, roadmap terms in the sections below (production remote
+daemon operation, mature fleet scheduling, production governance products,
+adapter certification, and broad marketplace work) are planned future surfaces
+and are not available in the 0.1 stable primitive line.
 
 ### What Splendor is
 

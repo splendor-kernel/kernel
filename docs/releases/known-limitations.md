@@ -61,4 +61,13 @@
 ## Compatibility
 
 - 0.01-dev through 0.05-dev schemas are provisional development contracts.
-- 0.1-dev will define the first stable primitive compatibility line.
+- 0.1-dev defines the first stable primitive compatibility line for the documented
+  primitive schemas, SDK/API boundary, conformance fixtures, adapter maturity
+  metadata, operational guides, migration policy, and compatibility policy.
+- 0.1-dev does not stabilize undocumented Rust internals, private helpers,
+  in-memory stores, production remote daemon authentication, production fleet
+  scheduling, adapter certification, marketplace behavior, production robotics
+  safety certification, or hard real-time control.
+- The current daemon can carry API version metadata, but it does not actively
+  negotiate API versions or reject unsupported version headers. Treat this as a
+  documented limitation, not a production protocol guarantee.
