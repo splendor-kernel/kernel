@@ -1,0 +1,306 @@
+{
+  "schema_version": "splendor.stable_primitives_manifest.v1",
+  "milestone": "Splendor0.1-dev",
+  "sprint": "0.1-S1",
+  "purpose": "Lightweight S1 schema example manifest for stable primitive docs validation. This is not the full 0.1-S2 conformance suite.",
+  "extension_policy": {
+    "authority": "non_authorizing",
+    "reserved_keys": [
+      "fleet_id", "node_id", "instance_id", "tenant_id", "agent_id", "runtime_context_id", "run_id", "tick_id", "action_id", "state_node_id", "trace_event_id", "message_id", "work_order_id", "approval_id", "artifact_id", "authority", "permission", "permissions", "allowed_actions", "allowed_adapters", "allowed_permissions", "scope", "scope_type", "policy", "policy_bundle", "work_order", "approval", "approval_token", "signature", "credential", "secret", "token", "adapter", "quota", "verifier", "gateway"
+    ]
+  },
+  "enum_values": {
+    "action_status": ["Executed", "Denied", "NeedsApproval", "NeedsIntervention", "Failed"],
+    "approval_decision": ["Granted", "Denied"],
+    "constraint_kind": ["Hard", "Soft"],
+    "constraint_scope": ["Global", "Action", "State"],
+    "message_delivery_status": ["pending", "queued", "delivered", "rejected", "expired", "consumed"],
+    "run_status": ["pending", "running", "paused", "waiting_for_approval", "interrupted", "resuming", "completed", "failed", "cancelled", "denied", "expired"],
+    "side_effect_class": ["ReadOnly", "Filesystem", "Network", "External"]
+  },
+  "deprecated_aliases": [
+    {
+      "alias": "trace_id",
+      "replacement": "trace_event_id",
+      "guidance": "Emit trace_event_id; accept trace_id only as a migration input alias where implemented."
+    }
+  ],
+  "primitives": [
+    {
+      "name": "Tenant",
+      "identity_fields": ["tenant_id"],
+      "required_fields": ["tenant_id", "allowed_actions", "allowed_adapters"],
+      "optional_fields": ["allowed_permissions", "quotas", "policy_refs", "data_refs", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "allowed_actions": ["sql.query", "artifact.create"],
+        "allowed_adapters": ["sql", "artifact-store"],
+        "allowed_permissions": ["finance.read"],
+        "quotas": { "max_actions_per_tick": 5 },
+        "extensions": { "display_label": "Finance tenant" }
+      }
+    },
+    {
+      "name": "Agent",
+      "identity_fields": ["agent_id", "tenant_id"],
+      "required_fields": ["agent_id", "tenant_id"],
+      "optional_fields": ["runtime_context_id", "label", "metadata", "allowed_actions", "allowed_adapters", "allowed_permissions", "state_head", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "runtime_context_id": "runtime_ctx_finance_1",
+        "label": "Finance reporter",
+        "metadata": { "domain": "finance" },
+        "state_head": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "Run",
+      "identity_fields": ["run_id", "tenant_id", "agent_id"],
+      "required_fields": ["run_id", "tenant_id", "agent_id", "status"],
+      "optional_fields": ["objective", "work_order_id", "parent_run_id", "child_run_ids", "state_head", "trace_range", "created_at", "updated_at", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "status": "running",
+        "objective": "Generate weekly revenue dashboard",
+        "work_order_id": "wo_finance_weekly",
+        "state_head": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "name": "Tick",
+      "identity_fields": ["run_id", "tick_id"],
+      "required_fields": ["run_id", "tick_id", "started_at"],
+      "optional_fields": ["completed_at", "percept_count", "proposed_action_count", "state_node_id", "status", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "tick_id": 1,
+        "started_at": "2026-05-25T00:00:00Z",
+        "completed_at": "2026-05-25T00:00:01Z",
+        "percept_count": 1,
+        "proposed_action_count": 1,
+        "status": "completed"
+      }
+    },
+    {
+      "name": "Action",
+      "identity_fields": ["action_id"],
+      "required_fields": ["name", "params", "side_effect_class", "required_permissions", "preconditions", "postconditions"],
+      "optional_fields": ["cost_estimate", "adapter"],
+      "extensions": "none",
+      "example": {
+        "name": "sql.query",
+        "params": { "query_ref": "query:approved.finance.weekly_revenue" },
+        "side_effect_class": "ReadOnly",
+        "required_permissions": ["finance.read"],
+        "preconditions": ["work_order_valid"],
+        "postconditions": ["rows_returned"],
+        "cost_estimate": { "units": "ms", "amount": 250 }
+      }
+    },
+    {
+      "name": "Percept",
+      "identity_fields": [],
+      "required_fields": ["schema", "payload", "provenance", "timestamp"],
+      "optional_fields": ["provenance.detail"],
+      "extensions": "none",
+      "example": {
+        "schema": "splendor.percept.dataset_available.v1",
+        "payload": { "data_ref": "dataset:finance.revenue_monthly_v4" },
+        "provenance": { "source": "daemon", "detail": "manual_append" },
+        "timestamp": "2026-05-25T00:00:00Z"
+      }
+    },
+    {
+      "name": "Message",
+      "identity_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id"],
+      "required_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "payload", "requires_response", "created_at"],
+      "optional_fields": ["causal_parent"],
+      "extensions": "none",
+      "example": {
+        "message_id": "44444444-4444-4444-4444-444444444444",
+        "source_agent_id": "22222222-2222-2222-2222-222222222222",
+        "target_agent_id": "55555555-5555-5555-5555-555555555555",
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "schema": "splendor.message.task_request.v1",
+        "payload": { "objective": "forecast revenue" },
+        "causal_parent": "66666666-6666-5666-8666-666666666666",
+        "requires_response": true,
+        "created_at": "2026-05-25T00:00:00Z"
+      }
+    },
+    {
+      "name": "StateNode",
+      "identity_fields": ["state_node_id", "tenant_id", "agent_id", "run_id"],
+      "required_fields": ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "created_at"],
+      "optional_fields": ["trace_event_id", "snapshot_id", "snapshot_ref", "metadata", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "state_node_id": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "parents": ["blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        "state_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "created_at": "2026-05-25T00:00:01Z",
+        "trace_event_id": "77777777-7777-5777-8777-777777777777"
+      }
+    },
+    {
+      "name": "TraceEvent",
+      "identity_fields": ["trace_event_id", "run_id"],
+      "required_fields": ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"],
+      "optional_fields": ["identity.fleet_id", "identity.node_id", "identity.instance_id", "identity.tenant_id", "identity.agent_id", "identity.tick_id", "identity.action_id", "identity.state_node_id", "identity.message_id", "identity.approval_id"],
+      "extensions": "none",
+      "example": {
+        "trace_event_id": "77777777-7777-5777-8777-777777777777",
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "sequence": 12,
+        "timestamp": "2026-05-25T00:00:01Z",
+        "identity": { "run_id": "33333333-3333-3333-3333-333333333333", "tenant_id": "11111111-1111-1111-1111-111111111111", "agent_id": "22222222-2222-2222-2222-222222222222", "tick_id": 1, "state_node_id": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        "kind": { "StateCommitted": { "state_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "snapshot_id": null } }
+      }
+    },
+    {
+      "name": "WorkOrder",
+      "identity_fields": ["work_order_id", "tenant_id", "agent_id", "run_id"],
+      "required_fields": ["schema_version", "work_order_id", "tenant_id", "agent_id", "objective", "allowed_actions", "allowed_adapters", "allowed_permissions", "data_refs", "quotas", "placement", "issued_at", "expires_at", "revocation", "signature"],
+      "optional_fields": ["run_id", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": "wo_finance_weekly",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "objective": "Generate weekly revenue dashboard",
+        "allowed_actions": ["sql.query", "artifact.create"],
+        "allowed_adapters": ["sql", "artifact-store"],
+        "allowed_permissions": ["finance.read", "artifact.create"],
+        "data_refs": ["dataset:finance.revenue_monthly_v4"],
+        "quotas": { "max_actions_per_tick": 5, "max_action_duration_ms": 30000 },
+        "placement": { "target": "resident_cloud_pool", "data_locality": "eu-west", "requires_gpu": false },
+        "issued_at": "2026-05-25T00:00:00Z",
+        "expires_at": "2026-05-25T01:00:00Z",
+        "revocation": "active",
+        "signature": { "key_id": "manager-local-key", "signature": "example-detached-signature" }
+      }
+    },
+    {
+      "name": "Approval",
+      "identity_fields": ["approval_id"],
+      "required_fields": ["schema_version", "approval_id", "tenant_id", "agent_id", "run_id", "decision", "issued_at", "expires_at"],
+      "optional_fields": ["action_id", "action_name", "adapter", "reason", "revoked", "trace_event_id", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "schema_version": "splendor.approval_evidence.v1",
+        "approval_id": "88888888-8888-8888-8888-888888888888",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "run_id": "33333333-3333-3333-3333-333333333333",
+        "action_id": "99999999-9999-9999-9999-999999999999",
+        "action_name": "artifact.publish",
+        "adapter": "artifact-store",
+        "decision": "Granted",
+        "reason": "approved by operator",
+        "issued_at": "2026-05-25T00:10:00Z",
+        "expires_at": "2026-05-25T00:40:00Z",
+        "revoked": false,
+        "trace_event_id": "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "Policy",
+      "identity_fields": ["policy_id", "policy_bundle_id", "tenant_id", "agent_id"],
+      "required_fields": ["schema_version", "policy_id", "tenant_id", "agent_id"],
+      "optional_fields": ["policy_bundle_id", "version", "issued_at", "expires_at", "revocation", "degraded_mode", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "schema_version": "splendor.policy.v1",
+        "policy_id": "policy_finance_reporter",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "policy_bundle_id": "policy_bundle_finance_v1",
+        "version": "1.0.0",
+        "issued_at": "2026-05-25T00:00:00Z",
+        "expires_at": "2026-05-26T00:00:00Z",
+        "revocation": "active"
+      }
+    },
+    {
+      "name": "Constraint",
+      "identity_fields": ["id"],
+      "required_fields": ["id", "kind", "scope", "predicate"],
+      "optional_fields": ["obligation", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "id": "constraint_finance_read_only",
+        "kind": "Hard",
+        "scope": "Action",
+        "predicate": "side_effect_class == ReadOnly",
+        "obligation": "deny non-read finance actions"
+      }
+    },
+    {
+      "name": "Verifier",
+      "identity_fields": ["verifier"],
+      "required_fields": ["verifier", "category", "result"],
+      "optional_fields": ["applies_to", "evidence_schema", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "verifier": "tenant_permission_verifier",
+        "category": "permission",
+        "result": { "allowed": true, "reasons": [], "artifacts": null },
+        "applies_to": ["sql.query"],
+        "evidence_schema": "splendor.verifier_evidence.v1"
+      }
+    },
+    {
+      "name": "Adapter",
+      "identity_fields": ["name"],
+      "required_fields": ["name", "capabilities", "execute"],
+      "optional_fields": ["verify", "compensate", "maturity", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "name": "sql",
+        "capabilities": ["sql.query"],
+        "execute": "ActionRequest -> ActionOutcome",
+        "verify": "optional adapter-local verifier",
+        "maturity": "experimental"
+      }
+    },
+    {
+      "name": "Feedback",
+      "identity_fields": ["trace_event_id"],
+      "required_fields": ["kind", "payload", "recorded_at"],
+      "optional_fields": ["trace_event_id", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "kind": "human",
+        "payload": { "rating": "accepted" },
+        "recorded_at": "2026-05-25T00:20:00Z",
+        "trace_event_id": "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb"
+      }
+    },
+    {
+      "name": "Reward",
+      "identity_fields": ["trace_event_id"],
+      "required_fields": ["value", "recorded_at"],
+      "optional_fields": ["units", "context", "trace_event_id", "extensions"],
+      "extensions": "non_authorizing",
+      "example": {
+        "value": 1,
+        "recorded_at": "2026-05-25T00:20:00Z",
+        "units": "score",
+        "context": { "source": "feedback" },
+        "trace_event_id": "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb"
+      }
+    }
+  ]
+}
