@@ -4889,6 +4889,7 @@ fn run_with_args_replay_succeeds() {
 
 #[test]
 fn run_with_args_version_succeeds() {
+    assert_eq!(SPLENDOR_RELEASE_LABEL, "Splendor0.05-dev");
     run_with_args(vec!["--version".to_string()]).expect("version");
 }
 
