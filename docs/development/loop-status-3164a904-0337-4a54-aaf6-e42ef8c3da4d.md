@@ -6,7 +6,7 @@
 - Master loop branch: `agent/loop-3164a904-0337-4a54-aaf6-e42ef8c3da4d`
 - Master loop worktree: `/Users/db/dev/Splendor Kernel-loop-3164a904-0337-4a54-aaf6-e42ef8c3da4d`
 - Base branch: latest `origin/dev` at loop creation (`6b350b8`, merge of prior release-readiness loop PR #109)
-- Final integration PR: not opened yet; source `agent/loop-3164a904-0337-4a54-aaf6-e42ef8c3da4d`, base `dev`
+- Final integration PR source/base: source `agent/loop-3164a904-0337-4a54-aaf6-e42ef8c3da4d`, base `dev`; do not merge to `dev` without project policy/human authorization.
 
 ## Sprint scope
 
@@ -38,8 +38,8 @@
 
 - The repository reports implemented development primitives through `Splendor0.05-dev` in `README.md` and release-facing docs.
 - Existing reference docs cover runtime loop, gateway, state/trace/replay, daemon API, messages, work orders, fleet, governance, and physical/edge primitives under `docs/reference/`.
-- After merged sub-agent PRs #112 and #111, the loop branch now contains `docs/spec/0.1/` stable primitive/schema-versioning docs, adapter maturity docs, stable primitive examples, adapter manifest fixtures, S1/S3 milestone docs, and lightweight schema/manifest validation.
-- `docs/operations/`, `docs/development/conformance-suite.md`, full `conformance/` suite, and 0.1 release/migration docs remain pending for later 0.1 tasks.
+- After merged sub-agent PRs #112, #111, #113, #114, #115, #116, and remediation PR #117, the loop branch contains the 0.1 stable primitive/spec docs, schema-versioning docs, conformance suite, adapter maturity model, SDK/API stability docs, operational docs, release/migration docs, changelog updates, compatibility policy, stable examples, adapter manifest fixtures, and lightweight validators.
+- `StateNode.trace_event_id` is now required in the stable primitive docs, stable examples, Python schema constants, and TypeScript schema constants so state commits remain trace-linked.
 
 ## Operating constraints for sub-agent work
 
@@ -72,11 +72,17 @@
 | #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | merged | [#115](https://github.com/splendor-os/kernel/pull/115) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Operational guides accepted; code-review noted optional future normalization of wire event/Rust enum naming and docs index linking. |
 | #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | merged | [#116](https://github.com/splendor-os/kernel/pull/116) merged into loop | PR CI rust/python/typescript/docker passed; integrated final validation commands listed below | Release notes, migration guide, compatibility policy, changelog, README, and known limitations accepted; no tag created pending human authorization. |
 
+## Remediation PRs
+
+| Scope | Branch | Status | PR | Validation | Notes |
+| --- | --- | --- | --- | --- | --- |
+| 0.1-S1 StateNode trace linkage | `agent/35-0.1-S1` | merged | [#117](https://github.com/splendor-os/kernel/pull/117) merged into loop | PR CI rust/python/typescript/docker passed; post-merge conformance, TypeScript, Python, adapter manifest, diff-check, and full final loop validation passed | Final integration review found `StateNode.trace_event_id` was optional in the stable schema. PR #117 made it required in docs/examples/Python/TypeScript stable contracts. |
+
 ## GitHub issue management
 
 - Open issues #35-#40 are the active 0.1 sprint issues.
 - No 0.1 issues have been closed by this loop.
-- PR #112, PR #111, PR #113, PR #114, PR #115, and PR #116 are merged into the loop branch. Issues remain open until final integration PR policy is satisfied; no issue was closed by this loop.
+- PR #112, PR #111, PR #113, PR #114, PR #115, PR #116, and remediation PR #117 are merged into the loop branch. Issues remain open until final integration PR policy is satisfied; no issue was closed by this loop.
 
 ## Validation log
 
@@ -121,6 +127,22 @@
 - 2026-06-04: Final integrated validation passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
 - 2026-06-04: Final integrated validation passed: `git diff --check origin/dev..HEAD`.
 - 2026-06-04: Final integrated validation passed: `bash scripts/verify-0.01-baseline.sh && bash scripts/verify-0.03-kernel-e2e.sh`.
+- 2026-06-04: Final integration review found one blocker: stable `StateNode.trace_event_id` was optional even though state commits must be trace-linked.
+- 2026-06-04: PR #117 opened and merged into loop after CI passed rust/python/typescript/docker, making `StateNode.trace_event_id` required in stable docs/examples/Python/TypeScript contracts.
+- 2026-06-04: Post-#117 validation passed: `python conformance/0.1/run-conformance.py` (24 cases, 0 failed).
+- 2026-06-04: Post-#117 validation passed: `npm ci && npm test` (22 TypeScript tests).
+- 2026-06-04: Post-#117 validation passed: `python -m pytest python/tests/test_runtime.py -q` (24 tests).
+- 2026-06-04: Post-#117 validation passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: Final integration re-review after #117 returned `APPROVE` with no remaining blockers for opening the final PR to `dev`.
+- 2026-06-04: Final integrated validation rerun after #117 passed: `cargo fmt --all -- --check`.
+- 2026-06-04: Final integrated validation rerun after #117 passed: `cargo test --workspace`.
+- 2026-06-04: Final integrated validation rerun after #117 passed: `python -m pytest python/tests -q` (24 tests).
+- 2026-06-04: Final integrated validation rerun after #117 passed: `npm ci && npm test` (22 TypeScript tests).
+- 2026-06-04: Final integrated validation rerun after #117 passed: `python conformance/0.1/run-conformance.py` (24 cases, 0 failed).
+- 2026-06-04: Final integrated validation rerun after #117 passed: `python conformance/0.1/run-conformance.py --format json --output target/conformance-0.1-report.json`.
+- 2026-06-04: Final integrated validation rerun after #117 passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
+- 2026-06-04: Final integrated validation rerun after #117 passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: Final integrated validation rerun after #117 passed: `bash scripts/verify-0.01-baseline.sh && bash scripts/verify-0.03-kernel-e2e.sh`.
 
 ## QA findings
 
@@ -134,6 +156,7 @@
 - S4 exposed stale example risk: stable docs must not mark old local/dev examples stable until request shapes, caller credentials, audit attribution, and WorkOrderEnvelope fields are current.
 - S5 docs are operational guidance only; release/migration must still avoid treating operation docs as production certification or broad deployment support.
 - S6 intentionally did not create a release tag. Release docs require human authorization before tagging.
+- Final review caught a stable state-schema trace-linkage gap (`StateNode.trace_event_id` optional); remediation PR #117 fixed it before final PR readiness.
 - The use-case E2E acceptance harness `scripts/e2e/verify-use-case-acceptance.sh --all` is not present on this branch; per `docs/rules/verifiable_criteria/main.md`, the use-case pack remains a post-implementation acceptance contract rather than executable completion evidence.
 
 ## Human-sync decisions
