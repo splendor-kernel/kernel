@@ -71,27 +71,30 @@
 
 | Task | Issue scope | Sprint scope | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | planned | pending | pending | Create 0.05 release notes and align README/known limitations/Docker docs without overclaiming robotics readiness. |
-| Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | planned | pending | pending | Update release-facing labels/tests/workflow defaults from 0.04-dev to 0.05-dev where appropriate; preserve 0.04 schema constants. |
-| QA/release-readiness review | #28-#34 | 0.05* | n/a | n/a | planned | n/a | pending | Review sub-agent diffs for contradictions, scope creep, tests, and integration behavior before merge. |
+| Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | merged | [#107](https://github.com/splendor-os/kernel/pull/107) merged into loop | Sub-agent `git diff --check`; PR CI rust/python/typescript/docker passed; code-review conditional pass resolved by merging label PR | Added 0.05 release notes and aligned README/known limitations/Docker docs/changelog without overclaiming robotics readiness. |
+| Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | merged | [#108](https://github.com/splendor-os/kernel/pull/108) merged into loop | `cargo test -p splendorctl run_with_args_version_succeeds`; `pytest python/tests/test_runtime.py -q`; `bash -n scripts/container-tests.sh`; full container smoke by reviewer; PR CI rust/python/typescript/docker passed | Updated release labels, Dockerfile, container test default, and Docker workflow while preserving `splendor.audit_export.v0.04-dev`. |
+| QA/release-readiness review | #106, #28-#34 | 0.05* | n/a | n/a | in progress | n/a | Integrated validation pending | Sub-agent PR reviews completed; final loop-level scans/tests still required before final PR. |
 
 ## GitHub issue management
 
 - Created #106 to track the release-readiness no-go across docs and package labels.
-- Pending: comment on #28-#34 that functional primitives are present but release-readiness is blocked by docs/version contradictions until this loop lands.
+- Commented on #28-#34 that functional primitives are present but release-readiness was blocked by docs/version contradictions and tracked in #106.
 - Pending: close #28-#34 only after integrated loop validation proves release-facing readiness and final PR is accepted/merged according to project policy.
 
 ## Validation log
 
-- Pending: focused physical harness validation on this loop branch.
-- Pending: release-label tests (`cargo test -p splendorctl`, `pytest python/tests/test_runtime.py`, metadata checks as applicable).
-- Pending: docs/reference consistency scan for release-facing contradictions.
+- 2026-06-04: PR #107 CI checks passed for rust, python, typescript, and docker.
+- 2026-06-04: PR #108 CI checks passed for rust, python, typescript, and docker.
+- Pending: focused physical harness validation on the integrated loop branch.
+- Pending: release-label tests on the integrated loop branch (`cargo test -p splendorctl run_with_args_version_succeeds`, `pytest python/tests/test_runtime.py -q`, `bash -n scripts/container-tests.sh`).
+- Pending: docs/reference consistency scan for release-facing contradictions on the integrated loop branch.
 - Pending: final integrated validation commands selected after sub-agent outputs.
 
 ## QA findings
 
 - Prior loop status tracker exists at `docs/development/loop-status-fe61f1a5-bb16-4136-92e0-cc82f4e6f302.md` and records implementation PRs #98-#105 as merged.
 - The current task is release-readiness integration, not new physical/edge primitive implementation.
+- Code-review subagent approved label PR #108 and conditionally approved docs PR #107 pending label/package alignment; condition resolved by merging #108 into the loop branch.
 
 ## Human-sync decisions
 
@@ -105,7 +108,7 @@
 
 ## Remaining blockers
 
-- Release docs and version/package surfaces still contradict 0.05 readiness.
+- None known after #107 and #108; integrated loop validation still pending.
 
 ## Final PR readiness
 
