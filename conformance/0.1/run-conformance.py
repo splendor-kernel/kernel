@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Splendor 0.1 primitive conformance runner.
+
+The suite is intentionally fixture-driven. It validates stable primitive contract
+evidence and adapter manifests without external services, production secrets, or
+runtime feature shims.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_PATH = ROOT / "conformance" / "0.1" / "fixtures" / "conformance-cases.json"
+ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
+ACTION_OUTCOMES = {
+    "action.executed",
+    "action.denied",
+    "action.failed",
+    "action.needs_approval",
+    "action.needs_intervention",
+}
+REQUIRED_TICK_ORDER = [
+    "tick.started",
+    "percepts.received",
+    "state.loaded",
+    "policy.invoked",
+    "policy.completed",
+    "actions.proposed",
+    "constraints.evaluated",
+    "verification.started",
+    "verification.completed",
+    "ACTION_OUTCOME",
+    "outcome.recorded",
+    "state.committed",
+    "tick.completed",
+]
+SECRET_KEYS = {"secret", "token", "credential", "password", "api_key", "authorization"}
+
+
+@dataclass
+class Result:
+    case_id: str
+    primitive: str
+    requirement: str
+    path: str
+    status: str
+    message: str
+
+
+class ConformanceError(ValueError):
+    pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ConformanceError(f"{path.relative_to(ROOT)} must contain a JSON object")
+    return data
+
+
+def assert_true(condition: bool, message: str) -> None:
+    if not condition:
+        raise ConformanceError(message)
+
+
+def event_kind_matches(actual: str, expected: str) -> bool:
+    if expected == "ACTION_OUTCOME":
+        return actual in ACTION_OUTCOMES
+    return actual == expected
+
+
+def validate_trace(trace: dict[str, Any]) -> None:
+    events = trace.get("events")
+    assert_true(isinstance(events, list) and events, "trace.events must be a non-empty array")
+    sequences = [event.get("sequence") for event in events]
+    assert_true(sequences == list(range(sequences[0], sequences[0] + len(sequences))), "trace sequences must be contiguous")
+
+    trace_ids: set[str] = set()
+    for event in events:
+        assert_true(isinstance(event, dict), "trace event must be an object")
+        trace_event_id = event.get("trace_event_id")
+        assert_true(isinstance(trace_event_id, str) and trace_event_id, "trace_event_id is required")
+        assert_true(trace_event_id not in trace_ids, f"duplicate trace_event_id {trace_event_id}")
+        trace_ids.add(trace_event_id)
+        assert_true("trace_id" not in event, "trace_id alias must not be emitted by 0.1 fixtures")
+        identity = event.get("identity")
+        assert_true(isinstance(identity, dict), "trace identity is required")
+        assert_true(identity.get("run_id") == trace.get("run_id"), "trace identity.run_id must match trace run_id")
+        if "tenant_id" in identity:
+            assert_true(identity["tenant_id"] == trace.get("tenant_id"), "trace identity.tenant_id mismatch")
+        if "agent_id" in identity:
+            assert_true(identity["agent_id"] == trace.get("agent_id"), "trace identity.agent_id mismatch")
+
+    ordered_kinds = [event["kind"] for event in events]
+    cursor = 0
+    for required in REQUIRED_TICK_ORDER:
+        while cursor < len(ordered_kinds) and not event_kind_matches(ordered_kinds[cursor], required):
+            cursor += 1
+        if cursor >= len(ordered_kinds):
+            raise ConformanceError(f"missing required ordered event {required.lower().replace('_', ' ')} before action outcome" if required == "ACTION_OUTCOME" else f"missing required ordered event {required}")
+        cursor += 1
+
+
+def validate_gateway(gateway: dict[str, Any]) -> None:
+    status = gateway.get("status")
+    assert_true(status in {"executed", "denied", "failed", "needs_approval", "needs_intervention"}, "gateway status is invalid")
+    verification = gateway.get("verification")
+    assert_true(isinstance(verification, dict), "gateway verification result is required")
+    assert_true(isinstance(verification.get("allowed"), bool), "verification.allowed must be boolean")
+    required_events = gateway.get("required_events")
+    assert_true(isinstance(required_events, list) and "verification.started" in required_events and "verification.completed" in required_events, "gateway must require verification trace events")
+    if status in {"denied", "needs_approval", "needs_intervention"}:
+        assert_true(gateway.get("adapter_executed") is False, "pre-execution denial/intervention must not execute adapter")
+        assert_true(verification.get("allowed") is False, "denial/intervention verification must fail closed")
+    if status == "failed":
+        assert_true(gateway.get("adapter_executed") is True, "adapter failure case must prove adapter execution happened after allow")
+        assert_true(verification.get("allowed") is True, "adapter failure requires successful pre-verification")
+        assert_true(isinstance(gateway.get("error"), str) and gateway["error"], "adapter failure must include error")
+
+
+def validate_state(case: dict[str, Any]) -> None:
+    state = case.get("state")
+    if state is not None:
+        required = {"state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "trace_event_id", "created_at"}
+        missing = sorted(required - set(state))
+        assert_true(not missing, f"state commit missing fields: {', '.join(missing)}")
+        assert_true(isinstance(state.get("parents"), list), "state parents must be an array")
+        trace_event = case.get("trace_event")
+        assert_true(isinstance(trace_event, dict), "state trace_event fixture is required")
+        assert_true(trace_event.get("trace_event_id") == state.get("trace_event_id"), "state trace_event_id linkage mismatch")
+        identity = trace_event.get("identity", {})
+        assert_true(identity.get("state_node_id") == state.get("state_node_id"), "state trace identity state_node_id mismatch")
+        assert_true(identity.get("tenant_id") == state.get("tenant_id"), "state trace identity tenant_id mismatch")
+        assert_true(identity.get("agent_id") == state.get("agent_id"), "state trace identity agent_id mismatch")
+    failure = case.get("state_failure")
+    if failure is not None:
+        assert_true(failure.get("state_committed") is False, "failed state commit must not be marked committed")
+        assert_true(failure.get("tick_completed") is False, "state commit failure must prevent tick completion")
+        assert_true(failure.get("next_tick_started") is False, "state commit failure must prevent next tick")
+
+
+def validate_replay(replay: dict[str, Any]) -> None:
+    assert_true(replay.get("mode") == "inspect_only", "replay default mode must be inspect_only")
+    assert_true(replay.get("side_effects_replayed") is False, "replay must not replay side effects")
+    assert_true(replay.get("invoked_components") == [], "replay must not invoke policies, gateways, verifiers, or adapters")
+
+
+def validate_message(case: dict[str, Any]) -> None:
+    message = case["message"]
+    required = {"message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "payload", "requires_response", "created_at"}
+    missing = sorted(required - set(message))
+    assert_true(not missing, f"message missing fields: {', '.join(missing)}")
+    assert_true(message["source_agent_id"] != message["target_agent_id"], "message source and target agents must be distinct")
+    trace_events = case.get("trace_events")
+    assert_true(isinstance(trace_events, list) and trace_events, "message trace_events are required")
+    trace_ids = {event.get("trace_event_id") for event in trace_events}
+    assert_true(message.get("causal_parent") in trace_ids, "message causal_parent must reference a trace event")
+    lifecycle = [event.get("kind") for event in trace_events if event.get("identity", {}).get("message_id") == message["message_id"]]
+    assert_true("message.queued" in lifecycle and "message.delivered" in lifecycle, "message lifecycle must include queued and delivered events")
+    for event in trace_events:
+        identity = event.get("identity", {})
+        assert_true(identity.get("run_id") == message["run_id"], "message trace run_id mismatch")
+
+
+def validate_work_order(work_order: dict[str, Any]) -> None:
+    status = work_order.get("status")
+    assert_true(status in {"accepted", "rejected"}, "work order status must be accepted or rejected")
+    if status == "accepted":
+        assert_true(isinstance(work_order.get("signature"), dict), "accepted work order requires signature metadata")
+        assert_true(work_order.get("revocation") == "active", "accepted work order must be active")
+        tenant_actions = set(work_order.get("tenant_allowed_actions", []))
+        allowed_actions = set(work_order.get("allowed_actions", []))
+        assert_true(allowed_actions <= tenant_actions, "accepted work order must not broaden tenant action authority")
+        assert_true(work_order.get("run_started") is True, "accepted work order should start run in positive fixture")
+    else:
+        assert_true(work_order.get("run_started") is False, "rejected work order must not start run")
+        reason = work_order.get("reason")
+        assert_true(reason in {"unsigned_work_order", "expired_work_order", "revoked_work_order", "overbroad_authority", "bad_signature", "incompatible_work_order"}, f"unexpected rejection reason {reason!r}")
+        if reason == "unsigned_work_order":
+            assert_true(not work_order.get("signature"), "unsigned rejection fixture must not carry signature")
+        if reason == "overbroad_authority":
+            tenant_actions = set(work_order.get("tenant_allowed_actions", []))
+            allowed_actions = set(work_order.get("allowed_actions", []))
+            assert_true(not allowed_actions <= tenant_actions, "overbroad fixture must broaden tenant authority")
+
+
+def validate_governance(governance: dict[str, Any]) -> None:
+    assert_true(governance.get("adapter_executed") is False, "governance denial/intervention must skip adapter execution")
+    required_events = governance.get("required_events")
+    assert_true(isinstance(required_events, list) and required_events, "governance required_events must be present")
+    transition = governance.get("transition")
+    if transition == "approval_requested":
+        assert_true(governance.get("action_status") == "needs_approval", "approval request must produce needs_approval")
+        assert_true(governance.get("run_status") == "waiting_for_approval", "approval request must pause run")
+    elif transition == "approval_denied":
+        assert_true(governance.get("action_status") == "denied", "approval denial must deny action")
+    elif transition == "escalation_opened":
+        assert_true(governance.get("action_status") == "needs_intervention", "escalation must require intervention")
+    elif transition == "circuit_breaker_tripped":
+        assert_true(governance.get("reason") == "circuit_breaker_tripped", "circuit breaker denial reason is required")
+    else:
+        raise ConformanceError(f"unknown governance transition {transition!r}")
+
+
+def contains_secret_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key.lower() in SECRET_KEYS:
+                return True
+            if contains_secret_key(nested):
+                return True
+    if isinstance(value, list):
+        return any(contains_secret_key(item) for item in value)
+    return False
+
+
+def load_adapter_validator():
+    spec = importlib.util.spec_from_file_location("validate_adapter_manifests", ADAPTER_VALIDATOR)
+    if spec is None or spec.loader is None:
+        raise ConformanceError("could not load adapter manifest validator")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_adapter_manifests(config: dict[str, Any]) -> None:
+    module = load_adapter_validator()
+    manifest_dir = ROOT / config.get("directory", "docs/spec/0.1/fixtures/adapter-manifests")
+    manifests = sorted(manifest_dir.glob("*.json"))
+    assert_true(bool(manifests), f"no adapter manifests found under {manifest_dir.relative_to(ROOT)}")
+    for manifest in manifests:
+        module.validate_manifest(manifest)
+        data = load_json(manifest)
+        if config.get("require_replay_side_effects_false"):
+            assert_true(data.get("replay_behavior", {}).get("side_effects_replayed") is False, f"{manifest.relative_to(ROOT)} must suppress replay side effects")
+        if config.get("forbid_secret_fields"):
+            assert_true(not contains_secret_key(data), f"{manifest.relative_to(ROOT)} contains secret-shaped fixture keys")
+        if config.get("require_gateway_evidence"):
+            text = json.dumps(data).lower()
+            assert_true("gateway" in text, f"{manifest.relative_to(ROOT)} must document gateway mediation")
+
+
+def validate_case(case: dict[str, Any]) -> None:
+    primitive = case.get("primitive")
+    if primitive == "runtime_loop":
+        validate_trace(case["trace"])
+    elif primitive == "gateway":
+        validate_gateway(case["gateway"])
+    elif primitive == "state":
+        validate_state(case)
+    elif primitive == "replay":
+        validate_replay(case["replay"])
+    elif primitive == "messages":
+        validate_message(case)
+    elif primitive == "work_orders":
+        validate_work_order(case["work_order"])
+    elif primitive == "governance":
+        validate_governance(case["governance"])
+    elif primitive == "adapters":
+        validate_adapter_manifests(case["adapter_manifests"])
+    else:
+        raise ConformanceError(f"unknown primitive {primitive!r}")
+
+
+def run_suite(fixture_path: Path) -> list[Result]:
+    fixture = load_json(fixture_path)
+    cases = fixture.get("cases")
+    assert_true(isinstance(cases, list) and cases, "conformance fixture must include cases")
+    results: list[Result] = []
+    for case in cases:
+        case_id = str(case.get("case_id"))
+        primitive = str(case.get("primitive"))
+        requirement = str(case.get("requirement"))
+        path = str(case.get("path"))
+        try:
+            validate_case(case)
+        except Exception as error:  # exact messages become report evidence
+            if path == "negative_fixture":
+                expected = case.get("expected_failure")
+                if expected and expected in str(error):
+                    results.append(Result(case_id, primitive, requirement, path, "pass", f"negative fixture failed as expected: {error}"))
+                else:
+                    results.append(Result(case_id, primitive, requirement, path, "fail", f"negative fixture failed with unexpected error: {error}"))
+            else:
+                results.append(Result(case_id, primitive, requirement, path, "fail", str(error)))
+        else:
+            if path == "negative_fixture":
+                results.append(Result(case_id, primitive, requirement, path, "fail", "negative fixture unexpectedly passed"))
+            else:
+                results.append(Result(case_id, primitive, requirement, path, "pass", "ok"))
+    return results
+
+
+def render_text(results: list[Result]) -> str:
+    failed = [result for result in results if result.status != "pass"]
+    lines = ["Splendor 0.1 conformance report", f"status: {'fail' if failed else 'pass'}", f"cases: {len(results)}", f"failed: {len(failed)}"]
+    for result in results:
+        lines.append(f"{result.status.upper()} {result.primitive} {result.requirement} {result.case_id}: {result.message}")
+    return "\n".join(lines)
+
+
+def render_json(results: list[Result]) -> str:
+    failed = [result for result in results if result.status != "pass"]
+    payload = {
+        "schema_version": "splendor.conformance_report.v1",
+        "milestone": "Splendor0.1-dev",
+        "sprint": "0.1-S2",
+        "status": "fail" if failed else "pass",
+        "case_count": len(results),
+        "failed_count": len(failed),
+        "results": [result.__dict__ for result in results],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run Splendor 0.1 primitive conformance fixtures")
+    parser.add_argument("--fixtures", type=Path, default=FIXTURE_PATH, help="path to conformance fixture JSON")
+    parser.add_argument("--format", choices={"text", "json"}, default="text", help="report format")
+    parser.add_argument("--output", type=Path, help="optional report output path")
+    args = parser.parse_args()
+
+    results = run_suite(args.fixtures)
+    output = render_json(results) if args.format == "json" else render_text(results)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output + "\n", encoding="utf-8")
+    print(output)
+    return 1 if any(result.status != "pass" for result in results) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,236 @@
+{
+  "schema_version": "splendor.conformance_suite.v1",
+  "milestone": "Splendor0.1-dev",
+  "sprint": "0.1-S2",
+  "scope": "stable primitive contract fixtures, not production use-case E2E acceptance",
+  "cases": [
+    {
+      "case_id": "runtime-loop-positive-order",
+      "primitive": "runtime_loop",
+      "requirement": "CONF-0.1-RUNTIME-ORDER",
+      "path": "positive",
+      "description": "A complete tick preserves the governed runtime order and identity linkage.",
+      "trace": {
+        "run_id": "run_conf_001",
+        "tenant_id": "tenant_conf_001",
+        "agent_id": "agent_conf_orchestrator",
+        "tick_id": 1,
+        "events": [
+          { "trace_event_id": "trace_run_started", "sequence": 0, "kind": "run.started", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator" } },
+          { "trace_event_id": "trace_tick_started", "sequence": 1, "kind": "tick.started", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_percepts", "sequence": 2, "kind": "percepts.received", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_state_loaded", "sequence": 3, "kind": "state.loaded", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_policy_invoked", "sequence": 4, "kind": "policy.invoked", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_policy_completed", "sequence": 5, "kind": "policy.completed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_actions_proposed", "sequence": 6, "kind": "actions.proposed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" } },
+          { "trace_event_id": "trace_constraints", "sequence": 7, "kind": "constraints.evaluated", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" } },
+          { "trace_event_id": "trace_verification_started", "sequence": 8, "kind": "verification.started", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" } },
+          { "trace_event_id": "trace_verification_completed", "sequence": 9, "kind": "verification.completed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" }, "verification": { "allowed": true } },
+          { "trace_event_id": "trace_action_executed", "sequence": 10, "kind": "action.executed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" } },
+          { "trace_event_id": "trace_outcome", "sequence": 11, "kind": "outcome.recorded", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_conf_query" } },
+          { "trace_event_id": "trace_state_committed", "sequence": 12, "kind": "state.committed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "state_node_id": "state_conf_001" } },
+          { "trace_event_id": "trace_tick_completed", "sequence": 13, "kind": "tick.completed", "identity": { "run_id": "run_conf_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } }
+        ]
+      }
+    },
+    {
+      "case_id": "runtime-loop-broken-order-negative-fixture",
+      "primitive": "runtime_loop",
+      "requirement": "CONF-0.1-RUNTIME-ORDER",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves the runner reports missing/late verification before execution.",
+      "expected_failure": "missing required ordered event percepts.received",
+      "trace": {
+        "run_id": "run_conf_bad_order",
+        "tenant_id": "tenant_conf_001",
+        "agent_id": "agent_conf_orchestrator",
+        "tick_id": 1,
+        "events": [
+          { "trace_event_id": "bad_tick_started", "sequence": 0, "kind": "tick.started", "identity": { "run_id": "run_conf_bad_order", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "bad_action_executed", "sequence": 1, "kind": "action.executed", "identity": { "run_id": "run_conf_bad_order", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_bad" } }
+        ]
+      }
+    },
+    {
+      "case_id": "gateway-denial-no-adapter",
+      "primitive": "gateway",
+      "requirement": "CONF-0.1-GATEWAY-DENIAL",
+      "path": "denial",
+      "description": "Gateway denial records verifier evidence and skips adapter execution.",
+      "gateway": {
+        "action_id": "action_denied_permission",
+        "status": "denied",
+        "verification": { "allowed": false, "reasons": ["missing_permission"], "verifier_results": [{ "verifier": "agent_permission", "allowed": false, "reason": "missing finance.write" }] },
+        "adapter_executed": false,
+        "required_events": ["verification.started", "verification.completed", "action.denied", "outcome.recorded"]
+      }
+    },
+    {
+      "case_id": "gateway-adapter-failure-traceable",
+      "primitive": "gateway",
+      "requirement": "CONF-0.1-GATEWAY-FAILURE",
+      "path": "failure",
+      "description": "Adapter failure after successful verification is recorded as an action failure outcome.",
+      "gateway": {
+        "action_id": "action_adapter_failed",
+        "status": "failed",
+        "verification": { "allowed": true, "reasons": [], "verifier_results": [{ "verifier": "tenant", "allowed": true, "reason": "tenant allowed" }] },
+        "adapter_executed": true,
+        "error": "adapter_failure",
+        "required_events": ["verification.started", "verification.completed", "action.failed", "outcome.recorded"]
+      }
+    },
+    {
+      "case_id": "gateway-verifier-unavailable-fail-closed",
+      "primitive": "gateway",
+      "requirement": "CONF-0.1-GATEWAY-FAIL-CLOSED",
+      "path": "fail_closed",
+      "description": "Unavailable required verifier returns intervention/denial and skips adapter execution.",
+      "gateway": {
+        "action_id": "action_verifier_unavailable",
+        "status": "needs_intervention",
+        "verification": { "allowed": false, "reasons": ["verifier_unavailable"], "verifier_results": [{ "verifier": "quota", "allowed": false, "reason": "unavailable" }] },
+        "adapter_executed": false,
+        "required_events": ["verification.started", "verification.completed", "action.needs_intervention", "outcome.recorded"]
+      }
+    },
+    {
+      "case_id": "trace-state-identity-consistency",
+      "primitive": "state",
+      "requirement": "CONF-0.1-STATE-IDENTITY",
+      "path": "positive",
+      "description": "State commit identifies tenant, agent, run, parent, hash, trace linkage, and timestamp.",
+      "state": {
+        "state_node_id": "state_conf_001",
+        "tenant_id": "tenant_conf_001",
+        "agent_id": "agent_conf_orchestrator",
+        "run_id": "run_conf_001",
+        "parents": ["state_conf_000"],
+        "state_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "snapshot_ref": "object://snapshots/state_conf_001",
+        "trace_event_id": "trace_state_committed",
+        "created_at": "2026-05-25T00:00:01Z"
+      },
+      "trace_event": { "trace_event_id": "trace_state_committed", "run_id": "run_conf_001", "identity": { "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "state_node_id": "state_conf_001" } }
+    },
+    {
+      "case_id": "state-commit-failure-no-tick-advance",
+      "primitive": "state",
+      "requirement": "CONF-0.1-STATE-FAILURE",
+      "path": "failure",
+      "description": "State commit failure is traceable and prevents tick completion.",
+      "state_failure": { "reason": "store_unavailable", "state_committed": false, "tick_completed": false, "next_tick_started": false }
+    },
+    {
+      "case_id": "replay-inspect-only",
+      "primitive": "replay",
+      "requirement": "CONF-0.1-REPLAY-NO-SIDE-EFFECTS",
+      "path": "replay",
+      "description": "Replay reconstructs facts and suppresses side effects by default.",
+      "replay": { "mode": "inspect_only", "side_effects_replayed": false, "invoked_components": [], "reconstructed": ["trace", "state", "messages", "governance", "work_orders"] }
+    },
+    {
+      "case_id": "message-causality-trace-linked",
+      "primitive": "messages",
+      "requirement": "CONF-0.1-MESSAGE-CAUSALITY",
+      "path": "positive",
+      "description": "Message lifecycle preserves source/target/run identity and causal parent trace linkage.",
+      "message": {
+        "message_id": "msg_conf_task",
+        "source_agent_id": "agent_conf_orchestrator",
+        "target_agent_id": "agent_conf_specialist",
+        "run_id": "run_conf_001",
+        "schema": "splendor.message.task_request.v1",
+        "payload": { "objective": "summarize fixture evidence" },
+        "causal_parent": "trace_actions_proposed",
+        "requires_response": true,
+        "created_at": "2026-05-25T00:00:00Z"
+      },
+      "trace_events": [
+        { "trace_event_id": "trace_actions_proposed", "sequence": 6, "kind": "actions.proposed", "identity": { "run_id": "run_conf_001" } },
+        { "trace_event_id": "trace_message_queued", "sequence": 7, "kind": "message.queued", "identity": { "run_id": "run_conf_001", "message_id": "msg_conf_task" } },
+        { "trace_event_id": "trace_message_delivered", "sequence": 8, "kind": "message.delivered", "identity": { "run_id": "run_conf_001", "message_id": "msg_conf_task" } }
+      ]
+    },
+    {
+      "case_id": "work-order-accepted-scopes-authority",
+      "primitive": "work_orders",
+      "requirement": "CONF-0.1-WORK-ORDER-POSITIVE",
+      "path": "positive",
+      "description": "Valid work order narrows tenant authority and carries signature metadata.",
+      "work_order": { "status": "accepted", "reason": null, "signature": { "key_id": "manager-local-key", "signature": "fixture-signature" }, "issued_at": "2026-05-25T00:00:00Z", "expires_at": "2026-05-25T01:00:00Z", "revocation": "active", "tenant_allowed_actions": ["sql.query", "artifact.create", "email.send"], "allowed_actions": ["sql.query", "artifact.create"], "allowed_adapters": ["sql", "artifact-store"], "allowed_permissions": ["finance.read", "artifact.create"], "run_started": true }
+    },
+    {
+      "case_id": "work-order-unsigned-rejected",
+      "primitive": "work_orders",
+      "requirement": "CONF-0.1-WORK-ORDER-UNSIGNED",
+      "path": "denial",
+      "description": "Unsigned work order is rejected before run start.",
+      "work_order": { "status": "rejected", "reason": "unsigned_work_order", "signature": null, "run_started": false }
+    },
+    {
+      "case_id": "work-order-expired-rejected",
+      "primitive": "work_orders",
+      "requirement": "CONF-0.1-WORK-ORDER-EXPIRED",
+      "path": "denial",
+      "description": "Expired work order is rejected before run start.",
+      "work_order": { "status": "rejected", "reason": "expired_work_order", "signature": { "key_id": "manager-local-key", "signature": "fixture-signature" }, "issued_at": "2026-05-25T00:00:00Z", "expires_at": "2026-05-24T00:00:00Z", "run_started": false }
+    },
+    {
+      "case_id": "work-order-revoked-rejected",
+      "primitive": "work_orders",
+      "requirement": "CONF-0.1-WORK-ORDER-REVOKED",
+      "path": "denial",
+      "description": "Revoked work order is rejected before run start.",
+      "work_order": { "status": "rejected", "reason": "revoked_work_order", "signature": { "key_id": "manager-local-key", "signature": "fixture-signature" }, "revocation": "revoked", "run_started": false }
+    },
+    {
+      "case_id": "work-order-overbroad-rejected",
+      "primitive": "work_orders",
+      "requirement": "CONF-0.1-WORK-ORDER-OVERBROAD",
+      "path": "fail_closed",
+      "description": "Work order that broadens tenant authority is rejected.",
+      "work_order": { "status": "rejected", "reason": "overbroad_authority", "signature": { "key_id": "manager-local-key", "signature": "fixture-signature" }, "tenant_allowed_actions": ["sql.query"], "allowed_actions": ["sql.query", "email.send"], "run_started": false }
+    },
+    {
+      "case_id": "governance-approval-required-pauses",
+      "primitive": "governance",
+      "requirement": "CONF-0.1-GOVERNANCE-APPROVAL",
+      "path": "denial",
+      "description": "Approval-required action pauses and does not execute the adapter before grant.",
+      "governance": { "transition": "approval_requested", "action_status": "needs_approval", "run_status": "waiting_for_approval", "adapter_executed": false, "required_events": ["action.needs_approval", "approval.requested", "run.paused"] }
+    },
+    {
+      "case_id": "governance-denial-blocks",
+      "primitive": "governance",
+      "requirement": "CONF-0.1-GOVERNANCE-DENIAL",
+      "path": "denial",
+      "description": "Approval denial blocks execution and records denial evidence.",
+      "governance": { "transition": "approval_denied", "action_status": "denied", "run_status": "denied", "adapter_executed": false, "required_events": ["approval.denied", "action.denied"] }
+    },
+    {
+      "case_id": "governance-escalation-intervention",
+      "primitive": "governance",
+      "requirement": "CONF-0.1-GOVERNANCE-ESCALATION",
+      "path": "fail_closed",
+      "description": "Verifier uncertainty escalates to intervention without adapter execution.",
+      "governance": { "transition": "escalation_opened", "action_status": "needs_intervention", "run_status": "paused", "adapter_executed": false, "required_events": ["escalation.triggered", "action.needs_intervention"] }
+    },
+    {
+      "case_id": "governance-circuit-breaker-denies",
+      "primitive": "governance",
+      "requirement": "CONF-0.1-GOVERNANCE-CIRCUIT-BREAKER",
+      "path": "denial",
+      "description": "Matching circuit breaker denies before adapter execution.",
+      "governance": { "transition": "circuit_breaker_tripped", "action_status": "denied", "reason": "circuit_breaker_tripped", "adapter_executed": false, "required_events": ["circuit_breaker.tripped", "action.denied"] }
+    },
+    {
+      "case_id": "adapter-manifests-secret-free-gateway-mediated",
+      "primitive": "adapters",
+      "requirement": "CONF-0.1-ADAPTER-MANIFESTS",
+      "path": "positive",
+      "description": "Adapter manifests validate maturity evidence, replay suppression, secret-free fixtures, and gateway mediation.",
+      "adapter_manifests": { "directory": "docs/spec/0.1/fixtures/adapter-manifests", "require_replay_side_effects_false": true, "forbid_secret_fields": true, "require_gateway_evidence": true }
+    }
+  ]
+}
