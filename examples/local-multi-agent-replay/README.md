@@ -1,5 +1,9 @@
 # Local Multi-Agent Replay Example
 
+Stability note: this is a legacy dev replay example, not a stable 0.1 SDK/API
+example. Stable 0.1 conformance replay behavior is validated by
+`python conformance/0.1/run-conformance.py`.
+
 This example documents the deterministic 0.02-S7 replay harness for local
 orchestrator/specialist traces. It is intentionally a test-backed fixture rather
 than a remote transport simulation.

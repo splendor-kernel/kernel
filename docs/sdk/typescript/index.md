@@ -1,9 +1,13 @@
 # TypeScript SDK Surface
 
-The 0.02-S6 TypeScript surface provides schema-aligned packages for control-plane
-and daemon clients. TypeScript is not a Splendor runtime and does not execute
+The TypeScript surface provides schema-aligned packages for control-plane and
+daemon clients. TypeScript is not a Splendor runtime and does not execute
 policies, verifiers, gateways, adapters, state commits, trace persistence, or
 replay.
+
+For the stable 0.1 public TypeScript surface, see
+[`stable-0.1.md`](stable-0.1.md). Historical 0.02-S6 wording describes where the
+packages were introduced, not a separate stable compatibility line.
 
 ## Packages
 
@@ -12,8 +16,10 @@ replay.
 | `@splendor/types` | Canonical TypeScript interfaces for daemon-facing Splendor schemas. |
 | `@splendor/client` | Thin authenticated HTTP client for the runtime daemon API. |
 
-Both packages are in `typescript/packages/` and are versioned against the
-`0.02-dev` daemon/schema compatibility line.
+Both packages are in `typescript/packages/` and are documented for the 0.1 stable
+schema/API surface. The current `@splendor/client` default API header remains
+`0.02-dev` until daemon-side active version negotiation is implemented; callers
+targeting a documented 0.1 daemon may pass `apiVersion: "0.1"` explicitly.
 
 ## Schema coverage
 

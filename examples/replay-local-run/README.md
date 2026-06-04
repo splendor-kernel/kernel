@@ -1,5 +1,10 @@
 # Replay Local Run
 
+Stability note: this is a legacy dev replay example, not a stable 0.1 SDK/API
+example. Stable 0.1 replay compatibility is documented in
+`docs/spec/0.1/api-stability.md` and validated by
+`python conformance/0.1/run-conformance.py`.
+
 This example documents the 0.01-dev replay contract using the local basic loop
 fixture. Replay reads persisted trace/state data and emits reconstructed tick
 JSON lines; it does **not** invoke policy code or adapters by default.

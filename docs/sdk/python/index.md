@@ -1,9 +1,13 @@
-# Python SDK 0.01-dev
+# Python SDK
 
-The Python SDK is an ergonomic local wrapper for the 0.01 runtime primitives. It
+The Python SDK is an ergonomic local wrapper for Splendor runtime primitives. It
 is not an enforcement bypass: policy code proposes actions, and
 `KernelRuntime.run_once` performs the gateway-style checks before adapter
 callbacks execute.
+
+For the stable 0.1 public surface, see [`stable-0.1.md`](stable-0.1.md). Older
+0.01-dev wording in examples describes the origin of the local SDK path, not an
+invitation to depend on undocumented internals.
 
 ## Install for local development
 
@@ -53,6 +57,9 @@ assert outcome.action_outcomes[0].status == "executed"
 - `subscribe_traces(run_id, callback)`: event subscription.
 - `tail_traces(run_id)`: inspect recorded trace events.
 - `replay_run(run_id)`: inspect-only replay from stored in-memory traces.
+
+These hooks are stable 0.1 local SDK methods when used as documented in
+`stable-0.1.md`.
 
 ## Non-goals
 

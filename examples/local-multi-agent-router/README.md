@@ -1,5 +1,10 @@
 # Local Multi-Agent Router Example
 
+Stability note: this is a legacy dev multi-agent example, not a stable 0.1
+SDK/API example. Stable 0.1 API surfaces are documented under
+`docs/spec/0.1/api-stability.md`, `docs/sdk/python/stable-0.1.md`, and
+`docs/sdk/typescript/stable-0.1.md`.
+
 This example documents the 0.02-S2 local message router path. It is intentionally
 in-process and local-only: no daemon API, remote broker, cross-instance transport,
 delegation model, or permission ledger is involved.

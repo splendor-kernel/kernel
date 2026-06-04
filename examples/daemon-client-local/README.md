@@ -1,8 +1,10 @@
 # Daemon Client Local Example
 
-This example documents the 0.02-S5 local runtime daemon API. It is intentionally
-local-only and uses explicit insecure development mode on loopback. Do not use it
-as a production transport.
+This example documents the stable 0.1 local runtime daemon API path. It is
+intentionally local-only and uses explicit insecure development mode on loopback.
+Do not use it as a production transport.
+
+Stable API reference: `docs/reference/runtime-daemon-api.md`.
 
 ## Run the reproducible smoke test
 
