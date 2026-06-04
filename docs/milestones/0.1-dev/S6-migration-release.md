@@ -116,6 +116,11 @@ Stable example entry points:
 - `examples/daemon-client-local/README.md`
 - `examples/typescript-daemon-client/README.md`
 
+Docs/examples review completed: reviewed the release notes, migration guide,
+compatibility policy, known limitations, local runtime guide, runtime daemon
+guide, daemon local example, and TypeScript daemon client example for stable
+example discoverability and unsupported-claim boundaries.
+
 ## Known Limitations
 
 - The 0.1 conformance suite is primitive compatibility evidence, not complete
