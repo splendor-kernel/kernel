@@ -201,10 +201,9 @@ snapshot, run, and agent IDs. Only one runtime context should own write authorit
 for a state head at a time.
 
 Required fields: `state_node_id`, `tenant_id`, `agent_id`, `run_id`, `parents`,
-`state_hash`, `created_at`.
+`state_hash`, `trace_event_id`, `created_at`.
 
-Optional fields: `trace_event_id`, `snapshot_id`, `snapshot_ref`, `metadata`,
-`extensions`.
+Optional fields: `snapshot_id`, `snapshot_ref`, `metadata`, `extensions`.
 
 Extension rules: Extensions cannot change parents, state hash, state ownership,
 trace linkage, or snapshot authority.

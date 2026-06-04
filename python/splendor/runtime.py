@@ -75,6 +75,7 @@ STABLE_0_1_REQUIRED_FIELDS = {
         "run_id",
         "parents",
         "state_hash",
+        "trace_event_id",
         "created_at",
     ),
     "TraceEvent": (
