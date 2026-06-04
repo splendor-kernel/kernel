@@ -46,6 +46,13 @@ REQUIRED_ACTION = {
     "params_scope",
     "risk",
 }
+REQUIRED_OBJECT_FIELDS = {
+    "trace_behavior",
+    "replay_behavior",
+    "scopes",
+    "governance_support",
+    "physical_device_safety",
+}
 
 
 def fail(path: Path, message: str) -> None:
@@ -56,6 +63,18 @@ def require_keys(path: Path, value: dict, required: set[str], label: str) -> Non
     missing = sorted(required - set(value))
     if missing:
         fail(path, f"missing {label} fields: {', '.join(missing)}")
+
+
+def evidence_ref_exists(ref: str) -> bool:
+    # Evidence refs are repository-relative file paths for this sprint's
+    # manifests. Future conformance URLs or opaque IDs should use another key.
+    if ref.startswith(("http://", "https://")):
+        return True
+    return (ROOT / ref).exists()
+
+
+def has_verifier(verifiers: list[object], expected: str) -> bool:
+    return any(isinstance(verifier, str) and expected in verifier for verifier in verifiers)
 
 
 def validate_manifest(path: Path) -> None:
@@ -70,6 +89,10 @@ def validate_manifest(path: Path) -> None:
         fail(path, "schema_version must be splendor.adapter_manifest.v1")
     if data["maturity_level"] not in ALLOWED_LEVELS:
         fail(path, f"invalid maturity_level {data['maturity_level']!r}")
+
+    for field in REQUIRED_OBJECT_FIELDS:
+        if not isinstance(data[field], dict):
+            fail(path, f"{field} must be an object")
 
     adapter = data["adapter"]
     if not isinstance(adapter, dict):
@@ -88,14 +111,31 @@ def validate_manifest(path: Path) -> None:
         if not isinstance(data[field], list) or not data[field]:
             fail(path, f"{field} must be a non-empty array")
 
+    verifiers = data["required_verifiers"]
+    if not all(isinstance(verifier, str) for verifier in verifiers):
+        fail(path, "required_verifiers entries must be strings")
+
+    maturity_level = data["maturity_level"]
+    if maturity_level == "network-safe" and not has_verifier(verifiers, "network_egress"):
+        fail(path, "network-safe manifests require a network_egress verifier")
+    if maturity_level == "device-safe" and not has_verifier(verifiers, "safety"):
+        fail(path, "device-safe manifests require a safety verifier")
+
+    for index, evidence in enumerate(data["evidence"]):
+        if not isinstance(evidence, dict):
+            fail(path, f"evidence[{index}] must be an object")
+        ref = evidence.get("ref")
+        if not isinstance(ref, str) or not ref:
+            fail(path, f"evidence[{index}].ref must be a non-empty string")
+        if not evidence_ref_exists(ref):
+            fail(path, f"evidence[{index}].ref does not exist: {ref}")
+
     replay = data["replay_behavior"]
-    if not isinstance(replay, dict):
-        fail(path, "replay_behavior must be an object")
     if replay.get("side_effects_replayed") is not False:
         fail(path, "replay_behavior.side_effects_replayed must be false")
 
     trace = data["trace_behavior"]
-    if not isinstance(trace, dict) or not trace.get("required_events"):
+    if not trace.get("required_events"):
         fail(path, "trace_behavior.required_events must be present")
 
 
