@@ -6,7 +6,7 @@
 - Master loop branch: `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`
 - Master loop worktree: `/Users/db/dev/Splendor Kernel-loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`
 - Base branch: latest `origin/dev` at loop creation (`fc37cdc`, merge of prior 0.05 implementation loop PR #105)
-- Final integration PR: pending; source `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`, base `dev`
+- Final integration PR: [#109](https://github.com/splendor-os/kernel/pull/109), source `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b`, base `dev`
 
 ## Sprint scope
 
@@ -94,6 +94,7 @@
 - 2026-06-04: Integrated loop branch validation passed: `bash scripts/container-tests.sh`; observed `splendorctl 0.1.0 (Splendor0.05-dev)` and `splendor python sdk 0.1.0 (Splendor0.05-dev)`.
 - 2026-06-04: Docker image inspection passed: runtime user `splendor`, OCI version `0.05-dev`, OCI description `Splendor 0.05-dev governed runtime image for local, physical, and edge primitive validation`.
 - 2026-06-04: Release-facing contradiction scan found no current docs saying physical/edge is missing. Current-label scan only found intentional historical 0.04 workflow fallback paths for 0.04 republishing, not active 0.05 defaults.
+- 2026-06-04: Final integration PR #109 opened against `dev`; CI checks passed for rust, python, typescript, and docker before this tracker update.
 
 ## QA findings
 
@@ -117,4 +118,4 @@
 
 ## Final PR readiness
 
-- Ready to open final integration PR from `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b` into `dev`; do not merge to `dev` without project policy/human authorization.
+- Final integration PR [#109](https://github.com/splendor-os/kernel/pull/109) is open against `dev`; do not merge to `dev` without project policy/human authorization.
