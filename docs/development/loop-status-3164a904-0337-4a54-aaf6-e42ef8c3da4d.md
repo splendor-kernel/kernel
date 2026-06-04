@@ -38,8 +38,8 @@
 
 - The repository reports implemented development primitives through `Splendor0.05-dev` in `README.md` and release-facing docs.
 - Existing reference docs cover runtime loop, gateway, state/trace/replay, daemon API, messages, work orders, fleet, governance, and physical/edge primitives under `docs/reference/`.
-- No `docs/spec/0.1/` directory, `docs/milestones/0.1-dev/` directory, `docs/operations/`, `docs/development/conformance-suite.md`, or 0.1 release/migration docs exist yet on the loop base.
-- No `conformance/` tree exists yet on the loop base.
+- After merged sub-agent PRs #112 and #111, the loop branch now contains `docs/spec/0.1/` stable primitive/schema-versioning docs, adapter maturity docs, stable primitive examples, adapter manifest fixtures, S1/S3 milestone docs, and lightweight schema/manifest validation.
+- `docs/operations/`, `docs/development/conformance-suite.md`, full `conformance/` suite, and 0.1 release/migration docs remain pending for later 0.1 tasks.
 
 ## Operating constraints for sub-agent work
 
@@ -65,10 +65,10 @@
 
 | Issue | Sprint | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| #35 | 0.1-S1 | `agent/35-0.1-S1` | `/Users/db/dev/Splendor Kernel-35-0.1-S1` | planned | not opened | pending | Stable primitive schemas/versioning/parity path. |
-| #37 | 0.1-S3 | `agent/37-0.1-S3` | `/Users/db/dev/Splendor Kernel-37-0.1-S3` | planned | not opened | pending | Adapter maturity docs/metadata/checklist; align with #35. |
-| #36 | 0.1-S2 | `agent/36-0.1-S2` | `/Users/db/dev/Splendor Kernel-36-0.1-S2` | blocked on #35 seed | not opened | pending | Conformance suite and fixtures; depends on stable primitive schema docs. |
-| #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | blocked on #35 seed | not opened | pending | Stable SDK/API docs and compatibility/deprecation policy. |
+| #35 | 0.1-S1 | `agent/35-0.1-S1` | `/Users/db/dev/Splendor Kernel-35-0.1-S1` | merged | [#112](https://github.com/splendor-os/kernel/pull/112) merged into loop | PR CI rust/python/typescript/docker passed; integrated `cargo test -p splendor-types`; `python -m pytest python/tests/test_runtime.py -q`; `npm ci && npm test`; `git diff --check origin/dev..HEAD` | Initial code-review blocked weak parity/examples; fixed with TS/Python schema constants, concrete examples, and lightweight S1 validators. |
+| #37 | 0.1-S3 | `agent/37-0.1-S3` | `/Users/db/dev/Splendor Kernel-37-0.1-S3` | merged | [#111](https://github.com/splendor-os/kernel/pull/111) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python scripts/validate-adapter-manifests.py`; JSON syntax checks in PR; `git diff --check origin/dev..HEAD` | Adapter maturity model, review checklist, manifests, and stricter lightweight validator accepted after review polish. |
+| #36 | 0.1-S2 | `agent/36-0.1-S2` | `/Users/db/dev/Splendor Kernel-36-0.1-S2` | ready to assign | not opened | pending | Conformance suite and fixtures can build on S1 stable examples and S3 adapter manifests. |
+| #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | ready to assign after loop tracker update | not opened | pending | Stable SDK/API docs and compatibility/deprecation policy; must reference S1 schema constants and S2 conformance expectations carefully. |
 | #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | blocked on #35/#38 terminology | not opened | pending | Operations guides across supported modes. |
 | #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | blocked on #35-#39 | not opened | pending | Release, migration, compatibility policy, changelog. |
 
@@ -76,18 +76,30 @@
 
 - Open issues #35-#40 are the active 0.1 sprint issues.
 - No 0.1 issues have been closed by this loop.
-- Pending: add progress comments once sub-agent branches/PRs are active and validation evidence is available.
+- PR #112 and PR #111 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
+- Pending: add/update comments for #36/#38 when their sub-agent branches/PRs are active.
 
 ## Validation log
 
 - 2026-06-04: Loop branch created from `origin/dev` at `6b350b8`.
 - 2026-06-04: Initial repository scan confirmed 0.1 required docs/conformance trees are absent and must be created by scoped sub-agent work.
+- 2026-06-04: PR #112 opened for #35; first review BLOCKED weak Python parity, ambiguous field alternatives, and insufficient stable examples; follow-up commit resolved blockers.
+- 2026-06-04: PR #112 merged into loop after code-review `APPROVE WITH NOTES` and PR CI passed rust/python/typescript/docker.
+- 2026-06-04: PR #111 opened for #37; review `APPROVE WITH NOTES`; follow-up commit strengthened adapter manifest validation.
+- 2026-06-04: PR #111 merged into loop after code-review `APPROVE` and PR CI passed rust/python/typescript/docker.
+- 2026-06-04: Integrated loop validation after #112/#111 merges passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: Integrated loop validation after #112/#111 merges passed: `cargo test -p splendor-types` (176 unit tests + 5 doc tests).
+- 2026-06-04: Integrated loop validation after #112/#111 merges passed: `python -m pytest python/tests/test_runtime.py -q` (24 tests).
+- 2026-06-04: Integrated loop validation after #112/#111 merges passed: `npm ci && npm test` (22 tests).
+- 2026-06-04: Integrated loop validation after #112/#111 merges passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
 
 ## QA findings
 
 - Existing 0.05 state is a prerequisite substrate; 0.1 work should not retrofit new runtime behavior unless required to make stable contracts testable.
 - 0.1 has six sprint issues that are interdependent; merging out of order risks conformance/API/migration docs referencing unstable names.
 - The issue bodies reference an obsolete acceptance path; reviewers must use the split criteria files.
+- S1 schema freeze initially looked complete but failed review because it did not yet prove Python parity or concrete example validation; this is the exact kind of shallow completion the loop must catch.
+- S3 adapter maturity work remained docs/fixture scoped; added validator checks are lightweight evidence, not certification or full conformance.
 
 ## Human-sync decisions
 
@@ -103,9 +115,10 @@
 
 ## Remaining blockers
 
-- No blocker to starting #35 and #37.
-- #36, #38, #39, and #40 should wait for at least a stable #35 seed or merge to avoid contradictory contracts.
+- No blocker to assigning #36 or #38.
+- #39 should wait for #38 stable API terminology or proceed only as draft docs with final alignment required.
+- #40 remains blocked on #35-#39 integrated outputs.
 
 ## Final PR readiness
 
-- Not ready. No sub-agent PRs have been opened, reviewed, merged, or validated yet.
+- Not ready. PRs #112 and #111 are merged and validated, but #36, #38, #39, and #40 remain pending.
