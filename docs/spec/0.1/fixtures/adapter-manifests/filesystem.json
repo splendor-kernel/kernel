@@ -1,0 +1,111 @@
+{
+  "schema_version": "splendor.adapter_manifest.v1",
+  "adapter": {
+    "id": "filesystem",
+    "name": "Filesystem Adapter",
+    "version": "0.1-dev",
+    "crate": "splendor-adapter-filesystem",
+    "owner": "splendor-runtime",
+    "description": "Sandboxed per-tenant filesystem operations behind the Action Gateway."
+  },
+  "maturity_level": "local-safe",
+  "supported_actions": [
+    {
+      "name": "read_file",
+      "side_effect_class": "filesystem.read",
+      "required_permissions": ["filesystem.read"],
+      "required_preconditions": [],
+      "postconditions": [],
+      "params_scope": "relative path inside tenant sandbox",
+      "risk": "bounded_local_read"
+    },
+    {
+      "name": "write_file",
+      "side_effect_class": "filesystem.write",
+      "required_permissions": ["filesystem.write"],
+      "required_preconditions": [],
+      "postconditions": [],
+      "params_scope": "relative path inside tenant sandbox plus bounded contents or bytes",
+      "risk": "bounded_local_write"
+    },
+    {
+      "name": "list_dir",
+      "side_effect_class": "filesystem.read",
+      "required_permissions": ["filesystem.read"],
+      "required_preconditions": [],
+      "postconditions": [],
+      "params_scope": "relative directory path inside tenant sandbox",
+      "risk": "bounded_local_read"
+    },
+    {
+      "name": "stat",
+      "side_effect_class": "filesystem.read",
+      "required_permissions": ["filesystem.read"],
+      "required_preconditions": [],
+      "postconditions": [],
+      "params_scope": "relative path inside tenant sandbox",
+      "risk": "bounded_local_read"
+    }
+  ],
+  "required_verifiers": [
+    "tenant",
+    "agent_permission",
+    "adapter",
+    "quota",
+    "precondition",
+    "data_scope",
+    "filesystem",
+    "postcondition"
+  ],
+  "quota_dimensions": [
+    "actions",
+    "action_duration_ms",
+    "filesystem_read_bytes",
+    "filesystem_write_bytes"
+  ],
+  "trace_behavior": {
+    "required_events": [
+      "verification.started",
+      "verification.completed",
+      "action.executed",
+      "action.denied",
+      "action.failed",
+      "outcome.recorded"
+    ],
+    "evidence": "Trace-safe sandbox-relative path intent, resolved tenant sandbox output, byte counts, verifier reasons, and postcondition references. Do not trace secrets or unbounded file contents."
+  },
+  "replay_behavior": {
+    "default_mode": "inspect_only",
+    "side_effects_replayed": false,
+    "notes": "Replay reconstructs filesystem outcomes from trace/state and does not read, list, stat, or write files."
+  },
+  "scopes": {
+    "tenant_scope": "required tenant_id sandbox",
+    "agent_scope": "required agent_id quota and permission scope",
+    "run_scope": "required run_id trace scope",
+    "data_scope": "declared relative file or directory path",
+    "filesystem_scope": "base_dir joined with tenant_id; absolute paths and traversal denied",
+    "network_scope": "not_applicable",
+    "credential_scope": "not_applicable"
+  },
+  "governance_support": {
+    "approval": "not_required_by_default; policy may require approval for writes or sensitive paths",
+    "circuit_breakers": ["adapter", "action", "action_class", "tenant", "agent"],
+    "policy_ttl": "runtime_policy_dependent",
+    "audit_attribution": "via gateway trace identity"
+  },
+  "physical_device_safety": {
+    "status": "not_applicable"
+  },
+  "limitations": [
+    "Local-safe is limited to declared tenant sandboxes and does not authorize arbitrary host filesystem access.",
+    "No marketplace, legal certification, production support, or compliance claim.",
+    "No network-safe, governance-aware, or device-safe claim is made by this manifest."
+  ],
+  "evidence": [
+    {"type": "doc", "ref": "docs/reference/action-gateway.md"},
+    {"type": "doc", "ref": "docs/reference/quotas.md"},
+    {"type": "test", "ref": "adapters/filesystem/tests/unit/filesystem_tests.rs"},
+    {"type": "source", "ref": "adapters/filesystem/src/lib.rs"}
+  ]
+}

@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import splendor
 
@@ -10,9 +12,97 @@ from splendor.runtime import (
     Percept,
     QuotaLedger,
     QuotaUsage,
+    STABLE_0_1_ENUM_VALUES,
+    STABLE_0_1_PRIMITIVES,
+    STABLE_0_1_REQUIRED_FIELDS,
+    STABLE_0_1_RESERVED_EXTENSION_KEYS,
     TenantPolicy,
     VerificationResult,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_stable_manifest() -> dict[str, object]:
+    path = REPO_ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _reject_authority_fields(
+    primitive: dict[str, object], candidate: dict[str, object]
+) -> None:
+    required = set(primitive["required_fields"])
+    optional = set(primitive["optional_fields"])
+    declared = required | optional
+    reserved = set(STABLE_0_1_RESERVED_EXTENSION_KEYS)
+    for key in candidate:
+        if key in reserved and key not in declared:
+            raise ValueError(f"unknown top-level authority field {key}")
+    extensions = candidate.get("extensions")
+    if extensions is not None:
+        if primitive["extensions"] != "non_authorizing" or not isinstance(extensions, dict):
+            raise ValueError("extensions not allowed")
+        for key in extensions:
+            if key in reserved:
+                raise ValueError(f"extension key {key} carries authority")
+
+
+def test_stable_0_1_python_schema_constants_match_examples() -> None:
+    manifest = _load_stable_manifest()
+    primitives = manifest["primitives"]
+    assert [entry["name"] for entry in primitives] == list(STABLE_0_1_PRIMITIVES)
+    assert manifest["extension_policy"]["reserved_keys"] == list(
+        STABLE_0_1_RESERVED_EXTENSION_KEYS
+    )
+    assert manifest["enum_values"] == {
+        key: list(value) for key, value in STABLE_0_1_ENUM_VALUES.items()
+    }
+
+    by_name = {entry["name"]: entry for entry in primitives}
+    for name in STABLE_0_1_PRIMITIVES:
+        entry = by_name[name]
+        assert entry["required_fields"] == list(STABLE_0_1_REQUIRED_FIELDS[name])
+        example = entry["example"]
+        for field in STABLE_0_1_REQUIRED_FIELDS[name]:
+            assert field in example
+        _reject_authority_fields(entry, example)
+
+        bad_extension = dict(example)
+        bad_extension["extensions"] = {"allowed_permissions": ["admin"]}
+        if entry["extensions"] == "non_authorizing":
+            try:
+                _reject_authority_fields(entry, bad_extension)
+            except ValueError as exc:
+                assert "extension key allowed_permissions" in str(exc)
+            else:
+                raise AssertionError("authority-bearing extension key was accepted")
+
+        bad_top_level = dict(example)
+        bad_top_level["credential"] = "secret"
+        try:
+            _reject_authority_fields(entry, bad_top_level)
+        except ValueError as exc:
+            assert "unknown top-level authority field credential" in str(exc)
+        else:
+            raise AssertionError("unknown top-level authority field was accepted")
+
+    assert by_name["Run"]["example"]["status"] in STABLE_0_1_ENUM_VALUES["run_status"]
+    assert (
+        by_name["Action"]["example"]["side_effect_class"]
+        in STABLE_0_1_ENUM_VALUES["side_effect_class"]
+    )
+    assert (
+        by_name["Approval"]["example"]["decision"]
+        in STABLE_0_1_ENUM_VALUES["approval_decision"]
+    )
+    assert by_name["Constraint"]["example"]["kind"] in STABLE_0_1_ENUM_VALUES[
+        "constraint_kind"
+    ]
+    assert by_name["Constraint"]["example"]["scope"] in STABLE_0_1_ENUM_VALUES[
+        "constraint_scope"
+    ]
+    assert by_name["WorkOrder"]["example"]["signature"] is not None
 
 
 def test_record_trace() -> None:

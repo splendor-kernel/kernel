@@ -1,5 +1,9 @@
 # Local Orchestrator + Specialists Example
 
+Stability note: this is a legacy dev delegation example, not a stable 0.1 SDK/API
+example. Stable 0.1 API surfaces are documented under
+`docs/spec/0.1/api-stability.md`.
+
 This example documents the 0.02-S4 local delegation path. It is intentionally
 local-only: one Splendor instance hosts an orchestrator parent run and specialist
 child runs. No remote work-order dispatch, fleet placement, or long-lived child

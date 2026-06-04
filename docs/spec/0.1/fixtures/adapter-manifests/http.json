@@ -1,0 +1,95 @@
+{
+  "schema_version": "splendor.adapter_manifest.v1",
+  "adapter": {
+    "id": "http",
+    "name": "HTTP Adapter",
+    "version": "0.1-dev",
+    "crate": "splendor-adapter-http",
+    "owner": "splendor-runtime",
+    "description": "Allowlisted HTTP GET and POST network access behind the Action Gateway."
+  },
+  "maturity_level": "network-safe",
+  "supported_actions": [
+    {
+      "name": "http_get",
+      "side_effect_class": "network.read",
+      "required_permissions": ["network.http.read"],
+      "required_preconditions": ["host_allowlisted", "method_allowed"],
+      "postconditions": [],
+      "params_scope": "allowlisted URL, optional trace-safe headers, bounded response size",
+      "risk": "bounded_network_read"
+    },
+    {
+      "name": "http_post",
+      "side_effect_class": "network.write",
+      "required_permissions": ["network.http.write"],
+      "required_preconditions": ["host_allowlisted", "method_allowed", "body_within_limit"],
+      "postconditions": [],
+      "params_scope": "allowlisted URL, optional trace-safe headers, bounded request and response body",
+      "risk": "bounded_network_write"
+    }
+  ],
+  "required_verifiers": [
+    "tenant",
+    "agent_permission",
+    "adapter",
+    "quota",
+    "precondition",
+    "data_scope",
+    "network_egress",
+    "policy_ttl",
+    "postcondition"
+  ],
+  "quota_dimensions": [
+    "actions",
+    "action_duration_ms",
+    "network_read_bytes",
+    "network_write_bytes",
+    "http_requests"
+  ],
+  "trace_behavior": {
+    "required_events": [
+      "verification.started",
+      "verification.completed",
+      "action.executed",
+      "action.denied",
+      "action.failed",
+      "outcome.recorded"
+    ],
+    "evidence": "Trace host, method, status, byte counts, duration, verifier reasons, and content type. Do not trace authorization headers, tokens, cookies, secrets, or unbounded response bodies."
+  },
+  "replay_behavior": {
+    "default_mode": "inspect_only",
+    "side_effects_replayed": false,
+    "notes": "Replay reconstructs HTTP decisions and outcomes from trace/state and does not reissue requests."
+  },
+  "scopes": {
+    "tenant_scope": "required tenant_id with optional tenant-specific domain allowlist",
+    "agent_scope": "required agent_id quota and permission scope",
+    "run_scope": "required run_id trace scope",
+    "data_scope": "declared URL and request body references only",
+    "filesystem_scope": "not_applicable",
+    "network_scope": "allowed domains, allowed methods, timeout, request byte limit, response byte limit",
+    "credential_scope": "no ambient broad credentials; caller-provided secrets must be scoped and redacted"
+  },
+  "governance_support": {
+    "approval": "policy may require approval for external mutation or sensitive destinations",
+    "circuit_breakers": ["adapter", "action", "action_class", "tenant", "agent"],
+    "policy_ttl": "required where egress policy is policy-bundle controlled",
+    "audit_attribution": "via gateway trace identity"
+  },
+  "physical_device_safety": {
+    "status": "not_applicable"
+  },
+  "limitations": [
+    "Network-safe does not authorize open internet egress, arbitrary webhook mutation, or broad credential use.",
+    "No governance-aware claim is made unless deployment policy adds approval and circuit-breaker evidence.",
+    "No marketplace, legal certification, production support, or external-service certification claim."
+  ],
+  "evidence": [
+    {"type": "doc", "ref": "docs/reference/action-gateway.md"},
+    {"type": "doc", "ref": "docs/reference/quotas.md"},
+    {"type": "test", "ref": "adapters/http/tests/unit/http_tests.rs"},
+    {"type": "source", "ref": "adapters/http/src/lib.rs"}
+  ]
+}
