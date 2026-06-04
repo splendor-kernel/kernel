@@ -49,14 +49,17 @@ Sends `POST /runs` with:
 {
   tenant_id: TenantId,
   agent_id: AgentId,
-  work_order: WorkOrderAuthorization,
+  work_order: WorkOrderEnvelope,
   credential: CallerCredential | null,
   audit_attribution: AuditAttribution | null,
   allowed_actions: string[],
   allowed_adapters: string[],
   allowed_permissions: string[],
   policy_actions: DaemonActionCandidate[],
+  policy_bundle_required: boolean,
+  policy_bundle: PolicyBundleEnvelope | null,
   registered_actions: RegisteredAction[],
+  approval_policies: ApprovalPolicy[],
   allowed_percept_schemas: string[],
   allowed_percept_sources: string[],
   initial_state: JsonValue | null,
@@ -70,10 +73,11 @@ not authorize a run by itself. The client uses the Rust daemon's flattened
 `CreateRunRequest` schema, not a `{ run_config, work_order, audit }` wrapper.
 
 The client performs only structural fail-closed checks before sending the
-request: signature metadata must be present, `runs_create` must be in
-`allowed_scopes`, `revocation` must be `active`, and `expires_at` must be in the
-future. Cryptographic signature verification and compatibility checks remain
-daemon/runtime responsibilities.
+request: signature metadata must be present, `schema_version`, `work_order_id`,
+and `objective` must be present, allowed actions/adapters must be scoped,
+`placement.target` must be present, `revocation` must be `active`, and
+`expires_at` must be in the future. Cryptographic signature verification and
+compatibility checks remain daemon/runtime responsibilities.
 
 ### `inspectRun(runId)`
 
@@ -87,7 +91,7 @@ Lifecycle mutating calls send `LifecycleRequest`:
 ```ts
 {
   credential: CallerCredential | null,
-  work_order: WorkOrderAuthorization | null,
+  work_order: WorkOrderEnvelope | null,
   audit_attribution: AuditAttribution | null,
   reason: string | null
 }

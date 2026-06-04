@@ -1,8 +1,12 @@
 openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
-  version: '0.1'
-  description: Stable 0.1 local runtime daemon API boundary. Clients should send X-Splendor-API-Version, but the current daemon implementation does not actively negotiate unsupported version headers.
+  version: 0.03-dev
+  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
+  x-splendor-compatibility:
+    stable_docs: docs/spec/0.1/api-stability.md
+    compatibility_line: '0.1'
+    version_negotiation: documented-not-enforced
 servers:
   - url: http://127.0.0.1:8077
     description: Explicit local development listener only.

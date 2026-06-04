@@ -65,16 +65,19 @@ verification.
 
 Programmatic callers should handle:
 
-- action outcomes through `outcome.action_outcomes[*].status` values
+- Python-local action outcomes through `outcome.action_outcomes[*].status` values
   `executed`, `denied`, `failed`, `needs_approval`, and `needs_intervention` when
-  the runtime records a gateway outcome;
+  the local Python runtime records a gateway-style outcome;
 - `ValueError` for invalid identities, malformed action/percept data, invalid
   quotas, replay sequence mismatch, or other validation failures;
 - `KeyError` or callback-raised exceptions only as local callback/input errors,
   not as authorization success.
 
-Adapter failures after verification are recorded as `failed` outcomes. Denied
-actions do not call adapters.
+Adapter failures after verification are recorded as Python-local `failed`
+outcomes. Denied actions do not call adapters. These lowercase strings are
+Python-local/dev-compatible statuses; stable daemon and TypeScript serialized
+`ActionOutcome.status` values are `Executed`, `Denied`, `NeedsApproval`,
+`NeedsIntervention`, and `Failed`.
 
 ## Replay Contract
 

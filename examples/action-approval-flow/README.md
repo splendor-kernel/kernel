@@ -40,6 +40,11 @@ cargo test -p splendor-gateway approval_verifier_uncertainty_needs_intervention_
 
 ## Minimal HTTP shape
 
+This shape is illustrative. Non-dev daemon calls must include an authenticated
+`CallerCredential` object with endpoint scopes, tenant binding, audience binding,
+expiry, and revocation status. A bearer token or audit record alone is not action
+authority.
+
 1. Create a run with `approval_policies`:
 
 ```json
@@ -47,8 +52,20 @@ cargo test -p splendor-gateway approval_verifier_uncertainty_needs_intervention_
   "tenant_id": "<tenant-id>",
   "agent_id": "<agent-id>",
   "work_order": { "...": "signed scoped work order" },
-  "credential": null,
-  "audit_attribution": { "principal": "dev", "credential_id": null, "request_id": "req-approval" },
+  "credential": {
+    "credential_id": "<credential-id>",
+    "principal": { "...": "client principal" },
+    "scopes": ["runs_create"],
+    "binding": { "tenant": { "tenant_id": "<tenant-id>" } },
+    "audience": { "daemon": { "daemon_id": "<daemon-id>" } },
+    "expires_at": "<rfc3339>",
+    "revocation": "active"
+  },
+  "audit_attribution": {
+    "principal": { "...": "same client principal" },
+    "credential_id": "<credential-id>",
+    "requested_at": "<rfc3339>"
+  },
   "allowed_actions": ["artifact.publish"],
   "allowed_adapters": ["artifact-store"],
   "allowed_permissions": ["artifact.publish"],

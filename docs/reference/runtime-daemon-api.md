@@ -2,8 +2,8 @@
 
 The runtime daemon API is the local control boundary for Splendor runs. In the
 0.1 compatibility line, the stable endpoint names and request/response shapes are
-documented here and in
-[`openapi/splendor-runtime-daemon.yaml`](../../openapi/splendor-runtime-daemon.yaml).
+documented here. The OpenAPI document remains versioned to the current runtime
+daemon API metadata and carries a separate 0.1 compatibility note.
 The implementation remains local/foundation-oriented; it is not a fleet manager
 or production auth provider.
 
@@ -38,8 +38,9 @@ X-Splendor-Client: <client-name>
 ```
 
 The current TypeScript client sends `X-Splendor-API-Version` and lets callers
-override the value. Its default remains `0.02-dev` until the daemon actively
-validates 0.1 compatibility headers.
+override the value. Its default remains `0.02-dev`, and daemon capabilities still
+advertise the current runtime daemon API line until the daemon actively validates
+0.1 compatibility headers.
 
 Current limitation: the daemon route implementation does not actively negotiate
 API versions or reject unsupported `X-Splendor-API-Version` values. Compatibility
@@ -271,7 +272,7 @@ Stable client handling rules:
 - treat `message` as human-readable diagnostics, not an authorization fact;
 - treat `details` as structured diagnostics whose exact keys may vary by code;
 - handle HTTP `503 runtime_unavailable` as fail-closed runtime unavailability;
-- handle gateway `denied`, `needs_approval`, and `needs_intervention` as action
+- handle gateway `Denied`, `NeedsApproval`, and `NeedsIntervention` as action
   outcomes where adapter execution did not occur;
 - never retry side-effectful actions blindly after transport, verifier, gateway,
   state, or trace failures.

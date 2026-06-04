@@ -99,11 +99,12 @@ successful `ActionOutcome`. Handle `ActionOutcome.status` values
 programmatically:
 
 ```text
-executed | denied | failed | needs_approval | needs_intervention
+Executed | Denied | NeedsApproval | NeedsIntervention | Failed
 ```
 
-`denied`, `needs_approval`, and `needs_intervention` mean the adapter did not
-execute.
+`Denied`, `NeedsApproval`, and `NeedsIntervention` mean the adapter did not
+execute. Lowercase Python-local/dev-compatible statuses are not the stable daemon
+or TypeScript serialized `ActionOutcome.status` values.
 
 ## Compatibility And Deprecation
 

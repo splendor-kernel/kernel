@@ -12,15 +12,19 @@ undocumented implementation internals.
 
 ### Rust
 
-The stable Rust 0.1 surface is the documented primitive and enforcement boundary
-exported by these crates:
+The stable Rust 0.1 surface is limited to these explicitly named exported items
+and their documented serialization/security semantics:
 
 | Crate | Stable public items |
 | --- | --- |
-| `splendor-types` | Public ID newtypes, stable primitive structs/enums/constants re-exported from `crates/splendor-types/src/lib.rs`, including `Action`, `Percept`, `Message`, `TraceEvent`, `WorkOrder`, `ApprovalEvidence`, daemon security types, work-order validation types, governance types, device/profile types, and 0.1 schema constants. |
-| `splendor-gateway` | `ActionRequest`, `ActionOutcome`, `ActionStatus`, `ActionGateway`, `ActionAdapter`, `AdapterResult`, `AdapterError`, verifier traits/results, `VerifiedActionGateway`, approval/safety verifier surfaces, and gateway denial/intervention outcomes. |
-| `splendor-daemon` | HTTP route contract exposed by `router`, request/response shapes used by `openapi/splendor-runtime-daemon.yaml`, structured `ApiError`, `DaemonState`, and `DaemonConfig` for local daemon construction. |
-| `splendor-store`, `splendor-kernel`, `splendor-net`, `splendor-policy` | Public traits and structs only where already documented in reference docs and conformance fixtures for state, trace, runtime loop, messages, policy, and replay primitives. Undocumented crate internals are not stable. |
+| `splendor-types` | ID newtypes `TenantId`, `AgentId`, `RunId`, `TickId`, `ActionId`, `StateNodeId`, `TraceEventId`, `MessageId`, `WorkOrderId`, `ApprovalId`, `FleetId`, `NodeId`, and `InstanceId`; primitive structs/enums `Action`, `Percept`, `PerceptProvenance`, `QuotaUsage`, `VerificationResult`, `Message`, `MessageEnvelope`, `TraceEvent`, `TraceEventKind`, `WorkOrder`, `WorkOrderEnvelope`, `WorkOrderPlacement`, `WorkOrderQuotaPolicy`, `ApprovalEvidence`, `ApprovalPolicy`, `ApprovalDecision`, `GovernanceState`, `CircuitBreaker`, `DeviceProfile`, and `CapabilityDocument`; daemon security structs/enums `AppPrincipal`, `ClientPrincipal`, `CallerCredential`, `CredentialBinding`, `CredentialAudience`, `EndpointScope`, `RevocationStatus`, `AuditAttribution`, `WorkOrderAuthorization`, `WorkOrderSignature`, `DaemonEndpoint`, and `GatewayVerificationState`; schema constants exported for work orders, approvals, governance, policy bundles, capabilities, and stable 0.1 primitives where documented. |
+| `splendor-gateway` | `ActionRequest`, `ActionOutcome`, `ActionStatus`, `ActionGateway`, `ActionAdapter`, `AdapterResult`, `AdapterError`, `VerifiedActionGateway`, `PolicyApprovalVerifier`, `SafetyVerifier`, `SafetyEvidence`, `SafetyVerification`, and `SAFETY_EVIDENCE_SCHEMA_VERSION`. |
+| `splendor-daemon` | `router`, `DaemonState`, `DaemonConfig`, `RunStatus`, documented request/response structs used by `openapi/splendor-runtime-daemon.yaml`, and structured `ApiError` response shape. |
+
+All other Rust crates, modules, structs, traits, helper functions, in-memory store
+implementations, scheduler internals, private handlers, test fixtures, and
+undocumented re-exports are non-stable in 0.1 even when they are public in the
+current Rust source.
 
 Stable Rust semantics include identity separation, gateway mediation for side
 effects, fail-closed verifier uncertainty, explicit state commits, append-only
@@ -56,9 +60,10 @@ directly from policy code.
 
 ### Runtime Daemon API
 
-The stable daemon boundary is the local HTTP API documented in
-`docs/reference/runtime-daemon-api.md` and described by
-`openapi/splendor-runtime-daemon.yaml`. Stable endpoint names are:
+The stable daemon compatibility boundary is the local HTTP API documented in
+`docs/reference/runtime-daemon-api.md`. The OpenAPI document remains versioned to
+the current runtime API metadata and carries a 0.1 compatibility note. Stable
+endpoint names are:
 
 - `POST /runs`
 - `GET /runs/{run_id}`
@@ -176,10 +181,11 @@ X-Splendor-Client: <client-name>
 ```
 
 The current TypeScript client sends `X-Splendor-API-Version` and allows callers to
-override it through `apiVersion`. Its default remains `0.02-dev` until the daemon
-server actively validates and negotiates the 0.1 header. The current daemon route
-implementation does not perform active version negotiation or reject unsupported
-version headers. This is a documented limitation, not a compatibility guarantee.
+override it through `apiVersion`. Its default remains `0.02-dev`, and daemon
+capabilities currently advertise the existing runtime daemon API line rather than
+an actively negotiated 0.1 protocol. The current daemon route implementation does
+not perform active version negotiation or reject unsupported version headers. This
+is a documented limitation, not a compatibility guarantee.
 
 Until active negotiation exists, compatibility is proven by schema/API docs,
 OpenAPI review, SDK contract tests, and the 0.1 conformance suite.
@@ -208,11 +214,14 @@ Gateway decisions are successful daemon responses with an `ActionOutcome.status`
 not transport errors, when the gateway evaluated the action:
 
 ```text
-executed | denied | failed | needs_approval | needs_intervention
+Executed | Denied | NeedsApproval | NeedsIntervention | Failed
 ```
 
-`denied`, `needs_approval`, and `needs_intervention` mean adapter execution did
-not occur.
+`Denied`, `NeedsApproval`, and `NeedsIntervention` mean adapter execution did not
+occur. Lowercase strings such as `executed`, `denied`, `needs_approval`, and
+`needs_intervention` are Python-local/dev-compatible status strings or trace event
+suffixes where explicitly documented; they are not the stable daemon/TypeScript
+serialized `ActionOutcome.status` values.
 
 ### TypeScript Client Errors
 

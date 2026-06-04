@@ -88,8 +88,9 @@ Stable failure handling is documented for:
 - daemon API errors with `code`, `message`, and `details`;
 - TypeScript `SplendorClientError` transport/response failures;
 - Python validation exceptions and recorded action outcomes;
-- gateway statuses `executed`, `denied`, `failed`, `needs_approval`, and
-  `needs_intervention`;
+- stable daemon/TypeScript gateway statuses `Executed`, `Denied`, `Failed`,
+  `NeedsApproval`, and `NeedsIntervention`, with lowercase statuses documented as
+  Python-local/dev-compatible only;
 - conformance report failures with case, primitive, requirement, path, status,
   and message.
 

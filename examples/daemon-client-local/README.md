@@ -26,39 +26,82 @@ cargo run -p splendor-daemon
 The daemon binds to `127.0.0.1:8077` and prints a warning that explicit local-only
 insecure development mode is active.
 
-## Minimal request shape
+## Minimal explicit local-dev request shape
 
-The daemon expects JSON. Run creation requires a signed, scoped work order:
+The daemon expects JSON. Run creation requires authenticated caller attribution
+and a signed, scoped `WorkOrderEnvelope`. The shape below is for the daemon's
+explicit loopback-only local development mode; non-dev daemon calls must use a
+real `CallerCredential` with expiry, endpoint scopes, tenant binding, audience
+binding, and revocation status. Do not treat the bearer token alone as action
+authority.
 
 ```json
 {
   "tenant_id": "00000000-0000-0000-0000-000000000001",
   "agent_id": "00000000-0000-0000-0000-000000000002",
   "work_order": {
+    "schema_version": "splendor.work_order.v1",
     "work_order_id": "wo_local_example",
     "tenant_id": "00000000-0000-0000-0000-000000000001",
     "agent_id": "00000000-0000-0000-0000-000000000002",
     "run_id": null,
-    "allowed_scopes": ["runs_create"],
-    "signature": { "key_id": "local-dev", "signature": "signed-for-dev" },
+    "objective": "Run the local daemon example",
+    "allowed_actions": ["allowed_action"],
+    "allowed_adapters": ["daemon.local"],
+    "allowed_permissions": [],
+    "data_refs": [],
+    "quotas": {
+      "max_actions_per_tick": 1,
+      "max_action_duration_ms": null,
+      "max_filesystem_read_bytes": null,
+      "max_filesystem_write_bytes": null,
+      "max_network_read_bytes": null,
+      "max_network_write_bytes": null,
+      "max_http_requests_per_minute": null
+    },
+    "placement": {
+      "target": "local_resident",
+      "data_locality": null,
+      "requires_gpu": false,
+      "dedicated_instance": false,
+      "required_capabilities": [],
+      "max_runtime_ms": null
+    },
+    "issued_at": "2099-01-01T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z",
+    "revocation": "active",
+    "signature": { "key_id": "local-dev", "signature": "signed-for-dev" }
+  },
+  "credential": {
+    "credential_id": "cred_local_example",
+    "principal": {
+      "app": { "app_principal_id": "app_local", "label": "Local daemon example" },
+      "client_principal_id": "client_local",
+      "label": "Local developer client"
+    },
+    "scopes": ["runs_create"],
+    "binding": { "tenant": { "tenant_id": "00000000-0000-0000-0000-000000000001" } },
+    "audience": { "daemon": { "daemon_id": "daemon_local" } },
     "expires_at": "2099-01-01T00:00:00Z",
     "revocation": "active"
   },
-  "credential": null,
   "audit_attribution": {
     "principal": {
-      "app": { "app_principal_id": "app_local", "label": null },
+      "app": { "app_principal_id": "app_local", "label": "Local daemon example" },
       "client_principal_id": "client_local",
-      "label": null
+      "label": "Local developer client"
     },
-    "credential_id": null,
+    "credential_id": "cred_local_example",
     "requested_at": "2099-01-01T00:00:00Z"
   },
   "allowed_actions": ["allowed_action"],
   "allowed_adapters": ["daemon.local"],
   "allowed_permissions": [],
   "policy_actions": [],
+  "policy_bundle_required": false,
+  "policy_bundle": null,
   "registered_actions": [{ "name": "allowed_action", "adapter": "daemon.local" }],
+  "approval_policies": [],
   "allowed_percept_schemas": ["splendor.percept.test.v1"],
   "allowed_percept_sources": ["daemon-client-local"],
   "initial_state": { "seed": true },
