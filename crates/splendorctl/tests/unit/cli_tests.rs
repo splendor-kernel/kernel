@@ -75,6 +75,7 @@ fn signed_work_order_block(
             dedicated_instance: Some(false),
             required_capabilities: vec!["filesystem".to_string()],
             max_runtime_ms: Some(30_000),
+            ..splendor_types::WorkOrderPlacement::default()
         },
         issued_at: now - time::Duration::minutes(1),
         expires_at: now + time::Duration::hours(1),
@@ -4888,6 +4889,7 @@ fn run_with_args_replay_succeeds() {
 
 #[test]
 fn run_with_args_version_succeeds() {
+    assert_eq!(SPLENDOR_RELEASE_LABEL, "Splendor0.05-dev");
     run_with_args(vec!["--version".to_string()]).expect("version");
 }
 

@@ -96,6 +96,38 @@ record with the same `(run_id, sequence)`, payload, `event_hash`, and
 `prev_event_hash`, that record is counted in `duplicate_records` and is not
 inserted again.
 
+## Offline nodes
+
+0.05-S3 extends trace sync for disconnected physical/edge nodes without changing
+the `TraceRecord` format. Local runtimes use `LocalTraceBuffer` at the storage
+boundary and keep writing the same append-only trace payloads while offline.
+Offline interval and sync marker records emitted by `LocalTraceBuffer` are
+canonical serialized `TraceEvent` values, not device-specific JSON markers.
+
+Offline/reconnect metadata is explicit:
+
+- `OfflineTraceIntervalTraceContext` identifies local offline execution periods.
+- `TraceSyncBoundaryTraceContext` identifies reconnect sync batches.
+- `TraceEventKind::{OfflineTraceIntervalStarted, OfflineTraceIntervalEnded,
+  TraceSyncStarted, TraceSyncCompleted, TraceSyncFailed}` records the local
+  runtime boundaries.
+- `TraceSyncBatch.offline_interval` and `TraceSyncBatch.sync_boundary` carry this
+  metadata to the central index.
+- `CentralTraceIndex::offline_intervals(run_id)` and
+  `CentralTraceIndex::sync_boundaries(run_id)` make the metadata queryable for
+  replay and audit.
+
+The sync path still validates ordering, run identity, previous-hash links, and
+event hashes. Duplicate reconnect attempts remain idempotent. Corrupted or
+conflicting segments are rejected/quarantined; missing ranges must be synced
+first and are not silently accepted.
+
+When local buffer storage pressure prevents durable trace preservation,
+`LocalTraceBufferError::BufferFull` is returned without dropping records.
+Side-effectful action boundaries should surface this through
+`TraceDurabilityState.last_local_buffer_error` so `TraceDurabilityGateway` denies
+before adapter execution.
+
 ## Rejection and quarantine
 
 `TraceSyncError` reports fail-closed rejection reasons:
@@ -136,6 +168,8 @@ default and can use the same record payloads and hash-chain metadata after sync.
 ## Security and failure notes
 
 - Sync failure never authorizes a side effect.
+- Local buffer-full failure never authorizes a side effect when trace durability
+  is required.
 - A runtime that requires central trace durability must wrap its action gateway
   with `TraceDurabilityGateway` or an equivalent fail-closed verifier.
 - Queryable identity fields are metadata for audit and lookup. They do not grant

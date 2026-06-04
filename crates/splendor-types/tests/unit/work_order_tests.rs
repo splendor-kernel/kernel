@@ -1,5 +1,8 @@
 use super::*;
-use crate::{RevocationStatus, WorkOrderId};
+use crate::{
+    PlacementExecutionMode, RevocationStatus, WorkOrderId, CLOUD_HELPER_ADAPTER_ID,
+    ROUTE_PLAN_PROPOSE_ACTION,
+};
 use time::{Duration, OffsetDateTime};
 
 const KEY_ID: &str = "local-test";
@@ -29,6 +32,7 @@ fn work_order(now: OffsetDateTime) -> WorkOrder {
             dedicated_instance: Some(false),
             required_capabilities: vec!["filesystem".to_string()],
             max_runtime_ms: Some(30_000),
+            ..WorkOrderPlacement::default()
         },
         issued_at: now - Duration::minutes(1),
         expires_at: now + Duration::hours(1),
@@ -54,6 +58,40 @@ fn context(order: &WorkOrder, now: OffsetDateTime) -> WorkOrderValidationContext
     }
 }
 
+fn sign(order: WorkOrder) -> WorkOrderEnvelope {
+    WorkOrderEnvelope::signed_with_shared_secret(order, KEY_ID, SECRET).expect("signed envelope")
+}
+
+fn cloud_helper_work_order(now: OffsetDateTime) -> WorkOrder {
+    WorkOrder {
+        schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_cloud_helper_canonical").expect("work order id"),
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: Some(RunId::new()),
+        objective: "propose advisory route".to_string(),
+        allowed_actions: vec![
+            ROUTE_PLAN_PROPOSE_ACTION.to_string(),
+            "message.send".to_string(),
+        ],
+        allowed_adapters: vec![
+            CLOUD_HELPER_ADAPTER_ID.to_string(),
+            "artifact-store".to_string(),
+        ],
+        allowed_permissions: vec!["route.plan".to_string()],
+        data_refs: vec!["map:warehouse-a".to_string()],
+        quotas: WorkOrderQuotaPolicy::default(),
+        placement: WorkOrderPlacement {
+            target: "resident_cloud_pool".to_string(),
+            execution_mode: PlacementExecutionMode::CloudHelper,
+            ..WorkOrderPlacement::default()
+        },
+        issued_at: now - Duration::minutes(1),
+        expires_at: now + Duration::hours(1),
+        revocation: RevocationStatus::Active,
+    }
+}
+
 #[test]
 fn signed_work_order_validates_and_round_trips() {
     let now = OffsetDateTime::now_utc();
@@ -76,6 +114,85 @@ fn signed_work_order_validates_and_round_trips() {
 
     assert_eq!(decision.work_order().work_order_id.as_str(), "wo_unit");
     assert_eq!(decision.work_order().allowed_actions, vec!["write_file"]);
+}
+
+#[test]
+fn old_signed_payload_without_execution_mode_defaults_to_live_and_validates() {
+    let now = OffsetDateTime::now_utc();
+    let order = work_order(now);
+    let envelope = sign(order.clone());
+    let mut payload = serde_json::to_value(&envelope).expect("serialize envelope");
+    payload
+        .get_mut("placement")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("placement object")
+        .remove("execution_mode");
+
+    let decoded: WorkOrderEnvelope = serde_json::from_value(payload).expect("old payload decodes");
+    assert_eq!(
+        decoded.work_order.placement.execution_mode,
+        PlacementExecutionMode::Live
+    );
+    validate_work_order(&decoded, &context(&order, now), &keyring())
+        .expect("old live payload validates");
+}
+
+#[test]
+fn non_live_execution_mode_is_signed_authority() {
+    let now = OffsetDateTime::now_utc();
+    let mut order = work_order(now);
+    let mut envelope = sign(order.clone());
+    envelope.work_order.placement.execution_mode = PlacementExecutionMode::CloudHelper;
+    assert_eq!(
+        validate_work_order(&envelope, &context(&order, now), &keyring()),
+        Err(WorkOrderValidationError::BadSignature)
+    );
+
+    order.placement.execution_mode = PlacementExecutionMode::CloudHelper;
+    order.allowed_actions = vec![
+        ROUTE_PLAN_PROPOSE_ACTION.to_string(),
+        "message.send".to_string(),
+    ];
+    order.allowed_adapters = vec![CLOUD_HELPER_ADAPTER_ID.to_string()];
+    let helper_envelope = sign(order.clone());
+    validate_work_order(&helper_envelope, &context(&order, now), &keyring())
+        .expect("signed non-live helper authority validates when scoped");
+}
+
+#[test]
+fn canonical_work_order_validation_rejects_unsafe_cloud_helper_authority() {
+    let now = OffsetDateTime::now_utc();
+
+    let mut robotics = cloud_helper_work_order(now);
+    robotics.allowed_adapters.push("robotics".to_string());
+    let robotics_envelope = sign(robotics.clone());
+    assert!(matches!(
+        validate_work_order(&robotics_envelope, &context(&robotics, now), &keyring()),
+        Err(WorkOrderValidationError::Malformed { reason })
+            if reason == "cloud_helper_robotics_adapter_authority_denied"
+    ));
+
+    let mut high_level = cloud_helper_work_order(now);
+    high_level
+        .allowed_actions
+        .push("move_to_waypoint".to_string());
+    let high_level_envelope = sign(high_level.clone());
+    assert!(matches!(
+        validate_work_order(&high_level_envelope, &context(&high_level, now), &keyring()),
+        Err(WorkOrderValidationError::Malformed { reason })
+            if reason == "cloud_helper_physical_action_authority_denied"
+    ));
+
+    let mut low_level = cloud_helper_work_order(now);
+    low_level
+        .allowed_actions
+        .push("set_motor_pwm_1".to_string());
+    let low_level_envelope = sign(low_level.clone());
+    assert!(matches!(
+        validate_work_order(&low_level_envelope, &context(&low_level, now), &keyring()),
+        Err(WorkOrderValidationError::Malformed { reason })
+            if reason == "cloud_helper_physical_action_authority_denied"
+    ));
 }
 
 #[test]

@@ -317,6 +317,43 @@ pub enum TraceEventKind {
         /// Sanitized failure reason code.
         reason: String,
     },
+    /// Marks a local offline execution interval beginning on an edge/physical node.
+    OfflineTraceIntervalStarted {
+        /// Replay-visible local/offline interval context.
+        interval: OfflineTraceIntervalTraceContext,
+    },
+    /// Marks a local offline execution interval ending before reconnect sync.
+    OfflineTraceIntervalEnded {
+        /// Replay-visible local/offline interval context.
+        interval: OfflineTraceIntervalTraceContext,
+    },
+    /// Marks a reconnect trace sync attempt boundary without executing side effects.
+    TraceSyncStarted {
+        /// Sync boundary context for replay and audit.
+        boundary: TraceSyncBoundaryTraceContext,
+    },
+    /// Marks a successful reconnect trace sync boundary.
+    TraceSyncCompleted {
+        /// Sync boundary context for replay and audit.
+        boundary: TraceSyncBoundaryTraceContext,
+    },
+    /// Marks a failed reconnect trace sync boundary.
+    TraceSyncFailed {
+        /// Sync boundary context for replay and audit.
+        boundary: TraceSyncBoundaryTraceContext,
+        /// Fail-closed sync failure reason.
+        reason: String,
+    },
+    /// Records explicit central policy connectivity transitions for offline or
+    /// reconnect operation without changing cached authority.
+    PolicyConnectivityChanged {
+        /// True when the runtime is disconnected from central policy authority.
+        disconnected: bool,
+        /// When the connectivity state was observed.
+        observed_at: OffsetDateTime,
+        /// Current cached bundle metadata, when present.
+        bundle: Option<PolicyBundleTraceContext>,
+    },
     /// Records policy TTL expiry affecting policy invocation or side effects.
     PolicyExpired {
         /// Policy bundle identity that expired.
@@ -944,6 +981,40 @@ pub struct TraceIntegrity {
     pub prev_event_hash: Option<ContentHash>,
     /// Hash of this LoopTickCompleted event (computed before embedding integrity).
     pub event_hash: ContentHash,
+}
+
+/// Replay-visible context for a local offline execution interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OfflineTraceIntervalTraceContext {
+    /// Runtime-generated interval identifier, unique within the source run.
+    pub offline_interval_id: String,
+    /// Local source node identifier when known.
+    pub node_id: Option<String>,
+    /// Local source instance identifier when known.
+    pub instance_id: Option<String>,
+    /// First local trace sequence covered by the offline interval marker.
+    pub start_sequence: u64,
+    /// Last local trace sequence covered by the interval when closed.
+    pub end_sequence: Option<u64>,
+    /// Sanitized reason such as `network_disconnected`.
+    pub reason: Option<String>,
+}
+
+/// Replay-visible context for a reconnect trace sync boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceSyncBoundaryTraceContext {
+    /// Runtime-generated sync batch identifier.
+    pub sync_batch_id: String,
+    /// Offline interval covered by this sync attempt, when applicable.
+    pub offline_interval_id: Option<String>,
+    /// Inclusive local start sequence synced.
+    pub start_sequence: u64,
+    /// Exclusive local end sequence synced.
+    pub end_sequence: u64,
+    /// Records accepted by the central index when known.
+    pub accepted_records: Option<usize>,
+    /// Records deduplicated by the central index when known.
+    pub duplicate_records: Option<usize>,
 }
 
 #[cfg(test)]

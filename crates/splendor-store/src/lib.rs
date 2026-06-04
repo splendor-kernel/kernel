@@ -28,6 +28,7 @@ pub use trace::{
     TraceStore, TraceStoreError,
 };
 pub use trace_sync::{
-    CentralTraceIndex, InMemoryCentralTraceIndex, TraceIndexQuery, TraceIndexRecord,
+    CentralTraceIndex, InMemoryCentralTraceIndex, LocalTraceBuffer, LocalTraceBufferConfig,
+    LocalTraceBufferError, TraceBufferAppendMode, TraceIndexQuery, TraceIndexRecord,
     TraceQuarantineEntry, TraceSyncBatch, TraceSyncError, TraceSyncReport, TraceSyncScope,
 };

@@ -3,7 +3,7 @@ set -euo pipefail
 
 IMAGE="${SPLENDOR_CONTAINER_IMAGE:-splendor:ci}"
 BUILD_IMAGE="${SPLENDOR_CONTAINER_BUILD:-1}"
-IMAGE_VERSION="${SPLENDOR_IMAGE_VERSION:-0.04-dev}"
+IMAGE_VERSION="${SPLENDOR_IMAGE_VERSION:-0.05-dev}"
 
 if [[ "${BUILD_IMAGE}" == "1" ]]; then
   docker build \

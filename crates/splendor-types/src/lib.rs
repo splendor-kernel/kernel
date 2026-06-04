@@ -32,7 +32,9 @@
 
 mod approval;
 mod capabilities;
+mod cloud_helper;
 mod daemon_security;
+mod device_profile;
 mod escalation;
 mod external_governance;
 mod fleet_telemetry;
@@ -56,6 +58,13 @@ pub use capabilities::{
     is_valid_capability_name, CapabilityDocument, CapabilityValidationError,
     CAPABILITY_DOCUMENT_SCHEMA,
 };
+pub use cloud_helper::{
+    cloud_helper_failure_validation, validate_cloud_helper_work_order,
+    validate_route_plan_for_local_execution, CloudHelperAuthority, CloudHelperValidationError,
+    LocalRoutePlanValidation, RoutePlanProposal, RouteWaypointProposal, CLOUD_HELPER_ADAPTER_ID,
+    CLOUD_HELPER_UNAVAILABLE_REASON, MISSION_PLAN_PROPOSE_ACTION, ROUTE_PLAN_PROPOSAL_SCHEMA,
+    ROUTE_PLAN_PROPOSE_ACTION,
+};
 pub use daemon_security::{
     validate_client_connection_policy, validate_daemon_request, validate_insecure_dev_mode,
     AppPrincipal, AuditAttribution, CallerCredential, ClientConnectionPolicy, ClientPrincipal,
@@ -63,6 +72,13 @@ pub use daemon_security::{
     DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
     InsecureDevMode, LocalTransportBinding, RevocationStatus, WorkOrderAuthorization,
     WorkOrderSignature,
+};
+pub use device_profile::{
+    is_allowed_physical_action, physical_action_capability, validate_physical_capability_document,
+    DeviceCapability, DeviceCapabilityCategory, DeviceLocalPolicyIndicators, DeviceNodeKind,
+    DeviceProfile, DeviceProfileValidationError, DeviceSafetyConstraint, ALLOWED_PHYSICAL_ACTIONS,
+    DEVICE_KIND_CAPABILITY_PREFIX, DEVICE_PROFILE_SCHEMA, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    PHYSICAL_ACTION_CAPABILITY_PREFIX,
 };
 pub use escalation::{
     EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
@@ -118,8 +134,8 @@ pub use placement::{
     PLACEMENT_DECISION_SCHEMA,
 };
 pub use policy_distribution::{
-    validate_policy_bundle, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyBundleIdError, PolicyBundleKeyring, PolicyBundleTraceContext,
+    validate_policy_bundle, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope,
+    PolicyBundleId, PolicyBundleIdError, PolicyBundleKeyring, PolicyBundleTraceContext,
     PolicyBundleValidationContext, PolicyBundleValidationError, PolicyDegradedMode,
     ValidatedPolicyBundle, POLICY_BUNDLE_SCHEMA_VERSION, POLICY_BUNDLE_SIGNATURE_ALGORITHM,
 };
@@ -132,8 +148,8 @@ pub use state_handoff::{
     StateReference, StateReferenceMode,
 };
 pub use trace::{
-    GovernanceTraceEventKindError, LocalDelegationTraceContext, TraceEvent, TraceEventKind,
-    TraceIntegrity,
+    GovernanceTraceEventKindError, LocalDelegationTraceContext, OfflineTraceIntervalTraceContext,
+    TraceEvent, TraceEventKind, TraceIntegrity, TraceSyncBoundaryTraceContext,
 };
 pub use work_order::{
     validate_work_order, ValidatedWorkOrder, WorkOrder, WorkOrderEnvelope, WorkOrderKeyring,

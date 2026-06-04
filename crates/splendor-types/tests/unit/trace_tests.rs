@@ -7,11 +7,12 @@ use crate::{
     GovernanceScope, GovernanceState, GovernanceTraceEventKindError, GovernanceTraceLink,
     GovernanceTransition, GovernanceTransitionError, InstanceId, InterventionId, KillSwitchId,
     LocalDelegationTraceContext, Message, MessageEnvelope, MessageId, MessageTraceContext, NodeId,
-    Percept, PerceptProvenance, RemoteMessageEnvelope, RemoteMessageRetryPolicy,
-    RemoteMessageTraceContext, RevocationStatus, SideEffectClass, SnapshotId,
-    StateHandoffTraceContext, StateReferenceMode, TaskFailure, TaskRequest, TenantId, TraceId,
-    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    GOVERNANCE_STATE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, WORK_ORDER_SCHEMA_VERSION,
+    OfflineTraceIntervalTraceContext, Percept, PerceptProvenance, RemoteMessageEnvelope,
+    RemoteMessageRetryPolicy, RemoteMessageTraceContext, RevocationStatus, SideEffectClass,
+    SnapshotId, StateHandoffTraceContext, StateReferenceMode, TaskFailure, TaskRequest, TenantId,
+    TraceId, TraceSyncBoundaryTraceContext, WorkOrder, WorkOrderEnvelope, WorkOrderId,
+    WorkOrderPlacement, WorkOrderQuotaPolicy, GOVERNANCE_STATE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 
 #[test]
@@ -78,6 +79,55 @@ fn trace_event_round_trip() {
     let payload = serde_json::to_vec(&percept_event).expect("serialize");
     let decoded: TraceEvent = serde_json::from_slice(&payload).expect("deserialize");
     assert_eq!(decoded, percept_event);
+}
+
+#[test]
+fn offline_interval_and_sync_boundary_trace_events_round_trip() {
+    let run_id = RunId::new();
+    let interval = OfflineTraceIntervalTraceContext {
+        offline_interval_id: "offline-run-0".to_string(),
+        node_id: Some("node-edge-1".to_string()),
+        instance_id: Some("instance-edge-1".to_string()),
+        start_sequence: 0,
+        end_sequence: Some(9),
+        reason: Some("network_disconnected".to_string()),
+    };
+    let boundary = TraceSyncBoundaryTraceContext {
+        sync_batch_id: "sync-run-0-10".to_string(),
+        offline_interval_id: Some(interval.offline_interval_id.clone()),
+        start_sequence: 0,
+        end_sequence: 10,
+        accepted_records: Some(10),
+        duplicate_records: Some(0),
+    };
+    let events = vec![
+        TraceEventKind::OfflineTraceIntervalStarted {
+            interval: interval.clone(),
+        },
+        TraceEventKind::OfflineTraceIntervalEnded { interval },
+        TraceEventKind::TraceSyncStarted {
+            boundary: boundary.clone(),
+        },
+        TraceEventKind::TraceSyncCompleted {
+            boundary: boundary.clone(),
+        },
+        TraceEventKind::TraceSyncFailed {
+            boundary,
+            reason: "central_unavailable".to_string(),
+        },
+    ];
+
+    for (sequence, kind) in events.into_iter().enumerate() {
+        let event = TraceEvent::new(
+            run_id.clone(),
+            sequence as u64,
+            OffsetDateTime::now_utc(),
+            kind,
+        );
+        let payload = serde_json::to_vec(&event).expect("serialize");
+        let decoded: TraceEvent = serde_json::from_slice(&payload).expect("deserialize");
+        assert_eq!(decoded, event);
+    }
 }
 
 #[test]
