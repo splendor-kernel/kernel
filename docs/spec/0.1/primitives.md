@@ -255,6 +255,11 @@ Extension rules: Extensions cannot add allowed actions, adapters, permissions,
 data refs, quotas, signatures, revocation status, placement execution authority,
 approvals, or credentials.
 
+Signature semantics: `signature` is required for run start/resume. A missing,
+null, empty, unknown-key, or invalid signature is not a local authority hint; it
+is invalid and must fail closed unless an explicitly documented local-dev
+unsigned mode is enabled outside stable production/fleet behavior.
+
 Trace/state/replay/security notes: Unsigned, expired, revoked, malformed, or
 incompatible work orders fail closed before run start/resume. Replay can inspect
 work-order trace records but must not re-verify external signatures or contact
@@ -269,11 +274,11 @@ Identity rules: `approval_id` is distinct from action, run, trace, work-order,
 and governance object IDs. Approval evidence is one verifier input; it never
 bypasses the gateway.
 
-Required fields: `approval_id`, `scope`, `status` or `decision`, `reason`,
-`issuer`, `trace` or `trace_event_id`, `created_at` or `issued_at`.
+Required fields: `schema_version`, `approval_id`, `tenant_id`, `agent_id`,
+`run_id`, `decision`, `issued_at`, `expires_at`.
 
-Optional fields: `expires_at`, `revocation`, `action_id`, `adapter`,
-`extensions`.
+Optional fields: `action_id`, `action_name`, `adapter`, `reason`, `revoked`,
+`trace_event_id`, `extensions`.
 
 Extension rules: Extensions cannot grant approvals, change scope, include tokens,
 or bypass verifier checks.
@@ -290,8 +295,7 @@ action proposals and constraint evaluation.
 Identity rules: Policy execution is scoped by tenant, agent, run, tick, state
 reference, percepts, and messages. Policy identity is not action authority.
 
-Required fields: `policy_id` or `policy`, `tenant_id`, `agent_id`,
-`schema_version` for policy bundles.
+Required fields: `schema_version`, `policy_id`, `tenant_id`, `agent_id`.
 
 Optional fields: `policy_bundle_id`, `version`, `issued_at`, `expires_at`,
 `revocation`, `degraded_mode`, `extensions`.
@@ -329,7 +333,7 @@ evidence before or after adapter execution.
 Identity rules: A verifier has a stable name/category but does not own tenant,
 agent, run, action, approval, or work-order identity.
 
-Required fields: `verifier` or `name`, `category`, `result`.
+Required fields: `verifier`, `category`, `result`.
 
 Optional fields: `applies_to`, `evidence_schema`, `extensions`.
 

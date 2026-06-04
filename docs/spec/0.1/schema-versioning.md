@@ -101,3 +101,8 @@ conversion.
 coverage to prove the stable primitive list, required fields, enum references,
 and extension restrictions are present. This is not the full 0.1-S2 conformance
 suite.
+
+The S1 validator checks concrete stable examples and Rust/TypeScript/Python
+schema-facing parity where this repository exposes those surfaces. It does not
+claim adapter certification, daemon compatibility, generated schemas, or the full
+cross-implementation conformance matrix planned for 0.1-S2.

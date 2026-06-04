@@ -9,6 +9,10 @@ import {
   ENDPOINT_SCOPE_VALUES,
   EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION,
   GOVERNED_ARTIFACT_REF_SCHEMA_VERSION,
+  STABLE_0_1_ENUM_VALUES,
+  STABLE_0_1_PRIMITIVES,
+  STABLE_0_1_REQUIRED_FIELDS,
+  STABLE_0_1_RESERVED_EXTENSION_KEYS,
   TRACE_EVENT_KIND_VARIANTS
 } from "@splendor/types";
 import type {
@@ -71,69 +75,75 @@ function extractOpenApiSchemaBlock(source: string, schema: string): string {
   return nextSchema ? remainder.slice(0, nextSchema.index + 1) : remainder;
 }
 
-const STABLE_0_1_PRIMITIVES = [
-  "Tenant",
-  "Agent",
-  "Run",
-  "Tick",
-  "Action",
-  "Percept",
-  "Message",
-  "StateNode",
-  "TraceEvent",
-  "WorkOrder",
-  "Approval",
-  "Policy",
-  "Constraint",
-  "Verifier",
-  "Adapter",
-  "Feedback",
-  "Reward"
-] as const;
+function pascalToSnake(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
 
-const AUTHORITY_EXTENSION_KEYS = [
-  "tenant_id",
-  "agent_id",
-  "run_id",
-  "action_id",
-  "trace_event_id",
-  "message_id",
-  "work_order_id",
-  "approval_id",
-  "authority",
-  "permissions",
-  "allowed_actions",
-  "allowed_adapters",
-  "allowed_permissions",
-  "policy",
-  "policy_bundle",
-  "work_order",
-  "approval",
-  "approval_token",
-  "signature",
-  "credential",
-  "adapter",
-  "quota",
-  "verifier",
-  "gateway"
-] as const;
+type StablePrimitiveManifest = {
+  schema_version: string;
+  extension_policy: { authority: string; reserved_keys: string[] };
+  enum_values: Record<string, string[]>;
+  deprecated_aliases: Array<{ alias: string; replacement: string }>;
+  primitives: Array<{
+    name: string;
+    identity_fields: string[];
+    required_fields: string[];
+    optional_fields: string[];
+    extensions: string;
+    example: Record<string, unknown>;
+  }>;
+};
+
+function rejectAuthorityFields(
+  primitive: { required_fields: string[]; optional_fields: string[]; extensions: string },
+  candidate: Record<string, unknown>,
+  reserved: readonly string[]
+): void {
+  const declared = new Set([...primitive.required_fields, ...primitive.optional_fields]);
+  for (const key of Object.keys(candidate)) {
+    assert.ok(!reserved.includes(key) || declared.has(key), `unknown top-level authority field ${key} must be rejected`);
+  }
+  if ("extensions" in candidate) {
+    assert.equal(primitive.extensions, "non_authorizing", "extensions must be explicitly allowed");
+    const extensions = candidate.extensions;
+    assert.ok(extensions !== null && typeof extensions === "object" && !Array.isArray(extensions), "extensions must be an object");
+    for (const key of Object.keys(extensions as Record<string, unknown>)) {
+      assert.ok(!reserved.includes(key), `extension key ${key} must not carry authority`);
+    }
+  }
+}
+
+function validateStableExample(
+  primitive: StablePrimitiveManifest["primitives"][number],
+  reserved: readonly string[],
+  enumValues: Record<string, readonly string[]>
+): void {
+  for (const field of primitive.required_fields) {
+    assert.ok(Object.hasOwn(primitive.example, field), `${primitive.name} example must include ${field}`);
+    assert.notEqual(primitive.example[field], undefined, `${primitive.name}.${field} must not be undefined`);
+  }
+  rejectAuthorityFields(primitive, primitive.example, reserved);
+  const invalidExtension = { ...primitive.example, extensions: { allowed_permissions: ["admin"] } };
+  if (primitive.extensions === "non_authorizing") {
+    assert.throws(() => rejectAuthorityFields(primitive, invalidExtension, reserved), /extension key allowed_permissions/);
+  }
+  const invalidTopLevel = { ...primitive.example, credential: "secret" };
+  assert.throws(() => rejectAuthorityFields(primitive, invalidTopLevel, reserved), /unknown top-level authority field credential/);
+
+  if (primitive.name === "Run") assert.ok(enumValues.run_status.includes(String(primitive.example.status)));
+  if (primitive.name === "Action") assert.ok(enumValues.side_effect_class.includes(String(primitive.example.side_effect_class)));
+  if (primitive.name === "Approval") assert.ok(enumValues.approval_decision.includes(String(primitive.example.decision)));
+  if (primitive.name === "Constraint") {
+    assert.ok(enumValues.constraint_kind.includes(String(primitive.example.kind)));
+    assert.ok(enumValues.constraint_scope.includes(String(primitive.example.scope)));
+  }
+}
 
 test("0.1-S1 stable primitive docs and example manifest are aligned", () => {
   const primitivesDoc = readRepoFile("docs/spec/0.1/primitives.md");
   const versioningDoc = readRepoFile("docs/spec/0.1/schema-versioning.md");
   const milestoneDoc = readRepoFile("docs/milestones/0.1-dev/S1-stable-schema-freeze.md");
-  const manifest = JSON.parse(readRepoFile("docs/spec/0.1/stable-primitive-examples.json")) as {
-    schema_version: string;
-    extension_policy: { authority: string; reserved_keys: string[] };
-    deprecated_aliases: Array<{ alias: string; replacement: string }>;
-    primitives: Array<{
-      name: string;
-      identity_fields: string[];
-      required_fields: string[];
-      optional_fields: string[];
-      extensions: string;
-    }>;
-  };
+  const manifest = JSON.parse(readRepoFile("docs/spec/0.1/stable-primitive-examples.json")) as StablePrimitiveManifest;
 
   assert.equal(manifest.schema_version, "splendor.stable_primitives_manifest.v1");
   assert.equal(manifest.extension_policy.authority, "non_authorizing");
@@ -141,18 +151,20 @@ test("0.1-S1 stable primitive docs and example manifest are aligned", () => {
     manifest.primitives.map((primitive) => primitive.name),
     [...STABLE_0_1_PRIMITIVES]
   );
+  assert.deepEqual(manifest.extension_policy.reserved_keys, [...STABLE_0_1_RESERVED_EXTENSION_KEYS]);
+  assert.deepEqual(manifest.enum_values, STABLE_0_1_ENUM_VALUES);
 
   for (const primitive of STABLE_0_1_PRIMITIVES) {
     assert.match(primitivesDoc, new RegExp(`## Primitive: ${primitive}\\n`), `${primitive} section must exist`);
     const entry = manifest.primitives.find((candidate) => candidate.name === primitive);
     assert.ok(entry, `${primitive} manifest entry must exist`);
-    assert.ok(entry.required_fields.length > 0, `${primitive} must list required fields`);
+    assert.deepEqual(entry.required_fields, STABLE_0_1_REQUIRED_FIELDS[primitive], `${primitive} required fields must match TS surface`);
     assert.ok(entry.optional_fields.length > 0, `${primitive} must list optional fields`);
     assert.ok(["none", "non_authorizing"].includes(entry.extensions), `${primitive} extension policy must be explicit`);
+    validateStableExample(entry, STABLE_0_1_RESERVED_EXTENSION_KEYS, STABLE_0_1_ENUM_VALUES);
   }
 
-  for (const reserved of AUTHORITY_EXTENSION_KEYS) {
-    assert.ok(manifest.extension_policy.reserved_keys.includes(reserved), `extension policy must reserve ${reserved}`);
+  for (const reserved of STABLE_0_1_RESERVED_EXTENSION_KEYS) {
     assert.match(primitivesDoc, new RegExp(`\\b${reserved}\\b`), `primitive docs must mention ${reserved}`);
   }
 
@@ -413,9 +425,21 @@ test("OpenAPI work-order envelope and run status contracts stay canonical", () =
 test("TypeScript enum contracts match canonical Rust gateway and trace variants", () => {
   const trace = readRepoFile("crates/splendor-types/src/trace.rs");
   const gateway = readRepoFile("crates/splendor-gateway/src/lib.rs");
+  const primitives = readRepoFile("crates/splendor-types/src/primitives.rs");
+  const message = readRepoFile("crates/splendor-types/src/message.rs");
+  const approval = readRepoFile("crates/splendor-types/src/approval.rs");
 
   assert.deepEqual([...TRACE_EVENT_KIND_VARIANTS], extractEnumVariants(trace, "TraceEventKind"));
   assert.deepEqual([...ACTION_STATUS_VALUES], extractEnumVariants(gateway, "ActionStatus"));
+  assert.deepEqual([...STABLE_0_1_ENUM_VALUES.action_status], extractEnumVariants(gateway, "ActionStatus"));
+  assert.deepEqual([...STABLE_0_1_ENUM_VALUES.approval_decision], extractEnumVariants(approval, "ApprovalDecision"));
+  assert.deepEqual([...STABLE_0_1_ENUM_VALUES.constraint_kind], extractEnumVariants(primitives, "ConstraintKind"));
+  assert.deepEqual([...STABLE_0_1_ENUM_VALUES.constraint_scope], extractEnumVariants(primitives, "ConstraintScope"));
+  assert.deepEqual([...STABLE_0_1_ENUM_VALUES.side_effect_class], extractEnumVariants(primitives, "SideEffectClass").filter((variant) => variant !== "Custom"));
+  assert.deepEqual(
+    [...STABLE_0_1_ENUM_VALUES.message_delivery_status],
+    extractEnumVariants(message, "MessageDeliveryStatus").map(pascalToSnake)
+  );
   assert.deepEqual([...ENDPOINT_SCOPE_VALUES], extractEnumVariants(readRepoFile("crates/splendor-types/src/daemon_security.rs"), "EndpointScope"));
 });
 

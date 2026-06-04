@@ -13,8 +13,11 @@ against documented public schemas without relying on undocumented internals.
 - Added `docs/spec/0.1/schema-versioning.md` for breaking/non-breaking changes,
   deprecation, migration, and extension compatibility.
 - Added `docs/spec/0.1/stable-primitive-examples.json` as a lightweight S1
-  example manifest.
-- Added focused TypeScript validation for the S1 docs and fixture.
+  example manifest with concrete examples for every stable primitive.
+- Added focused TypeScript and Python validation for the S1 docs, fixture,
+  required fields, enum values, and extension restrictions.
+- Added schema-facing TypeScript and Python constants for stable primitive names,
+  required fields, enum values, and reserved extension keys.
 
 ## Non-Goals
 
@@ -32,8 +35,9 @@ against documented public schemas without relying on undocumented internals.
 - Documentation of dev-era aliases, including `trace_id` as an input alias for
   `trace_event_id` where implemented.
 
-No Rust, Python, TypeScript runtime, daemon, gateway, or adapter API behavior was
-changed by this sprint.
+No production runtime, daemon, gateway, or adapter behavior was changed by this
+sprint. The TypeScript and Python additions are schema-facing constants used for
+parity validation.
 
 ## Runtime Primitive Impact
 
@@ -91,8 +95,9 @@ changed by this sprint.
 
 | Test | Purpose | Evidence |
 | --- | --- | --- |
-| contract | Validate stable primitive docs and fixture cover required S1 primitives, fields, identity, and extensions. | `npm test` includes `0.1-S1 stable primitive docs and example manifest are aligned`. |
-| negative | Validate extension reserved keys include authority-bearing keys and examples do not authorize through extensions. | `npm test` fixture checks. |
+| contract | Validate stable primitive docs and fixture cover required S1 primitives, fields, identity, enum values, and extensions. | `npm test` includes `0.1-S1 stable primitive docs and example manifest are aligned`. |
+| parity | Validate TypeScript/Python schema constants match the stable fixture, while TypeScript parity tests continue checking Rust structs/enums. | `npm test`; `python -m pytest python/tests/test_runtime.py`. |
+| negative | Validate extension reserved keys include authority-bearing keys and examples do not authorize through extensions or unknown top-level authority fields. | TypeScript and Python fixture validators. |
 | docs | Validate required docs are present and mention breaking/non-breaking changes plus deprecations. | `npm test`; `git diff --check`. |
 
 ## Example or Fixture
