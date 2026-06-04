@@ -73,7 +73,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Release docs alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-docs` | `/Users/db/dev/Splendor Kernel-106-0.05-docs` | merged | [#107](https://github.com/splendor-os/kernel/pull/107) merged into loop | Sub-agent `git diff --check`; PR CI rust/python/typescript/docker passed; code-review conditional pass resolved by merging label PR | Added 0.05 release notes and aligned README/known limitations/Docker docs/changelog without overclaiming robotics readiness. |
 | Release/package label alignment | #106, #28-#34 | 0.05* | `agent/106-0.05-labels` | `/Users/db/dev/Splendor Kernel-106-0.05-labels` | merged | [#108](https://github.com/splendor-os/kernel/pull/108) merged into loop | `cargo test -p splendorctl run_with_args_version_succeeds`; `pytest python/tests/test_runtime.py -q`; `bash -n scripts/container-tests.sh`; full container smoke by reviewer; PR CI rust/python/typescript/docker passed | Updated release labels, Dockerfile, container test default, and Docker workflow while preserving `splendor.audit_export.v0.04-dev`. |
-| QA/release-readiness review | #106, #28-#34 | 0.05* | n/a | n/a | in progress | n/a | Integrated validation pending | Sub-agent PR reviews completed; final loop-level scans/tests still required before final PR. |
+| QA/release-readiness review | #106, #28-#34 | 0.05* | n/a | n/a | completed | n/a | Integrated loop validation completed | Sub-agent PR reviews completed; docs/package contradictions resolved; final PR can open after tracker update. |
 
 ## GitHub issue management
 
@@ -85,10 +85,15 @@
 
 - 2026-06-04: PR #107 CI checks passed for rust, python, typescript, and docker.
 - 2026-06-04: PR #108 CI checks passed for rust, python, typescript, and docker.
-- Pending: focused physical harness validation on the integrated loop branch.
-- Pending: release-label tests on the integrated loop branch (`cargo test -p splendorctl run_with_args_version_succeeds`, `pytest python/tests/test_runtime.py -q`, `bash -n scripts/container-tests.sh`).
-- Pending: docs/reference consistency scan for release-facing contradictions on the integrated loop branch.
-- Pending: final integrated validation commands selected after sub-agent outputs.
+- 2026-06-04: Integrated loop branch validation passed: `cargo fmt --all -- --check`.
+- 2026-06-04: Integrated loop branch validation passed: `cargo test -p splendorctl run_with_args_version_succeeds`.
+- 2026-06-04: Integrated loop branch validation passed: `cargo test -p splendor-kernel physical_harness --no-default-features` (5 focused harness tests passed).
+- 2026-06-04: Integrated loop branch validation passed: `pytest python/tests/test_runtime.py -q` (23 tests passed).
+- 2026-06-04: Integrated loop branch validation passed: `bash -n scripts/container-tests.sh`.
+- 2026-06-04: Integrated loop branch validation passed: `git diff --check`.
+- 2026-06-04: Integrated loop branch validation passed: `bash scripts/container-tests.sh`; observed `splendorctl 0.1.0 (Splendor0.05-dev)` and `splendor python sdk 0.1.0 (Splendor0.05-dev)`.
+- 2026-06-04: Docker image inspection passed: runtime user `splendor`, OCI version `0.05-dev`, OCI description `Splendor 0.05-dev governed runtime image for local, physical, and edge primitive validation`.
+- 2026-06-04: Release-facing contradiction scan found no current docs saying physical/edge is missing. Current-label scan only found intentional historical 0.04 workflow fallback paths for 0.04 republishing, not active 0.05 defaults.
 
 ## QA findings
 
@@ -108,8 +113,8 @@
 
 ## Remaining blockers
 
-- None known after #107 and #108; integrated loop validation still pending.
+- None known.
 
 ## Final PR readiness
 
-- Not ready. Final PR must wait for sub-agent fixes, QA review, and integrated validation.
+- Ready to open final integration PR from `agent/loop-7f2a06d6-0c86-440c-9d05-af3e6a6e960b` into `dev`; do not merge to `dev` without project policy/human authorization.
