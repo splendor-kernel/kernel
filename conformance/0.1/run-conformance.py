@@ -19,6 +19,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "conformance" / "0.1" / "fixtures" / "conformance-cases.json"
 ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
+STABLE_EXAMPLES_PATH = ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
 ACTION_OUTCOMES = {
     "action.executed",
     "action.denied",
@@ -41,7 +42,19 @@ REQUIRED_TICK_ORDER = [
     "state.committed",
     "tick.completed",
 ]
-SECRET_KEYS = {"secret", "token", "credential", "password", "api_key", "authorization"}
+SECRET_KEYS = {
+    "accesstoken",
+    "apikey",
+    "apitoken",
+    "authorization",
+    "bearertoken",
+    "clientsecret",
+    "credential",
+    "password",
+    "privatekey",
+    "secret",
+    "token",
+}
 
 
 @dataclass
@@ -77,6 +90,10 @@ def event_kind_matches(actual: str, expected: str) -> bool:
     return actual == expected
 
 
+def normalize_key(key: str) -> str:
+    return "".join(character for character in key.lower() if character.isalnum())
+
+
 def validate_trace(trace: dict[str, Any]) -> None:
     events = trace.get("events")
     assert_true(isinstance(events, list) and events, "trace.events must be a non-empty array")
@@ -100,6 +117,12 @@ def validate_trace(trace: dict[str, Any]) -> None:
             assert_true(identity["agent_id"] == trace.get("agent_id"), "trace identity.agent_id mismatch")
 
     ordered_kinds = [event["kind"] for event in events]
+    verification_completed_index = next((index for index, kind in enumerate(ordered_kinds) if kind == "verification.completed"), None)
+    first_outcome_index = next((index for index, kind in enumerate(ordered_kinds) if kind in ACTION_OUTCOMES), None)
+    if first_outcome_index is not None:
+        assert_true(verification_completed_index is not None, "action outcome occurred before verification.completed")
+        assert_true(first_outcome_index > verification_completed_index, "action outcome occurred before verification.completed")
+
     cursor = 0
     for required in REQUIRED_TICK_ORDER:
         while cursor < len(ordered_kinds) and not event_kind_matches(ordered_kinds[cursor], required):
@@ -120,6 +143,10 @@ def validate_gateway(gateway: dict[str, Any]) -> None:
     if status in {"denied", "needs_approval", "needs_intervention"}:
         assert_true(gateway.get("adapter_executed") is False, "pre-execution denial/intervention must not execute adapter")
         assert_true(verification.get("allowed") is False, "denial/intervention verification must fail closed")
+    if status == "executed":
+        assert_true(gateway.get("adapter_executed") is True, "executed gateway case must prove adapter execution")
+        assert_true(verification.get("allowed") is True, "executed gateway case requires successful verification")
+        assert_true("action.executed" in required_events, "executed gateway case must require action.executed trace event")
     if status == "failed":
         assert_true(gateway.get("adapter_executed") is True, "adapter failure case must prove adapter execution happened after allow")
         assert_true(verification.get("allowed") is True, "adapter failure requires successful pre-verification")
@@ -213,7 +240,7 @@ def validate_governance(governance: dict[str, Any]) -> None:
 def contains_secret_key(value: Any) -> bool:
     if isinstance(value, dict):
         for key, nested in value.items():
-            if key.lower() in SECRET_KEYS:
+            if normalize_key(key) in SECRET_KEYS:
                 return True
             if contains_secret_key(nested):
                 return True
@@ -248,9 +275,46 @@ def validate_adapter_manifests(config: dict[str, Any]) -> None:
             assert_true("gateway" in text, f"{manifest.relative_to(ROOT)} must document gateway mediation")
 
 
+def validate_stable_examples(config: dict[str, Any]) -> None:
+    path = ROOT / config.get("path", STABLE_EXAMPLES_PATH.relative_to(ROOT))
+    data = load_json(path)
+    assert_true(data.get("schema_version") == "splendor.stable_primitives_manifest.v1", "stable examples schema_version mismatch")
+    assert_true(data.get("milestone") == "Splendor0.1-dev", "stable examples milestone mismatch")
+    extension_policy = data.get("extension_policy")
+    assert_true(isinstance(extension_policy, dict), "stable examples extension_policy is required")
+    assert_true(extension_policy.get("authority") == "non_authorizing", "stable examples extensions must be non_authorizing")
+    reserved_keys = extension_policy.get("reserved_keys")
+    assert_true(isinstance(reserved_keys, list) and reserved_keys, "stable examples reserved_keys must be present")
+
+    primitives = data.get("primitives")
+    assert_true(isinstance(primitives, list) and primitives, "stable examples primitives must be non-empty")
+    required_primitives = set(config.get("required_primitives", []))
+    seen_primitives: set[str] = set()
+    for primitive in primitives:
+        assert_true(isinstance(primitive, dict), "stable primitive entry must be an object")
+        name = primitive.get("name")
+        assert_true(isinstance(name, str) and name, "stable primitive name is required")
+        seen_primitives.add(name)
+        required_fields = primitive.get("required_fields")
+        example = primitive.get("example")
+        assert_true(isinstance(required_fields, list), f"{name} required_fields must be an array")
+        assert_true(isinstance(example, dict), f"{name} example must be an object")
+        missing = [field for field in required_fields if field not in example]
+        assert_true(not missing, f"{name} example missing required fields: {', '.join(missing)}")
+        extensions = example.get("extensions")
+        if isinstance(extensions, dict):
+            illegal = sorted(key for key in extensions if key in reserved_keys or normalize_key(key) in SECRET_KEYS)
+            assert_true(not illegal, f"{name} extensions contain reserved authority keys: {', '.join(illegal)}")
+
+    missing_primitives = sorted(required_primitives - seen_primitives)
+    assert_true(not missing_primitives, f"stable examples missing primitives: {', '.join(missing_primitives)}")
+
+
 def validate_case(case: dict[str, Any]) -> None:
     primitive = case.get("primitive")
     if primitive == "runtime_loop":
+        validate_trace(case["trace"])
+    elif primitive == "trace":
         validate_trace(case["trace"])
     elif primitive == "gateway":
         validate_gateway(case["gateway"])
@@ -266,6 +330,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_governance(case["governance"])
     elif primitive == "adapters":
         validate_adapter_manifests(case["adapter_manifests"])
+    elif primitive == "stable_primitives":
+        validate_stable_examples(case["stable_examples"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 

@@ -39,7 +39,7 @@
       "requirement": "CONF-0.1-RUNTIME-ORDER",
       "path": "negative_fixture",
       "description": "Negative fixture proves the runner reports missing/late verification before execution.",
-      "expected_failure": "missing required ordered event percepts.received",
+      "expected_failure": "action outcome occurred before verification.completed",
       "trace": {
         "run_id": "run_conf_bad_order",
         "tenant_id": "tenant_conf_001",
@@ -49,6 +49,78 @@
           { "trace_event_id": "bad_tick_started", "sequence": 0, "kind": "tick.started", "identity": { "run_id": "run_conf_bad_order", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
           { "trace_event_id": "bad_action_executed", "sequence": 1, "kind": "action.executed", "identity": { "run_id": "run_conf_bad_order", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_bad" } }
         ]
+      }
+    },
+    {
+      "case_id": "trace-order-identity-positive",
+      "primitive": "trace",
+      "requirement": "CONF-0.1-TRACE-ORDER-IDENTITY",
+      "path": "positive",
+      "description": "Trace primitive coverage validates strict event order, contiguous sequences, stable trace_event_id use, and identity linkage.",
+      "trace": {
+        "run_id": "run_conf_trace_001",
+        "tenant_id": "tenant_conf_001",
+        "agent_id": "agent_conf_orchestrator",
+        "tick_id": 1,
+        "events": [
+          { "trace_event_id": "trace_only_tick_started", "sequence": 0, "kind": "tick.started", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_only_percepts", "sequence": 1, "kind": "percepts.received", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_only_state_loaded", "sequence": 2, "kind": "state.loaded", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_only_policy_invoked", "sequence": 3, "kind": "policy.invoked", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_only_policy_completed", "sequence": 4, "kind": "policy.completed", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_only_actions", "sequence": 5, "kind": "actions.proposed", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" } },
+          { "trace_event_id": "trace_only_constraints", "sequence": 6, "kind": "constraints.evaluated", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" } },
+          { "trace_event_id": "trace_only_verification_started", "sequence": 7, "kind": "verification.started", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" } },
+          { "trace_event_id": "trace_only_verification_completed", "sequence": 8, "kind": "verification.completed", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" }, "verification": { "allowed": false } },
+          { "trace_event_id": "trace_only_action_denied", "sequence": 9, "kind": "action.denied", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" } },
+          { "trace_event_id": "trace_only_outcome", "sequence": 10, "kind": "outcome.recorded", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_trace_only" } },
+          { "trace_event_id": "trace_only_state_committed", "sequence": 11, "kind": "state.committed", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "state_node_id": "state_trace_only" } },
+          { "trace_event_id": "trace_only_tick_completed", "sequence": 12, "kind": "tick.completed", "identity": { "run_id": "run_conf_trace_001", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } }
+        ]
+      }
+    },
+    {
+      "case_id": "trace-action-outcome-before-verification-negative-fixture",
+      "primitive": "trace",
+      "requirement": "CONF-0.1-TRACE-NO-PREVERIFY-OUTCOME",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves an action outcome before verification.completed is rejected even when a later valid ordered subsequence exists.",
+      "expected_failure": "action outcome occurred before verification.completed",
+      "trace": {
+        "run_id": "run_conf_trace_bad_outcome",
+        "tenant_id": "tenant_conf_001",
+        "agent_id": "agent_conf_orchestrator",
+        "tick_id": 1,
+        "events": [
+          { "trace_event_id": "trace_bad_tick_started", "sequence": 0, "kind": "tick.started", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_bad_early_action", "sequence": 1, "kind": "action.executed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_early" } },
+          { "trace_event_id": "trace_bad_percepts", "sequence": 2, "kind": "percepts.received", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_bad_state_loaded", "sequence": 3, "kind": "state.loaded", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_bad_policy_invoked", "sequence": 4, "kind": "policy.invoked", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_bad_policy_completed", "sequence": 5, "kind": "policy.completed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } },
+          { "trace_event_id": "trace_bad_actions", "sequence": 6, "kind": "actions.proposed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_constraints", "sequence": 7, "kind": "constraints.evaluated", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_verification_started", "sequence": 8, "kind": "verification.started", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_verification_completed", "sequence": 9, "kind": "verification.completed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_action_denied", "sequence": 10, "kind": "action.denied", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_outcome", "sequence": 11, "kind": "outcome.recorded", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "action_id": "action_later" } },
+          { "trace_event_id": "trace_bad_state_committed", "sequence": 12, "kind": "state.committed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1, "state_node_id": "state_bad_trace" } },
+          { "trace_event_id": "trace_bad_tick_completed", "sequence": 13, "kind": "tick.completed", "identity": { "run_id": "run_conf_trace_bad_outcome", "tenant_id": "tenant_conf_001", "agent_id": "agent_conf_orchestrator", "tick_id": 1 } }
+        ]
+      }
+    },
+    {
+      "case_id": "gateway-executed-after-verification",
+      "primitive": "gateway",
+      "requirement": "CONF-0.1-GATEWAY-POSITIVE",
+      "path": "positive",
+      "description": "Gateway executed path proves successful verification, adapter execution, and required trace events.",
+      "gateway": {
+        "action_id": "action_executed_query",
+        "status": "executed",
+        "verification": { "allowed": true, "reasons": [], "verifier_results": [{ "verifier": "tenant", "allowed": true, "reason": "tenant allowed" }, { "verifier": "quota", "allowed": true, "reason": "quota available" }] },
+        "adapter_executed": true,
+        "required_events": ["verification.started", "verification.completed", "action.executed", "outcome.recorded"]
       }
     },
     {
@@ -153,6 +225,29 @@
       ]
     },
     {
+      "case_id": "message-missing-causal-parent-negative-fixture",
+      "primitive": "messages",
+      "requirement": "CONF-0.1-MESSAGE-CAUSALITY",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves message causality failures report against the message primitive.",
+      "expected_failure": "message causal_parent must reference a trace event",
+      "message": {
+        "message_id": "msg_conf_bad_parent",
+        "source_agent_id": "agent_conf_orchestrator",
+        "target_agent_id": "agent_conf_specialist",
+        "run_id": "run_conf_001",
+        "schema": "splendor.message.task_request.v1",
+        "payload": { "objective": "bad causal parent" },
+        "causal_parent": "trace_missing_parent",
+        "requires_response": true,
+        "created_at": "2026-05-25T00:00:00Z"
+      },
+      "trace_events": [
+        { "trace_event_id": "trace_message_bad_queued", "sequence": 7, "kind": "message.queued", "identity": { "run_id": "run_conf_001", "message_id": "msg_conf_bad_parent" } },
+        { "trace_event_id": "trace_message_bad_delivered", "sequence": 8, "kind": "message.delivered", "identity": { "run_id": "run_conf_001", "message_id": "msg_conf_bad_parent" } }
+      ]
+    },
+    {
       "case_id": "work-order-accepted-scopes-authority",
       "primitive": "work_orders",
       "requirement": "CONF-0.1-WORK-ORDER-POSITIVE",
@@ -231,6 +326,14 @@
       "path": "positive",
       "description": "Adapter manifests validate maturity evidence, replay suppression, secret-free fixtures, and gateway mediation.",
       "adapter_manifests": { "directory": "docs/spec/0.1/fixtures/adapter-manifests", "require_replay_side_effects_false": true, "forbid_secret_fields": true, "require_gateway_evidence": true }
+    },
+    {
+      "case_id": "stable-primitive-examples-validate-required-fields",
+      "primitive": "stable_primitives",
+      "requirement": "CONF-0.1-STABLE-PRIMITIVE-EXAMPLES",
+      "path": "positive",
+      "description": "S1 stable primitive examples load with required fields, non-authorizing extensions, and expected primitive coverage.",
+      "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json", "required_primitives": ["Tenant", "Agent", "Run", "Tick", "Action", "Percept", "Message", "StateNode", "TraceEvent", "WorkOrder", "Approval", "Policy", "Constraint", "Verifier", "Adapter", "Feedback", "Reward"] }
     }
   ]
 }

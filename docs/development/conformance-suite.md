@@ -22,6 +22,7 @@ The command exits non-zero when any conformance case fails.
 ## What It Validates
 
 - Runtime loop ordering and trace identity.
+- Dedicated trace primitive ordering and pre-verification outcome rejection.
 - Gateway positive, denial, failure, and fail-closed boundaries.
 - State graph identity, hash, parent, and trace linkage.
 - Replay side-effect suppression.
@@ -29,6 +30,7 @@ The command exits non-zero when any conformance case fails.
 - Work-order unsigned, expired, revoked, and overbroad rejection.
 - Governance approval, denial, escalation, and circuit-breaker contract evidence.
 - Adapter maturity manifests without production secrets or external systems.
+- S1 stable primitive examples from `docs/spec/0.1/stable-primitive-examples.json`.
 
 ## Fixture Library
 
@@ -44,9 +46,9 @@ Adapter contract evidence is reused from:
 docs/spec/0.1/fixtures/adapter-manifests/*.json
 ```
 
-The runner also includes a negative fixture that is expected to fail internally.
-That case proves broken trace ordering produces an exact primitive/requirement
-failure instead of a shallow file-existence pass.
+The runner also includes negative fixtures that are expected to fail internally.
+Those cases prove broken trace ordering and message causality produce exact
+primitive/requirement failures instead of shallow file-existence passes.
 
 ## CI Usage
 

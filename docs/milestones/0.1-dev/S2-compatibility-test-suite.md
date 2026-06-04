@@ -11,6 +11,8 @@ exact primitive and requirement failures.
 - Add `conformance/0.1/run-conformance.py` as the single reference runner.
 - Add `conformance/0.1/fixtures/conformance-cases.json` as the fixture library.
 - Reuse S3 adapter manifests from `docs/spec/0.1/fixtures/adapter-manifests/`.
+- Reuse S1 stable primitive examples from
+  `docs/spec/0.1/stable-primitive-examples.json`.
 - Add text and JSON report formats.
 - Cover runtime loop, gateway, trace, state, replay, messages, work orders,
   governance, and adapters.
@@ -49,7 +51,8 @@ No stable primitive schema changed. This sprint adds conformance fixture schema
 No runtime trace events were added or changed. Fixtures validate existing stable
 event classes including `tick.started`, `verification.completed`, action outcome
 events, `state.committed`, message lifecycle events, approval events,
-escalation, and circuit-breaker events.
+escalation, and circuit-breaker events. Dedicated `primitive: trace` fixtures
+report trace-specific ordering and identity failures.
 
 ## 7. State Behavior Added Or Changed
 
@@ -60,8 +63,9 @@ state commit failure behavior.
 ## 8. Verifier/Gateway Behavior Added Or Changed
 
 No runtime gateway behavior changed. Fixtures validate gateway mediation,
-verification before action outcome, denial before adapter execution, verifier
-uncertainty fail-closed behavior, and adapter failure recording.
+successful execution after verification, verification before action outcome,
+denial before adapter execution, verifier uncertainty fail-closed behavior, and
+adapter failure recording.
 
 ## 9. Replay Behavior
 
@@ -73,8 +77,8 @@ adapters in replay fixtures and adapter manifests.
 
 The suite includes failures for adapter errors, state commit failure, verifier
 unavailability, unsigned/expired/revoked/overbroad work orders, approval denial,
-escalation to intervention, circuit-breaker denial, and a negative trace-order
-fixture that must fail internally.
+escalation to intervention, circuit-breaker denial, message causality, and
+negative trace-order fixtures that must fail internally.
 
 ## 11. Test Evidence
 

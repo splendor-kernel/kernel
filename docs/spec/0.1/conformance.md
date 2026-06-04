@@ -44,7 +44,9 @@ The suite validates:
 
 - Complete runtime tick ordering from `tick.started` through `tick.completed`.
 - Verification before action outcome events.
+- Trace-specific ordering and identity failures with `primitive: trace` reporting.
 - Gateway denials and verifier uncertainty that skip adapter execution.
+- Gateway successful execution after verification.
 - Adapter failure recorded as a traceable failure after verification allows.
 - State commits with tenant, agent, run, parent, hash, trace linkage, and time.
 - State commit failure preventing tick completion and next-tick advancement.
@@ -54,6 +56,8 @@ The suite validates:
 - Governance approval, denial, escalation/intervention, and circuit-breaker paths.
 - Adapter manifests with maturity metadata, replay suppression, gateway mediation,
   and no secret-shaped fixture fields.
+- S1 stable primitive examples with required fields and non-authorizing
+  extensions.
 
 ## Report Format
 
@@ -62,7 +66,7 @@ The text report is stable for humans:
 ```text
 Splendor 0.1 conformance report
 status: pass
-cases: 18
+cases: <case_count>
 failed: 0
 PASS <primitive> <requirement> <case_id>: <message>
 ```
@@ -75,7 +79,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 18,
+  "case_count": 24,
   "failed_count": 0,
   "results": [
     {
