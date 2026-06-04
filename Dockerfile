@@ -31,12 +31,12 @@ RUN python -m venv /opt/splendor-venv \
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 
-ARG SPLENDOR_IMAGE_VERSION=0.04-dev
+ARG SPLENDOR_IMAGE_VERSION=0.05-dev
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="Splendor Kernel" \
-      org.opencontainers.image.description="Splendor 0.04-dev governed runtime deployment image" \
+      org.opencontainers.image.description="Splendor 0.05-dev governed runtime image for local, physical, and edge primitive validation" \
       org.opencontainers.image.version="${SPLENDOR_IMAGE_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
@@ -63,7 +63,7 @@ COPY --chown=splendor:splendor examples/daemon-client-local ./examples/daemon-cl
 COPY --chown=splendor:splendor examples/action-approval-flow ./examples/action-approval-flow
 COPY --chown=splendor:splendor examples/circuit-breaker-basic ./examples/circuit-breaker-basic
 COPY --chown=splendor:splendor examples/governance-audit-export ./examples/governance-audit-export
-COPY --chown=splendor:splendor docs/releases/0.04-dev.md ./docs/releases/0.04-dev.md
+COPY --chown=splendor:splendor docs/releases ./docs/releases
 COPY --chown=splendor:splendor docs/deployment/docker.md ./docs/deployment/docker.md
 COPY --chown=splendor:splendor openapi/splendor-runtime-daemon.yaml ./openapi/splendor-runtime-daemon.yaml
 

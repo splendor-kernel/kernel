@@ -9,11 +9,40 @@
   local safety verifier.
 - Hardened gateway physical-action validation so forbidden low-level physical
   control names are denied before adapter execution.
+- Added the 0.05-S1 device profile and physical capability schemas for robots,
+  drones, humanoids, edge appliances, desktop sidecars, and industrial devices,
+  including validation that rejects raw motor/actuator and ambiguous direct
+  physical actions.
+- Added the 0.05-S2 offline policy cache behavior for disconnected physical/edge
+  instances, including cached-policy TTL handling, low-risk offline allowance,
+  high-risk denial/local intervention, and trace-visible connectivity changes.
+- Added the 0.05-S3 local trace buffer and reconnect sync contracts, including
+  offline interval markers, sync boundaries, duplicate sync handling, corruption
+  quarantine/rejection, and storage-pressure fail-closed behavior for
+  side-effectful actions.
+- Added the 0.05-S5 safety verifier API in the existing gateway chain with
+  simulated geofence, battery, emergency stop, collision, altitude, privacy,
+  proximity, uncertainty, and postcondition evidence.
+- Added the 0.05-S6 advisory cloud-helper pattern with scoped helper work-order
+  validation, route-plan proposal messages, local route validation, helper
+  failure handling, and denial of cloud direct physical or robotics adapter
+  authority.
+- Added the 0.05-S7 physical simulation harness covering successful high-level
+  missions, safety denial before adapter execution, offline interval/reconnect
+  sync, operator intervention/override request flow, cloud-helper local
+  validation, final state heads, and inspect-only replay without helper or
+  adapter side effects.
+- Added 0.05-dev release notes and aligned release-facing documentation with the
+  implemented physical/edge development primitives while preserving production
+  hardware non-goals.
 
 ### Explicitly not included
 
 - No ROS/native package, live hardware path, motor controller, direct
   cloud-to-actuator path, or robotics safety certification claim.
+- No hard real-time robot control, raw actuator writes, firmware safety bypass,
+  production physical hardware deployment, fleet route optimizer product, adapter
+  certification program, or 0.1 stable compatibility guarantee.
 
 ## 0.04-dev — Governance workflows
 

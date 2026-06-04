@@ -41,7 +41,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.04-dev";
+const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.05-dev";
 
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
