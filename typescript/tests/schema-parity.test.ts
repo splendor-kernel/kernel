@@ -71,6 +71,105 @@ function extractOpenApiSchemaBlock(source: string, schema: string): string {
   return nextSchema ? remainder.slice(0, nextSchema.index + 1) : remainder;
 }
 
+const STABLE_0_1_PRIMITIVES = [
+  "Tenant",
+  "Agent",
+  "Run",
+  "Tick",
+  "Action",
+  "Percept",
+  "Message",
+  "StateNode",
+  "TraceEvent",
+  "WorkOrder",
+  "Approval",
+  "Policy",
+  "Constraint",
+  "Verifier",
+  "Adapter",
+  "Feedback",
+  "Reward"
+] as const;
+
+const AUTHORITY_EXTENSION_KEYS = [
+  "tenant_id",
+  "agent_id",
+  "run_id",
+  "action_id",
+  "trace_event_id",
+  "message_id",
+  "work_order_id",
+  "approval_id",
+  "authority",
+  "permissions",
+  "allowed_actions",
+  "allowed_adapters",
+  "allowed_permissions",
+  "policy",
+  "policy_bundle",
+  "work_order",
+  "approval",
+  "approval_token",
+  "signature",
+  "credential",
+  "adapter",
+  "quota",
+  "verifier",
+  "gateway"
+] as const;
+
+test("0.1-S1 stable primitive docs and example manifest are aligned", () => {
+  const primitivesDoc = readRepoFile("docs/spec/0.1/primitives.md");
+  const versioningDoc = readRepoFile("docs/spec/0.1/schema-versioning.md");
+  const milestoneDoc = readRepoFile("docs/milestones/0.1-dev/S1-stable-schema-freeze.md");
+  const manifest = JSON.parse(readRepoFile("docs/spec/0.1/stable-primitive-examples.json")) as {
+    schema_version: string;
+    extension_policy: { authority: string; reserved_keys: string[] };
+    deprecated_aliases: Array<{ alias: string; replacement: string }>;
+    primitives: Array<{
+      name: string;
+      identity_fields: string[];
+      required_fields: string[];
+      optional_fields: string[];
+      extensions: string;
+    }>;
+  };
+
+  assert.equal(manifest.schema_version, "splendor.stable_primitives_manifest.v1");
+  assert.equal(manifest.extension_policy.authority, "non_authorizing");
+  assert.deepEqual(
+    manifest.primitives.map((primitive) => primitive.name),
+    [...STABLE_0_1_PRIMITIVES]
+  );
+
+  for (const primitive of STABLE_0_1_PRIMITIVES) {
+    assert.match(primitivesDoc, new RegExp(`## Primitive: ${primitive}\\n`), `${primitive} section must exist`);
+    const entry = manifest.primitives.find((candidate) => candidate.name === primitive);
+    assert.ok(entry, `${primitive} manifest entry must exist`);
+    assert.ok(entry.required_fields.length > 0, `${primitive} must list required fields`);
+    assert.ok(entry.optional_fields.length > 0, `${primitive} must list optional fields`);
+    assert.ok(["none", "non_authorizing"].includes(entry.extensions), `${primitive} extension policy must be explicit`);
+  }
+
+  for (const reserved of AUTHORITY_EXTENSION_KEYS) {
+    assert.ok(manifest.extension_policy.reserved_keys.includes(reserved), `extension policy must reserve ${reserved}`);
+    assert.match(primitivesDoc, new RegExp(`\\b${reserved}\\b`), `primitive docs must mention ${reserved}`);
+  }
+
+  assert.ok(
+    manifest.deprecated_aliases.some((alias) => alias.alias === "trace_id" && alias.replacement === "trace_event_id"),
+    "trace_id alias must have migration guidance"
+  );
+  assert.match(primitivesDoc, /Replay must not execute side effects by default/);
+  assert.match(primitivesDoc, /Side-effectful work must remain mediated by `ActionRequest`/);
+  assert.match(versioningDoc, /## Breaking Changes/);
+  assert.match(versioningDoc, /## Non-Breaking Changes/);
+  assert.match(versioningDoc, /## Deprecation Policy/);
+  assert.match(versioningDoc, /This is not the full 0\.1-S2 conformance\s+suite/);
+  assert.match(milestoneDoc, /0\.1-S1/);
+  assert.match(milestoneDoc, /No runtime behavior changes/);
+});
+
 test("TypeScript primitive field contracts match canonical Rust structs", () => {
   const message = readRepoFile("crates/splendor-types/src/message.rs");
   const primitives = readRepoFile("crates/splendor-types/src/primitives.rs");

@@ -1,0 +1,73 @@
+{
+  "schema_version": "splendor.stable_primitives_manifest.v1",
+  "milestone": "Splendor0.1-dev",
+  "sprint": "0.1-S1",
+  "purpose": "Lightweight S1 schema example manifest for stable primitive docs validation. This is not the full 0.1-S2 conformance suite.",
+  "extension_policy": {
+    "authority": "non_authorizing",
+    "reserved_keys": [
+      "fleet_id",
+      "node_id",
+      "instance_id",
+      "tenant_id",
+      "agent_id",
+      "runtime_context_id",
+      "run_id",
+      "tick_id",
+      "action_id",
+      "state_node_id",
+      "trace_event_id",
+      "message_id",
+      "work_order_id",
+      "approval_id",
+      "artifact_id",
+      "authority",
+      "permission",
+      "permissions",
+      "allowed_actions",
+      "allowed_adapters",
+      "allowed_permissions",
+      "scope",
+      "scope_type",
+      "policy",
+      "policy_bundle",
+      "work_order",
+      "approval",
+      "approval_token",
+      "signature",
+      "credential",
+      "secret",
+      "token",
+      "adapter",
+      "quota",
+      "verifier",
+      "gateway"
+    ]
+  },
+  "deprecated_aliases": [
+    {
+      "alias": "trace_id",
+      "replacement": "trace_event_id",
+      "guidance": "Emit trace_event_id; accept trace_id only as a migration input alias where implemented."
+    }
+  ],
+  "primitives": [
+    { "name": "Tenant", "identity_fields": ["tenant_id"], "required_fields": ["tenant_id", "allowed_actions", "allowed_adapters"], "optional_fields": ["allowed_permissions", "quotas", "policy_refs", "data_refs", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Agent", "identity_fields": ["agent_id", "tenant_id"], "required_fields": ["agent_id", "tenant_id"], "optional_fields": ["runtime_context_id", "label", "metadata", "allowed_actions", "allowed_adapters", "allowed_permissions", "state_head", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Run", "identity_fields": ["run_id", "tenant_id", "agent_id"], "required_fields": ["run_id", "tenant_id", "agent_id", "status"], "optional_fields": ["objective", "work_order_id", "parent_run_id", "child_run_ids", "state_head", "trace_range", "created_at", "updated_at", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Tick", "identity_fields": ["run_id", "tick_id"], "required_fields": ["run_id", "tick_id", "started_at"], "optional_fields": ["completed_at", "percept_count", "proposed_action_count", "state_node_id", "status", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Action", "identity_fields": ["action_id"], "required_fields": ["name", "params", "side_effect_class", "required_permissions", "preconditions", "postconditions"], "optional_fields": ["cost_estimate", "adapter"], "extensions": "none" },
+    { "name": "Percept", "identity_fields": [], "required_fields": ["schema", "payload", "provenance", "timestamp"], "optional_fields": ["provenance.detail"], "extensions": "none" },
+    { "name": "Message", "identity_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id"], "required_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "payload", "requires_response", "created_at"], "optional_fields": ["causal_parent"], "extensions": "none" },
+    { "name": "StateNode", "identity_fields": ["state_node_id", "tenant_id", "agent_id", "run_id"], "required_fields": ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "created_at"], "optional_fields": ["trace_event_id", "snapshot_id", "snapshot_ref", "metadata", "extensions"], "extensions": "non_authorizing" },
+    { "name": "TraceEvent", "identity_fields": ["trace_event_id", "run_id"], "required_fields": ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"], "optional_fields": ["identity.fleet_id", "identity.node_id", "identity.instance_id", "identity.tenant_id", "identity.agent_id", "identity.tick_id", "identity.action_id", "identity.state_node_id", "identity.message_id", "identity.approval_id"], "extensions": "none" },
+    { "name": "WorkOrder", "identity_fields": ["work_order_id", "tenant_id", "agent_id", "run_id"], "required_fields": ["schema_version", "work_order_id", "tenant_id", "agent_id", "objective", "allowed_actions", "allowed_adapters", "allowed_permissions", "data_refs", "quotas", "placement", "issued_at", "expires_at", "revocation", "signature"], "optional_fields": ["run_id", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Approval", "identity_fields": ["approval_id"], "required_fields": ["approval_id", "scope", "status", "reason", "issuer", "trace", "created_at"], "optional_fields": ["decision", "expires_at", "revocation", "action_id", "adapter", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Policy", "identity_fields": ["policy_id", "policy_bundle_id", "tenant_id", "agent_id"], "required_fields": ["policy_id", "tenant_id", "agent_id", "schema_version"], "optional_fields": ["policy_bundle_id", "version", "issued_at", "expires_at", "revocation", "degraded_mode", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Constraint", "identity_fields": ["id"], "required_fields": ["id", "kind", "scope", "predicate"], "optional_fields": ["obligation", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Verifier", "identity_fields": ["verifier"], "required_fields": ["verifier", "category", "result"], "optional_fields": ["applies_to", "evidence_schema", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Adapter", "identity_fields": ["name"], "required_fields": ["name", "capabilities", "execute"], "optional_fields": ["verify", "compensate", "maturity", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Feedback", "identity_fields": ["trace_event_id"], "required_fields": ["kind", "payload", "recorded_at"], "optional_fields": ["trace_event_id", "extensions"], "extensions": "non_authorizing" },
+    { "name": "Reward", "identity_fields": ["trace_event_id"], "required_fields": ["value", "recorded_at"], "optional_fields": ["units", "context", "trace_event_id", "extensions"], "extensions": "non_authorizing" }
+  ]
+}
