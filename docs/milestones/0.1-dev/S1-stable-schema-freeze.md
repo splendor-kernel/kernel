@@ -71,8 +71,8 @@ parity validation.
 - No state nodes are created by this sprint.
 - No state head update behavior changed.
 - Stable docs define public StateNode/commit fields including `state_node_id`,
-  parent linkage, state hash, optional snapshot references, trace linkage, and
-  tenant/agent/run scope.
+  parent linkage, state hash, required trace linkage, optional snapshot
+  references, and tenant/agent/run scope.
 - State commit failure behavior remains unchanged.
 
 ## Gateway and Verifier Behavior

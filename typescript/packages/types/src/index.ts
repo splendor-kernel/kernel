@@ -65,7 +65,7 @@ export const STABLE_0_1_REQUIRED_FIELDS = {
     "requires_response",
     "created_at"
   ],
-  StateNode: ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "created_at"],
+  StateNode: ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "trace_event_id", "created_at"],
   TraceEvent: ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"],
   WorkOrder: [
     "schema_version",

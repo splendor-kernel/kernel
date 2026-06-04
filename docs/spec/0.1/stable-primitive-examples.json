@@ -138,8 +138,8 @@
     {
       "name": "StateNode",
       "identity_fields": ["state_node_id", "tenant_id", "agent_id", "run_id"],
-      "required_fields": ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "created_at"],
-      "optional_fields": ["trace_event_id", "snapshot_id", "snapshot_ref", "metadata", "extensions"],
+      "required_fields": ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "trace_event_id", "created_at"],
+      "optional_fields": ["snapshot_id", "snapshot_ref", "metadata", "extensions"],
       "extensions": "non_authorizing",
       "example": {
         "state_node_id": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
