@@ -68,16 +68,16 @@
 | #35 | 0.1-S1 | `agent/35-0.1-S1` | `/Users/db/dev/Splendor Kernel-35-0.1-S1` | merged | [#112](https://github.com/splendor-os/kernel/pull/112) merged into loop | PR CI rust/python/typescript/docker passed; integrated `cargo test -p splendor-types`; `python -m pytest python/tests/test_runtime.py -q`; `npm ci && npm test`; `git diff --check origin/dev..HEAD` | Initial code-review blocked weak parity/examples; fixed with TS/Python schema constants, concrete examples, and lightweight S1 validators. |
 | #37 | 0.1-S3 | `agent/37-0.1-S3` | `/Users/db/dev/Splendor Kernel-37-0.1-S3` | merged | [#111](https://github.com/splendor-os/kernel/pull/111) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python scripts/validate-adapter-manifests.py`; JSON syntax checks in PR; `git diff --check origin/dev..HEAD` | Adapter maturity model, review checklist, manifests, and stricter lightweight validator accepted after review polish. |
 | #36 | 0.1-S2 | `agent/36-0.1-S2` | `/Users/db/dev/Splendor Kernel-36-0.1-S2` | merged | [#113](https://github.com/splendor-os/kernel/pull/113) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; JSON report generation; `python scripts/validate-adapter-manifests.py`; `git diff --check origin/dev..HEAD` | Initial code-review blocked trace-order blind spot, missing trace primitive case, missing gateway positive path, and missing S1 example integration; fixed before merge. |
-| #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | ready to assign after fast-forward to latest loop | not opened | pending | Stable SDK/API docs and compatibility/deprecation policy; must reference S1 schema constants and S2 conformance suite. |
-| #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | blocked on #35/#38 terminology | not opened | pending | Operations guides across supported modes. |
+| #38 | 0.1-S4 | `agent/38-0.1-S4` | `/Users/db/dev/Splendor Kernel-38-0.1-S4` | merged | [#114](https://github.com/splendor-os/kernel/pull/114) merged into loop | PR CI rust/python/typescript/docker passed; integrated `python conformance/0.1/run-conformance.py`; `npm ci && npm test`; `python -m pytest python/tests/test_runtime.py -q`; TS example typecheck; `git diff --check origin/dev..HEAD` | Initial reviews blocked stale status casing, invalid stable examples/security shape, OpenAPI version risk, and inaccurate milestone evidence; fixed before merge. |
+| #39 | 0.1-S5 | `agent/39-0.1-S5` | `/Users/db/dev/Splendor Kernel-39-0.1-S5` | ready to assign | not opened | pending | Operations guides can now use S1 schemas, S2 conformance, S3 maturity, and S4 stable API terminology. |
 | #40 | 0.1-S6 | `agent/40-0.1-S6` | `/Users/db/dev/Splendor Kernel-40-0.1-S6` | blocked on #35-#39 | not opened | pending | Release, migration, compatibility policy, changelog. |
 
 ## GitHub issue management
 
 - Open issues #35-#40 are the active 0.1 sprint issues.
 - No 0.1 issues have been closed by this loop.
-- PR #112, PR #111, and PR #113 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
-- Pending: add/update comments for #38/#39 when their sub-agent branches/PRs are active.
+- PR #112, PR #111, PR #113, and PR #114 are merged into the loop branch. Issues remain open until the integrated final 0.1 loop satisfies sprint acceptance and final PR policy.
+- Pending: add/update comments for #39 when its sub-agent branch/PR is active.
 
 ## Validation log
 
@@ -98,6 +98,14 @@
 - 2026-06-04: Integrated loop validation after #113 merge passed: `python conformance/0.1/run-conformance.py --format json --output target/conformance-0.1-report.json`.
 - 2026-06-04: Integrated loop validation after #113 merge passed: `python scripts/validate-adapter-manifests.py` (3 manifests).
 - 2026-06-04: Integrated loop validation after #113 merge passed: `git diff --check origin/dev..HEAD`.
+- 2026-06-04: PR #114 opened for #38; first review BLOCKED contradictory action outcome casing, invalid/stale stable examples, daemon security-boundary ambiguity, OpenAPI version metadata risk, and overbroad Rust stable API language.
+- 2026-06-04: PR #114 second review still BLOCKED stale approval-flow request shapes and inaccurate S4 milestone validation/change claims; follow-up commit resolved blockers.
+- 2026-06-04: PR #114 merged into loop after code-review `APPROVE WITH NOTES` and PR CI passed rust/python/typescript/docker.
+- 2026-06-04: Integrated loop validation after #114 merge passed: `python conformance/0.1/run-conformance.py` (24 cases).
+- 2026-06-04: Integrated loop validation after #114 merge passed: `npm ci && npm test` (22 tests).
+- 2026-06-04: Integrated loop validation after #114 merge passed: `python -m pytest python/tests/test_runtime.py -q` (24 tests).
+- 2026-06-04: Integrated loop validation after #114 merge passed: `npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/typescript-daemon-client/example.ts`.
+- 2026-06-04: Integrated loop validation after #114 merge passed: `git diff --check origin/dev..HEAD`.
 
 ## QA findings
 
@@ -108,6 +116,7 @@
 - S3 adapter maturity work remained docs/fixture scoped; added validator checks are lightweight evidence, not certification or full conformance.
 - S2 conformance runner is intentionally fixture/contract-level for governance escalation/circuit-breaker and adapter certification; runtime E2E acceptance remains separate.
 - Code-review noted future hardening should make trace verification action-id-specific; non-blocking for S2 but should be considered during later conformance expansion.
+- S4 exposed stale example risk: stable docs must not mark old local/dev examples stable until request shapes, caller credentials, audit attribution, and WorkOrderEnvelope fields are current.
 
 ## Human-sync decisions
 
@@ -123,10 +132,9 @@
 
 ## Remaining blockers
 
-- No blocker to assigning #38.
-- #39 should wait for #38 stable API terminology or proceed only as draft docs with final alignment required.
+- No blocker to assigning #39.
 - #40 remains blocked on #35-#39 integrated outputs.
 
 ## Final PR readiness
 
-- Not ready. PRs #112 and #111 are merged and validated, but #36, #38, #39, and #40 remain pending.
+- Not ready. PRs #112, #111, #113, and #114 are merged and validated, but #39 and #40 remain pending.
