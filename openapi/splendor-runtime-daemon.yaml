@@ -1144,9 +1144,6 @@ components:
         status:
           $ref: '#/components/schemas/RunStatus'
         count: { type: integer, minimum: 0 }
-    RunStatus:
-      type: string
-      enum: [pending, running, paused, waiting_for_approval, interrupted, resuming, completed, failed, cancelled, denied, expired]
     RunTelemetry:
       type: object
       required: [tenant_id, agent_id, run_id, node_id, instance_id, status, updated_at]
