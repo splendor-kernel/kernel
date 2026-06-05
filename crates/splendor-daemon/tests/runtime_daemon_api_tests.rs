@@ -310,13 +310,18 @@ async fn call_empty_with_credential_header<T: DeserializeOwned>(
 }
 
 fn caller_credential(scopes: Vec<EndpointScope>) -> CallerCredential {
+    caller_credential_for_tenant(TenantId::new(), scopes)
+}
+
+fn caller_credential_for_tenant(
+    tenant_id: TenantId,
+    scopes: Vec<EndpointScope>,
+) -> CallerCredential {
     CallerCredential {
         credential_id: "cred_test".to_string(),
         principal: principal(),
         scopes,
-        binding: CredentialBinding::Tenant {
-            tenant_id: TenantId::new(),
-        },
+        binding: CredentialBinding::Tenant { tenant_id },
         audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
@@ -654,11 +659,17 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert!(saw_appended, "append endpoint should be trace-linked");
     assert!(saw_received, "queued daemon percept should reach the tick");
 
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = AuditAttribution {
+        credential_id: Some(trace_credential.credential_id.clone()),
+        ..attribution()
+    };
     let (status, trace_export): (StatusCode, Value) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/traces/export", created.run_id),
-        json!({"credential": null, "redaction_policy": "none", "start": null, "end": null}),
+        json!({"credential": trace_credential, "audit_attribution": trace_audit, "redaction_policy": "none", "start": null, "end": null}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -671,12 +682,18 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         .unwrap_or_default()
         .starts_with("trace-chain:v1:"));
 
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let before_replay_executions = inspected.adapter_executions;
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential.clone(), "audit_attribution": replay_audit.clone()}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -686,7 +703,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({"mode": "inspect_only", "side_effects_allowed": false}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit, "mode": "inspect_only", "side_effects_allowed": false}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -723,6 +740,96 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         inspected_after_replay.adapter_executions, before_replay_executions,
         "replay must not call adapters again"
     );
+}
+
+#[tokio::test]
+async fn replay_and_trace_export_reject_missing_null_and_mismatched_audit() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let create = create_request(tenant_id.clone(), agent_id, Vec::new(), Vec::new());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = AuditAttribution {
+        credential_id: Some(trace_credential.credential_id.clone()),
+        ..attribution()
+    };
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id, vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
+
+    for (path, credential, audit) in [
+        (
+            format!("/runs/{}/traces/export", created.run_id),
+            serde_json::to_value(&trace_credential).unwrap(),
+            serde_json::to_value(&trace_audit).unwrap(),
+        ),
+        (
+            format!("/runs/{}/replay", created.run_id),
+            serde_json::to_value(&replay_credential).unwrap(),
+            serde_json::to_value(&replay_audit).unwrap(),
+        ),
+    ] {
+        let mut base = if path.ends_with("/replay") {
+            json!({"mode": "inspect_only", "side_effects_allowed": false})
+        } else {
+            json!({"redaction_policy": "none", "start": null, "end": null})
+        };
+
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} missing credential");
+        assert_eq!(error.code, "missing_caller_credential");
+
+        base["credential"] = Value::Null;
+        base["audit_attribution"] = audit.clone();
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} null credential");
+        assert_eq!(error.code, "missing_caller_credential");
+
+        base["credential"] = credential.clone();
+        base.as_object_mut().unwrap().remove("audit_attribution");
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} missing audit");
+        assert_eq!(error.code, "missing_audit_attribution");
+
+        base["audit_attribution"] = Value::Null;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} null audit");
+        assert_eq!(error.code, "missing_audit_attribution");
+
+        let mut mismatched = audit.clone();
+        mismatched["credential_id"] = json!("cred_other");
+        base["audit_attribution"] = mismatched;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} credential mismatch");
+        assert_eq!(error.code, "audit_credential_mismatch");
+
+        let mut principal_mismatch = audit.clone();
+        principal_mismatch["principal"] =
+            serde_json::to_value(ClientPrincipal::new("app_test", "client_other")).unwrap();
+        base["audit_attribution"] = principal_mismatch;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} principal mismatch");
+        assert_eq!(error.code, "audit_principal_mismatch");
+    }
 }
 
 #[tokio::test]
@@ -879,11 +986,17 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
             .unwrap_or(false)
     }));
 
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1339,11 +1452,17 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(inspected.adapter_executions, 0);
 
+        let replay_credential =
+            caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+        let replay_audit = AuditAttribution {
+            credential_id: Some(replay_credential.credential_id.clone()),
+            ..attribution()
+        };
         let (status, replay): (StatusCode, ReplayResponse) = call_json(
             app.clone(),
             Method::POST,
             &format!("/runs/{}/replay", created.run_id),
-            json!({}),
+            json!({"credential": replay_credential, "audit_attribution": replay_audit}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1923,11 +2042,17 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::ActionNeedsApproval { .. })));
 
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

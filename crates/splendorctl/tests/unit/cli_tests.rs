@@ -121,6 +121,80 @@ fn fixed_action_id(value: u128) -> ActionId {
     Uuid::from_u128(value).into()
 }
 
+#[test]
+fn daemon_request_refuses_anonymous_mutating_fallback() {
+    let err = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/runs".to_string(),
+    ])
+    .expect_err("token is required");
+    assert!(err.contains("anonymous daemon fallback is not allowed"));
+}
+
+#[test]
+fn daemon_request_parses_local_get_with_credential_header() {
+    let command = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/health".to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+        "--caller-credential".to_string(),
+        "cred.json".to_string(),
+    ])
+    .expect("daemon command parses");
+    match command {
+        Command::DaemonRequest {
+            method,
+            url,
+            credential_path,
+            token,
+            ..
+        } => {
+            assert_eq!(method, "GET");
+            assert_eq!(url, "http://127.0.0.1:8077/health");
+            assert_eq!(credential_path.unwrap(), PathBuf::from("cred.json"));
+            assert_eq!(token, "token");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_request_rejects_missing_or_null_mutating_authority_body() {
+    for body in [
+        r#"{"audit_attribution":{"credential_id":"cred"}}"#,
+        r#"{"credential":{"credential_id":"cred"}}"#,
+        r#"{"credential":null,"audit_attribution":{"credential_id":"cred"}}"#,
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":null}"#,
+    ] {
+        let file = NamedTempFile::new().expect("body file");
+        std::fs::write(file.path(), body).expect("write body");
+        let err = daemon_request(
+            "POST",
+            "http://127.0.0.1:8077/runs/test/replay",
+            Some(file.path()),
+            None,
+            "token",
+        )
+        .expect_err("null or missing authority rejected before send");
+        assert!(err.contains("credential and audit_attribution"));
+    }
+}
+
+#[test]
+fn daemon_url_refuses_non_local_hosts() {
+    let err = parse_local_http_url("http://0.0.0.0:8077/health").expect_err("non-local refused");
+    assert!(err.contains("refuses non-local"));
+}
+
 fn fixed_approval_id(value: u128) -> ApprovalId {
     Uuid::from_u128(value).into()
 }

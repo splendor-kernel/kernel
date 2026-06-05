@@ -1254,7 +1254,8 @@ export interface AppendPerceptResponse {
 }
 
 export interface ReplayRequest {
-  credential: CallerCredential | null;
+  credential: CallerCredential;
+  audit_attribution: AuditAttribution;
   mode: "inspect_only";
   side_effects_allowed: false;
 }
@@ -1282,7 +1283,8 @@ export interface TracePageResponse {
 }
 
 export interface TraceExportRequest {
-  credential: CallerCredential | null;
+  credential: CallerCredential;
+  audit_attribution: AuditAttribution;
   redaction_policy: string | null;
   start: number | null;
   end: number | null;
@@ -1462,7 +1464,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
   ],
   policy_sync_response: ["run_id", "accepted", "policy_bundle", "cache_status"],
   trace_page_response: ["run_id", "records"],
-  trace_export_request: ["credential", "redaction_policy", "start", "end"],
+  trace_export_request: ["credential", "audit_attribution", "redaction_policy", "start", "end"],
   trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
   replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
   submit_action_request: [

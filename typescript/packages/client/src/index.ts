@@ -50,10 +50,12 @@ export interface ReadTracesOptions {
   start?: number;
   end?: number;
   credential?: CallerCredential | null;
+  audit?: AuditAttribution;
 }
 
 export interface RequestReplayOptions {
   credential?: CallerCredential | null;
+  audit?: AuditAttribution;
 }
 
 export interface DaemonErrorPayload {
@@ -124,9 +126,7 @@ export class SplendorClient {
       throw new TypeError("createRun requires a signed, scoped work order envelope");
     }
     this.validateCreateRunWorkOrder(request.work_order);
-    if (!request.audit_attribution) {
-      throw new TypeError("mutating daemon calls require audit attribution");
-    }
+    this.requireMutatingAuthority(request.credential, request.audit_attribution);
     return this.request<CreateRunResponse>("POST", "runs", {
       body: request
     });
@@ -162,9 +162,10 @@ export class SplendorClient {
     options: AppendPerceptOptions = {}
   ): Promise<AppendPerceptResponse> {
     const audit = this.requireAudit(options.audit);
+    const credential = this.requireCredential(options.credential);
     return this.request<AppendPerceptResponse>("POST", `runs/${encodeURIComponent(runId)}/percepts`, {
       body: {
-        credential: options.credential ?? this.defaultCredential ?? null,
+        credential,
         audit_attribution: audit,
         percept,
       }
@@ -190,7 +191,8 @@ export class SplendorClient {
     }
     return this.request<TraceExportResponse>("POST", `runs/${encodeURIComponent(runId)}/traces/export`, {
       body: {
-        credential: options.credential ?? this.defaultCredential ?? null,
+        credential: this.requireCredential(options.credential),
+        audit_attribution: this.requireAudit(options.audit),
         redaction_policy: options.redactionPolicy,
         start: options.start ?? null,
         end: options.end ?? null
@@ -215,7 +217,8 @@ export class SplendorClient {
   async requestReplay(runId: RunId, options: RequestReplayOptions = {}): Promise<ReplayResponse> {
     return this.request<ReplayResponse>("POST", `runs/${encodeURIComponent(runId)}/replay`, {
       body: {
-        credential: options.credential ?? this.defaultCredential ?? null,
+        credential: this.requireCredential(options.credential),
+        audit_attribution: this.requireAudit(options.audit),
         mode: "inspect_only",
         side_effects_allowed: false
       }
@@ -229,7 +232,7 @@ export class SplendorClient {
     return this.request<ActionOutcome>("POST", "actions", {
       body: {
         ...request,
-        credential: request.credential ?? this.defaultCredential ?? null,
+        credential: this.requireCredential(request.credential),
         audit_attribution: request.audit_attribution ?? this.requireAudit()
       }
     });
@@ -251,10 +254,25 @@ export class SplendorClient {
     return this.request<T>("POST", `runs/${encodeURIComponent(runId)}/${action}`, {
       body: {
         ...request,
-        credential: request.credential ?? this.defaultCredential ?? null,
+        credential: this.requireCredential(request.credential),
         audit_attribution: request.audit_attribution ?? this.requireAudit()
       }
     });
+  }
+
+  private requireCredential(credential?: CallerCredential | null): CallerCredential {
+    const resolved = credential ?? this.defaultCredential;
+    if (!resolved) {
+      throw new TypeError("mutating daemon calls require caller credential; unauthenticated fallback is not allowed");
+    }
+    return resolved;
+  }
+
+  private requireMutatingAuthority(credential?: CallerCredential | null, audit?: AuditAttribution | null): void {
+    this.requireCredential(credential);
+    if (!audit) {
+      throw new TypeError("mutating daemon calls require audit attribution");
+    }
   }
 
   private requireAudit(audit?: AuditAttribution): AuditAttribution {

@@ -1062,13 +1062,9 @@ components:
         work_order:
           $ref: '#/components/schemas/WorkOrderEnvelope'
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         allowed_actions:
           type: array
           items:
@@ -1199,13 +1195,9 @@ components:
       required: [credential, audit_attribution, percept]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         percept:
           oneOf:
             - type: 'null'
@@ -1225,13 +1217,9 @@ components:
       required: [credential, audit_attribution, policy_bundle, sync_error, disconnected]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         policy_bundle:
           oneOf:
             - type: 'null'
@@ -1304,12 +1292,12 @@ components:
             $ref: '#/components/schemas/TraceRecord'
     TraceExportRequest:
       type: object
-      required: [credential, redaction_policy, start, end]
+      required: [credential, audit_attribution, redaction_policy, start, end]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
         redaction_policy:
           type: [string, 'null']
           description: Required non-empty redaction policy for executable trace exports.
@@ -1339,12 +1327,12 @@ components:
           type: string
     ReplayRequest:
       type: object
-      required: [credential, mode, side_effects_allowed]
+      required: [credential, audit_attribution, mode, side_effects_allowed]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
         mode:
           type: string
           enum: [inspect_only]

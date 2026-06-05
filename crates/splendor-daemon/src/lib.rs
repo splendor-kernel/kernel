@@ -544,6 +544,7 @@ pub struct TracePageResponse {
 #[serde(rename_all = "snake_case")]
 pub struct TraceExportRequest {
     pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
     pub redaction_policy: Option<String>,
     pub start: Option<u64>,
     pub end: Option<u64>,
@@ -563,6 +564,7 @@ pub struct TraceExportResponse {
 #[serde(rename_all = "snake_case")]
 pub struct ReplayRequest {
     pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
     #[serde(default = "default_replay_mode")]
     pub mode: String,
     #[serde(default)]
@@ -1423,6 +1425,10 @@ async fn export_traces(
     let redaction_policy = request.redaction_policy.clone();
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    require_post_audit_attribution(
+        request.credential.as_ref(),
+        request.audit_attribution.as_ref(),
+    )?;
     state.validate_security(
         DaemonEndpoint::TraceRead {
             tenant_id: slot.tenant_id.clone(),
@@ -1431,7 +1437,7 @@ async fn export_traces(
         },
         request.credential,
         None,
-        None,
+        request.audit_attribution,
     )?;
     let records = match (request.start, request.end) {
         (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
@@ -1470,6 +1476,10 @@ async fn replay_run(
     }
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    require_post_audit_attribution(
+        request.credential.as_ref(),
+        request.audit_attribution.as_ref(),
+    )?;
     state.validate_security(
         DaemonEndpoint::ReplayCreate {
             tenant_id: slot.tenant_id.clone(),
@@ -1477,7 +1487,7 @@ async fn replay_run(
         },
         request.credential,
         None,
-        None,
+        request.audit_attribution,
     )?;
     let records = slot
         .trace_store
@@ -2283,6 +2293,41 @@ fn trace_error(error: TraceStoreError) -> ApiError {
 fn invalid_run(run_id: &RunId) -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "invalid_run", "run was not found")
         .details(serde_json::json!({ "run_id": run_id }))
+}
+
+fn require_post_audit_attribution(
+    credential: Option<&CallerCredential>,
+    audit_attribution: Option<&AuditAttribution>,
+) -> Result<(), ApiError> {
+    let credential = credential.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing_caller_credential",
+            "mutating daemon requests require caller credential",
+        )
+    })?;
+    let audit = audit_attribution.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing_audit_attribution",
+            "mutating daemon requests require audit attribution",
+        )
+    })?;
+    if audit.credential_id.as_deref() != Some(credential.credential_id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "audit_credential_mismatch",
+            "audit attribution credential_id must match caller credential",
+        ));
+    }
+    if audit.principal != credential.principal {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "audit_principal_mismatch",
+            "audit attribution principal must match caller credential principal",
+        ));
+    }
+    Ok(())
 }
 
 fn lock_error() -> ApiError {

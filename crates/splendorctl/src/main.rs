@@ -35,6 +35,8 @@ use splendor_types::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::path::{Component, Path};
 use std::process::ExitCode;
@@ -97,6 +99,19 @@ where
             key_id,
             secret,
         } => sign_work_order(&input_path, &key_id, &secret)?,
+        Command::DaemonRequest {
+            method,
+            url,
+            body_path,
+            credential_path,
+            token,
+        } => daemon_request(
+            &method,
+            &url,
+            body_path.as_deref(),
+            credential_path.as_deref(),
+            &token,
+        )?,
     }
     Ok(())
 }
@@ -151,6 +166,14 @@ enum Command {
         key_id: String,
         secret: String,
     },
+    /// Call a documented daemon HTTP endpoint without bypassing daemon/gateway enforcement.
+    DaemonRequest {
+        method: String,
+        url: String,
+        body_path: Option<PathBuf>,
+        credential_path: Option<PathBuf>,
+        token: String,
+    },
 }
 
 /// Parses top-level CLI arguments.
@@ -184,10 +207,69 @@ where
     if command == "work-order" {
         return parse_work_order_command(args);
     }
+    if command == "daemon" {
+        return parse_daemon_command(args);
+    }
     if command == "--help" || command == "-h" {
         return Err(usage());
     }
     Err(format!("Unknown command: {command}\n\n{}", usage()))
+}
+
+fn parse_daemon_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    if subcommand != "request" {
+        return Err(format!(
+            "Unknown daemon subcommand: {subcommand}\n\n{}",
+            usage()
+        ));
+    }
+    let mut method = None;
+    let mut url = None;
+    let mut body_path = None;
+    let mut credential_path = None;
+    let mut token = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--method" => method = args.next(),
+            "--url" => url = args.next(),
+            "--body" => body_path = args.next().map(PathBuf::from),
+            "--caller-credential" => credential_path = args.next().map(PathBuf::from),
+            "--token" => token = args.next(),
+            "--help" | "-h" => return Err(usage()),
+            _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+        }
+    }
+    let method = method
+        .ok_or_else(|| "Missing required --method".to_string())?
+        .to_uppercase();
+    let url = url.ok_or_else(|| "Missing required --url".to_string())?;
+    let token = token.ok_or_else(|| {
+        "Missing required --token; anonymous daemon fallback is not allowed".to_string()
+    })?;
+    if token.trim().is_empty() {
+        return Err(
+            "Missing required --token; anonymous daemon fallback is not allowed".to_string(),
+        );
+    }
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") && body_path.is_none() {
+        return Err(
+            "Mutating daemon requests require --body with credential and audit attribution"
+                .to_string(),
+        );
+    }
+    Ok(Command::DaemonRequest {
+        method,
+        url,
+        body_path,
+        credential_path,
+        token,
+    })
 }
 
 fn parse_work_order_command<I>(mut args: I) -> Result<Command, String>
@@ -4056,6 +4138,134 @@ fn parse_run_id(value: &str) -> Result<splendor_types::RunId, String> {
     Ok(uuid.into())
 }
 
+fn daemon_request(
+    method: &str,
+    url: &str,
+    body_path: Option<&Path>,
+    credential_path: Option<&Path>,
+    token: &str,
+) -> Result<(), String> {
+    let parsed = parse_local_http_url(url)?;
+    let body = match body_path {
+        Some(path) => Some(
+            fs::read_to_string(path).map_err(|err| format!("Failed to read body file: {err}"))?,
+        ),
+        None => None,
+    };
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        let body_json: serde_json::Value = serde_json::from_str(body.as_deref().unwrap_or(""))
+            .map_err(|err| format!("Mutating daemon request body must be JSON: {err}"))?;
+        if body_json
+            .get("credential")
+            .map_or(true, serde_json::Value::is_null)
+            || body_json
+                .get("audit_attribution")
+                .map_or(true, serde_json::Value::is_null)
+        {
+            return Err(
+                "Mutating daemon requests require body credential and audit_attribution"
+                    .to_string(),
+            );
+        }
+    }
+    let credential = match credential_path {
+        Some(path) => Some(
+            fs::read_to_string(path)
+                .map_err(|err| format!("Failed to read caller credential file: {err}"))?,
+        ),
+        None => None,
+    };
+    let response = send_local_http(
+        &parsed.host,
+        parsed.port,
+        method,
+        &parsed.path,
+        token,
+        body.as_deref(),
+        credential.as_deref(),
+    )?;
+    print!("{response}");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParsedLocalUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_local_http_url(url: &str) -> Result<ParsedLocalUrl, String> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        "splendorctl daemon request only supports explicit local http:// daemon URLs".to_string()
+    })?;
+    let (authority, path_part) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "Daemon URL must include host and port".to_string())?;
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return Err("splendorctl daemon request refuses non-local daemon hosts".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "Daemon URL port is invalid".to_string())?;
+    let path = format!("/{}", path_part);
+    Ok(ParsedLocalUrl {
+        host: host.trim_matches(&['[', ']'][..]).to_string(),
+        port,
+        path,
+    })
+}
+
+fn send_local_http(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+    credential: Option<&str>,
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect((host, port))
+        .map_err(|err| format!("Failed to connect to daemon: {err}"))?;
+    let body = body.unwrap_or("");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\nAuthorization: Bearer {token}\r\nX-Splendor-API-Version: 0.1\r\nX-Splendor-Client: splendorctl\r\nConnection: close\r\n"
+    );
+    if let Some(credential) = credential {
+        request.push_str("X-Splendor-Caller-Credential: ");
+        request.push_str(&credential.replace(['\r', '\n'], ""));
+        request.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.as_bytes().len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("Failed to write daemon request: {err}"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("Failed to read daemon response: {err}"))?;
+    let (head, response_body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "Daemon returned malformed HTTP response".to_string())?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "Daemon request failed with HTTP {status}: {response_body}"
+        ));
+    }
+    Ok(response_body.to_string())
+}
+
 /// Returns the CLI usage string.
 fn usage() -> String {
     [
@@ -4065,6 +4275,7 @@ fn usage() -> String {
         "splendorctl audit export --db <trace-path> --state-db <state-path> --run <run-id> [--tenant <id>] [--agent <id>] [--action <id-or-name>] [--adapter <id>] [--node <id>] [--instance <id>] [--fleet <id>]",
         "splendorctl run --config <path> [--cycles <n> | --forever]",
         "splendorctl work-order sign --input <work-order.json> --key-id <id> --secret <secret>",
+        "splendorctl daemon request --method <GET|POST> --url <local-url> --token <token> [--body <json>] [--caller-credential <json>]",
         "splendorctl --version",
         "",
         "Commands:",
@@ -4074,6 +4285,7 @@ fn usage() -> String {
         "  audit export   Export a redacted governance audit from trace + state stores.",
         "  run            Run a local agent loop from config.",
         "  work-order     Sign local work-order fixtures for scoped run authority.",
+        "  daemon         Request documented local daemon endpoints; actions still go through /actions and the gateway.",
         "  --version      Print package and milestone release identifiers.",
         "",
         "Options:",
@@ -4087,6 +4299,7 @@ fn usage() -> String {
         "  --config <path>      Path to a run config (yaml/json).",
         "  --cycles <n>         Number of cycles to run.",
         "  --forever            Run until interrupted.",
+        "  --token <token>      Required caller token; anonymous daemon fallback is refused.",
     ]
     .join("\n")
 }

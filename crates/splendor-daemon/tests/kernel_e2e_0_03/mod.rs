@@ -944,11 +944,16 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     .await?;
     assert_eq!(status, StatusCode::OK);
     let before_replay = inspected.adapter_executions;
+    let replay_credential = credential(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution(true)
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({"credential": null}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
@@ -3130,14 +3135,19 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         StateMetadata::new(now, Some("final_journey_import".to_string())),
     )?;
 
+    let replay_credential = credential(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution(true)
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{run_id}/replay"),
         serde_json::to_value(LifecycleRequest {
-            credential: None,
+            credential: Some(replay_credential),
             work_order: None,
-            audit_attribution: Some(attribution(false)),
+            audit_attribution: Some(replay_audit),
             reason: Some("final journey replay".to_string()),
             approval_evidence: None,
         })?,

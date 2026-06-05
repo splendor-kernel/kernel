@@ -397,6 +397,9 @@ def load_s2_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "audit-report.json",
         "anti-drift-results.json",
         "schema-parity.json",
+        "typescript-client-workflow.json",
+        "python-sdk-workflow.json",
+        "splendorctl-workflow.json",
         "stdout.log",
         "stderr.log",
     ]
@@ -452,16 +455,33 @@ def load_s2_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if not state.get(key):
             failures.append(f"s2_state_export_missing:{key}")
     schema = read_json(artifact_dir / "schema-parity.json")
-    if schema.get("status") != "passed":
-        failures.append("s2_schema_parity_failed")
-    ts_contract = schema.get("typescript_client", {})
-    for key in ["client_refuses_anonymous_fallback", "client_sends_caller_credential_header", "client_requires_replay_suppression"]:
-        if ts_contract.get(key) is not True:
-            failures.append(f"s2_typescript_contract_missing:{key}")
     client_paths = scenario.get("client_path_coverage", {})
-    for path_name in ["typescript_client", "python_sdk", "splendorctl"]:
+    for path_name in ["raw_openapi_http", "typescript_client", "python_sdk", "splendorctl"]:
         if client_paths.get(path_name, {}).get("executable_workflow") is not True:
             failures.append(f"s2_client_path_not_executable:{path_name}")
+    raw_http = client_paths.get("raw_openapi_http", {})
+    raw_missing = sorted(S2_REQUIRED_OPERATIONS - set(raw_http.get("operations_observed", [])))
+    if raw_missing:
+        failures.append("s2_raw_http_workflow_missing_ops:" + ",".join(raw_missing))
+    if not raw_http.get("evidence_artifacts"):
+        failures.append("s2_raw_http_workflow_missing_evidence_artifacts")
+    workflow_artifacts = {
+        "typescript_client": "typescript-client-workflow.json",
+        "python_sdk": "python-sdk-workflow.json",
+        "splendorctl": "splendorctl-workflow.json",
+    }
+    for path_name, artifact_name in workflow_artifacts.items():
+        workflow = read_json(artifact_dir / artifact_name)
+        if workflow.get("status") != "passed" or workflow.get("executable_workflow") is not True:
+            failures.append(f"s2_client_workflow_artifact_not_passed:{path_name}")
+        observed = set(workflow.get("operations_observed", []))
+        missing = sorted({"createRun", "appendPercept", "startRun", "submitAction", "getStateHead", "getRunTraces", "exportTraces", "replayRun", "cancelRun"} - observed)
+        if missing:
+            failures.append(f"s2_client_workflow_missing_ops:{path_name}:" + ",".join(missing))
+        if workflow.get("action_status") != "Executed":
+            failures.append(f"s2_client_workflow_action_not_executed:{path_name}")
+        if workflow.get("adapter_executions_before_replay") != workflow.get("adapter_executions_after_replay"):
+            failures.append(f"s2_client_workflow_replay_executed_adapter:{path_name}")
     anti = read_json(artifact_dir / "anti-drift-results.json")
     if anti.get("status") != "passed":
         failures.append("s2_anti_drift_failed")
@@ -609,7 +629,7 @@ def main() -> int:
         "blocking_failures": blocking,
         "non_goal_observations": [
             "S0 does not mark later scenarios passing; UC-E2E-S1 is included only when executable scenario evidence is present.",
-            "UC-E2E-S2 partially validates the local management API/client contract until executable TypeScript/Python/CLI client workflow evidence is present; S3-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S2 validates the local management API/client contract only when raw HTTP, TypeScript, Python SDK, and splendorctl executable workflow evidence is present; S3-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],

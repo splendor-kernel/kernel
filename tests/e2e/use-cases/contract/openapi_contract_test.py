@@ -126,6 +126,26 @@ def require_schema_fields(text: str, schema_name: str, fields: set[str]) -> list
     return [f"{schema_name}.{field}" for field in missing]
 
 
+def require_non_null_authority_fields(text: str, schema_name: str) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    failures: list[str] = []
+    for field in ("credential", "audit_attribution"):
+        field_match = re.search(rf"^\s+{field}:\s*$", block, re.MULTILINE)
+        if not field_match:
+            failures.append(f"{schema_name}.{field}")
+            continue
+        next_field = re.search(r"^\s{8}[A-Za-z0-9_]+:\s*$", block[field_match.end() :], re.MULTILINE)
+        field_block = block[field_match.end() : field_match.end() + next_field.start()] if next_field else block[field_match.end() :]
+        if "type: 'null'" in field_block or "type: [" in field_block and "'null'" in field_block:
+            failures.append(f"{schema_name}.{field}_allows_null")
+        expected_ref = "CallerCredential" if field == "credential" else "AuditAttribution"
+        if f"#/components/schemas/{expected_ref}" not in field_block:
+            failures.append(f"{schema_name}.{field}_missing_ref")
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--openapi", required=True)
@@ -198,10 +218,12 @@ def main() -> int:
             },
         )
     )
-    schema_failures.extend(require_schema_fields(text, "ReplayRequest", {"credential", "mode", "side_effects_allowed"}))
+    schema_failures.extend(require_schema_fields(text, "ReplayRequest", {"credential", "audit_attribution", "mode", "side_effects_allowed"}))
     schema_failures.extend(
-        require_schema_fields(text, "TraceExportRequest", {"credential", "redaction_policy", "start", "end"})
+        require_schema_fields(text, "TraceExportRequest", {"credential", "audit_attribution", "redaction_policy", "start", "end"})
     )
+    schema_failures.extend(require_non_null_authority_fields(text, "ReplayRequest"))
+    schema_failures.extend(require_non_null_authority_fields(text, "TraceExportRequest"))
     schema_failures.extend(
         require_schema_fields(text, "VersionResponse", {"daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"})
     )

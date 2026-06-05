@@ -354,6 +354,7 @@ test("OpenAPI documents S5 daemon request and response schemas", () => {
     "PolicySyncResponse",
     "StateHeadResponse",
     "TracePageResponse",
+    "TraceExportRequest",
     "ReplayRequest",
     "ReplayResponse",
     "SubmitActionRequest",
@@ -375,6 +376,13 @@ test("OpenAPI documents S5 daemon request and response schemas", () => {
     "submitAction"
   ]) {
     assert.match(openapi, new RegExp(`operationId: ${operation}[\\s\\S]*?requestBody:`), `${operation} must document a request body`);
+  }
+  for (const schema of ["TraceExportRequest", "ReplayRequest"]) {
+    const block = extractOpenApiSchemaBlock(openapi, schema);
+    assert.doesNotMatch(block, /credential:[\s\S]*?type:\s*'null'/, `${schema}.credential must be non-null`);
+    assert.doesNotMatch(block, /audit_attribution:[\s\S]*?type:\s*'null'/, `${schema}.audit_attribution must be non-null`);
+    assert.match(block, /credential:\n\s+\$ref: '#\/components\/schemas\/CallerCredential'/, `${schema}.credential must reference CallerCredential directly`);
+    assert.match(block, /audit_attribution:\n\s+\$ref: '#\/components\/schemas\/AuditAttribution'/, `${schema}.audit_attribution must reference AuditAttribution directly`);
   }
 });
 

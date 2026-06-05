@@ -23,6 +23,15 @@ Stable 0.1 daemon clients may rely on:
 - inspect-only replay default;
 - no silent fallback to unauthenticated non-dev communication.
 
+Executable public client coverage for UC-E2E-S2 now includes the raw documented
+HTTP path, `@splendor/client`, `python.splendor.daemon_client.SplendorDaemonClient`,
+and `splendorctl daemon request`. Each client path creates a run from a signed
+work order, appends a percept, starts a tick, submits the allowed action through
+`POST /actions`, reads state/traces, exports traces, requests inspect-only replay,
+and cancels the run. These clients are wrappers around daemon endpoints only; they
+do not execute adapters directly or treat management credentials as action
+authority.
+
 Stable 0.1 clients must not rely on private Rust handler names, in-memory run slot
 layout, local queue internals, exact test fixture IDs, native Node bindings,
 browser runtime execution, production OAuth/PKI behavior, or remote fleet
@@ -49,6 +58,13 @@ conformance suite, not by runtime version negotiation.
 
 Future active negotiation must fail closed on unsupported versions and document
 accepted version ranges before becoming stable.
+
+The Python daemon client and `splendorctl daemon request` send the same version
+and client attribution headers. `splendorctl daemon request` is intentionally
+narrow and local: it accepts only explicit `http://127.0.0.1`, `localhost`, or
+loopback daemon URLs, requires a caller token, supports caller-credential header
+files for read requests, and requires JSON body files containing credentials for
+mutating requests. It is a daemon-management wrapper, not a gateway bypass.
 
 ## Layered daemon authorization
 
@@ -205,6 +221,10 @@ PerceptsAppended
 after S0 security validation and before the runtime mutation, preserving caller
 identity and credential attribution in the run trace.
 
+Trace export is a POST audit boundary even though it uses the trace-read scope:
+its request body must include non-null `credential` and `audit_attribution`, and
+the audit principal and `credential_id` must match the caller credential.
+
 Policy distribution events added in 0.04-S5:
 
 ```text
@@ -239,6 +259,10 @@ that sequence numbers are contiguous and run-scoped, and returns a replay summar
 with event counts and `approval_events`. It does not invoke perceptors, policies,
 gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
+
+Replay request bodies must include non-null `credential` and
+`audit_attribution`; both principal identity and `credential_id` are validated
+before replay evidence is read.
 
 `approval_events` reports approval lifecycle events with lifecycle label,
 approval context, optional reason, trace event ID, and sequence. It explains why

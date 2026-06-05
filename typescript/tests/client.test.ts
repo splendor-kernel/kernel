@@ -89,7 +89,7 @@ const createRunRequest: CreateRunRequest = {
   tenant_id: tenantId,
   agent_id: agentId,
   work_order: workOrder,
-  credential: null,
+  credential: callerCredential,
   audit_attribution: audit,
   allowed_actions: ["noop"],
   allowed_adapters: ["daemon.local"],
@@ -106,7 +106,7 @@ const createRunRequest: CreateRunRequest = {
 };
 
 const lifecycleRequest: LifecycleRequest = {
-  credential: null,
+  credential: callerCredential,
   work_order: null,
   audit_attribution: audit,
   reason: "test",
@@ -194,6 +194,7 @@ test("createRun fails closed when work order or audit attribution is absent", as
   const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
 
   await assert.rejects(() => client.createRun({ ...createRunRequest, audit_attribution: null }), /audit attribution/);
+  await assert.rejects(() => client.createRun({ ...createRunRequest, credential: null }), /caller credential/);
   await assert.rejects(() => client.createRun({ ...createRunRequest, work_order: null as never }), /work order/);
 });
 
@@ -239,6 +240,8 @@ test("lifecycle and inspection helpers use daemon endpoint shapes", async () => 
     ]
   );
   assert.deepEqual(calls[1].jsonBody, lifecycleRequest);
+
+  await assert.rejects(() => client.startRun(runId, { ...lifecycleRequest, credential: null }), /caller credential/);
 });
 
 test("createRun rejects structurally invalid work-order authority before daemon calls", async () => {
@@ -278,12 +281,15 @@ test("appendPercept posts a run-scoped percept with audit attribution", async ()
   const { fetcher, calls } = makeFetch({ run_id: runId, accepted: 1 });
   const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
 
-  const response = await client.appendPercept(runId, percept, { audit });
+  const response = await client.appendPercept(runId, percept, { credential: callerCredential, audit });
 
   assert.equal(response.accepted, 1);
   assert.equal(new URL(calls[0].url).pathname, `/runs/${runId}/percepts`);
   assert.equal(calls[0].init.method, "POST");
-  assert.deepEqual(calls[0].jsonBody, { credential: null, audit_attribution: audit, percept });
+  assert.deepEqual(calls[0].jsonBody, { credential: callerCredential, audit_attribution: audit, percept });
+
+  const anonymousClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+  await assert.rejects(() => anonymousClient.appendPercept(runId, percept, { audit }), /caller credential/);
 });
 
 test("submitAction stays trace-linked and audit-attributed", async () => {
@@ -302,7 +308,7 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
     run_id: runId,
     tenant_id: tenantId,
     agent_id: agentId,
-    credential: null,
+    credential: callerCredential,
     audit_attribution: audit,
     causal_trace_id: "00000000-0000-0000-0000-000000000011",
     action,
@@ -317,6 +323,7 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
   assert.deepEqual(calls[0].jsonBody, request);
   await assert.rejects(() => client.submitAction({ ...request, causal_trace_id: null }), /trace linkage/);
   await assert.rejects(() => client.submitAction({ ...request, audit_attribution: null }), /audit attribution/);
+  await assert.rejects(() => client.submitAction({ ...request, credential: null }), /caller credential/);
 });
 
 test("readTraces requires redaction policy and preserves event order", async () => {
@@ -350,7 +357,7 @@ test("exportTraces posts an explicit redaction policy and credential", async () 
     { run_id: runId, sequence: 1, recorded_at: "2026-05-25T00:00:00Z", event_hash: { algorithm: "Blake3", value: "h1" }, prev_event_hash: null, payload: { trace_id: "00000000-0000-0000-0000-000000000010", run_id: runId, sequence: 1, timestamp: "2026-05-25T00:00:00Z", kind: "RunStarted" } }
   ];
   const { fetcher, calls } = makeFetch({ run_id: runId, records, record_count: 1, redaction_policy: "tenant-default", integrity_hash: "trace-chain:v1:1:h1" });
-  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher, defaultCredential: callerCredential });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher, defaultCredential: callerCredential, defaultAudit: audit });
 
   await assert.rejects(() => client.exportTraces(runId, { redactionPolicy: " " }), /redactionPolicy/);
   const result = await client.exportTraces(runId, { redactionPolicy: "tenant-default", start: 0, end: 2 });
@@ -360,10 +367,14 @@ test("exportTraces posts an explicit redaction policy and credential", async () 
   assert.equal(calls[0].init.method, "POST");
   assert.deepEqual(calls[0].jsonBody, {
     credential: callerCredential,
+    audit_attribution: audit,
     redaction_policy: "tenant-default",
     start: 0,
     end: 2
   });
+
+  const anonymousClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher, defaultAudit: audit });
+  await assert.rejects(() => anonymousClient.exportTraces(runId, { redactionPolicy: "tenant-default" }), /caller credential/);
 });
 
 test("streamTraces exposes an async iterable over trace reads", async () => {
@@ -391,13 +402,16 @@ test("getStateHead and requestReplay call daemon inspection endpoints", async ()
   assert.equal(new URL(stateFetch.calls[0].url).pathname, `/runs/${runId}/state-head`);
 
   const replayFetch = makeFetch({ replay_id: "replay_test", run_id: runId, mode: "inspect_only", event_count: 3, action_event_count: 0, approval_events: [] });
-  const replayClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: replayFetch.fetcher });
+  const replayClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: replayFetch.fetcher, defaultCredential: callerCredential, defaultAudit: audit });
 
   const replay = await replayClient.requestReplay(runId);
 
   assert.equal(replay.replay_id, "replay_test");
   assert.equal(new URL(replayFetch.calls[0].url).pathname, `/runs/${runId}/replay`);
-  assert.deepEqual(replayFetch.calls[0].jsonBody, { credential: null, mode: "inspect_only", side_effects_allowed: false });
+  assert.deepEqual(replayFetch.calls[0].jsonBody, { credential: callerCredential, audit_attribution: audit, mode: "inspect_only", side_effects_allowed: false });
+
+  const anonymousReplayClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: replayFetch.fetcher, defaultAudit: audit });
+  await assert.rejects(() => anonymousReplayClient.requestReplay(runId), /caller credential/);
 });
 
 test("health version capabilities include caller credential header when configured", async () => {

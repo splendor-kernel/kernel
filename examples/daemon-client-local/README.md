@@ -26,6 +26,35 @@ cargo run -p splendor-daemon
 The daemon binds to `127.0.0.1:8077` and prints a warning that explicit local-only
 insecure development mode is active.
 
+## Public client workflow coverage
+
+The UC-E2E-S2 acceptance scenario exercises the same management workflow through
+four public paths:
+
+- raw documented daemon HTTP;
+- `@splendor/client` from TypeScript;
+- `python.splendor.daemon_client.SplendorDaemonClient`;
+- `splendorctl daemon request`.
+
+Each path creates a run from a signed work order, appends a percept, starts a
+tick, submits an action through `/actions` (and therefore the gateway), reads
+state/traces, exports traces, requests inspect-only replay with
+`side_effects_allowed=false`, and cancels the run.
+
+Example CLI wrapper shape:
+
+```bash
+splendorctl daemon request \
+  --method GET \
+  --url http://127.0.0.1:8077/health \
+  --token "$SPLENDOR_CALLER_TOKEN" \
+  --caller-credential ./caller-credential.json
+```
+
+For mutating daemon requests, pass `--body ./request.json`; the body must contain
+the scoped caller credential and audit attribution expected by the endpoint. The
+CLI refuses anonymous fallback and refuses non-loopback daemon URLs.
+
 ## Minimal explicit local-dev request shape
 
 The daemon expects JSON. Run creation requires authenticated caller attribution
