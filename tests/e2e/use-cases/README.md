@@ -1,9 +1,11 @@
 # Use-Case E2E Acceptance Harness
 
-This directory contains the foundational `UC-E2E-S0` harness for later use-case
-acceptance scenarios. S0 validates the harness, report contract, deterministic
-fixtures, OpenAPI contract visibility, and anti-drift gates. It does **not**
-implement or mark S1-S10 scenario behavior as passing.
+This directory contains the foundational `UC-E2E-S0` harness and the
+`UC-E2E-S1` local governed action loop scenario. S0 validates the harness,
+report contract, deterministic fixtures, OpenAPI contract visibility, and
+anti-drift gates. S1 validates a local CLI-driven governed loop through the real
+gateway, HTTP/filesystem adapters, state graph, trace store, and inspect-only
+replay suppression.
 
 ## Commands
 
@@ -11,6 +13,7 @@ implement or mark S1-S10 scenario behavior as passing.
 bash scripts/e2e/verify-use-case-acceptance.sh --anti-drift-only
 bash scripts/e2e/verify-use-case-acceptance.sh --contract-only
 bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S0
+bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S1
 bash scripts/e2e/verify-use-case-acceptance.sh --all
 ```
 
@@ -27,10 +30,12 @@ Reports are written under:
 target/splendor-e2e/use-case-acceptance/report.json
 target/splendor-e2e/use-case-acceptance/report.md
 target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S0/
+target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/
 ```
 
-Report generation fails if required S0 evidence artifacts are absent or empty;
-the harness does not create green placeholder trace/state/replay/audit evidence.
+Report generation fails if required S0/S1 evidence artifacts are absent or
+empty; the harness does not create green placeholder trace/state/replay/audit
+evidence.
 
 ## Compose topology
 
@@ -41,8 +46,15 @@ loopback-only; compose makes the runner share the daemon container network
 namespace so it can call documented `/health` and `/capabilities` on
 `127.0.0.1` without publishing daemon ports or binding all interfaces. The S0
 probe supplies schema-aligned caller credentials for those read-only endpoints.
-Later scenarios must add authenticated mutating daemon calls, scoped work orders,
-and gateway enforcement evidence before claiming scenario success.
+S1 uses `splendorctl` as the documented public boundary. It signs a scoped local
+work order, runs HTTP and filesystem actions through the real action gateway,
+exports trace/state evidence through CLI commands, and runs inspect-only replay
+while checking that the HTTP fixture counter and artifact checksum do not change.
+The negative branch proves URL allowlist and sandbox path traversal denials occur
+as `action.denied` gateway outcomes with adapter non-execution evidence, and uses
+deterministic trace/state failure injection to prove fail-closed behavior.
+S1 deliberately does not add remote messaging, fleet placement, governance
+approval workflows, or physical/edge actions.
 
 ## Anti-drift rules
 
@@ -61,5 +73,6 @@ Negative fixtures under `anti_drift/fixtures/negative/` prove those failures.
 
 `UC-E2E-S0` adds the acceptance harness entry point, deterministic fixture seed,
 compose topology skeleton, OpenAPI contract status report, anti-drift scanner
-self-tests, and report aggregation. S1-S10 remain blocked/not-yet-covered until
-their scenario PRs add executable public-boundary evidence.
+self-tests, and report aggregation. `UC-E2E-S1` adds executable local governed
+loop evidence. S2-S10 remain blocked/not-yet-covered until their scenario PRs add
+executable public-boundary evidence.

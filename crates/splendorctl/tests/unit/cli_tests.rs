@@ -4419,6 +4419,7 @@ fn build_gateway_rejects_missing_adapter() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = std::collections::HashMap::new();
@@ -4427,6 +4428,208 @@ fn build_gateway_rejects_missing_adapter() {
         Err(error) => error,
     };
     assert!(error.contains("Adapter not configured"));
+}
+
+fn resource_boundary_request(params: serde_json::Value) -> splendor_gateway::ActionRequest {
+    splendor_gateway::ActionRequest {
+        action_id: ActionId::new(),
+        action: Action {
+            name: "resource.check".to_string(),
+            params,
+            side_effect_class: SideEffectClass::External,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        },
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: RunId::new(),
+        adapter: None,
+        quota_usage: QuotaUsage::single_action(),
+        satisfied_preconditions: Vec::new(),
+        requested_at: OffsetDateTime::now_utc(),
+        approval_evidence: None,
+    }
+}
+
+#[test]
+fn local_resource_boundary_verifier_covers_http_and_filesystem_paths() {
+    let adapters = AdaptersConfig {
+        filesystem: Some(FilesystemConfig {
+            base_dir: PathBuf::from("/tmp/splendor-test"),
+            max_read_bytes: None,
+            max_write_bytes: None,
+            max_list_entries: None,
+        }),
+        http: Some(HttpConfig {
+            allowed_domains: vec![
+                "example.com".to_string(),
+                "*.trusted.test".to_string(),
+                ".suffix.test".to_string(),
+            ],
+            allowed_methods: None,
+            max_request_bytes: None,
+            max_response_bytes: None,
+            timeout_ms: None,
+        }),
+    };
+    let verifier = LocalResourceBoundaryVerifier::from_config(Some(&adapters));
+    let permissive = LocalResourceBoundaryVerifier::from_config(None);
+
+    let unknown_adapter = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "https://blocked.test"})),
+        Some("unknown"),
+    );
+    assert!(unknown_adapter.allowed);
+    assert!(!domain_allowed(
+        &permissive.http_allowed_domains,
+        "example.com"
+    ));
+
+    let missing_url = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({})),
+        Some("http"),
+    );
+    assert!(!missing_url.allowed);
+    assert_eq!(missing_url.reasons, vec!["network_scope_missing_url"]);
+
+    let invalid_url = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "ftp://example.com"})),
+        Some("http"),
+    );
+    assert!(!invalid_url.allowed);
+    assert_eq!(invalid_url.reasons, vec!["network_scope_invalid_url"]);
+
+    let denied_host = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "https://evil.test/path"})),
+        Some("http"),
+    );
+    assert!(!denied_host.allowed);
+    assert_eq!(denied_host.reasons, vec!["network_scope_denied"]);
+    assert_eq!(
+        denied_host.artifacts["adapter_execution"],
+        serde_json::json!("not_attempted")
+    );
+
+    for url in [
+        "https://example.com/path",
+        "https://api.trusted.test/v1",
+        "https://child.suffix.test/data",
+    ] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"url": url})),
+            Some("http"),
+        );
+        assert!(result.allowed, "expected URL to be allowed: {url}");
+    }
+    assert_eq!(
+        http_host("https://user:pass@example.com:443/secret"),
+        Some("example.com".to_string())
+    );
+    assert_eq!(http_host("https://"), None);
+
+    let missing_path = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({})),
+        Some("filesystem"),
+    );
+    assert!(!missing_path.allowed);
+    assert_eq!(missing_path.reasons, vec!["filesystem_scope_missing_path"]);
+
+    for path in ["../secret.txt", "/etc/passwd"] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"path": path})),
+            Some("filesystem"),
+        );
+        assert!(!result.allowed, "expected path to be denied: {path}");
+        assert_eq!(result.reasons, vec!["filesystem_scope_denied"]);
+    }
+
+    for path in ["safe/file.txt", "./safe/file.txt"] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"path": path})),
+            Some("filesystem"),
+        );
+        assert!(result.allowed, "expected path to be allowed: {path}");
+    }
+}
+
+#[test]
+fn failure_injection_trace_store_fails_once_then_delegates() {
+    let db = NamedTempFile::new().expect("trace db");
+    let store = FailingTraceStore {
+        inner: SqliteTraceStore::open(db.path()).expect("trace store"),
+        fail_on_event: "tick.started".to_string(),
+        failed: Mutex::new(false),
+    };
+    let run_id = RunId::new().to_string();
+    let payload = serde_json::json!({"kind": "tick.started", "tick_id": 1});
+
+    assert_eq!(
+        trace_payload_kind(&payload),
+        Some("tick.started".to_string())
+    );
+    let error =
+        TraceStore::append(&store, &run_id, payload.clone()).expect_err("first append fails");
+    assert!(error
+        .to_string()
+        .contains("injected_trace_write_failure:tick.started"));
+
+    let sequence = TraceStore::append(&store, &run_id, payload).expect("second append succeeds");
+    assert_eq!(sequence, 0);
+    let object_kind_payload = serde_json::json!({"kind": {"tick.completed": {"tick_id": 1}}});
+    assert_eq!(
+        trace_payload_kind(&object_kind_payload),
+        Some("tick.completed".to_string())
+    );
+    let second_sequence =
+        TraceStore::append(&store, &run_id, object_kind_payload).expect("append object kind");
+    assert_eq!(second_sequence, 1);
+
+    let records = TraceStore::read(&store, &run_id).expect("records");
+    assert_eq!(records.len(), 2);
+    let range = TraceStore::read_range(&store, &run_id, 0, 2).expect("range");
+    assert_eq!(range.len(), 2);
+}
+
+#[test]
+fn failure_injection_state_store_fails_once_then_delegates() {
+    let db = NamedTempFile::new().expect("state db");
+    let store = FailingStateStore {
+        inner: SqliteStateStore::open(db.path()).expect("state store"),
+        fail_commit: true,
+        failed: Mutex::new(false),
+    };
+    let data_ref = StateStore::put_state(
+        &store,
+        StateData {
+            bytes: b"state".to_vec(),
+            content_type: Some("text/plain".to_string()),
+        },
+    )
+    .expect("state data");
+    let metadata = || StateMetadata {
+        created_at: OffsetDateTime::now_utc(),
+        label: Some("unit".to_string()),
+        tenant_id: Some(TenantId::new()),
+        agent_id: Some(AgentId::new()),
+        run_id: Some(RunId::new()),
+        trace_event_id: Some(TraceEventId::new()),
+    };
+
+    let error = StateStore::commit_node(&store, Vec::new(), data_ref.clone(), metadata())
+        .expect_err("first commit fails");
+    assert!(error.to_string().contains("injected_state_commit_failure"));
+
+    let node_id = StateStore::commit_node(&store, Vec::new(), data_ref.clone(), metadata())
+        .expect("second commit succeeds");
+    let node = StateStore::get_node(&store, &node_id).expect("node");
+    assert_eq!(node.id, node_id);
+    let loaded = StateStore::get_state(&store, &data_ref).expect("state");
+    assert_eq!(loaded.bytes, b"state".to_vec());
+    let snapshot_id = StateStore::snapshot(&store, &node_id).expect("snapshot");
+    let snapshot = StateStore::load_snapshot(&store, &snapshot_id).expect("load snapshot");
+    assert_eq!(snapshot.node_id, node_id);
 }
 
 #[test]
@@ -4501,6 +4704,74 @@ fn parse_args_rejects_unknown_run_argument() {
     ])
     .expect_err("error");
     assert!(error.contains("Unknown argument"));
+}
+
+#[test]
+fn work_order_sign_parses_and_signs_fixture() {
+    let input = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .expect("work order file");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let now = OffsetDateTime::now_utc();
+    let order = WorkOrder {
+        schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_cli_sign").expect("work order id"),
+        tenant_id,
+        agent_id,
+        run_id: Some(run_id),
+        objective: "sign local fixture".to_string(),
+        allowed_actions: vec!["write_file".to_string()],
+        allowed_adapters: vec!["filesystem".to_string()],
+        allowed_permissions: vec!["fs.write".to_string()],
+        data_refs: vec!["dataset:fixture".to_string()],
+        quotas: splendor_types::WorkOrderQuotaPolicy {
+            max_actions_per_tick: Some(1),
+            ..splendor_types::WorkOrderQuotaPolicy::default()
+        },
+        placement: splendor_types::WorkOrderPlacement {
+            target: "local_resident".to_string(),
+            data_locality: Some("local".to_string()),
+            requires_gpu: Some(false),
+            ..splendor_types::WorkOrderPlacement::default()
+        },
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        revocation: splendor_types::RevocationStatus::Active,
+    };
+    std::fs::write(
+        input.path(),
+        serde_json::to_string(&order).expect("encode work order"),
+    )
+    .expect("write work order");
+
+    let command = parse_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--input".to_string(),
+        input.path().to_string_lossy().to_string(),
+        "--key-id".to_string(),
+        "local-key".to_string(),
+        "--secret".to_string(),
+        "secret".to_string(),
+    ])
+    .expect("parse sign command");
+    match command {
+        Command::WorkOrderSign {
+            input_path,
+            key_id,
+            secret,
+        } => {
+            assert_eq!(input_path, input.path());
+            assert_eq!(key_id, "local-key");
+            assert_eq!(secret, "secret");
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    sign_work_order(input.path(), "local-key", "secret").expect("sign work order");
 }
 
 #[test]
@@ -5035,6 +5306,7 @@ fn build_gateway_success() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = build_adapters(config.adapters.as_ref()).expect("adapters");
