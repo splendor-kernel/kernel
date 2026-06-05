@@ -1,0 +1,102 @@
+# S0-compatible acceptance topology.
+#
+# The active S0 service is a static harness runner plus deterministic fake
+# boundary services. Future Splendor runtime/fleet/device roles are declared
+# under the `future-scenarios` profile so the service names and volume shape can
+# expand without weakening the current daemon's loopback-only local-dev bind.
+services:
+  e2e-runner:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      SPLENDOR_E2E_MODE: acceptance
+      SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
+      SPLENDOR_E2E_NO_COMPOSE: "1"
+      SPLENDOR_DAEMON_URL: http://splendor-daemon-local:8077
+      SPLENDOR_MANAGER_URL: http://central-manager:8081
+      SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
+      SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
+      SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
+      SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
+    command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "UC-E2E-S0", "--reuse-build"]
+    depends_on:
+      - fake-http-service
+      - fake-artifact-store
+      - fake-governance-plane
+      - fake-telemetry-sink
+      - device-sim
+    volumes:
+      - ../../..:/workspace
+
+  fake-http-service:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8082"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-artifact-store:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-artifacts
+    command: ["python", "-m", "http.server", "8083"]
+    volumes:
+      - e2e-state:/var/lib/splendor-artifacts
+
+  fake-governance-plane:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8084"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-telemetry-sink:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-telemetry
+    command: ["python", "-m", "http.server", "8085"]
+    volumes:
+      - e2e-state:/var/lib/splendor-telemetry
+
+  device-sim:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8086"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  splendor-daemon-local:
+    profiles: ["future-scenarios"]
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  central-manager:
+    profiles: ["future-scenarios"]
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8081"]
+
+  resident-cloud-node:
+    profiles: ["future-scenarios"]
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8091"]
+
+  resident-vpc-node:
+    profiles: ["future-scenarios"]
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8092"]
+
+  resident-edge-node:
+    profiles: ["future-scenarios"]
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8093"]
+
+  toxiproxy:
+    profiles: ["future-scenarios"]
+    image: ghcr.io/shopify/toxiproxy:latest
+
+volumes:
+  e2e-state:

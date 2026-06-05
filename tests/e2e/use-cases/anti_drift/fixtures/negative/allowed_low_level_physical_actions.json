@@ -1,0 +1,8 @@
+{
+  "device_kind": "drone_sim",
+  "allowed_physical_actions": [
+    "read_battery",
+    "set_motor_pwm",
+    "disable_firmware_safety"
+  ]
+}
