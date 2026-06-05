@@ -4419,6 +4419,7 @@ fn build_gateway_rejects_missing_adapter() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = std::collections::HashMap::new();
@@ -5035,6 +5036,7 @@ fn build_gateway_success() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = build_adapters(config.adapters.as_ref()).expect("adapters");

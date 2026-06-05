@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig, HttpMethod};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, CircuitBreakerEvaluator, StaticCircuitBreakerEvaluator,
-    VerifiedActionGateway,
+    ActionAdapter, ActionGateway, CircuitBreakerEvaluator, ResourceBoundaryVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
     ActionCandidate, AdapterQuota, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -35,16 +35,16 @@ use splendor_types::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.05-dev";
 
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Entry point for the CLI.
 fn main() -> ExitCode {
@@ -1934,6 +1934,13 @@ fn string_value(value: &serde_json::Value, key: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ReplayOutput {
+    ReplayLifecycle {
+        event: String,
+        trace_event_id: TraceEventId,
+        run_id: String,
+        replay_mode: String,
+        side_effects_replayed: bool,
+    },
     ReplayStart {
         run_id: String,
         from_snapshot: Option<String>,
@@ -1980,6 +1987,16 @@ enum ReplayOutput {
         reason: Option<String>,
         trace_sequence: u64,
     },
+}
+
+fn replay_lifecycle_record(run_id: &RunId, event: &str, sequence: u64) -> ReplayOutput {
+    ReplayOutput::ReplayLifecycle {
+        event: event.to_string(),
+        trace_event_id: TraceEventId::from_run_sequence(run_id, sequence),
+        run_id: run_id.to_string(),
+        replay_mode: "inspect_only".to_string(),
+        side_effects_replayed: false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2171,13 +2188,27 @@ fn collect_replay_outputs(
     start_tick: Option<u64>,
     include_state: bool,
 ) -> Result<Vec<ReplayOutput>, String> {
-    let mut outputs = vec![ReplayOutput::ReplayStart {
-        run_id: run_id.to_string(),
-        from_snapshot,
-        snapshot_bytes_len,
-        replay_mode: "inspect_only".to_string(),
-        side_effects_replayed: false,
-    }];
+    let replay_run_id = if let Some(event) = events.first() {
+        event.run_id.clone()
+    } else {
+        RunId::parse(run_id)
+            .map_err(|error| format!("Invalid replay run_id '{run_id}': {error}"))?
+    };
+    let next_replay_sequence = events
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .map_or(0, |sequence| sequence + 1);
+    let mut outputs = vec![
+        replay_lifecycle_record(&replay_run_id, "replay.started", next_replay_sequence),
+        ReplayOutput::ReplayStart {
+            run_id: run_id.to_string(),
+            from_snapshot,
+            snapshot_bytes_len,
+            replay_mode: "inspect_only".to_string(),
+            side_effects_replayed: false,
+        },
+    ];
 
     let mut current_tick: Option<ReplayTick> = None;
     let mut current_tick_id = 0;
@@ -2299,6 +2330,21 @@ fn collect_replay_outputs(
         approval_events: causal_graph.approval_events,
         circuit_breaker_denials: causal_graph.circuit_breaker_denials,
     });
+    if events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ActionExecuted { .. }))
+    {
+        outputs.push(replay_lifecycle_record(
+            &replay_run_id,
+            "replay.adapter_suppressed",
+            next_replay_sequence + 1,
+        ));
+    }
+    outputs.push(replay_lifecycle_record(
+        &replay_run_id,
+        "replay.completed",
+        next_replay_sequence + 2,
+    ));
     Ok(outputs)
 }
 
@@ -2699,6 +2745,13 @@ struct RunConfig {
     work_order: Option<WorkOrderConfig>,
     runtime_identity: Option<RuntimeIdentityConfig>,
     circuit_breakers: Option<Vec<CircuitBreakerConfig>>,
+    failure_injection: Option<FailureInjectionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailureInjectionConfig {
+    trace_fail_on_event: Option<String>,
+    state_commit_fail: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2828,6 +2881,112 @@ struct HttpConfig {
     timeout_ms: Option<u64>,
 }
 
+struct FailingTraceStore {
+    inner: SqliteTraceStore,
+    fail_on_event: String,
+    failed: Mutex<bool>,
+}
+
+impl TraceStore for FailingTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
+            let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
+            if !*failed {
+                *failed = true;
+                return Err(TraceStoreError::InvalidTimestamp(format!(
+                    "injected_trace_write_failure:{}",
+                    self.fail_on_event
+                )));
+            }
+        }
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read(run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read_range(run_id, start, end)
+    }
+}
+
+fn trace_payload_kind(payload: &serde_json::Value) -> Option<String> {
+    let kind = payload.get("kind")?;
+    kind.as_str()
+        .map(ToString::to_string)
+        .or_else(|| kind.as_object()?.keys().next().cloned())
+}
+
+struct FailingStateStore {
+    inner: SqliteStateStore,
+    fail_commit: bool,
+    failed: Mutex<bool>,
+}
+
+impl StateStore for FailingStateStore {
+    fn put_state(
+        &self,
+        state: splendor_store::StateData,
+    ) -> Result<splendor_store::StateDataRef, splendor_store::StateStoreError> {
+        self.inner.put_state(state)
+    }
+
+    fn get_state(
+        &self,
+        data_ref: &splendor_store::StateDataRef,
+    ) -> Result<splendor_store::StateData, splendor_store::StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<splendor_types::StateNodeId>,
+        data_ref: splendor_store::StateDataRef,
+        metadata: splendor_store::StateMetadata,
+    ) -> Result<splendor_types::StateNodeId, splendor_store::StateStoreError> {
+        if self.fail_commit {
+            let mut failed = self
+                .failed
+                .lock()
+                .map_err(|_| splendor_store::StateStoreError::Poisoned)?;
+            if !*failed {
+                *failed = true;
+                return Err(splendor_store::StateStoreError::InvalidStateNodeId(
+                    "injected_state_commit_failure".to_string(),
+                ));
+            }
+        }
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(
+        &self,
+        node_id: &splendor_types::StateNodeId,
+    ) -> Result<splendor_store::StateNode, splendor_store::StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(
+        &self,
+        node_id: &splendor_types::StateNodeId,
+    ) -> Result<SnapshotId, splendor_store::StateStoreError> {
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(
+        &self,
+        snapshot_id: &SnapshotId,
+    ) -> Result<splendor_store::StateSnapshot, splendor_store::StateStoreError> {
+        self.inner.load_snapshot(snapshot_id)
+    }
+}
+
 struct StaticPerceptor {
     percepts: Vec<PerceptConfig>,
 }
@@ -2928,10 +3087,21 @@ fn run_from_config(
                 .map_err(|error| format!("Failed to create trace directory: {error}"))?;
         }
     }
-    let trace_store = Arc::new(
-        SqliteTraceStore::open(&config.trace_db)
-            .map_err(|error| format!("Failed to open trace store: {error}"))?,
-    );
+    let sqlite_trace_store = SqliteTraceStore::open(&config.trace_db)
+        .map_err(|error| format!("Failed to open trace store: {error}"))?;
+    let trace_store: Arc<dyn TraceStore> = if let Some(event) = config
+        .failure_injection
+        .as_ref()
+        .and_then(|injection| injection.trace_fail_on_event.clone())
+    {
+        Arc::new(FailingTraceStore {
+            inner: sqlite_trace_store,
+            fail_on_event: event,
+            failed: Mutex::new(false),
+        })
+    } else {
+        Arc::new(sqlite_trace_store)
+    };
     let work_order = validate_config_work_order(&config, trace_store.as_ref())?;
 
     if let Some(parent) = config.state_db.parent() {
@@ -2940,10 +3110,22 @@ fn run_from_config(
                 .map_err(|error| format!("Failed to create state directory: {error}"))?;
         }
     }
-    let state_store = Arc::new(
-        SqliteStateStore::open(&config.state_db)
-            .map_err(|error| format!("Failed to open state store: {error}"))?,
-    );
+    let sqlite_state_store = SqliteStateStore::open(&config.state_db)
+        .map_err(|error| format!("Failed to open state store: {error}"))?;
+    let state_store: Arc<dyn StateStore> = if config
+        .failure_injection
+        .as_ref()
+        .and_then(|injection| injection.state_commit_fail)
+        .unwrap_or(false)
+    {
+        Arc::new(FailingStateStore {
+            inner: sqlite_state_store,
+            fail_commit: true,
+            failed: Mutex::new(false),
+        })
+    } else {
+        Arc::new(sqlite_state_store)
+    };
 
     let registry = build_registry_with_work_order(&config, work_order.as_ref())?;
     let circuit_breaker_trace_contexts =
@@ -3386,6 +3568,9 @@ fn build_gateway(
         ));
     }
     gateway.set_circuit_breaker_evaluator(evaluator);
+    gateway.set_resource_boundary_verifier(Arc::new(LocalResourceBoundaryVerifier::from_config(
+        config.adapters.as_ref(),
+    )));
     let actions = collect_action_configs(config)?;
     for action in actions {
         let adapter_id = action
@@ -3398,6 +3583,150 @@ fn build_gateway(
         gateway.register_adapter(&action.name, &adapter_id, Arc::clone(adapter));
     }
     Ok(Arc::new(gateway))
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalResourceBoundaryVerifier {
+    http_allowed_domains: Vec<String>,
+}
+
+impl LocalResourceBoundaryVerifier {
+    fn from_config(config: Option<&AdaptersConfig>) -> Self {
+        Self {
+            http_allowed_domains: config
+                .and_then(|adapters| adapters.http.as_ref())
+                .map(|http| http.allowed_domains.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl ResourceBoundaryVerifier for LocalResourceBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+        adapter: Option<&str>,
+    ) -> splendor_types::VerificationResult {
+        match adapter {
+            Some("http") => self.verify_http(action),
+            Some("filesystem") => self.verify_filesystem(action),
+            _ => splendor_types::VerificationResult::allow(),
+        }
+    }
+}
+
+impl LocalResourceBoundaryVerifier {
+    fn verify_http(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+    ) -> splendor_types::VerificationResult {
+        let Some(url) = action
+            .action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+        else {
+            return boundary_denied(
+                "network_scope_missing_url",
+                "network_egress_verifier",
+                serde_json::json!({"parameter": "url"}),
+            );
+        };
+        let Some(host) = http_host(url) else {
+            return boundary_denied(
+                "network_scope_invalid_url",
+                "network_egress_verifier",
+                serde_json::json!({"url": url}),
+            );
+        };
+        if !domain_allowed(&self.http_allowed_domains, &host) {
+            return boundary_denied(
+                "network_scope_denied",
+                "network_egress_verifier",
+                serde_json::json!({"host": host, "allowed_domains": self.http_allowed_domains}),
+            );
+        }
+        splendor_types::VerificationResult::allow()
+    }
+
+    fn verify_filesystem(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+    ) -> splendor_types::VerificationResult {
+        let Some(raw_path) = action
+            .action
+            .params
+            .get("path")
+            .and_then(|value| value.as_str())
+        else {
+            return boundary_denied(
+                "filesystem_scope_missing_path",
+                "filesystem_verifier",
+                serde_json::json!({"parameter": "path"}),
+            );
+        };
+        let path = Path::new(raw_path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return boundary_denied(
+                "filesystem_scope_denied",
+                "filesystem_verifier",
+                serde_json::json!({"path": raw_path, "reason": "path_traversal_or_absolute_path"}),
+            );
+        }
+        splendor_types::VerificationResult::allow()
+    }
+}
+
+fn boundary_denied(
+    reason: &str,
+    verifier: &str,
+    evidence: serde_json::Value,
+) -> splendor_types::VerificationResult {
+    splendor_types::VerificationResult {
+        allowed: false,
+        reasons: vec![reason.to_string()],
+        artifacts: serde_json::json!({
+            "source": verifier,
+            "verifier": verifier,
+            "adapter_execution": "not_attempted",
+            "evidence": evidence,
+        }),
+    }
+}
+
+fn http_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+        .split(':')
+        .next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn domain_allowed(allowlist: &[String], host: &str) -> bool {
+    !allowlist.is_empty()
+        && allowlist.iter().any(|entry| {
+            if entry.starts_with("*.") {
+                host.ends_with(&entry[1..])
+            } else if entry.starts_with('.') {
+                host.ends_with(entry)
+            } else {
+                host == entry
+            }
+        })
 }
 
 fn build_runtime_identity(

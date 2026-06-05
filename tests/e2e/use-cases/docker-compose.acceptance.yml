@@ -23,7 +23,15 @@ services:
       SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
       SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
       SPLENDOR_E2E_SCENARIO: ${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}
-    command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}", "--reuse-build"]
+      SPLENDOR_E2E_MODE_ARG: ${SPLENDOR_E2E_MODE_ARG:-scenario}
+    command:
+      - bash
+      - -lc
+      - |
+        if [[ "${SPLENDOR_E2E_MODE_ARG:-scenario}" == "all" ]]; then
+          exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --all --reuse-build
+        fi
+        exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --scenario "${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}" --reuse-build
     depends_on:
       - splendor-daemon-local
       - central-manager

@@ -411,6 +411,35 @@ pub trait InvariantEvaluator: Send + Sync {
     ) -> VerificationResult;
 }
 
+/// Verifies adapter-specific resource boundaries before adapter execution.
+///
+/// This keeps filesystem, network, data-scope, and similar boundary checks in
+/// the verifier pipeline instead of relying on adapter failures after execution
+/// has been attempted.
+pub trait ResourceBoundaryVerifier: Send + Sync {
+    /// Verifies that the action's addressed resource is in scope for the
+    /// effective adapter. A denied result prevents adapter execution.
+    fn verify_resource_boundary(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+    ) -> VerificationResult;
+}
+
+/// Resource verifier that allows all resources.
+#[derive(Clone, Debug, Default)]
+pub struct NoopResourceBoundaryVerifier;
+
+impl ResourceBoundaryVerifier for NoopResourceBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        VerificationResult::allow()
+    }
+}
+
 /// Result returned by an approval verifier.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ApprovalVerification {
@@ -724,6 +753,7 @@ pub struct VerifiedActionGateway {
     adapters: HashMap<String, AdapterRegistration>,
     tenant_access: Arc<dyn TenantAccess>,
     invariant_evaluator: Arc<dyn InvariantEvaluator>,
+    resource_boundary_verifier: Arc<dyn ResourceBoundaryVerifier>,
     approval_verifier: Arc<dyn ApprovalVerifier>,
     safety_verifier: Option<Arc<dyn SafetyVerifier>>,
     circuit_breaker_evaluator: Arc<dyn CircuitBreakerEvaluator>,
@@ -737,6 +767,7 @@ impl VerifiedActionGateway {
             adapters: HashMap::new(),
             tenant_access,
             invariant_evaluator: Arc::new(SimpleInvariantEvaluator),
+            resource_boundary_verifier: Arc::new(NoopResourceBoundaryVerifier),
             approval_verifier: Arc::new(NoApprovalVerifier),
             safety_verifier: None,
             circuit_breaker_evaluator: Arc::new(NoopCircuitBreakerEvaluator),
@@ -763,6 +794,11 @@ impl VerifiedActionGateway {
     /// Overrides the invariant evaluator used by the gateway.
     pub fn set_invariant_evaluator(&mut self, evaluator: Arc<dyn InvariantEvaluator>) {
         self.invariant_evaluator = evaluator;
+    }
+
+    /// Overrides the resource boundary verifier used before adapter execution.
+    pub fn set_resource_boundary_verifier(&mut self, verifier: Arc<dyn ResourceBoundaryVerifier>) {
+        self.resource_boundary_verifier = verifier;
     }
 
     /// Overrides the approval verifier used by the gateway.
@@ -865,6 +901,15 @@ impl ActionGateway for VerifiedActionGateway {
             combine_verifications([("policy", policy_result), ("invariant", invariant_pre)]);
 
         if !verification.allowed {
+            attach_request_context(&mut verification, &action);
+            return Ok(denied_outcome(action.action_id, verification));
+        }
+
+        let resource_result = self
+            .resource_boundary_verifier
+            .verify_resource_boundary(&action, Some(adapter_id));
+        if !resource_result.allowed {
+            let mut verification = combine_verifications([("resource_boundary", resource_result)]);
             attach_request_context(&mut verification, &action);
             return Ok(denied_outcome(action.action_id, verification));
         }

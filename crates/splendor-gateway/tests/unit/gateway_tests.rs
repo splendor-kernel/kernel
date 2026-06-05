@@ -172,6 +172,25 @@ struct CountingAdapter {
     satisfied: Vec<String>,
 }
 
+struct DenyResourceVerifier;
+
+impl ResourceBoundaryVerifier for DenyResourceVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        VerificationResult {
+            allowed: false,
+            reasons: vec!["resource_scope_denied".to_string()],
+            artifacts: serde_json::json!({
+                "source": "test_resource_verifier",
+                "adapter_execution": "not_attempted",
+            }),
+        }
+    }
+}
+
 impl ActionAdapter for CountingAdapter {
     fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
         *self.calls.lock().expect("calls lock") += 1;
@@ -203,6 +222,28 @@ fn base_request() -> ActionRequest {
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
     }
+}
+
+#[test]
+fn resource_boundary_denial_prevents_adapter_execution() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("noop", "test", adapter.clone());
+    gateway.set_resource_boundary_verifier(Arc::new(DenyResourceVerifier));
+
+    let mut request = base_request();
+    request.adapter = Some("test".to_string());
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"resource_scope_denied".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }
 
 fn physical_request() -> ActionRequest {

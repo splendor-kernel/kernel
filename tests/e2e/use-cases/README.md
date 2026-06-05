@@ -30,6 +30,7 @@ Reports are written under:
 target/splendor-e2e/use-case-acceptance/report.json
 target/splendor-e2e/use-case-acceptance/report.md
 target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S0/
+target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/
 ```
 
 Report generation fails if required S0/S1 evidence artifacts are absent or
@@ -49,6 +50,9 @@ S1 uses `splendorctl` as the documented public boundary. It signs a scoped local
 work order, runs HTTP and filesystem actions through the real action gateway,
 exports trace/state evidence through CLI commands, and runs inspect-only replay
 while checking that the HTTP fixture counter and artifact checksum do not change.
+The negative branch proves URL allowlist and sandbox path traversal denials occur
+as `action.denied` gateway outcomes with adapter non-execution evidence, and uses
+deterministic trace/state failure injection to prove fail-closed behavior.
 S1 deliberately does not add remote messaging, fleet placement, governance
 approval workflows, or physical/edge actions.
 

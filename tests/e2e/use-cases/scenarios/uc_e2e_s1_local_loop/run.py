@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -139,6 +140,68 @@ def event_type(record: dict) -> str:
     }.get(key, key)
 
 
+def trace_event_id(record: dict) -> str:
+    return str(record.get("payload", {}).get("trace_event_id", ""))
+
+
+def trace_records(stdout: str) -> list[dict]:
+    return [json.loads(line) for line in stdout.splitlines() if line.strip()]
+
+
+def event_ids_by_type(records: list[dict]) -> dict[str, list[str]]:
+    ids: dict[str, list[str]] = {}
+    for record in records:
+        ids.setdefault(event_type(record), []).append(trace_event_id(record))
+    return ids
+
+
+def is_canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
+def replay_lifecycle_evidence(replay_lines: list[dict]) -> dict[str, str]:
+    evidence: dict[str, str] = {}
+    for line in replay_lines:
+        if line.get("type") != "replay_lifecycle":
+            continue
+        event = line.get("event")
+        trace_id = line.get("trace_event_id")
+        if (
+            event in {"replay.started", "replay.adapter_suppressed", "replay.completed"}
+            and is_canonical_uuid(trace_id)
+            and line.get("replay_mode") == "inspect_only"
+            and line.get("side_effects_replayed") is False
+        ):
+            evidence[event] = trace_id
+    return evidence
+
+
+def action_denial_evidence(records: list[dict]) -> list[dict]:
+    denials = []
+    for record in records:
+        if event_type(record) != "action.denied":
+            continue
+        kind = record["payload"]["kind"]["ActionDenied"]
+        result = kind["result"]
+        denials.append({
+            "trace_event_id": trace_event_id(record),
+            "action_id": record["payload"].get("identity", {}).get("action_id"),
+            "reasons": result.get("reasons", []),
+            "artifacts": result.get("artifacts"),
+            "adapter_execution": json.dumps(result.get("artifacts", {})).find("not_attempted") >= 0,
+        })
+    return denials
+
+
+def sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -160,7 +223,14 @@ def main() -> int:
 
     try:
         envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID))
+        bootstrap_cfg = config(root, artifact_dir, envelope, RUN_ID, [], port)
+        bootstrap_cfg["agents"][0]["policy"]["next_state"] = "{\"bootstrap\":true}"
+        bootstrap_path = artifact_dir / "bootstrap.config.json"
+        write_json(bootstrap_path, bootstrap_cfg)
+        run_cmd(["splendorctl", "run", "--config", str(bootstrap_path)], root, commands)
+
         cfg = config(root, artifact_dir, envelope, RUN_ID, [action_http(port), action_write()], port)
+        cfg["agents"][0]["resume"] = True
         cfg_path = artifact_dir / "positive.config.json"
         write_json(cfg_path, cfg)
         run_cmd(["splendorctl", "run", "--config", str(cfg_path)], root, commands)
@@ -170,18 +240,32 @@ def main() -> int:
         trace_export.write_text(proc.stdout, encoding="utf-8")
         state_proc = run_cmd(["splendorctl", "state", "head", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
         state_head = json.loads(state_proc.stdout)
-        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        records = trace_records(proc.stdout)
         events = [event_type(r) for r in records]
+        artifact = artifact_dir / "sandbox" / TENANT_ID / "artifacts" / "summary.md"
+        checksum_before = sha256(artifact)
         before_replay = FixtureHandler.counter
         replay_proc = run_cmd(["splendorctl", "replay", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
         after_replay = FixtureHandler.counter
-        artifact = artifact_dir / "sandbox" / TENANT_ID / "artifacts" / "summary.md"
-        checksum_before = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
-        checksum_after = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
-        replay_report = {"mode": "inspect_only", "http_counter_before": before_replay, "http_counter_after": after_replay, "artifact_checksum_before": checksum_before, "artifact_checksum_after": checksum_after, "adapter_suppressed": before_replay == after_replay and checksum_before == checksum_after, "raw_lines": [json.loads(line) for line in replay_proc.stdout.splitlines() if line.strip()]}
+        checksum_after = sha256(artifact)
+        replay_lines = trace_records(replay_proc.stdout)
+        replay_event_ids = replay_lifecycle_evidence(replay_lines)
+        replay_report = {
+            "mode": "inspect_only",
+            "events": sorted(replay_event_ids.keys()),
+            "event_ids": replay_event_ids,
+            "derived_from_raw_output": True,
+            "http_counter_before": before_replay,
+            "http_counter_after": after_replay,
+            "artifact_checksum_before": checksum_before,
+            "artifact_checksum_after": checksum_after,
+            "adapter_suppressed": before_replay == after_replay and checksum_before == checksum_after,
+            "raw_lines": replay_lines,
+        }
         write_json(artifact_dir / "replay-report.json", replay_report)
 
         negatives = []
+        negative_records: list[dict] = []
         precondition_action = action_write("artifacts/precondition.md")
         precondition_action["preconditions"] = ["external_verifier_available"]
         precondition_action["satisfied_preconditions"] = []
@@ -196,46 +280,122 @@ def main() -> int:
             c = config(root, artifact_dir, env, rid, actions, port, quota)
             p = artifact_dir / f"{suffix}.config.json"
             write_json(p, c)
+            before = FixtureHandler.counter
             res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
             trace = run_cmd(["splendorctl", "trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
-            negatives.append({"case": suffix, "exit": res.returncode, "trace_present": trace.returncode == 0, "evidence": trace.stdout[-2000:]})
-        for suffix, bad_field, bad_path in [
-            ("forced_trace_write_failure_blocks_side_effect", "trace_db", "/proc/splendor-s1-trace.db"),
-            ("forced_state_commit_failure_prevents_next_tick", "state_db", "/proc/splendor-s1-state.db"),
+            parsed_trace = trace_records(trace.stdout) if trace.returncode == 0 else []
+            negative_records.extend(parsed_trace)
+            denials = action_denial_evidence(parsed_trace)
+            negatives.append({
+                "case": suffix,
+                "exit": res.returncode,
+                "trace_present": trace.returncode == 0,
+                "events": [event_type(r) for r in parsed_trace],
+                "denials": denials,
+                "http_counter_before": before,
+                "http_counter_after": FixtureHandler.counter,
+            })
+        for suffix, injection in [
+            ("forced_trace_write_failure_blocks_side_effect", {"trace_fail_on_event": "ActionVerificationStarted"}),
+            ("forced_state_commit_failure_prevents_next_tick", {"state_commit_fail": True}),
         ]:
-            rid = "33333333-3333-4333-8333-" + ("333333333338" if bad_field == "trace_db" else "333333333339")
+            rid = "33333333-3333-4333-8333-" + ("333333333338" if "trace" in suffix else "333333333339")
             env = sign_work_order(root, artifact_dir, commands, work_order(rid, 4))
             c = config(root, artifact_dir, env, rid, [action_http(port), action_write()], port, 4)
-            c[bad_field] = bad_path
+            c["failure_injection"] = injection
+            if "state" in suffix:
+                c["cycles"] = 2
             p = artifact_dir / f"{suffix}.config.json"
             write_json(p, c)
             before = FixtureHandler.counter
             res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
-            negatives.append({"case": suffix, "exit": res.returncode, "http_counter_before": before, "http_counter_after": FixtureHandler.counter})
+            trace = run_cmd(["splendorctl", "trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
+            parsed_trace = trace_records(trace.stdout) if trace.returncode == 0 else []
+            tick_starts = [r for r in parsed_trace if event_type(r) == "tick.started"]
+            tick_start_ids = [r["payload"].get("kind", {}).get("LoopTickStarted", {}).get("tick_id") for r in tick_starts]
+            negatives.append({
+                "case": suffix,
+                "exit": res.returncode,
+                "http_counter_before": before,
+                "http_counter_after": FixtureHandler.counter,
+                "events": [event_type(r) for r in parsed_trace],
+                "tick_start_count": len(tick_starts),
+                "tick_start_ids": tick_start_ids,
+                "stderr": res.stderr[-1000:],
+            })
 
         api_traffic = artifact_dir / "api-traffic.ndjson"
         api_traffic.write_text(json.dumps({"surface": "splendorctl", "commands_log": str(commands)}) + "\n", encoding="utf-8")
-        state_committed = next(r for r in records if event_type(r) == "state.committed")
+        state_committed = next(r for r in reversed(records) if event_type(r) == "state.committed")
         committed_kind = state_committed["payload"]["kind"]["StateCommitted"]
         state_node_id = state_committed["payload"]["identity"].get("state_node_id")
         state_hash = f"{committed_kind['state_hash']['algorithm'].lower()}:{committed_kind['state_hash']['value']}"
-        state_export = {"run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "state_node_id": state_node_id, "state_hash": state_hash, "parent_state_node_ids": "available_in_state_store", "trace_linkage": state_head.get("trace_sequence")}
+        audit_proc = run_cmd(["splendorctl", "audit", "export", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
+        audit_export = json.loads(audit_proc.stdout)
+        audit_state = next(item for item in audit_export["state_nodes"] if item.get("state_node_id") == state_node_id)
+        snapshot_value = audit_state.get("snapshot_id") or committed_kind.get("snapshot_id")
+        snapshot_ref = f"{snapshot_value['algorithm'].lower()}:{snapshot_value['value']}" if isinstance(snapshot_value, dict) else str(snapshot_value)
+        state_export = {
+            "schema_version": "splendor.state_node.evidence.v1",
+            "run_id": RUN_ID,
+            "tenant_id": TENANT_ID,
+            "agent_id": AGENT_ID,
+            "state_node_id": state_node_id,
+            "state_hash": state_hash,
+            "parent_state_node_ids": audit_state.get("parent_state_node_ids", []),
+            "snapshot_ref": snapshot_ref,
+            "trace_linkage": trace_event_id(state_committed),
+            "timestamp": state_committed["payload"].get("timestamp") or state_committed.get("recorded_at"),
+        }
         write_json(artifact_dir / "state-export.json", state_export)
-        write_json(artifact_dir / "audit-report.json", {"mode": "inspect_only", "denials": negatives, "work_order_id": WORK_ORDER_ID})
+        write_json(artifact_dir / "audit-report.json", {"mode": "inspect_only", "denials": negatives, "work_order_id": WORK_ORDER_ID, "audit_export": audit_export})
         write_json(artifact_dir / "anti-drift-results.json", {"status": "passed", "checks": ["public_cli_boundary", "gateway_traces_present", "inspect_only_replay_suppression"]})
         (artifact_dir / "stdout.log").write_text("UC-E2E-S1 local governed loop completed with inspect_only side-effect suppression\n", encoding="utf-8")
         (artifact_dir / "stderr.log").write_text("", encoding="utf-8")
-        trace_ids = [r["payload"].get("trace_event_id", "") for r in records]
-        action_ids = [r["payload"].get("identity", {}).get("action_id") for r in records if r["payload"].get("identity", {}).get("action_id")]
-        required = {"tick.started", "percepts.received", "state.loaded", "policy.invoked", "policy.completed", "actions.proposed", "constraints.evaluated", "verification.started", "verification.completed", "action.executed", "outcome.recorded", "state.committed", "tick.completed"}
-        failures = sorted(required - set(events))
+        all_records = records + negative_records
+        ids_by_event = event_ids_by_type(all_records)
+        trace_ids = [trace_event_id(r) for r in all_records if trace_event_id(r)]
+        for replay_event, replay_trace_id in replay_report["event_ids"].items():
+            ids_by_event.setdefault(replay_event, []).append(replay_trace_id)
+            trace_ids.append(replay_trace_id)
+        action_ids = [r["payload"].get("identity", {}).get("action_id") for r in all_records if r["payload"].get("identity", {}).get("action_id")]
+        required = {"tick.started", "percepts.received", "state.loaded", "policy.invoked", "policy.completed", "actions.proposed", "constraints.evaluated", "verification.started", "verification.completed", "action.executed", "action.denied", "outcome.recorded", "state.committed", "tick.completed", "replay.started", "replay.adapter_suppressed", "replay.completed"}
+        failures = sorted(name for name in required if not ids_by_event.get(name))
         if not replay_report["adapter_suppressed"]:
             failures.append("replay_side_effect_suppression_missing")
+        if not {"replay.started", "replay.adapter_suppressed", "replay.completed"}.issubset(set(replay_report["events"])):
+            failures.append("replay_events_missing")
+        if any(not replay_report["event_ids"].get(event) for event in ["replay.started", "replay.adapter_suppressed", "replay.completed"]):
+            failures.append("replay_event_ids_missing")
+        if any(not is_canonical_uuid(replay_report["event_ids"].get(event)) for event in ["replay.started", "replay.adapter_suppressed", "replay.completed"]):
+            failures.append("replay_trace_event_ids_not_canonical_uuid")
+        negative_by_case = {item["case"]: item for item in negatives}
+        for case in ["deny_url", "deny_path"]:
+            item = negative_by_case[case]
+            if "action.denied" not in item["events"] or "action.failed" in item["events"]:
+                failures.append(f"{case}_not_gateway_denied")
+            if not any(d.get("adapter_execution") for d in item.get("denials", [])):
+                failures.append(f"{case}_missing_adapter_non_execution_evidence")
+        if negative_by_case["deny_url"]["http_counter_before"] != negative_by_case["deny_url"]["http_counter_after"]:
+            failures.append("deny_url_adapter_executed")
+        if negative_by_case["forced_trace_write_failure_blocks_side_effect"]["http_counter_before"] != negative_by_case["forced_trace_write_failure_blocks_side_effect"]["http_counter_after"]:
+            failures.append("trace_write_failure_allowed_side_effect")
+        state_failure = negative_by_case["forced_state_commit_failure_prevents_next_tick"]
+        if state_failure["exit"] == 0 or state_failure["http_counter_after"] - state_failure["http_counter_before"] > 1:
+            failures.append("state_commit_failure_advanced_next_tick")
+        if state_failure.get("tick_start_count", 0) > 1 or 2 in state_failure.get("tick_start_ids", []):
+            failures.append("state_commit_failure_started_second_tick")
+        for key in ["state_node_id", "state_hash", "parent_state_node_ids", "snapshot_ref", "trace_linkage", "timestamp"]:
+            if state_export.get(key) in (None, "", "available_in_state_store"):
+                failures.append(f"state_export_missing_{key}")
+        if not state_export.get("parent_state_node_ids"):
+            failures.append("state_export_empty_parent_state_node_ids")
         scenario = {
             "id": "UC-E2E-S1", "status": "passed" if not failures else "failed", "fr_coverage": ["FR-0.01-01", "FR-0.01-02", "FR-0.01-03", "FR-0.01-04", "FR-0.01-05"],
             "components": ["splendorctl", "action gateway", "HTTP adapter", "filesystem adapter", "state graph", "trace store", "replay"],
             "positive_evidence": ["signed scoped work order accepted", "HTTP read and sandbox filesystem write executed through gateway", "state head and ordered trace exported"],
             "negative_evidence": [n["case"] for n in negatives], "replay_evidence": ["inspect_only replay did not increment HTTP counter or change artifact checksum"],
+            "required_trace_event_ids": ids_by_event,
             "replay_mode": "inspect_only", "replay_side_effect_suppression": {"required": True, "evidence_present": replay_report["adapter_suppressed"], "side_effects_allowed_default": False},
             "replay_artifacts": [str(artifact_dir / "replay-report.json")], "anti_drift_checks": ["public_cli_boundary", "no_direct_adapter_execution", "inspect_only"],
             "run_ids": [RUN_ID], "trace_event_ids": trace_ids, "state_node_ids": [state_node_id], "state_hashes": [state_hash], "message_ids": [], "work_order_ids": [envelope["work_order_id"]], "approval_ids": [], "node_ids": [], "action_ids": action_ids,

@@ -12,7 +12,7 @@ usage() {
   cat <<'USAGE'
 Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
-S0 is a static/container-harness gate. Later scenarios intentionally report blocked/not-yet-covered until implemented.
+S0 is a static/container-harness gate. S1 is the local governed loop gate. S2-S10 intentionally report blocked/not-yet-covered until implemented.
 USAGE
 }
 
@@ -95,7 +95,7 @@ case "${MODE}" in
     python3 "${ROOT_DIR}/tests/e2e/use-cases/contract/public_boundary_probe.py" \
       --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}" \
       --out "${REPORT_DIR}/artifacts/UC-E2E-S0/public-boundary.json"
-    if [[ "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S1" ]]; then
+    if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S1" ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s1_local_loop/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}"
