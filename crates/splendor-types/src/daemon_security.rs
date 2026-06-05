@@ -184,6 +184,7 @@ pub struct CallerCredential {
     /// Audience this credential was issued for.
     pub audience: CredentialAudience,
     /// Expiration time; expired credentials fail closed.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     /// Revocation status from the configured revocation path.
     pub revocation: RevocationStatus,
@@ -226,6 +227,7 @@ pub struct WorkOrderAuthorization {
     /// Validated signature metadata; missing or empty values fail closed.
     pub signature: Option<WorkOrderSignature>,
     /// Expiration time; expired work orders fail closed.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     /// Revocation status from the configured work-order revocation path.
     pub revocation: RevocationStatus,
@@ -240,6 +242,7 @@ pub struct AuditAttribution {
     /// Credential that authenticated the caller.
     pub credential_id: Option<String>,
     /// Request timestamp recorded into trace/audit metadata.
+    #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
 }
 

@@ -58,6 +58,22 @@ def run_cmd(cmd: list[str], cwd: Path, log: Path, check: bool = True) -> subproc
     return proc
 
 
+def splendorctl_cmd_prefix(root: Path) -> list[str]:
+    container = Path("/usr/local/bin/splendorctl")
+    if root == Path("/workspace") and container.exists():
+        return [str(container)]
+    local = root / "target" / "debug" / "splendorctl"
+    if local.exists():
+        return [str(local)]
+    if container.exists():
+        return [str(container)]
+    if shutil.which("splendorctl"):
+        return ["splendorctl"]
+    if shutil.which("cargo"):
+        return ["cargo", "run", "-q", "-p", "splendorctl", "--"]
+    return ["splendorctl"]
+
+
 def write_json(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -67,7 +83,7 @@ def sign_work_order(root: Path, artifact_dir: Path, commands: Path, work_order: 
     raw = artifact_dir / f"{work_order['work_order_id']}.unsigned.json"
     write_json(raw, work_order)
     proc = run_cmd(
-        ["splendorctl", "work-order", "sign", "--input", str(raw), "--key-id", KEY_ID, "--secret", SECRET],
+        splendorctl_cmd_prefix(root) + ["work-order", "sign", "--input", str(raw), "--key-id", KEY_ID, "--secret", SECRET],
         root,
         commands,
     )
@@ -215,6 +231,7 @@ def main() -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     commands = artifact_dir / "commands.log"
     commands.write_text("", encoding="utf-8")
+    ctl = splendorctl_cmd_prefix(root)
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
     port = httpd.server_address[1]
@@ -227,25 +244,25 @@ def main() -> int:
         bootstrap_cfg["agents"][0]["policy"]["next_state"] = "{\"bootstrap\":true}"
         bootstrap_path = artifact_dir / "bootstrap.config.json"
         write_json(bootstrap_path, bootstrap_cfg)
-        run_cmd(["splendorctl", "run", "--config", str(bootstrap_path)], root, commands)
+        run_cmd(ctl + ["run", "--config", str(bootstrap_path)], root, commands)
 
         cfg = config(root, artifact_dir, envelope, RUN_ID, [action_http(port), action_write()], port)
         cfg["agents"][0]["resume"] = True
         cfg_path = artifact_dir / "positive.config.json"
         write_json(cfg_path, cfg)
-        run_cmd(["splendorctl", "run", "--config", str(cfg_path)], root, commands)
+        run_cmd(ctl + ["run", "--config", str(cfg_path)], root, commands)
 
         trace_export = artifact_dir / "trace-export.jsonl"
-        proc = run_cmd(["splendorctl", "trace", "export", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
+        proc = run_cmd(ctl + ["trace", "export", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
         trace_export.write_text(proc.stdout, encoding="utf-8")
-        state_proc = run_cmd(["splendorctl", "state", "head", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
+        state_proc = run_cmd(ctl + ["state", "head", "--db", cfg["trace_db"], "--run", RUN_ID], root, commands)
         state_head = json.loads(state_proc.stdout)
         records = trace_records(proc.stdout)
         events = [event_type(r) for r in records]
         artifact = artifact_dir / "sandbox" / TENANT_ID / "artifacts" / "summary.md"
         checksum_before = sha256(artifact)
         before_replay = FixtureHandler.counter
-        replay_proc = run_cmd(["splendorctl", "replay", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
+        replay_proc = run_cmd(ctl + ["replay", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
         after_replay = FixtureHandler.counter
         checksum_after = sha256(artifact)
         replay_lines = trace_records(replay_proc.stdout)
@@ -281,8 +298,8 @@ def main() -> int:
             p = artifact_dir / f"{suffix}.config.json"
             write_json(p, c)
             before = FixtureHandler.counter
-            res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
-            trace = run_cmd(["splendorctl", "trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
+            res = run_cmd(ctl + ["run", "--config", str(p)], root, commands, check=False)
+            trace = run_cmd(ctl + ["trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
             parsed_trace = trace_records(trace.stdout) if trace.returncode == 0 else []
             negative_records.extend(parsed_trace)
             denials = action_denial_evidence(parsed_trace)
@@ -308,8 +325,8 @@ def main() -> int:
             p = artifact_dir / f"{suffix}.config.json"
             write_json(p, c)
             before = FixtureHandler.counter
-            res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
-            trace = run_cmd(["splendorctl", "trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
+            res = run_cmd(ctl + ["run", "--config", str(p)], root, commands, check=False)
+            trace = run_cmd(ctl + ["trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
             parsed_trace = trace_records(trace.stdout) if trace.returncode == 0 else []
             tick_starts = [r for r in parsed_trace if event_type(r) == "tick.started"]
             tick_start_ids = [r["payload"].get("kind", {}).get("LoopTickStarted", {}).get("tick_id") for r in tick_starts]
@@ -330,7 +347,7 @@ def main() -> int:
         committed_kind = state_committed["payload"]["kind"]["StateCommitted"]
         state_node_id = state_committed["payload"]["identity"].get("state_node_id")
         state_hash = f"{committed_kind['state_hash']['algorithm'].lower()}:{committed_kind['state_hash']['value']}"
-        audit_proc = run_cmd(["splendorctl", "audit", "export", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
+        audit_proc = run_cmd(ctl + ["audit", "export", "--db", cfg["trace_db"], "--state-db", cfg["state_db"], "--run", RUN_ID], root, commands)
         audit_export = json.loads(audit_proc.stdout)
         audit_state = next(item for item in audit_export["state_nodes"] if item.get("state_node_id") == state_node_id)
         snapshot_value = audit_state.get("snapshot_id") or committed_kind.get("snapshot_id")

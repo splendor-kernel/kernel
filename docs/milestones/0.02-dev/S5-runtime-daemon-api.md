@@ -9,8 +9,8 @@ verifiers, adapter, outcome, state commit, and trace.
 ## Functional scope
 
 - Added `crates/splendor-daemon`, a local-only Rust daemon crate and binary.
-- Implemented endpoints for runs, percepts, state-head, traces, replay, actions,
-  health, and capabilities.
+- Implemented endpoints for runs, percepts, state-head, trace read/export,
+  replay, actions, health, version, and capabilities.
 - Reused the 0.02-S0 daemon security validator for endpoint scope, work-order,
   audit attribution, and explicit insecure local dev mode checks.
 - Added `StateStore::get_node` so state-head responses prove the node exists.
@@ -32,6 +32,10 @@ verifiers, adapter, outcome, state commit, and trace.
 - New OpenAPI file: `openapi/splendor-runtime-daemon.yaml`.
 - Extended daemon scopes: `splendor.runs.start`, `splendor.runs.read`,
   `splendor.runs.pause`, and `splendor.runs.stop`.
+- Added management-contract aliases for `cancelRun`, `getVersion`, and
+  `exportTraces` without widening runtime authority: cancel uses the same stop
+  scope, version is health/read-only metadata, and trace export still requires
+  `splendor.traces.read` plus explicit redaction policy.
 - Added trace event variants: `RunPaused`, `RunResumed`, `RunStopped`, and
   `PerceptsAppended`.
 - Added `StateStore::get_node` and async equivalent.
@@ -56,10 +60,13 @@ verifiers, adapter, outcome, state commit, and trace.
 - `RunStarted` is emitted when a daemon run slot is created.
 - `PerceptsAppended` records daemon percept acceptance before the next tick.
 - Normal tick events remain ordered by `LoopEngine`.
-- `RunPaused`, `RunResumed`, and `RunStopped` record local lifecycle transitions.
+- `RunPaused`, `RunResumed`, and `RunStopped` record local lifecycle transitions;
+  `/runs/{run_id}/cancel` emits the same stop transition while preserving
+  trace/state evidence.
 - `/actions` records action verification, action result, and outcome events through
   the run's trace runtime.
-- Trace pages are returned in store sequence order.
+- Trace pages are returned in store sequence order. Trace exports return the same
+  ordered records plus redaction-policy and integrity metadata.
 
 ## State behavior
 

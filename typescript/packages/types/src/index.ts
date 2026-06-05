@@ -1255,6 +1255,8 @@ export interface AppendPerceptResponse {
 
 export interface ReplayRequest {
   credential: CallerCredential | null;
+  mode: "inspect_only";
+  side_effects_allowed: false;
 }
 
 export interface ReplayResponse {
@@ -1279,6 +1281,21 @@ export interface TracePageResponse {
   records: TraceRecord[];
 }
 
+export interface TraceExportRequest {
+  credential: CallerCredential | null;
+  redaction_policy: string | null;
+  start: number | null;
+  end: number | null;
+}
+
+export interface TraceExportResponse {
+  run_id: RunId;
+  records: TraceRecord[];
+  record_count: number;
+  redaction_policy: string;
+  integrity_hash: string;
+}
+
 export interface SubmitActionRequest {
   run_id: RunId;
   tenant_id: TenantId;
@@ -1297,6 +1314,14 @@ export interface HealthResponse {
   status: string;
   local_only: boolean;
   runtime_available: boolean;
+}
+
+export interface VersionResponse {
+  daemon_api_version: string;
+  compatibility_line: string;
+  openapi_version: string;
+  local_only: boolean;
+  schema_versions: string[];
 }
 
 export interface CapabilitiesResponse {
@@ -1437,6 +1462,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
   ],
   policy_sync_response: ["run_id", "accepted", "policy_bundle", "cache_status"],
   trace_page_response: ["run_id", "records"],
+  trace_export_request: ["credential", "redaction_policy", "start", "end"],
+  trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
   replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
   submit_action_request: [
     "run_id",
@@ -1452,6 +1479,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "approval_evidence"
   ],
   health_response: ["status", "local_only", "runtime_available"],
+  version_response: ["daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"],
   capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints"]
 } as const satisfies {
   message: readonly (keyof Message)[];
@@ -1479,9 +1507,12 @@ export const CANONICAL_SCHEMA_FIELDS = {
   policy_cache_status_response: readonly (keyof PolicyCacheStatusResponse)[];
   policy_sync_response: readonly (keyof PolicySyncResponse)[];
   trace_page_response: readonly (keyof TracePageResponse)[];
+  trace_export_request: readonly (keyof TraceExportRequest)[];
+  trace_export_response: readonly (keyof TraceExportResponse)[];
   replay_response: readonly (keyof ReplayResponse)[];
   submit_action_request: readonly (keyof SubmitActionRequest)[];
   health_response: readonly (keyof HealthResponse)[];
+  version_response: readonly (keyof VersionResponse)[];
   capabilities_response: readonly (keyof CapabilitiesResponse)[];
 };
 

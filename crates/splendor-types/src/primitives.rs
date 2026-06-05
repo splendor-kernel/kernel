@@ -35,6 +35,7 @@ pub struct Percept {
     /// Provenance details to trace the source of the percept.
     pub provenance: PerceptProvenance,
     /// Timestamp when the percept was recorded.
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
 }
 

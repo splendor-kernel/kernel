@@ -15,8 +15,10 @@ import type {
   StateHead,
   SubmitActionRequest,
   TickResponse,
+  TraceExportResponse,
   TracePageResponse,
   TraceRecord,
+  VersionResponse,
   WorkOrderEnvelope
 } from "@splendor/types";
 
@@ -47,6 +49,7 @@ export interface ReadTracesOptions {
   redactionPolicy: string;
   start?: number;
   end?: number;
+  credential?: CallerCredential | null;
 }
 
 export interface RequestReplayOptions {
@@ -149,6 +152,10 @@ export class SplendorClient {
     return this.lifecycle<RunInspectResponse>(runId, "stop", request);
   }
 
+  async cancelRun(runId: RunId, request: LifecycleRequest): Promise<RunInspectResponse> {
+    return this.lifecycle<RunInspectResponse>(runId, "cancel", request);
+  }
+
   async appendPercept(
     runId: RunId,
     percept: Percept,
@@ -177,6 +184,20 @@ export class SplendorClient {
     });
   }
 
+  async exportTraces(runId: RunId, options: ReadTracesOptions): Promise<TraceExportResponse> {
+    if (!options?.redactionPolicy.trim()) {
+      throw new TypeError("exportTraces requires an explicit redactionPolicy");
+    }
+    return this.request<TraceExportResponse>("POST", `runs/${encodeURIComponent(runId)}/traces/export`, {
+      body: {
+        credential: options.credential ?? this.defaultCredential ?? null,
+        redaction_policy: options.redactionPolicy,
+        start: options.start ?? null,
+        end: options.end ?? null
+      }
+    });
+  }
+
   async readTraces(runId: RunId, options: ReadTracesOptions): Promise<TraceRecord[]> {
     return (await this.readTracePage(runId, options)).records;
   }
@@ -194,7 +215,9 @@ export class SplendorClient {
   async requestReplay(runId: RunId, options: RequestReplayOptions = {}): Promise<ReplayResponse> {
     return this.request<ReplayResponse>("POST", `runs/${encodeURIComponent(runId)}/replay`, {
       body: {
-        credential: options.credential ?? this.defaultCredential ?? null
+        credential: options.credential ?? this.defaultCredential ?? null,
+        mode: "inspect_only",
+        side_effects_allowed: false
       }
     });
   }
@@ -216,11 +239,15 @@ export class SplendorClient {
     return this.request<HealthResponse>("GET", "health");
   }
 
+  async getVersion(): Promise<VersionResponse> {
+    return this.request<VersionResponse>("GET", "version");
+  }
+
   async getCapabilities(): Promise<CapabilitiesResponse> {
     return this.request<CapabilitiesResponse>("GET", "capabilities");
   }
 
-  private lifecycle<T>(runId: RunId, action: "start" | "pause" | "resume" | "stop", request: LifecycleRequest): Promise<T> {
+  private lifecycle<T>(runId: RunId, action: "start" | "pause" | "resume" | "stop" | "cancel", request: LifecycleRequest): Promise<T> {
     return this.request<T>("POST", `runs/${encodeURIComponent(runId)}/${action}`, {
       body: {
         ...request,
@@ -284,6 +311,9 @@ export class SplendorClient {
       "X-Splendor-API-Version": this.apiVersion,
       "X-Splendor-Client": "@splendor/client"
     });
+    if (this.defaultCredential) {
+      headers.set("X-Splendor-Caller-Credential", JSON.stringify(this.defaultCredential));
+    }
     let body: string | undefined;
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");

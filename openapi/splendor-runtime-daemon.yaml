@@ -42,6 +42,7 @@ paths:
       operationId: inspectRun
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Run metadata.
@@ -153,6 +154,31 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+  /runs/{run_id}/cancel:
+    post:
+      summary: Cancel a local run without deleting trace or state evidence.
+      operationId: cancelRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LifecycleRequest'
+      responses:
+        '200':
+          description: Run cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunInspectResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /runs/{run_id}/percepts:
     post:
       summary: Append a percept to the daemon queue for the next tick.
@@ -209,6 +235,7 @@ paths:
       operationId: getStateHead
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: State head metadata.
@@ -226,6 +253,7 @@ paths:
       operationId: getRunTraces
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
         - name: start
           in: query
           schema:
@@ -248,6 +276,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TracePageResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /runs/{run_id}/traces/export:
+    post:
+      summary: Export ordered trace records with explicit redaction policy and integrity metadata.
+      operationId: exportTraces
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TraceExportRequest'
+      responses:
+        '200':
+          description: Trace export package.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceExportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -315,6 +368,23 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /version:
+    get:
+      summary: Read daemon/runtime/schema compatibility metadata.
+      operationId: getVersion
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200':
+          description: Version and compatibility metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /capabilities:
     get:
       summary: Read local daemon capabilities.
@@ -1232,6 +1302,41 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TraceRecord'
+    TraceExportRequest:
+      type: object
+      required: [credential, redaction_policy, start, end]
+      properties:
+        credential:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CallerCredential'
+        redaction_policy:
+          type: [string, 'null']
+          description: Required non-empty redaction policy for executable trace exports.
+        start:
+          type: [integer, 'null']
+          minimum: 0
+        end:
+          type: [integer, 'null']
+          minimum: 0
+    TraceExportResponse:
+      type: object
+      required: [run_id, records, record_count, redaction_policy, integrity_hash]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRecord'
+        record_count:
+          type: integer
+          minimum: 0
+        redaction_policy:
+          type: string
+        integrity_hash:
+          type: string
     ReplayRequest:
       type: object
       required: [credential, mode, side_effects_allowed]
@@ -1337,6 +1442,22 @@ components:
           type: boolean
         runtime_available:
           type: boolean
+    VersionResponse:
+      type: object
+      required: [daemon_api_version, compatibility_line, openapi_version, local_only, schema_versions]
+      properties:
+        daemon_api_version:
+          type: string
+        compatibility_line:
+          type: string
+        openapi_version:
+          type: string
+        local_only:
+          type: boolean
+        schema_versions:
+          type: array
+          items:
+            type: string
     CapabilitiesResponse:
       type: object
       required: [daemon_api_version, local_only, replay_modes, endpoints]

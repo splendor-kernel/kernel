@@ -10,9 +10,9 @@ REUSE_BUILD=0
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
+Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
-S0 is a static/container-harness gate. S1 is the local governed loop gate. S2-S10 intentionally report blocked/not-yet-covered until implemented.
+S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3-S10 intentionally report blocked/not-yet-covered until implemented.
 USAGE
 }
 
@@ -32,7 +32,7 @@ done
 if [[ "${MODE}" == "scenario" && -z "${SCENARIO}" ]]; then
   SCENARIO="UC-E2E-S0"
 fi
-if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" ]]; then
+if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" ]]; then
   echo "${SCENARIO} is not implemented; use --all to report future scenarios as blocked." >&2
   exit 2
 fi
@@ -48,6 +48,15 @@ COMMAND_LOG="${REPORT_DIR}/artifacts/${COMMAND_SCENARIO}/commands.log"
   echo "command=bash scripts/e2e/verify-use-case-acceptance.sh $*"
   echo "mode=${MODE} scenario=${SCENARIO:-all} inside_compose=${INSIDE_COMPOSE} reuse_build=${REUSE_BUILD}"
 } >> "${COMMAND_LOG}"
+if [[ "${COMMAND_SCENARIO}" != "UC-E2E-S0" ]]; then
+  mkdir -p "${REPORT_DIR}/artifacts/UC-E2E-S0"
+  {
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "command=bash scripts/e2e/verify-use-case-acceptance.sh $*"
+    echo "mode=${MODE} scenario=${SCENARIO:-all} inside_compose=${INSIDE_COMPOSE} reuse_build=${REUSE_BUILD}"
+    echo "delegated_command_log=${COMMAND_LOG}"
+  } >> "${REPORT_DIR}/artifacts/UC-E2E-S0/commands.log"
+fi
 
 COMPOSE_FILE="${ROOT_DIR}/tests/e2e/use-cases/docker-compose.acceptance.yml"
 if [[ ( "${MODE}" == "all" || "${MODE}" == "scenario" ) && "${INSIDE_COMPOSE}" == "0" ]]; then
@@ -99,6 +108,12 @@ case "${MODE}" in
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s1_local_loop/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}"
+    fi
+    if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S2" ) || "${MODE}" == "all" ]]; then
+      python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s2_management_api/run.py" \
+        --root "${ROOT_DIR}" \
+        --report-dir "${REPORT_DIR}" \
+        --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}"
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \

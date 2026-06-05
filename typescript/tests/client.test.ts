@@ -4,6 +4,7 @@ import { SplendorClient, SplendorClientError, type FetchLike } from "@splendor/c
 import type {
   Action,
   AuditAttribution,
+  CallerCredential,
   CreateRunRequest,
   LifecycleRequest,
   Percept,
@@ -24,6 +25,30 @@ const audit: AuditAttribution = {
   },
   credential_id: "cred_test",
   requested_at: "2026-05-25T00:00:00Z"
+};
+
+const callerCredential: CallerCredential = {
+  credential_id: "cred_test",
+  principal: audit.principal,
+  scopes: [
+    "health_read",
+    "capabilities_read",
+    "runs_create",
+    "runs_start",
+    "runs_read",
+    "runs_pause",
+    "runs_resume",
+    "runs_stop",
+    "percepts_append",
+    "actions_submit",
+    "traces_read",
+    "state_read",
+    "replay_create"
+  ],
+  binding: { tenant: { tenant_id: tenantId } },
+  audience: { daemon: { daemon_id: "daemon_local" } },
+  expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+  revocation: "active"
 };
 
 const workOrder: WorkOrderEnvelope = {
@@ -200,6 +225,7 @@ test("lifecycle and inspection helpers use daemon endpoint shapes", async () => 
   assert.equal((await client.pauseRun(runId, lifecycleRequest)).status, "paused");
   assert.equal((await client.resumeRun(runId, lifecycleRequest)).tick_id, 1);
   assert.equal((await client.stopRun(runId, lifecycleRequest)).state_head, "state_1");
+  assert.equal((await client.cancelRun(runId, lifecycleRequest)).state_head, "state_1");
 
   assert.deepEqual(
     calls.map((call) => [new URL(call.url).pathname, call.init.method]),
@@ -208,7 +234,8 @@ test("lifecycle and inspection helpers use daemon endpoint shapes", async () => 
       [`/runs/${runId}/start`, "POST"],
       [`/runs/${runId}/pause`, "POST"],
       [`/runs/${runId}/resume`, "POST"],
-      [`/runs/${runId}/stop`, "POST"]
+      [`/runs/${runId}/stop`, "POST"],
+      [`/runs/${runId}/cancel`, "POST"]
     ]
   );
   assert.deepEqual(calls[1].jsonBody, lifecycleRequest);
@@ -318,6 +345,27 @@ test("readTraces requires redaction policy and preserves event order", async () 
   assert.equal(url.searchParams.get("end"), "3");
 });
 
+test("exportTraces posts an explicit redaction policy and credential", async () => {
+  const records: TraceRecord[] = [
+    { run_id: runId, sequence: 1, recorded_at: "2026-05-25T00:00:00Z", event_hash: { algorithm: "Blake3", value: "h1" }, prev_event_hash: null, payload: { trace_id: "00000000-0000-0000-0000-000000000010", run_id: runId, sequence: 1, timestamp: "2026-05-25T00:00:00Z", kind: "RunStarted" } }
+  ];
+  const { fetcher, calls } = makeFetch({ run_id: runId, records, record_count: 1, redaction_policy: "tenant-default", integrity_hash: "trace-chain:v1:1:h1" });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher, defaultCredential: callerCredential });
+
+  await assert.rejects(() => client.exportTraces(runId, { redactionPolicy: " " }), /redactionPolicy/);
+  const result = await client.exportTraces(runId, { redactionPolicy: "tenant-default", start: 0, end: 2 });
+
+  assert.equal(result.record_count, 1);
+  assert.equal(new URL(calls[0].url).pathname, `/runs/${runId}/traces/export`);
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(calls[0].jsonBody, {
+    credential: callerCredential,
+    redaction_policy: "tenant-default",
+    start: 0,
+    end: 2
+  });
+});
+
 test("streamTraces exposes an async iterable over trace reads", async () => {
   const records: TraceRecord[] = [
     { run_id: runId, sequence: 1, recorded_at: "2026-05-25T00:00:00Z", event_hash: { algorithm: "Blake3", value: "h1" }, prev_event_hash: null, payload: { trace_id: "00000000-0000-0000-0000-000000000010", run_id: runId, sequence: 1, timestamp: "2026-05-25T00:00:00Z", kind: "RunStarted" } }
@@ -349,7 +397,22 @@ test("getStateHead and requestReplay call daemon inspection endpoints", async ()
 
   assert.equal(replay.replay_id, "replay_test");
   assert.equal(new URL(replayFetch.calls[0].url).pathname, `/runs/${runId}/replay`);
-  assert.deepEqual(replayFetch.calls[0].jsonBody, { credential: null });
+  assert.deepEqual(replayFetch.calls[0].jsonBody, { credential: null, mode: "inspect_only", side_effects_allowed: false });
+});
+
+test("health version capabilities include caller credential header when configured", async () => {
+  const { fetcher, calls } = makeFetch({ status: "ok", local_only: true, runtime_available: true });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher, defaultCredential: callerCredential });
+
+  await client.getHealth();
+  await client.getVersion();
+  await client.getCapabilities();
+
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), ["/health", "/version", "/capabilities"]);
+  for (const call of calls) {
+    const headers = new Headers(call.init.headers);
+    assert.deepEqual(JSON.parse(headers.get("x-splendor-caller-credential") ?? "{}"), callerCredential);
+  }
 });
 
 test("daemon errors preserve status, daemon code, details, and request id", async () => {

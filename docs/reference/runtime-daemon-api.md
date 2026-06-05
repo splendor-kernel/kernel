@@ -65,7 +65,8 @@ others.
 The runtime daemon API was originally the 0.02-S5 local control boundary for
 Splendor runs.
 It exposes a minimal HTTP surface for creating, starting, pausing, resuming,
-stopping, inspecting, replaying, and safely submitting actions to a local runtime.
+stopping/cancelling, inspecting, exporting traces, replaying, and safely
+submitting actions to a local runtime.
 
 This API strengthens the `SDK/API`, `runtime context`, `percept`, `state graph`,
 `trace store`, `action gateway`, and `replay` primitives. It is local-only and
@@ -81,13 +82,16 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/pause` | Mark a local run paused | `splendor.runs.pause` |
 | `POST` | `/runs/{run_id}/resume` | Resume a paused run and execute one tick | `splendor.runs.resume` |
 | `POST` | `/runs/{run_id}/stop` | Mark a local run stopped | `splendor.runs.stop` |
+| `POST` | `/runs/{run_id}/cancel` | Cancel a local run while preserving trace/state evidence | `splendor.runs.stop` |
 | `POST` | `/runs/{run_id}/percepts` | Append a daemon-submitted percept queue entry | `splendor.percepts.append` |
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
 | `GET` | `/runs/{run_id}/traces` | Read ordered trace records; requires `redaction_policy` | `splendor.traces.read` |
+| `POST` | `/runs/{run_id}/traces/export` | Export ordered trace records with redaction policy and integrity metadata | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/replay` | Start inspect-only replay summary | `splendor.replay.create` |
 | `POST` | `/actions` | Submit an action through the run gateway | `splendor.actions.submit` |
 | `GET` | `/health` | Read local daemon health | `splendor.health.read` |
+| `GET` | `/version` | Read daemon/runtime/schema compatibility metadata | `splendor.health.read` |
 | `GET` | `/capabilities` | Read local daemon capabilities | `splendor.capabilities.read` |
 
 The OpenAPI description is maintained in
@@ -182,7 +186,10 @@ Response fields include:
 
 Trace responses return `TraceRecord` values from the run's trace store. Records
 are returned in monotonic sequence order. Range reads use `start` inclusive and
-`end` exclusive semantics from `TraceStore::read_range`.
+`end` exclusive semantics from `TraceStore::read_range`. `GET /runs/{run_id}/traces`
+and `POST /runs/{run_id}/traces/export` both require an explicit
+`redaction_policy`; the export response also includes a deterministic
+`integrity_hash` summary over the returned trace chain.
 
 Lifecycle and daemon-specific events added for 0.02-S5:
 

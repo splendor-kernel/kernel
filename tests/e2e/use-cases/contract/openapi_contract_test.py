@@ -22,21 +22,21 @@ CORE_LOCAL_REQUIRED = {
     "pauseRun",
     "resumeRun",
     "stopRun",
+    "cancelRun",
     "appendPercept",
     "submitAction",
     "getStateHead",
     "getRunTraces",
+    "exportTraces",
     "replayRun",
     "getHealth",
+    "getVersion",
     "getCapabilities",
 }
 
 LOCAL_CONTRACT_NOT_YET_COVERED = {
-    "getVersion",
-    "cancelRun",
     "exportStateSnapshot",
     "importStateSnapshot",
-    "exportTraces",
 }
 
 FUTURE_GROUPS = {
@@ -152,9 +152,11 @@ def main() -> int:
         "pauseRun",
         "resumeRun",
         "stopRun",
+        "cancelRun",
         "appendPercept",
         "submitAction",
         "replayRun",
+        "exportTraces",
     }
     for op_id in sorted(mutating_core & operation_ids):
         block = blocks.get(op_id, "")
@@ -197,6 +199,12 @@ def main() -> int:
         )
     )
     schema_failures.extend(require_schema_fields(text, "ReplayRequest", {"credential", "mode", "side_effects_allowed"}))
+    schema_failures.extend(
+        require_schema_fields(text, "TraceExportRequest", {"credential", "redaction_policy", "start", "end"})
+    )
+    schema_failures.extend(
+        require_schema_fields(text, "VersionResponse", {"daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"})
+    )
     if schema_failures:
         failures.append("Missing required local contract schema fields: " + ", ".join(schema_failures))
 

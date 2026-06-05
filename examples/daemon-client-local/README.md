@@ -13,9 +13,9 @@ cargo test -p splendor-daemon
 ```
 
 The integration tests create a run, append a percept, start a tick, pause,
-resume, stop, inspect state-head, page traces, submit a denied action through the
-gateway, and start inspect-only replay without increasing adapter execution
-count.
+resume, stop/cancel, inspect state-head, page and export traces, submit a denied
+action through the gateway, and start inspect-only replay without increasing
+adapter execution count.
 
 ## Start the local daemon binary
 
@@ -119,6 +119,8 @@ authority.
 - `GET /runs/:run_id/state-head` returns a state node verified through the state
   store.
 - `GET /runs/:run_id/traces?redaction_policy=none` returns ordered records.
+- `POST /runs/:run_id/traces/export` returns ordered records with explicit
+  redaction-policy and trace-chain integrity metadata.
 - `POST /runs/:run_id/replay` returns `inspect_only` replay metadata and does not
   execute adapters.
 

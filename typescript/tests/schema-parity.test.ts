@@ -239,9 +239,12 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.policy_cache_status_response, extractStructFields(daemon, "PolicyCacheStatusResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.policy_sync_response, extractStructFields(daemon, "PolicySyncResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_page_response, extractStructFields(daemon, "TracePageResponse"));
+  assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_export_request, extractStructFields(daemon, "TraceExportRequest"));
+  assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_export_response, extractStructFields(daemon, "TraceExportResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.replay_response, extractStructFields(daemon, "ReplayResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.submit_action_request, extractStructFields(daemon, "SubmitActionRequest"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.health_response, extractStructFields(daemon, "HealthResponse"));
+  assert.deepEqual(CANONICAL_SCHEMA_FIELDS.version_response, extractStructFields(daemon, "VersionResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.capabilities_response, extractStructFields(daemon, "CapabilitiesResponse"));
 });
 

@@ -172,13 +172,16 @@ pub fn router(state: DaemonState) -> Router {
         .route("/runs/:run_id/pause", post(pause_run))
         .route("/runs/:run_id/resume", post(resume_run))
         .route("/runs/:run_id/stop", post(stop_run))
+        .route("/runs/:run_id/cancel", post(cancel_run))
         .route("/runs/:run_id/percepts", post(append_percept))
         .route("/runs/:run_id/policies/sync", post(sync_policy))
         .route("/runs/:run_id/state-head", get(state_head))
         .route("/runs/:run_id/traces", get(traces))
+        .route("/runs/:run_id/traces/export", post(export_traces))
         .route("/runs/:run_id/replay", post(replay_run))
         .route("/actions", post(submit_action))
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/capabilities", get(capabilities))
         .with_state(state)
 }
@@ -539,6 +542,25 @@ pub struct TracePageResponse {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct TraceExportRequest {
+    pub credential: Option<CallerCredential>,
+    pub redaction_policy: Option<String>,
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TraceExportResponse {
+    pub run_id: RunId,
+    pub records: Vec<TraceRecord>,
+    pub record_count: usize,
+    pub redaction_policy: String,
+    pub integrity_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ReplayRequest {
     pub credential: Option<CallerCredential>,
     #[serde(default = "default_replay_mode")]
@@ -596,6 +618,16 @@ pub struct HealthResponse {
     pub status: String,
     pub local_only: bool,
     pub runtime_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VersionResponse {
+    pub daemon_api_version: String,
+    pub compatibility_line: String,
+    pub openapi_version: String,
+    pub local_only: bool,
+    pub schema_versions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -998,8 +1030,10 @@ async fn create_run(
 async fn inspect_run(
     Path(run_id): Path<RunId>,
     State(state): State<DaemonState>,
+    headers: HeaderMap,
 ) -> Result<Json<RunInspectResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    let credential = caller_credential_from_headers(&headers)?;
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     state.validate_security(
@@ -1007,7 +1041,7 @@ async fn inspect_run(
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
         },
-        None,
+        credential,
         None,
         None,
     )?;
@@ -1091,6 +1125,35 @@ async fn stop_run(
         request.audit_attribution,
     )?;
     record_daemon_audit(slot, "splendor.runs.stop", security.audit_attribution)?;
+    record_run_event(
+        slot,
+        TraceEventKind::RunStopped {
+            reason: request.reason,
+        },
+    )?;
+    slot.status = RunStatus::Cancelled;
+    slot.updated_at = OffsetDateTime::now_utc();
+    Ok(Json(inspect_response(slot)))
+}
+
+async fn cancel_run(
+    Path(run_id): Path<RunId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<RunInspectResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    let security = state.validate_security(
+        DaemonEndpoint::RunStop {
+            tenant_id: slot.tenant_id.clone(),
+            run_id: run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    record_daemon_audit(slot, "splendor.runs.cancel", security.audit_attribution)?;
     record_run_event(
         slot,
         TraceEventKind::RunStopped {
@@ -1284,8 +1347,10 @@ async fn sync_policy(
 async fn state_head(
     Path(run_id): Path<RunId>,
     State(state): State<DaemonState>,
+    headers: HeaderMap,
 ) -> Result<Json<StateHeadResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    let credential = caller_credential_from_headers(&headers)?;
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     state.validate_security(
@@ -1293,7 +1358,7 @@ async fn state_head(
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
         },
-        None,
+        credential,
         None,
         None,
     )?;
@@ -1325,8 +1390,10 @@ async fn traces(
     Path(run_id): Path<RunId>,
     State(state): State<DaemonState>,
     Query(query): Query<TraceQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<TracePageResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    let credential = caller_credential_from_headers(&headers)?;
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     state.validate_security(
@@ -1335,7 +1402,7 @@ async fn traces(
             run_id: run_id.clone(),
             redaction_policy: query.redaction_policy,
         },
-        None,
+        credential,
         None,
         None,
     )?;
@@ -1345,6 +1412,40 @@ async fn traces(
     }
     .map_err(trace_error)?;
     Ok(Json(TracePageResponse { run_id, records }))
+}
+
+async fn export_traces(
+    Path(run_id): Path<RunId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<TraceExportRequest>,
+) -> Result<Json<TraceExportResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    let redaction_policy = request.redaction_policy.clone();
+    let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    state.validate_security(
+        DaemonEndpoint::TraceRead {
+            tenant_id: slot.tenant_id.clone(),
+            run_id: run_id.clone(),
+            redaction_policy: redaction_policy.clone(),
+        },
+        request.credential,
+        None,
+        None,
+    )?;
+    let records = match (request.start, request.end) {
+        (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
+        _ => slot.trace_store.read(&run_id.to_string()),
+    }
+    .map_err(trace_error)?;
+    let integrity_hash = trace_export_integrity_hash(&records);
+    Ok(Json(TraceExportResponse {
+        run_id,
+        record_count: records.len(),
+        records,
+        redaction_policy: redaction_policy.unwrap_or_default(),
+        integrity_hash,
+    }))
 }
 
 async fn replay_run(
@@ -1674,8 +1775,35 @@ fn caller_credential_from_public_header_json(
 
 fn endpoint_scope_from_public_str(scope: &str) -> Option<EndpointScope> {
     match scope {
+        "runs_create" | "splendor.runs.create" => Some(EndpointScope::RunsCreate),
+        "runs_start" | "splendor.runs.start" => Some(EndpointScope::RunsStart),
+        "runs_read" | "splendor.runs.read" => Some(EndpointScope::RunsRead),
+        "runs_pause" | "splendor.runs.pause" => Some(EndpointScope::RunsPause),
+        "runs_resume" | "splendor.runs.resume" => Some(EndpointScope::RunsResume),
+        "runs_stop" | "splendor.runs.stop" | "splendor.runs.cancel" => {
+            Some(EndpointScope::RunsStop)
+        }
+        "percepts_append" | "splendor.percepts.append" => Some(EndpointScope::PerceptsAppend),
+        "actions_submit" | "splendor.actions.submit" => Some(EndpointScope::ActionsSubmit),
+        "traces_read" | "splendor.traces.read" => Some(EndpointScope::TracesRead),
+        "state_read" | "splendor.state.read" => Some(EndpointScope::StateRead),
+        "replay_create" | "splendor.replay.create" | "splendor.replay.run" => {
+            Some(EndpointScope::ReplayCreate)
+        }
+        "messages_send" | "splendor.messages.send" => Some(EndpointScope::MessagesSend),
         "health_read" | "splendor.health.read" => Some(EndpointScope::HealthRead),
         "capabilities_read" | "splendor.capabilities.read" => Some(EndpointScope::CapabilitiesRead),
+        "policies_sync" | "splendor.policies.sync" => Some(EndpointScope::PoliciesSync),
+        "nodes_register" | "splendor.nodes.register" | "splendor.fleet.register" => {
+            Some(EndpointScope::NodesRegister)
+        }
+        "instances_register" | "splendor.instances.register" => {
+            Some(EndpointScope::InstancesRegister)
+        }
+        "nodes_heartbeat" | "splendor.nodes.heartbeat" => Some(EndpointScope::NodesHeartbeat),
+        "instances_heartbeat" | "splendor.instances.heartbeat" => {
+            Some(EndpointScope::InstancesHeartbeat)
+        }
         _ => None,
     }
 }
@@ -1699,6 +1827,25 @@ async fn health(
     }))
 }
 
+async fn version(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<VersionResponse>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    state.validate_security(DaemonEndpoint::Health, credential, None, None)?;
+    Ok(Json(VersionResponse {
+        daemon_api_version: "0.02-S5".to_string(),
+        compatibility_line: "0.1".to_string(),
+        openapi_version: "0.03-dev".to_string(),
+        local_only: true,
+        schema_versions: vec![
+            splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+            splendor_types::POLICY_BUNDLE_SCHEMA_VERSION.to_string(),
+            splendor_types::APPROVAL_EVIDENCE_SCHEMA_VERSION.to_string(),
+        ],
+    }))
+}
+
 async fn capabilities(
     State(state): State<DaemonState>,
     headers: HeaderMap,
@@ -1716,13 +1863,16 @@ async fn capabilities(
             "POST /runs/{run_id}/pause".to_string(),
             "POST /runs/{run_id}/resume".to_string(),
             "POST /runs/{run_id}/stop".to_string(),
+            "POST /runs/{run_id}/cancel".to_string(),
             "POST /runs/{run_id}/percepts".to_string(),
             "POST /runs/{run_id}/policies/sync".to_string(),
             "GET /runs/{run_id}/state-head".to_string(),
             "GET /runs/{run_id}/traces".to_string(),
+            "POST /runs/{run_id}/traces/export".to_string(),
             "POST /runs/{run_id}/replay".to_string(),
             "POST /actions".to_string(),
             "GET /health".to_string(),
+            "GET /version".to_string(),
             "GET /capabilities".to_string(),
         ],
     }))
@@ -2105,6 +2255,14 @@ fn validate_trace_order(records: &[TraceRecord], run_id: &RunId) -> Result<(), A
         }
     }
     Ok(())
+}
+
+fn trace_export_integrity_hash(records: &[TraceRecord]) -> String {
+    let last_event_hash = records
+        .last()
+        .map(|record| record.event_hash.to_string())
+        .unwrap_or_else(|| "empty".to_string());
+    format!("trace-chain:v1:{}:{last_event_hash}", records.len())
 }
 
 fn trace_error(error: TraceStoreError) -> ApiError {

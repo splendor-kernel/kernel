@@ -570,6 +570,16 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stopped.status, RunStatus::Cancelled);
 
+    let (status, cancelled): (StatusCode, RunInspectResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/cancel", created.run_id),
+        serde_json::to_value(&lifecycle).expect("cancel request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+
     let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
         Method::GET,
@@ -643,6 +653,23 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     });
     assert!(saw_appended, "append endpoint should be trace-linked");
     assert!(saw_received, "queued daemon percept should reach the tick");
+
+    let (status, trace_export): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({"credential": null, "redaction_policy": "none", "start": null, "end": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        trace_export["record_count"].as_u64(),
+        Some(traces.records.len() as u64)
+    );
+    assert!(trace_export["integrity_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("trace-chain:v1:"));
 
     let before_replay_executions = inspected.adapter_executions;
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
@@ -2422,6 +2449,17 @@ async fn health_and_capabilities_accept_canonical_and_public_header_credentials(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(health["runtime_available"], true);
 
+    let public_version = public_caller_credential_header(vec!["splendor.health.read"]);
+    let (status, version): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/version",
+        public_version,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(version["compatibility_line"], "0.1");
+
     let public_capabilities = public_caller_credential_header(vec!["capabilities_read"]);
     let (status, capabilities): (StatusCode, Value) = call_empty_with_credential_header(
         locked_app,
@@ -2529,7 +2567,7 @@ async fn public_credential_header_rejections_cover_revocation_and_scope_branches
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "invalid_caller_credential_header");
 
-    let unsupported_scope = public_caller_credential_header(vec!["splendor.runs.create"]);
+    let unsupported_scope = public_caller_credential_header(vec!["splendor.future.scope"]);
     let (status, error): (StatusCode, ApiErrorBody) =
         call_empty_with_credential_header(locked_app, Method::GET, "/health", unsupported_scope)
             .await;

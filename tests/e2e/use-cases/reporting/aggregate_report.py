@@ -31,6 +31,35 @@ S1_REQUIRED_EVENTS = {
     "replay.adapter_suppressed",
     "replay.completed",
 }
+S2_REQUIRED_OPERATIONS = {
+    "getHealth",
+    "getVersion",
+    "getCapabilities",
+    "createRun",
+    "inspectRun",
+    "startRun",
+    "pauseRun",
+    "resumeRun",
+    "cancelRun",
+    "appendPercept",
+    "submitAction",
+    "getStateHead",
+    "getRunTraces",
+    "exportTraces",
+    "replayRun",
+}
+S2_REQUIRED_NEGATIVES = {
+    "management_token_alone_cannot_authorize_arbitrary_action",
+    "wrong_endpoint_scope",
+    "expired_caller_credential",
+    "wrong_caller_audience",
+    "unsigned_work_order",
+    "expired_work_order",
+    "revoked_work_order",
+    "malformed_work_order",
+    "bad_signature_work_order",
+    "action_wrong_scope_rejected_before_gateway",
+}
 
 
 def utc_now() -> str:
@@ -222,6 +251,12 @@ def render_markdown(report: dict) -> str:
             "- Replay fields are present with inspect-only/side-effect suppression requirements.",
             "- Future scenarios remain blocked/not-yet-covered unless their scenario evidence is present.",
             "",
+            "## S2 evidence",
+            "",
+            "- Management API traffic is recorded in `artifacts/UC-E2E-S2/api-traffic.ndjson` when S2 runs.",
+            "- S2 requires health/version/capabilities, run lifecycle, percept, action, state, trace export, and replay operations.",
+            "- S2 requires caller credentials, endpoint scopes, signed work orders, audit attribution, gateway denial evidence, and replay adapter-suppression evidence.",
+            "",
             "## Non-goals observed",
             "",
         ]
@@ -346,6 +381,105 @@ def load_s1_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s2_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S2"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "commands.log",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "schema-parity.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s2_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s2_artifact:{name}")
+    scenario_blockers = scenario.get("blocking_failures", [])
+    for blocker in scenario_blockers:
+        if blocker not in failures:
+            failures.append(blocker)
+    if scenario.get("status") == "partial":
+        failures.append("s2_scenario_partial")
+    elif scenario.get("status") != "passed":
+        failures.append("s2_scenario_report_failed")
+    if not scenario.get("run_ids") or not scenario.get("trace_event_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes"):
+        failures.append("s2_missing_runtime_ids")
+    if not scenario.get("work_order_ids"):
+        failures.append("s2_missing_work_order_ids")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S2_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s2_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S2_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s2_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in ["wrong_endpoint_scope", "expired_caller_credential", "wrong_caller_audience", "action_wrong_scope_rejected_before_gateway"]:
+        if negatives.get(case, {}).get("status") != 403:
+            failures.append(f"s2_{case}_not_forbidden")
+    for case in ["unsigned_work_order", "expired_work_order", "revoked_work_order", "malformed_work_order", "bad_signature_work_order"]:
+        if negatives.get(case, {}).get("status") not in {400, 403}:
+            failures.append(f"s2_{case}_not_rejected")
+    arbitrary = negatives.get("management_token_alone_cannot_authorize_arbitrary_action", {})
+    if arbitrary.get("outcome_status") != "Denied":
+        failures.append("s2_arbitrary_action_not_denied")
+    if arbitrary.get("adapter_executions_before") != arbitrary.get("adapter_executions_after"):
+        failures.append("s2_arbitrary_action_reached_adapter")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only":
+        failures.append("s2_replay_not_inspect_only")
+    if replay.get("side_effects_allowed_default") is not False:
+        failures.append("s2_replay_side_effect_default_not_false")
+    if replay.get("adapter_executions_before") != replay.get("adapter_executions_after"):
+        failures.append("s2_replay_executed_adapter")
+    suppression = scenario.get("replay_side_effect_suppression", {})
+    if not suppression.get("evidence_present") or suppression.get("side_effects_allowed_default") is not False:
+        failures.append("s2_replay_suppression_missing")
+    state = read_json(artifact_dir / "state-export.json")
+    for key in ["state_node_id", "data_hash", "run_id", "tenant_id", "agent_id"]:
+        if not state.get(key):
+            failures.append(f"s2_state_export_missing:{key}")
+    schema = read_json(artifact_dir / "schema-parity.json")
+    if schema.get("status") != "passed":
+        failures.append("s2_schema_parity_failed")
+    ts_contract = schema.get("typescript_client", {})
+    for key in ["client_refuses_anonymous_fallback", "client_sends_caller_credential_header", "client_requires_replay_suppression"]:
+        if ts_contract.get(key) is not True:
+            failures.append(f"s2_typescript_contract_missing:{key}")
+    client_paths = scenario.get("client_path_coverage", {})
+    for path_name in ["typescript_client", "python_sdk", "splendorctl"]:
+        if client_paths.get(path_name, {}).get("executable_workflow") is not True:
+            failures.append(f"s2_client_path_not_executable:{path_name}")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    if anti.get("status") != "passed":
+        failures.append("s2_anti_drift_failed")
+    if anti.get("health_capabilities_or_version_authorize_actions") is not False:
+        failures.append("s2_health_capabilities_version_authoritative")
+    if anti.get("management_token_authorizes_action_without_gateway") is not False:
+        failures.append("s2_management_token_authorized_action")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    for event in ["daemon.audit", "percepts.appended", "tick.started", "state.committed", "verification.started", "verification.completed", "action.executed", "action.denied", "outcome.recorded", "run.paused", "run.resumed", "run.cancelled_or_stopped"]:
+        if not event_ids.get(event):
+            failures.append(f"s2_missing_required_trace_event:{event}")
+    for trace_id in scenario.get("trace_event_ids", [])[:20]:
+        if trace_id and not is_canonical_uuid(trace_id):
+            failures.append("s2_trace_event_id_not_canonical_uuid")
+            break
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -415,19 +549,27 @@ def main() -> int:
 
     scenarios = [s0_scenario]
     s1_scenario, s1_failures = load_s1_scenario(report_dir)
+    s2_scenario, s2_failures = load_s2_scenario(report_dir)
+    active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
+        active_ids.add("UC-E2E-S1")
         if s1_scenario is None:
             blocking.append("missing_uc_e2e_s1_scenario_report")
         else:
             scenarios.append(s1_scenario)
             blocking.extend(s1_failures)
-        blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid != "UC-E2E-S1"]
-    else:
-        blocked_ids = FUTURE_SCENARIOS
+    if args.scenario == "UC-E2E-S2" or args.mode == "all":
+        active_ids.add("UC-E2E-S2")
+        if s2_scenario is None:
+            blocking.append("missing_uc_e2e_s2_scenario_report")
+        else:
+            scenarios.append(s2_scenario)
+            blocking.extend(s2_failures)
+    blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s0-harness",
+        "suite_version": "0.1-s2-management-api",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -437,6 +579,8 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --anti-drift-only",
             "bash scripts/e2e/verify-use-case-acceptance.sh --contract-only",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S0",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S1",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S2",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -465,6 +609,7 @@ def main() -> int:
         "blocking_failures": blocking,
         "non_goal_observations": [
             "S0 does not mark later scenarios passing; UC-E2E-S1 is included only when executable scenario evidence is present.",
+            "UC-E2E-S2 partially validates the local management API/client contract until executable TypeScript/Python/CLI client workflow evidence is present; S3-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
