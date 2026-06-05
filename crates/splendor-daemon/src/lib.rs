@@ -16,13 +16,15 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
-    AdapterError, AdapterResult, PolicyApprovalVerifier, VerifiedActionGateway,
+    AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
-    Action, ActionCandidate, AgentContext, AgentRuntimeConfig, LoopEngine, LoopError, Percept,
-    Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyDecision, PolicyDistributionGateway,
-    QuotaPolicy, RunId, RunTraceContext, Scheduler, SchedulerConfig, SchedulerError,
-    SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceEventKind,
+    Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
+    LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyDecision,
+    PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler, SchedulerConfig,
+    SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
+    TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateNodeId, StateStore, TraceRecord,
@@ -30,13 +32,14 @@ use splendor_store::{
 };
 use splendor_types::{
     validate_policy_bundle, AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
-    DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError, DaemonSecurityRequest,
-    EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding,
-    PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
-    PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
-    TraceEvent, TraceEventId, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
+    AuditAttribution, CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience,
+    CredentialBinding, DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError,
+    DaemonSecurityRequest, EndpointScope, GatewayVerificationState, InsecureDevMode,
+    LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
+    RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId, WorkOrder,
+    WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -185,6 +188,10 @@ pub fn router(state: DaemonState) -> Router {
         .route("/runs/:run_id/cancel", post(cancel_run))
         .route("/runs/:run_id/percepts", post(append_percept))
         .route("/runs/:run_id/policies/sync", post(sync_policy))
+        .route(
+            "/runs/:run_id/governance/circuit-breakers/sync",
+            post(sync_circuit_breakers),
+        )
         .route("/runs/:run_id/state-head", get(state_head))
         .route("/state-snapshots/export", post(export_state_snapshot))
         .route("/state-snapshots/import", post(import_state_snapshot))
@@ -223,6 +230,7 @@ struct RunSlot {
     state_store: Arc<dyn StateStore>,
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
+    circuit_breakers: SharedCircuitBreakerEvaluator,
     policy_cache: PolicyCache,
     percept_queue: PerceptQueue,
     allowed_percept_schemas: Vec<String>,
@@ -234,6 +242,61 @@ struct RunSlot {
     tick_count: u64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Default)]
+struct SharedCircuitBreakerEvaluator {
+    breakers: Arc<Mutex<Vec<CircuitBreaker>>>,
+}
+
+impl SharedCircuitBreakerEvaluator {
+    fn new(breakers: Vec<CircuitBreaker>) -> Self {
+        Self {
+            breakers: Arc::new(Mutex::new(breakers)),
+        }
+    }
+
+    fn set(&self, breakers: Vec<CircuitBreaker>) -> Result<(), ApiError> {
+        *self.breakers.lock().map_err(|_| lock_error())? = breakers;
+        Ok(())
+    }
+}
+
+impl CircuitBreakerEvaluator for SharedCircuitBreakerEvaluator {
+    fn verify_action(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+        runtime_identity: &splendor_types::RuntimeIdentityContext,
+    ) -> splendor_types::VerificationResult {
+        let Ok(breakers) = self.breakers.lock() else {
+            return splendor_types::VerificationResult {
+                allowed: false,
+                reasons: vec!["circuit_breaker_state_unavailable".to_string()],
+                artifacts: serde_json::json!({"source":"circuit_breaker","reason":"state_lock_unavailable"}),
+            };
+        };
+        StaticCircuitBreakerEvaluator::new(breakers.clone()).verify_action(
+            action,
+            adapter,
+            runtime_identity,
+        )
+    }
+
+    fn verify_runtime_admission(
+        &self,
+        runtime_identity: &splendor_types::RuntimeIdentityContext,
+    ) -> splendor_types::VerificationResult {
+        let Ok(breakers) = self.breakers.lock() else {
+            return splendor_types::VerificationResult {
+                allowed: false,
+                reasons: vec!["circuit_breaker_state_unavailable".to_string()],
+                artifacts: serde_json::json!({"source":"circuit_breaker","reason":"state_lock_unavailable"}),
+            };
+        };
+        StaticCircuitBreakerEvaluator::new(breakers.clone())
+            .verify_runtime_admission(runtime_identity)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -398,6 +461,8 @@ pub struct CreateRunRequest {
     #[serde(default)]
     pub approval_policies: Vec<ApprovalPolicy>,
     #[serde(default)]
+    pub circuit_breakers: Vec<CircuitBreaker>,
+    #[serde(default)]
     pub allowed_percept_schemas: Vec<String>,
     #[serde(default)]
     pub allowed_percept_sources: Vec<String>,
@@ -408,6 +473,8 @@ pub struct CreateRunRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DaemonActionCandidate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<ActionId>,
     pub action: Action,
     pub adapter: Option<String>,
     pub quota_usage: Option<splendor_types::QuotaUsage>,
@@ -427,8 +494,30 @@ impl DaemonActionCandidate {
         if !self.satisfied_preconditions.is_empty() {
             candidate = candidate.with_satisfied_preconditions(self.satisfied_preconditions);
         }
+        if let Some(action_id) = self.action_id {
+            candidate = candidate.with_action_id(action_id);
+        }
         candidate
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CircuitBreakerSyncRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    #[serde(default)]
+    pub circuit_breakers: Vec<CircuitBreaker>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CircuitBreakerSyncResponse {
+    pub run_id: RunId,
+    pub accepted: bool,
+    pub breaker_ids: Vec<String>,
+    pub trace_event_id: TraceEventId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -648,6 +737,8 @@ pub struct ApprovalReplayEvent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SubmitActionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<ActionId>,
     pub run_id: RunId,
     pub tenant_id: TenantId,
     pub agent_id: splendor_types::AgentId,
@@ -922,7 +1013,7 @@ async fn create_run(
     let trace_store: Arc<dyn TraceStore> = Arc::new(InMemoryTraceStore::default());
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
     let tenant_registry = TenantRegistry::new();
-    tenant_registry.insert(TenantContext::new(
+    let mut tenant_context = TenantContext::new(
         request.tenant_id.clone(),
         TenantPolicy {
             allowed_actions: validated_work_order.allowed_actions.clone(),
@@ -930,7 +1021,15 @@ async fn create_run(
             allowed_permissions: validated_work_order.allowed_permissions.clone(),
         },
         QuotaPolicy::default().constrain_to_work_order(&validated_work_order),
-    ));
+    );
+    tenant_context.register_agent_policy(
+        request.agent_id.clone(),
+        AgentIsolationPolicy {
+            allowed_permissions: validated_work_order.allowed_permissions.clone(),
+            ..AgentIsolationPolicy::default()
+        },
+    );
+    tenant_registry.insert(tenant_context);
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
@@ -939,6 +1038,8 @@ async fn create_run(
             request.approval_policies.clone(),
         )));
     }
+    let circuit_breakers = SharedCircuitBreakerEvaluator::new(request.circuit_breakers.clone());
+    gateway.set_circuit_breaker_evaluator(Arc::new(circuit_breakers.clone()));
     let registrations = registrations_for_request(&request, &validated_work_order);
     for registration in registrations {
         gateway.register_adapter(
@@ -1034,9 +1135,6 @@ async fn create_run(
     engine.add_perceptor(QueuedPerceptor {
         queue: percept_queue.clone(),
     });
-    if policy_cache.snapshot().enforcement_required {
-        engine.set_policy_runtime_authority(Arc::new(policy_cache.clone()));
-    }
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), tenant_registry);
     scheduler.add_agent(engine);
 
@@ -1049,6 +1147,7 @@ async fn create_run(
         state_store,
         trace_store,
         gateway,
+        circuit_breakers,
         policy_cache,
         percept_queue,
         allowed_percept_schemas: request.allowed_percept_schemas,
@@ -1075,6 +1174,51 @@ async fn create_run(
     Ok(Json(CreateRunResponse {
         run_id,
         status: RunStatus::Pending,
+    }))
+}
+
+async fn sync_circuit_breakers(
+    Path(run_id): Path<RunId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<CircuitBreakerSyncRequest>,
+) -> Result<Json<CircuitBreakerSyncResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    let security = state.validate_security(
+        DaemonEndpoint::PolicySync {
+            tenant_id: slot.tenant_id.clone(),
+            run_id: run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    let trace_event_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::DaemonAudit {
+            endpoint: "splendor.governance.circuit_breakers.sync".to_string(),
+            audit: security.audit_attribution.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "missing_audit_attribution",
+                    "validated breaker sync did not return audit attribution",
+                )
+            })?,
+        },
+    )?;
+    let breaker_ids = request
+        .circuit_breakers
+        .iter()
+        .map(|breaker| breaker.breaker_id.to_string())
+        .collect::<Vec<_>>();
+    slot.circuit_breakers.set(request.circuit_breakers)?;
+    slot.updated_at = OffsetDateTime::now_utc();
+    Ok(Json(CircuitBreakerSyncResponse {
+        run_id,
+        accepted: true,
+        breaker_ids,
+        trace_event_id,
     }))
 }
 
@@ -1777,7 +1921,7 @@ async fn submit_action(
         },
     )?;
     let action_request = ActionRequest {
-        action_id: ActionId::new(),
+        action_id: request.action_id.unwrap_or_else(ActionId::new),
         tenant_id: request.tenant_id,
         agent_id: request.agent_id,
         run_id: request.run_id,
@@ -2881,6 +3025,7 @@ mod tests {
             allowed_adapters: Vec::new(),
             allowed_permissions: Vec::new(),
             policy_actions: vec![DaemonActionCandidate {
+                action_id: None,
                 action: Action {
                     name: "policy_only".to_string(),
                     params: serde_json::json!({}),
@@ -2898,6 +3043,7 @@ mod tests {
             policy_bundle: None,
             registered_actions: Vec::new(),
             approval_policies: Vec::new(),
+            circuit_breakers: Vec::new(),
             allowed_percept_schemas: Vec::new(),
             allowed_percept_sources: Vec::new(),
             initial_state: None,
@@ -2910,6 +3056,7 @@ mod tests {
 
         let mut direct_registration_request = request.clone();
         direct_registration_request.policy_actions = vec![DaemonActionCandidate {
+            action_id: None,
             action: Action {
                 name: "policy_fallback".to_string(),
                 params: serde_json::json!({}),
@@ -2941,6 +3088,7 @@ mod tests {
             state_store: Arc::new(InMemoryStateStore::default()),
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
+            circuit_breakers: SharedCircuitBreakerEvaluator::default(),
             policy_cache: PolicyCache::new(PolicyCacheConfig::default()),
             percept_queue: PerceptQueue::default(),
             allowed_percept_schemas: Vec::new(),
@@ -2967,5 +3115,29 @@ mod tests {
         .expect_err("empty scheduler cannot record agent event");
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.body.code, "trace_error");
+    }
+
+    #[test]
+    fn shared_circuit_breaker_evaluator_checks_runtime_admission() {
+        let breaker = CircuitBreaker::tripped(
+            splendor_types::CircuitBreakerId::try_new("breaker_runtime_unit").expect("breaker id"),
+            splendor_types::CircuitBreakerScope::Global,
+            "unit_runtime_admission",
+            OffsetDateTime::now_utc(),
+        )
+        .expect("breaker");
+        let evaluator = SharedCircuitBreakerEvaluator::new(vec![breaker]);
+        let denied =
+            evaluator.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "circuit_breaker_tripped"));
+
+        evaluator.set(Vec::new()).expect("clear breakers");
+        let allowed =
+            evaluator.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
+        assert!(allowed.allowed);
     }
 }

@@ -15,9 +15,9 @@ use splendor_gateway::{
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ApprovalTraceContext, Constraint, ContentHash, EscalationContext, EscalationPolicy,
-    EscalationPolicyError, Feedback, Percept, PolicyBundleTraceContext, QuotaUsage, Reward, RunId,
-    SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
-    VerificationResult, WorkOrder,
+    EscalationPolicyError, Feedback, Percept, PolicyBundleId, PolicyBundleTraceContext, QuotaUsage,
+    Reward, RunId, SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind,
+    TraceIdentityContext, VerificationResult, WorkOrder,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,6 +110,9 @@ impl OutcomeEvaluator for NoopOutcomeEvaluator {
 /// Proposed action with quota usage and adapter metadata.
 #[derive(Clone, Debug)]
 pub struct ActionCandidate {
+    /// Stable action identifier when a proposed action must be re-evaluated
+    /// across pause/resume boundaries, such as approval-scoped actions.
+    pub action_id: Option<ActionId>,
     /// Action to be executed.
     pub action: Action,
     /// Adapter identifier used for policy allowlists.
@@ -127,6 +130,7 @@ impl ActionCandidate {
     pub fn new(action: Action) -> Self {
         let satisfied_preconditions = action.preconditions.clone();
         Self {
+            action_id: None,
             action,
             adapter: None,
             usage: QuotaUsage::single_action(),
@@ -156,6 +160,12 @@ impl ActionCandidate {
     /// Attaches approval evidence for the gateway approval verifier.
     pub fn with_approval_evidence(mut self, evidence: splendor_types::ApprovalEvidence) -> Self {
         self.approval_evidence = Some(evidence);
+        self
+    }
+
+    /// Sets a stable action identity for repeated evaluations of this candidate.
+    pub fn with_action_id(mut self, action_id: ActionId) -> Self {
+        self.action_id = Some(action_id);
         self
     }
 }
@@ -623,7 +633,7 @@ impl LoopEngine {
         let mut escalations = Vec::new();
         for candidate in &decision.actions {
             let action = candidate.action.clone();
-            let action_id = ActionId::new();
+            let action_id = candidate.action_id.clone().unwrap_or_else(ActionId::new);
             self.record_action_event(
                 tick_id,
                 &action_id,
@@ -681,6 +691,10 @@ impl LoopEngine {
                 candidate.adapter.as_deref(),
                 &mut outcome,
             );
+
+            if let Some(policy_expired) = action_policy_expired_trace_kind(&action, &outcome) {
+                self.record_action_event(tick_id, &action_id, policy_expired)?;
+            }
 
             self.record_action_event(
                 tick_id,
@@ -972,6 +986,38 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
         error: Some(message),
         completed_at: OffsetDateTime::now_utc(),
     }
+}
+
+fn action_policy_expired_trace_kind(
+    action: &Action,
+    outcome: &ActionOutcome,
+) -> Option<TraceEventKind> {
+    if outcome.verification.allowed
+        || !outcome
+            .verification
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_expired")
+    {
+        return None;
+    }
+    let artifacts = &outcome.verification.artifacts;
+    if artifacts.get("source")?.as_str()? != "policy_distribution_cache" {
+        return None;
+    }
+    let policy_bundle_id =
+        PolicyBundleId::try_new(artifacts.get("policy_bundle_id")?.as_str()?).ok()?;
+    let version = artifacts.get("version")?.as_str()?.to_string();
+    let action_name = artifacts
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(action.name.as_str())
+        .to_string();
+    Some(TraceEventKind::PolicyExpired {
+        policy_bundle_id,
+        version,
+        action: Some(action_name),
+    })
 }
 
 fn approval_artifact(result: &VerificationResult) -> Option<(String, ApprovalTraceContext)> {

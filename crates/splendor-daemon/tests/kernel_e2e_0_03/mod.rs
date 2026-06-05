@@ -784,6 +784,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         allowed_adapters: vec!["daemon.local".to_string()],
         allowed_permissions: Vec::new(),
         policy_actions: vec![DaemonActionCandidate {
+            action_id: None,
             action: daemon_action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
@@ -793,6 +794,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         policy_bundle: None,
         registered_actions: Vec::new(),
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.kernel_e2e.v1".to_string()],
         allowed_percept_sources: vec!["kernel-e2e-daemon".to_string()],
         initial_state: Some(json!({"seed": true})),
@@ -855,6 +857,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     });
 
     let unlinked = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -880,6 +883,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     let mut denied_action = daemon_action("denied_action");
     denied_action.required_permissions = vec!["not.allowed".to_string()];
     let denied = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -905,6 +909,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     let mut failing_action = daemon_action("failing_action");
     failing_action.params = json!({"fail_adapter": true});
     let failing = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -1014,6 +1019,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         policy_bundle: None,
         registered_actions: Vec::new(),
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: Vec::new(),
         allowed_percept_sources: Vec::new(),
         initial_state: Some(json!({"non_dev": true})),
@@ -2877,6 +2883,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         allowed_adapters: vec!["daemon.local".to_string()],
         allowed_permissions: Vec::new(),
         policy_actions: vec![DaemonActionCandidate {
+            action_id: None,
             action: daemon_action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
@@ -2886,6 +2893,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         policy_bundle: None,
         registered_actions: Vec::new(),
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.final_journey.v1".to_string()],
         allowed_percept_sources: vec!["kernel-e2e-daemon".to_string()],
         initial_state: Some(json!({"journey": "start"})),
@@ -2959,6 +2967,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     let mut denied_action = daemon_action("denied_action");
     denied_action.required_permissions = vec!["not.allowed".to_string()];
     let denied = SubmitActionRequest {
+        action_id: None,
         run_id: run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: orchestrator.clone(),
@@ -3558,6 +3567,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         allowed_adapters: vec!["fixture".to_string()],
         allowed_permissions: vec!["fixture.use".to_string()],
         policy_actions: vec![DaemonActionCandidate {
+            action_id: None,
             action: daemon_action("fixture.allowed"),
             adapter: Some("fixture".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
@@ -3570,6 +3580,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             adapter: "fixture".to_string(),
         }],
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.e2e.v1".to_string()],
         allowed_percept_sources: vec!["kernel-e2e".to_string()],
         initial_state: Some(json!({"openapi": "request-shape"})),

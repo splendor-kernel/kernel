@@ -108,6 +108,14 @@ pub enum EndpointScope {
     NodesHeartbeat,
     /// Record an instance heartbeat.
     InstancesHeartbeat,
+    /// Publish a governance/safety policy bundle.
+    PoliciesPublish,
+    /// Revoke a governance/safety policy bundle.
+    PoliciesRevoke,
+    /// Grant, deny, or revoke approvals under scoped authority.
+    ApprovalsManage,
+    /// Create/clear circuit breakers or activate kill switches.
+    GovernanceControl,
 }
 
 impl EndpointScope {
@@ -139,6 +147,10 @@ impl EndpointScope {
             Self::InstancesRegister => "splendor.instances.register",
             Self::NodesHeartbeat => "splendor.nodes.heartbeat",
             Self::InstancesHeartbeat => "splendor.instances.heartbeat",
+            Self::PoliciesPublish => "splendor.policies.publish",
+            Self::PoliciesRevoke => "splendor.policies.revoke",
+            Self::ApprovalsManage => "splendor.approvals.manage",
+            Self::GovernanceControl => "splendor.governance.control",
         }
     }
 }

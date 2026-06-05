@@ -40,6 +40,7 @@ pub struct ApprovalPolicy {
     /// Reason included in trace artifacts when approval is required.
     pub reason: String,
     /// Optional policy expiry. Expired approval policies fail closed.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -161,8 +162,10 @@ pub struct ApprovalEvidence {
     /// Reason supplied by the approver/control boundary.
     pub reason: Option<String>,
     /// Issuance time for audit/replay.
+    #[serde(with = "time::serde::rfc3339")]
     pub issued_at: OffsetDateTime,
     /// Expiry for this approval evidence.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     /// Revocation flag supplied by the approval boundary.
     pub revoked: bool,
@@ -243,8 +246,10 @@ pub struct ApprovalTraceContext {
     /// Optional risk level that required approval.
     pub risk_level: Option<String>,
     /// Evidence issuance time when known.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub issued_at: Option<OffsetDateTime>,
     /// Expiry for policy or evidence when known.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     /// Whether the evidence was revoked.
     pub revoked: bool,

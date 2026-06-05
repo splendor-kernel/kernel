@@ -99,6 +99,7 @@ const createRunRequest: CreateRunRequest = {
   policy_bundle: null,
   registered_actions: [],
   approval_policies: [],
+  circuit_breakers: [],
   allowed_percept_schemas: ["splendor.percept.test.v1"],
   allowed_percept_sources: ["daemon-client-local"],
   initial_state: { seed: true },
@@ -305,6 +306,7 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
   const { fetcher, calls } = makeFetch(outcome);
   const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
   const request: SubmitActionRequest = {
+    action_id: outcome.action_id,
     run_id: runId,
     tenant_id: tenantId,
     agent_id: agentId,

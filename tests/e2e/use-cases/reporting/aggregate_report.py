@@ -118,6 +118,61 @@ S4_REQUIRED_NEGATIVES = {
     "trace_sync_tamper_rejected",
     "telemetry_non_authoritative",
 }
+S5_REQUIRED_OPERATIONS = {
+    "publishPolicyBundle",
+    "getPolicyStatus",
+    "revokePolicyBundle",
+    "requestApproval",
+    "grantApproval",
+    "denyApproval",
+    "revokeApproval",
+    "createCircuitBreaker",
+    "syncCircuitBreakers",
+    "clearCircuitBreaker",
+    "activateKillSwitch",
+    "exportGovernanceAudit",
+    "createRun",
+    "startRun",
+    "resumeRun",
+    "cancelRun",
+    "submitAction",
+    "getStateHead",
+    "exportTraces",
+    "replayRun",
+}
+S5_REQUIRED_NEGATIVES = {
+    "approval_denial_blocks_pending_action",
+    "expired_approval_cannot_authorize_execution",
+    "revoked_approval_cannot_authorize_execution",
+    "missing_policy_bundle_fails_closed",
+    "expired_policy_bundle_fails_closed",
+    "revoked_policy_bundle_fails_closed",
+    "verifier_uncertainty_escalates_not_allow",
+    "circuit_breaker_blocks_matching_action",
+    "clearing_circuit_breaker_requires_scope",
+    "kill_switch_cancels_matching_run",
+    "kill_switch_missing_ack_fails_closed",
+    "governance_plane_cannot_issue_broad_unknown_authority",
+}
+S5_REQUIRED_EVENTS = {
+    "approval.requested",
+    "approval.granted",
+    "approval.denied",
+    "approval.expired",
+    "approval.revoked",
+    "action.needs_approval",
+    "action.needs_intervention",
+    "action.denied",
+    "run.paused",
+    "run.resumed",
+    "run.cancelled",
+    "policy.expired",
+    "policy.revoked",
+    "circuit_breaker.tripped",
+    "circuit_breaker.cleared",
+    "kill_switch.activated",
+    "governance.audit.exported",
+}
 
 
 def utc_now() -> str:
@@ -146,7 +201,11 @@ def trace_record_kind(record: dict) -> str:
     return {
         "LoopTickStarted": "tick.started",
         "LoopTickCompleted": "tick.completed",
+        "PolicyInvoked": "policy.invoked",
         "PolicyCompleted": "policy.completed",
+        "CandidatesProposed": "actions.proposed",
+        "ConstraintsEvaluated": "constraints.evaluated",
+        "ActionVerificationStarted": "verification.started",
         "MessageQueued": "message.queued",
         "MessageDelivered": "message.delivered",
         "MessageConsumed": "message.consumed",
@@ -158,8 +217,20 @@ def trace_record_kind(record: dict) -> str:
         "ActionVerificationCompleted": "verification.completed",
         "ActionExecuted": "action.executed",
         "ActionDenied": "action.denied",
+        "ActionNeedsApproval": "action.needs_approval",
+        "ActionNeedsIntervention": "action.needs_intervention",
         "OutcomeRecorded": "outcome.recorded",
         "StateCommitted": "state.committed",
+        "ApprovalRequested": "approval.requested",
+        "ApprovalGranted": "approval.granted",
+        "ApprovalDenied": "approval.denied",
+        "ApprovalExpired": "approval.expired",
+        "ApprovalRevoked": "approval.revoked",
+        "RunPaused": "run.paused",
+        "RunResumed": "run.resumed",
+        "RunStopped": "run.cancelled",
+        "PolicyExpired": "policy.expired",
+        "PolicyRevoked": "policy.revoked",
     }.get(key, key)
 
 
@@ -377,7 +448,13 @@ def render_markdown(report: dict) -> str:
             "",
             "- Fleet dispatch evidence is recorded in `artifacts/UC-E2E-S4/` when S4 runs.",
             "- S4 requires public manager/resident HTTP APIs, same-image Splendor services, signed work-order validation, placement, remote messages, state handoff, trace sync, telemetry, and replay/audit evidence.",
-            "- S4 keeps telemetry observational only and leaves S5-S10 blocked until their own scenario evidence exists.",
+            "- S4 keeps telemetry observational only and leaves later scenarios blocked until their own scenario evidence exists.",
+            "",
+            "## S5 evidence",
+            "",
+            "- Governance evidence is recorded in `artifacts/UC-E2E-S5/` when S5 runs.",
+            "- S5 requires public daemon and manager APIs, scoped approval grant/deny/revoke, policy bundle TTL/revocation, circuit breaker, kill switch, audit export, and inspect-only replay evidence.",
+            "- S5 keeps governance runtime-enforced and does not claim enterprise approval UI or product workflow coverage.",
             "",
             "## Non-goals observed",
             "",
@@ -919,6 +996,203 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S5"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "approval-flow.json",
+        "policy-bundle-report.json",
+        "circuit-breaker-report.json",
+        "kill-switch-report.json",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s5_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s5_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s5_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s5_scenario_failure:{failure}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S5_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s5_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S5_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s5_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S5_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s5_negative_case_not_asserted:{case}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S5_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s5_missing_required_trace_events:" + ",".join(missing_events))
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
+    audit = read_json(artifact_dir / "audit-report.json")
+    exported = audit.get("manager", {})
+    manager_events = exported.get("events", [])
+    manager_by_id = {str(event.get("trace_event_id", "")): event for event in manager_events if event.get("trace_event_id")}
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s5_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s5_trace_event_id_not_uuid:{event_name}:{trace_id}")
+            if trace_id not in trace_by_id and trace_id not in manager_by_id:
+                failures.append(f"s5_trace_event_id_missing_from_exports:{event_name}:{trace_id}")
+            if trace_id in trace_by_id and trace_record_kind(trace_by_id[trace_id]) != event_name:
+                failures.append(f"s5_trace_event_kind_mismatch:{event_name}:{trace_record_kind(trace_by_id[trace_id])}")
+            if trace_id in manager_by_id and manager_by_id[trace_id].get("event_type") != event_name:
+                failures.append(f"s5_manager_event_kind_mismatch:{event_name}:{manager_by_id[trace_id].get('event_type')}")
+    if not scenario.get("run_ids") or not scenario.get("work_order_ids") or not scenario.get("approval_ids"):
+        failures.append("s5_missing_identity_evidence")
+    if not scenario.get("state_node_ids") or not scenario.get("state_hashes"):
+        failures.append("s5_missing_state_evidence")
+    positive = scenario.get("positive_checks", {})
+    for key in ["policy_published", "internal_artifact_executed", "external_needs_approval", "adapter_not_called_before_approval", "approved_action_executed_once", "audit_exported", "replay_inspect_only"]:
+        if positive.get(key) is not True:
+            failures.append(f"s5_positive_check_missing:{key}")
+    approval_flow = read_json(artifact_dir / "approval-flow.json")
+    grant_evidence = approval_flow.get("grant", {}).get("evidence", {})
+    request_approval = approval_flow.get("request", {})
+    if grant_evidence.get("decision") != "Granted":
+        failures.append("s5_grant_missing_scoped_evidence")
+    for field in ["approval_id", "tenant_id", "agent_id", "run_id", "action_id", "action_name", "adapter"]:
+        if not grant_evidence.get(field):
+            failures.append(f"s5_grant_evidence_missing:{field}")
+    for field in ["approval_id", "tenant_id", "agent_id", "run_id", "action_id", "action_name", "adapter"]:
+        if request_approval.get(field) and grant_evidence.get(field) != request_approval.get(field):
+            failures.append(f"s5_grant_evidence_scope_mismatch:{field}")
+    revoked_record = approval_flow.get("revoke", {})
+    revoked_evidence = revoked_record.get("evidence", {})
+    if revoked_record.get("status") != "revoked" or revoked_evidence.get("revoked") is not True:
+        failures.append("s5_revoke_approval_missing_public_evidence")
+    if revoked_evidence.get("action_id") != grant_evidence.get("action_id"):
+        failures.append("s5_revoked_evidence_action_scope_mismatch")
+    if approval_flow.get("expired", {}).get("status") != "Denied":
+        failures.append("s5_expired_approval_not_denied")
+    if approval_flow.get("revoked", {}).get("status") != "Denied":
+        failures.append("s5_revoked_approval_not_denied")
+    policy = read_json(artifact_dir / "policy-bundle-report.json")
+    if policy.get("published", {}).get("status") != "published" or not policy.get("published", {}).get("envelope", {}).get("signature"):
+        failures.append("s5_policy_publish_not_signed")
+    if policy.get("revoked_policy_create", {}).get("status") != 403:
+        failures.append("s5_revoked_policy_create_not_forbidden")
+    runtime_expired = policy.get("runtime_expired_policy", {})
+    runtime_start = runtime_expired.get("start", {})
+    ttl_run_id = runtime_expired.get("run_id")
+    ttl_action_id = runtime_expired.get("action_id")
+    ttl_action_name = runtime_expired.get("action_name")
+    ttl_denial = runtime_expired.get("denial", {})
+    ttl_denial_verification = ttl_denial.get("verification", {})
+    ttl_denial_artifacts = ttl_denial_verification.get("artifacts", {})
+    if runtime_expired.get("create", {}).get("status") != 200 or runtime_start.get("status") != 200:
+        failures.append("s5_policy_expiry_not_runtime_exercised")
+    if ttl_denial.get("action_id") != ttl_action_id or ttl_denial.get("status") not in {"Denied", "NeedsIntervention"}:
+        failures.append("s5_policy_expiry_missing_action_level_outcome")
+    if runtime_expired.get("reason_code") != "policy_expired" or "policy_expired" not in ttl_denial_verification.get("reasons", []):
+        failures.append("s5_policy_expiry_missing_reason_code")
+    if ttl_denial_artifacts.get("policy_bundle_id") != "policy_uc_e2e_s5_runtime_expiry" or ttl_denial_artifacts.get("action") != "artifact.publish_external":
+        failures.append("s5_policy_expiry_action_artifacts_mismatch")
+    policy_expired_records = [trace_by_id[trace_id] for trace_id in event_ids.get("policy.expired", []) if trace_id in trace_by_id]
+    ttl_policy_expired_records = [
+        record for record in policy_expired_records
+        if trace_record_kind_payload(record).get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry"
+        and trace_record_kind_payload(record).get("action") == ttl_action_name == "artifact.publish_external"
+        and record.get("payload", {}).get("run_id") == ttl_run_id
+        and record.get("payload", {}).get("identity", {}).get("action_id") == ttl_action_id
+    ]
+    if not ttl_policy_expired_records:
+        failures.append("s5_policy_expired_trace_not_linked_to_ttl_action")
+    ttl_action_records = [
+        trace_by_id[trace_id]
+        for trace_id in event_ids.get("action.denied", []) + event_ids.get("action.needs_intervention", [])
+        if trace_id in trace_by_id
+        and trace_by_id[trace_id].get("payload", {}).get("run_id") == ttl_run_id
+        and trace_by_id[trace_id].get("payload", {}).get("identity", {}).get("action_id") == ttl_action_id
+    ]
+    if not any(
+        "policy_expired" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        and "artifact.publish_external" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        for record in ttl_action_records
+    ):
+        failures.append("s5_policy_expired_action_denial_trace_missing")
+    intervention_records = [trace_by_id[trace_id] for trace_id in event_ids.get("action.needs_intervention", []) if trace_id in trace_by_id]
+    if not any(
+        "approval_policy_expired" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        or "intervention_required" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        for record in intervention_records
+    ):
+        failures.append("s5_verifier_uncertainty_trace_not_explicit")
+    breaker = read_json(artifact_dir / "circuit-breaker-report.json")
+    if breaker.get("blocked_action", {}).get("status") != "Denied":
+        failures.append("s5_circuit_breaker_action_not_denied")
+    created_breaker_id = breaker.get("created", {}).get("breaker_id")
+    manager_payload = breaker.get("manager_sync_payload", {})
+    manager_record = manager_payload.get("breaker_record", {})
+    synced_ids = set(breaker.get("synced", {}).get("breaker_ids", []))
+    denied_breaker = breaker.get("blocked_action", {}).get("verification", {}).get("artifacts", {}).get("circuit_breaker", {})
+    denied_breaker_id = denied_breaker.get("breaker_id") or denied_breaker.get("circuit_breaker", {}).get("breaker_id")
+    if not created_breaker_id or created_breaker_id not in synced_ids or denied_breaker_id != created_breaker_id:
+        failures.append("s5_circuit_breaker_not_manager_correlated")
+    if manager_record.get("breaker_id") != created_breaker_id or manager_record.get("trace_event_id") != breaker.get("created", {}).get("trace_event_id"):
+        failures.append("s5_circuit_breaker_sync_payload_not_manager_derived")
+    if not manager_payload.get("circuit_breakers") or manager_payload.get("reason") != "manager_propagated_breaker":
+        failures.append("s5_circuit_breaker_sync_payload_missing")
+    if breaker.get("synced", {}).get("trace_event_id") not in trace_by_id:
+        failures.append("s5_circuit_breaker_sync_trace_missing")
+    if breaker.get("clear_wrong_scope", {}).get("status") != 403:
+        failures.append("s5_clear_breaker_wrong_scope_not_forbidden")
+    kill = read_json(artifact_dir / "kill-switch-report.json")
+    if kill.get("activated", {}).get("propagation_acknowledged") is not True:
+        failures.append("s5_kill_switch_not_acknowledged")
+    activated_kill = kill.get("activated", {})
+    if activated_kill.get("target_derived_from_registry") is not True or not activated_kill.get("target_instance_id") or activated_kill.get("cancel_payload_schema") != "splendor.daemon.lifecycle_request.v1":
+        failures.append("s5_kill_switch_target_not_registry_derived")
+    for row in read_jsonl(artifact_dir / "api-traffic.ndjson"):
+        if row.get("operation_id") != "activateKillSwitch":
+            continue
+        request_keys = set((row.get("request") or {}).keys())
+        if {"target_daemon_url", "cancel_payload"} & request_keys:
+            failures.append("s5_kill_switch_request_contains_caller_supplied_target_or_payload")
+    if kill.get("missing_ack", {}).get("fail_closed") is not True:
+        failures.append("s5_kill_switch_missing_ack_not_fail_closed")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("external_publish_replayed") is not False:
+        failures.append("s5_replay_suppression_missing")
+    if "requested" not in replay.get("approval_lifecycles", []) or "granted" not in replay.get("approval_lifecycles", []):
+        failures.append("s5_replay_missing_approval_explanation")
+    if exported.get("exported") is not True or not exported.get("approval_ids") or not exported.get("policy_bundle_ids") or not exported.get("circuit_breaker_ids") or not exported.get("kill_switch_ids"):
+        failures.append("s5_governance_audit_missing_links")
+    required_manager_events = {"circuit_breaker.tripped", "circuit_breaker.sync_payload.exported", "circuit_breaker.cleared", "kill_switch.activated", "governance.audit.exported"}
+    missing_manager_events = sorted(required_manager_events - {event.get("event_type") for event in manager_events})
+    if missing_manager_events:
+        failures.append("s5_governance_audit_missing_event_types:" + ",".join(missing_manager_events))
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "governance_plane_direct_runtime_mutation", "broad_action_authority", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s5_anti_drift_expected_false:{key}")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -991,6 +1265,7 @@ def main() -> int:
     s2_scenario, s2_failures = load_s2_scenario(report_dir)
     s3_scenario, s3_failures = load_s3_scenario(report_dir)
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
+    s5_scenario, s5_failures = load_s5_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -1020,11 +1295,18 @@ def main() -> int:
         else:
             scenarios.append(s4_scenario)
             blocking.extend(s4_failures)
+    if args.scenario == "UC-E2E-S5" or args.mode == "all":
+        active_ids.add("UC-E2E-S5")
+        if s5_scenario is None:
+            blocking.append("missing_uc_e2e_s5_scenario_report")
+        else:
+            scenarios.append(s5_scenario)
+            blocking.extend(s5_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s4-fleet-dispatch",
+        "suite_version": "0.1-s5-governance",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -1038,6 +1320,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S2",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S3",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S4",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S5",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -1069,6 +1352,7 @@ def main() -> int:
             "UC-E2E-S2 validates the local management API/client contract only when raw HTTP, TypeScript, Python SDK, and splendorctl executable workflow evidence is present.",
             "UC-E2E-S3 validates local multi-agent delegation through public crate APIs and splendorctl replay only; it does not claim daemon message API coverage.",
             "UC-E2E-S4 validates fleet dispatch through public manager and resident daemon HTTP APIs with same-image Splendor services.",
+            "UC-E2E-S5 validates governance through public manager and daemon HTTP APIs without enterprise UI or direct governance-plane runtime mutation.",
             "S5-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
