@@ -182,12 +182,16 @@ def main() -> int:
         write_json(artifact_dir / "replay-report.json", replay_report)
 
         negatives = []
+        precondition_action = action_write("artifacts/precondition.md")
+        precondition_action["preconditions"] = ["external_verifier_available"]
+        precondition_action["satisfied_preconditions"] = []
         for suffix, actions, quota in [
             ("deny_url", [action_http(port, "http://example.com/outside")], 4),
             ("deny_path", [action_write("../../escape.md")], 4),
             ("deny_quota", [action_http(port), action_write()], 1),
+            ("deny_verifier_precondition", [precondition_action], 4),
         ]:
-            rid = "33333333-3333-4333-8333-" + {"deny_url": "333333333334", "deny_path": "333333333335", "deny_quota": "333333333336"}[suffix]
+            rid = "33333333-3333-4333-8333-" + {"deny_url": "333333333334", "deny_path": "333333333335", "deny_quota": "333333333336", "deny_verifier_precondition": "333333333337"}[suffix]
             env = sign_work_order(root, artifact_dir, commands, work_order(rid, quota))
             c = config(root, artifact_dir, env, rid, actions, port, quota)
             p = artifact_dir / f"{suffix}.config.json"
@@ -195,8 +199,19 @@ def main() -> int:
             res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
             trace = run_cmd(["splendorctl", "trace", "export", "--db", c["trace_db"], "--run", rid], root, commands, check=False)
             negatives.append({"case": suffix, "exit": res.returncode, "trace_present": trace.returncode == 0, "evidence": trace.stdout[-2000:]})
-        trace_fail = run_cmd(["splendorctl", "run", "--config", "/proc/forbidden/s1.json"], root, commands, check=False)
-        negatives.append({"case": "forced_trace_or_config_failure_blocks_side_effect", "exit": trace_fail.returncode, "http_counter": FixtureHandler.counter})
+        for suffix, bad_field, bad_path in [
+            ("forced_trace_write_failure_blocks_side_effect", "trace_db", "/proc/splendor-s1-trace.db"),
+            ("forced_state_commit_failure_prevents_next_tick", "state_db", "/proc/splendor-s1-state.db"),
+        ]:
+            rid = "33333333-3333-4333-8333-" + ("333333333338" if bad_field == "trace_db" else "333333333339")
+            env = sign_work_order(root, artifact_dir, commands, work_order(rid, 4))
+            c = config(root, artifact_dir, env, rid, [action_http(port), action_write()], port, 4)
+            c[bad_field] = bad_path
+            p = artifact_dir / f"{suffix}.config.json"
+            write_json(p, c)
+            before = FixtureHandler.counter
+            res = run_cmd(["splendorctl", "run", "--config", str(p)], root, commands, check=False)
+            negatives.append({"case": suffix, "exit": res.returncode, "http_counter_before": before, "http_counter_after": FixtureHandler.counter})
 
         api_traffic = artifact_dir / "api-traffic.ndjson"
         api_traffic.write_text(json.dumps({"surface": "splendorctl", "commands_log": str(commands)}) + "\n", encoding="utf-8")
