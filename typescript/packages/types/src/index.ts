@@ -62,6 +62,7 @@ export const STABLE_0_1_REQUIRED_FIELDS = {
     "run_id",
     "schema",
     "payload",
+    "causal_parent",
     "requires_response",
     "created_at"
   ],

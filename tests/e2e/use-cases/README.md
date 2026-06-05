@@ -1,11 +1,13 @@
 # Use-Case E2E Acceptance Harness
 
-This directory contains the foundational `UC-E2E-S0` harness and the
-`UC-E2E-S1` local governed action loop scenario. S0 validates the harness,
-report contract, deterministic fixtures, OpenAPI contract visibility, and
-anti-drift gates. S1 validates a local CLI-driven governed loop through the real
-gateway, HTTP/filesystem adapters, state graph, trace store, and inspect-only
-replay suppression.
+This directory contains the foundational `UC-E2E-S0` harness plus implemented
+use-case scenarios through `UC-E2E-S3`. S0 validates the harness, report
+contract, deterministic fixtures, OpenAPI contract visibility, and anti-drift
+gates. S1 validates a local CLI-driven governed loop through the real gateway,
+HTTP/filesystem adapters, state graph, trace store, and inspect-only replay
+suppression. S2 validates the local management API/client contract. S3 validates
+local multi-agent delegation and typed communication through documented public
+crate APIs plus `splendorctl replay` causal graph output.
 
 ## Commands
 
@@ -14,6 +16,8 @@ bash scripts/e2e/verify-use-case-acceptance.sh --anti-drift-only
 bash scripts/e2e/verify-use-case-acceptance.sh --contract-only
 bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S0
 bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S1
+bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S2
+bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S3
 bash scripts/e2e/verify-use-case-acceptance.sh --all
 ```
 
@@ -31,11 +35,13 @@ target/splendor-e2e/use-case-acceptance/report.json
 target/splendor-e2e/use-case-acceptance/report.md
 target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S0/
 target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/
+target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S2/
+target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S3/
 ```
 
-Report generation fails if required S0/S1 evidence artifacts are absent or
-empty; the harness does not create green placeholder trace/state/replay/audit
-evidence.
+Report generation fails if required implemented-scenario evidence artifacts are
+absent or empty; the harness does not create green placeholder
+trace/state/replay/audit evidence.
 
 ## Compose topology
 
@@ -56,6 +62,24 @@ deterministic trace/state failure injection to prove fail-closed behavior.
 S1 deliberately does not add remote messaging, fleet placement, governance
 approval workflows, or physical/edge actions.
 
+S3 uses `crates/splendor-kernel/examples/uc_e2e_s3_multi_agent_delegation.rs` as
+an executable public-crate acceptance path. It creates orchestrator and specialist
+agent runtime contexts under one tenant, delegates a typed
+`splendor.message.task_request.v1`, runs a specialist child run with narrower
+authority, commits child and parent state, sends/consumes a typed
+`splendor.message.task_response.v1`, and executes the orchestrator's internal
+artifact action through the real action gateway. Negative branches cover
+specialist external publish denial, unauthorized recipient rejection, unsupported
+schema rejection before delivery, overbroad delegated permission/data-ref
+smuggling denial, cross-tenant delegation rejection, and specialist quota
+exhaustion without mutating the orchestrator ledger. Replay evidence is generated
+by `splendorctl replay` and written to `replay-report.json` and
+`message-causal-graph.json` with `side_effects_replayed=false`.
+
+S3 deliberately remains local-only. It does not add or claim daemon message API
+coverage, remote transport, central fleet management, governance workflows,
+distributed state migration, or physical/edge behavior.
+
 ## Anti-drift rules
 
 The scanner fails closed on:
@@ -74,5 +98,7 @@ Negative fixtures under `anti_drift/fixtures/negative/` prove those failures.
 `UC-E2E-S0` adds the acceptance harness entry point, deterministic fixture seed,
 compose topology skeleton, OpenAPI contract status report, anti-drift scanner
 self-tests, and report aggregation. `UC-E2E-S1` adds executable local governed
-loop evidence. S2-S10 remain blocked/not-yet-covered until their scenario PRs add
-executable public-boundary evidence.
+loop evidence. `UC-E2E-S2` adds executable management API/client contract
+evidence. `UC-E2E-S3` adds executable local multi-agent delegation and replay
+causal graph evidence. S4-S10 remain blocked/not-yet-covered until their scenario
+PRs add executable public-boundary evidence.

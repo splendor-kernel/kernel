@@ -60,6 +60,27 @@ S2_REQUIRED_NEGATIVES = {
     "bad_signature_work_order",
     "action_wrong_scope_rejected_before_gateway",
 }
+S3_REQUIRED_EVENTS = {
+    "message.queued",
+    "message.delivered",
+    "message.consumed",
+    "message.rejected",
+    "delegation.requested",
+    "delegation.rejected",
+    "child_run.started",
+    "child_run.completed",
+    "action.executed",
+    "action.denied",
+    "state.committed",
+}
+S3_REQUIRED_NEGATIVES = {
+    "specialist_external_artifact_publish_denied",
+    "unauthorized_recipient_message_denied",
+    "unsupported_message_schema_rejected_before_delivery",
+    "broad_permission_data_ref_smuggling_denied",
+    "cross_tenant_message_attempt_rejected",
+    "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger",
+}
 
 
 def utc_now() -> str:
@@ -70,6 +91,58 @@ def read_json(path: Path) -> dict:
     if not path.exists():
         raise SystemExit(f"required evidence artifact missing: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        raise SystemExit(f"required evidence artifact missing: {path}")
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def trace_record_id(record: dict) -> str:
+    return str(record.get("payload", {}).get("trace_event_id", ""))
+
+
+def trace_record_kind(record: dict) -> str:
+    kind = record.get("payload", {}).get("kind")
+    key = kind if isinstance(kind, str) else next(iter(kind.keys())) if isinstance(kind, dict) and kind else "unknown"
+    return {
+        "LoopTickStarted": "tick.started",
+        "LoopTickCompleted": "tick.completed",
+        "PolicyCompleted": "policy.completed",
+        "MessageQueued": "message.queued",
+        "MessageDelivered": "message.delivered",
+        "MessageConsumed": "message.consumed",
+        "MessageRejected": "message.rejected",
+        "DelegationRequested": "delegation.requested",
+        "DelegationRejected": "delegation.rejected",
+        "ChildRunStarted": "child_run.started",
+        "ChildRunCompleted": "child_run.completed",
+        "ActionVerificationCompleted": "verification.completed",
+        "ActionExecuted": "action.executed",
+        "ActionDenied": "action.denied",
+        "OutcomeRecorded": "outcome.recorded",
+        "StateCommitted": "state.committed",
+    }.get(key, key)
+
+
+def trace_record_kind_payload(record: dict) -> dict:
+    kind = record.get("payload", {}).get("kind")
+    if isinstance(kind, dict) and kind:
+        value = next(iter(kind.values()))
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def content_hash_string(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        algorithm = str(value.get("algorithm", "")).lower()
+        digest = value.get("value")
+        if algorithm and digest:
+            return f"{algorithm}:{digest}"
+    return ""
 
 
 def digest_file(path: Path) -> str:
@@ -256,6 +329,12 @@ def render_markdown(report: dict) -> str:
             "- Management API traffic is recorded in `artifacts/UC-E2E-S2/api-traffic.ndjson` when S2 runs.",
             "- S2 requires health/version/capabilities, run lifecycle, percept, action, state, trace export, and replay operations.",
             "- S2 requires caller credentials, endpoint scopes, signed work orders, audit attribution, gateway denial evidence, and replay adapter-suppression evidence.",
+            "",
+            "## S3 evidence",
+            "",
+            "- Local multi-agent delegation evidence is recorded in `artifacts/UC-E2E-S3/` when S3 runs.",
+            "- S3 requires typed task request/response messages, parent/child runs, scoped specialist authority, gateway denial evidence, state commits, and replay causal graph reconstruction.",
+            "- S3 is local-only and does not claim daemon message API, remote transport, fleet, governance, or physical/edge coverage.",
             "",
             "## Non-goals observed",
             "",
@@ -500,6 +579,179 @@ def load_s2_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S3"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "commands.log",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "state-export.json",
+        "replay-report.json",
+        "message-causal-graph.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "runtime-evidence.json",
+        "schema-parity.json",
+        "schema-parity-rust.json",
+        "schema-parity-typescript.json",
+        "schema-parity-python.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s3_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s3_artifact:{name}")
+    for blocker in scenario.get("blocking_failures", []):
+        if blocker not in failures:
+            failures.append(blocker)
+    if scenario.get("status") != "passed":
+        failures.append("s3_scenario_report_failed")
+    if len(scenario.get("run_ids", [])) < 2:
+        failures.append("s3_missing_parent_child_run_ids")
+    if len(scenario.get("message_ids", [])) < 4:
+        failures.append("s3_missing_message_ids")
+    if len(scenario.get("state_node_ids", [])) < 2 or len(scenario.get("state_hashes", [])) < 2:
+        failures.append("s3_missing_parent_child_state_evidence")
+    ids_by_event = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S3_REQUIRED_EVENTS if not ids_by_event.get(event))
+    if missing_events:
+        failures.append("s3_missing_required_trace_events:" + ",".join(missing_events))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S3_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s3_missing_negative_cases:" + ",".join(missing_negatives))
+    for case, item in negatives.items():
+        if item.get("adapter_executions_before") != item.get("adapter_executions_after") and case != "broad_permission_data_ref_smuggling_denied":
+            failures.append(f"s3_denial_reached_adapter:{case}")
+        if not item.get("reason_codes"):
+            failures.append(f"s3_negative_missing_reason_codes:{case}")
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
+    expected_negative_kinds = {
+        "specialist_external_artifact_publish_denied": "action.denied",
+        "unauthorized_recipient_message_denied": "message.rejected",
+        "unsupported_message_schema_rejected_before_delivery": "message.rejected",
+        "broad_permission_data_ref_smuggling_denied": "delegation.rejected",
+        "cross_tenant_message_attempt_rejected": "delegation.rejected",
+        "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger": "action.denied",
+    }
+    expected_reason_text = {
+        "unsupported_message_schema_rejected_before_delivery": ["unsupported"],
+    }
+    for case, item in negatives.items():
+        expected_kind = expected_negative_kinds.get(case)
+        trace_ids = item.get("trace_event_ids") or []
+        if not trace_ids:
+            failures.append(f"s3_negative_missing_trace_ids:{case}")
+            continue
+        for trace_id in trace_ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s3_negative_trace_id_not_canonical:{case}")
+                continue
+            record = trace_by_id.get(trace_id)
+            if record is None:
+                failures.append(f"s3_negative_trace_id_missing_from_export:{case}:{trace_id}")
+                continue
+            if expected_kind and trace_record_kind(record) != expected_kind:
+                failures.append(f"s3_negative_trace_wrong_kind:{case}:{trace_record_kind(record)}")
+            record_text = json.dumps(record, sort_keys=True)
+            for reason in expected_reason_text.get(case, item.get("reason_codes", [])):
+                if reason not in record_text:
+                    failures.append(f"s3_negative_trace_wrong_reason:{case}:{reason}")
+            message_id = item.get("message_id")
+            if message_id and message_id not in record_text:
+                failures.append(f"s3_negative_trace_wrong_message:{case}:{message_id}")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only":
+        failures.append("s3_replay_not_inspect_only")
+    if replay.get("side_effects_replayed") is not False or replay.get("side_effects_allowed_default") is not False:
+        failures.append("s3_replay_side_effect_suppression_missing")
+    if len(replay.get("messages", [])) < 4:
+        failures.append("s3_replay_missing_messages")
+    lifecycles = {message.get("lifecycle") for message in replay.get("messages", [])}
+    for lifecycle in ["queued", "delivered", "consumed", "rejected"]:
+        if lifecycle not in lifecycles:
+            failures.append(f"s3_replay_missing_message_lifecycle:{lifecycle}")
+    if not replay.get("parent_child_runs"):
+        failures.append("s3_replay_missing_parent_child_runs")
+    if not replay.get("isolation_denials"):
+        failures.append("s3_replay_missing_isolation_denials")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    if anti.get("status") != "passed":
+        failures.append("s3_anti_drift_failed")
+    expected_false = [
+        "private_helper_only_e2e",
+        "gateway_bypass",
+        "specialist_broad_permission_inheritance",
+        "hidden_shared_state",
+        "replay_side_effects_allowed_default",
+        "remote_transport",
+        "fleet_governance_or_physical_scope",
+    ]
+    for key in expected_false:
+        if anti.get(key) is not False:
+            failures.append(f"s3_anti_drift_expected_false:{key}")
+    runtime = read_json(artifact_dir / "runtime-evidence.json")
+    delegated = runtime.get("delegated_authority", {})
+    if "artifact.publish_external" in delegated.get("allowed_permissions", []):
+        failures.append("s3_specialist_delegation_includes_broad_publish_permission")
+    state_export = read_json(artifact_dir / "state-export.json")
+    state_commit_ids = set(scenario.get("required_trace_event_ids", {}).get("state.committed", []))
+    for state_name in ["parent", "child"]:
+        state = state_export.get(state_name, {})
+        trace_id = state.get("trace_event_id")
+        metadata_trace_id = state.get("metadata_trace_event_id")
+        if not trace_id or trace_id != metadata_trace_id:
+            failures.append(f"s3_state_metadata_trace_mismatch:{state_name}")
+        if trace_id not in trace_by_id or trace_record_kind(trace_by_id.get(trace_id, {})) != "state.committed":
+            failures.append(f"s3_state_trace_not_committed_event:{state_name}")
+        if trace_id not in state_commit_ids:
+            failures.append(f"s3_state_trace_missing_from_required_events:{state_name}")
+        trace_state_hash = content_hash_string(
+            trace_record_kind_payload(trace_by_id.get(trace_id, {})).get("state_hash")
+        )
+        if state.get("state_hash") != trace_state_hash:
+            failures.append(f"s3_state_hash_trace_mismatch:{state_name}")
+        if not state.get("state_node_hash"):
+            failures.append(f"s3_state_node_hash_missing:{state_name}")
+    schema = read_json(artifact_dir / "schema-parity.json")
+    if schema.get("status") != "passed":
+        failures.append("s3_schema_parity_not_passed")
+    rust_schema = schema.get("rust", {})
+    typescript_schema = schema.get("typescript", {})
+    python_schema = schema.get("python", {})
+    if typescript_schema.get("status") != "passed" or typescript_schema.get("executable_check") is not True:
+        failures.append("s3_typescript_schema_parity_not_executable")
+    if python_schema.get("status") != "passed" or python_schema.get("executable_check") is not True:
+        failures.append("s3_python_schema_parity_not_executable")
+    missing_python_fields = python_schema.get("missing_canonical_message_fields", [])
+    if missing_python_fields:
+        failures.append("s3_python_missing_canonical_message_fields:" + ",".join(missing_python_fields))
+    canonical_fields = set(rust_schema.get("task_request_message", {}).keys())
+    python_present_fields = set(python_schema.get("message_required_fields_present", []))
+    missing_present_fields = sorted(canonical_fields - python_present_fields)
+    if missing_present_fields:
+        failures.append("s3_python_required_fields_do_not_cover_canonical_message:" + ",".join(missing_present_fields))
+    if "causal_parent" not in python_present_fields:
+        failures.append("s3_python_message_required_fields_missing_causal_parent")
+    for callback in ["perceptor", "policy", "trace_subscriber"]:
+        if callback not in python_schema.get("callbacks_observed", []):
+            failures.append(f"s3_python_callback_missing:{callback}")
+    if python_schema.get("actions_proposed") != 0 or python_schema.get("adapter_callbacks_executed") != 0:
+        failures.append("s3_python_callback_side_effect_boundary_failed")
+    if rust_schema.get("task_request_schema") != "splendor.message.task_request.v1" or rust_schema.get("task_response_schema") != "splendor.message.task_response.v1":
+        failures.append("s3_rust_schema_parity_wrong_schema")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -570,6 +822,7 @@ def main() -> int:
     scenarios = [s0_scenario]
     s1_scenario, s1_failures = load_s1_scenario(report_dir)
     s2_scenario, s2_failures = load_s2_scenario(report_dir)
+    s3_scenario, s3_failures = load_s3_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -585,11 +838,18 @@ def main() -> int:
         else:
             scenarios.append(s2_scenario)
             blocking.extend(s2_failures)
+    if args.scenario == "UC-E2E-S3" or args.mode == "all":
+        active_ids.add("UC-E2E-S3")
+        if s3_scenario is None:
+            blocking.append("missing_uc_e2e_s3_scenario_report")
+        else:
+            scenarios.append(s3_scenario)
+            blocking.extend(s3_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s2-management-api",
+        "suite_version": "0.1-s3-multi-agent-delegation",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -601,6 +861,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S0",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S1",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S2",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S3",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -629,7 +890,9 @@ def main() -> int:
         "blocking_failures": blocking,
         "non_goal_observations": [
             "S0 does not mark later scenarios passing; UC-E2E-S1 is included only when executable scenario evidence is present.",
-            "UC-E2E-S2 validates the local management API/client contract only when raw HTTP, TypeScript, Python SDK, and splendorctl executable workflow evidence is present; S3-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S2 validates the local management API/client contract only when raw HTTP, TypeScript, Python SDK, and splendorctl executable workflow evidence is present.",
+            "UC-E2E-S3 validates local multi-agent delegation through public crate APIs and splendorctl replay only; it does not claim daemon message API coverage.",
+            "S4-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],

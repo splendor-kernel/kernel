@@ -20,6 +20,13 @@ COPY . .
 
 RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release -p splendorctl -p splendor-daemon
 
+FROM rust-builder AS acceptance-builder
+
+ARG RUST_TOOLCHAIN=1.88.0
+
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
+    -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation
+
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-builder
 
 WORKDIR /src
@@ -75,3 +82,26 @@ USER splendor
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["splendorctl", "--version"]
+
+FROM runtime AS acceptance-runner
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=acceptance-builder /src/target/release/examples/uc_e2e_s3_multi_agent_delegation /usr/local/bin/uc_e2e_s3_multi_agent_delegation
+
+WORKDIR /opt/splendor
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts \
+    && ln -s /opt/splendor/node_modules/.bin/tsc /usr/local/bin/tsc
+
+ENV PATH="/opt/splendor/node_modules/.bin:/opt/splendor-venv/bin:${PATH}"
+
+USER splendor
+
+FROM runtime AS production

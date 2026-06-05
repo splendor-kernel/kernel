@@ -49,7 +49,7 @@ before routing.
 | `run_id` | `RunId` | yes | Run that scopes the message and trace causality. The nil UUID is rejected. |
 | `schema` | `String` | yes | Versioned payload schema, such as `splendor.message.task_request.v1`. |
 | `payload` | `serde_json::Value` | yes | Typed JSON payload. JSON `null` is rejected at the envelope layer. |
-| `causal_parent` | `Option<TraceEventId>` | no | Trace event that causally produced the message. Preserved by serialization/replay inputs. |
+| `causal_parent` | `Option<TraceEventId>` | yes | Required-but-nullable trace event that causally produced the message. The JSON field must be present; use `null` when no causal parent exists. |
 | `requires_response` | `bool` | yes | Whether the sender expects a response message. |
 | `created_at` | `OffsetDateTime` | yes | Message creation timestamp. |
 
@@ -126,12 +126,17 @@ the typed payload shape before routing. When a schema-specific payload validator
 rejects a message, routing code records a `message.rejected` trace event with
 the message trace context and reason.
 
+The `causal_parent` field is required in canonical JSON even though its value may
+be `null`. Producers must not omit it. This keeps Rust, Python, TypeScript,
+acceptance reports, and replay tooling aligned on one stable field set.
+
 ## Trace and replay behavior
 
-Messages carry an optional `causal_parent: TraceEventId`. The value identifies the
-trace event that caused the message to be proposed or produced. Serialization
-round trips preserve this field. Multi-agent replay uses it to reconstruct
-message lineage without re-executing side effects.
+Messages carry required-but-nullable `causal_parent: TraceEventId | null`. The
+value identifies the trace event that caused the message to be proposed or
+produced; `null` means no causal parent is known. Serialization round trips
+preserve this field. Multi-agent replay uses it to reconstruct message lineage
+without re-executing side effects.
 
 Message lifecycle trace events are documented in
 [`trace-events.md#message-events`](trace-events.md#message-events).

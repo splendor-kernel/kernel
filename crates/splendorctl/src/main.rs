@@ -2525,6 +2525,42 @@ fn replay_message_event(event: &TraceEvent) -> Result<Option<ReplayMessageEvent>
 }
 
 fn replay_parent_child_run(event: &TraceEvent) -> Result<Option<ReplayParentChildRun>, String> {
+    match &event.kind {
+        TraceEventKind::DelegationRequested { delegation }
+        | TraceEventKind::ChildRunCompleted { delegation }
+        | TraceEventKind::ChildRunFailed { delegation, .. }
+        | TraceEventKind::DelegationRejected { delegation, .. } => {
+            if delegation.parent_run_id != event.run_id {
+                return Err(format!(
+                    "Local delegation parent run mismatch at sequence {}: event run '{}' but parent run '{}'",
+                    event.sequence, event.run_id, delegation.parent_run_id
+                ));
+            }
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        TraceEventKind::ChildRunStarted { delegation } => {
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        _ => {}
+    }
     if let TraceEventKind::ChildRunLinked {
         parent_run_id,
         child_run_id,
@@ -4157,10 +4193,10 @@ fn daemon_request(
             .map_err(|err| format!("Mutating daemon request body must be JSON: {err}"))?;
         if body_json
             .get("credential")
-            .map_or(true, serde_json::Value::is_null)
+            .is_none_or(serde_json::Value::is_null)
             || body_json
                 .get("audit_attribution")
-                .map_or(true, serde_json::Value::is_null)
+                .is_none_or(serde_json::Value::is_null)
         {
             return Err(
                 "Mutating daemon requests require body credential and audit_attribution"
@@ -4209,7 +4245,7 @@ fn parse_local_http_url(url: &str) -> Result<ParsedLocalUrl, String> {
     let port = port
         .parse::<u16>()
         .map_err(|_| "Daemon URL port is invalid".to_string())?;
-    let path = format!("/{}", path_part);
+    let path = format!("/{path_part}");
     Ok(ParsedLocalUrl {
         host: host.trim_matches(&['[', ']'][..]).to_string(),
         port,
@@ -4239,7 +4275,7 @@ fn send_local_http(
     }
     if !body.is_empty() {
         request.push_str("Content-Type: application/json\r\n");
-        request.push_str(&format!("Content-Length: {}\r\n", body.as_bytes().len()));
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
     request.push_str(body);
