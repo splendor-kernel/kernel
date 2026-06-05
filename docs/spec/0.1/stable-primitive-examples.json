@@ -120,8 +120,8 @@
     {
       "name": "Message",
       "identity_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id"],
-      "required_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "payload", "requires_response", "created_at"],
-      "optional_fields": ["causal_parent"],
+      "required_fields": ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "payload", "causal_parent", "requires_response", "created_at"],
+      "optional_fields": [],
       "extensions": "none",
       "example": {
         "message_id": "44444444-4444-4444-4444-444444444444",

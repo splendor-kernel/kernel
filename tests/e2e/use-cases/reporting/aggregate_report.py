@@ -126,6 +126,25 @@ def trace_record_kind(record: dict) -> str:
     }.get(key, key)
 
 
+def trace_record_kind_payload(record: dict) -> dict:
+    kind = record.get("payload", {}).get("kind")
+    if isinstance(kind, dict) and kind:
+        value = next(iter(kind.values()))
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def content_hash_string(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        algorithm = str(value.get("algorithm", "")).lower()
+        digest = value.get("value")
+        if algorithm and digest:
+            return f"{algorithm}:{digest}"
+    return ""
+
+
 def digest_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -696,6 +715,13 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"s3_state_trace_not_committed_event:{state_name}")
         if trace_id not in state_commit_ids:
             failures.append(f"s3_state_trace_missing_from_required_events:{state_name}")
+        trace_state_hash = content_hash_string(
+            trace_record_kind_payload(trace_by_id.get(trace_id, {})).get("state_hash")
+        )
+        if state.get("state_hash") != trace_state_hash:
+            failures.append(f"s3_state_hash_trace_mismatch:{state_name}")
+        if not state.get("state_node_hash"):
+            failures.append(f"s3_state_node_hash_missing:{state_name}")
     schema = read_json(artifact_dir / "schema-parity.json")
     if schema.get("status") != "passed":
         failures.append("s3_schema_parity_not_passed")
@@ -706,6 +732,16 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s3_typescript_schema_parity_not_executable")
     if python_schema.get("status") != "passed" or python_schema.get("executable_check") is not True:
         failures.append("s3_python_schema_parity_not_executable")
+    missing_python_fields = python_schema.get("missing_canonical_message_fields", [])
+    if missing_python_fields:
+        failures.append("s3_python_missing_canonical_message_fields:" + ",".join(missing_python_fields))
+    canonical_fields = set(rust_schema.get("task_request_message", {}).keys())
+    python_present_fields = set(python_schema.get("message_required_fields_present", []))
+    missing_present_fields = sorted(canonical_fields - python_present_fields)
+    if missing_present_fields:
+        failures.append("s3_python_required_fields_do_not_cover_canonical_message:" + ",".join(missing_present_fields))
+    if "causal_parent" not in python_present_fields:
+        failures.append("s3_python_message_required_fields_missing_causal_parent")
     for callback in ["perceptor", "policy", "trace_subscriber"]:
         if callback not in python_schema.get("callbacks_observed", []):
             failures.append(f"s3_python_callback_missing:{callback}")

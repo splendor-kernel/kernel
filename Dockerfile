@@ -103,3 +103,5 @@ RUN npm ci --ignore-scripts \
 ENV PATH="/opt/splendor/node_modules/.bin:/opt/splendor-venv/bin:${PATH}"
 
 USER splendor
+
+FROM runtime AS production

@@ -117,6 +117,7 @@ struct StateEvidence {
     run_id: String,
     agent_id: String,
     state_node_id: String,
+    state_node_hash: String,
     state_hash: String,
     trace_event_id: String,
     metadata_trace_event_id: String,
@@ -769,6 +770,7 @@ fn commit_state(
         },
     )?;
     let state_hash = splendor_types::ContentHash::blake3(&bytes);
+    let data_hash = state_hash.to_string();
     let event = runtime.record_event_with_identity(
         TraceIdentityContext::new(run_id.clone())
             .with_tenant_agent(tenant_id.clone(), agent_id.clone())
@@ -802,7 +804,8 @@ fn commit_state(
         run_id: run_id.to_string(),
         agent_id: agent_id.to_string(),
         state_node_id: commit.node_id.to_string(),
-        state_hash: commit.node_id.hash().to_string(),
+        state_node_hash: commit.node_id.hash().to_string(),
+        state_hash: data_hash,
         trace_event_id: event.trace_event_id.to_string(),
         metadata_trace_event_id: metadata_trace_event_id.to_string(),
     })

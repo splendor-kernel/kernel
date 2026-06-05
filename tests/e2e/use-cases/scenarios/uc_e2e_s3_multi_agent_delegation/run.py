@@ -188,13 +188,17 @@ def run_python_schema_parity(root: Path, rust_parity: dict) -> dict:
     runtime.subscribe_traces(run_id, trace_subscriber)
     outcome = runtime.run_once(agent_id)
 
-    message_fields = set(STABLE_0_1_REQUIRED_FIELDS["Message"])
-    required = set(rust_parity["task_request_message"].keys())
+    python_fields = set(STABLE_0_1_REQUIRED_FIELDS["Message"])
+    canonical_fields = set(rust_parity["task_request_message"].keys())
+    missing_canonical_fields = sorted(canonical_fields - python_fields)
+    status = "passed" if not missing_canonical_fields else "failed"
     return {
-        "status": "passed",
+        "status": status,
         "executable_check": True,
         "checked_surface": "python.splendor.runtime callbacks and Message required fields",
-        "message_required_fields_present": sorted(message_fields & required),
+        "canonical_message_fields": sorted(canonical_fields),
+        "message_required_fields_present": sorted(canonical_fields & python_fields),
+        "missing_canonical_message_fields": missing_canonical_fields,
         "message_delivery_status_values": list(STABLE_0_1_ENUM_VALUES["message_delivery_status"]),
         "callbacks_observed": sorted(set(observed_callbacks)),
         "actions_proposed": len(outcome.action_outcomes),
@@ -324,6 +328,7 @@ def main() -> int:
         "trace_event_ids": trace_ids + list(replay["event_ids"].values()),
         "state_node_ids": [runtime_evidence["parent_state"]["state_node_id"], runtime_evidence["child_state"]["state_node_id"]],
         "state_hashes": [runtime_evidence["parent_state"]["state_hash"], runtime_evidence["child_state"]["state_hash"]],
+        "state_node_hashes": [runtime_evidence["parent_state"]["state_node_hash"], runtime_evidence["child_state"]["state_node_hash"]],
         "message_ids": message_ids,
         "work_order_ids": [],
         "approval_ids": [],

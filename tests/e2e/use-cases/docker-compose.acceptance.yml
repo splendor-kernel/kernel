@@ -88,6 +88,7 @@ services:
     build:
       context: ../../..
       dockerfile: Dockerfile
+      target: runtime
     working_dir: /workspace
     command: ["splendor-daemon"]
     volumes:
