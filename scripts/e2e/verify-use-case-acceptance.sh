@@ -10,7 +10,7 @@ REUSE_BUILD=0
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
+Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
 S0 is a static/container-harness gate. Later scenarios intentionally report blocked/not-yet-covered until implemented.
 USAGE
@@ -32,13 +32,17 @@ done
 if [[ "${MODE}" == "scenario" && -z "${SCENARIO}" ]]; then
   SCENARIO="UC-E2E-S0"
 fi
-if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" ]]; then
-  echo "${SCENARIO} is not implemented by S0; use --all to report future scenarios as blocked." >&2
+if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" ]]; then
+  echo "${SCENARIO} is not implemented; use --all to report future scenarios as blocked." >&2
   exit 2
 fi
 
-mkdir -p "${REPORT_DIR}/artifacts/UC-E2E-S0"
-COMMAND_LOG="${REPORT_DIR}/artifacts/UC-E2E-S0/commands.log"
+COMMAND_SCENARIO="${SCENARIO:-UC-E2E-S0}"
+if [[ "${MODE}" == "all" ]]; then
+  COMMAND_SCENARIO="UC-E2E-S0"
+fi
+mkdir -p "${REPORT_DIR}/artifacts/${COMMAND_SCENARIO}"
+COMMAND_LOG="${REPORT_DIR}/artifacts/${COMMAND_SCENARIO}/commands.log"
 {
   echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "command=bash scripts/e2e/verify-use-case-acceptance.sh $*"
@@ -54,6 +58,8 @@ if [[ ( "${MODE}" == "all" || "${MODE}" == "scenario" ) && "${INSIDE_COMPOSE}" =
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     docker compose -f "${COMPOSE_FILE}" config >/dev/null
     export SPLENDOR_E2E_SOURCE_REV="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || printf unknown-source-revision)"
+    export SPLENDOR_E2E_SCENARIO="${SCENARIO:-UC-E2E-S0}"
+    export SPLENDOR_E2E_MODE_ARG="${MODE}"
     COMPOSE_ARGS=( -f "${COMPOSE_FILE}" up --abort-on-container-exit --exit-code-from e2e-runner )
     if [[ "${REUSE_BUILD}" == "0" ]]; then
       COMPOSE_ARGS+=( --build )
@@ -89,10 +95,15 @@ case "${MODE}" in
     python3 "${ROOT_DIR}/tests/e2e/use-cases/contract/public_boundary_probe.py" \
       --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}" \
       --out "${REPORT_DIR}/artifacts/UC-E2E-S0/public-boundary.json"
+    if [[ "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S1" ]]; then
+      python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s1_local_loop/run.py" \
+        --root "${ROOT_DIR}" \
+        --report-dir "${REPORT_DIR}"
+    fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \
       --report-dir "${REPORT_DIR}" \
-      --scenario "UC-E2E-S0" \
+      --scenario "${SCENARIO:-UC-E2E-S0}" \
       --mode "${MODE}" \
       --compose-file "${COMPOSE_FILE}"
     ;;

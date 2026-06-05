@@ -191,7 +191,7 @@ def render_markdown(report: dict) -> str:
             "- Daemon `/health` and `/capabilities` were called through the compose public boundary.",
             "- Anti-drift scanner self-tests proved negative fixtures fail closed.",
             "- Replay fields are present with inspect-only/side-effect suppression requirements.",
-            "- Future S1-S10 scenarios are blocked/not-yet-covered, not marked passing.",
+            "- Future scenarios remain blocked/not-yet-covered unless their scenario evidence is present.",
             "",
             "## Non-goals observed",
             "",
@@ -228,6 +228,40 @@ def blocked_future_scenario(scenario_id: str) -> dict:
         "artifact_paths": [],
         "blocker": "Scenario behavior is outside UC-E2E-S0 and must be implemented by its own scenario sprint before it can count as acceptance coverage.",
     }
+
+
+def load_s1_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S1"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures = []
+    required = [
+        "commands.log",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s1_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s1_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s1_scenario_report_failed")
+    if not scenario.get("run_ids") or not scenario.get("trace_event_ids") or not scenario.get("state_hashes"):
+        failures.append("s1_missing_runtime_ids")
+    suppression = scenario.get("replay_side_effect_suppression", {})
+    if not suppression.get("evidence_present") or suppression.get("side_effects_allowed_default") is not False:
+        failures.append("s1_replay_suppression_missing")
+    return scenario, failures
 
 
 def main() -> int:
@@ -297,6 +331,18 @@ def main() -> int:
         "artifact_paths": artifact_paths,
     }
 
+    scenarios = [s0_scenario]
+    s1_scenario, s1_failures = load_s1_scenario(report_dir)
+    if args.scenario == "UC-E2E-S1":
+        if s1_scenario is None:
+            blocking.append("missing_uc_e2e_s1_scenario_report")
+        else:
+            scenarios.append(s1_scenario)
+            blocking.extend(s1_failures)
+        blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid != "UC-E2E-S1"]
+    else:
+        blocked_ids = FUTURE_SCENARIOS
+
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
         "suite_version": "0.1-s0-harness",
@@ -333,10 +379,10 @@ def main() -> int:
             "self_test": anti.get("self_test", {}),
             "findings": anti.get("findings", []),
         },
-        "scenarios": [s0_scenario] + [blocked_future_scenario(sid) for sid in FUTURE_SCENARIOS],
+        "scenarios": scenarios + [blocked_future_scenario(sid) for sid in blocked_ids],
         "blocking_failures": blocking,
         "non_goal_observations": [
-            "No S1-S10 scenario behavior is implemented or marked passing by S0.",
+            "S0 does not mark later scenarios passing; UC-E2E-S1 is included only when executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],

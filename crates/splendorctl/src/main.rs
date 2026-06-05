@@ -92,6 +92,11 @@ where
             cycles,
             forever,
         } => run_from_config(config_path.as_path(), cycles, forever)?,
+        Command::WorkOrderSign {
+            input_path,
+            key_id,
+            secret,
+        } => sign_work_order(&input_path, &key_id, &secret)?,
     }
     Ok(())
 }
@@ -140,6 +145,12 @@ enum Command {
         cycles: Option<u64>,
         forever: bool,
     },
+    /// Sign a local work-order fixture with the reference shared-secret scheme.
+    WorkOrderSign {
+        input_path: PathBuf,
+        key_id: String,
+        secret: String,
+    },
 }
 
 /// Parses top-level CLI arguments.
@@ -170,10 +181,45 @@ where
     if command == "run" {
         return parse_run_command(args);
     }
+    if command == "work-order" {
+        return parse_work_order_command(args);
+    }
     if command == "--help" || command == "-h" {
         return Err(usage());
     }
     Err(format!("Unknown command: {command}\n\n{}", usage()))
+}
+
+fn parse_work_order_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    if subcommand != "sign" {
+        return Err(format!(
+            "Unknown work-order subcommand: {subcommand}\n\n{}",
+            usage()
+        ));
+    }
+    let mut input_path = None;
+    let mut key_id = None;
+    let mut secret = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--input" => input_path = args.next().map(PathBuf::from),
+            "--key-id" => key_id = args.next(),
+            "--secret" => secret = args.next(),
+            "--help" | "-h" => return Err(usage()),
+            _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+        }
+    }
+    Ok(Command::WorkOrderSign {
+        input_path: input_path.ok_or_else(|| "Missing required --input".to_string())?,
+        key_id: key_id.ok_or_else(|| "Missing required --key-id".to_string())?,
+        secret: secret.ok_or_else(|| "Missing required --secret".to_string())?,
+    })
 }
 
 /// Parses `splendorctl state ...` subcommands.
@@ -3021,6 +3067,20 @@ fn load_run_config(path: &Path) -> Result<RunConfig, String> {
     }
 }
 
+fn sign_work_order(input_path: &Path, key_id: &str, secret: &str) -> Result<(), String> {
+    let content = fs::read_to_string(input_path)
+        .map_err(|error| format!("Failed to read work order: {error}"))?;
+    let work_order: WorkOrder = serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse work order JSON: {error}"))?;
+    let envelope =
+        WorkOrderEnvelope::signed_with_shared_secret(work_order, key_id, secret.as_bytes())
+            .map_err(|error| format!("Work order rejected: {}", error.reason_code()))?;
+    let line = serde_json::to_string_pretty(&envelope)
+        .map_err(|error| format!("Failed to encode signed work order: {error}"))?;
+    println!("{line}");
+    Ok(())
+}
+
 fn resolve_config_path(path: &Path) -> Result<PathBuf, String> {
     if path.is_dir() {
         for filename in ["config.yaml", "config.yml", "config.json"] {
@@ -3675,6 +3735,7 @@ fn usage() -> String {
         "splendorctl replay --db <trace-path> --state-db <state-path> --run <run-id> [--from-snapshot <id>] [--include-state]",
         "splendorctl audit export --db <trace-path> --state-db <state-path> --run <run-id> [--tenant <id>] [--agent <id>] [--action <id-or-name>] [--adapter <id>] [--node <id>] [--instance <id>] [--fleet <id>]",
         "splendorctl run --config <path> [--cycles <n> | --forever]",
+        "splendorctl work-order sign --input <work-order.json> --key-id <id> --secret <secret>",
         "splendorctl --version",
         "",
         "Commands:",
@@ -3683,6 +3744,7 @@ fn usage() -> String {
         "  replay         Replay a run from trace + state stores.",
         "  audit export   Export a redacted governance audit from trace + state stores.",
         "  run            Run a local agent loop from config.",
+        "  work-order     Sign local work-order fixtures for scoped run authority.",
         "  --version      Print package and milestone release identifiers.",
         "",
         "Options:",

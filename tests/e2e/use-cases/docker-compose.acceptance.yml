@@ -6,8 +6,11 @@
 # loopback-only TCP. Daemon ports are not published.
 services:
   e2e-runner:
-    image: python:3.12-slim
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
     working_dir: /workspace
+    user: root
     environment:
       SPLENDOR_E2E_MODE: acceptance
       SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
@@ -19,7 +22,8 @@ services:
       SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
       SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
       SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
-    command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "UC-E2E-S0", "--reuse-build"]
+      SPLENDOR_E2E_SCENARIO: ${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}
+    command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}", "--reuse-build"]
     depends_on:
       - splendor-daemon-local
       - central-manager
