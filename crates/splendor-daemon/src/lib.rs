@@ -16,13 +16,15 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
-    AdapterError, AdapterResult, PolicyApprovalVerifier, VerifiedActionGateway,
+    AdapterError, AdapterResult, PolicyApprovalVerifier, StaticCircuitBreakerEvaluator,
+    VerifiedActionGateway,
 };
 use splendor_kernel::{
-    Action, ActionCandidate, AgentContext, AgentRuntimeConfig, LoopEngine, LoopError, Percept,
-    Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyDecision, PolicyDistributionGateway,
-    QuotaPolicy, RunId, RunTraceContext, Scheduler, SchedulerConfig, SchedulerError,
-    SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceEventKind,
+    Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
+    LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyDecision,
+    PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler, SchedulerConfig,
+    SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
+    TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateNodeId, StateStore, TraceRecord,
@@ -30,13 +32,14 @@ use splendor_store::{
 };
 use splendor_types::{
     validate_policy_bundle, AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
-    DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError, DaemonSecurityRequest,
-    EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding,
-    PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
-    PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
-    TraceEvent, TraceEventId, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
+    AuditAttribution, CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience,
+    CredentialBinding, DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError,
+    DaemonSecurityRequest, EndpointScope, GatewayVerificationState, InsecureDevMode,
+    LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
+    RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId, WorkOrder,
+    WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -397,6 +400,8 @@ pub struct CreateRunRequest {
     pub registered_actions: Vec<RegisteredAction>,
     #[serde(default)]
     pub approval_policies: Vec<ApprovalPolicy>,
+    #[serde(default)]
+    pub circuit_breakers: Vec<CircuitBreaker>,
     #[serde(default)]
     pub allowed_percept_schemas: Vec<String>,
     #[serde(default)]
@@ -922,7 +927,7 @@ async fn create_run(
     let trace_store: Arc<dyn TraceStore> = Arc::new(InMemoryTraceStore::default());
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
     let tenant_registry = TenantRegistry::new();
-    tenant_registry.insert(TenantContext::new(
+    let mut tenant_context = TenantContext::new(
         request.tenant_id.clone(),
         TenantPolicy {
             allowed_actions: validated_work_order.allowed_actions.clone(),
@@ -930,13 +935,26 @@ async fn create_run(
             allowed_permissions: validated_work_order.allowed_permissions.clone(),
         },
         QuotaPolicy::default().constrain_to_work_order(&validated_work_order),
-    ));
+    );
+    tenant_context.register_agent_policy(
+        request.agent_id.clone(),
+        AgentIsolationPolicy {
+            allowed_permissions: validated_work_order.allowed_permissions.clone(),
+            ..AgentIsolationPolicy::default()
+        },
+    );
+    tenant_registry.insert(tenant_context);
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
     if !request.approval_policies.is_empty() {
         gateway.set_approval_verifier(Arc::new(PolicyApprovalVerifier::new(
             request.approval_policies.clone(),
+        )));
+    }
+    if !request.circuit_breakers.is_empty() {
+        gateway.set_circuit_breaker_evaluator(Arc::new(StaticCircuitBreakerEvaluator::new(
+            request.circuit_breakers.clone(),
         )));
     }
     let registrations = registrations_for_request(&request, &validated_work_order);
@@ -2898,6 +2916,7 @@ mod tests {
             policy_bundle: None,
             registered_actions: Vec::new(),
             approval_policies: Vec::new(),
+            circuit_breakers: Vec::new(),
             allowed_percept_schemas: Vec::new(),
             allowed_percept_sources: Vec::new(),
             initial_state: None,

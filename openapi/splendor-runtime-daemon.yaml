@@ -567,6 +567,124 @@ paths:
       responses:
         '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /policies:
+    post:
+      summary: Publish and sign a governance policy bundle for acceptance runtimes.
+      operationId: publishPolicyBundle
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PublishPolicyBundleRequest' } } } }
+      responses:
+        '200': { description: Policy bundle published., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /policies/{policy_id}/read:
+    post:
+      summary: Read policy bundle status without granting runtime authority.
+      operationId: getPolicyStatus
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Policy bundle status., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /policies/{policy_id}/revoke:
+    post:
+      summary: Revoke a policy bundle so high-risk side effects fail closed.
+      operationId: revokePolicyBundle
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokePolicyBundleRequest' } } } }
+      responses:
+        '200': { description: Policy bundle revoked., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals:
+    post:
+      summary: Record a trace-linked approval request from runtime evidence.
+      operationId: requestApproval
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalRequestPayload' } } } }
+      responses:
+        '200': { description: Approval requested., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/grant:
+    post:
+      summary: Grant scoped approval evidence for one action.
+      operationId: grantApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval granted., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/deny:
+    post:
+      summary: Deny a pending approval request.
+      operationId: denyApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval denied., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/revoke:
+    post:
+      summary: Revoke approval evidence before it authorizes execution.
+      operationId: revokeApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval revoked., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/circuit-breakers:
+    post:
+      summary: Create a scoped circuit breaker.
+      operationId: createCircuitBreaker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CircuitBreakerRequest' } } } }
+      responses:
+        '200': { description: Circuit breaker tripped., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceCircuitBreakerRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/circuit-breakers/{breaker_id}/clear:
+    post:
+      summary: Clear a scoped circuit breaker with governance authority.
+      operationId: clearCircuitBreaker
+      parameters:
+        - name: breaker_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClearCircuitBreakerRequest' } } } }
+      responses:
+        '200': { description: Circuit breaker cleared., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceCircuitBreakerRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/kill-switches:
+    post:
+      summary: Activate a kill switch and record propagation evidence.
+      operationId: activateKillSwitch
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/KillSwitchRequest' } } } }
+      responses:
+        '200': { description: Kill switch status., content: { application/json: { schema: { $ref: '#/components/schemas/KillSwitchReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/audit/export:
+    post:
+      summary: Export governance audit evidence linking policies, approvals, circuit breakers, kill switches, and runs.
+      operationId: exportGovernanceAudit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceAuditExportRequest' } } } }
+      responses:
+        '200': { description: Governance audit exported., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceAuditExportReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /fleet/audit/read:
     post:
       summary: Read manager audit events for acceptance replay/audit evidence.
@@ -676,6 +794,10 @@ components:
         - health_read
         - capabilities_read
         - policies_sync
+        - policies_publish
+        - policies_revoke
+        - approvals_manage
+        - governance_control
         - nodes_register
         - instances_register
         - nodes_heartbeat
@@ -904,6 +1026,163 @@ components:
     ManagerReadRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
+    PublishPolicyBundleRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [policy_bundle]
+          properties:
+            policy_bundle:
+              $ref: '#/components/schemas/PolicyBundle'
+    RevokePolicyBundleRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+    PolicyBundleStatusReport:
+      type: object
+      required: [policy_bundle_id, status, envelope, trace_event_id]
+      properties:
+        policy_bundle_id: { type: string }
+        status: { type: string, enum: [published, revoked] }
+        envelope:
+          $ref: '#/components/schemas/PolicyBundleEnvelope'
+        trace_event_id: { type: string, format: uuid }
+    ApprovalRequestPayload:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, expires_at, reason]
+          properties:
+            approval_id: { type: string, format: uuid }
+            tenant_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            action_id: { type: string, format: uuid }
+            action_name: { type: string }
+            adapter: { type: string }
+            policy_id: { type: string }
+            risk_level: { type: string }
+            audience: { type: string }
+            expires_at: { type: string, format: date-time }
+            reason: { type: string }
+    ApprovalDecisionRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+            expires_at: { type: [string, 'null'], format: date-time }
+    GovernanceApprovalRecord:
+      type: object
+      required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, status, reason, issued_by, expires_at, trace_event_id, evidence]
+      properties:
+        approval_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        action_id: { type: string, format: uuid }
+        action_name: { type: string }
+        adapter: { type: string }
+        policy_id: { type: string }
+        risk_level: { type: string }
+        audience: { type: string }
+        status: { type: string, enum: [requested, granted, denied, revoked] }
+        reason: { type: string }
+        issued_by:
+          $ref: '#/components/schemas/AuditAttribution'
+        expires_at: { type: string, format: date-time }
+        trace_event_id: { type: string, format: uuid }
+        evidence:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ApprovalEvidence'
+    CircuitBreakerRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [breaker_id, tenant_id, adapter, action, reason]
+          properties:
+            breaker_id: { type: string }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            adapter: { type: [string, 'null'] }
+            action: { type: [string, 'null'] }
+            reason: { type: string }
+    ClearCircuitBreakerRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+    GovernanceCircuitBreakerRecord:
+      type: object
+      required: [breaker_id, status, tenant_id, adapter, action, reason, trace_event_id]
+      properties:
+        breaker_id: { type: string }
+        status: { type: string, enum: [tripped, cleared] }
+        tenant_id: { type: [string, 'null'], format: uuid }
+        adapter: { type: [string, 'null'] }
+        action: { type: [string, 'null'] }
+        reason: { type: string }
+        trace_event_id: { type: string, format: uuid }
+    KillSwitchRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [kill_switch_id, run_id, tenant_id, node_id, instance_id, reason, propagation_ack_required, target_daemon_url, cancel_payload]
+          properties:
+            kill_switch_id: { type: string }
+            run_id: { type: [string, 'null'], format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            node_id: { type: [string, 'null'], format: uuid }
+            instance_id: { type: [string, 'null'], format: uuid }
+            reason: { type: string }
+            propagation_ack_required: { type: boolean }
+            target_daemon_url: { type: [string, 'null'] }
+            cancel_payload: true
+    KillSwitchReport:
+      type: object
+      required: [kill_switch_id, status, fail_closed, propagation_acknowledged, cancel_status, trace_event_id, reason]
+      properties:
+        kill_switch_id: { type: string }
+        status: { type: string, enum: [activated, fail_closed] }
+        fail_closed: { type: boolean }
+        propagation_acknowledged: { type: boolean }
+        cancel_status: { type: [integer, 'null'] }
+        trace_event_id: { type: string, format: uuid }
+        reason: { type: string }
+    GovernanceAuditExportRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [run_id]
+          properties:
+            run_id: { type: [string, 'null'], format: uuid }
+    GovernanceAuditExportReport:
+      type: object
+      required: [exported, trace_event_id, events, policy_bundle_ids, approval_ids, circuit_breaker_ids, kill_switch_ids]
+      properties:
+        exported: { type: boolean }
+        trace_event_id: { type: string, format: uuid }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/ManagerAuditEvent' }
+        policy_bundle_ids:
+          type: array
+          items: { type: string }
+        approval_ids:
+          type: array
+          items: { type: string, format: uuid }
+        circuit_breaker_ids:
+          type: array
+          items: { type: string }
+        kill_switch_ids:
+          type: array
+          items: { type: string }
     NodeRegistration:
       type: object
       required: [node_id, kind, scope, capability_document, runtime_version, health, registered_at]

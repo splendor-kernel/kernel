@@ -11,11 +11,12 @@ use splendor_store::{
     CentralTraceIndex, InMemoryCentralTraceIndex, TraceSyncBatch, TraceSyncReport,
 };
 use splendor_types::{
-    select_placement, AuditAttribution, CallerCredential, CredentialAudience, CredentialBinding,
-    DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus, InstanceId,
-    InstanceRegistration, InstanceTelemetry, MessageEnvelope, MessageId, NodeHeartbeat, NodeId,
-    NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
-    PlacementExecutionMode, PlacementRequest, PlacementTarget, RevocationStatus, RunId, RunStatus,
+    select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
+    CallerCredential, CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
+    FleetTelemetrySnapshot, HealthStatus, InstanceId, InstanceRegistration, InstanceTelemetry,
+    MessageEnvelope, MessageId, NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate,
+    PlacementDecision, PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest,
+    PlacementTarget, PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus,
     RunTelemetry, TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope,
     WorkOrderKeyring, WorkOrderValidationContext,
 };
@@ -45,6 +46,10 @@ struct ManagerInner {
     trace_index: InMemoryCentralTraceIndex,
     telemetry: Mutex<FleetTelemetryCollector>,
     audit: Mutex<Vec<ManagerAuditEvent>>,
+    policies: Mutex<HashMap<String, PolicyBundleEnvelope>>,
+    approvals: Mutex<HashMap<String, GovernanceApprovalRecord>>,
+    circuit_breakers: Mutex<HashMap<String, GovernanceCircuitBreakerRecord>>,
+    kill_switches: Mutex<HashMap<String, KillSwitchReport>>,
 }
 
 impl ManagerState {
@@ -73,6 +78,10 @@ impl ManagerState {
                 trace_index: InMemoryCentralTraceIndex::default(),
                 telemetry: Mutex::new(FleetTelemetryCollector::new(fleet_id)),
                 audit: Mutex::new(Vec::new()),
+                policies: Mutex::new(HashMap::new()),
+                approvals: Mutex::new(HashMap::new()),
+                circuit_breakers: Mutex::new(HashMap::new()),
+                kill_switches: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -184,6 +193,20 @@ pub fn router(state: ManagerState) -> Router {
         .route("/fleet/traces/sync", post(sync_trace_buffer))
         .route("/messages", post(send_message))
         .route("/messages/:message_id/read", post(get_message))
+        .route("/policies", post(publish_policy_bundle))
+        .route("/policies/:policy_id/read", post(get_policy_status))
+        .route("/policies/:policy_id/revoke", post(revoke_policy_bundle))
+        .route("/approvals", post(request_approval))
+        .route("/approvals/:approval_id/grant", post(grant_approval))
+        .route("/approvals/:approval_id/deny", post(deny_approval))
+        .route("/approvals/:approval_id/revoke", post(revoke_approval))
+        .route("/governance/circuit-breakers", post(create_circuit_breaker))
+        .route(
+            "/governance/circuit-breakers/:breaker_id/clear",
+            post(clear_circuit_breaker),
+        )
+        .route("/governance/kill-switches", post(activate_kill_switch))
+        .route("/governance/audit/export", post(export_governance_audit))
         .route("/fleet/audit/read", post(audit_events))
         .with_state(state)
 }
@@ -293,6 +316,150 @@ pub struct MessageStatusReport {
     pub route_permission: Option<String>,
     pub remote_state_mutated: bool,
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublishPolicyBundleRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub policy_bundle: PolicyBundle,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevokePolicyBundleRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicyBundleStatusReport {
+    pub policy_bundle_id: String,
+    pub status: String,
+    pub envelope: PolicyBundleEnvelope,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalRequestPayload {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub approval_id: ApprovalId,
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub run_id: RunId,
+    pub action_id: splendor_types::ActionId,
+    pub action_name: String,
+    pub adapter: String,
+    pub policy_id: String,
+    pub risk_level: String,
+    pub audience: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub reason: String,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceApprovalRecord {
+    pub approval_id: ApprovalId,
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub run_id: RunId,
+    pub action_id: splendor_types::ActionId,
+    pub action_name: String,
+    pub adapter: String,
+    pub policy_id: String,
+    pub risk_level: String,
+    pub audience: String,
+    pub status: String,
+    pub reason: String,
+    pub issued_by: AuditAttribution,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    pub trace_event_id: String,
+    pub evidence: Option<ApprovalEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CircuitBreakerRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub breaker_id: String,
+    pub tenant_id: Option<TenantId>,
+    pub adapter: Option<String>,
+    pub action: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClearCircuitBreakerRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceCircuitBreakerRecord {
+    pub breaker_id: String,
+    pub status: String,
+    pub tenant_id: Option<TenantId>,
+    pub adapter: Option<String>,
+    pub action: Option<String>,
+    pub reason: String,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KillSwitchRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub kill_switch_id: String,
+    pub run_id: Option<RunId>,
+    pub tenant_id: Option<TenantId>,
+    pub node_id: Option<NodeId>,
+    pub instance_id: Option<InstanceId>,
+    pub reason: String,
+    pub propagation_ack_required: bool,
+    pub target_daemon_url: Option<String>,
+    pub cancel_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KillSwitchReport {
+    pub kill_switch_id: String,
+    pub status: String,
+    pub fail_closed: bool,
+    pub propagation_acknowledged: bool,
+    pub cancel_status: Option<u16>,
+    pub trace_event_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAuditExportRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub run_id: Option<RunId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAuditExportReport {
+    pub exported: bool,
+    pub trace_event_id: String,
+    pub events: Vec<ManagerAuditEvent>,
+    pub policy_bundle_ids: Vec<String>,
+    pub approval_ids: Vec<String>,
+    pub circuit_breaker_ids: Vec<String>,
+    pub kill_switch_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1241,6 +1408,458 @@ async fn get_message(
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
     Ok(Json(report))
+}
+
+async fn publish_policy_bundle(
+    State(state): State<ManagerState>,
+    Json(request): Json<PublishPolicyBundleRequest>,
+) -> Result<Json<PolicyBundleStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::PoliciesPublish,
+        true,
+    )?;
+    let policy_bundle_id = request.policy_bundle.policy_bundle_id.to_string();
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        request.policy_bundle,
+        "policy-local-key",
+        b"splendor-local-policy-secret",
+    )
+    .map_err(|e| ManagerApiError::bad_request("policy_bundle_rejected", e.to_string()))?;
+    let trace_event_id = state.audit(
+        "policy.published",
+        serde_json::json!({"policy_bundle_id": policy_bundle_id, "tenant_id": envelope.bundle.tenant_id}),
+    )?;
+    state
+        .inner
+        .policies
+        .lock()
+        .map_err(|_| ManagerApiError::internal("policy_lock", "policy lock unavailable"))?
+        .insert(policy_bundle_id.clone(), envelope.clone());
+    Ok(Json(PolicyBundleStatusReport {
+        policy_bundle_id,
+        status: "published".to_string(),
+        envelope,
+        trace_event_id,
+    }))
+}
+
+async fn get_policy_status(
+    Path(policy_id): Path<String>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
+) -> Result<Json<PolicyBundleStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::FleetRead,
+        false,
+    )?;
+    let envelope = state
+        .inner
+        .policies
+        .lock()
+        .map_err(|_| ManagerApiError::internal("policy_lock", "policy lock unavailable"))?
+        .get(&policy_id)
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("policy_not_found", "policy not found"))?;
+    let trace_event_id = state.audit(
+        "policy.read",
+        serde_json::json!({"policy_bundle_id": policy_id}),
+    )?;
+    Ok(Json(PolicyBundleStatusReport {
+        policy_bundle_id: policy_id,
+        status: match envelope.bundle.revocation {
+            RevocationStatus::Active => "published".to_string(),
+            RevocationStatus::Revoked { .. } => "revoked".to_string(),
+        },
+        envelope,
+        trace_event_id,
+    }))
+}
+
+async fn revoke_policy_bundle(
+    Path(policy_id): Path<String>,
+    State(state): State<ManagerState>,
+    Json(request): Json<RevokePolicyBundleRequest>,
+) -> Result<Json<PolicyBundleStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::PoliciesRevoke,
+        true,
+    )?;
+    let mut policies = state
+        .inner
+        .policies
+        .lock()
+        .map_err(|_| ManagerApiError::internal("policy_lock", "policy lock unavailable"))?;
+    let mut envelope = policies
+        .get(&policy_id)
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("policy_not_found", "policy not found"))?;
+    envelope.bundle.revocation = RevocationStatus::Revoked {
+        reason: request.reason.clone(),
+    };
+    envelope.signature = None;
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        envelope.bundle,
+        "policy-local-key",
+        b"splendor-local-policy-secret",
+    )
+    .map_err(|e| ManagerApiError::bad_request("policy_bundle_rejected", e.to_string()))?;
+    policies.insert(policy_id.clone(), envelope.clone());
+    let trace_event_id = state.audit(
+        "policy.revoked",
+        serde_json::json!({"policy_bundle_id": policy_id, "reason": request.reason}),
+    )?;
+    Ok(Json(PolicyBundleStatusReport {
+        policy_bundle_id: policy_id,
+        status: "revoked".to_string(),
+        envelope,
+        trace_event_id,
+    }))
+}
+
+async fn request_approval(
+    State(state): State<ManagerState>,
+    Json(request): Json<ApprovalRequestPayload>,
+) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::ApprovalsManage,
+        true,
+    )?;
+    let trace_event_id = state.audit(
+        "approval.requested",
+        serde_json::json!({"approval_id": request.approval_id, "run_id": request.run_id, "action_id": request.action_id, "policy_id": request.policy_id}),
+    )?;
+    let record = GovernanceApprovalRecord {
+        approval_id: request.approval_id.clone(),
+        tenant_id: request.tenant_id,
+        agent_id: request.agent_id,
+        run_id: request.run_id,
+        action_id: request.action_id,
+        action_name: request.action_name,
+        adapter: request.adapter,
+        policy_id: request.policy_id,
+        risk_level: request.risk_level,
+        audience: request.audience,
+        status: "requested".to_string(),
+        reason: request.reason,
+        issued_by: request.security.audit_attribution,
+        expires_at: request.expires_at,
+        trace_event_id,
+        evidence: None,
+    };
+    state
+        .inner
+        .approvals
+        .lock()
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?
+        .insert(record.approval_id.to_string(), record.clone());
+    Ok(Json(record))
+}
+
+async fn grant_approval(
+    Path(approval_id): Path<ApprovalId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::ApprovalsManage,
+        true,
+    )?;
+    let mut approvals = state
+        .inner
+        .approvals
+        .lock()
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?;
+    let mut record = approvals
+        .get(&approval_id.to_string())
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))?;
+    let expires_at = request.expires_at.unwrap_or(record.expires_at);
+    let mut evidence = ApprovalEvidence::new(
+        approval_id.clone(),
+        record.tenant_id.clone(),
+        record.agent_id.clone(),
+        record.run_id.clone(),
+        ApprovalDecision::Granted,
+        expires_at,
+    )
+    .with_action_name(record.action_name.clone())
+    .with_adapter(record.adapter.clone());
+    evidence.action_id = Some(record.action_id.clone());
+    evidence.reason = Some(request.reason.clone());
+    let trace_event_id = state.audit(
+        "approval.granted",
+        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "audience": record.audience}),
+    )?;
+    record.status = "granted".to_string();
+    record.reason = request.reason;
+    record.expires_at = expires_at;
+    record.trace_event_id = trace_event_id;
+    record.evidence = Some(evidence);
+    approvals.insert(approval_id.to_string(), record.clone());
+    Ok(Json(record))
+}
+
+async fn deny_approval(
+    Path(approval_id): Path<ApprovalId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    decide_approval(
+        state,
+        approval_id,
+        request,
+        "denied",
+        ApprovalDecision::Denied,
+        false,
+    )
+    .await
+}
+
+async fn revoke_approval(
+    Path(approval_id): Path<ApprovalId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    decide_approval(
+        state,
+        approval_id,
+        request,
+        "revoked",
+        ApprovalDecision::Denied,
+        true,
+    )
+    .await
+}
+
+async fn decide_approval(
+    state: ManagerState,
+    approval_id: ApprovalId,
+    request: ApprovalDecisionRequest,
+    status: &'static str,
+    decision: ApprovalDecision,
+    revoked: bool,
+) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::ApprovalsManage,
+        true,
+    )?;
+    let mut approvals = state
+        .inner
+        .approvals
+        .lock()
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?;
+    let mut record = approvals
+        .get(&approval_id.to_string())
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))?;
+    let mut evidence = ApprovalEvidence::new(
+        approval_id.clone(),
+        record.tenant_id.clone(),
+        record.agent_id.clone(),
+        record.run_id.clone(),
+        decision,
+        request.expires_at.unwrap_or(record.expires_at),
+    )
+    .with_action_name(record.action_name.clone())
+    .with_adapter(record.adapter.clone());
+    evidence.action_id = Some(record.action_id.clone());
+    evidence.reason = Some(request.reason.clone());
+    evidence.revoked = revoked;
+    let trace_event_id = state.audit(
+        &format!("approval.{status}"),
+        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "reason": request.reason}),
+    )?;
+    record.status = status.to_string();
+    record.reason = request.reason;
+    record.trace_event_id = trace_event_id;
+    record.evidence = Some(evidence);
+    approvals.insert(approval_id.to_string(), record.clone());
+    Ok(Json(record))
+}
+
+async fn create_circuit_breaker(
+    State(state): State<ManagerState>,
+    Json(request): Json<CircuitBreakerRequest>,
+) -> Result<Json<GovernanceCircuitBreakerRecord>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::GovernanceControl,
+        true,
+    )?;
+    let trace_event_id = state.audit(
+        "circuit_breaker.tripped",
+        serde_json::json!({"breaker_id": request.breaker_id, "tenant_id": request.tenant_id, "adapter": request.adapter, "action": request.action, "reason": request.reason}),
+    )?;
+    let record = GovernanceCircuitBreakerRecord {
+        breaker_id: request.breaker_id,
+        status: "tripped".to_string(),
+        tenant_id: request.tenant_id,
+        adapter: request.adapter,
+        action: request.action,
+        reason: request.reason,
+        trace_event_id,
+    };
+    state
+        .inner
+        .circuit_breakers
+        .lock()
+        .map_err(|_| ManagerApiError::internal("breaker_lock", "breaker lock unavailable"))?
+        .insert(record.breaker_id.clone(), record.clone());
+    Ok(Json(record))
+}
+
+async fn clear_circuit_breaker(
+    Path(breaker_id): Path<String>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ClearCircuitBreakerRequest>,
+) -> Result<Json<GovernanceCircuitBreakerRecord>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::GovernanceControl,
+        true,
+    )?;
+    let mut breakers = state
+        .inner
+        .circuit_breakers
+        .lock()
+        .map_err(|_| ManagerApiError::internal("breaker_lock", "breaker lock unavailable"))?;
+    let mut record = breakers.get(&breaker_id).cloned().ok_or_else(|| {
+        ManagerApiError::not_found("breaker_not_found", "circuit breaker not found")
+    })?;
+    let trace_event_id = state.audit(
+        "circuit_breaker.cleared",
+        serde_json::json!({"breaker_id": breaker_id, "reason": request.reason}),
+    )?;
+    record.status = "cleared".to_string();
+    record.reason = request.reason;
+    record.trace_event_id = trace_event_id;
+    breakers.insert(breaker_id, record.clone());
+    Ok(Json(record))
+}
+
+async fn activate_kill_switch(
+    State(state): State<ManagerState>,
+    Json(request): Json<KillSwitchRequest>,
+) -> Result<Json<KillSwitchReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::GovernanceControl,
+        true,
+    )?;
+    let mut acknowledged = false;
+    let mut cancel_status = None;
+    if let (Some(url), Some(run_id), Some(payload)) = (
+        &request.target_daemon_url,
+        &request.run_id,
+        &request.cancel_payload,
+    ) {
+        let response = post_json(url, &format!("/runs/{run_id}/cancel"), payload)
+            .map_err(|e| ManagerApiError::internal("kill_switch_http_error", e))?;
+        cancel_status = Some(response.status);
+        acknowledged = (200..300).contains(&response.status);
+    }
+    let fail_closed = request.propagation_ack_required && !acknowledged;
+    let trace_event_id = state.audit(
+        "kill_switch.activated",
+        serde_json::json!({"kill_switch_id": request.kill_switch_id, "run_id": request.run_id, "node_id": request.node_id, "instance_id": request.instance_id, "acknowledged": acknowledged, "fail_closed": fail_closed, "reason": request.reason}),
+    )?;
+    let report = KillSwitchReport {
+        kill_switch_id: request.kill_switch_id,
+        status: if fail_closed {
+            "fail_closed"
+        } else {
+            "activated"
+        }
+        .to_string(),
+        fail_closed,
+        propagation_acknowledged: acknowledged,
+        cancel_status,
+        trace_event_id,
+        reason: request.reason,
+    };
+    state
+        .inner
+        .kill_switches
+        .lock()
+        .map_err(|_| ManagerApiError::internal("kill_switch_lock", "kill switch lock unavailable"))?
+        .insert(report.kill_switch_id.clone(), report.clone());
+    Ok(Json(report))
+}
+
+async fn export_governance_audit(
+    State(state): State<ManagerState>,
+    Json(request): Json<GovernanceAuditExportRequest>,
+) -> Result<Json<GovernanceAuditExportReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::TracesRead,
+        false,
+    )?;
+    let trace_event_id = state.audit(
+        "governance.audit.exported",
+        serde_json::json!({"run_id": request.run_id}),
+    )?;
+    let events = state
+        .inner
+        .audit
+        .lock()
+        .map_err(|_| ManagerApiError::internal("audit_lock", "audit lock unavailable"))?
+        .clone();
+    Ok(Json(GovernanceAuditExportReport {
+        exported: true,
+        trace_event_id,
+        events,
+        policy_bundle_ids: state
+            .inner
+            .policies
+            .lock()
+            .map_err(|_| ManagerApiError::internal("policy_lock", "policy lock unavailable"))?
+            .keys()
+            .cloned()
+            .collect(),
+        approval_ids: state
+            .inner
+            .approvals
+            .lock()
+            .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?
+            .keys()
+            .cloned()
+            .collect(),
+        circuit_breaker_ids: state
+            .inner
+            .circuit_breakers
+            .lock()
+            .map_err(|_| ManagerApiError::internal("breaker_lock", "breaker lock unavailable"))?
+            .keys()
+            .cloned()
+            .collect(),
+        kill_switch_ids: state
+            .inner
+            .kill_switches
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal("kill_switch_lock", "kill switch lock unavailable")
+            })?
+            .keys()
+            .cloned()
+            .collect(),
+    }))
 }
 
 async fn get_fleet_telemetry(

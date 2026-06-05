@@ -1078,6 +1078,10 @@ export type EndpointScope =
   | "health_read"
   | "capabilities_read"
   | "policies_sync"
+  | "policies_publish"
+  | "policies_revoke"
+  | "approvals_manage"
+  | "governance_control"
   | "nodes_register"
   | "instances_register"
   | "nodes_heartbeat"
@@ -1186,6 +1190,7 @@ export interface CreateRunRequest {
   policy_bundle: PolicyBundleEnvelope | null;
   registered_actions: RegisteredAction[];
   approval_policies: ApprovalPolicy[];
+  circuit_breakers: CircuitBreaker[];
   allowed_percept_schemas: string[];
   allowed_percept_sources: string[];
   initial_state: JsonValue | null;
@@ -1441,6 +1446,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "policy_bundle",
     "registered_actions",
     "approval_policies",
+    "circuit_breakers",
     "allowed_percept_schemas",
     "allowed_percept_sources",
     "initial_state",
@@ -1645,7 +1651,11 @@ export const ENDPOINT_SCOPE_VALUES = [
   "NodesRegister",
   "InstancesRegister",
   "NodesHeartbeat",
-  "InstancesHeartbeat"
+  "InstancesHeartbeat",
+  "PoliciesPublish",
+  "PoliciesRevoke",
+  "ApprovalsManage",
+  "GovernanceControl"
 ] as const;
 
 export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
@@ -1670,6 +1680,10 @@ export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
   health_read: "splendor.health.read",
   capabilities_read: "splendor.capabilities.read",
   policies_sync: "splendor.policies.sync",
+  policies_publish: "splendor.policies.publish",
+  policies_revoke: "splendor.policies.revoke",
+  approvals_manage: "splendor.approvals.manage",
+  governance_control: "splendor.governance.control",
   nodes_register: "splendor.nodes.register",
   instances_register: "splendor.instances.register",
   nodes_heartbeat: "splendor.nodes.heartbeat",

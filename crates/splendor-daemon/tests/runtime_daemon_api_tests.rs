@@ -199,6 +199,7 @@ fn create_request(
         policy_bundle: None,
         registered_actions,
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.test.v1".to_string()],
         allowed_percept_sources: vec!["daemon-client-local".to_string()],
         initial_state: Some(json!({"seed": true})),

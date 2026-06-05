@@ -124,8 +124,10 @@ pub struct CircuitBreaker {
     /// Sanitized reason code or short explanation.
     pub reason: String,
     /// Creation timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// Last state-change timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 

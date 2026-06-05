@@ -99,6 +99,7 @@ const createRunRequest: CreateRunRequest = {
   policy_bundle: null,
   registered_actions: [],
   approval_policies: [],
+  circuit_breakers: [],
   allowed_percept_schemas: ["splendor.percept.test.v1"],
   allowed_percept_sources: ["daemon-client-local"],
   initial_state: { seed: true },
