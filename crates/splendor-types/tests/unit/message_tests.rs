@@ -166,6 +166,44 @@ fn message_requires_schema_payload_and_timestamp() {
 }
 
 #[test]
+fn message_causal_parent_is_required_but_nullable() {
+    let message = valid_message();
+    let mut value = serde_json::to_value(&message).expect("message json");
+    value["causal_parent"] = serde_json::Value::Null;
+
+    let decoded = serde_json::from_value::<Message>(value.clone()).expect("null causal parent");
+    assert_eq!(decoded.causal_parent, None);
+
+    let mut missing = value;
+    missing
+        .as_object_mut()
+        .expect("message object")
+        .remove("causal_parent");
+    let error = serde_json::from_value::<Message>(missing).expect_err("missing causal_parent");
+    assert!(
+        error.to_string().contains("causal_parent"),
+        "missing field error should identify causal_parent: {error}"
+    );
+}
+
+#[test]
+fn message_envelope_rejects_missing_nested_causal_parent() {
+    let envelope = MessageEnvelope::new(valid_message()).expect("valid envelope");
+    let mut value = serde_json::to_value(&envelope).expect("envelope json");
+    value["message"]
+        .as_object_mut()
+        .expect("message object")
+        .remove("causal_parent");
+
+    let error =
+        serde_json::from_value::<MessageEnvelope>(value).expect_err("missing causal_parent");
+    assert!(
+        error.to_string().contains("causal_parent"),
+        "missing nested field error should identify causal_parent: {error}"
+    );
+}
+
+#[test]
 fn task_request_schema_requires_explicit_target_and_scoped_objective() {
     let parent_run_id = RunId::new();
     let child_run_id = RunId::new();
