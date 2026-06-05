@@ -3,21 +3,21 @@ use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use splendor_daemon::{
-    router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
-    DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest, PolicySyncRequest,
-    PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus,
-    StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
+    router, ApiErrorBody, AppendPerceptRequest, CircuitBreakerSyncResponse, CreateRunRequest,
+    CreateRunResponse, DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest,
+    PolicySyncRequest, PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse,
+    RunStatus, StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
     StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
     TracePageResponse,
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
-    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
-    EndpointScope, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent,
-    TraceEventKind, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement,
-    WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION,
-    WORK_ORDER_SCHEMA_VERSION,
+    AuditAttribution, CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
+    ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope, Percept,
+    PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
+    QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
+    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -417,6 +417,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: action("allowed_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -759,11 +760,15 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
+    let policy_action_id = ActionId::new();
+    let mut planned_action = read_only_action("allowed_action");
+    planned_action.preconditions = vec!["ready".to_string()];
     let policy_actions = vec![DaemonActionCandidate {
-        action: read_only_action("allowed_action"),
+        action_id: Some(policy_action_id.clone()),
+        action: planned_action,
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
-        satisfied_preconditions: Vec::new(),
+        satisfied_preconditions: vec!["ready".to_string()],
     }];
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
@@ -799,6 +804,13 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!tick.state_node_id.is_empty());
+    assert_eq!(
+        tick.action_outcomes
+            .first()
+            .expect("policy action outcome")
+            .action_id,
+        policy_action_id
+    );
 
     let credential =
         caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::StateRead]);
@@ -986,6 +998,7 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: action("allowed_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -1168,6 +1181,7 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: read_only_action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1302,6 +1316,191 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
     let serialized = serde_json::to_string(&traces.records).expect("serialized traces");
     assert!(!serialized.contains("raw-secret"));
     assert!(!serialized.contains("token="));
+}
+
+#[tokio::test]
+async fn circuit_breaker_sync_updates_live_gateway_and_preserves_action_id() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let breaker_id = CircuitBreakerId::try_new("breaker_daemon_sync").expect("breaker id");
+    let breaker = CircuitBreaker::tripped(
+        breaker_id.clone(),
+        CircuitBreakerScope::Adapter("daemon.local".to_string()),
+        "unit_breaker_sync",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("breaker");
+    let (status, synced): (StatusCode, CircuitBreakerSyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/governance/circuit-breakers/sync", created.run_id),
+        json!({
+            "credential": null,
+            "audit_attribution": attribution(),
+            "circuit_breakers": [breaker],
+            "reason": "unit_manager_sync"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(synced.accepted);
+    assert_eq!(synced.run_id, created.run_id);
+    assert_eq!(synced.breaker_ids, vec![breaker_id.to_string()]);
+
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces
+        .records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .find(|event| event.trace_event_id == synced.trace_event_id)
+        .map(|event| event.trace_event_id)
+        .expect("breaker sync audit trace");
+
+    let action_id = ActionId::new();
+    let submit = SubmitActionRequest {
+        action_id: Some(action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id: Some(causal_trace_id),
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(submit).expect("submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.action_id, action_id);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "circuit_breaker_tripped"));
+    assert_eq!(
+        outcome
+            .verification
+            .artifacts
+            .get("circuit_breaker")
+            .and_then(|value| value.get("circuit_breaker"))
+            .and_then(|value| value.get("breaker_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Some(breaker_id.to_string())
+    );
+}
+
+#[tokio::test]
+async fn create_run_circuit_breaker_denies_runtime_admission_fail_closed() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let mut create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    let breaker_id = CircuitBreakerId::try_new("breaker_global_admission").expect("breaker id");
+    create.circuit_breakers = vec![CircuitBreaker::tripped(
+        breaker_id.clone(),
+        CircuitBreakerScope::Global,
+        "unit_global_admission",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("global breaker")];
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("global breaker admission".to_string()),
+        approval_evidence: None,
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("start request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tick.status, RunStatus::Running);
+
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces.records.first().and_then(|record| {
+        serde_json::from_value::<TraceEvent>(record.payload.clone())
+            .ok()
+            .map(|event| event.trace_event_id)
+    });
+    let submit = SubmitActionRequest {
+        action_id: None,
+        run_id: created.run_id,
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id,
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app,
+        Method::POST,
+        "/actions",
+        serde_json::to_value(submit).expect("submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "circuit_breaker_tripped"));
+    assert!(outcome
+        .verification
+        .artifacts
+        .to_string()
+        .contains(&breaker_id.to_string()));
 }
 
 #[tokio::test]
@@ -1442,6 +1641,7 @@ async fn revoked_policy_bundle_blocks_existing_side_effects() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id,
         agent_id,
@@ -1490,6 +1690,7 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         let tenant_id = TenantId::new();
         let agent_id = AgentId::new();
         let policy_actions = vec![DaemonActionCandidate {
+            action_id: None,
             action: action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1829,6 +2030,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action("extra_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1851,6 +2053,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action("allowed_action"),
             adapter: Some("extra.adapter".to_string()),
             quota_usage: None,
@@ -1875,6 +2078,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action_with_permission,
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1970,6 +2174,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     denied_action.required_permissions = vec!["not.allowed".to_string()];
 
     let unlinked_submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -2006,6 +2211,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id,
         agent_id,
@@ -2094,6 +2300,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
     });
 
     let approval_required = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -2137,6 +2344,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         ApprovalDecision::Granted,
     );
     let approval_granted = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -2252,6 +2460,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
             .map(|event| event.trace_event_id)
     });
     let expired_submit = SubmitActionRequest {
+        action_id: None,
         run_id: expired_created.run_id.clone(),
         tenant_id: expired_tenant_id,
         agent_id: expired_agent_id,
@@ -2383,6 +2592,7 @@ async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
     assert_eq!(error.code, "invalid_run_state");
 
     let wrong_scope_submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: TenantId::new(),
         agent_id: agent_id.clone(),
@@ -2446,6 +2656,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     let mut planned = action("allowed_action");
     planned.preconditions = vec!["ready".to_string()];
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: planned,
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage {
@@ -2511,6 +2722,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id,
         tenant_id,
         agent_id,
@@ -2536,6 +2748,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     let mut failing = action("failing_action");
     failing.params = json!({"fail_adapter": true});
     let failed_submit = SubmitActionRequest {
+        action_id: None,
         run_id: submit.run_id,
         tenant_id: submit.tenant_id,
         agent_id: submit.agent_id,
@@ -2857,6 +3070,7 @@ async fn resume_without_signed_work_order_fails_before_tick_execution() {
         tenant_id,
         agent_id,
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,

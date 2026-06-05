@@ -125,7 +125,9 @@ S5_REQUIRED_OPERATIONS = {
     "requestApproval",
     "grantApproval",
     "denyApproval",
+    "revokeApproval",
     "createCircuitBreaker",
+    "syncCircuitBreakers",
     "clearCircuitBreaker",
     "activateKillSwitch",
     "exportGovernanceAudit",
@@ -163,6 +165,7 @@ S5_REQUIRED_EVENTS = {
     "run.paused",
     "run.resumed",
     "run.cancelled",
+    "policy.expired",
     "policy.revoked",
     "circuit_breaker.tripped",
     "circuit_breaker.cleared",
@@ -1044,8 +1047,22 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if positive.get(key) is not True:
             failures.append(f"s5_positive_check_missing:{key}")
     approval_flow = read_json(artifact_dir / "approval-flow.json")
-    if approval_flow.get("grant", {}).get("evidence", {}).get("decision") != "Granted":
+    grant_evidence = approval_flow.get("grant", {}).get("evidence", {})
+    request_approval = approval_flow.get("request", {})
+    if grant_evidence.get("decision") != "Granted":
         failures.append("s5_grant_missing_scoped_evidence")
+    for field in ["approval_id", "tenant_id", "agent_id", "run_id", "action_id", "action_name", "adapter"]:
+        if not grant_evidence.get(field):
+            failures.append(f"s5_grant_evidence_missing:{field}")
+    for field in ["approval_id", "tenant_id", "agent_id", "run_id", "action_id", "action_name", "adapter"]:
+        if request_approval.get(field) and grant_evidence.get(field) != request_approval.get(field):
+            failures.append(f"s5_grant_evidence_scope_mismatch:{field}")
+    revoked_record = approval_flow.get("revoke", {})
+    revoked_evidence = revoked_record.get("evidence", {})
+    if revoked_record.get("status") != "revoked" or revoked_evidence.get("revoked") is not True:
+        failures.append("s5_revoke_approval_missing_public_evidence")
+    if revoked_evidence.get("action_id") != grant_evidence.get("action_id"):
+        failures.append("s5_revoked_evidence_action_scope_mismatch")
     if approval_flow.get("expired", {}).get("status") != "Denied":
         failures.append("s5_expired_approval_not_denied")
     if approval_flow.get("revoked", {}).get("status") != "Denied":
@@ -1055,14 +1072,33 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s5_policy_publish_not_signed")
     if policy.get("revoked_policy_create", {}).get("status") != 403:
         failures.append("s5_revoked_policy_create_not_forbidden")
+    runtime_expired = policy.get("runtime_expired_policy", {})
+    runtime_start = runtime_expired.get("start", {})
+    if runtime_expired.get("create", {}).get("status") != 200 or runtime_start.get("status") not in {200, 500}:
+        failures.append("s5_policy_expiry_not_runtime_exercised")
     breaker = read_json(artifact_dir / "circuit-breaker-report.json")
     if breaker.get("blocked_action", {}).get("status") != "Denied":
         failures.append("s5_circuit_breaker_action_not_denied")
+    created_breaker_id = breaker.get("created", {}).get("breaker_id")
+    synced_ids = set(breaker.get("synced", {}).get("breaker_ids", []))
+    denied_breaker = breaker.get("blocked_action", {}).get("verification", {}).get("artifacts", {}).get("circuit_breaker", {})
+    denied_breaker_id = denied_breaker.get("breaker_id") or denied_breaker.get("circuit_breaker", {}).get("breaker_id")
+    if not created_breaker_id or created_breaker_id not in synced_ids or denied_breaker_id != created_breaker_id:
+        failures.append("s5_circuit_breaker_not_manager_correlated")
     if breaker.get("clear_wrong_scope", {}).get("status") != 403:
         failures.append("s5_clear_breaker_wrong_scope_not_forbidden")
     kill = read_json(artifact_dir / "kill-switch-report.json")
     if kill.get("activated", {}).get("propagation_acknowledged") is not True:
         failures.append("s5_kill_switch_not_acknowledged")
+    activated_kill = kill.get("activated", {})
+    if activated_kill.get("target_derived_from_registry") is not True or not activated_kill.get("target_instance_id") or activated_kill.get("cancel_payload_schema") != "splendor.daemon.lifecycle_request.v1":
+        failures.append("s5_kill_switch_target_not_registry_derived")
+    for row in read_jsonl(artifact_dir / "api-traffic.ndjson"):
+        if row.get("operation_id") != "activateKillSwitch":
+            continue
+        request_keys = set((row.get("request") or {}).keys())
+        if {"target_daemon_url", "cancel_payload"} & request_keys:
+            failures.append("s5_kill_switch_request_contains_caller_supplied_target_or_payload")
     if kill.get("missing_ack", {}).get("fail_closed") is not True:
         failures.append("s5_kill_switch_missing_ack_not_fail_closed")
     replay = read_json(artifact_dir / "replay-report.json")

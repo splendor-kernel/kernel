@@ -306,6 +306,7 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
   const { fetcher, calls } = makeFetch(outcome);
   const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
   const request: SubmitActionRequest = {
+    action_id: outcome.action_id,
     run_id: runId,
     tenant_id: tenantId,
     agent_id: agentId,

@@ -1311,6 +1311,7 @@ export interface TraceExportResponse {
 }
 
 export interface SubmitActionRequest {
+  action_id: ActionId | null;
   run_id: RunId;
   tenant_id: TenantId;
   agent_id: AgentId;
@@ -1481,6 +1482,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
   trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
   replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
   submit_action_request: [
+    "action_id",
     "run_id",
     "tenant_id",
     "agent_id",

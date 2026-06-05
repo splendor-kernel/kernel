@@ -110,6 +110,9 @@ impl OutcomeEvaluator for NoopOutcomeEvaluator {
 /// Proposed action with quota usage and adapter metadata.
 #[derive(Clone, Debug)]
 pub struct ActionCandidate {
+    /// Stable action identifier when a proposed action must be re-evaluated
+    /// across pause/resume boundaries, such as approval-scoped actions.
+    pub action_id: Option<ActionId>,
     /// Action to be executed.
     pub action: Action,
     /// Adapter identifier used for policy allowlists.
@@ -127,6 +130,7 @@ impl ActionCandidate {
     pub fn new(action: Action) -> Self {
         let satisfied_preconditions = action.preconditions.clone();
         Self {
+            action_id: None,
             action,
             adapter: None,
             usage: QuotaUsage::single_action(),
@@ -156,6 +160,12 @@ impl ActionCandidate {
     /// Attaches approval evidence for the gateway approval verifier.
     pub fn with_approval_evidence(mut self, evidence: splendor_types::ApprovalEvidence) -> Self {
         self.approval_evidence = Some(evidence);
+        self
+    }
+
+    /// Sets a stable action identity for repeated evaluations of this candidate.
+    pub fn with_action_id(mut self, action_id: ActionId) -> Self {
+        self.action_id = Some(action_id);
         self
     }
 }
@@ -623,7 +633,7 @@ impl LoopEngine {
         let mut escalations = Vec::new();
         for candidate in &decision.actions {
             let action = candidate.action.clone();
-            let action_id = ActionId::new();
+            let action_id = candidate.action_id.clone().unwrap_or_else(ActionId::new);
             self.record_action_event(
                 tick_id,
                 &action_id,

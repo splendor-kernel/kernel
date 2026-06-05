@@ -429,8 +429,6 @@ pub struct KillSwitchRequest {
     pub instance_id: Option<InstanceId>,
     pub reason: String,
     pub propagation_ack_required: bool,
-    pub target_daemon_url: Option<String>,
-    pub cancel_payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -440,6 +438,10 @@ pub struct KillSwitchReport {
     pub fail_closed: bool,
     pub propagation_acknowledged: bool,
     pub cancel_status: Option<u16>,
+    pub target_daemon_url: Option<String>,
+    pub target_instance_id: Option<InstanceId>,
+    pub target_derived_from_registry: bool,
+    pub cancel_payload_schema: Option<String>,
     pub trace_event_id: String,
     pub reason: String,
 }
@@ -1761,22 +1763,38 @@ async fn activate_kill_switch(
         EndpointScope::GovernanceControl,
         true,
     )?;
+    let target = resolve_kill_switch_target(&state, &request)?;
     let mut acknowledged = false;
     let mut cancel_status = None;
-    if let (Some(url), Some(run_id), Some(payload)) = (
-        &request.target_daemon_url,
-        &request.run_id,
-        &request.cancel_payload,
-    ) {
-        let response = post_json(url, &format!("/runs/{run_id}/cancel"), payload)
-            .map_err(|e| ManagerApiError::internal("kill_switch_http_error", e))?;
+    let mut cancel_payload_schema = None;
+    if let (Some(target), Some(run_id), Some(tenant_id)) =
+        (&target, &request.run_id, &request.tenant_id)
+    {
+        let credential = kill_switch_credential(
+            &request.security.credential,
+            &request.kill_switch_id,
+            &target.instance_id,
+            tenant_id,
+        );
+        let payload = serde_json::json!({
+            "credential": credential,
+            "audit_attribution": resident_audit(&credential),
+            "reason": request.reason,
+        });
+        cancel_payload_schema = Some("splendor.daemon.lifecycle_request.v1".to_string());
+        let response = post_json(
+            &target.daemon_url,
+            &format!("/runs/{run_id}/cancel"),
+            &payload,
+        )
+        .map_err(|e| ManagerApiError::internal("kill_switch_http_error", e))?;
         cancel_status = Some(response.status);
         acknowledged = (200..300).contains(&response.status);
     }
     let fail_closed = request.propagation_ack_required && !acknowledged;
     let trace_event_id = state.audit(
         "kill_switch.activated",
-        serde_json::json!({"kill_switch_id": request.kill_switch_id, "run_id": request.run_id, "node_id": request.node_id, "instance_id": request.instance_id, "acknowledged": acknowledged, "fail_closed": fail_closed, "reason": request.reason}),
+        serde_json::json!({"kill_switch_id": request.kill_switch_id, "run_id": request.run_id, "node_id": request.node_id, "instance_id": request.instance_id, "target_instance_id": target.as_ref().map(|target| target.instance_id.clone()), "target_derived_from_registry": target.is_some(), "acknowledged": acknowledged, "fail_closed": fail_closed, "reason": request.reason}),
     )?;
     let report = KillSwitchReport {
         kill_switch_id: request.kill_switch_id,
@@ -1789,6 +1807,10 @@ async fn activate_kill_switch(
         fail_closed,
         propagation_acknowledged: acknowledged,
         cancel_status,
+        target_daemon_url: target.as_ref().map(|target| target.daemon_url.clone()),
+        target_instance_id: target.as_ref().map(|target| target.instance_id.clone()),
+        target_derived_from_registry: target.is_some(),
+        cancel_payload_schema,
         trace_event_id,
         reason: request.reason,
     };
@@ -1799,6 +1821,69 @@ async fn activate_kill_switch(
         .map_err(|_| ManagerApiError::internal("kill_switch_lock", "kill switch lock unavailable"))?
         .insert(report.kill_switch_id.clone(), report.clone());
     Ok(Json(report))
+}
+
+#[derive(Clone, Debug)]
+struct KillSwitchTarget {
+    daemon_url: String,
+    instance_id: InstanceId,
+}
+
+fn resolve_kill_switch_target(
+    state: &ManagerState,
+    request: &KillSwitchRequest,
+) -> Result<Option<KillSwitchTarget>, ManagerApiError> {
+    let Some(run_id) = request.run_id.as_ref() else {
+        return Ok(None);
+    };
+    let telemetry_target = state
+        .inner
+        .telemetry
+        .lock()
+        .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
+        .snapshot(OffsetDateTime::now_utc())
+        .runs
+        .into_iter()
+        .find(|run| &run.run_id == run_id)
+        .map(|run| (run.node_id, run.instance_id));
+    let (node_id, instance_id) = match (&request.node_id, &request.instance_id, telemetry_target) {
+        (Some(node_id), Some(instance_id), _) => (node_id.clone(), instance_id.clone()),
+        (_, _, Some((node_id, instance_id))) => (node_id, instance_id),
+        _ => return Ok(None),
+    };
+    let instance = state
+        .inner
+        .registry
+        .instance(&instance_id)
+        .map_err(|e| ManagerApiError::not_found("instance_not_found", e.to_string()))?;
+    if instance.registration.node_id != node_id {
+        return Err(ManagerApiError::forbidden(
+            "kill_switch_target_mismatch",
+            "instance is not hosted by requested node",
+        ));
+    }
+    let node = state
+        .inner
+        .registry
+        .node(&node_id)
+        .map_err(|e| ManagerApiError::not_found("node_not_found", e.to_string()))?;
+    let daemon_url = node
+        .registration
+        .capability_document
+        .constraints
+        .get("resident_daemon_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "missing_resident_daemon_url",
+                "registered node does not advertise resident_daemon_url",
+            )
+        })?
+        .to_string();
+    Ok(Some(KillSwitchTarget {
+        daemon_url,
+        instance_id,
+    }))
 }
 
 async fn export_governance_audit(
@@ -2035,6 +2120,24 @@ fn resident_credential(
         EndpointScope::TracesRead,
         EndpointScope::ReplayCreate,
     ];
+    serde_json::to_value(credential).expect("credential serializes")
+}
+
+fn kill_switch_credential(
+    manager_credential: &CallerCredential,
+    kill_switch_id: &str,
+    instance_id: &InstanceId,
+    tenant_id: &TenantId,
+) -> serde_json::Value {
+    let mut credential = manager_credential.clone();
+    credential.credential_id = format!("kill-switch-{kill_switch_id}");
+    credential.audience = CredentialAudience::Instance {
+        instance_id: instance_id.clone(),
+    };
+    credential.binding = CredentialBinding::Tenant {
+        tenant_id: tenant_id.clone(),
+    };
+    credential.scopes = vec![EndpointScope::RunsStop];
     serde_json::to_value(credential).expect("credential serializes")
 }
 
@@ -2511,6 +2614,8 @@ mod tests {
                 EndpointScope::GovernanceControl,
                 EndpointScope::FleetRead,
                 EndpointScope::TracesRead,
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
             ],
         );
         let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
@@ -2696,8 +2801,6 @@ mod tests {
                 instance_id: None,
                 reason: "unit kill".to_string(),
                 propagation_ack_required: true,
-                target_daemon_url: None,
-                cancel_payload: None,
             }),
         )
         .await
@@ -2717,8 +2820,6 @@ mod tests {
                 instance_id: None,
                 reason: "unit nonblocking kill".to_string(),
                 propagation_ack_required: false,
-                target_daemon_url: None,
-                cancel_payload: None,
             }),
         )
         .await
@@ -2726,6 +2827,144 @@ mod tests {
         .0;
         assert_eq!(non_blocking_kill.status, "activated");
         assert!(!non_blocking_kill.fail_closed);
+
+        let target_node_id = "00000000-0000-4000-8000-000000000905";
+        let target_instance_id = "00000000-0000-4000-8000-000000000906";
+        let resident_url = spawn_resident_mock();
+        let registered_node = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node(
+                    &state.inner.fleet_id,
+                    target_node_id,
+                    &resident_url,
+                    "resident_cloud_pool",
+                    "cloud",
+                    vec!["runtime.resident"],
+                ),
+            }),
+        )
+        .await
+        .expect("kill target node registered")
+        .0;
+        let registered_instance = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(target_node_id, target_instance_id, &tenant_id),
+            }),
+        )
+        .await
+        .expect("kill target instance registered")
+        .0;
+        let propagated_kill = activate_kill_switch(
+            State(state.clone()),
+            Json(KillSwitchRequest {
+                security: security.clone(),
+                kill_switch_id: "kill_s5_unit_propagated".to_string(),
+                run_id: Some(run_id.clone()),
+                tenant_id: Some(tenant_id.clone()),
+                node_id: Some(registered_node.node_id.clone()),
+                instance_id: Some(registered_instance.instance_id.clone()),
+                reason: "unit propagated kill".to_string(),
+                propagation_ack_required: true,
+            }),
+        )
+        .await
+        .expect("registry-derived kill switch propagates")
+        .0;
+        assert_eq!(propagated_kill.status, "activated");
+        assert!(propagated_kill.propagation_acknowledged);
+        assert!(!propagated_kill.fail_closed);
+        assert_eq!(propagated_kill.cancel_status, Some(201));
+        assert_eq!(
+            propagated_kill.target_daemon_url.as_deref(),
+            Some(resident_url.as_str())
+        );
+        assert_eq!(
+            propagated_kill.target_instance_id,
+            Some(registered_instance.instance_id.clone())
+        );
+        assert!(propagated_kill.target_derived_from_registry);
+        assert_eq!(
+            propagated_kill.cancel_payload_schema.as_deref(),
+            Some("splendor.daemon.lifecycle_request.v1")
+        );
+
+        let target_mismatch = activate_kill_switch(
+            State(state.clone()),
+            Json(KillSwitchRequest {
+                security: security.clone(),
+                kill_switch_id: "kill_s5_unit_target_mismatch".to_string(),
+                run_id: Some(run_id.clone()),
+                tenant_id: Some(tenant_id.clone()),
+                node_id: Some(
+                    NodeId::parse("00000000-0000-4000-8000-000000000999").expect("mismatched node"),
+                ),
+                instance_id: Some(registered_instance.instance_id.clone()),
+                reason: "unit mismatched kill target".to_string(),
+                propagation_ack_required: true,
+            }),
+        )
+        .await
+        .expect_err("mismatched target is denied");
+        assert_eq!(target_mismatch.body.code, "kill_switch_target_mismatch");
+
+        let no_url_node: NodeRegistration = serde_json::from_value(serde_json::json!({
+            "node_id": "00000000-0000-4000-8000-000000000907",
+            "kind": "vpc.worker",
+            "scope": {"fleet_id": state.inner.fleet_id, "tenant_id": null},
+            "capability_document": {
+                "schema": "splendor.capabilities.v1",
+                "capabilities": ["runtime.resident"],
+                "constraints": {"placement_target": "resident_cloud_pool", "data_locality": "cloud"}
+            },
+            "runtime_version": "0.1-test",
+            "health": {"status": "healthy", "observed_at": now_rfc3339(), "metadata": {}},
+            "registered_at": now_rfc3339()
+        }))
+        .expect("no-url node");
+        let registered_no_url_node = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: no_url_node,
+            }),
+        )
+        .await
+        .expect("no-url node registered")
+        .0;
+        let registered_no_url_instance = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(
+                    &registered_no_url_node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000908",
+                    &tenant_id,
+                ),
+            }),
+        )
+        .await
+        .expect("no-url instance registered")
+        .0;
+        let missing_url = activate_kill_switch(
+            State(state.clone()),
+            Json(KillSwitchRequest {
+                security: security.clone(),
+                kill_switch_id: "kill_s5_unit_missing_url".to_string(),
+                run_id: Some(run_id.clone()),
+                tenant_id: Some(tenant_id.clone()),
+                node_id: Some(registered_no_url_node.node_id),
+                instance_id: Some(registered_no_url_instance.instance_id),
+                reason: "unit missing url target".to_string(),
+                propagation_ack_required: true,
+            }),
+        )
+        .await
+        .expect_err("missing resident daemon url rejected");
+        assert_eq!(missing_url.body.code, "missing_resident_daemon_url");
 
         let revoked_policy = revoke_policy_bundle(
             Path("policy_s5_unit".to_string()),
