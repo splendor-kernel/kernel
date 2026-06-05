@@ -180,9 +180,10 @@ Identity rules: `message_id` is distinct from trace, run, action, and state IDs.
 Messages are scoped by `run_id`, `source_agent_id`, and `target_agent_id`.
 
 Required fields: `message_id`, `source_agent_id`, `target_agent_id`, `run_id`,
-`schema`, `payload`, `requires_response`, `created_at`.
+`schema`, `payload`, `causal_parent`, `requires_response`, `created_at`.
 
-Optional fields: `causal_parent`.
+Optional fields: none in the canonical `Message` object. Message envelopes may
+carry lifecycle metadata such as delivery status and trace links.
 
 Extension rules: No stable `extensions` field is defined for `Message` in 0.1.
 Message payload schemas may define metadata fields, but messages do not grant

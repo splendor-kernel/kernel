@@ -159,7 +159,12 @@ test("0.1-S1 stable primitive docs and example manifest are aligned", () => {
     const entry = manifest.primitives.find((candidate) => candidate.name === primitive);
     assert.ok(entry, `${primitive} manifest entry must exist`);
     assert.deepEqual(entry.required_fields, STABLE_0_1_REQUIRED_FIELDS[primitive], `${primitive} required fields must match TS surface`);
-    assert.ok(entry.optional_fields.length > 0, `${primitive} must list optional fields`);
+    if (primitive === "Message") {
+      assert.deepEqual(entry.optional_fields, [], "Message has no optional fields once causal_parent is canonical");
+      assert.ok(entry.required_fields.includes("causal_parent"), "Message must require causal_parent for replay causality");
+    } else {
+      assert.ok(entry.optional_fields.length > 0, `${primitive} must list optional fields`);
+    }
     assert.ok(["none", "non_authorizing"].includes(entry.extensions), `${primitive} extension policy must be explicit`);
     validateStableExample(entry, STABLE_0_1_RESERVED_EXTENSION_KEYS, STABLE_0_1_ENUM_VALUES);
   }

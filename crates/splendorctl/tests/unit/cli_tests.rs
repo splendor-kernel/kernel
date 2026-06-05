@@ -5,10 +5,11 @@ use splendor_types::{
     CircuitBreakerId, CircuitBreakerState, ContentHash, EscalationContext, EscalationDecision,
     EscalationId, EscalationScope, EscalationTrigger, Feedback, GovernanceIssuer,
     GovernanceObjectRef, GovernanceScope, GovernanceState, GovernanceTraceLink,
-    GovernanceTransition, GovernanceTransitionRejection, InterventionId, KillSwitchId, MessageId,
-    MessageTraceContext, Percept, PerceptProvenance, Reward, RunId, SideEffectClass, SnapshotId,
-    StateHandoffTraceContext, StateReferenceMode, TenantId, TickId, TraceEvent, TraceEventId,
-    TraceEventKind, TraceId, TraceIdentityContext, VerificationResult,
+    GovernanceTransition, GovernanceTransitionRejection, InterventionId, KillSwitchId,
+    LocalDelegationTraceContext, MessageId, MessageTraceContext, Percept, PerceptProvenance,
+    Reward, RunId, SideEffectClass, SnapshotId, StateHandoffTraceContext, StateReferenceMode,
+    TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext,
+    VerificationResult,
 };
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
@@ -189,10 +190,182 @@ fn daemon_request_rejects_missing_or_null_mutating_authority_body() {
     }
 }
 
+fn spawn_local_daemon_response(
+    status: u16,
+    body: &'static str,
+) -> (String, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept daemon request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write daemon response");
+        String::from_utf8(request).expect("request utf8")
+    });
+    (format!("http://{}:{}/runs", addr.ip(), addr.port()), handle)
+}
+
+#[test]
+fn daemon_request_sends_authorized_local_request_with_sanitized_credential() {
+    let body = NamedTempFile::new().expect("body");
+    std::fs::write(
+        body.path(),
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":{"caller":"cli-test"}}"#,
+    )
+    .expect("write body");
+    let credential = NamedTempFile::new().expect("credential");
+    std::fs::write(credential.path(), "caller\ncredential\r\n").expect("write credential");
+    let (url, handle) = spawn_local_daemon_response(200, r#"{"ok":true}"#);
+
+    daemon_request(
+        "POST",
+        &url,
+        Some(body.path()),
+        Some(credential.path()),
+        "token",
+    )
+    .expect("authorized local request succeeds");
+
+    let request = handle.join().expect("daemon request captured");
+    assert!(request.starts_with("POST /runs HTTP/1.1"));
+    assert!(request.contains("Authorization: Bearer token"));
+    assert!(request.contains("X-Splendor-Caller-Credential: callercredential"));
+    assert!(request.contains("Content-Type: application/json"));
+    assert!(request.contains("audit_attribution"));
+}
+
+#[test]
+fn local_daemon_http_errors_and_malformed_responses_are_explicit() {
+    let (url, handle) = spawn_local_daemon_response(403, r#"{"error":"denied"}"#);
+    let parsed = parse_local_http_url(&url).expect("parse local url");
+    let err = send_local_http(
+        &parsed.host,
+        parsed.port,
+        "GET",
+        &parsed.path,
+        "token",
+        None,
+        None,
+    )
+    .expect_err("http errors are surfaced");
+    assert!(err.contains("HTTP 403"));
+    let _ = handle.join().expect("daemon request captured");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind malformed daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept malformed request");
+        stream.write_all(b"not-http").expect("write malformed");
+    });
+    let err = send_local_http(
+        &addr.ip().to_string(),
+        addr.port(),
+        "GET",
+        "/health",
+        "token",
+        None,
+        None,
+    )
+    .expect_err("malformed response rejected");
+    assert!(
+        err.contains("malformed HTTP response") || err.contains("Failed to read daemon response"),
+        "unexpected malformed response error: {err}"
+    );
+    handle.join().expect("malformed daemon joined");
+}
+
 #[test]
 fn daemon_url_refuses_non_local_hosts() {
     let err = parse_local_http_url("http://0.0.0.0:8077/health").expect_err("non-local refused");
     assert!(err.contains("refuses non-local"));
+}
+
+#[test]
+fn parse_args_rejects_daemon_and_work_order_error_paths() {
+    let daemon_missing = parse_args(vec!["daemon".to_string()]).expect_err("daemon usage");
+    assert!(daemon_missing.contains("splendorctl"));
+
+    let daemon_unknown = parse_args(vec!["daemon".to_string(), "unknown".to_string()])
+        .expect_err("unknown daemon subcommand");
+    assert!(daemon_unknown.contains("Unknown daemon subcommand"));
+
+    let daemon_help = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("daemon help");
+    assert!(daemon_help.contains("splendorctl"));
+
+    let blank_token = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/health".to_string(),
+        "--token".to_string(),
+        " ".to_string(),
+    ])
+    .expect_err("blank token rejected");
+    assert!(blank_token.contains("anonymous daemon fallback"));
+
+    let mutating_without_body = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/runs".to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+    ])
+    .expect_err("mutating request requires body");
+    assert!(mutating_without_body.contains("credential and audit attribution"));
+
+    let work_order_missing =
+        parse_args(vec!["work-order".to_string()]).expect_err("work order usage");
+    assert!(work_order_missing.contains("splendorctl"));
+
+    let work_order_unknown = parse_args(vec!["work-order".to_string(), "unknown".to_string()])
+        .expect_err("unknown work-order subcommand");
+    assert!(work_order_unknown.contains("Unknown work-order subcommand"));
+
+    let work_order_help = parse_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("work order help");
+    assert!(work_order_help.contains("splendorctl"));
 }
 
 fn fixed_approval_id(value: u128) -> ApprovalId {
@@ -1152,6 +1325,66 @@ fn replay_reconstructs_local_multi_agent_harness_deterministically() {
         + usize::from(lifecycles.contains(&"expired"))
         + isolation_denials.len();
     assert!(denial_failure_scenarios >= 3);
+}
+
+fn test_delegation_context(parent_run_id: RunId) -> LocalDelegationTraceContext {
+    LocalDelegationTraceContext {
+        parent_run_id: parent_run_id.clone(),
+        child_run_id: fixed_run_id(0x111),
+        parent_trace_id: Some(TraceId::from_run_sequence(&parent_run_id, 7)),
+        request_message_id: Some(fixed_message_id(0x112)),
+        response_message_id: Some(fixed_message_id(0x113)),
+        source_agent_id: fixed_agent_id(0x114),
+        target_agent_id: fixed_agent_id(0x115),
+        objective: "scoped specialist work".to_string(),
+    }
+}
+
+#[test]
+fn replay_parent_child_run_covers_local_delegation_lifecycle_variants() {
+    let run_id = fixed_run_id(0x110);
+    let delegation = test_delegation_context(run_id.clone());
+    let timestamp = OffsetDateTime::UNIX_EPOCH;
+    let failure = splendor_types::TaskFailure {
+        code: "child_failed".to_string(),
+        reason: "specialist denied scoped work".to_string(),
+        retryable: false,
+        trace_id: Some(TraceId::from_run_sequence(&run_id, 12)),
+    };
+
+    let variants = vec![
+        TraceEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunStarted {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunCompleted {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunFailed {
+            delegation: delegation.clone(),
+            failure,
+        },
+        TraceEventKind::DelegationRejected {
+            delegation: delegation.clone(),
+            reason: "target_agent_tenant_mismatch".to_string(),
+        },
+    ];
+
+    for (sequence, kind) in variants.into_iter().enumerate() {
+        let event = TraceEvent::new(run_id.clone(), sequence as u64, timestamp, kind);
+        let replay = replay_parent_child_run(&event)
+            .expect("delegation replay parses")
+            .expect("delegation replay event");
+        assert_eq!(replay.parent_run_id, run_id);
+        assert_eq!(replay.child_run_id, delegation.child_run_id);
+        assert_eq!(replay.parent_agent_id, delegation.source_agent_id);
+        assert_eq!(replay.child_agent_id, delegation.target_agent_id);
+        assert_eq!(replay.causal_parent, delegation.parent_trace_id);
+        assert_eq!(replay.source_message_id, delegation.request_message_id);
+        assert!(!replay.side_effects_replayed);
+    }
 }
 
 #[test]
@@ -5152,6 +5385,85 @@ fn run_with_args_trace_export_succeeds() {
         "run-1".to_string(),
     ])
     .expect("run with args");
+}
+
+#[test]
+fn run_with_args_daemon_request_succeeds() {
+    let body = NamedTempFile::new().expect("body");
+    std::fs::write(
+        body.path(),
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":{"caller":"cli-test"}}"#,
+    )
+    .expect("write body");
+    let (url, handle) = spawn_local_daemon_response(200, r#"{"accepted":true}"#);
+
+    run_with_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        url,
+        "--body".to_string(),
+        body.path().display().to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+    ])
+    .expect("daemon request");
+
+    let request = handle.join().expect("daemon request captured");
+    assert!(request.starts_with("POST /runs HTTP/1.1"));
+    assert!(request.contains("Authorization: Bearer token"));
+}
+
+#[test]
+fn run_with_args_work_order_sign_succeeds() {
+    let input = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .expect("work order file");
+    let order = WorkOrder {
+        schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_cli_run_with_args").expect("work order id"),
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: Some(RunId::new()),
+        objective: "sign via command dispatch".to_string(),
+        allowed_actions: vec!["write_file".to_string()],
+        allowed_adapters: vec!["filesystem".to_string()],
+        allowed_permissions: vec!["fs.write".to_string()],
+        data_refs: vec!["dataset:fixture".to_string()],
+        quotas: splendor_types::WorkOrderQuotaPolicy {
+            max_actions_per_tick: Some(1),
+            ..splendor_types::WorkOrderQuotaPolicy::default()
+        },
+        placement: splendor_types::WorkOrderPlacement {
+            target: "local_resident".to_string(),
+            data_locality: Some("local".to_string()),
+            requires_gpu: Some(false),
+            ..splendor_types::WorkOrderPlacement::default()
+        },
+        issued_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(10),
+        revocation: splendor_types::RevocationStatus::Active,
+    };
+    std::fs::write(
+        input.path(),
+        serde_json::to_string(&order).expect("order json"),
+    )
+    .expect("write work order");
+
+    run_with_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--input".to_string(),
+        input.path().display().to_string(),
+        "--key-id".to_string(),
+        "local-key".to_string(),
+        "--secret".to_string(),
+        "local-secret".to_string(),
+    ])
+    .expect("work order sign");
 }
 
 #[test]
