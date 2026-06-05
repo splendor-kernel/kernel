@@ -343,6 +343,10 @@ impl LocalDelegationManager {
             return Err(LocalDelegationError::SourceAgentMismatch);
         }
         if parent_run.tenant_id != target_agent.agent.tenant_id {
+            parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                delegation: trace_context,
+                reason: "target_agent_tenant_mismatch".to_string(),
+            })?;
             return Err(LocalDelegationError::TenantMismatch);
         }
         if !request

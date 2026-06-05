@@ -2525,6 +2525,42 @@ fn replay_message_event(event: &TraceEvent) -> Result<Option<ReplayMessageEvent>
 }
 
 fn replay_parent_child_run(event: &TraceEvent) -> Result<Option<ReplayParentChildRun>, String> {
+    match &event.kind {
+        TraceEventKind::DelegationRequested { delegation }
+        | TraceEventKind::ChildRunCompleted { delegation }
+        | TraceEventKind::ChildRunFailed { delegation, .. }
+        | TraceEventKind::DelegationRejected { delegation, .. } => {
+            if delegation.parent_run_id != event.run_id {
+                return Err(format!(
+                    "Local delegation parent run mismatch at sequence {}: event run '{}' but parent run '{}'",
+                    event.sequence, event.run_id, delegation.parent_run_id
+                ));
+            }
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        TraceEventKind::ChildRunStarted { delegation } => {
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        _ => {}
+    }
     if let TraceEventKind::ChildRunLinked {
         parent_run_id,
         child_run_id,
