@@ -9,6 +9,7 @@ services:
     build:
       context: ../../..
       dockerfile: Dockerfile
+      target: acceptance-runner
     working_dir: /workspace
     user: root
     environment:

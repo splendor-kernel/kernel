@@ -7,12 +7,14 @@ use splendor_kernel::{
     LocalDelegationManager, LocalDelegationRequest, MessageRouter, QuotaPolicy, SnapshotPolicy,
     StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceStoreSink,
 };
-use splendor_store::{SqliteStateStore, SqliteTraceStore, StateData, StateMetadata};
+use splendor_store::{
+    SqliteStateStore, SqliteTraceStore, StateData, StateMetadata, StateStore, TraceStore,
+};
 use splendor_types::{
     Action, ActionId, AgentId, DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope,
     MessageId, MessageSchemaVersion, MessageTraceLinks, QuotaUsage, RunId, SideEffectClass,
-    TenantId, TickId, TraceEventId, TraceEventKind, TraceIdentityContext, TASK_REQUEST_SCHEMA,
-    TASK_RESPONSE_SCHEMA,
+    TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
+    TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
 };
 use std::env;
 use std::fs;
@@ -74,6 +76,16 @@ struct Evidence {
 }
 
 #[derive(Serialize)]
+struct SchemaParityEvidence {
+    schema_version: String,
+    task_request_schema: String,
+    task_response_schema: String,
+    task_request_message: Message,
+    task_response_message: Message,
+    python_sdk_callback_expectations: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct PositiveEvidence {
     request_message_id: String,
     response_message_id: String,
@@ -107,6 +119,29 @@ struct StateEvidence {
     state_node_id: String,
     state_hash: String,
     trace_event_id: String,
+    metadata_trace_event_id: String,
+}
+
+struct ActionRequestInput<'a> {
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    run_id: RunId,
+    name: &'a str,
+    adapter: &'a str,
+    side_effect_class: SideEffectClass,
+    permissions: &'a [&'a str],
+    quota_usage: QuotaUsage,
+}
+
+struct RouterNegativeInput<'a> {
+    case: &'a str,
+    runtime: &'a KernelRuntime,
+    router: &'a splendor_kernel::LocalMessageRouter,
+    trace_store: &'a SqliteTraceStore,
+    source: &'a AgentId,
+    target: &'a AgentId,
+    run_id: &'a RunId,
+    schema: &'a str,
 }
 
 #[derive(Serialize)]
@@ -243,16 +278,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&child_adapter),
         Arc::clone(&orchestrator_adapter),
     );
-    let child_read = action_request(
-        tenant_id.clone(),
-        specialist_id.clone(),
-        child_run_id.clone(),
-        "data.read_fixture",
-        "fixture_data",
-        SideEffectClass::ReadOnly,
-        &["document.read"],
-        QuotaUsage::single_action(),
-    );
+    let child_read = action_request(ActionRequestInput {
+        tenant_id: tenant_id.clone(),
+        agent_id: specialist_id.clone(),
+        run_id: child_run_id.clone(),
+        name: "data.read_fixture",
+        adapter: "fixture_data",
+        side_effect_class: SideEffectClass::ReadOnly,
+        permissions: &["document.read"],
+        quota_usage: QuotaUsage::single_action(),
+    });
     let child_read_outcome = gateway.submit(child_read.clone())?;
     record_action(&child_runtime, &child_read, &child_read_outcome)?;
 
@@ -283,16 +318,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &task_response.response_message.message.message_id,
     )?;
     let before_orchestrator = orchestrator_adapter.executions();
-    let internal_artifact = action_request(
-        tenant_id.clone(),
-        orchestrator_id.clone(),
-        parent_run_id.clone(),
-        "artifact.create_internal",
-        "artifact",
-        SideEffectClass::Filesystem,
-        &["artifact.create_internal"],
-        QuotaUsage::single_action(),
-    );
+    let internal_artifact = action_request(ActionRequestInput {
+        tenant_id: tenant_id.clone(),
+        agent_id: orchestrator_id.clone(),
+        run_id: parent_run_id.clone(),
+        name: "artifact.create_internal",
+        adapter: "artifact",
+        side_effect_class: SideEffectClass::Filesystem,
+        permissions: &["artifact.create_internal"],
+        quota_usage: QuotaUsage::single_action(),
+    });
     let internal_outcome = gateway.submit(internal_artifact.clone())?;
     record_action(&parent_runtime, &internal_artifact, &internal_outcome)?;
     let after_orchestrator = orchestrator_adapter.executions();
@@ -307,16 +342,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut negatives = Vec::new();
-    let publish = action_request(
-        tenant_id.clone(),
-        specialist_id.clone(),
-        child_run_id.clone(),
-        "artifact.publish_external",
-        "artifact",
-        SideEffectClass::External,
-        &["artifact.publish_external"],
-        QuotaUsage::single_action(),
-    );
+    let publish = action_request(ActionRequestInput {
+        tenant_id: tenant_id.clone(),
+        agent_id: specialist_id.clone(),
+        run_id: child_run_id.clone(),
+        name: "artifact.publish_external",
+        adapter: "artifact",
+        side_effect_class: SideEffectClass::External,
+        permissions: &["artifact.publish_external"],
+        quota_usage: QuotaUsage::single_action(),
+    });
     let before = orchestrator_adapter.executions();
     let publish_outcome = gateway.submit(publish.clone())?;
     let mut publish_result = publish_outcome.verification.clone();
@@ -351,18 +386,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         artifacts: publish_result.artifacts,
     });
 
-    negatives.push(router_negative(
-        "unauthorized_recipient_message_denied",
-        &parent_runtime,
-        manager.router(),
-        &specialist_id,
-        &reviewer_id,
-        &parent_run_id,
-        TASK_RESPONSE_SCHEMA,
-    )?);
+    negatives.push(router_negative(RouterNegativeInput {
+        case: "unauthorized_recipient_message_denied",
+        runtime: &parent_runtime,
+        router: manager.router(),
+        trace_store: trace_store.as_ref(),
+        source: &specialist_id,
+        target: &reviewer_id,
+        run_id: &parent_run_id,
+        schema: TASK_RESPONSE_SCHEMA,
+    })?);
     negatives.push(invalid_schema_negative(
         &parent_runtime,
         manager.router(),
+        trace_store.as_ref(),
         &specialist_id,
         &orchestrator_id,
         &parent_run_id,
@@ -381,20 +418,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(causal_parent.trace_event_id.clone()),
     );
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
+    let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
     let before_events = manager
         .router()
         .outbox(&orchestrator_id, &parent_run_id)?
         .len();
     let overbroad_result = manager.create_child_run(&parent_runtime, &overbroad_runtime, overbroad);
+    let overbroad_error = overbroad_result.expect_err("overbroad delegation denied");
+    let overbroad_trace_id = find_delegation_rejection_trace_id(
+        trace_store.as_ref(),
+        &parent_run_id,
+        &overbroad_child_run_id,
+        "delegated_authority_exceeds_target_scope",
+    )?;
     negatives.push(NegativeEvidence {
         case: "broad_permission_data_ref_smuggling_denied".to_string(),
-        status: format!(
-            "{:?}",
-            overbroad_result.err().expect("overbroad delegation denied")
-        ),
+        status: format!("{overbroad_error:?}"),
         reason_codes: vec!["delegated_authority_exceeds_target_scope".to_string()],
-        trace_event_ids: vec![TraceEventId::from_run_sequence(&parent_run_id, 14).to_string()],
+        trace_event_ids: vec![overbroad_trace_id.to_string()],
         message_id: None,
         adapter_executions_before: before_events,
         adapter_executions_after: manager
@@ -413,13 +455,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(causal_parent.trace_event_id),
     );
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
-    let cross_runtime = runtime(cross_tenant.child_run_id.clone(), trace_store);
+    let cross_child_run_id = cross_tenant.child_run_id.clone();
+    let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
     let cross_result = manager.create_child_run(&parent_runtime, &cross_runtime, cross_tenant);
+    let cross_error = cross_result.expect_err("cross tenant denied");
+    let cross_trace_id = find_delegation_rejection_trace_id(
+        trace_store.as_ref(),
+        &parent_run_id,
+        &cross_child_run_id,
+        "target_agent_tenant_mismatch",
+    )?;
     negatives.push(NegativeEvidence {
         case: "cross_tenant_message_attempt_rejected".to_string(),
-        status: format!("{:?}", cross_result.err().expect("cross tenant denied")),
+        status: format!("{cross_error:?}"),
         reason_codes: vec!["target_agent_tenant_mismatch".to_string()],
-        trace_event_ids: vec![TraceEventId::from_run_sequence(&parent_run_id, 15).to_string()],
+        trace_event_ids: vec![cross_trace_id.to_string()],
         message_id: None,
         adapter_executions_before: 0,
         adapter_executions_after: 0,
@@ -427,16 +477,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let before_child_quota = child_adapter.executions();
-    let quota_action = action_request(
-        tenant_id.clone(),
-        specialist_id.clone(),
-        child_run_id.clone(),
-        "data.read_fixture",
-        "fixture_data",
-        SideEffectClass::ReadOnly,
-        &["document.read"],
-        QuotaUsage::single_action(),
-    );
+    let quota_action = action_request(ActionRequestInput {
+        tenant_id: tenant_id.clone(),
+        agent_id: specialist_id.clone(),
+        run_id: child_run_id.clone(),
+        name: "data.read_fixture",
+        adapter: "fixture_data",
+        side_effect_class: SideEffectClass::ReadOnly,
+        permissions: &["document.read"],
+        quota_usage: QuotaUsage::single_action(),
+    });
     let quota_outcome = gateway.submit(quota_action.clone())?;
     let quota_trace = parent_runtime.record_event_with_identity(
         TraceIdentityContext::new(parent_run_id.clone())
@@ -506,6 +556,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         trace_db: trace_db.display().to_string(),
         state_db: state_db.display().to_string(),
     };
+    let parity = SchemaParityEvidence {
+        schema_version: "splendor.e2e.s3.schema-parity.rust.v1".to_string(),
+        task_request_schema: TASK_REQUEST_SCHEMA.to_string(),
+        task_response_schema: TASK_RESPONSE_SCHEMA.to_string(),
+        task_request_message: child_run.request_message.message.clone(),
+        task_response_message: task_response.response_message.message.clone(),
+        python_sdk_callback_expectations: vec![
+            "policy callbacks propose messages but do not execute side effects".to_string(),
+            "adapter callbacks remain behind daemon/gateway boundaries".to_string(),
+            "trace subscribers observe message causality without mutating runtime state"
+                .to_string(),
+        ],
+    };
+    fs::write(
+        artifact_dir.join("schema-parity-rust.json"),
+        serde_json::to_vec_pretty(&parity)?,
+    )?;
     let path = artifact_dir.join("runtime-evidence.json");
     fs::write(path, serde_json::to_vec_pretty(&evidence)?)?;
     Ok(())
@@ -586,32 +653,27 @@ fn gateway(
     gateway
 }
 
-fn action_request(
-    tenant_id: TenantId,
-    agent_id: AgentId,
-    run_id: RunId,
-    name: &str,
-    adapter: &str,
-    side_effect_class: SideEffectClass,
-    permissions: &[&str],
-    quota_usage: QuotaUsage,
-) -> ActionRequest {
+fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
     ActionRequest {
         action_id: ActionId::new(),
-        tenant_id,
-        agent_id,
-        run_id,
+        tenant_id: input.tenant_id,
+        agent_id: input.agent_id,
+        run_id: input.run_id,
         action: Action {
-            name: name.to_string(),
-            params: serde_json::json!({"ref": format!("fixture:{name}")}),
-            side_effect_class,
+            name: input.name.to_string(),
+            params: serde_json::json!({"ref": format!("fixture:{}", input.name)}),
+            side_effect_class: input.side_effect_class,
             cost_estimate: None,
-            required_permissions: permissions.iter().map(|value| value.to_string()).collect(),
+            required_permissions: input
+                .permissions
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
             preconditions: Vec::new(),
             postconditions: Vec::new(),
         },
-        adapter: Some(adapter.to_string()),
-        quota_usage,
+        adapter: Some(input.adapter.to_string()),
+        quota_usage: input.quota_usage,
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
@@ -684,6 +746,7 @@ fn commit_state(
     bytes: Vec<u8>,
     label: &str,
 ) -> Result<StateEvidence, Box<dyn std::error::Error>> {
+    let store_lookup = Arc::clone(&store);
     let mut graph = StateGraph::new(
         store,
         SnapshotPolicy {
@@ -705,6 +768,16 @@ fn commit_state(
             trace_event_id: None,
         },
     )?;
+    let state_hash = splendor_types::ContentHash::blake3(&bytes);
+    let event = runtime.record_event_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tenant_agent(tenant_id.clone(), agent_id.clone())
+            .with_tick_id(TickId::from(1)),
+        TraceEventKind::StateCommitted {
+            state_hash,
+            snapshot_id: None,
+        },
+    )?;
     let commit = graph.commit(
         StateData {
             bytes,
@@ -716,63 +789,62 @@ fn commit_state(
             tenant_id: Some(tenant_id.clone()),
             agent_id: Some(agent_id.clone()),
             run_id: Some(run_id.clone()),
-            trace_event_id: None,
+            trace_event_id: Some(event.trace_event_id.clone()),
         },
     )?;
-    let event = runtime.record_event_with_identity(
-        TraceIdentityContext::new(run_id.clone())
-            .with_tenant_agent(tenant_id, agent_id.clone())
-            .with_tick_id(TickId::from(1))
-            .with_state_node_id(commit.node_id.clone()),
-        TraceEventKind::StateCommitted {
-            state_hash: commit.node_id.hash().clone(),
-            snapshot_id: commit.snapshot_id.clone(),
-        },
-    )?;
+    let node = store_lookup.get_node(&commit.node_id)?;
+    let metadata_trace_event_id = node
+        .metadata
+        .trace_event_id
+        .clone()
+        .ok_or("state metadata missing trace_event_id")?;
     Ok(StateEvidence {
         run_id: run_id.to_string(),
         agent_id: agent_id.to_string(),
         state_node_id: commit.node_id.to_string(),
         state_hash: commit.node_id.hash().to_string(),
         trace_event_id: event.trace_event_id.to_string(),
+        metadata_trace_event_id: metadata_trace_event_id.to_string(),
     })
 }
 
 fn router_negative(
-    case: &str,
-    runtime: &KernelRuntime,
-    router: &splendor_kernel::LocalMessageRouter,
-    source: &AgentId,
-    target: &AgentId,
-    run_id: &RunId,
-    schema: &str,
+    input: RouterNegativeInput<'_>,
 ) -> Result<NegativeEvidence, Box<dyn std::error::Error>> {
     let message = Message::new(
         MessageId::new(),
-        source.clone(),
-        target.clone(),
-        run_id.clone(),
-        schema,
+        input.source.clone(),
+        input.target.clone(),
+        input.run_id.clone(),
+        input.schema,
         serde_json::to_value(splendor_types::TaskResponse::new(
-            run_id.clone(),
+            input.run_id.clone(),
             RunId::parse(CHILD_RUN_ID)?,
             splendor_types::TaskResponseStatus::Completed,
             Some(serde_json::json!({"summary": "not delivered"})),
             None,
         )?)?,
-        Some(TraceEventId::from_run_sequence(run_id, 0)),
+        Some(TraceEventId::from_run_sequence(input.run_id, 0)),
         false,
         OffsetDateTime::now_utc(),
     )?;
-    let id = message.message_id.to_string();
-    let err = router
-        .send(runtime, MessageEnvelope::new(message)?)
+    let message_id = message.message_id.clone();
+    let id = message_id.to_string();
+    let err = input
+        .router
+        .send(input.runtime, MessageEnvelope::new(message)?)
         .expect_err("message denied");
+    let trace_id = find_message_rejection_trace_id(
+        input.trace_store,
+        input.run_id,
+        &message_id,
+        "message_recipient_not_allowed",
+    )?;
     Ok(NegativeEvidence {
-        case: case.to_string(),
+        case: input.case.to_string(),
         status: format!("{err}"),
         reason_codes: vec!["message_recipient_not_allowed".to_string()],
-        trace_event_ids: vec![TraceEventId::from_run_sequence(run_id, 11).to_string()],
+        trace_event_ids: vec![trace_id.to_string()],
         message_id: Some(id),
         adapter_executions_before: 0,
         adapter_executions_after: 0,
@@ -783,6 +855,7 @@ fn router_negative(
 fn invalid_schema_negative(
     runtime: &KernelRuntime,
     router: &splendor_kernel::LocalMessageRouter,
+    trace_store: &SqliteTraceStore,
     source: &AgentId,
     target: &AgentId,
     run_id: &RunId,
@@ -807,16 +880,67 @@ fn invalid_schema_negative(
     let err = router
         .send(runtime, envelope)
         .expect_err("invalid schema denied");
+    let trace_id =
+        find_message_rejection_trace_id(trace_store, run_id, &message_id, "unsupported")?;
     Ok(NegativeEvidence {
         case: "unsupported_message_schema_rejected_before_delivery".to_string(),
         status: format!("{err}"),
         reason_codes: vec!["unsupported_schema_version".to_string()],
-        trace_event_ids: vec![TraceEventId::from_run_sequence(run_id, 12).to_string()],
+        trace_event_ids: vec![trace_id.to_string()],
         message_id: Some(message_id.to_string()),
         adapter_executions_before: 0,
         adapter_executions_after: 0,
         artifacts: serde_json::json!({"delivery_status": "rejected"}),
     })
+}
+
+fn trace_events(
+    trace_store: &SqliteTraceStore,
+    run_id: &RunId,
+) -> Result<Vec<TraceEvent>, Box<dyn std::error::Error>> {
+    trace_store
+        .read(&run_id.to_string())?
+        .into_iter()
+        .map(|record| serde_json::from_value(record.payload).map_err(Into::into))
+        .collect()
+}
+
+fn find_message_rejection_trace_id(
+    trace_store: &SqliteTraceStore,
+    run_id: &RunId,
+    message_id: &MessageId,
+    expected_reason: &str,
+) -> Result<TraceEventId, Box<dyn std::error::Error>> {
+    for event in trace_events(trace_store, run_id)? {
+        if let TraceEventKind::MessageRejected { message, reason } = &event.kind {
+            if &message.message_id == message_id && reason.contains(expected_reason) {
+                return Ok(event.trace_event_id);
+            }
+        }
+    }
+    Err(
+        format!("missing MessageRejected trace for message {message_id} reason {expected_reason}")
+            .into(),
+    )
+}
+
+fn find_delegation_rejection_trace_id(
+    trace_store: &SqliteTraceStore,
+    run_id: &RunId,
+    child_run_id: &RunId,
+    expected_reason: &str,
+) -> Result<TraceEventId, Box<dyn std::error::Error>> {
+    for event in trace_events(trace_store, run_id)? {
+        if let TraceEventKind::DelegationRejected { delegation, reason } = &event.kind {
+            if &delegation.child_run_id == child_run_id && reason == expected_reason {
+                return Ok(event.trace_event_id);
+            }
+        }
+    }
+    Err(format!(
+        "missing DelegationRejected trace for child run {child_run_id} reason {expected_reason}"
+    )
+    .into())
 }
 
 fn merge_artifacts(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {

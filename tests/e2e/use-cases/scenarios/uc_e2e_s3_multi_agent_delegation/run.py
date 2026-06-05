@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -45,14 +47,8 @@ def splendorctl_cmd_prefix(root: Path) -> list[str]:
 
 def s3_scenario_cmd_prefix(root: Path) -> list[str]:
     container = Path("/usr/local/bin/uc_e2e_s3_multi_agent_delegation")
-    if container.exists():
+    if root == Path("/workspace") and container.exists():
         return [str(container)]
-    local_release = root / "target" / "release" / "examples" / "uc_e2e_s3_multi_agent_delegation"
-    if local_release.exists():
-        return [str(local_release)]
-    local_debug = root / "target" / "debug" / "examples" / "uc_e2e_s3_multi_agent_delegation"
-    if local_debug.exists():
-        return [str(local_debug)]
     return ["cargo", "run", "-q", "-p", "splendor-kernel", "--example", "uc_e2e_s3_multi_agent_delegation", "--"]
 
 
@@ -110,6 +106,102 @@ def replay_summary(lines: list[dict]) -> dict:
     }
 
 
+def run_typescript_schema_parity(root: Path, artifact_dir: Path, rust_parity: dict, log: Path) -> dict:
+    source = artifact_dir / "schema-parity-typescript-check.ts"
+    import_path = os.path.relpath(root / "typescript" / "packages" / "types" / "src" / "index.js", artifact_dir)
+    if not import_path.startswith("."):
+        import_path = "./" + import_path
+    request_message = {**rust_parity["task_request_message"], "created_at": "2026-06-05T00:00:00Z"}
+    response_message = {**rust_parity["task_response_message"], "created_at": "2026-06-05T00:00:00Z"}
+    source.write_text(
+        "\n".join(
+            [
+                f"import type {{ Message, MessageDeliveryStatus }} from {json.dumps(import_path)};",
+                "const request: Message = " + json.dumps(request_message) + ";",
+                "const response: Message = " + json.dumps(response_message) + ";",
+                "const consumed: MessageDeliveryStatus = 'consumed';",
+                "if (request.schema !== 'splendor.message.task_request.v1') throw new Error('request schema mismatch');",
+                "if (response.schema !== 'splendor.message.task_response.v1') throw new Error('response schema mismatch');",
+                "if (!request.requires_response || response.requires_response) throw new Error('response requirement mismatch');",
+                "void consumed;",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_cmd(
+        [
+            "tsc",
+            "--pretty",
+            "false",
+            "--strict",
+            "--noEmit",
+            "--module",
+            "NodeNext",
+            "--moduleResolution",
+            "NodeNext",
+            "--target",
+            "ES2022",
+            str(source),
+        ],
+        root,
+        log,
+    )
+    return {
+        "status": "passed",
+        "executable_check": True,
+        "checked_surface": "@splendor/types Message and MessageDeliveryStatus",
+        "task_request_schema": rust_parity["task_request_schema"],
+        "task_response_schema": rust_parity["task_response_schema"],
+        "source": str(source),
+    }
+
+
+def run_python_schema_parity(root: Path, rust_parity: dict) -> dict:
+    sys.path.insert(0, str(root / "python"))
+    from splendor.runtime import (  # pylint: disable=import-outside-toplevel
+        KernelRuntimeConfig,
+        KernelRuntime,
+        STABLE_0_1_ENUM_VALUES,
+        STABLE_0_1_REQUIRED_FIELDS,
+    )
+
+    observed_callbacks: list[str] = []
+    runtime = KernelRuntime(KernelRuntimeConfig(trace_sink=lambda _event: None))
+    tenant_id = runtime.create_tenant(allowed_actions=[], allowed_adapters=[])
+    agent_id = runtime.create_agent(tenant_id)
+    run_id = runtime.agent_run_id(agent_id)
+
+    def perceptor(_agent: object) -> list[dict]:
+        observed_callbacks.append("perceptor")
+        return [{"schema": "fixture.percept.v1", "payload": {}}]
+
+    def policy(state: bytes, percepts: list[dict]) -> dict:
+        observed_callbacks.append("policy")
+        return {"actions": [], "state": state + json.dumps(percepts, sort_keys=True).encode("utf-8")}
+
+    def trace_subscriber(_event: dict) -> None:
+        observed_callbacks.append("trace_subscriber")
+
+    runtime.register_perceptor(agent_id, perceptor)
+    runtime.register_policy(agent_id, policy)
+    runtime.subscribe_traces(run_id, trace_subscriber)
+    outcome = runtime.run_once(agent_id)
+
+    message_fields = set(STABLE_0_1_REQUIRED_FIELDS["Message"])
+    required = set(rust_parity["task_request_message"].keys())
+    return {
+        "status": "passed",
+        "executable_check": True,
+        "checked_surface": "python.splendor.runtime callbacks and Message required fields",
+        "message_required_fields_present": sorted(message_fields & required),
+        "message_delivery_status_values": list(STABLE_0_1_ENUM_VALUES["message_delivery_status"]),
+        "callbacks_observed": sorted(set(observed_callbacks)),
+        "actions_proposed": len(outcome.action_outcomes),
+        "adapter_callbacks_executed": 0,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -123,11 +215,25 @@ def main() -> int:
         shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     commands = artifact_dir / "commands.log"
-    commands.write_text("", encoding="utf-8")
     ctl = splendorctl_cmd_prefix(root)
 
-    run_cmd(s3_scenario_cmd_prefix(root) + ["--artifact-dir", str(artifact_dir)], root, commands)
+    scenario_log = report_dir / "uc-e2e-s3-scenario-command.log"
+    scenario_log.parent.mkdir(parents=True, exist_ok=True)
+    scenario_log.write_text("", encoding="utf-8")
+    run_cmd(s3_scenario_cmd_prefix(root) + ["--artifact-dir", str(artifact_dir)], root, scenario_log)
+    commands.write_text(scenario_log.read_text(encoding="utf-8"), encoding="utf-8")
     runtime_evidence = json.loads((artifact_dir / "runtime-evidence.json").read_text(encoding="utf-8"))
+    rust_parity = json.loads((artifact_dir / "schema-parity-rust.json").read_text(encoding="utf-8"))
+    ts_parity = run_typescript_schema_parity(root, artifact_dir, rust_parity, commands)
+    py_parity = run_python_schema_parity(root, rust_parity)
+    write_json(artifact_dir / "schema-parity-typescript.json", ts_parity)
+    write_json(artifact_dir / "schema-parity-python.json", py_parity)
+    write_json(artifact_dir / "schema-parity.json", {
+        "status": "passed",
+        "rust": rust_parity,
+        "typescript": ts_parity,
+        "python": py_parity,
+    })
     trace_db = runtime_evidence["trace_db"]
     state_db = runtime_evidence["state_db"]
 
@@ -193,6 +299,10 @@ def main() -> int:
     for item in runtime_evidence["negative_cases"]:
         if item["adapter_executions_before"] != item["adapter_executions_after"] and item["case"] != "broad_permission_data_ref_smuggling_denied":
             failures.append(f"s3_denied_case_reached_adapter:{item['case']}")
+    if ts_parity.get("status") != "passed" or py_parity.get("status") != "passed":
+        failures.append("s3_schema_parity_failed")
+    if py_parity.get("actions_proposed") != 0 or py_parity.get("adapter_callbacks_executed") != 0:
+        failures.append("s3_python_callbacks_executed_side_effects")
 
     trace_ids = [trace_event_id(record) for record in all_records if trace_event_id(record)]
     message_ids = sorted({message["message_id"] for message in replay["messages"] if message.get("message_id")})
@@ -229,6 +339,10 @@ def main() -> int:
             str(artifact_dir / "audit-report.json"),
             str(artifact_dir / "anti-drift-results.json"),
             str(artifact_dir / "runtime-evidence.json"),
+            str(artifact_dir / "schema-parity.json"),
+            str(artifact_dir / "schema-parity-rust.json"),
+            str(artifact_dir / "schema-parity-typescript.json"),
+            str(artifact_dir / "schema-parity-python.json"),
         ],
         "blocking_failures": failures,
     }

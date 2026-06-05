@@ -93,6 +93,39 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        raise SystemExit(f"required evidence artifact missing: {path}")
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def trace_record_id(record: dict) -> str:
+    return str(record.get("payload", {}).get("trace_event_id", ""))
+
+
+def trace_record_kind(record: dict) -> str:
+    kind = record.get("payload", {}).get("kind")
+    key = kind if isinstance(kind, str) else next(iter(kind.keys())) if isinstance(kind, dict) and kind else "unknown"
+    return {
+        "LoopTickStarted": "tick.started",
+        "LoopTickCompleted": "tick.completed",
+        "PolicyCompleted": "policy.completed",
+        "MessageQueued": "message.queued",
+        "MessageDelivered": "message.delivered",
+        "MessageConsumed": "message.consumed",
+        "MessageRejected": "message.rejected",
+        "DelegationRequested": "delegation.requested",
+        "DelegationRejected": "delegation.rejected",
+        "ChildRunStarted": "child_run.started",
+        "ChildRunCompleted": "child_run.completed",
+        "ActionVerificationCompleted": "verification.completed",
+        "ActionExecuted": "action.executed",
+        "ActionDenied": "action.denied",
+        "OutcomeRecorded": "outcome.recorded",
+        "StateCommitted": "state.committed",
+    }.get(key, key)
+
+
 def digest_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -544,6 +577,10 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "audit-report.json",
         "anti-drift-results.json",
         "runtime-evidence.json",
+        "schema-parity.json",
+        "schema-parity-rust.json",
+        "schema-parity-typescript.json",
+        "schema-parity-python.json",
         "stdout.log",
         "stderr.log",
     ]
@@ -577,6 +614,42 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"s3_denial_reached_adapter:{case}")
         if not item.get("reason_codes"):
             failures.append(f"s3_negative_missing_reason_codes:{case}")
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
+    expected_negative_kinds = {
+        "specialist_external_artifact_publish_denied": "action.denied",
+        "unauthorized_recipient_message_denied": "message.rejected",
+        "unsupported_message_schema_rejected_before_delivery": "message.rejected",
+        "broad_permission_data_ref_smuggling_denied": "delegation.rejected",
+        "cross_tenant_message_attempt_rejected": "delegation.rejected",
+        "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger": "action.denied",
+    }
+    expected_reason_text = {
+        "unsupported_message_schema_rejected_before_delivery": ["unsupported"],
+    }
+    for case, item in negatives.items():
+        expected_kind = expected_negative_kinds.get(case)
+        trace_ids = item.get("trace_event_ids") or []
+        if not trace_ids:
+            failures.append(f"s3_negative_missing_trace_ids:{case}")
+            continue
+        for trace_id in trace_ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s3_negative_trace_id_not_canonical:{case}")
+                continue
+            record = trace_by_id.get(trace_id)
+            if record is None:
+                failures.append(f"s3_negative_trace_id_missing_from_export:{case}:{trace_id}")
+                continue
+            if expected_kind and trace_record_kind(record) != expected_kind:
+                failures.append(f"s3_negative_trace_wrong_kind:{case}:{trace_record_kind(record)}")
+            record_text = json.dumps(record, sort_keys=True)
+            for reason in expected_reason_text.get(case, item.get("reason_codes", [])):
+                if reason not in record_text:
+                    failures.append(f"s3_negative_trace_wrong_reason:{case}:{reason}")
+            message_id = item.get("message_id")
+            if message_id and message_id not in record_text:
+                failures.append(f"s3_negative_trace_wrong_message:{case}:{message_id}")
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("mode") != "inspect_only":
         failures.append("s3_replay_not_inspect_only")
@@ -611,6 +684,35 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     delegated = runtime.get("delegated_authority", {})
     if "artifact.publish_external" in delegated.get("allowed_permissions", []):
         failures.append("s3_specialist_delegation_includes_broad_publish_permission")
+    state_export = read_json(artifact_dir / "state-export.json")
+    state_commit_ids = set(scenario.get("required_trace_event_ids", {}).get("state.committed", []))
+    for state_name in ["parent", "child"]:
+        state = state_export.get(state_name, {})
+        trace_id = state.get("trace_event_id")
+        metadata_trace_id = state.get("metadata_trace_event_id")
+        if not trace_id or trace_id != metadata_trace_id:
+            failures.append(f"s3_state_metadata_trace_mismatch:{state_name}")
+        if trace_id not in trace_by_id or trace_record_kind(trace_by_id.get(trace_id, {})) != "state.committed":
+            failures.append(f"s3_state_trace_not_committed_event:{state_name}")
+        if trace_id not in state_commit_ids:
+            failures.append(f"s3_state_trace_missing_from_required_events:{state_name}")
+    schema = read_json(artifact_dir / "schema-parity.json")
+    if schema.get("status") != "passed":
+        failures.append("s3_schema_parity_not_passed")
+    rust_schema = schema.get("rust", {})
+    typescript_schema = schema.get("typescript", {})
+    python_schema = schema.get("python", {})
+    if typescript_schema.get("status") != "passed" or typescript_schema.get("executable_check") is not True:
+        failures.append("s3_typescript_schema_parity_not_executable")
+    if python_schema.get("status") != "passed" or python_schema.get("executable_check") is not True:
+        failures.append("s3_python_schema_parity_not_executable")
+    for callback in ["perceptor", "policy", "trace_subscriber"]:
+        if callback not in python_schema.get("callbacks_observed", []):
+            failures.append(f"s3_python_callback_missing:{callback}")
+    if python_schema.get("actions_proposed") != 0 or python_schema.get("adapter_callbacks_executed") != 0:
+        failures.append("s3_python_callback_side_effect_boundary_failed")
+    if rust_schema.get("task_request_schema") != "splendor.message.task_request.v1" or rust_schema.get("task_response_schema") != "splendor.message.task_response.v1":
+        failures.append("s3_rust_schema_parity_wrong_schema")
     return scenario, failures
 
 

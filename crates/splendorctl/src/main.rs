@@ -4193,10 +4193,10 @@ fn daemon_request(
             .map_err(|err| format!("Mutating daemon request body must be JSON: {err}"))?;
         if body_json
             .get("credential")
-            .map_or(true, serde_json::Value::is_null)
+            .is_none_or(serde_json::Value::is_null)
             || body_json
                 .get("audit_attribution")
-                .map_or(true, serde_json::Value::is_null)
+                .is_none_or(serde_json::Value::is_null)
         {
             return Err(
                 "Mutating daemon requests require body credential and audit_attribution"
@@ -4245,7 +4245,7 @@ fn parse_local_http_url(url: &str) -> Result<ParsedLocalUrl, String> {
     let port = port
         .parse::<u16>()
         .map_err(|_| "Daemon URL port is invalid".to_string())?;
-    let path = format!("/{}", path_part);
+    let path = format!("/{path_part}");
     Ok(ParsedLocalUrl {
         host: host.trim_matches(&['[', ']'][..]).to_string(),
         port,
@@ -4275,7 +4275,7 @@ fn send_local_http(
     }
     if !body.is_empty() {
         request.push_str("Content-Type: application/json\r\n");
-        request.push_str(&format!("Content-Length: {}\r\n", body.as_bytes().len()));
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
     request.push_str(body);

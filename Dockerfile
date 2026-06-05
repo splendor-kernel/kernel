@@ -18,10 +18,13 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release -p splendorctl -p splendor-daemon
+
+FROM rust-builder AS acceptance-builder
+
+ARG RUST_TOOLCHAIN=1.88.0
+
 RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
-    -p splendorctl \
-    -p splendor-daemon \
-    && RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
     -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-builder
@@ -50,8 +53,6 @@ LABEL org.opencontainers.image.title="Splendor Kernel" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        nodejs \
-        npm \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system splendor \
@@ -61,13 +62,9 @@ RUN apt-get update \
 
 COPY --from=rust-builder /src/target/release/splendorctl /usr/local/bin/splendorctl
 COPY --from=rust-builder /src/target/release/splendor-daemon /usr/local/bin/splendor-daemon
-COPY --from=rust-builder /src/target/release/examples/uc_e2e_s3_multi_agent_delegation /usr/local/bin/uc_e2e_s3_multi_agent_delegation
 COPY --from=python-builder /opt/splendor-venv /opt/splendor-venv
 
 WORKDIR /opt/splendor
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts \
-    && ln -s /opt/splendor/node_modules/.bin/tsc /usr/local/bin/tsc
 COPY --chown=splendor:splendor examples/local-basic-loop ./examples/local-basic-loop
 COPY --chown=splendor:splendor examples/daemon-client-local ./examples/daemon-client-local
 COPY --chown=splendor:splendor examples/action-approval-flow ./examples/action-approval-flow
@@ -77,7 +74,7 @@ COPY --chown=splendor:splendor docs/releases ./docs/releases
 COPY --chown=splendor:splendor docs/deployment/docker.md ./docs/deployment/docker.md
 COPY --chown=splendor:splendor openapi/splendor-runtime-daemon.yaml ./openapi/splendor-runtime-daemon.yaml
 
-ENV PATH="/opt/splendor/node_modules/.bin:/opt/splendor-venv/bin:${PATH}" \
+ENV PATH="/opt/splendor-venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     SPLENDOR_RUNTIME_MODE=local
 
@@ -85,3 +82,24 @@ USER splendor
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["splendorctl", "--version"]
+
+FROM runtime AS acceptance-runner
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=acceptance-builder /src/target/release/examples/uc_e2e_s3_multi_agent_delegation /usr/local/bin/uc_e2e_s3_multi_agent_delegation
+
+WORKDIR /opt/splendor
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts \
+    && ln -s /opt/splendor/node_modules/.bin/tsc /usr/local/bin/tsc
+
+ENV PATH="/opt/splendor/node_modules/.bin:/opt/splendor-venv/bin:${PATH}"
+
+USER splendor
