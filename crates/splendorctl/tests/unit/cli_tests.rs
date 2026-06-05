@@ -3129,6 +3129,162 @@ fn replay_rejects_message_context_run_mismatch() {
 }
 
 #[test]
+fn audit_filter_helpers_cover_governance_and_artifact_branches() {
+    let run_id = fixed_run_id(0x180);
+    let tenant_id: TenantId = Uuid::from_u128(0x181).into();
+    let agent_id = fixed_agent_id(0x182);
+    let action_id = fixed_action_id(0x183);
+    let timestamp = OffsetDateTime::UNIX_EPOCH;
+    let approval = ApprovalTraceContext {
+        approval_id: ApprovalId::new(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: "artifact.publish".to_string(),
+        adapter: Some("artifact-store".to_string()),
+        decision: Some(ApprovalDecision::Denied),
+        reason: Some("policy".to_string()),
+        policy_id: Some("approval-policy".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: Some(timestamp),
+        expires_at: Some(timestamp + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let denied = TraceEvent::new(
+        run_id.clone(),
+        1,
+        timestamp,
+        TraceEventKind::ApprovalDenied {
+            approval: approval.clone(),
+            reason: "operator_denied".to_string(),
+        },
+    );
+    assert!(event_has_tenant(&denied, &tenant_id.to_string()));
+    assert!(event_has_agent(&denied, &agent_id.to_string()));
+    assert!(event_has_action(&denied, &action_id.to_string()));
+    assert!(event_has_action(&denied, "artifact.publish"));
+    assert!(event_has_adapter(
+        &denied,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let escalation = EscalationContext {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: Some("artifact.publish".to_string()),
+        adapter: Some("artifact-store".to_string()),
+        trigger: EscalationTrigger::RepeatedAdapterFailure,
+        scope: EscalationScope::Action,
+        decision: EscalationDecision::NeedsIntervention,
+        reason: "failure threshold".to_string(),
+        observed_count: 3,
+        threshold: 3,
+        evidence: serde_json::json!({"adapter":"artifact-store"}),
+        decided_at: timestamp,
+    };
+    let escalation_event = TraceEvent::new(
+        run_id.clone(),
+        2,
+        timestamp,
+        TraceEventKind::EscalationTriggered { escalation },
+    );
+    assert!(event_has_action(&escalation_event, &action_id.to_string()));
+    assert!(event_has_adapter(
+        &escalation_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let breaker = splendor_types::CircuitBreakerTraceContext::try_new(
+        CircuitBreakerId::try_new("cb_adapter").expect("breaker"),
+        splendor_types::CircuitBreakerScope::Adapter("artifact-store".to_string()),
+        CircuitBreakerState::Tripped,
+        "adapter outage",
+        "test",
+        timestamp,
+    )
+    .expect("breaker context");
+    let breaker_event = TraceEvent::new(
+        run_id.clone(),
+        3,
+        timestamp,
+        TraceEventKind::CircuitBreakerTripped { breaker },
+    );
+    assert!(event_has_adapter(
+        &breaker_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let result = VerificationResult {
+        allowed: false,
+        reasons: vec!["adapter circuit breaker".to_string()],
+        artifacts: serde_json::json!({
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": "artifact.publish",
+                "adapter": "artifact-store"
+            },
+            "circuit_breaker": {
+                "scope": "adapter",
+                "scope_value": "artifact-store"
+            }
+        }),
+    };
+    let action = Action {
+        name: "artifact.publish".to_string(),
+        params: serde_json::json!({}),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let result_event = TraceEvent::new(
+        run_id.clone(),
+        4,
+        timestamp,
+        TraceEventKind::ActionFailed {
+            action,
+            error: "adapter failed".to_string(),
+            result,
+        },
+    );
+    assert!(event_has_tenant(&result_event, &tenant_id.to_string()));
+    assert!(event_has_agent(&result_event, &agent_id.to_string()));
+    assert!(event_has_action(&result_event, &action_id.to_string()));
+    assert!(event_has_action(&result_event, "artifact.publish"));
+    assert!(event_has_adapter(
+        &result_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let rejected = TraceEvent::new(
+        run_id,
+        5,
+        timestamp,
+        TraceEventKind::WorkOrderRejected {
+            work_order_id: Some(
+                splendor_types::WorkOrderId::try_new("wo_rejected").expect("work order id"),
+            ),
+            tenant_id: Some(tenant_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            run_id: None,
+            reason: "bad_signature".to_string(),
+        },
+    );
+    assert!(event_has_tenant(&rejected, &tenant_id.to_string()));
+    assert!(event_has_agent(&rejected, &agent_id.to_string()));
+}
+
+#[test]
 fn replay_rejects_child_run_parent_mismatch() {
     let state_temp = NamedTempFile::new().expect("state db");
     let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");

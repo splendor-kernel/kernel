@@ -46,4 +46,19 @@ mod tests {
         std::env::remove_var("SPLENDOR_RUNTIME_MODE");
         std::env::remove_var("SPLENDOR_DAEMON_ACCEPTANCE_BIND_UNSAFE");
     }
+
+    #[test]
+    fn daemon_state_switches_between_local_dev_and_resident_modes() {
+        std::env::remove_var("SPLENDOR_DAEMON_MODE");
+        let _local = super::daemon_state();
+
+        std::env::set_var("SPLENDOR_DAEMON_MODE", "resident");
+        std::env::set_var(
+            "SPLENDOR_INSTANCE_ID",
+            "00000000-0000-4000-8000-000000000302",
+        );
+        let _resident = super::daemon_state();
+        std::env::remove_var("SPLENDOR_DAEMON_MODE");
+        std::env::remove_var("SPLENDOR_INSTANCE_ID");
+    }
 }

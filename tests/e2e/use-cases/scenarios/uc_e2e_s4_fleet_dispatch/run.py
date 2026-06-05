@@ -183,7 +183,7 @@ def work_order(expires: int = 60, revoked: bool = False, target: str = "customer
         "objective": "UC-E2E-S4 fleet work-order dispatch with VPC data locality and cloud proposal message",
         "allowed_actions": ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal"],
         "allowed_adapters": ["fixture-sql", "artifact-store", "remote-message"],
-        "allowed_permissions": ["fixture.sql.read", "artifact.create_internal", "message.remote.proposal"],
+        "allowed_permissions": ["fixture.sql.read", "artifact.create_internal", f"message.remote.proposal:{HELPER_AGENT_ID}"],
         "data_refs": ["dataset:eu-west.fixture.v1"],
         "quotas": {"max_actions_per_tick": 5, "max_action_duration_ms": 30000},
         "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal"]},
@@ -265,16 +265,16 @@ def main() -> int:
     run_id = dispatch["body"].get("run_id", RUN_ID)
 
     message = {"message": {"message_id": "55555555-5555-4555-8555-555555555554", "source_agent_id": AGENT_ID, "target_agent_id": HELPER_AGENT_ID, "run_id": run_id, "schema": "splendor.message.proposal_request.v1", "payload": {"request": "proposal_only", "mutation_authority": False}, "causal_parent": None, "requires_response": True, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
-    remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "message_envelope": message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
+    remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
     duplicate_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555556"}}
-    duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
+    duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
     received = call("getMessage", "POST", args.manager_url, f"/messages/{message['message']['message_id']}/read", sec(cred))
     failed_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555555"}}
-    failed_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-fail", "simulate_failure": "toxiproxy_transport_failure"})
+    failed_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-fail", "simulate_failure": "toxiproxy_transport_failure"})
     unsupported_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555557", "schema": "splendor.message.unsupported.v1"}}
-    unsupported_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "message_envelope": unsupported_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unsupported", "simulate_failure": None})
+    unsupported_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": unsupported_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unsupported", "simulate_failure": None})
     unauthorized_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555558", "target_agent_id": AGENT_ID}}
-    unauthorized_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "message_envelope": unauthorized_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unauthorized", "simulate_failure": None})
+    unauthorized_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": unauthorized_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unauthorized", "simulate_failure": None})
 
     vpc_cred = resident_credential(VPC_INSTANCE_ID)
     exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID})
@@ -361,7 +361,7 @@ def main() -> int:
         "work_order_accepted": validation["status"] == 200 and validation["body"].get("accepted") is True,
         "placement_selected": placement["body"].get("status") == "selected" and placement["body"].get("candidate_id") == VPC_NODE_ID,
         "dispatch_started_resident_run": dispatch["body"].get("create_run_status") in {200, 201} and dispatch["body"].get("start_run_status") in {200, 201},
-        "remote_message_delivered": remote["body"].get("delivery_status") == "delivered" and remote["body"].get("recipient_validated") is True and remote["body"].get("remote_state_mutated") is False,
+        "remote_message_delivered": remote["body"].get("delivery_status") == "delivered" and remote["body"].get("recipient_validated") is True and remote["body"].get("work_order_authority_validated") is True and remote["body"].get("route_permission") == f"message.remote.proposal:{HELPER_AGENT_ID}" and remote["body"].get("remote_state_mutated") is False,
         "remote_message_received_publicly": received["status"] == 200 and received["body"].get("receive_side_validated") is True,
         "state_handoff_imported": imported["body"].get("accepted") is True,
         "trace_sync_accepted": sync["body"].get("accepted_records", 0) > 0,

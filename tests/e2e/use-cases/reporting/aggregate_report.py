@@ -861,8 +861,11 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     remote = read_json(artifact_dir / "remote-message-report.json")
     if remote.get("delivered", {}).get("delivery_status") != "delivered":
         failures.append("s4_remote_message_not_delivered")
-    if remote.get("delivered", {}).get("recipient_validated") is not True or remote.get("delivered", {}).get("remote_state_mutated") is not False:
+    delivered = remote.get("delivered", {})
+    if delivered.get("recipient_validated") is not True or delivered.get("remote_state_mutated") is not False:
         failures.append("s4_remote_receive_validation_missing")
+    if delivered.get("work_order_authority_validated") is not True or not str(delivered.get("route_permission", "")).startswith("message.remote.proposal:"):
+        failures.append("s4_remote_route_not_work_order_authorized")
     if remote.get("received", {}).get("receive_side_validated") is not True:
         failures.append("s4_remote_message_not_publicly_read")
     if remote.get("duplicate", {}).get("duplicate") is not True:

@@ -6,7 +6,9 @@ use splendor_daemon::{
     router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
     DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest, PolicySyncRequest,
     PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus,
-    StateHeadResponse, SubmitActionRequest, TickResponse, TracePageResponse,
+    StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
+    StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
+    TracePageResponse,
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
@@ -327,6 +329,14 @@ fn caller_credential_for_tenant(
         },
         expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
         revocation: RevocationStatus::Active,
+    }
+}
+
+fn matching_attribution(credential: &CallerCredential) -> AuditAttribution {
+    AuditAttribution {
+        principal: credential.principal.clone(),
+        credential_id: Some(credential.credential_id.clone()),
+        requested_at: OffsetDateTime::now_utc(),
     }
 }
 
@@ -740,6 +750,143 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         inspected_after_replay.adapter_executions, before_replay_executions,
         "replay must not call adapters again"
     );
+}
+
+#[tokio::test]
+async fn state_snapshot_export_import_uses_authenticated_state_authority() {
+    let state = DaemonState::local_dev();
+    let app = router(state);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let policy_actions = vec![DaemonActionCandidate {
+        action: read_only_action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+    }];
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            policy_actions,
+            vec![RegisteredAction {
+                name: "allowed_action".to_string(),
+                adapter: "daemon.local".to_string(),
+            }],
+        ))
+        .expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("commit state before handoff".to_string()),
+        approval_evidence: None,
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("start request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!tick.state_node_id.is_empty());
+
+    let credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::StateRead]);
+    let audit_attribution = matching_attribution(&credential);
+    let export_request = StateSnapshotExportRequest {
+        run_id: created.run_id.clone(),
+        credential: Some(credential.clone()),
+        audit_attribution: Some(audit_attribution.clone()),
+        work_order_id: "wo_state_handoff_test".to_string(),
+        source_instance_id: Some("instance_source".to_string()),
+        receiver_instance_id: Some("instance_receiver".to_string()),
+    };
+    let (status, exported): (StatusCode, StateSnapshotExportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/export",
+        serde_json::to_value(export_request.clone()).expect("export request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(exported.run_id, created.run_id);
+    assert_eq!(exported.state_node_id, tick.state_node_id);
+    assert_eq!(
+        exported.handoff.source_trace_id.as_ref(),
+        Some(&exported.trace_event_id)
+    );
+    assert_eq!(
+        exported.handoff.previous_state_node_id.as_deref(),
+        Some(tick.state_node_id.as_str())
+    );
+
+    let import_request = StateSnapshotImportRequest {
+        handoff: exported.handoff.clone(),
+        credential: Some(credential.clone()),
+        audit_attribution: Some(audit_attribution.clone()),
+    };
+    let (status, imported): (StatusCode, StateSnapshotImportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(import_request).expect("import request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(imported.run_id, created.run_id);
+    assert!(imported.accepted);
+    assert_eq!(imported.state_node_id, tick.state_node_id);
+
+    let (status, head): (StatusCode, StateHeadResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/state-head", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(head.state_node_id, imported.state_node_id);
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/export",
+        serde_json::to_value(StateSnapshotExportRequest {
+            credential: None,
+            audit_attribution: Some(audit_attribution.clone()),
+            ..export_request
+        })
+        .expect("missing credential export request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_caller_credential");
+
+    let mut wrong_handoff = exported.handoff;
+    wrong_handoff.authority.tenant_id = TenantId::new();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app,
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: wrong_handoff,
+            credential: Some(credential),
+            audit_attribution: Some(audit_attribution),
+        })
+        .expect("wrong authority import request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "state_handoff_authority_mismatch");
+    assert!(error.details["trace_event_id"].is_string());
 }
 
 #[tokio::test]
