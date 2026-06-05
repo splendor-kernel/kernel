@@ -1,0 +1,24 @@
+{
+  "schema_version": "splendor.e2e.fixture-seed.v1",
+  "seed": "UC-E2E-S0-deterministic-seed",
+  "ids": {
+    "tenant_id": "00000000-0000-0000-0000-00000000e200",
+    "agent_id": "00000000-0000-0000-0000-00000000e201",
+    "run_id": "00000000-0000-0000-0000-00000000e202",
+    "node_id": "00000000-0000-0000-0000-00000000e203",
+    "instance_id": "00000000-0000-0000-0000-00000000e204",
+    "message_id": "00000000-0000-0000-0000-00000000e205",
+    "work_order_id": "wo_uc_e2e_s0_seed"
+  },
+  "fixture_responses": {
+    "fake_http_service": {
+      "path": "/allowed/s0-health",
+      "status": 200,
+      "body": {"ok": true, "fixture": "UC-E2E-S0"}
+    },
+    "fake_artifact_store": {
+      "artifact_id": "artifact_uc_e2e_s0_seed",
+      "checksum": "sha256:uc-e2e-s0-deterministic-artifact"
+    }
+  }
+}

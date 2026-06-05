@@ -1,5 +1,5 @@
 use axum::body::{to_bytes, Body};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use splendor_daemon::{
@@ -10,11 +10,12 @@ use splendor_daemon::{
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
-    AuditAttribution, ClientPrincipal, CredentialAudience, EndpointScope, Percept,
-    PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
-    QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
-    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
+    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
+    EndpointScope, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
+    PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent,
+    TraceEventKind, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement,
+    WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -251,6 +252,146 @@ async fn call_empty<T: DeserializeOwned>(
         )
     });
     (status, parsed)
+}
+
+async fn call_empty_with_credential<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    credential: &CallerCredential,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            "x-splendor-caller-credential",
+            serde_json::to_string(credential).expect("credential json"),
+        )
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "json response ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+async fn call_empty_with_credential_header<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    header: HeaderValue,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-splendor-caller-credential", header)
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "json response ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+fn caller_credential(scopes: Vec<EndpointScope>) -> CallerCredential {
+    CallerCredential {
+        credential_id: "cred_test".to_string(),
+        principal: principal(),
+        scopes,
+        binding: CredentialBinding::Tenant {
+            tenant_id: TenantId::new(),
+        },
+        audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        revocation: RevocationStatus::Active,
+    }
+}
+
+fn public_caller_credential_header(scopes: Vec<&str>) -> HeaderValue {
+    HeaderValue::from_str(
+        &json!({
+            "credential_id": "cred_public_header",
+            "principal": {
+                "app": {
+                    "app_principal_id": "app_public_header",
+                    "label": "public header app"
+                },
+                "client_principal_id": "client_public_header",
+                "label": "public header client"
+            },
+            "scopes": scopes,
+            "binding": {
+                "tenant": {
+                    "tenant_id": TenantId::new().to_string()
+                }
+            },
+            "audience": {
+                "daemon": {
+                    "daemon_id": "daemon_local"
+                }
+            },
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expires_at"),
+            "revocation": "active"
+        })
+        .to_string(),
+    )
+    .expect("public credential header")
+}
+
+fn public_caller_credential_header_with_revocation(
+    scopes: Vec<&str>,
+    revocation: Value,
+) -> HeaderValue {
+    HeaderValue::from_str(
+        &json!({
+            "credential_id": "cred_public_header",
+            "principal": {
+                "app": {
+                    "app_principal_id": "app_public_header",
+                    "label": "public header app"
+                },
+                "client_principal_id": "client_public_header",
+                "label": "public header client"
+            },
+            "scopes": scopes,
+            "binding": {
+                "tenant": {
+                    "tenant_id": TenantId::new().to_string()
+                }
+            },
+            "audience": {
+                "daemon": {
+                    "daemon_id": "daemon_local"
+                }
+            },
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expires_at"),
+            "revocation": revocation
+        })
+        .to_string(),
+    )
+    .expect("public credential header")
 }
 
 #[tokio::test]
@@ -513,6 +654,36 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(replay.mode, "inspect_only");
+
+    let (status, explicit_replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "inspect_only", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_replay.mode, "inspect_only");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "inspect_only", "side_effects_allowed": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "replay_side_effects_forbidden");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "execute", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "unsupported_replay_mode");
 
     let (status, inspected_after_replay): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
@@ -2187,7 +2358,231 @@ async fn health_and_capabilities_remain_local_dev_only_without_credentials() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
     let (status, error): (StatusCode, ApiErrorBody) =
-        call_empty(locked_app, Method::GET, "/capabilities").await;
+        call_empty(locked_app.clone(), Method::GET, "/capabilities").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
+
+    let health_credential = caller_credential(vec![EndpointScope::HealthRead]);
+    let (status, _health): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        &health_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let capabilities_credential = caller_credential(vec![EndpointScope::CapabilitiesRead]);
+    let (status, _capabilities): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/capabilities",
+        &capabilities_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app, Method::GET, "/capabilities", &health_credential)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_scope");
+}
+
+#[tokio::test]
+async fn health_and_capabilities_accept_canonical_and_public_header_credentials() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let canonical_health = caller_credential(vec![EndpointScope::HealthRead]);
+    let (status, health): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        &canonical_health,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["status"], "ok");
+
+    let public_health = public_caller_credential_header(vec!["splendor.health.read"]);
+    let (status, health): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        public_health,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["runtime_available"], true);
+
+    let public_capabilities = public_caller_credential_header(vec!["capabilities_read"]);
+    let (status, capabilities): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app,
+        Method::GET,
+        "/capabilities",
+        public_capabilities,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities["daemon_api_version"], "0.02-S5");
+}
+
+#[tokio::test]
+async fn credential_header_rejections_fail_closed_for_malformed_and_invalid_authority() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let invalid_utf8 = HeaderValue::from_bytes(&[0xff, 0xfe]).expect("invalid utf8 header bytes");
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app.clone(), Method::GET, "/health", invalid_utf8)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let malformed_json = HeaderValue::from_static("{not-json");
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        malformed_json,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let mut expired = caller_credential(vec![EndpointScope::HealthRead]);
+    expired.expires_at = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &expired).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_expired");
+
+    let mut revoked = caller_credential(vec![EndpointScope::HealthRead]);
+    revoked.revocation = RevocationStatus::Revoked {
+        reason: "operator_revoked".to_string(),
+    };
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &revoked).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_revoked");
+
+    let mut wrong_audience = caller_credential(vec![EndpointScope::HealthRead]);
+    wrong_audience.audience = CredentialAudience::Daemon {
+        daemon_id: "daemon_other".to_string(),
+    };
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &wrong_audience)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "wrong_audience");
+
+    let missing_scope = caller_credential(vec![EndpointScope::CapabilitiesRead]);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app, Method::GET, "/health", &missing_scope).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_scope");
+}
+
+#[tokio::test]
+async fn public_credential_header_rejections_cover_revocation_and_scope_branches() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let revoked = public_caller_credential_header_with_revocation(
+        vec!["splendor.health.read"],
+        json!({"revoked": {"reason": "operator_revoked"}}),
+    );
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app.clone(), Method::GET, "/health", revoked)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_revoked");
+
+    let malformed_revocation =
+        public_caller_credential_header_with_revocation(vec!["splendor.health.read"], json!(null));
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        malformed_revocation,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let unsupported_scope = public_caller_credential_header(vec!["splendor.runs.create"]);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app, Method::GET, "/health", unsupported_scope)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+}
+
+#[tokio::test]
+async fn resume_without_signed_work_order_fails_before_tick_execution() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let request = create_request(
+        tenant_id,
+        agent_id,
+        vec![DaemonActionCandidate {
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resume_request = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("operator retry".to_string()),
+        approval_evidence: None,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(resume_request).expect("resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_work_order");
+
+    let (status, inspected): (StatusCode, RunInspectResponse) =
+        call_empty(app, Method::GET, &format!("/runs/{}", created.run_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.status, RunStatus::Pending);
+    assert_eq!(inspected.ticks, 0);
+    assert_eq!(inspected.adapter_executions, 0);
 }

@@ -1,0 +1,104 @@
+# S0-compatible acceptance topology.
+#
+# S0 runs the acceptance runner, local daemon public health/capabilities path,
+# required role placeholders, and deterministic fake boundary services. The
+# runner shares the daemon network namespace so the daemon can remain bound to
+# loopback-only TCP. Daemon ports are not published.
+services:
+  e2e-runner:
+    image: python:3.12-slim
+    working_dir: /workspace
+    environment:
+      SPLENDOR_E2E_MODE: acceptance
+      SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
+      SPLENDOR_E2E_NO_COMPOSE: "1"
+      SPLENDOR_E2E_SOURCE_REV: ${SPLENDOR_E2E_SOURCE_REV:-unknown-source-revision}
+      SPLENDOR_DAEMON_URL: http://127.0.0.1:8077
+      SPLENDOR_MANAGER_URL: http://central-manager:8081
+      SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
+      SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
+      SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
+      SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
+    command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "UC-E2E-S0", "--reuse-build"]
+    depends_on:
+      - splendor-daemon-local
+      - central-manager
+      - resident-cloud-node
+      - resident-vpc-node
+      - resident-edge-node
+      - fake-http-service
+      - fake-artifact-store
+      - fake-governance-plane
+      - fake-telemetry-sink
+      - device-sim
+      - toxiproxy
+    network_mode: service:splendor-daemon-local
+    volumes:
+      - ../../..:/workspace
+
+  fake-http-service:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8082"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-artifact-store:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-artifacts
+    command: ["python", "-m", "http.server", "8083"]
+    volumes:
+      - e2e-state:/var/lib/splendor-artifacts
+
+  fake-governance-plane:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8084"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-telemetry-sink:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-telemetry
+    command: ["python", "-m", "http.server", "8085"]
+    volumes:
+      - e2e-state:/var/lib/splendor-telemetry
+
+  device-sim:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8086"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  splendor-daemon-local:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  central-manager:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8081"]
+
+  resident-cloud-node:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8091"]
+
+  resident-vpc-node:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8092"]
+
+  resident-edge-node:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8093"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+
+volumes:
+  e2e-state:

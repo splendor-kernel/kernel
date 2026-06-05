@@ -304,6 +304,8 @@ paths:
     get:
       summary: Read daemon health.
       operationId: getHealth
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Health status.
@@ -317,6 +319,8 @@ paths:
     get:
       summary: Read local daemon capabilities.
       operationId: getCapabilities
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Capability list.
@@ -335,6 +339,13 @@ components:
       schema:
         type: string
         format: uuid
+    CallerCredentialHeader:
+      name: X-Splendor-Caller-Credential
+      in: header
+      required: false
+      description: JSON-encoded CallerCredential for non-dev health/capability reads. Explicit local-dev mode may omit it only on loopback or Unix-socket transports.
+      schema:
+        type: string
   responses:
     BadRequest:
       description: Malformed request.
@@ -1223,12 +1234,20 @@ components:
             $ref: '#/components/schemas/TraceRecord'
     ReplayRequest:
       type: object
-      required: [credential]
+      required: [credential, mode, side_effects_allowed]
       properties:
         credential:
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/CallerCredential'
+        mode:
+          type: string
+          enum: [inspect_only]
+          default: inspect_only
+        side_effects_allowed:
+          type: boolean
+          default: false
+          description: Must remain false for default inspect-only replay; side-effectful replay modes are not exposed by the local daemon contract.
     ReplayResponse:
       type: object
       required: [replay_id, run_id, mode, event_count, action_event_count, approval_events]

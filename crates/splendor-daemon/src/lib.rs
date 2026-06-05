@@ -6,10 +6,11 @@
 //! no fleet registry, remote scheduler, or production auth provider is included.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
@@ -26,17 +27,19 @@ use splendor_store::{
     TraceStore, TraceStoreError,
 };
 use splendor_types::{
-    validate_policy_bundle, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    AuditAttribution, CallerCredential, CredentialAudience, DaemonEndpoint, DaemonSecurityDecision,
-    DaemonSecurityError, DaemonSecurityRequest, GatewayVerificationState, InsecureDevMode,
-    LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
-    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError, TenantId,
+    validate_policy_bundle, AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
+    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
+    DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError, DaemonSecurityRequest,
+    EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding,
+    PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
+    PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
     TraceEvent, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
     WorkOrderValidationContext, WorkOrderValidationError,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Local daemon state shared by the HTTP router.
@@ -538,6 +541,14 @@ pub struct TracePageResponse {
 #[serde(rename_all = "snake_case")]
 pub struct ReplayRequest {
     pub credential: Option<CallerCredential>,
+    #[serde(default = "default_replay_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub side_effects_allowed: bool,
+}
+
+fn default_replay_mode() -> String {
+    "inspect_only".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1342,6 +1353,20 @@ async fn replay_run(
     Json(request): Json<ReplayRequest>,
 ) -> Result<Json<ReplayResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    if request.mode != "inspect_only" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_replay_mode",
+            "local daemon replay only supports inspect_only mode",
+        ));
+    }
+    if request.side_effects_allowed {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "replay_side_effects_forbidden",
+            "local daemon replay is inspect-only and must not allow side effects",
+        ));
+    }
     let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     state.validate_security(
@@ -1542,8 +1567,125 @@ async fn submit_action(
     Ok(Json(outcome))
 }
 
-async fn health(State(state): State<DaemonState>) -> Result<Json<HealthResponse>, ApiError> {
-    state.validate_security(DaemonEndpoint::Health, None, None, None)?;
+fn caller_credential_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<CallerCredential>, ApiError> {
+    let Some(value) = headers.get("x-splendor-caller-credential") else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_caller_credential_header",
+            "x-splendor-caller-credential must be valid UTF-8 JSON",
+        )
+    })?;
+    serde_json::from_str(raw)
+        .or_else(|_| caller_credential_from_public_header_json(raw))
+        .map(Some)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_caller_credential_header",
+                "x-splendor-caller-credential did not match CallerCredential schema",
+            )
+        })
+}
+
+fn caller_credential_from_public_header_json(
+    raw: &str,
+) -> Result<CallerCredential, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let tenant_id = value
+        .pointer("/binding/tenant/tenant_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| TenantId::parse(raw).ok())
+        .ok_or_else(|| serde_json::Error::custom("missing tenant binding"))?;
+    let daemon_id = value
+        .pointer("/audience/daemon/daemon_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| serde_json::Error::custom("missing daemon audience"))?
+        .to_string();
+    let expires_at = value
+        .get("expires_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| OffsetDateTime::parse(raw, &Rfc3339).ok())
+        .ok_or_else(|| serde_json::Error::custom("invalid expires_at"))?;
+    let scopes = value
+        .get("scopes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| serde_json::Error::custom("missing scopes"))?
+        .iter()
+        .map(|scope| {
+            scope
+                .as_str()
+                .and_then(endpoint_scope_from_public_str)
+                .ok_or_else(|| serde_json::Error::custom("invalid scope"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let revocation = match value.get("revocation") {
+        Some(serde_json::Value::String(status)) if status == "active" => RevocationStatus::Active,
+        Some(serde_json::Value::Object(status)) => {
+            let reason = status
+                .get("revoked")
+                .and_then(|revoked| revoked.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| serde_json::Error::custom("invalid revocation"))?
+                .to_string();
+            RevocationStatus::Revoked { reason }
+        }
+        _ => return Err(serde_json::Error::custom("invalid revocation")),
+    };
+    Ok(CallerCredential {
+        credential_id: value
+            .get("credential_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde_json::Error::custom("missing credential_id"))?
+            .to_string(),
+        principal: ClientPrincipal {
+            app: AppPrincipal {
+                app_principal_id: value
+                    .pointer("/principal/app/app_principal_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| serde_json::Error::custom("missing app principal"))?
+                    .to_string(),
+                label: value
+                    .pointer("/principal/app/label")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            },
+            client_principal_id: value
+                .pointer("/principal/client_principal_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| serde_json::Error::custom("missing client principal"))?
+                .to_string(),
+            label: value
+                .pointer("/principal/label")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+        },
+        scopes,
+        binding: CredentialBinding::Tenant { tenant_id },
+        audience: CredentialAudience::Daemon { daemon_id },
+        expires_at,
+        revocation,
+    })
+}
+
+fn endpoint_scope_from_public_str(scope: &str) -> Option<EndpointScope> {
+    match scope {
+        "health_read" | "splendor.health.read" => Some(EndpointScope::HealthRead),
+        "capabilities_read" | "splendor.capabilities.read" => Some(EndpointScope::CapabilitiesRead),
+        _ => None,
+    }
+}
+
+async fn health(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<HealthResponse>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    state.validate_security(DaemonEndpoint::Health, credential, None, None)?;
     let runtime_available = state.inner.runtime_available.load(Ordering::SeqCst);
     Ok(Json(HealthResponse {
         status: if runtime_available {
@@ -1559,8 +1701,10 @@ async fn health(State(state): State<DaemonState>) -> Result<Json<HealthResponse>
 
 async fn capabilities(
     State(state): State<DaemonState>,
+    headers: HeaderMap,
 ) -> Result<Json<CapabilitiesResponse>, ApiError> {
-    state.validate_security(DaemonEndpoint::Capabilities, None, None, None)?;
+    let credential = caller_credential_from_headers(&headers)?;
+    state.validate_security(DaemonEndpoint::Capabilities, credential, None, None)?;
     Ok(Json(CapabilitiesResponse {
         daemon_api_version: "0.02-S5".to_string(),
         local_only: true,
@@ -2155,6 +2299,10 @@ mod tests {
         let scheduler_error = ApiError::from(SchedulerError::NoAgents);
         assert_eq!(scheduler_error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(scheduler_error.body.code, "scheduler_error");
+        let loop_error = ApiError::from(LoopError::Policy("unit policy failure".to_string()));
+        assert_eq!(loop_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(loop_error.body.code, "loop_error");
+        assert_eq!(loop_error.body.message, "policy error: unit policy failure");
 
         let run_not_found = trace_error(TraceStoreError::RunNotFound);
         assert_eq!(run_not_found.status, StatusCode::NOT_FOUND);
@@ -2317,6 +2465,26 @@ mod tests {
         assert_eq!(registrations.len(), 1);
         assert_eq!(registrations[0].name, "policy_only");
         assert_eq!(registrations[0].adapter, "daemon.local");
+
+        let mut direct_registration_request = request.clone();
+        direct_registration_request.policy_actions = vec![DaemonActionCandidate {
+            action: Action {
+                name: "policy_fallback".to_string(),
+                params: serde_json::json!({}),
+                side_effect_class: splendor_types::SideEffectClass::ReadOnly,
+                cost_estimate: None,
+                required_permissions: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+            },
+            adapter: None,
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }];
+        let registrations = registrations_for_request(&direct_registration_request, &work_order);
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[1].name, "policy_fallback");
+        assert_eq!(registrations[1].adapter, "daemon.local");
 
         let lock = lock_error();
         assert_eq!(lock.status, StatusCode::INTERNAL_SERVER_ERROR);
