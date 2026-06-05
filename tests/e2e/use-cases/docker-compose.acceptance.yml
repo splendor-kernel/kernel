@@ -1,9 +1,9 @@
 # S0-compatible acceptance topology.
 #
-# The active S0 service is a static harness runner plus deterministic fake
-# boundary services. Future Splendor runtime/fleet/device roles are declared
-# under the `future-scenarios` profile so the service names and volume shape can
-# expand without weakening the current daemon's loopback-only local-dev bind.
+# S0 runs the acceptance runner, local daemon public health/capabilities path,
+# required role placeholders, and deterministic fake boundary services. The
+# daemon uses an explicit acceptance-only bind flag scoped to this compose
+# topology; production/default daemon startup remains loopback-only.
 services:
   e2e-runner:
     image: python:3.12-slim
@@ -12,6 +12,7 @@ services:
       SPLENDOR_E2E_MODE: acceptance
       SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
       SPLENDOR_E2E_NO_COMPOSE: "1"
+      SPLENDOR_E2E_SOURCE_REV: ${SPLENDOR_E2E_SOURCE_REV:-unknown-source-revision}
       SPLENDOR_DAEMON_URL: http://splendor-daemon-local:8077
       SPLENDOR_MANAGER_URL: http://central-manager:8081
       SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
@@ -20,11 +21,17 @@ services:
       SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
     command: ["bash", "scripts/e2e/verify-use-case-acceptance.sh", "--inside-compose", "--scenario", "UC-E2E-S0", "--reuse-build"]
     depends_on:
+      - splendor-daemon-local
+      - central-manager
+      - resident-cloud-node
+      - resident-vpc-node
+      - resident-edge-node
       - fake-http-service
       - fake-artifact-store
       - fake-governance-plane
       - fake-telemetry-sink
       - device-sim
+      - toxiproxy
     volumes:
       - ../../..:/workspace
 
@@ -64,38 +71,35 @@ services:
       - ./fixtures:/fixtures:ro
 
   splendor-daemon-local:
-    profiles: ["future-scenarios"]
     build:
       context: ../../..
       dockerfile: Dockerfile
     working_dir: /workspace
+    environment:
+      SPLENDOR_RUNTIME_MODE: acceptance
+      SPLENDOR_DAEMON_ACCEPTANCE_BIND_UNSAFE: "1"
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
 
   central-manager:
-    profiles: ["future-scenarios"]
     image: python:3.12-slim
     command: ["python", "-m", "http.server", "8081"]
 
   resident-cloud-node:
-    profiles: ["future-scenarios"]
     image: python:3.12-slim
     command: ["python", "-m", "http.server", "8091"]
 
   resident-vpc-node:
-    profiles: ["future-scenarios"]
     image: python:3.12-slim
     command: ["python", "-m", "http.server", "8092"]
 
   resident-edge-node:
-    profiles: ["future-scenarios"]
     image: python:3.12-slim
     command: ["python", "-m", "http.server", "8093"]
 
   toxiproxy:
-    profiles: ["future-scenarios"]
     image: ghcr.io/shopify/toxiproxy:latest
 
 volumes:

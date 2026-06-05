@@ -14,8 +14,10 @@ bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S0
 bash scripts/e2e/verify-use-case-acceptance.sh --all
 ```
 
-`--reuse-build` is accepted for compose-backed runs. `--inside-compose` is an
-internal guard used by the `e2e-runner` service.
+`--scenario UC-E2E-S0` and `--all` run through Docker Compose and fail if Docker
+Compose is unavailable. Static-only execution is limited to `--contract-only`
+and `--anti-drift-only`. `--reuse-build` is accepted for compose-backed runs.
+`--inside-compose` is an internal guard used by the `e2e-runner` service.
 
 ## Evidence
 
@@ -27,16 +29,19 @@ target/splendor-e2e/use-case-acceptance/report.md
 target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S0/
 ```
 
-Report generation fails if required S0 evidence artifacts are absent.
+Report generation fails if required S0 evidence artifacts are absent or empty;
+the harness does not create green placeholder trace/state/replay/audit evidence.
 
 ## Compose topology
 
-`docker-compose.acceptance.yml` provides active S0 fake boundary services plus
-future service roles under the `future-scenarios` profile. The current daemon
-binary binds `127.0.0.1` inside its own container for explicit local-dev mode,
-so S0 does not weaken daemon defaults to make cross-container calls work.
-Later scenarios must add guarded daemon topology only when authenticated caller
-identity, scoped work orders, and gateway enforcement can be exercised safely.
+`docker-compose.acceptance.yml` provides active S0 service roles: runner, local
+daemon, central manager placeholder, resident node placeholders, device sim,
+fake external services, telemetry sink, and toxiproxy. The local daemon remains
+loopback-only by default; compose uses explicit `SPLENDOR_RUNTIME_MODE=acceptance`
+and `SPLENDOR_DAEMON_ACCEPTANCE_BIND_UNSAFE=1` so the runner can call documented
+`/health` and `/capabilities` endpoints inside the local acceptance network.
+Later scenarios must add authenticated mutating daemon calls, scoped work orders,
+and gateway enforcement evidence before claiming scenario success.
 
 ## Anti-drift rules
 
