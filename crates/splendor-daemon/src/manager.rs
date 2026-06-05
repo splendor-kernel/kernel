@@ -2447,6 +2447,58 @@ mod tests {
             .expect("matching audit accepted");
     }
 
+    #[test]
+    fn manager_s5_governance_scopes_are_independently_enforced() {
+        let state = ManagerState::local_acceptance();
+        let s5_scope_pairs = [
+            (
+                EndpointScope::PoliciesPublish,
+                EndpointScope::PoliciesRevoke,
+                "splendor.policies.publish",
+            ),
+            (
+                EndpointScope::PoliciesRevoke,
+                EndpointScope::PoliciesPublish,
+                "splendor.policies.revoke",
+            ),
+            (
+                EndpointScope::ApprovalsManage,
+                EndpointScope::GovernanceControl,
+                "splendor.approvals.manage",
+            ),
+            (
+                EndpointScope::GovernanceControl,
+                EndpointScope::ApprovalsManage,
+                "splendor.governance.control",
+            ),
+            (
+                EndpointScope::TracesRead,
+                EndpointScope::FleetRead,
+                "splendor.traces.read",
+            ),
+            (
+                EndpointScope::FleetRead,
+                EndpointScope::TracesRead,
+                "splendor.fleet.read",
+            ),
+        ];
+
+        for (required_scope, wrong_scope, expected_label) in s5_scope_pairs {
+            assert_eq!(required_scope.as_str(), expected_label);
+            let credential = credential(state.inner.fleet_id.clone(), vec![required_scope]);
+            let audit = audit_for(&credential);
+            state
+                .validate_security(&credential, Some(&audit), required_scope, true)
+                .expect("credential with exact S5 scope is accepted");
+
+            let denied = state
+                .validate_security(&credential, Some(&audit), wrong_scope, true)
+                .expect_err("credential without required S5 scope is denied");
+            assert_eq!(denied.status, StatusCode::FORBIDDEN);
+            assert_eq!(denied.body.code, "missing_scope");
+        }
+    }
+
     #[tokio::test]
     async fn manager_governance_handlers_cover_s5_authority_and_audit_paths() {
         let state = ManagerState::local_acceptance();
