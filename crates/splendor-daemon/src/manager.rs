@@ -12,13 +12,13 @@ use splendor_store::{
 };
 use splendor_types::{
     select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
-    CallerCredential, CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
-    FleetTelemetrySnapshot, HealthStatus, InstanceId, InstanceRegistration, InstanceTelemetry,
-    MessageEnvelope, MessageId, NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate,
-    PlacementDecision, PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest,
-    PlacementTarget, PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus,
-    RunTelemetry, TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext,
+    CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CredentialAudience,
+    CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus,
+    InstanceId, InstanceRegistration, InstanceTelemetry, MessageEnvelope, MessageId, NodeHeartbeat,
+    NodeId, NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
+    PlacementExecutionMode, PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope,
+    RevocationStatus, RunId, RunStatus, RunTelemetry, TelemetryRuntimeMode, TenantId,
+    TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -201,6 +201,10 @@ pub fn router(state: ManagerState) -> Router {
         .route("/approvals/:approval_id/deny", post(deny_approval))
         .route("/approvals/:approval_id/revoke", post(revoke_approval))
         .route("/governance/circuit-breakers", post(create_circuit_breaker))
+        .route(
+            "/governance/circuit-breakers/:breaker_id/sync-payload",
+            post(read_circuit_breaker_sync_payload),
+        )
         .route(
             "/governance/circuit-breakers/:breaker_id/clear",
             post(clear_circuit_breaker),
@@ -416,6 +420,23 @@ pub struct GovernanceCircuitBreakerRecord {
     pub action: Option<String>,
     pub reason: String,
     pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CircuitBreakerSyncPayloadRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub run_id: RunId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CircuitBreakerSyncPayloadReport {
+    pub run_id: RunId,
+    pub breaker_record: GovernanceCircuitBreakerRecord,
+    pub circuit_breakers: Vec<CircuitBreaker>,
+    pub manager_trace_event_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1723,6 +1744,65 @@ async fn create_circuit_breaker(
     Ok(Json(record))
 }
 
+async fn read_circuit_breaker_sync_payload(
+    Path(breaker_id): Path<String>,
+    State(state): State<ManagerState>,
+    Json(request): Json<CircuitBreakerSyncPayloadRequest>,
+) -> Result<Json<CircuitBreakerSyncPayloadReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::GovernanceControl,
+        true,
+    )?;
+    let record = state
+        .inner
+        .circuit_breakers
+        .lock()
+        .map_err(|_| ManagerApiError::internal("breaker_lock", "breaker lock unavailable"))?
+        .get(&breaker_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::not_found("breaker_not_found", "circuit breaker not found")
+        })?;
+    if record.status != "tripped" {
+        return Err(ManagerApiError::bad_request(
+            "breaker_not_tripped",
+            "only tripped circuit breakers can be exported for daemon sync",
+        ));
+    }
+    let scope = if let Some(action) = record.action.clone() {
+        CircuitBreakerScope::Action(action)
+    } else if let Some(adapter) = record.adapter.clone() {
+        CircuitBreakerScope::Adapter(adapter)
+    } else if let Some(tenant_id) = record.tenant_id.clone() {
+        CircuitBreakerScope::Tenant(tenant_id)
+    } else {
+        CircuitBreakerScope::Global
+    };
+    let breaker_id = CircuitBreakerId::parse(&record.breaker_id)
+        .map_err(|e| ManagerApiError::bad_request("invalid_breaker_id", e.to_string()))?;
+    let now = OffsetDateTime::now_utc();
+    let circuit_breaker = CircuitBreaker::tripped(breaker_id, scope, record.reason.clone(), now)
+        .map_err(|e| ManagerApiError::bad_request("invalid_circuit_breaker", e.to_string()))?;
+    let manager_trace_event_id = state.audit(
+        "circuit_breaker.sync_payload.exported",
+        serde_json::json!({
+            "breaker_id": record.breaker_id,
+            "run_id": request.run_id,
+            "source_trace_event_id": record.trace_event_id,
+            "reason": request.reason,
+        }),
+    )?;
+    Ok(Json(CircuitBreakerSyncPayloadReport {
+        run_id: request.run_id,
+        breaker_record: record,
+        circuit_breakers: vec![circuit_breaker],
+        manager_trace_event_id,
+        reason: request.reason,
+    }))
+}
+
 async fn clear_circuit_breaker(
     Path(breaker_id): Path<String>,
     State(state): State<ManagerState>,
@@ -2753,7 +2833,7 @@ mod tests {
             State(state.clone()),
             Json(CircuitBreakerRequest {
                 security: security.clone(),
-                breaker_id: "breaker_s5_unit".to_string(),
+                breaker_id: "77777777-7777-4777-8777-777777777777".to_string(),
                 tenant_id: Some(tenant_id.clone()),
                 adapter: Some("artifact-store".to_string()),
                 action: Some("artifact.publish_external".to_string()),
@@ -2765,8 +2845,30 @@ mod tests {
         .0;
         assert_eq!(breaker.status, "tripped");
 
+        let sync_payload = read_circuit_breaker_sync_payload(
+            Path("77777777-7777-4777-8777-777777777777".to_string()),
+            State(state.clone()),
+            Json(CircuitBreakerSyncPayloadRequest {
+                security: security.clone(),
+                run_id: run_id.clone(),
+                reason: "unit sync".to_string(),
+            }),
+        )
+        .await
+        .expect("breaker sync payload exported")
+        .0;
+        assert_eq!(
+            sync_payload.breaker_record.trace_event_id,
+            breaker.trace_event_id
+        );
+        assert_eq!(sync_payload.circuit_breakers.len(), 1);
+        assert_eq!(
+            sync_payload.circuit_breakers[0].breaker_id.to_string(),
+            "77777777-7777-4777-8777-777777777777"
+        );
+
         let cleared = clear_circuit_breaker(
-            Path("breaker_s5_unit".to_string()),
+            Path("77777777-7777-4777-8777-777777777777".to_string()),
             State(state.clone()),
             Json(ClearCircuitBreakerRequest {
                 security: security.clone(),
@@ -2777,6 +2879,102 @@ mod tests {
         .expect("breaker cleared")
         .0;
         assert_eq!(cleared.status, "cleared");
+
+        let cleared_sync_payload = read_circuit_breaker_sync_payload(
+            Path("77777777-7777-4777-8777-777777777777".to_string()),
+            State(state.clone()),
+            Json(CircuitBreakerSyncPayloadRequest {
+                security: security.clone(),
+                run_id: run_id.clone(),
+                reason: "unit cleared sync".to_string(),
+            }),
+        )
+        .await
+        .expect_err("cleared breaker cannot be exported");
+        assert_eq!(cleared_sync_payload.body.code, "breaker_not_tripped");
+
+        let tenant_breaker = create_circuit_breaker(
+            State(state.clone()),
+            Json(CircuitBreakerRequest {
+                security: security.clone(),
+                breaker_id: "77777777-7777-4777-8777-777777777778".to_string(),
+                tenant_id: Some(tenant_id.clone()),
+                adapter: None,
+                action: None,
+                reason: "unit tenant breaker".to_string(),
+            }),
+        )
+        .await
+        .expect("tenant breaker created")
+        .0;
+        let tenant_payload = read_circuit_breaker_sync_payload(
+            Path(tenant_breaker.breaker_id.clone()),
+            State(state.clone()),
+            Json(CircuitBreakerSyncPayloadRequest {
+                security: security.clone(),
+                run_id: run_id.clone(),
+                reason: "unit tenant sync".to_string(),
+            }),
+        )
+        .await
+        .expect("tenant breaker sync payload exported")
+        .0;
+        assert_eq!(tenant_payload.circuit_breakers[0].scope.label(), "tenant");
+
+        let global_breaker = create_circuit_breaker(
+            State(state.clone()),
+            Json(CircuitBreakerRequest {
+                security: security.clone(),
+                breaker_id: "77777777-7777-4777-8777-777777777779".to_string(),
+                tenant_id: None,
+                adapter: None,
+                action: None,
+                reason: "unit global breaker".to_string(),
+            }),
+        )
+        .await
+        .expect("global breaker created")
+        .0;
+        let global_payload = read_circuit_breaker_sync_payload(
+            Path(global_breaker.breaker_id.clone()),
+            State(state.clone()),
+            Json(CircuitBreakerSyncPayloadRequest {
+                security: security.clone(),
+                run_id: run_id.clone(),
+                reason: "unit global sync".to_string(),
+            }),
+        )
+        .await
+        .expect("global breaker sync payload exported")
+        .0;
+        assert_eq!(global_payload.circuit_breakers[0].scope.label(), "global");
+
+        let invalid_id_breaker = create_circuit_breaker(
+            State(state.clone()),
+            Json(CircuitBreakerRequest {
+                security: security.clone(),
+                breaker_id: "breaker_s5_unit_invalid_id".to_string(),
+                tenant_id: None,
+                adapter: Some("artifact-store".to_string()),
+                action: None,
+                reason: "unit invalid id breaker".to_string(),
+            }),
+        )
+        .await
+        .expect("invalid id breaker stored")
+        .0;
+        let invalid_id_payload = read_circuit_breaker_sync_payload(
+            Path(invalid_id_breaker.breaker_id),
+            State(state.clone()),
+            Json(CircuitBreakerSyncPayloadRequest {
+                security: security.clone(),
+                run_id: run_id.clone(),
+                reason: "unit invalid id sync".to_string(),
+            }),
+        )
+        .await
+        .expect_err("invalid id breaker cannot become daemon sync payload");
+        assert_eq!(invalid_id_payload.body.code, "invalid_breaker_id");
 
         let missing_breaker = clear_circuit_breaker(
             Path("breaker_missing".to_string()),
@@ -3035,7 +3233,7 @@ mod tests {
             .contains(&"66666666-6666-4666-8666-666666666666".to_string()));
         assert!(audit
             .circuit_breaker_ids
-            .contains(&"breaker_s5_unit".to_string()));
+            .contains(&"77777777-7777-4777-8777-777777777777".to_string()));
         assert!(audit.kill_switch_ids.contains(&"kill_s5_unit".to_string()));
 
         let missing_scope = create_circuit_breaker(

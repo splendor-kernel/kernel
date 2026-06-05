@@ -161,6 +161,7 @@ S5_REQUIRED_EVENTS = {
     "approval.expired",
     "approval.revoked",
     "action.needs_approval",
+    "action.needs_intervention",
     "action.denied",
     "run.paused",
     "run.resumed",
@@ -200,7 +201,11 @@ def trace_record_kind(record: dict) -> str:
     return {
         "LoopTickStarted": "tick.started",
         "LoopTickCompleted": "tick.completed",
+        "PolicyInvoked": "policy.invoked",
         "PolicyCompleted": "policy.completed",
+        "CandidatesProposed": "actions.proposed",
+        "ConstraintsEvaluated": "constraints.evaluated",
+        "ActionVerificationStarted": "verification.started",
         "MessageQueued": "message.queued",
         "MessageDelivered": "message.delivered",
         "MessageConsumed": "message.consumed",
@@ -1038,6 +1043,25 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     missing_events = sorted(event for event in S5_REQUIRED_EVENTS if not event_ids.get(event))
     if missing_events:
         failures.append("s5_missing_required_trace_events:" + ",".join(missing_events))
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
+    audit = read_json(artifact_dir / "audit-report.json")
+    exported = audit.get("manager", {})
+    manager_events = exported.get("events", [])
+    manager_by_id = {str(event.get("trace_event_id", "")): event for event in manager_events if event.get("trace_event_id")}
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s5_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s5_trace_event_id_not_uuid:{event_name}:{trace_id}")
+            if trace_id not in trace_by_id and trace_id not in manager_by_id:
+                failures.append(f"s5_trace_event_id_missing_from_exports:{event_name}:{trace_id}")
+            if trace_id in trace_by_id and trace_record_kind(trace_by_id[trace_id]) != event_name:
+                failures.append(f"s5_trace_event_kind_mismatch:{event_name}:{trace_record_kind(trace_by_id[trace_id])}")
+            if trace_id in manager_by_id and manager_by_id[trace_id].get("event_type") != event_name:
+                failures.append(f"s5_manager_event_kind_mismatch:{event_name}:{manager_by_id[trace_id].get('event_type')}")
     if not scenario.get("run_ids") or not scenario.get("work_order_ids") or not scenario.get("approval_ids"):
         failures.append("s5_missing_identity_evidence")
     if not scenario.get("state_node_ids") or not scenario.get("state_hashes"):
@@ -1076,15 +1100,37 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     runtime_start = runtime_expired.get("start", {})
     if runtime_expired.get("create", {}).get("status") != 200 or runtime_start.get("status") not in {200, 500}:
         failures.append("s5_policy_expiry_not_runtime_exercised")
+    policy_expired_records = [trace_by_id[trace_id] for trace_id in event_ids.get("policy.expired", []) if trace_id in trace_by_id]
+    if not any(
+        trace_record_kind_payload(record).get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry"
+        and record.get("payload", {}).get("run_id") in scenario.get("run_ids", [])
+        for record in policy_expired_records
+    ):
+        failures.append("s5_policy_expired_trace_not_linked_to_ttl_run")
+    intervention_records = [trace_by_id[trace_id] for trace_id in event_ids.get("action.needs_intervention", []) if trace_id in trace_by_id]
+    if not any(
+        "approval_policy_expired" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        or "intervention_required" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        for record in intervention_records
+    ):
+        failures.append("s5_verifier_uncertainty_trace_not_explicit")
     breaker = read_json(artifact_dir / "circuit-breaker-report.json")
     if breaker.get("blocked_action", {}).get("status") != "Denied":
         failures.append("s5_circuit_breaker_action_not_denied")
     created_breaker_id = breaker.get("created", {}).get("breaker_id")
+    manager_payload = breaker.get("manager_sync_payload", {})
+    manager_record = manager_payload.get("breaker_record", {})
     synced_ids = set(breaker.get("synced", {}).get("breaker_ids", []))
     denied_breaker = breaker.get("blocked_action", {}).get("verification", {}).get("artifacts", {}).get("circuit_breaker", {})
     denied_breaker_id = denied_breaker.get("breaker_id") or denied_breaker.get("circuit_breaker", {}).get("breaker_id")
     if not created_breaker_id or created_breaker_id not in synced_ids or denied_breaker_id != created_breaker_id:
         failures.append("s5_circuit_breaker_not_manager_correlated")
+    if manager_record.get("breaker_id") != created_breaker_id or manager_record.get("trace_event_id") != breaker.get("created", {}).get("trace_event_id"):
+        failures.append("s5_circuit_breaker_sync_payload_not_manager_derived")
+    if not manager_payload.get("circuit_breakers") or manager_payload.get("reason") != "manager_propagated_breaker":
+        failures.append("s5_circuit_breaker_sync_payload_missing")
+    if breaker.get("synced", {}).get("trace_event_id") not in trace_by_id:
+        failures.append("s5_circuit_breaker_sync_trace_missing")
     if breaker.get("clear_wrong_scope", {}).get("status") != 403:
         failures.append("s5_clear_breaker_wrong_scope_not_forbidden")
     kill = read_json(artifact_dir / "kill-switch-report.json")
@@ -1106,10 +1152,12 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s5_replay_suppression_missing")
     if "requested" not in replay.get("approval_lifecycles", []) or "granted" not in replay.get("approval_lifecycles", []):
         failures.append("s5_replay_missing_approval_explanation")
-    audit = read_json(artifact_dir / "audit-report.json")
-    exported = audit.get("manager", {})
     if exported.get("exported") is not True or not exported.get("approval_ids") or not exported.get("policy_bundle_ids") or not exported.get("circuit_breaker_ids") or not exported.get("kill_switch_ids"):
         failures.append("s5_governance_audit_missing_links")
+    required_manager_events = {"circuit_breaker.tripped", "circuit_breaker.sync_payload.exported", "circuit_breaker.cleared", "kill_switch.activated", "governance.audit.exported"}
+    missing_manager_events = sorted(required_manager_events - {event.get("event_type") for event in manager_events})
+    if missing_manager_events:
+        failures.append("s5_governance_audit_missing_event_types:" + ",".join(missing_manager_events))
     anti = read_json(artifact_dir / "anti-drift-results.json")
     for key in ["private_helper_only_e2e", "gateway_bypass", "governance_plane_direct_runtime_mutation", "broad_action_authority", "replay_side_effects_allowed_default"]:
         if anti.get(key) is not False:
