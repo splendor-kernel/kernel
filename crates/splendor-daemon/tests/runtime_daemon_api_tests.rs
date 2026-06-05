@@ -358,6 +358,42 @@ fn public_caller_credential_header(scopes: Vec<&str>) -> HeaderValue {
     .expect("public credential header")
 }
 
+fn public_caller_credential_header_with_revocation(
+    scopes: Vec<&str>,
+    revocation: Value,
+) -> HeaderValue {
+    HeaderValue::from_str(
+        &json!({
+            "credential_id": "cred_public_header",
+            "principal": {
+                "app": {
+                    "app_principal_id": "app_public_header",
+                    "label": "public header app"
+                },
+                "client_principal_id": "client_public_header",
+                "label": "public header client"
+            },
+            "scopes": scopes,
+            "binding": {
+                "tenant": {
+                    "tenant_id": TenantId::new().to_string()
+                }
+            },
+            "audience": {
+                "daemon": {
+                    "daemon_id": "daemon_local"
+                }
+            },
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expires_at"),
+            "revocation": revocation
+        })
+        .to_string(),
+    )
+    .expect("public credential header")
+}
+
 #[tokio::test]
 async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     let state = DaemonState::local_dev();
@@ -2458,4 +2494,95 @@ async fn credential_header_rejections_fail_closed_for_malformed_and_invalid_auth
         call_empty_with_credential(locked_app, Method::GET, "/health", &missing_scope).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error.code, "missing_scope");
+}
+
+#[tokio::test]
+async fn public_credential_header_rejections_cover_revocation_and_scope_branches() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let revoked = public_caller_credential_header_with_revocation(
+        vec!["splendor.health.read"],
+        json!({"revoked": {"reason": "operator_revoked"}}),
+    );
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app.clone(), Method::GET, "/health", revoked)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_revoked");
+
+    let malformed_revocation =
+        public_caller_credential_header_with_revocation(vec!["splendor.health.read"], json!(null));
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        malformed_revocation,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let unsupported_scope = public_caller_credential_header(vec!["splendor.runs.create"]);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app, Method::GET, "/health", unsupported_scope)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+}
+
+#[tokio::test]
+async fn resume_without_signed_work_order_fails_before_tick_execution() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let request = create_request(
+        tenant_id,
+        agent_id,
+        vec![DaemonActionCandidate {
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resume_request = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("operator retry".to_string()),
+        approval_evidence: None,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(resume_request).expect("resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_work_order");
+
+    let (status, inspected): (StatusCode, RunInspectResponse) =
+        call_empty(app, Method::GET, &format!("/runs/{}", created.run_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.status, RunStatus::Pending);
+    assert_eq!(inspected.ticks, 0);
+    assert_eq!(inspected.adapter_executions, 0);
 }

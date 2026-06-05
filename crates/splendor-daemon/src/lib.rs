@@ -2299,6 +2299,10 @@ mod tests {
         let scheduler_error = ApiError::from(SchedulerError::NoAgents);
         assert_eq!(scheduler_error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(scheduler_error.body.code, "scheduler_error");
+        let loop_error = ApiError::from(LoopError::Policy("unit policy failure".to_string()));
+        assert_eq!(loop_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(loop_error.body.code, "loop_error");
+        assert_eq!(loop_error.body.message, "policy error: unit policy failure");
 
         let run_not_found = trace_error(TraceStoreError::RunNotFound);
         assert_eq!(run_not_found.status, StatusCode::NOT_FOUND);
@@ -2461,6 +2465,26 @@ mod tests {
         assert_eq!(registrations.len(), 1);
         assert_eq!(registrations[0].name, "policy_only");
         assert_eq!(registrations[0].adapter, "daemon.local");
+
+        let mut direct_registration_request = request.clone();
+        direct_registration_request.policy_actions = vec![DaemonActionCandidate {
+            action: Action {
+                name: "policy_fallback".to_string(),
+                params: serde_json::json!({}),
+                side_effect_class: splendor_types::SideEffectClass::ReadOnly,
+                cost_estimate: None,
+                required_permissions: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+            },
+            adapter: None,
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }];
+        let registrations = registrations_for_request(&direct_registration_request, &work_order);
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[1].name, "policy_fallback");
+        assert_eq!(registrations[1].adapter, "daemon.local");
 
         let lock = lock_error();
         assert_eq!(lock.status, StatusCode::INTERNAL_SERVER_ERROR);
