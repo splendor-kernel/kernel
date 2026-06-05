@@ -43,6 +43,8 @@ use splendor_types::{
     WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::format_description::well_known::Rfc3339;
@@ -449,15 +451,92 @@ impl ActionAdapter for RecordingAdapter {
             ));
         }
         let execution = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
+        let simulator = submit_device_sim_action(action, execution)?;
         Ok(AdapterResult {
             output: serde_json::json!({
                 "adapter": "daemon.recording",
                 "execution": execution,
                 "action": action.action.name,
+                "device_sim": simulator,
             }),
             satisfied_postconditions: action.action.postconditions.clone(),
         })
     }
+}
+
+fn submit_device_sim_action(
+    action: &ActionRequest,
+    execution: u64,
+) -> Result<Option<serde_json::Value>, AdapterError> {
+    let Ok(base_url) = std::env::var("SPLENDOR_DEVICE_SIM_URL") else {
+        return Ok(None);
+    };
+    submit_device_sim_action_to(&base_url, action, execution)
+}
+
+fn submit_device_sim_action_to(
+    base_url: &str,
+    action: &ActionRequest,
+    execution: u64,
+) -> Result<Option<serde_json::Value>, AdapterError> {
+    let (host, port) = parse_http_host_port(base_url)?;
+    let body = serde_json::json!({
+        "action_id": action.action_id,
+        "action_name": action.action.name,
+        "tenant_id": action.tenant_id,
+        "agent_id": action.agent_id,
+        "run_id": action.run_id,
+        "adapter_execution": execution,
+        "params": action.action.params,
+    });
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_payload_error:{error}")))?;
+    let mut stream = TcpStream::connect((host.as_str(), port))
+        .map_err(|error| AdapterError::Failed(format!("device_sim_connect_error:{error}")))?;
+    let request = format!(
+        "POST /actions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(&body_bytes))
+        .map_err(|error| AdapterError::Failed(format!("device_sim_write_error:{error}")))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_read_error:{error}")))?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if !status_line.contains(" 200 ") {
+        return Err(AdapterError::Failed(format!(
+            "device_sim_status_error:{status_line}"
+        )));
+    }
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| AdapterError::Failed("device_sim_missing_body".to_string()))?;
+    let parsed = serde_json::from_str(body)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_response_error:{error}")))?;
+    Ok(Some(parsed))
+}
+
+fn parse_http_host_port(base_url: &str) -> Result<(String, u16), AdapterError> {
+    let rest = base_url
+        .strip_prefix("http://")
+        .ok_or_else(|| AdapterError::Failed("device_sim_url_must_be_http".to_string()))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| AdapterError::Failed("device_sim_url_missing_port".to_string()))?;
+    if host.trim().is_empty() {
+        return Err(AdapterError::Failed(
+            "device_sim_url_missing_host".to_string(),
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| AdapterError::Failed(format!("device_sim_url_bad_port:{error}")))?;
+    Ok((host.to_string(), port))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2800,6 +2879,7 @@ async fn sync_device_trace_buffer(
     )?;
     let audit_attribution = required_audit(security.audit_attribution)?;
     let mut expected = None;
+    let mut expected_prev_hash = None;
     for record in &request.records {
         if let Some(prev) = expected {
             if record.sequence <= prev {
@@ -2817,7 +2897,22 @@ async fn sync_device_trace_buffer(
                 }));
             }
         }
+        if record.prev_event_hash != expected_prev_hash {
+            let trace_event_id = record_device_audit(
+                &state,
+                "trace.sync.failed",
+                audit_attribution.clone(),
+                serde_json::json!({"node_id": node_id, "reason": "trace_sync_hash_chain_mismatch"}),
+            )?;
+            return Ok(Json(DeviceTraceBufferSyncResponse {
+                accepted: false,
+                accepted_records: 0,
+                trace_event_id,
+                reason_code: Some("trace_sync_hash_chain_mismatch".to_string()),
+            }));
+        }
         expected = Some(record.sequence);
+        expected_prev_hash = Some(record.event_hash.clone());
     }
     if request.simulate_tamper {
         let trace_event_id = record_device_audit(
@@ -3884,6 +3979,9 @@ mod tests {
     use super::*;
     use axum::extract::Path;
     use splendor_store::{InMemoryTraceStore, TraceStore};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     fn unit_audit() -> AuditAttribution {
         AuditAttribution {
@@ -4054,6 +4152,141 @@ mod tests {
             safety_context,
             operator_intervention_evidence: None,
         }
+    }
+
+    fn unit_action_request(action_name: &str) -> ActionRequest {
+        ActionRequest {
+            action_id: ActionId::new(),
+            tenant_id: TenantId::new(),
+            agent_id: splendor_types::AgentId::new(),
+            run_id: RunId::new(),
+            action: physical_action(action_name),
+            adapter: Some("device-sim".to_string()),
+            quota_usage: splendor_types::QuotaUsage::single_action(),
+            satisfied_preconditions: Vec::new(),
+            requested_at: OffsetDateTime::now_utc(),
+            approval_evidence: None,
+        }
+    }
+
+    #[test]
+    fn device_sim_url_parser_and_disabled_env_path_are_explicit() {
+        assert_eq!(
+            parse_http_host_port("http://device-sim:8086/path").expect("valid url"),
+            ("device-sim".to_string(), 8086)
+        );
+        for invalid in [
+            "https://device-sim:8086",
+            "http://device-sim",
+            "http://:8086",
+            "http://device-sim:not-a-port",
+        ] {
+            assert!(parse_http_host_port(invalid).is_err());
+        }
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+        assert!(
+            submit_device_sim_action(&unit_action_request("read_battery"), 7)
+                .expect("disabled simulator is allowed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn device_sim_submit_posts_gateway_executed_action_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let bytes = stream.read(&mut buffer).expect("read simulator request");
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                let text = String::from_utf8_lossy(&request);
+                if text.contains("\"action_name\":\"inspect_zone\"")
+                    && text.contains("\"adapter_execution\":42")
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /actions HTTP/1.1"));
+            assert!(request.contains("\"action_name\":\"inspect_zone\""));
+            assert!(request.contains("\"adapter_execution\":42"));
+            let body = serde_json::json!({"accepted": true, "counter": 1});
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.to_string().len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write simulator response");
+        });
+        let response = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("inspect_zone"),
+            42,
+        )
+        .expect("submit to simulator")
+        .expect("simulator response");
+        assert_eq!(response["accepted"], true);
+        assert_eq!(response["counter"], 1);
+        handle.join().expect("simulator thread joins");
+    }
+
+    #[test]
+    fn device_sim_submit_rejects_non_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer).expect("read request bytes");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("write failure response");
+        });
+        let error = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("read_battery"),
+            1,
+        )
+        .expect_err("non-200 simulator responses fail closed");
+        assert!(error.to_string().contains("device_sim_"));
+        handle.join().expect("simulator thread joins");
+    }
+
+    #[test]
+    fn device_sim_submit_rejects_malformed_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer).expect("read request bytes");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+                )
+                .expect("write malformed success response");
+        });
+        let error = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("read_battery"),
+            1,
+        )
+        .expect_err("malformed simulator bodies fail closed");
+        assert!(error.to_string().contains("device_sim_"));
+        handle.join().expect("simulator thread joins");
     }
 
     #[test]

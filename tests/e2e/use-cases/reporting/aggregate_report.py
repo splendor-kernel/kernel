@@ -197,6 +197,11 @@ S6_REQUIRED_NEGATIVES = {
     "operator_approval_after_expiry_rejected",
     "trace_sync_tamper_or_reordering_detected",
 }
+S6_REQUIRED_SECURITY_NEGATIVES = {
+    "device_endpoint_missing_credential_rejected",
+    "device_endpoint_wrong_audience_rejected",
+    "device_endpoint_wrong_tenant_rejected",
+}
 S6_REQUIRED_EVENTS = {
     "device.profile.registered",
     "policy.cache.loaded",
@@ -217,6 +222,32 @@ S6_REQUIRED_EVENTS = {
     "trace.buffer.appended",
     "trace.sync.completed",
     "trace.sync.failed",
+}
+S6_REQUIRED_SIMULATED_ACTION_LABELS = {
+    "read_battery_policy_warmup": 1,
+    "inspect_zone_from_typed_cloud_proposal": 1,
+    "move_to_waypoint_from_typed_cloud_proposal": 1,
+    "capture_image": 1,
+    "read_sensor_summary_offline": 1,
+    "return_to_base_low_battery_safe": 1,
+    "upload_trace_summary": 1,
+    "ambiguous_privacy_denied_until_operator": 0,
+    "operator_granted_capture": 1,
+    "geofence_breach_denied": 0,
+    "low_battery_needs_intervention": 0,
+    "expired_policy_cache_denied": 0,
+    "cloud_helper_direct_authority_denied": 0,
+    "operator_wrong_scope_denied": 0,
+    "operator_expired_evidence_denied": 0,
+}
+S6_DENIED_SIMULATOR_LABELS = {
+    "ambiguous_privacy_denied_until_operator",
+    "geofence_breach_denied",
+    "low_battery_needs_intervention",
+    "expired_policy_cache_denied",
+    "cloud_helper_direct_authority_denied",
+    "operator_wrong_scope_denied",
+    "operator_expired_evidence_denied",
 }
 
 
@@ -1256,6 +1287,8 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "device-safety-evidence.json",
         "operator-intervention.json",
         "trace-sync-report.json",
+        "device-sim-counters.json",
+        "security-negatives.json",
         "state-export.json",
         "replay-report.json",
         "audit-report.json",
@@ -1281,7 +1314,10 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     missing_negatives = sorted(S6_REQUIRED_NEGATIVES - set(negatives))
     if missing_negatives:
         failures.append("s6_missing_negative_cases:" + ",".join(missing_negatives))
-    for case in S6_REQUIRED_NEGATIVES & set(negatives):
+    missing_security_negatives = sorted(S6_REQUIRED_SECURITY_NEGATIVES - set(negatives))
+    if missing_security_negatives:
+        failures.append("s6_missing_security_negative_cases:" + ",".join(missing_security_negatives))
+    for case in (S6_REQUIRED_NEGATIVES | S6_REQUIRED_SECURITY_NEGATIVES) & set(negatives):
         if negatives.get(case, {}).get("passed") is not True:
             failures.append(f"s6_negative_case_not_asserted:{case}")
     event_ids = scenario.get("required_trace_event_ids", {})
@@ -1303,23 +1339,45 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if not {"set_motor_pwm", "disable_firmware_safety", "bypass_collision_avoidance", "ignore_emergency_stop"} <= forbidden:
         failures.append("s6_device_profile_missing_forbidden_action_classes")
     allowed = set(profile_body.get("allowed_physical_actions", []))
-    if not {"read_battery", "move_to_waypoint", "capture_image", "return_to_base", "upload_trace_summary"} <= allowed:
+    if not {"read_battery", "read_sensor_summary", "inspect_zone", "move_to_waypoint", "capture_image", "return_to_base", "upload_trace_summary"} <= allowed:
         failures.append("s6_device_profile_missing_high_level_actions")
     cache = read_json(artifact_dir / "policy-cache-status.json")
     if cache.get("loaded") is not True or cache.get("expired") is not False:
         failures.append("s6_policy_cache_status_not_loaded")
     helper = read_json(artifact_dir / "cloud-helper-proposal.json")
-    if helper.get("proposal", {}).get("direct_actuator_authority") is not False:
+    helper_message = helper.get("message", {})
+    helper_payload = helper.get("proposal", {})
+    if helper_payload.get("direct_actuator_authority") is not False:
         failures.append("s6_cloud_helper_has_direct_actuator_authority")
+    for field in ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "causal_parent", "created_at"]:
+        if not helper_message.get(field):
+            failures.append(f"s6_cloud_helper_missing_typed_message_field:{field}")
+    if helper_message.get("message_id") not in scenario.get("message_ids", []):
+        failures.append("s6_cloud_helper_message_id_missing_from_scenario")
+    if helper_message.get("schema") != "splendor.message.task_request.v1":
+        failures.append("s6_cloud_helper_wrong_message_schema")
+    if helper_message.get("requires_response") is not False:
+        failures.append("s6_cloud_helper_requires_response_unexpected")
+    if helper_payload.get("proposal_id") != helper.get("local_validation_inputs", {}).get("inspect_zone", {}).get("cloud_helper_proposal_id"):
+        failures.append("s6_inspect_zone_not_linked_to_cloud_helper_proposal")
+    if helper.get("local_validation_outcomes", {}).get("inspect_zone", {}).get("status") != "Executed":
+        failures.append("s6_inspect_zone_not_executed_through_physical_endpoint")
     if helper.get("direct_attempt", {}).get("status") != "Denied":
         failures.append("s6_cloud_helper_direct_attempt_not_denied")
     safety = read_json(artifact_dir / "device-safety-evidence.json")
     if safety.get("positive", {}).get("safe_actions_executed") is not True:
         failures.append("s6_safe_high_level_actions_not_executed")
+    safe_actions = safety.get("safe_actions", {})
+    if safe_actions.get("inspect_zone", {}).get("status") != "Executed":
+        failures.append("s6_safety_evidence_missing_inspect_zone_execution")
     denials = safety.get("denials", {})
     for key in ["geofence", "low_battery", "expired_policy", "cloud_direct"]:
         if not denials.get(key):
             failures.append(f"s6_missing_safety_denial:{key}")
+        elif denials.get(key, {}).get("status") not in {"Denied", "NeedsIntervention"}:
+            failures.append(f"s6_safety_denial_wrong_status:{key}")
+        elif not denials.get(key, {}).get("verification", {}).get("reasons"):
+            failures.append(f"s6_safety_denial_missing_reason_codes:{key}")
     operator = read_json(artifact_dir / "operator-intervention.json")
     if operator.get("ambiguous", {}).get("status") != "NeedsIntervention":
         failures.append("s6_ambiguous_action_not_needs_intervention")
@@ -1332,9 +1390,36 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s6_trace_sync_not_completed")
     if trace_sync.get("tamper", {}).get("accepted") is not False or trace_sync.get("reordered", {}).get("accepted") is not False:
         failures.append("s6_trace_sync_tamper_or_reorder_not_detected")
+    if trace_sync.get("tamper", {}).get("reason_code") != "trace_sync_hash_chain_mismatch":
+        failures.append("s6_trace_sync_tamper_wrong_reason")
+    if trace_sync.get("tampered_record_mutation") != "prev_event_hash" or trace_sync.get("reordered_records") is not True:
+        failures.append("s6_trace_sync_not_mutating_real_records")
+    simulator = read_json(artifact_dir / "device-sim-counters.json")
+    simulator_evidence = {item.get("label"): item for item in simulator.get("evidence", [])}
+    missing_sim_labels = sorted(set(S6_REQUIRED_SIMULATED_ACTION_LABELS) - set(simulator_evidence))
+    if missing_sim_labels:
+        failures.append("s6_missing_simulator_counter_labels:" + ",".join(missing_sim_labels))
+    for label, expected_delta in S6_REQUIRED_SIMULATED_ACTION_LABELS.items():
+        item = simulator_evidence.get(label, {})
+        if item.get("expected_sim_delta") != expected_delta or item.get("total_delta") != expected_delta:
+            failures.append(f"s6_simulator_counter_delta_mismatch:{label}")
+        if expected_delta == 1 and item.get("action_delta") != 1:
+            failures.append(f"s6_simulator_action_delta_mismatch:{label}")
+        if label in S6_DENIED_SIMULATOR_LABELS and item.get("total_delta") != 0:
+            failures.append(f"s6_denied_action_reached_simulator:{label}")
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("simulator_actuator_calls_replayed") is not False:
         failures.append("s6_replay_suppression_missing")
+    if replay.get("simulator_counter_before") != replay.get("simulator_counter_after"):
+        failures.append("s6_replay_changed_simulator_counters")
+    if simulator.get("before_replay") != simulator.get("after_replay"):
+        failures.append("s6_device_sim_counter_artifact_replay_changed")
+    security = read_json(artifact_dir / "security-negatives.json")
+    if security.get("missing_credential_status", {}).get("status") not in {401, 403} or security.get("missing_credential_action", {}).get("status") not in {401, 403}:
+        failures.append("s6_missing_credential_not_rejected")
+    for key in ["wrong_audience_status", "wrong_tenant_status", "wrong_audience_action", "wrong_tenant_action"]:
+        if security.get(key, {}).get("status") != 403:
+            failures.append(f"s6_security_negative_not_forbidden:{key}")
     audit = read_json(artifact_dir / "audit-report.json")
     if audit.get("cloud_helper_direct_action_authorized") is not False or audit.get("cloud_helper_authority") != "proposal_only":
         failures.append("s6_audit_does_not_prove_cloud_helper_proposal_only")

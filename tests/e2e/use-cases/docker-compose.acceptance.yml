@@ -80,7 +80,7 @@ services:
   device-sim:
     image: python:3.12-slim
     working_dir: /fixtures
-    command: ["python", "-m", "http.server", "8086"]
+    command: ["python", "device_sim.py"]
     volumes:
       - ./fixtures:/fixtures:ro
 
@@ -151,6 +151,7 @@ services:
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8093
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000306
+      SPLENDOR_DEVICE_SIM_URL: http://device-sim:8086
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace

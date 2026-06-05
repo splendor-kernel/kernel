@@ -1016,7 +1016,9 @@ components:
         accepted: { type: boolean }
         accepted_records: { type: integer, minimum: 0 }
         trace_event_id: { type: string, format: uuid }
-        reason_code: { type: string }
+        reason_code:
+          type: string
+          enum: [trace_sync_hash_chain_mismatch, trace_sync_order_mismatch, trace_sync_tamper_simulated, run_not_found, node_not_found]
     ApiError:
       type: object
       required: [code, message, details]
