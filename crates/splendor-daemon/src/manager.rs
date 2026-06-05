@@ -2270,6 +2270,17 @@ mod tests {
         (status, parsed)
     }
 
+    #[tokio::test]
+    async fn manager_health_endpoint_reports_component_without_mutation() {
+        let state = ManagerState::local_acceptance();
+        let (status, body): (StatusCode, serde_json::Value) =
+            manager_call(router(state), Method::GET, "/health", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["component"], "splendor-manager");
+    }
+
     #[test]
     fn manager_read_endpoints_require_scope_audience_binding_expiry_and_revocation() {
         let state = ManagerState::local_acceptance();
@@ -2763,8 +2774,11 @@ mod tests {
         let addr = listener.local_addr().expect("mock addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept post_json request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read post_json request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .expect("set post_json read timeout");
+            let mut request = Vec::new();
+            let _ = stream.read_to_end(&mut request);
             let body = r#"{"cancelled":true}"#;
             write!(
                 stream,
@@ -2788,8 +2802,11 @@ mod tests {
         let addr = listener.local_addr().expect("prefixed mock addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept prefixed request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read prefixed request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .expect("set prefixed read timeout");
+            let mut request = Vec::new();
+            let _ = stream.read_to_end(&mut request);
             write!(
                 stream,
                 "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
