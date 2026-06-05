@@ -1082,6 +1082,9 @@ export type EndpointScope =
   | "policies_revoke"
   | "approvals_manage"
   | "governance_control"
+  | "device_register"
+  | "device_read"
+  | "operator_intervene"
   | "nodes_register"
   | "instances_register"
   | "nodes_heartbeat"
@@ -1657,7 +1660,10 @@ export const ENDPOINT_SCOPE_VALUES = [
   "PoliciesPublish",
   "PoliciesRevoke",
   "ApprovalsManage",
-  "GovernanceControl"
+  "GovernanceControl",
+  "DeviceRegister",
+  "DeviceRead",
+  "OperatorIntervene"
 ] as const;
 
 export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
@@ -1686,6 +1692,9 @@ export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
   policies_revoke: "splendor.policies.revoke",
   approvals_manage: "splendor.approvals.manage",
   governance_control: "splendor.governance.control",
+  device_register: "splendor.device.register",
+  device_read: "splendor.device.read",
+  operator_intervene: "splendor.operator.intervene",
   nodes_register: "splendor.nodes.register",
   instances_register: "splendor.instances.register",
   nodes_heartbeat: "splendor.nodes.heartbeat",

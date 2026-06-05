@@ -716,6 +716,96 @@ paths:
       responses:
         '200': { description: Audit events., content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ManagerAuditEvent' } } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /devices/profiles:
+    post:
+      summary: Register a resident physical/edge device profile.
+      operationId: registerDeviceProfile
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileRequest' } } } }
+      responses:
+        '200': { description: Device profile registered., content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /devices/{node_id}/status:
+    get:
+      summary: Read device safety and runtime status; never authorizes actions.
+      operationId: getDeviceStatus
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200': { description: Device status., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceRuntimeProfile' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/policy-cache:
+    get:
+      summary: Read local policy cache status; expired high-risk offline actions fail closed.
+      operationId: getPolicyCacheStatus
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200': { description: Policy cache status., content: { application/json: { schema: { $ref: '#/components/schemas/DevicePolicyCacheStatus' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/actions:
+    post:
+      summary: Submit a high-level bounded physical action through gateway and safety verification.
+      operationId: submitPhysicalAction
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitPhysicalActionRequest' } } } }
+      responses:
+        '200': { description: Physical action outcome., content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /operator/interventions:
+    post:
+      summary: Request local operator intervention for an ambiguous physical action.
+      operationId: requestOperatorIntervention
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention requested., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /operator/interventions/{intervention_id}/grant:
+    post:
+      summary: Grant scoped expiring local operator intervention.
+      operationId: grantOperatorIntervention
+      parameters:
+        - name: intervention_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention granted., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /operator/interventions/{intervention_id}/deny:
+    post:
+      summary: Deny scoped local operator intervention.
+      operationId: denyOperatorIntervention
+      parameters:
+        - name: intervention_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention denied., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/trace-buffer/sync:
+    post:
+      summary: Sync an offline device trace buffer with ordering and tamper checks.
+      operationId: syncDeviceTraceBuffer
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncRequest' } } } }
+      responses:
+        '200': { description: Device trace sync result., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 components:
   parameters:
     RunId:
@@ -732,6 +822,13 @@ components:
       description: JSON-encoded CallerCredential for non-dev health/capability reads. Explicit local-dev mode may omit it only on loopback or Unix-socket transports.
       schema:
         type: string
+    NodeId:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   responses:
     BadRequest:
       description: Malformed request.
@@ -770,6 +867,156 @@ components:
           schema:
             $ref: '#/components/schemas/ApiError'
   schemas:
+    RegisterDeviceProfileRequest:
+      type: object
+      required: [credential, audit_attribution, profile]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        profile: { $ref: '#/components/schemas/DeviceRuntimeProfile' }
+    RegisterDeviceProfileResponse:
+      type: object
+      required: [profile, trace_event_id]
+      properties:
+        profile: { $ref: '#/components/schemas/DeviceRuntimeProfile' }
+        trace_event_id: { type: string, format: uuid }
+    DeviceRuntimeProfile:
+      type: object
+      required: [node_id, tenant_id, device_kind, capabilities, allowed_physical_actions, forbidden_action_classes, safety_constraints, runtime_mode, safety_status, policy_cache, trace_buffer, registered_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        device_kind:
+          type: string
+          enum: [drone_sim]
+        capabilities:
+          type: array
+          items: { type: string }
+        allowed_physical_actions:
+          type: array
+          items:
+            type: string
+            enum: [read_battery, read_sensor_summary, read_map, move_to_waypoint, return_to_base, dock, inspect_zone, capture_image, pause_mission, resume_mission, request_operator_override, notify_operator, upload_trace_summary]
+        forbidden_action_classes:
+          type: array
+          items:
+            type: string
+            enum: [set_motor_pwm, raw_actuator_write, disable_firmware_safety, bypass_collision_avoidance, modify_flight_controller_internals, ignore_emergency_stop, hard_real_time_stabilization]
+        safety_constraints: { type: object, additionalProperties: true }
+        runtime_mode:
+          type: string
+          enum: [resident]
+        safety_status: { type: object, additionalProperties: true }
+        policy_cache: { $ref: '#/components/schemas/DevicePolicyCacheStatus' }
+        trace_buffer: { $ref: '#/components/schemas/DeviceTraceBufferStatus' }
+        registered_at: { type: string, format: date-time }
+    DevicePolicyCacheStatus:
+      type: object
+      required: [policy_id, loaded, ttl_seconds, expires_at, expired]
+      properties:
+        policy_id: { type: string }
+        loaded: { type: boolean }
+        ttl_seconds: { type: integer, minimum: 0 }
+        expires_at: { type: string, format: date-time }
+        expired: { type: boolean }
+    DeviceTraceBufferStatus:
+      type: object
+      required: [enabled, buffered_records, integrity]
+      properties:
+        enabled: { type: boolean }
+        buffered_records: { type: integer, minimum: 0 }
+        integrity: { type: string }
+    SubmitPhysicalActionRequest:
+      allOf:
+        - $ref: '#/components/schemas/SubmitActionRequest'
+        - type: object
+          required: [safety_context]
+          properties:
+            safety_context: { $ref: '#/components/schemas/SafetyContext' }
+            operator_intervention_evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
+    SafetyContext:
+      type: object
+      required: [allowed_zone_refs, privacy_clear, human_proximity_clear, emergency_stop_clear, offline, policy_cache_expired, high_risk, cloud_helper_direct_authority]
+      properties:
+        allowed_zone_refs: { type: array, items: { type: string } }
+        zone_ref: { type: string }
+        altitude_m: { type: number }
+        max_altitude_m: { type: number }
+        battery_percent: { type: number, minimum: 0, maximum: 1 }
+        privacy_clear: { type: boolean }
+        human_proximity_clear: { type: boolean }
+        emergency_stop_clear: { type: boolean }
+        offline: { type: boolean }
+        policy_cache_expired: { type: boolean }
+        high_risk: { type: boolean }
+        cloud_helper_direct_authority: { type: boolean }
+        cloud_helper_proposal_id: { type: string }
+    OperatorInterventionRequest:
+      type: object
+      required: [credential, audit_attribution, intervention_id, tenant_id, agent_id, run_id, node_id, action_name, reason, expires_at]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        action_name: { type: string }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+    OperatorDecisionRequest:
+      type: object
+      required: [credential, audit_attribution, reason]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+    OperatorInterventionEvidence:
+      type: object
+      required: [intervention_id, tenant_id, run_id, action_name, decision, expires_at]
+      properties:
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        action_name: { type: string }
+        decision: { type: string, enum: [granted, denied] }
+        expires_at: { type: string, format: date-time }
+    OperatorInterventionRecord:
+      type: object
+      required: [intervention_id, tenant_id, agent_id, run_id, node_id, action_name, status, reason, expires_at, trace_event_id]
+      properties:
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        action_name: { type: string }
+        status: { type: string, enum: [requested, granted, denied] }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+        trace_event_id: { type: string, format: uuid }
+        evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
+    DeviceTraceBufferSyncRequest:
+      type: object
+      required: [credential, audit_attribution, run_id, records]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        run_id: { type: string, format: uuid }
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/TraceRecord' }
+        simulate_tamper: { type: boolean, default: false }
+    DeviceTraceBufferSyncResponse:
+      type: object
+      required: [accepted, accepted_records, trace_event_id]
+      properties:
+        accepted: { type: boolean }
+        accepted_records: { type: integer, minimum: 0 }
+        trace_event_id: { type: string, format: uuid }
+        reason_code: { type: string }
     ApiError:
       type: object
       required: [code, message, details]
@@ -821,6 +1068,9 @@ components:
         - policies_revoke
         - approvals_manage
         - governance_control
+        - device_register
+        - device_read
+        - operator_intervene
         - nodes_register
         - instances_register
         - nodes_heartbeat

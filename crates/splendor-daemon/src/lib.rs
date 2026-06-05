@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
     AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
+    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
@@ -31,15 +32,15 @@ use splendor_store::{
     TraceStore, TraceStoreError,
 };
 use splendor_types::{
-    validate_policy_bundle, AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    AuditAttribution, CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience,
-    CredentialBinding, DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError,
-    DaemonSecurityRequest, EndpointScope, GatewayVerificationState, InsecureDevMode,
-    LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
-    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
-    RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId, WorkOrder,
-    WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
-    WorkOrderValidationError,
+    is_allowed_physical_action, validate_policy_bundle, AppPrincipal, ApprovalEvidence,
+    ApprovalPolicy, ApprovalTraceContext, AuditAttribution, CallerCredential, CircuitBreaker,
+    ClientPrincipal, CredentialAudience, CredentialBinding, DaemonEndpoint, DaemonSecurityDecision,
+    DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
+    InsecureDevMode, LocalTransportBinding, NodeId, PerceptProvenance, PolicyBundleEnvelope,
+    PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
+    PolicyBundleValidationError, RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId,
+    WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +61,9 @@ struct DaemonInner {
     policy_bundle_keyring: PolicyBundleKeyring,
     work_order_keyring: WorkOrderKeyring,
     runtime_available: AtomicBool,
+    device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
+    operator_interventions: Mutex<HashMap<String, OperatorInterventionRecord>>,
+    device_audit: Mutex<Vec<DeviceAuditEvent>>,
 }
 
 impl DaemonState {
@@ -83,6 +87,9 @@ impl DaemonState {
                 policy_bundle_keyring: config.policy_bundle_keyring,
                 work_order_keyring: config.work_order_keyring,
                 runtime_available: AtomicBool::new(true),
+                device_profiles: Mutex::new(HashMap::new()),
+                operator_interventions: Mutex::new(HashMap::new()),
+                device_audit: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -199,6 +206,29 @@ pub fn router(state: DaemonState) -> Router {
         .route("/runs/:run_id/traces/export", post(export_traces))
         .route("/runs/:run_id/replay", post(replay_run))
         .route("/actions", post(submit_action))
+        .route("/devices/profiles", post(register_device_profile))
+        .route("/devices/:node_id/status", get(get_device_status))
+        .route(
+            "/devices/:node_id/policy-cache",
+            get(get_policy_cache_status),
+        )
+        .route("/devices/:node_id/actions", post(submit_physical_action))
+        .route(
+            "/operator/interventions",
+            post(request_operator_intervention),
+        )
+        .route(
+            "/operator/interventions/:intervention_id/grant",
+            post(grant_operator_intervention),
+        )
+        .route(
+            "/operator/interventions/:intervention_id/deny",
+            post(deny_operator_intervention),
+        )
+        .route(
+            "/devices/:node_id/trace-buffer/sync",
+            post(sync_device_trace_buffer),
+        )
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/capabilities", get(capabilities))
@@ -230,6 +260,7 @@ struct RunSlot {
     state_store: Arc<dyn StateStore>,
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
+    tenant_registry: TenantRegistry,
     circuit_breakers: SharedCircuitBreakerEvaluator,
     policy_cache: PolicyCache,
     percept_queue: PerceptQueue,
@@ -756,6 +787,172 @@ pub struct SubmitActionRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct DeviceRuntimeProfile {
+    pub node_id: NodeId,
+    pub tenant_id: TenantId,
+    pub device_kind: String,
+    pub capabilities: Vec<String>,
+    pub allowed_physical_actions: Vec<String>,
+    pub forbidden_action_classes: Vec<String>,
+    pub safety_constraints: serde_json::Value,
+    pub runtime_mode: String,
+    pub safety_status: serde_json::Value,
+    pub policy_cache: DevicePolicyCacheStatus,
+    pub trace_buffer: DeviceTraceBufferStatus,
+    pub registered_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DevicePolicyCacheStatus {
+    pub policy_id: String,
+    pub loaded: bool,
+    pub ttl_seconds: u64,
+    pub expires_at: String,
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferStatus {
+    pub enabled: bool,
+    pub buffered_records: usize,
+    pub integrity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RegisterDeviceProfileRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub profile: DeviceRuntimeProfile,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RegisterDeviceProfileResponse {
+    pub profile: DeviceRuntimeProfile,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SafetyContext {
+    #[serde(default)]
+    pub allowed_zone_refs: Vec<String>,
+    pub zone_ref: Option<String>,
+    pub altitude_m: Option<f64>,
+    pub max_altitude_m: Option<f64>,
+    pub battery_percent: Option<f64>,
+    #[serde(default)]
+    pub privacy_clear: bool,
+    #[serde(default)]
+    pub human_proximity_clear: bool,
+    #[serde(default)]
+    pub emergency_stop_clear: bool,
+    #[serde(default)]
+    pub offline: bool,
+    #[serde(default)]
+    pub policy_cache_expired: bool,
+    #[serde(default)]
+    pub high_risk: bool,
+    #[serde(default)]
+    pub cloud_helper_direct_authority: bool,
+    pub cloud_helper_proposal_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SubmitPhysicalActionRequest {
+    #[serde(flatten)]
+    pub action_request: SubmitActionRequest,
+    pub safety_context: SafetyContext,
+    pub operator_intervention_evidence: Option<OperatorInterventionEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionEvidence {
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub action_name: String,
+    pub decision: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub agent_id: splendor_types::AgentId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub action_name: String,
+    pub reason: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorDecisionRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub reason: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionRecord {
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub agent_id: splendor_types::AgentId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub action_name: String,
+    pub status: String,
+    pub reason: String,
+    pub expires_at: String,
+    pub trace_event_id: String,
+    pub evidence: Option<OperatorInterventionEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferSyncRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub run_id: RunId,
+    pub records: Vec<TraceRecord>,
+    #[serde(default)]
+    pub simulate_tamper: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferSyncResponse {
+    pub accepted: bool,
+    pub accepted_records: usize,
+    pub trace_event_id: String,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceAuditEvent {
+    pub trace_event_id: String,
+    pub event_type: String,
+    pub audit: AuditAttribution,
+    pub details: serde_json::Value,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct HealthResponse {
     pub status: String,
     pub local_only: bool,
@@ -1135,7 +1332,8 @@ async fn create_run(
     engine.add_perceptor(QueuedPerceptor {
         queue: percept_queue.clone(),
     });
-    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), tenant_registry);
+    let mut scheduler =
+        Scheduler::with_registry(SchedulerConfig::default(), tenant_registry.clone());
     scheduler.add_agent(engine);
 
     let slot = RunSlot {
@@ -1147,6 +1345,7 @@ async fn create_run(
         state_store,
         trace_store,
         gateway,
+        tenant_registry,
         circuit_breakers,
         policy_cache,
         percept_queue,
@@ -2035,6 +2234,869 @@ async fn submit_action(
     Ok(Json(outcome))
 }
 
+async fn register_device_profile(
+    State(state): State<DaemonState>,
+    Json(request): Json<RegisterDeviceProfileRequest>,
+) -> Result<Json<RegisterDeviceProfileResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    validate_device_profile_payload(&request.profile)?;
+    let security = state.validate_security(
+        DaemonEndpoint::DeviceProfileRegister {
+            tenant_id: request.profile.tenant_id.clone(),
+            node_id: request.profile.node_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let mut profile = request.profile;
+    profile.registered_at = now_rfc3339();
+    state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .insert(profile.node_id.clone(), profile.clone());
+    let audit_attribution = required_audit(security.audit_attribution)?;
+    let trace_event_id = record_device_audit(
+        &state,
+        "device.profile.registered",
+        audit_attribution,
+        serde_json::json!({"node_id": profile.node_id, "device_kind": profile.device_kind}),
+    )?;
+    Ok(Json(RegisterDeviceProfileResponse {
+        profile,
+        trace_event_id,
+    }))
+}
+
+async fn get_device_status(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceRuntimeProfile>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id.clone(),
+            node_id,
+        },
+        credential,
+        None,
+        None,
+    )?;
+    Ok(Json(profile))
+}
+
+async fn get_policy_cache_status(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<DevicePolicyCacheStatus>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id.clone(),
+            node_id,
+        },
+        credential,
+        None,
+        None,
+    )?;
+    Ok(Json(profile.policy_cache))
+}
+
+async fn submit_physical_action(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<SubmitPhysicalActionRequest>,
+) -> Result<Json<ActionOutcome>, ApiError> {
+    state.ensure_runtime_available()?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    if profile.tenant_id != request.action_request.tenant_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wrong_scope",
+            "device tenant does not match action tenant",
+        ));
+    }
+    let action_name = request.action_request.action.name.clone();
+    if matches_forbidden_physical_action(&action_name) || !is_allowed_physical_action(&action_name)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "low_level_physical_action_rejected",
+            "physical endpoint accepts only bounded high-level actions",
+        ));
+    }
+    if !profile
+        .allowed_physical_actions
+        .iter()
+        .any(|allowed| allowed == &action_name)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "physical_action_not_profile_allowed",
+            "device profile does not allow action",
+        ));
+    }
+
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs
+        .get_mut(&request.action_request.run_id)
+        .ok_or_else(|| invalid_run(&request.action_request.run_id))?;
+    if request.action_request.tenant_id != slot.tenant_id
+        || request.action_request.agent_id != slot.agent_id
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wrong_scope",
+            "action tenant or agent does not match the run",
+        ));
+    }
+    let security = state.validate_security(
+        DaemonEndpoint::ActionSubmit {
+            tenant_id: request.action_request.tenant_id.clone(),
+            run_id: request.action_request.run_id.clone(),
+            trace_linked: request.action_request.causal_trace_id.is_some(),
+            gateway_verification: GatewayVerificationState::Required,
+        },
+        request.action_request.credential.clone(),
+        None,
+        request.action_request.audit_attribution.clone(),
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.devices.actions.submit",
+        security.audit_attribution.clone(),
+    )?;
+    record_physical_run_event(
+        slot,
+        "safety.verification.started",
+        &request.action_request.action,
+        serde_json::json!({"node_id": node_id, "action": action_name}),
+    )?;
+    if let Some(proposal_id) = &request.safety_context.cloud_helper_proposal_id {
+        record_physical_run_event(
+            slot,
+            "cloud_helper.proposal.received",
+            &request.action_request.action,
+            serde_json::json!({"proposal_id": proposal_id, "direct_authority": request.safety_context.cloud_helper_direct_authority}),
+        )?;
+    }
+    if request.safety_context.offline {
+        record_physical_run_event(
+            slot,
+            "offline.entered",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id}),
+        )?;
+    }
+
+    if request.safety_context.cloud_helper_direct_authority {
+        let outcome = physical_outcome(
+            &request,
+            ActionStatus::Denied,
+            "cloud_helper_direct_authority_denied",
+            serde_json::json!({"cloud_helper_can_propose_only": true}),
+        );
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "safety.verification.denied",
+        )?;
+        return Ok(Json(outcome));
+    }
+    if request.safety_context.offline
+        && request.safety_context.policy_cache_expired
+        && request.safety_context.high_risk
+    {
+        record_physical_run_event(
+            slot,
+            "policy.cache.expired",
+            &request.action_request.action,
+            serde_json::json!({"policy_id": profile.policy_cache.policy_id, "action": action_name}),
+        )?;
+        let outcome = physical_outcome(
+            &request,
+            ActionStatus::Denied,
+            "policy_cache_expired",
+            serde_json::json!({"offline": true, "high_risk": true}),
+        );
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "safety.verification.denied",
+        )?;
+        return Ok(Json(outcome));
+    }
+    if let Some(zone_ref) = &request.safety_context.zone_ref {
+        if !request
+            .safety_context
+            .allowed_zone_refs
+            .iter()
+            .any(|allowed| allowed == zone_ref)
+        {
+            let outcome = physical_outcome(
+                &request,
+                ActionStatus::Denied,
+                "geofence_breach",
+                serde_json::json!({"zone_ref": zone_ref, "allowed_zone_refs": request.safety_context.allowed_zone_refs}),
+            );
+            record_physical_denial(
+                slot,
+                &request.action_request.action,
+                &outcome,
+                "safety.verification.denied",
+            )?;
+            return Ok(Json(outcome));
+        }
+    }
+    if request
+        .safety_context
+        .battery_percent
+        .is_some_and(|battery| battery < 0.20)
+        && !matches!(
+            action_name.as_str(),
+            "return_to_base" | "dock" | "read_battery" | "read_sensor_summary"
+        )
+    {
+        let outcome = physical_outcome(
+            &request,
+            ActionStatus::NeedsIntervention,
+            "low_battery_return_to_base_required",
+            serde_json::json!({"battery_percent": request.safety_context.battery_percent, "allowed_safe_actions": ["return_to_base", "dock"]}),
+        );
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "action.needs_intervention",
+        )?;
+        return Ok(Json(outcome));
+    }
+    if !request.safety_context.privacy_clear
+        || !request.safety_context.human_proximity_clear
+        || !request.safety_context.emergency_stop_clear
+    {
+        let outcome = physical_outcome(
+            &request,
+            ActionStatus::NeedsIntervention,
+            "operator_intervention_required",
+            serde_json::json!({"privacy_clear": request.safety_context.privacy_clear, "human_proximity_clear": request.safety_context.human_proximity_clear, "emergency_stop_clear": request.safety_context.emergency_stop_clear}),
+        );
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "action.needs_intervention",
+        )?;
+        return Ok(Json(outcome));
+    }
+    if let Some(evidence) = &request.operator_intervention_evidence {
+        let expires_at = OffsetDateTime::parse(&evidence.expires_at, &Rfc3339).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "operator_intervention_bad_expiry",
+                "operator intervention expiry is invalid",
+            )
+        })?;
+        if expires_at <= OffsetDateTime::now_utc() {
+            record_physical_run_event(
+                slot,
+                "operator.intervention.expired",
+                &request.action_request.action,
+                serde_json::json!({"intervention_id": evidence.intervention_id, "action": action_name}),
+            )?;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "operator_intervention_expired",
+                "operator intervention evidence expired",
+            ));
+        }
+        validate_operator_evidence(
+            &state,
+            evidence,
+            &request.action_request.run_id,
+            &action_name,
+        )?;
+    }
+
+    record_physical_run_event(
+        slot,
+        "safety.verification.completed",
+        &request.action_request.action,
+        serde_json::json!({"allowed": true, "node_id": node_id}),
+    )?;
+    let action_request = ActionRequest {
+        action_id: request.action_request.action_id.clone().unwrap_or_default(),
+        tenant_id: request.action_request.tenant_id.clone(),
+        agent_id: request.action_request.agent_id.clone(),
+        run_id: request.action_request.run_id.clone(),
+        action: request.action_request.action.clone(),
+        adapter: request.action_request.adapter.clone(),
+        quota_usage: request
+            .action_request
+            .quota_usage
+            .unwrap_or_else(splendor_types::QuotaUsage::single_action),
+        satisfied_preconditions: request.action_request.satisfied_preconditions.clone(),
+        requested_at: OffsetDateTime::now_utc(),
+        approval_evidence: request.action_request.approval_evidence.clone(),
+    };
+    let mut physical_gateway = VerifiedActionGateway::new(Arc::new(slot.tenant_registry.clone()));
+    physical_gateway.set_circuit_breaker_evaluator(Arc::new(slot.circuit_breakers.clone()));
+    physical_gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
+        simulated_safety_snapshot(&request, &profile, &action_name),
+    )));
+    physical_gateway.register_adapter(
+        action_name.clone(),
+        action_request
+            .adapter
+            .clone()
+            .unwrap_or_else(|| "device-sim".to_string()),
+        Arc::new(RecordingAdapter {
+            executions: Arc::clone(&slot.adapter_executions),
+        }),
+    );
+    let physical_gateway: Arc<dyn ActionGateway> = Arc::new(PolicyDistributionGateway::new(
+        Arc::new(physical_gateway),
+        Arc::new(slot.policy_cache.clone()),
+    ));
+    let outcome = physical_gateway.submit(action_request).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway_error",
+            error.to_string(),
+        )
+    })?;
+    if outcome.status == ActionStatus::Executed {
+        record_run_event(
+            slot,
+            TraceEventKind::ActionExecuted {
+                action: request.action_request.action.clone(),
+                outcome: outcome.output.clone().unwrap_or(serde_json::Value::Null),
+            },
+        )?;
+    } else {
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "safety.verification.denied",
+        )?;
+    }
+    record_run_event(
+        slot,
+        TraceEventKind::OutcomeRecorded {
+            outcome: serde_json::json!({"source": "daemon.physical_action", "action_outcome": outcome}),
+            feedback: None,
+            reward: None,
+        },
+    )?;
+    if request.safety_context.offline {
+        record_physical_run_event(
+            slot,
+            "trace.buffer.appended",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id, "action": action_name}),
+        )?;
+        record_physical_run_event(
+            slot,
+            "offline.exited",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id}),
+        )?;
+    }
+    Ok(Json(outcome))
+}
+
+async fn request_operator_intervention(
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorInterventionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    state.ensure_runtime_available()?;
+    let security = state.validate_security(
+        DaemonEndpoint::OperatorIntervene {
+            tenant_id: request.tenant_id.clone(),
+            run_id: request.run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let trace_event_id = record_device_audit(
+        &state,
+        "operator.intervention.requested",
+        required_audit(security.audit_attribution)?,
+        serde_json::json!({"intervention_id": request.intervention_id, "run_id": request.run_id, "action": request.action_name, "reason": request.reason}),
+    )?;
+    let record = OperatorInterventionRecord {
+        intervention_id: request.intervention_id.clone(),
+        tenant_id: request.tenant_id,
+        agent_id: request.agent_id,
+        run_id: request.run_id,
+        node_id: request.node_id,
+        action_name: request.action_name,
+        status: "requested".to_string(),
+        reason: request.reason,
+        expires_at: request.expires_at,
+        trace_event_id,
+        evidence: None,
+    };
+    state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?
+        .insert(request.intervention_id, record.clone());
+    Ok(Json(record))
+}
+
+async fn grant_operator_intervention(
+    Path(intervention_id): Path<String>,
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorDecisionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    decide_operator_intervention(state, intervention_id, request, "granted").await
+}
+
+async fn deny_operator_intervention(
+    Path(intervention_id): Path<String>,
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorDecisionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    decide_operator_intervention(state, intervention_id, request, "denied").await
+}
+
+async fn decide_operator_intervention(
+    state: DaemonState,
+    intervention_id: String,
+    request: OperatorDecisionRequest,
+    status: &str,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    let mut interventions = state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?;
+    let record = interventions.get_mut(&intervention_id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "operator_intervention_not_found",
+            "operator intervention not found",
+        )
+    })?;
+    let security = state.validate_security(
+        DaemonEndpoint::OperatorIntervene {
+            tenant_id: record.tenant_id.clone(),
+            run_id: record.run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let event = if status == "granted" {
+        "operator.intervention.granted"
+    } else {
+        "operator.intervention.denied"
+    };
+    let trace_event_id = record_device_audit(
+        &state,
+        event,
+        required_audit(security.audit_attribution)?,
+        serde_json::json!({"intervention_id": intervention_id, "reason": request.reason}),
+    )?;
+    record.status = status.to_string();
+    record.reason = request.reason;
+    record.trace_event_id = trace_event_id;
+    record.evidence = Some(OperatorInterventionEvidence {
+        intervention_id: record.intervention_id.clone(),
+        tenant_id: record.tenant_id.clone(),
+        run_id: record.run_id.clone(),
+        action_name: record.action_name.clone(),
+        decision: if status == "granted" {
+            "granted"
+        } else {
+            "denied"
+        }
+        .to_string(),
+        expires_at: request
+            .expires_at
+            .unwrap_or_else(|| record.expires_at.clone()),
+    });
+    Ok(Json(record.clone()))
+}
+
+async fn sync_device_trace_buffer(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<DeviceTraceBufferSyncRequest>,
+) -> Result<Json<DeviceTraceBufferSyncResponse>, ApiError> {
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    let security = state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id,
+            node_id: node_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    let audit_attribution = required_audit(security.audit_attribution)?;
+    let mut expected = None;
+    for record in &request.records {
+        if let Some(prev) = expected {
+            if record.sequence <= prev {
+                let trace_event_id = record_device_audit(
+                    &state,
+                    "trace.sync.failed",
+                    audit_attribution.clone(),
+                    serde_json::json!({"node_id": node_id, "reason": "trace_sync_reordered"}),
+                )?;
+                return Ok(Json(DeviceTraceBufferSyncResponse {
+                    accepted: false,
+                    accepted_records: 0,
+                    trace_event_id,
+                    reason_code: Some("trace_sync_reordered".to_string()),
+                }));
+            }
+        }
+        expected = Some(record.sequence);
+    }
+    if request.simulate_tamper {
+        let trace_event_id = record_device_audit(
+            &state,
+            "trace.sync.failed",
+            audit_attribution,
+            serde_json::json!({"node_id": node_id, "reason": "trace_sync_tampered"}),
+        )?;
+        return Ok(Json(DeviceTraceBufferSyncResponse {
+            accepted: false,
+            accepted_records: 0,
+            trace_event_id,
+            reason_code: Some("trace_sync_tampered".to_string()),
+        }));
+    }
+    let trace_event_id = record_device_audit(
+        &state,
+        "trace.sync.completed",
+        audit_attribution,
+        serde_json::json!({"node_id": node_id, "accepted_records": request.records.len()}),
+    )?;
+    Ok(Json(DeviceTraceBufferSyncResponse {
+        accepted: true,
+        accepted_records: request.records.len(),
+        trace_event_id,
+        reason_code: None,
+    }))
+}
+
+fn validate_device_profile_payload(profile: &DeviceRuntimeProfile) -> Result<(), ApiError> {
+    if profile.device_kind != "drone_sim" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_device_kind",
+            "S6 acceptance supports drone_sim only",
+        ));
+    }
+    if profile.runtime_mode != "resident" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "device_requires_resident_runtime",
+            "physical edge acceptance requires resident runtime mode",
+        ));
+    }
+    for action in &profile.allowed_physical_actions {
+        if matches_forbidden_physical_action(action) || !is_allowed_physical_action(action) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "low_level_physical_action_rejected",
+                "device profile contains unsupported physical action",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn matches_forbidden_physical_action(action: &str) -> bool {
+    let normalized = action
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    FORBIDDEN_PHYSICAL_ACTION_PATTERNS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+}
+
+fn physical_outcome(
+    request: &SubmitPhysicalActionRequest,
+    status: ActionStatus,
+    reason: &str,
+    evidence: serde_json::Value,
+) -> ActionOutcome {
+    ActionOutcome {
+        action_id: request.action_request.action_id.clone().unwrap_or_default(),
+        status,
+        verification: splendor_types::VerificationResult {
+            allowed: status == ActionStatus::Executed,
+            reasons: vec![reason.to_string()],
+            artifacts: serde_json::json!({"safety": evidence, "reason_code": reason}),
+        },
+        post_verification: None,
+        output: None,
+        error: Some(reason.to_string()),
+        completed_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn simulated_safety_snapshot(
+    request: &SubmitPhysicalActionRequest,
+    profile: &DeviceRuntimeProfile,
+    action_name: &str,
+) -> SimulatedSafetySnapshot {
+    let is_safe_low_battery_action = matches!(
+        action_name,
+        "return_to_base" | "dock" | "read_battery" | "read_sensor_summary"
+    );
+    let configured_min_battery = profile
+        .safety_constraints
+        .get("min_battery_percent")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.20);
+    SimulatedSafetySnapshot {
+        current_zone: request.safety_context.zone_ref.clone(),
+        allowed_zones: request.safety_context.allowed_zone_refs.clone(),
+        battery_percent: request.safety_context.battery_percent,
+        min_battery_percent: Some(if is_safe_low_battery_action {
+            0.0
+        } else {
+            configured_min_battery
+        }),
+        emergency_stop_engaged: Some(!request.safety_context.emergency_stop_clear),
+        collision_risk: Some(SimulatedRiskLevel::Low),
+        altitude_m: request.safety_context.altitude_m,
+        max_altitude_m: request.safety_context.max_altitude_m,
+        privacy_zone_active: Some(!request.safety_context.privacy_clear),
+        proximity_m: Some(if request.safety_context.human_proximity_clear {
+            2.0
+        } else {
+            0.0
+        }),
+        min_proximity_m: Some(1.0),
+        sensor_refs: vec![profile.node_id.to_string()],
+    }
+}
+
+fn record_physical_denial(
+    slot: &RunSlot,
+    action: &Action,
+    outcome: &ActionOutcome,
+    event_type: &str,
+) -> Result<(), ApiError> {
+    record_physical_run_event(
+        slot,
+        event_type,
+        action,
+        serde_json::json!({"verification": outcome.verification, "status": outcome.status}),
+    )?;
+    match outcome.status {
+        ActionStatus::NeedsIntervention => record_run_event(
+            slot,
+            TraceEventKind::ActionNeedsIntervention {
+                action: action.clone(),
+                result: outcome.verification.clone(),
+            },
+        ),
+        _ => record_run_event(
+            slot,
+            TraceEventKind::ActionDenied {
+                action: action.clone(),
+                result: outcome.verification.clone(),
+            },
+        ),
+    }
+}
+
+fn record_physical_run_event(
+    slot: &RunSlot,
+    event_type: &str,
+    _action: &Action,
+    details: serde_json::Value,
+) -> Result<String, ApiError> {
+    let _ = details;
+    let trace_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::DaemonAudit {
+            endpoint: event_type.to_string(),
+            audit: AuditAttribution {
+                principal: ClientPrincipal {
+                    app: AppPrincipal {
+                        app_principal_id: "runtime_physical_edge".to_string(),
+                        label: Some("runtime physical edge".to_string()),
+                    },
+                    client_principal_id: "runtime_physical_edge".to_string(),
+                    label: Some("runtime physical edge".to_string()),
+                },
+                credential_id: Some("runtime_physical_edge".to_string()),
+                requested_at: OffsetDateTime::now_utc(),
+            },
+        },
+    )?;
+    Ok(trace_id.to_string())
+}
+
+fn record_device_audit(
+    state: &DaemonState,
+    event_type: &str,
+    audit: AuditAttribution,
+    details: serde_json::Value,
+) -> Result<String, ApiError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    state
+        .inner
+        .device_audit
+        .lock()
+        .map_err(|_| lock_error())?
+        .push(DeviceAuditEvent {
+            trace_event_id: event_id.clone(),
+            event_type: event_type.to_string(),
+            audit,
+            details,
+            timestamp: now_rfc3339(),
+        });
+    Ok(event_id)
+}
+
+fn required_audit(audit: Option<AuditAttribution>) -> Result<AuditAttribution, ApiError> {
+    audit.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing_audit_attribution",
+            "mutating physical/edge request requires audit attribution",
+        )
+    })
+}
+
+fn validate_operator_evidence(
+    state: &DaemonState,
+    evidence: &OperatorInterventionEvidence,
+    run_id: &RunId,
+    action_name: &str,
+) -> Result<(), ApiError> {
+    let interventions = state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?;
+    let record = interventions
+        .get(&evidence.intervention_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "operator_intervention_unknown",
+                "operator intervention evidence is unknown",
+            )
+        })?;
+    if &record.run_id != run_id
+        || record.action_name != action_name
+        || record.status != "granted"
+        || evidence.decision != "granted"
+        || evidence.run_id != *run_id
+        || evidence.action_name != action_name
+        || evidence.tenant_id != record.tenant_id
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "operator_intervention_scope_mismatch",
+            "operator intervention evidence is outside scope",
+        ));
+    }
+    let expires_at = OffsetDateTime::parse(&evidence.expires_at, &Rfc3339).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator_intervention_bad_expiry",
+            "operator intervention expiry is invalid",
+        )
+    })?;
+    if expires_at <= OffsetDateTime::now_utc() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "operator_intervention_expired",
+            "operator intervention evidence expired",
+        ));
+    }
+    Ok(())
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
 fn caller_credential_from_headers(
     headers: &HeaderMap,
 ) -> Result<Option<CallerCredential>, ApiError> {
@@ -2181,6 +3243,11 @@ fn endpoint_scope_from_public_str(scope: &str) -> Option<EndpointScope> {
         "instances_heartbeat" | "splendor.instances.heartbeat" => {
             Some(EndpointScope::InstancesHeartbeat)
         }
+        "device_register" | "splendor.device.register" => Some(EndpointScope::DeviceRegister),
+        "device_read" | "splendor.device.read" => Some(EndpointScope::DeviceRead),
+        "operator_intervene" | "splendor.operator.intervene" => {
+            Some(EndpointScope::OperatorIntervene)
+        }
         _ => None,
     }
 }
@@ -2248,6 +3315,14 @@ async fn capabilities(
             "POST /runs/{run_id}/traces/export".to_string(),
             "POST /runs/{run_id}/replay".to_string(),
             "POST /actions".to_string(),
+            "POST /devices/profiles".to_string(),
+            "GET /devices/{node_id}/status".to_string(),
+            "GET /devices/{node_id}/policy-cache".to_string(),
+            "POST /devices/{node_id}/actions".to_string(),
+            "POST /operator/interventions".to_string(),
+            "POST /operator/interventions/{intervention_id}/grant".to_string(),
+            "POST /operator/interventions/{intervention_id}/deny".to_string(),
+            "POST /devices/{node_id}/trace-buffer/sync".to_string(),
             "GET /health".to_string(),
             "GET /version".to_string(),
             "GET /capabilities".to_string(),
@@ -3088,6 +4163,7 @@ mod tests {
             state_store: Arc::new(InMemoryStateStore::default()),
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
+            tenant_registry: TenantRegistry::new(),
             circuit_breakers: SharedCircuitBreakerEvaluator::default(),
             policy_cache: PolicyCache::new(PolicyCacheConfig::default()),
             percept_queue: PerceptQueue::default(),
