@@ -2332,6 +2332,75 @@ mod tests {
         assert_eq!(error.body.code, "credential_revoked");
     }
 
+    #[tokio::test]
+    async fn manager_registry_handlers_fail_closed_without_required_scope() {
+        let state = ManagerState::local_acceptance();
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000504",
+            "http://127.0.0.1:1",
+            "resident_cloud_pool",
+            "cloud",
+            vec!["runtime.resident"],
+        );
+        let missing_scope = manager_security(&state, vec![EndpointScope::FleetRead]);
+
+        let register_node_error = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: missing_scope.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect_err("node registration requires node scope");
+        assert_eq!(register_node_error.body.code, "missing_scope");
+
+        let register_instance_error = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: missing_scope.clone(),
+                registration: instance(
+                    "00000000-0000-4000-8000-000000000504",
+                    "00000000-0000-4000-8000-000000000604",
+                    &tenant_id,
+                ),
+            }),
+        )
+        .await
+        .expect_err("instance registration requires instance scope");
+        assert_eq!(register_instance_error.body.code, "missing_scope");
+
+        let heartbeat_error = heartbeat_node(
+            Path(node.node_id.clone()),
+            State(state.clone()),
+            Json(HeartbeatNodeRequest {
+                security: missing_scope.clone(),
+                heartbeat: NodeHeartbeat {
+                    node_id: node.node_id.clone(),
+                    health: node.health.clone(),
+                    recorded_at: OffsetDateTime::now_utc(),
+                },
+            }),
+        )
+        .await
+        .expect_err("heartbeat requires heartbeat scope");
+        assert_eq!(heartbeat_error.body.code, "missing_scope");
+
+        let advertise_error = advertise_capabilities(
+            Path(node.node_id.clone()),
+            State(state.clone()),
+            Json(AdvertiseCapabilitiesRequest {
+                security: missing_scope,
+                capability_document: node.capability_document.clone(),
+            }),
+        )
+        .await
+        .expect_err("capability advertisement requires node scope");
+        assert_eq!(advertise_error.body.code, "missing_scope");
+    }
+
     #[test]
     fn manager_mutating_endpoints_require_matching_audit_attribution() {
         let state = ManagerState::local_acceptance();
@@ -2365,6 +2434,377 @@ mod tests {
                 true,
             )
             .expect("matching audit accepted");
+    }
+
+    #[tokio::test]
+    async fn manager_governance_handlers_cover_s5_authority_and_audit_paths() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::PoliciesPublish,
+                EndpointScope::PoliciesRevoke,
+                EndpointScope::ApprovalsManage,
+                EndpointScope::GovernanceControl,
+                EndpointScope::FleetRead,
+                EndpointScope::TracesRead,
+            ],
+        );
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let agent_id = AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent");
+        let run_id = RunId::parse("44444444-4444-4444-8444-444444444444").expect("run");
+        let action_id = splendor_types::ActionId::parse("55555555-5555-4555-8555-555555555555")
+            .expect("action");
+
+        let policy_bundle: PolicyBundle = serde_json::from_value(serde_json::json!({
+            "schema_version": "splendor.policy_bundle.v1",
+            "policy_bundle_id": "policy_s5_unit",
+            "version": "unit.v1",
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "issued_at": now_rfc3339(),
+            "expires_at": (OffsetDateTime::now_utc() + Duration::minutes(30)).format(&Rfc3339).expect("expiry formats"),
+            "revocation": "active",
+            "degraded_mode": {
+                "allow_low_risk_cached": false,
+                "disconnected_low_risk_actions": ["artifact.create_internal"],
+                "disconnected_high_risk_actions": ["artifact.publish_external"],
+                "high_risk_disconnected_behavior": "deny"
+            }
+        }))
+        .expect("policy bundle parses");
+        let published = publish_policy_bundle(
+            State(state.clone()),
+            Json(PublishPolicyBundleRequest {
+                security: security.clone(),
+                policy_bundle,
+            }),
+        )
+        .await
+        .expect("policy published")
+        .0;
+        assert_eq!(published.status, "published");
+        assert!(published.envelope.signature.is_some());
+
+        let read = get_policy_status(
+            Path("policy_s5_unit".to_string()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: security.clone(),
+            }),
+        )
+        .await
+        .expect("policy read")
+        .0;
+        assert_eq!(read.status, "published");
+
+        let missing_policy = get_policy_status(
+            Path("policy_missing".to_string()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: security.clone(),
+            }),
+        )
+        .await
+        .expect_err("missing policy rejected");
+        assert_eq!(missing_policy.body.code, "policy_not_found");
+
+        let approval_id =
+            ApprovalId::parse("66666666-6666-4666-8666-666666666666").expect("approval");
+        let requested = request_approval(
+            State(state.clone()),
+            Json(ApprovalRequestPayload {
+                security: security.clone(),
+                approval_id: approval_id.clone(),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                action_id: action_id.clone(),
+                action_name: "artifact.publish_external".to_string(),
+                adapter: "artifact-store".to_string(),
+                policy_id: "policy_s5_unit".to_string(),
+                risk_level: "high".to_string(),
+                audience: "daemon_local".to_string(),
+                expires_at: OffsetDateTime::now_utc() + Duration::minutes(10),
+                reason: "unit approval request".to_string(),
+            }),
+        )
+        .await
+        .expect("approval requested")
+        .0;
+        assert_eq!(requested.status, "requested");
+
+        let granted = grant_approval(
+            Path(approval_id.clone()),
+            State(state.clone()),
+            Json(ApprovalDecisionRequest {
+                security: security.clone(),
+                reason: "grant unit".to_string(),
+                expires_at: Some(OffsetDateTime::now_utc() + Duration::minutes(5)),
+            }),
+        )
+        .await
+        .expect("approval granted")
+        .0;
+        assert_eq!(granted.status, "granted");
+        assert_eq!(
+            granted.evidence.expect("grant evidence").decision,
+            ApprovalDecision::Granted
+        );
+
+        let denied = deny_approval(
+            Path(approval_id.clone()),
+            State(state.clone()),
+            Json(ApprovalDecisionRequest {
+                security: security.clone(),
+                reason: "deny unit".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("approval denied")
+        .0;
+        assert_eq!(denied.status, "denied");
+
+        let revoked = revoke_approval(
+            Path(approval_id),
+            State(state.clone()),
+            Json(ApprovalDecisionRequest {
+                security: security.clone(),
+                reason: "revoke unit".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("approval revoked")
+        .0;
+        assert_eq!(revoked.status, "revoked");
+        assert!(revoked.evidence.expect("revoked evidence").revoked);
+
+        let breaker = create_circuit_breaker(
+            State(state.clone()),
+            Json(CircuitBreakerRequest {
+                security: security.clone(),
+                breaker_id: "breaker_s5_unit".to_string(),
+                tenant_id: Some(tenant_id.clone()),
+                adapter: Some("artifact-store".to_string()),
+                action: Some("artifact.publish_external".to_string()),
+                reason: "unit breaker".to_string(),
+            }),
+        )
+        .await
+        .expect("breaker created")
+        .0;
+        assert_eq!(breaker.status, "tripped");
+
+        let cleared = clear_circuit_breaker(
+            Path("breaker_s5_unit".to_string()),
+            State(state.clone()),
+            Json(ClearCircuitBreakerRequest {
+                security: security.clone(),
+                reason: "unit clear".to_string(),
+            }),
+        )
+        .await
+        .expect("breaker cleared")
+        .0;
+        assert_eq!(cleared.status, "cleared");
+
+        let missing_breaker = clear_circuit_breaker(
+            Path("breaker_missing".to_string()),
+            State(state.clone()),
+            Json(ClearCircuitBreakerRequest {
+                security: security.clone(),
+                reason: "unit missing clear".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing breaker rejected");
+        assert_eq!(missing_breaker.body.code, "breaker_not_found");
+
+        let kill = activate_kill_switch(
+            State(state.clone()),
+            Json(KillSwitchRequest {
+                security: security.clone(),
+                kill_switch_id: "kill_s5_unit".to_string(),
+                run_id: Some(run_id.clone()),
+                tenant_id: Some(tenant_id.clone()),
+                node_id: None,
+                instance_id: None,
+                reason: "unit kill".to_string(),
+                propagation_ack_required: true,
+                target_daemon_url: None,
+                cancel_payload: None,
+            }),
+        )
+        .await
+        .expect("kill switch fail closed")
+        .0;
+        assert!(kill.fail_closed);
+        assert!(!kill.propagation_acknowledged);
+
+        let non_blocking_kill = activate_kill_switch(
+            State(state.clone()),
+            Json(KillSwitchRequest {
+                security: security.clone(),
+                kill_switch_id: "kill_s5_unit_nonblocking".to_string(),
+                run_id: None,
+                tenant_id: Some(tenant_id.clone()),
+                node_id: None,
+                instance_id: None,
+                reason: "unit nonblocking kill".to_string(),
+                propagation_ack_required: false,
+                target_daemon_url: None,
+                cancel_payload: None,
+            }),
+        )
+        .await
+        .expect("nonblocking kill switch activates")
+        .0;
+        assert_eq!(non_blocking_kill.status, "activated");
+        assert!(!non_blocking_kill.fail_closed);
+
+        let revoked_policy = revoke_policy_bundle(
+            Path("policy_s5_unit".to_string()),
+            State(state.clone()),
+            Json(RevokePolicyBundleRequest {
+                security: security.clone(),
+                reason: "unit revoke".to_string(),
+            }),
+        )
+        .await
+        .expect("policy revoked")
+        .0;
+        assert_eq!(revoked_policy.status, "revoked");
+
+        let revoked_status = get_policy_status(
+            Path("policy_s5_unit".to_string()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: security.clone(),
+            }),
+        )
+        .await
+        .expect("revoked policy read")
+        .0;
+        assert_eq!(revoked_status.status, "revoked");
+
+        let missing_revoke = revoke_policy_bundle(
+            Path("policy_missing".to_string()),
+            State(state.clone()),
+            Json(RevokePolicyBundleRequest {
+                security: security.clone(),
+                reason: "missing policy revoke".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing revoke rejected");
+        assert_eq!(missing_revoke.body.code, "policy_not_found");
+
+        let missing_approval = grant_approval(
+            Path(ApprovalId::parse("77777777-7777-4777-8777-777777777777").expect("approval")),
+            State(state.clone()),
+            Json(ApprovalDecisionRequest {
+                security: security.clone(),
+                reason: "missing approval grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("missing approval rejected");
+        assert_eq!(missing_approval.body.code, "approval_not_found");
+
+        let audit = export_governance_audit(
+            State(state.clone()),
+            Json(GovernanceAuditExportRequest {
+                security: security.clone(),
+                run_id: Some(run_id),
+            }),
+        )
+        .await
+        .expect("audit exported")
+        .0;
+        assert!(audit.exported);
+        assert!(audit
+            .policy_bundle_ids
+            .contains(&"policy_s5_unit".to_string()));
+        assert!(audit
+            .approval_ids
+            .contains(&"66666666-6666-4666-8666-666666666666".to_string()));
+        assert!(audit
+            .circuit_breaker_ids
+            .contains(&"breaker_s5_unit".to_string()));
+        assert!(audit.kill_switch_ids.contains(&"kill_s5_unit".to_string()));
+
+        let missing_scope = create_circuit_breaker(
+            State(state.clone()),
+            Json(CircuitBreakerRequest {
+                security: manager_security(&state, vec![EndpointScope::FleetRead]),
+                breaker_id: "breaker_denied".to_string(),
+                tenant_id: Some(tenant_id),
+                adapter: None,
+                action: None,
+                reason: "missing governance scope".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing governance scope rejected");
+        assert_eq!(missing_scope.body.code, "missing_scope");
+
+        let bad_url = post_json(
+            "https://example.invalid",
+            "/runs/x/cancel",
+            &serde_json::json!({}),
+        )
+        .expect_err("non-local test post_json rejects unsupported URL schemes");
+        assert!(bad_url.contains("only http://"));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind post_json mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept post_json request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read post_json request");
+            let body = r#"{"cancelled":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write post_json response");
+        });
+        let response = post_json(
+            &format!("http://{addr}"),
+            "/runs/unit/cancel",
+            &serde_json::json!({"reason":"unit"}),
+        )
+        .expect("post_json success");
+        assert_eq!(response.status, 202);
+        assert!(response.body.expect("response body").contains("cancelled"));
+        handle.join().expect("post_json mock joined");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind prefixed mock");
+        let addr = listener.local_addr().expect("prefixed mock addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept prefixed request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read prefixed request");
+            write!(
+                stream,
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write prefixed response");
+        });
+        let response = post_json(
+            &format!("http://{addr}/daemon"),
+            "/runs/unit/cancel",
+            &serde_json::json!({"reason":"unit"}),
+        )
+        .expect("post_json prefixed success");
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_none());
+        handle.join().expect("prefixed mock joined");
     }
 
     #[test]
