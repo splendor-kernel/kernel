@@ -8,7 +8,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -16,11 +16,41 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def request_json(base_url: str, path: str, timeout: float = 2.0) -> dict:
-    req = urllib.request.Request(base_url.rstrip("/") + path, headers={"Accept": "application/json"})
+def caller_credential(scopes: list[str]) -> dict:
+    return {
+        "credential_id": "cred_uc_e2e_s0_public_boundary",
+        "principal": {
+            "app": {"app_principal_id": "app_uc_e2e_s0", "label": "UC-E2E-S0"},
+            "client_principal_id": "client_uc_e2e_s0",
+            "label": "S0 public-boundary probe",
+        },
+        "scopes": scopes,
+        "binding": {"tenant": {"tenant_id": "00000000-0000-0000-0000-00000000e200"}},
+        "audience": {"daemon": {"daemon_id": "daemon_local"}},
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "revocation": "active",
+    }
+
+
+def request_json(base_url: str, path: str, scopes: list[str], timeout: float = 2.0) -> dict:
+    credential = caller_credential(scopes)
+    req = urllib.request.Request(
+        base_url.rstrip("/") + path,
+        headers={
+            "Accept": "application/json",
+            "X-Splendor-Caller-Credential": json.dumps(credential, sort_keys=True, separators=(",", ":")),
+        },
+    )
     with urllib.request.urlopen(req, timeout=timeout) as response:
         body = response.read().decode("utf-8")
-        return {"status": response.status, "body": json.loads(body), "path": path, "method": "GET"}
+        return {
+            "status": response.status,
+            "body": json.loads(body),
+            "path": path,
+            "method": "GET",
+            "credential_id": credential["credential_id"],
+            "scopes": scopes,
+        }
 
 
 def main() -> int:
@@ -36,7 +66,8 @@ def main() -> int:
         "mode": "explicit_local_acceptance_dev",
         "caller_evidence": {
             "transport": "compose-local-network",
-            "auth_model": "documented local-dev health/capabilities only",
+            "auth_model": "schema-aligned caller credential header validated by daemon security path",
+            "credential_backed": True,
             "mutating_calls_attempted": False,
             "health_or_capabilities_authorize_actions": False,
         },
@@ -46,8 +77,11 @@ def main() -> int:
 
     for _ in range(60):
         try:
-            evidence["requests"].append(request_json(args.base_url, "/health"))
+            evidence["requests"].append(request_json(args.base_url, "/health", ["health_read"]))
             break
+        except urllib.error.HTTPError as exc:
+            last_error = f"HTTP Error {exc.code}: {exc.reason}; body={exc.read().decode('utf-8', errors='replace')}"
+            time.sleep(0.5)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             last_error = str(exc)
             time.sleep(0.5)
@@ -56,7 +90,12 @@ def main() -> int:
 
     if not evidence["failures"]:
         try:
-            evidence["requests"].append(request_json(args.base_url, "/capabilities"))
+            evidence["requests"].append(
+                request_json(args.base_url, "/capabilities", ["capabilities_read"])
+            )
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            evidence["failures"].append(f"daemon capabilities endpoint failed: HTTP {exc.code}; body={body}")
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             evidence["failures"].append(f"daemon capabilities endpoint failed: {exc}")
 

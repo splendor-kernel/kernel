@@ -274,7 +274,7 @@ def main() -> int:
         "components": ["OpenAPI", "reporting", "anti-drift", "fixtures", "Docker Compose topology"],
         "positive_evidence": [
             "contract-status.json present and passing for current local daemon operation IDs",
-            "public-boundary.json proves /health and /capabilities were called through documented local daemon HTTP endpoints",
+            "public-boundary.json proves /health and /capabilities were called through documented loopback daemon HTTP endpoints with caller credentials",
             "fixture-seed.json written with deterministic digest",
             "report.json/report.md generated from executable checks",
         ],
@@ -338,7 +338,7 @@ def main() -> int:
         "non_goal_observations": [
             "No S1-S10 scenario behavior is implemented or marked passing by S0.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
-            "Default daemon startup remains loopback-only; the compose cross-container bind is guarded by explicit acceptance-only environment variables.",
+            "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
         "human_summary_path": str(report_dir / "report.md"),
     }

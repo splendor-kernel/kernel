@@ -37,9 +37,10 @@ the harness does not create green placeholder trace/state/replay/audit evidence.
 `docker-compose.acceptance.yml` provides active S0 service roles: runner, local
 daemon, central manager placeholder, resident node placeholders, device sim,
 fake external services, telemetry sink, and toxiproxy. The local daemon remains
-loopback-only by default; compose uses explicit `SPLENDOR_RUNTIME_MODE=acceptance`
-and `SPLENDOR_DAEMON_ACCEPTANCE_BIND_UNSAFE=1` so the runner can call documented
-`/health` and `/capabilities` endpoints inside the local acceptance network.
+loopback-only; compose makes the runner share the daemon container network
+namespace so it can call documented `/health` and `/capabilities` on
+`127.0.0.1` without publishing daemon ports or binding all interfaces. The S0
+probe supplies schema-aligned caller credentials for those read-only endpoints.
 Later scenarios must add authenticated mutating daemon calls, scoped work orders,
 and gateway enforcement evidence before claiming scenario success.
 

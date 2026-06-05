@@ -10,11 +10,12 @@ use splendor_daemon::{
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
-    AuditAttribution, ClientPrincipal, CredentialAudience, EndpointScope, Percept,
-    PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
-    QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
-    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
+    AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
+    EndpointScope, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
+    PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent,
+    TraceEventKind, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement,
+    WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -251,6 +252,51 @@ async fn call_empty<T: DeserializeOwned>(
         )
     });
     (status, parsed)
+}
+
+async fn call_empty_with_credential<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    credential: &CallerCredential,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            "x-splendor-caller-credential",
+            serde_json::to_string(credential).expect("credential json"),
+        )
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "json response ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+fn caller_credential(scopes: Vec<EndpointScope>) -> CallerCredential {
+    CallerCredential {
+        credential_id: "cred_test".to_string(),
+        principal: principal(),
+        scopes,
+        binding: CredentialBinding::Tenant {
+            tenant_id: TenantId::new(),
+        },
+        audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        revocation: RevocationStatus::Active,
+    }
 }
 
 #[tokio::test]
@@ -513,6 +559,36 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(replay.mode, "inspect_only");
+
+    let (status, explicit_replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "inspect_only", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_replay.mode, "inspect_only");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "inspect_only", "side_effects_allowed": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "replay_side_effects_forbidden");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "execute", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "unsupported_replay_mode");
 
     let (status, inspected_after_replay): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
@@ -2187,7 +2263,33 @@ async fn health_and_capabilities_remain_local_dev_only_without_credentials() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
     let (status, error): (StatusCode, ApiErrorBody) =
-        call_empty(locked_app, Method::GET, "/capabilities").await;
+        call_empty(locked_app.clone(), Method::GET, "/capabilities").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
+
+    let health_credential = caller_credential(vec![EndpointScope::HealthRead]);
+    let (status, _health): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        &health_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let capabilities_credential = caller_credential(vec![EndpointScope::CapabilitiesRead]);
+    let (status, _capabilities): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/capabilities",
+        &capabilities_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app, Method::GET, "/capabilities", &health_credential)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_scope");
 }
