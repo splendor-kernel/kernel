@@ -29,10 +29,10 @@ services:
       - bash
       - -lc
       - |
-        if [[ "${SPLENDOR_E2E_MODE_ARG:-scenario}" == "all" ]]; then
+        if [[ "$${SPLENDOR_E2E_MODE_ARG:-scenario}" == "all" ]]; then
           exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --all --reuse-build
         fi
-        exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --scenario "${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}" --reuse-build
+        exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --scenario "$${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}" --reuse-build
     depends_on:
       - splendor-daemon-local
       - central-manager
@@ -96,20 +96,65 @@ services:
       - e2e-state:/var/lib/splendor
 
   central-manager:
-    image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8081"]
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_MANAGER_BIND_ADDR: 0.0.0.0:8081
+      SPLENDOR_MANAGER_ALLOW_NON_LOOPBACK_DEV: "1"
+      SPLENDOR_MANAGER_ID: central-manager
+      SPLENDOR_FLEET_ID: 00000000-0000-4000-8000-000000000104
+    command: ["splendor-manager"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
 
   resident-cloud-node:
-    image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8091"]
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8091
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000304
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
 
   resident-vpc-node:
-    image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8092"]
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8092
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000302
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
 
   resident-edge-node:
-    image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8093"]
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8093
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000306
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest

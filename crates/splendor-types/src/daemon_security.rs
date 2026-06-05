@@ -82,6 +82,18 @@ pub enum EndpointScope {
     ReplayCreate,
     /// Send a typed message across a remote Splendor instance boundary.
     MessagesSend,
+    /// Read typed message delivery metadata.
+    MessagesRead,
+    /// Submit a signed work order to a manager boundary.
+    WorkOrdersSubmit,
+    /// Revoke a submitted work order.
+    WorkOrdersRevoke,
+    /// Read fleet registry, placement, and telemetry metadata.
+    FleetRead,
+    /// Dispatch an accepted work order to a resident runtime.
+    FleetDispatch,
+    /// Export or import explicit state handoff snapshots.
+    StateHandoff,
     /// Read daemon health.
     HealthRead,
     /// Read daemon capabilities.
@@ -114,6 +126,12 @@ impl EndpointScope {
             Self::StateRead => "splendor.state.read",
             Self::ReplayCreate => "splendor.replay.create",
             Self::MessagesSend => "splendor.messages.send",
+            Self::MessagesRead => "splendor.messages.read",
+            Self::WorkOrdersSubmit => "splendor.work_orders.submit",
+            Self::WorkOrdersRevoke => "splendor.work_orders.revoke",
+            Self::FleetRead => "splendor.fleet.read",
+            Self::FleetDispatch => "splendor.fleet.dispatch",
+            Self::StateHandoff => "splendor.state.handoff",
             Self::HealthRead => "splendor.health.read",
             Self::CapabilitiesRead => "splendor.capabilities.read",
             Self::PoliciesSync => "splendor.policies.sync",

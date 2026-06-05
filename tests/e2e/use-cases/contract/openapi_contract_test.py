@@ -89,6 +89,17 @@ FUTURE_GROUPS = {
     },
 }
 
+S4_MANAGER_RESPONSE_REFS = {
+    "getFleetTelemetry": "FleetTelemetrySnapshot",
+    "evaluatePlacement": "PlacementDecision",
+    "dispatchWorkOrder": "DispatchReport",
+    "sendMessage": "MessageStatusReport",
+    "getMessage": "MessageStatusReport",
+    "syncTraceBuffer": "TraceSyncReport",
+    "exportStateSnapshot": "ExportStateSnapshotResponse",
+    "importStateSnapshot": "ImportStateSnapshotResponse",
+}
+
 
 def parse_operation_ids(text: str) -> set[str]:
     return set(re.findall(r"^\s*operationId:\s*([A-Za-z0-9_]+)\s*$", text, re.MULTILINE))
@@ -144,6 +155,19 @@ def require_non_null_authority_fields(text: str, schema_name: str) -> list[str]:
         if f"#/components/schemas/{expected_ref}" not in field_block:
             failures.append(f"{schema_name}.{field}_missing_ref")
     return failures
+
+
+def require_operation_response_ref(blocks: dict[str, str], op_id: str, schema_name: str) -> list[str]:
+    block = blocks.get(op_id, "")
+    if not block:
+        return [f"missing operation {op_id}"]
+    if "'200':" not in block and "200:" not in block:
+        return [f"{op_id}.missing_200_response"]
+    if f"#/components/schemas/{schema_name}" not in block:
+        return [f"{op_id}.200_missing_{schema_name}_ref"]
+    if re.search(r"'200':\s*\{\s*description:\s*[^}]+\}\s*$", block, re.MULTILINE):
+        return [f"{op_id}.200_description_only"]
+    return []
 
 
 def main() -> int:
@@ -227,8 +251,50 @@ def main() -> int:
     schema_failures.extend(
         require_schema_fields(text, "VersionResponse", {"daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"})
     )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "FleetTelemetrySnapshot",
+            {
+                "schema_version",
+                "fleet_id",
+                "observed_at",
+                "authority",
+                "nodes",
+                "instances",
+                "runs",
+                "queues",
+                "quota_signals",
+                "denial_signals",
+                "trace_sync",
+                "failures",
+            },
+        )
+    )
+    schema_failures.extend(require_schema_fields(text, "NodeTelemetry", {"node_id", "online_state", "instance_ids"}))
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "InstanceTelemetry",
+            {"node_id", "instance_id", "runtime_version", "runtime_mode", "runtime_image", "build_target", "current_run_counts"},
+        )
+    )
+    schema_failures.extend(require_schema_fields(text, "RunTelemetry", {"run_id", "node_id", "instance_id", "status"}))
+    schema_failures.extend(require_schema_fields(text, "QuotaSignal", {"allowed", "usage", "reasons", "artifacts"}))
+    schema_failures.extend(require_schema_fields(text, "DenialSignal", {"verifier", "action_name", "reasons", "artifacts"}))
+    schema_failures.extend(require_schema_fields(text, "TraceSyncTelemetry", {"last_synced_sequence", "source_high_watermark", "lag_events", "last_failure"}))
     if schema_failures:
         failures.append("Missing required local contract schema fields: " + ", ".join(schema_failures))
+
+    s4_response_failures: list[str] = []
+    for op_id, schema_name in S4_MANAGER_RESPONSE_REFS.items():
+        if op_id in operation_ids:
+            s4_response_failures.extend(require_operation_response_ref(blocks, op_id, schema_name))
+    telemetry_block = schema_block(text, "FleetTelemetrySnapshot")
+    if telemetry_block and "observational_only" not in telemetry_block:
+        s4_response_failures.append("FleetTelemetrySnapshot.authority_missing_observational_only_marker")
+    if s4_response_failures:
+        failures.append("Missing required S4 manager response contracts: " + ", ".join(s4_response_failures))
 
     blocked = []
     local_blocked = sorted(LOCAL_CONTRACT_NOT_YET_COVERED - operation_ids)
@@ -293,6 +359,7 @@ def main() -> int:
             "mutating_operations_checked": sorted(mutating_core & operation_ids),
             "health_capabilities_auth_semantics_checked": sorted({"getHealth", "getCapabilities"} & operation_ids),
             "schema_fields_checked": ["CallerCredential", "WorkOrderEnvelope", "ReplayRequest"],
+            "s4_response_refs_checked": sorted(op for op in S4_MANAGER_RESPONSE_REFS if op in operation_ids),
         },
         "blocked_not_yet_covered": blocked,
         "physical_contract_status": physical_schema_status,

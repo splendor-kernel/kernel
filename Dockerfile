@@ -62,6 +62,7 @@ RUN apt-get update \
 
 COPY --from=rust-builder /src/target/release/splendorctl /usr/local/bin/splendorctl
 COPY --from=rust-builder /src/target/release/splendor-daemon /usr/local/bin/splendor-daemon
+COPY --from=rust-builder /src/target/release/splendor-manager /usr/local/bin/splendor-manager
 COPY --from=python-builder /opt/splendor-venv /opt/splendor-venv
 
 WORKDIR /opt/splendor

@@ -400,6 +400,181 @@ paths:
                 $ref: '#/components/schemas/CapabilitiesResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /state-snapshots/export:
+    post:
+      summary: Export an explicit state handoff snapshot.
+      operationId: exportStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportStateSnapshotRequest'
+      responses:
+        '200':
+          description: State handoff snapshot exported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportStateSnapshotResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /state-snapshots/import:
+    post:
+      summary: Import an explicit state handoff snapshot.
+      operationId: importStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportStateSnapshotRequest'
+      responses:
+        '200':
+          description: State handoff snapshot imported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportStateSnapshotResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /fleet/nodes:
+    post:
+      summary: Register a fleet node.
+      operationId: registerNode
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterNodeRequest' } } } }
+      responses:
+        '200': { description: Node registered., content: { application/json: { schema: { $ref: '#/components/schemas/NodeRegistration' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/list:
+    post:
+      summary: List fleet nodes.
+      operationId: listNodes
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Registry projection., content: { application/json: { schema: { $ref: '#/components/schemas/FleetNodeListResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/instances:
+    post:
+      summary: Register a runtime instance.
+      operationId: registerInstance
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterInstanceRequest' } } } }
+      responses:
+        '200': { description: Instance registered., content: { application/json: { schema: { $ref: '#/components/schemas/InstanceRegistration' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/heartbeat:
+    post:
+      summary: Record node heartbeat.
+      operationId: heartbeatNode
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatNodeRequest' } } } }
+      responses:
+        '200': { description: Heartbeat recorded., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedTraceResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/capabilities:
+    post:
+      summary: Advertise node capabilities.
+      operationId: advertiseCapabilities
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdvertiseCapabilitiesRequest' } } } }
+      responses:
+        '200': { description: Capabilities advertised., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedNodeResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/placement/evaluate:
+    post:
+      summary: Evaluate placement against registered capabilities.
+      operationId: evaluatePlacement
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementEvaluationRequest' } } } }
+      responses:
+        '200': { description: Placement decision., content: { application/json: { schema: { $ref: '#/components/schemas/PlacementDecision' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders:
+    post:
+      summary: Submit a signed work order to the manager.
+      operationId: submitWorkOrder
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Work order accepted., content: { application/json: { schema: { $ref: '#/components/schemas/WorkOrderValidationReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/revoke:
+    post:
+      summary: Revoke a submitted work order.
+      operationId: revokeWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Work order revoked., content: { application/json: { schema: { $ref: '#/components/schemas/RevokedWorkOrderResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/dispatch:
+    post:
+      summary: Dispatch an accepted work order to a resident daemon.
+      operationId: dispatchWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Dispatch report., content: { application/json: { schema: { $ref: '#/components/schemas/DispatchReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/telemetry/read:
+    post:
+      summary: Read observational fleet telemetry.
+      operationId: getFleetTelemetry
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Fleet telemetry., content: { application/json: { schema: { $ref: '#/components/schemas/FleetTelemetrySnapshot' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/traces/sync:
+    post:
+      summary: Sync local trace buffer into central trace index.
+      operationId: syncTraceBuffer
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SyncTraceBufferRequest' } } } }
+      responses:
+        '200': { description: Trace sync report., content: { application/json: { schema: { $ref: '#/components/schemas/TraceSyncReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages:
+    post:
+      summary: Send a typed remote message.
+      operationId: sendMessage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SendMessageRequest' } } } }
+      responses:
+        '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages/{message_id}/read:
+    post:
+      summary: Read message delivery status.
+      operationId: getMessage
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/audit/read:
+    post:
+      summary: Read manager audit events for acceptance replay/audit evidence.
+      operationId: managerAudit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Audit events., content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ManagerAuditEvent' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
 components:
   parameters:
     RunId:
@@ -492,6 +667,12 @@ components:
         - state_read
         - replay_create
         - messages_send
+        - messages_read
+        - work_orders_submit
+        - work_orders_revoke
+        - fleet_read
+        - fleet_dispatch
+        - state_handoff
         - health_read
         - capabilities_read
         - policies_sync
@@ -712,6 +893,588 @@ components:
         requested_at:
           type: string
           format: date-time
+    ManagerSecurityFields:
+      type: object
+      required: [credential, audit_attribution]
+      properties:
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+    ManagerReadRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+    NodeRegistration:
+      type: object
+      required: [node_id, kind, scope, capability_document, runtime_version, health, registered_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        kind: { type: string }
+        scope:
+          type: object
+          required: [fleet_id, tenant_id]
+          properties:
+            fleet_id: { type: string, format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+        capability_document:
+          $ref: '#/components/schemas/CapabilityDocument'
+        runtime_version: { type: string }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        registered_at: { type: string, format: date-time }
+    InstanceRegistration:
+      type: object
+      required: [instance_id, node_id, runtime_mode, hosted_tenants, supported_features, runtime_version, health, registered_at]
+      properties:
+        instance_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        runtime_mode: { type: string }
+        hosted_tenants:
+          type: array
+          items: { type: string, format: uuid }
+        supported_features:
+          type: array
+          items: { type: string }
+        runtime_version: { type: string }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        registered_at: { type: string, format: date-time }
+    NodeHealth:
+      type: object
+      required: [status, observed_at, metadata]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        observed_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+    NodeHeartbeat:
+      type: object
+      required: [node_id, health, recorded_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        recorded_at: { type: string, format: date-time }
+    CapabilityDocument:
+      type: object
+      required: [schema, capabilities, constraints]
+      properties:
+        schema: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        constraints:
+          type: object
+          required: [placement_target, data_locality, resident_daemon_url]
+          properties:
+            placement_target: { type: string }
+            data_locality: { type: string }
+            resident_daemon_url: { type: string, format: uri }
+          additionalProperties: true
+    PlacementRequest:
+      type: object
+      required: [target, required_capabilities, data_locality, dedicated_instance, required_runtime_version, max_runtime_ms, execution_mode]
+      properties:
+        target: { type: string }
+        required_capabilities:
+          type: array
+          items: { type: string }
+        data_locality: { type: [string, 'null'] }
+        dedicated_instance: { type: boolean }
+        required_runtime_version: { type: [string, 'null'] }
+        max_runtime_ms: { type: [integer, 'null'], minimum: 0 }
+        execution_mode: { type: string }
+    TraceSyncBatch:
+      type: object
+      required: [scope, records]
+      properties:
+        scope:
+          type: object
+          required: [fleet_id, node_id, instance_id, tenant_id, agent_id, run_id, work_order_id]
+          properties:
+            fleet_id: { type: [string, 'null'], format: uuid }
+            node_id: { type: [string, 'null'], format: uuid }
+            instance_id: { type: [string, 'null'], format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            agent_id: { type: [string, 'null'], format: uuid }
+            run_id: { type: [string, 'null'], format: uuid }
+            work_order_id: { type: [string, 'null'] }
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRecord'
+    MessageEnvelope:
+      type: object
+      required: [message, schema_version, delivery_status, trace_links]
+      properties:
+        message:
+          type: object
+          required: [message_id, source_agent_id, target_agent_id, run_id, schema, payload, causal_parent, requires_response, created_at]
+          properties:
+            message_id: { type: string, format: uuid }
+            source_agent_id: { type: string, format: uuid }
+            target_agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            schema: { type: string }
+            payload: { $ref: '#/components/schemas/JsonValue' }
+            causal_parent: { type: [string, 'null'] }
+            requires_response: { type: boolean }
+            created_at: { type: string, format: date-time }
+        schema_version: { type: string }
+        delivery_status: { type: string }
+        trace_links:
+          type: object
+          additionalProperties: true
+    AcceptedTraceResponse:
+      type: object
+      required: [accepted, trace_event_id]
+      properties:
+        accepted: { type: boolean }
+        trace_event_id: { type: string }
+    AcceptedNodeResponse:
+      type: object
+      required: [accepted, node_id]
+      properties:
+        accepted: { type: boolean }
+        node_id: { type: string, format: uuid }
+    FleetNodeListResponse:
+      type: object
+      required: [fleet_id, audit_event_count]
+      properties:
+        fleet_id: { type: string, format: uuid }
+        audit_event_count: { type: integer, minimum: 0 }
+    FleetTelemetrySnapshot:
+      type: object
+      required: [schema_version, fleet_id, observed_at, authority, nodes, instances, runs, queues, quota_signals, denial_signals, trace_sync, failures]
+      properties:
+        schema_version:
+          type: string
+          const: splendor.fleet_telemetry.v1
+        fleet_id: { type: string, format: uuid }
+        observed_at: { type: string, format: date-time }
+        authority:
+          type: string
+          enum: [observational_only]
+          description: Explicit non-authoritative marker; telemetry never authorizes dispatch, runs, messages, or actions.
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeTelemetry'
+        instances:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstanceTelemetry'
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunTelemetry'
+        queues:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueueTelemetry'
+        quota_signals:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuotaSignal'
+        denial_signals:
+          type: array
+          items:
+            $ref: '#/components/schemas/DenialSignal'
+        trace_sync:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceSyncTelemetry'
+        failures:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailureSignal'
+    NodeTelemetry:
+      type: object
+      required: [fleet_id, node_id, online_state, last_heartbeat_at, observed_at, instance_ids]
+      properties:
+        fleet_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        online_state:
+          type: string
+          enum: [online, stale, offline]
+        last_heartbeat_at: { type: [string, 'null'], format: date-time }
+        observed_at: { type: string, format: date-time }
+        instance_ids:
+          type: array
+          items: { type: string, format: uuid }
+    InstanceTelemetry:
+      type: object
+      required: [node_id, instance_id, runtime_version, runtime_mode, capabilities, current_run_counts, reported_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        runtime_version:
+          type: string
+          description: Runtime image identity or semantic build label reported by the resident instance.
+        runtime_mode:
+          type: string
+          enum: [ephemeral, resident, dedicated, customer_vpc, on_prem, edge_device, physical_robot, desktop_sidecar]
+        runtime_image:
+          type: [string, 'null']
+          description: Optional image identity when the manager can derive it from deployment evidence.
+        build_target:
+          type: [string, 'null']
+          description: Optional compose/build target evidence for same-runtime-image checks.
+        capabilities:
+          type: array
+          items: { type: string }
+        current_run_counts:
+          $ref: '#/components/schemas/RunStatusCounts'
+        reported_at: { type: string, format: date-time }
+    RunStatusCounts:
+      type: object
+      required: [counts]
+      properties:
+        counts:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunStatusCount'
+    RunStatusCount:
+      type: object
+      required: [status, count]
+      properties:
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        count: { type: integer, minimum: 0 }
+    RunTelemetry:
+      type: object
+      required: [tenant_id, agent_id, run_id, node_id, instance_id, status, updated_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        updated_at: { type: string, format: date-time }
+    QueueTelemetry:
+      type: object
+      required: [node_id, instance_id, queued_runs, queued_messages, updated_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        queued_runs: { type: integer, minimum: 0 }
+        queued_messages: { type: integer, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+    FailureCategory:
+      type: string
+      enum: [heartbeat_stale, heartbeat_offline, instance_unavailable, run_failed, quota_denied, verification_denied, trace_sync_lag, trace_sync_failed, state_handoff_failed, work_order_rejected, gateway_failed, other]
+    FailureSignal:
+      type: object
+      required: [category, node_id, instance_id, tenant_id, agent_id, run_id, verifier, message, trace_id, recorded_at]
+      properties:
+        category:
+          $ref: '#/components/schemas/FailureCategory'
+        node_id: { type: [string, 'null'], format: uuid }
+        instance_id: { type: [string, 'null'], format: uuid }
+        tenant_id: { type: [string, 'null'], format: uuid }
+        agent_id: { type: [string, 'null'], format: uuid }
+        run_id: { type: [string, 'null'], format: uuid }
+        verifier: { type: [string, 'null'] }
+        message: { type: string }
+        trace_id: { type: [string, 'null'] }
+        recorded_at: { type: string, format: date-time }
+    QuotaSignal:
+      type: object
+      required: [tenant_id, agent_id, run_id, verifier, allowed, usage, reasons, artifacts, recorded_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        verifier: { type: [string, 'null'] }
+        allowed: { type: boolean }
+        usage:
+          $ref: '#/components/schemas/QuotaUsage'
+        reasons:
+          type: array
+          items: { type: string }
+        artifacts:
+          $ref: '#/components/schemas/JsonValue'
+        recorded_at: { type: string, format: date-time }
+    DenialSignal:
+      type: object
+      required: [tenant_id, agent_id, run_id, verifier, action_name, reasons, artifacts, recorded_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        verifier: { type: [string, 'null'] }
+        action_name: { type: [string, 'null'] }
+        reasons:
+          type: array
+          items: { type: string }
+        artifacts:
+          $ref: '#/components/schemas/JsonValue'
+        recorded_at: { type: string, format: date-time }
+    TraceSyncFailure:
+      type: object
+      required: [category, message, failed_at]
+      properties:
+        category:
+          $ref: '#/components/schemas/FailureCategory'
+        message: { type: string }
+        failed_at: { type: string, format: date-time }
+    TraceSyncTelemetry:
+      type: object
+      required: [node_id, instance_id, last_synced_trace_id, last_synced_sequence, source_high_watermark, lag_events, last_sync_at, last_failure]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        last_synced_trace_id: { type: [string, 'null'] }
+        last_synced_sequence: { type: [integer, 'null'], minimum: 0 }
+        source_high_watermark: { type: [integer, 'null'], minimum: 0 }
+        lag_events: { type: integer, minimum: 0 }
+        last_sync_at: { type: [string, 'null'], format: date-time }
+        last_failure:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/TraceSyncFailure'
+    PlacementDecision:
+      type: object
+      required: [status, candidate_id, reasons]
+      properties:
+        status: { type: string }
+        candidate_id: { type: [string, 'null'] }
+        reasons:
+          type: array
+          items: { type: string }
+    WorkOrderValidationReport:
+      type: object
+      required: [work_order_id, accepted, reasons, trace_event_id]
+      properties:
+        work_order_id: { type: string }
+        accepted: { type: boolean }
+        reasons:
+          type: array
+          items: { type: string }
+        trace_event_id: { type: string }
+    RevokedWorkOrderResponse:
+      type: object
+      required: [revoked, trace_event_id]
+      properties:
+        revoked: { type: boolean }
+        trace_event_id: { type: string }
+    DispatchReport:
+      type: object
+      required: [work_order_id, selected_node_id, selected_instance_id, run_id, create_run_status, start_run_status, trace_event_id, resident_daemon_url]
+      properties:
+        work_order_id: { type: string }
+        selected_node_id: { type: string, format: uuid }
+        selected_instance_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        create_run_status: { type: integer }
+        start_run_status: { type: integer }
+        create_run_body: { type: [string, 'null'] }
+        start_run_body: { type: [string, 'null'] }
+        trace_event_id: { type: string }
+        resident_daemon_url: { type: string, format: uri }
+    TraceSyncReport:
+      type: object
+      required: [accepted_records, duplicate_records, latest_sequence]
+      properties:
+        accepted_records: { type: integer, minimum: 0 }
+        duplicate_records: { type: integer, minimum: 0 }
+        latest_sequence: { type: [integer, 'null'], minimum: 0 }
+    MessageStatusReport:
+      type: object
+      required: [message_id, work_order_id, delivery_status, trace_event_id, duplicate, idempotency_key, source_instance_id, target_instance_id, recipient_validated, receive_side_validated, work_order_authority_validated, route_permission, remote_state_mutated, reason]
+      properties:
+        message_id: { type: string, format: uuid }
+        work_order_id: { type: string }
+        delivery_status: { type: string }
+        trace_event_id: { type: string }
+        duplicate: { type: boolean }
+        idempotency_key: { type: [string, 'null'] }
+        source_instance_id: { type: string, format: uuid }
+        target_instance_id: { type: string, format: uuid }
+        recipient_validated: { type: boolean }
+        receive_side_validated: { type: boolean }
+        work_order_authority_validated: { type: boolean }
+        route_permission: { type: [string, 'null'] }
+        remote_state_mutated: { type: boolean }
+        reason: { type: [string, 'null'] }
+    ManagerAuditEvent:
+      type: object
+      required: [trace_event_id, event_type, details, timestamp]
+      properties:
+        trace_event_id: { type: string }
+        event_type: { type: string }
+        details: { $ref: '#/components/schemas/JsonValue' }
+        timestamp: { type: string, format: date-time }
+    RegisterNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              $ref: '#/components/schemas/NodeRegistration'
+    RegisterInstanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              $ref: '#/components/schemas/InstanceRegistration'
+    HeartbeatNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [heartbeat]
+          properties:
+            heartbeat:
+              $ref: '#/components/schemas/NodeHeartbeat'
+    AdvertiseCapabilitiesRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [capability_document]
+          properties:
+            capability_document:
+              $ref: '#/components/schemas/CapabilityDocument'
+    PlacementEvaluationRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order_id, request]
+          properties:
+            work_order_id:
+              type: [string, 'null']
+            request:
+              $ref: '#/components/schemas/PlacementRequest'
+    SubmitWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order, expected_audience]
+          properties:
+            work_order:
+              $ref: '#/components/schemas/WorkOrderEnvelope'
+            expected_audience:
+              type: string
+    RevokeWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason:
+              type: string
+    DispatchWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [target_node_id]
+          properties:
+            target_node_id:
+              type: [string, 'null']
+              format: uuid
+    SyncTraceBufferRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [batch]
+          properties:
+            batch:
+              $ref: '#/components/schemas/TraceSyncBatch'
+    SendMessageRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order_id, message_envelope, source_instance_id, target_instance_id, idempotency_key, simulate_failure]
+          properties:
+            work_order_id:
+              type: string
+            message_envelope:
+              $ref: '#/components/schemas/MessageEnvelope'
+            source_instance_id:
+              type: string
+              format: uuid
+            target_instance_id:
+              type: string
+              format: uuid
+            idempotency_key:
+              type: [string, 'null']
+            simulate_failure:
+              type: [string, 'null']
+    ExportStateSnapshotRequest:
+      type: object
+      required: [run_id, credential, audit_attribution, work_order_id, source_instance_id, receiver_instance_id]
+      properties:
+        run_id: { type: string, format: uuid }
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+        work_order_id: { type: string }
+        source_instance_id: { type: string, format: uuid }
+        receiver_instance_id: { type: string, format: uuid }
+    ImportStateSnapshotRequest:
+      type: object
+      required: [handoff, credential, audit_attribution]
+      properties:
+        handoff:
+          type: object
+          required: [authority, snapshot]
+          properties:
+            authority:
+              type: object
+              required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+            snapshot:
+              type: object
+              required: [state_node_id, state_hash]
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+    ExportStateSnapshotResponse:
+      type: object
+      required: [run_id, state_node_id, trace_event_id, handoff]
+      properties:
+        run_id: { type: string, format: uuid }
+        state_node_id: { type: string }
+        trace_event_id: { type: string }
+        handoff:
+          $ref: '#/components/schemas/StateHandoff'
+    ImportStateSnapshotResponse:
+      type: object
+      required: [run_id, state_node_id, trace_event_id, accepted]
+      properties:
+        run_id: { type: string, format: uuid }
+        state_node_id: { type: string }
+        trace_event_id: { type: string }
+        accepted: { type: boolean }
+    StateHandoff:
+      type: object
+      required: [authority, snapshot]
+      properties:
+        authority:
+          type: object
+          required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+          properties:
+            tenant_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            work_order_id: { type: string }
+            source_instance_id: { type: string, format: uuid }
+            receiver_instance_id: { type: string, format: uuid }
+        snapshot:
+          type: object
+          required: [state_node_id, state_hash]
+          properties:
+            state_node_id: { type: string }
+            state_hash: { type: string }
+          additionalProperties: true
     Percept:
       type: object
       required: [schema, payload, provenance, timestamp]
