@@ -103,6 +103,7 @@ services:
     working_dir: /workspace
     environment:
       SPLENDOR_MANAGER_BIND_ADDR: 0.0.0.0:8081
+      SPLENDOR_MANAGER_ALLOW_NON_LOOPBACK_DEV: "1"
       SPLENDOR_MANAGER_ID: central-manager
       SPLENDOR_FLEET_ID: 00000000-0000-4000-8000-000000000104
     command: ["splendor-manager"]

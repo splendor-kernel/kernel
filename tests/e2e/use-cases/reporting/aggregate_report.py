@@ -101,10 +101,21 @@ S4_REQUIRED_NEGATIVES = {
     "revoked_work_order",
     "wrong_audience_work_order",
     "wrong_tenant_credential",
+    "wrong_audience_credential",
     "capability_mismatch",
+    "stale_heartbeat_placement_rejection",
+    "dispatch_target_mismatch",
+    "dispatch_revoked_work_order",
     "duplicate_remote_message",
     "remote_message_delivery_failure",
+    "unsupported_remote_message_schema",
+    "unauthorized_remote_message_recipient",
     "state_handoff_wrong_tenant_rejected",
+    "state_handoff_wrong_hash_rejected",
+    "state_handoff_wrong_run_rejected",
+    "receiver_state_unchanged_on_failed_import",
+    "trace_sync_idempotent_duplicate",
+    "trace_sync_tamper_rejected",
     "telemetry_non_authoritative",
 }
 
@@ -818,6 +829,8 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"empty_required_s4_artifact:{name}")
     if scenario.get("status") != "passed":
         failures.append("s4_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s4_scenario_failure:{failure}")
     operations = set(scenario.get("api_operations", []))
     missing_ops = sorted(S4_REQUIRED_OPERATIONS - operations)
     if missing_ops:
@@ -826,11 +839,19 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     missing_negatives = sorted(S4_REQUIRED_NEGATIVES - set(negatives))
     if missing_negatives:
         failures.append("s4_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S4_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s4_negative_case_not_asserted:{case}")
     same_image = scenario.get("same_image_fleet_evidence", {})
     if same_image.get("all_same") is not True or same_image.get("same_build_target") != "runtime":
         failures.append("s4_same_image_fleet_evidence_missing")
     if len(same_image.get("splendor_services", [])) < 5:
         failures.append("s4_same_image_missing_splendor_services")
+    targets = same_image.get("build_targets", {})
+    if targets and set(targets.values()) != {"runtime"}:
+        failures.append("s4_same_image_build_targets_differ")
+    if same_image.get("runner_exception") is not True:
+        failures.append("s4_acceptance_runner_exception_missing")
     placement = read_json(artifact_dir / "placement-decision.json")
     if placement.get("status") != "selected" or placement.get("candidate_id") not in scenario.get("node_ids", []):
         failures.append("s4_vpc_placement_not_selected")
@@ -840,15 +861,36 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     remote = read_json(artifact_dir / "remote-message-report.json")
     if remote.get("delivered", {}).get("delivery_status") != "delivered":
         failures.append("s4_remote_message_not_delivered")
+    if remote.get("delivered", {}).get("recipient_validated") is not True or remote.get("delivered", {}).get("remote_state_mutated") is not False:
+        failures.append("s4_remote_receive_validation_missing")
+    if remote.get("received", {}).get("receive_side_validated") is not True:
+        failures.append("s4_remote_message_not_publicly_read")
     if remote.get("duplicate", {}).get("duplicate") is not True:
         failures.append("s4_duplicate_message_not_detected")
+    if remote.get("duplicate", {}).get("idempotency_key") != "proposal-once":
+        failures.append("s4_duplicate_not_based_on_idempotency_key")
     if remote.get("failed", {}).get("delivery_status") != "failed":
         failures.append("s4_remote_failure_not_trace_linked")
+    if remote.get("unsupported_schema", {}).get("status") != 400:
+        failures.append("s4_unsupported_schema_not_rejected")
+    if remote.get("unauthorized_recipient", {}).get("status") != 403:
+        failures.append("s4_unauthorized_recipient_not_rejected")
     handoff = read_json(artifact_dir / "state-handoff-report.json")
     if not handoff.get("exported", {}).get("handoff") or handoff.get("imported", {}).get("accepted") is not True:
         failures.append("s4_state_handoff_export_import_missing")
     if handoff.get("rejected", {}).get("status") not in {400, 403}:
         failures.append("s4_bad_state_handoff_not_rejected")
+    if handoff.get("wrong_hash", {}).get("status") != 403:
+        failures.append("s4_wrong_hash_handoff_not_rejected")
+    if handoff.get("wrong_run", {}).get("status") not in {400, 404}:
+        failures.append("s4_wrong_run_handoff_not_rejected")
+    if handoff.get("receiver_unchanged_on_failed_import") is not True:
+        failures.append("s4_failed_handoff_mutated_receiver_state")
+    trace_sync = read_json(artifact_dir / "trace-sync-report.json")
+    if trace_sync.get("duplicate_sync", {}).get("duplicate_records", 0) <= 0:
+        failures.append("s4_trace_sync_duplicate_not_idempotent")
+    if trace_sync.get("tampered_sync", {}).get("status") != 403:
+        failures.append("s4_trace_sync_tamper_not_rejected")
     telemetry = read_json(artifact_dir / "fleet-telemetry.json")
     if telemetry.get("authority") != "observational_only":
         failures.append("s4_telemetry_not_observational_only")
@@ -857,6 +899,11 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("remote_messages_resent") is not False:
         failures.append("s4_replay_suppression_missing")
+    if replay.get("derived_from_public_replay_api") is not True or not replay.get("replay_id"):
+        failures.append("s4_replay_not_from_public_api")
+    audit = read_json(artifact_dir / "audit-report.json")
+    if not audit.get("events"):
+        failures.append("s4_audit_events_missing")
     anti = read_json(artifact_dir / "anti-drift-results.json")
     for key in ["same_image_fleet", "private_helper_only_e2e", "telemetry_authorizes_dispatch", "gateway_bypass", "replay_side_effects_allowed_default"]:
         if key == "same_image_fleet":

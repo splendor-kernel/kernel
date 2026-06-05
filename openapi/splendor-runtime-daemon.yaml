@@ -434,13 +434,15 @@ paths:
     post:
       summary: Register a fleet node.
       operationId: registerNode
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterNodeRequest' } } } }
       responses:
         '200': { description: Node registered. }
         '403': { $ref: '#/components/responses/Forbidden' }
-    get:
+  /fleet/nodes/list:
+    post:
       summary: List fleet nodes.
       operationId: listNodes
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
       responses:
         '200': { description: Registry projection. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -448,7 +450,7 @@ paths:
     post:
       summary: Register a runtime instance.
       operationId: registerInstance
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterInstanceRequest' } } } }
       responses:
         '200': { description: Instance registered. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -461,7 +463,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatNodeRequest' } } } }
       responses:
         '200': { description: Heartbeat recorded. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -474,7 +476,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdvertiseCapabilitiesRequest' } } } }
       responses:
         '200': { description: Capabilities advertised. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -482,7 +484,7 @@ paths:
     post:
       summary: Evaluate placement against registered capabilities.
       operationId: evaluatePlacement
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementEvaluationRequest' } } } }
       responses:
         '200': { description: Placement decision. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -490,7 +492,7 @@ paths:
     post:
       summary: Submit a signed work order to the manager.
       operationId: submitWorkOrder
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitWorkOrderRequest' } } } }
       responses:
         '200': { description: Work order accepted. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -503,7 +505,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeWorkOrderRequest' } } } }
       responses:
         '200': { description: Work order revoked. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -516,14 +518,15 @@ paths:
           in: path
           required: true
           schema: { type: string }
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchWorkOrderRequest' } } } }
       responses:
         '200': { description: Dispatch report. }
         '403': { $ref: '#/components/responses/Forbidden' }
-  /fleet/telemetry:
-    get:
+  /fleet/telemetry/read:
+    post:
       summary: Read observational fleet telemetry.
       operationId: getFleetTelemetry
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
       responses:
         '200': { description: Fleet telemetry. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -531,7 +534,7 @@ paths:
     post:
       summary: Sync local trace buffer into central trace index.
       operationId: syncTraceBuffer
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SyncTraceBufferRequest' } } } }
       responses:
         '200': { description: Trace sync report. }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -539,12 +542,12 @@ paths:
     post:
       summary: Send a typed remote message.
       operationId: sendMessage
-      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SendMessageRequest' } } } }
       responses:
         '200': { description: Message status. }
         '403': { $ref: '#/components/responses/Forbidden' }
-  /messages/{message_id}:
-    get:
+  /messages/{message_id}/read:
+    post:
       summary: Read message delivery status.
       operationId: getMessage
       parameters:
@@ -552,8 +555,17 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
       responses:
         '200': { description: Message status. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/audit/read:
+    post:
+      summary: Read manager audit events for acceptance replay/audit evidence.
+      operationId: managerAudit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Audit events. }
         '403': { $ref: '#/components/responses/Forbidden' }
 components:
   parameters:
@@ -647,6 +659,12 @@ components:
         - state_read
         - replay_create
         - messages_send
+        - messages_read
+        - work_orders_submit
+        - work_orders_revoke
+        - fleet_read
+        - fleet_dispatch
+        - state_handoff
         - health_read
         - capabilities_read
         - policies_sync
@@ -867,6 +885,119 @@ components:
         requested_at:
           type: string
           format: date-time
+    ManagerSecurityFields:
+      type: object
+      required: [credential, audit_attribution]
+      properties:
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+    ManagerReadRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+    RegisterNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              type: object
+              required: [node_id, kind, scope, capability_document, runtime_version, health, registered_at]
+    RegisterInstanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              type: object
+              required: [instance_id, node_id, runtime_mode, hosted_tenants, supported_features, runtime_version, health, registered_at]
+    HeartbeatNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [heartbeat]
+          properties:
+            heartbeat:
+              type: object
+              required: [node_id, health, recorded_at]
+    AdvertiseCapabilitiesRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [capability_document]
+          properties:
+            capability_document:
+              type: object
+              required: [schema, capabilities, constraints]
+    PlacementEvaluationRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order_id, request]
+          properties:
+            work_order_id:
+              type: [string, 'null']
+            request:
+              type: object
+              required: [target, required_capabilities, data_locality, dedicated_instance, required_runtime_version, max_runtime_ms, execution_mode]
+    SubmitWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order, expected_audience]
+          properties:
+            work_order:
+              $ref: '#/components/schemas/WorkOrderEnvelope'
+            expected_audience:
+              type: string
+    RevokeWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason:
+              type: string
+    DispatchWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [target_node_id]
+          properties:
+            target_node_id:
+              type: [string, 'null']
+              format: uuid
+    SyncTraceBufferRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [batch]
+          properties:
+            batch:
+              type: object
+              required: [scope, records]
+    SendMessageRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [message_envelope, source_instance_id, target_instance_id, idempotency_key, simulate_failure]
+          properties:
+            message_envelope:
+              type: object
+              required: [message, schema_version, delivery_status, trace_links]
+            source_instance_id:
+              type: string
+              format: uuid
+            target_instance_id:
+              type: string
+              format: uuid
+            idempotency_key:
+              type: [string, 'null']
+            simulate_failure:
+              type: [string, 'null']
     Percept:
       type: object
       required: [schema, payload, provenance, timestamp]

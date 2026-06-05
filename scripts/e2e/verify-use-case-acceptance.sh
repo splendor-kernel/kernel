@@ -12,7 +12,7 @@ usage() {
   cat <<'USAGE'
 Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
-S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4-S10 intentionally report blocked/not-yet-covered until implemented.
+S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4 is the fleet dispatch acceptance gate. S5-S10 intentionally report blocked/not-yet-covered until implemented.
 USAGE
 }
 

@@ -1069,6 +1069,12 @@ export type EndpointScope =
   | "state_read"
   | "replay_create"
   | "messages_send"
+  | "messages_read"
+  | "work_orders_submit"
+  | "work_orders_revoke"
+  | "fleet_read"
+  | "fleet_dispatch"
+  | "state_handoff"
   | "health_read"
   | "capabilities_read"
   | "policies_sync"
@@ -1627,6 +1633,12 @@ export const ENDPOINT_SCOPE_VALUES = [
   "StateRead",
   "ReplayCreate",
   "MessagesSend",
+  "MessagesRead",
+  "WorkOrdersSubmit",
+  "WorkOrdersRevoke",
+  "FleetRead",
+  "FleetDispatch",
+  "StateHandoff",
   "HealthRead",
   "CapabilitiesRead",
   "PoliciesSync",
@@ -1649,6 +1661,12 @@ export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
   state_read: "splendor.state.read",
   replay_create: "splendor.replay.create",
   messages_send: "splendor.messages.send",
+  messages_read: "splendor.messages.read",
+  work_orders_submit: "splendor.work_orders.submit",
+  work_orders_revoke: "splendor.work_orders.revoke",
+  fleet_read: "splendor.fleet.read",
+  fleet_dispatch: "splendor.fleet.dispatch",
+  state_handoff: "splendor.state.handoff",
   health_read: "splendor.health.read",
   capabilities_read: "splendor.capabilities.read",
   policies_sync: "splendor.policies.sync",

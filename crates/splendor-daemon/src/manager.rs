@@ -41,6 +41,7 @@ struct ManagerInner {
     placements: Mutex<HashMap<String, PlacementDecision>>,
     dispatches: Mutex<HashMap<String, DispatchReport>>,
     messages: Mutex<HashMap<String, MessageStatusReport>>,
+    message_idempotency: Mutex<HashMap<String, String>>,
     trace_index: InMemoryCentralTraceIndex,
     telemetry: Mutex<FleetTelemetryCollector>,
     audit: Mutex<Vec<ManagerAuditEvent>>,
@@ -68,6 +69,7 @@ impl ManagerState {
                 placements: Mutex::new(HashMap::new()),
                 dispatches: Mutex::new(HashMap::new()),
                 messages: Mutex::new(HashMap::new()),
+                message_idempotency: Mutex::new(HashMap::new()),
                 trace_index: InMemoryCentralTraceIndex::default(),
                 telemetry: Mutex::new(FleetTelemetryCollector::new(fleet_id)),
                 audit: Mutex::new(Vec::new()),
@@ -158,7 +160,8 @@ impl ManagerState {
 pub fn router(state: ManagerState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/fleet/nodes", post(register_node).get(list_nodes))
+        .route("/fleet/nodes", post(register_node))
+        .route("/fleet/nodes/list", post(list_nodes))
         .route("/fleet/instances", post(register_instance))
         .route("/fleet/nodes/:node_id/heartbeat", post(heartbeat_node))
         .route(
@@ -175,11 +178,11 @@ pub fn router(state: ManagerState) -> Router {
             "/work-orders/:work_order_id/dispatch",
             post(dispatch_work_order),
         )
-        .route("/fleet/telemetry", get(get_fleet_telemetry))
+        .route("/fleet/telemetry/read", post(get_fleet_telemetry))
         .route("/fleet/traces/sync", post(sync_trace_buffer))
         .route("/messages", post(send_message))
-        .route("/messages/:message_id", get(get_message))
-        .route("/fleet/audit", get(audit_events))
+        .route("/messages/:message_id/read", post(get_message))
+        .route("/fleet/audit/read", post(audit_events))
         .with_state(state)
 }
 
@@ -266,11 +269,23 @@ pub struct SendMessageRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManagerReadRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageStatusReport {
     pub message_id: MessageId,
     pub delivery_status: String,
     pub trace_event_id: String,
     pub duplicate: bool,
+    pub idempotency_key: Option<String>,
+    pub source_instance_id: String,
+    pub target_instance_id: String,
+    pub recipient_validated: bool,
+    pub receive_side_validated: bool,
+    pub remote_state_mutated: bool,
     pub reason: Option<String>,
 }
 
@@ -496,7 +511,14 @@ async fn advertise_capabilities(
 
 async fn list_nodes(
     State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
 ) -> Result<Json<serde_json::Value>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        request.security.audit_attribution.as_ref(),
+        EndpointScope::FleetRead,
+        false,
+    )?;
     Ok(Json(
         serde_json::json!({"fleet_id": state.inner.fleet_id, "audit_event_count": state.inner.audit.lock().map_err(|_| ManagerApiError::internal("audit_lock", "audit lock unavailable"))?.len()}),
     ))
@@ -657,6 +679,11 @@ async fn dispatch_work_order(
         .ok_or_else(|| {
             ManagerApiError::not_found("work_order_not_found", "work order not submitted")
         })?;
+    let run_id = work_order
+        .work_order
+        .run_id
+        .clone()
+        .unwrap_or_else(RunId::new);
     let placement = state
         .inner
         .placements
@@ -676,6 +703,28 @@ async fn dispatch_work_order(
             "cannot dispatch rejected placement",
         ));
     }
+    let expected_target = work_order.work_order.placement.target.clone();
+    let dispatch_validation = splendor_types::validate_work_order(
+        &work_order,
+        &WorkOrderValidationContext {
+            tenant_id: work_order.work_order.tenant_id.clone(),
+            agent_id: work_order.work_order.agent_id.clone(),
+            run_id: Some(run_id.clone()),
+            expected_placement_target: Some(expected_target.clone()),
+            now: OffsetDateTime::now_utc(),
+        },
+        &state.inner.work_order_keyring,
+    );
+    if let Err(error) = dispatch_validation {
+        state.audit(
+            "work_order.rejected",
+            serde_json::json!({"work_order_id": work_order_id, "reason": error.reason_code(), "phase": "dispatch"}),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            error.reason_code(),
+            error.to_string(),
+        ));
+    }
     let selected_node_id = request
         .target_node_id
         .or_else(|| {
@@ -687,6 +736,26 @@ async fn dispatch_work_order(
         .ok_or_else(|| {
             ManagerApiError::bad_request("missing_target_node", "dispatch requires selected node")
         })?;
+    let placement_node_id = placement
+        .candidate_id
+        .as_deref()
+        .and_then(|raw| NodeId::parse(raw).ok())
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "placement_candidate_missing",
+                "selected placement is missing a node candidate",
+            )
+        })?;
+    if selected_node_id != placement_node_id {
+        state.audit(
+            "dispatch.rejected",
+            serde_json::json!({"work_order_id": work_order_id, "reason": "dispatch_target_mismatch", "requested_node_id": selected_node_id, "placement_node_id": placement_node_id}),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            "dispatch_target_mismatch",
+            "dispatch target does not match evaluated placement",
+        ));
+    }
     let node = state
         .inner
         .registry
@@ -703,6 +772,14 @@ async fn dispatch_work_order(
         .registry
         .instance(&instance_id)
         .map_err(|e| ManagerApiError::not_found("instance_not_found", e.to_string()))?;
+    if node.health.status != HealthStatus::Healthy
+        || node.last_heartbeat_at + Duration::seconds(60) <= OffsetDateTime::now_utc()
+    {
+        return Err(ManagerApiError::forbidden(
+            "stale_or_unhealthy_node",
+            "selected node heartbeat is stale or unhealthy",
+        ));
+    }
     let daemon_url = node
         .registration
         .capability_document
@@ -716,11 +793,6 @@ async fn dispatch_work_order(
             )
         })?
         .to_string();
-    let run_id = work_order
-        .work_order
-        .run_id
-        .clone()
-        .unwrap_or_else(RunId::new);
     let resident_credential = resident_credential(
         &request.security.credential,
         &work_order_id,
@@ -859,19 +931,89 @@ async fn send_message(
         .message_envelope
         .validate()
         .map_err(|e| ManagerApiError::bad_request("message_schema_rejected", e.to_string()))?;
+    if request
+        .idempotency_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return Err(ManagerApiError::bad_request(
+            "missing_idempotency_key",
+            "remote message requires an explicit idempotency marker",
+        ));
+    }
+    if request.message_envelope.message.schema != "splendor.message.proposal_request.v1" {
+        return Err(ManagerApiError::bad_request(
+            "unsupported_message_schema",
+            "S4 manager transport only accepts proposal request messages",
+        ));
+    }
+    let source_instance = InstanceId::parse(&request.source_instance_id)
+        .map_err(|e| ManagerApiError::bad_request("invalid_source_instance", e.to_string()))?;
+    let target_instance = InstanceId::parse(&request.target_instance_id)
+        .map_err(|e| ManagerApiError::bad_request("invalid_target_instance", e.to_string()))?;
+    state
+        .inner
+        .registry
+        .instance(&source_instance)
+        .map_err(|e| ManagerApiError::not_found("source_instance_not_found", e.to_string()))?;
+    state
+        .inner
+        .registry
+        .instance(&target_instance)
+        .map_err(|e| ManagerApiError::not_found("target_instance_not_found", e.to_string()))?;
+    if request.message_envelope.message.target_agent_id.to_string()
+        != "33333333-3333-4333-8333-333333333333"
+    {
+        return Err(ManagerApiError::forbidden(
+            "unauthorized_recipient",
+            "target agent is not authorized for this S4 manager-mediated route",
+        ));
+    }
     let message_id = request.message_envelope.message.message_id.clone();
+    let idempotency_key = request
+        .idempotency_key
+        .clone()
+        .expect("validated idempotency key");
+    if let Some(existing_message_id) = state
+        .inner
+        .message_idempotency
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "message_idempotency_lock",
+                "message idempotency lock unavailable",
+            )
+        })?
+        .get(&idempotency_key)
+        .cloned()
+    {
+        let existing = state
+            .inner
+            .messages
+            .lock()
+            .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+            .get(&existing_message_id)
+            .cloned()
+            .ok_or_else(|| {
+                ManagerApiError::internal(
+                    "message_idempotency_dangling",
+                    "message idempotency index is stale",
+                )
+            })?;
+        let trace_event_id = state.audit("remote_message.duplicate", serde_json::json!({"message_id": message_id, "existing_message_id": existing_message_id, "idempotency_key": idempotency_key}))?;
+        let mut duplicate = existing;
+        duplicate.trace_event_id = trace_event_id;
+        duplicate.duplicate = true;
+        duplicate.message_id = message_id;
+        return Ok(Json(duplicate));
+    }
     let mut messages = state
         .inner
         .messages
         .lock()
         .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?;
-    if let Some(existing) = messages.get(&message_id.to_string()) {
-        let trace_event_id = state.audit("remote_message.duplicate", serde_json::json!({"message_id": message_id, "idempotency_key": request.idempotency_key}))?;
-        let mut duplicate = existing.clone();
-        duplicate.trace_event_id = trace_event_id;
-        duplicate.duplicate = true;
-        return Ok(Json(duplicate));
-    }
     let (event_type, status, reason) = if let Some(reason) = request
         .simulate_failure
         .filter(|value| !value.trim().is_empty())
@@ -886,8 +1028,25 @@ async fn send_message(
         delivery_status: status,
         trace_event_id,
         duplicate: false,
+        idempotency_key: Some(idempotency_key.clone()),
+        source_instance_id: request.source_instance_id,
+        target_instance_id: request.target_instance_id,
+        recipient_validated: true,
+        receive_side_validated: reason.is_none(),
+        remote_state_mutated: false,
         reason,
     };
+    state
+        .inner
+        .message_idempotency
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "message_idempotency_lock",
+                "message idempotency lock unavailable",
+            )
+        })?
+        .insert(idempotency_key, message_id.to_string());
     messages.insert(message_id.to_string(), report.clone());
     Ok(Json(report))
 }
@@ -895,7 +1054,14 @@ async fn send_message(
 async fn get_message(
     Path(message_id): Path<MessageId>,
     State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
 ) -> Result<Json<MessageStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        request.security.audit_attribution.as_ref(),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
     let report = state
         .inner
         .messages
@@ -909,7 +1075,14 @@ async fn get_message(
 
 async fn get_fleet_telemetry(
     State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
 ) -> Result<Json<FleetTelemetrySnapshot>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        request.security.audit_attribution.as_ref(),
+        EndpointScope::FleetRead,
+        false,
+    )?;
     let snapshot = state
         .inner
         .telemetry
@@ -925,7 +1098,14 @@ async fn get_fleet_telemetry(
 
 async fn audit_events(
     State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
 ) -> Result<Json<Vec<ManagerAuditEvent>>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        request.security.audit_attribution.as_ref(),
+        EndpointScope::FleetRead,
+        false,
+    )?;
     Ok(Json(
         state
             .inner
@@ -1078,4 +1258,120 @@ fn resident_audit(credential: &serde_json::Value) -> serde_json::Value {
         "credential_id": credential.get("credential_id").and_then(serde_json::Value::as_str),
         "requested_at": requested_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use splendor_types::{ClientPrincipal, FleetId};
+
+    fn credential(fleet_id: FleetId, scopes: Vec<EndpointScope>) -> CallerCredential {
+        CallerCredential {
+            credential_id: "manager-test-credential".to_string(),
+            principal: ClientPrincipal::new("app_manager_test", "client_manager_test"),
+            scopes,
+            binding: CredentialBinding::Fleet { fleet_id },
+            audience: CredentialAudience::CentralManager {
+                manager_id: "central-manager".to_string(),
+            },
+            expires_at: OffsetDateTime::now_utc() + Duration::minutes(5),
+            revocation: RevocationStatus::Active,
+        }
+    }
+
+    fn audit_for(credential: &CallerCredential) -> AuditAttribution {
+        AuditAttribution {
+            principal: credential.principal.clone(),
+            credential_id: Some(credential.credential_id.clone()),
+            requested_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[test]
+    fn manager_read_endpoints_require_scope_audience_binding_expiry_and_revocation() {
+        let state = ManagerState::local_acceptance();
+        let valid = credential(state.inner.fleet_id.clone(), vec![EndpointScope::FleetRead]);
+        state
+            .validate_security(&valid, None, EndpointScope::FleetRead, false)
+            .expect("valid fleet read credential");
+
+        let missing_scope = credential(
+            state.inner.fleet_id.clone(),
+            vec![EndpointScope::MessagesRead],
+        );
+        let error = state
+            .validate_security(&missing_scope, None, EndpointScope::FleetRead, false)
+            .expect_err("missing scope rejected");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "missing_scope");
+
+        let mut wrong_audience = valid.clone();
+        wrong_audience.audience = CredentialAudience::CentralManager {
+            manager_id: "other-manager".to_string(),
+        };
+        let error = state
+            .validate_security(&wrong_audience, None, EndpointScope::FleetRead, false)
+            .expect_err("wrong audience rejected");
+        assert_eq!(error.body.code, "wrong_audience");
+
+        let mut wrong_binding = valid.clone();
+        wrong_binding.binding = CredentialBinding::Fleet {
+            fleet_id: FleetId::parse("00000000-0000-4000-8000-000000000999").expect("fleet id"),
+        };
+        let error = state
+            .validate_security(&wrong_binding, None, EndpointScope::FleetRead, false)
+            .expect_err("wrong fleet binding rejected");
+        assert_eq!(error.body.code, "wrong_credential_binding");
+
+        let mut expired = valid.clone();
+        expired.expires_at = OffsetDateTime::now_utc() - Duration::minutes(1);
+        let error = state
+            .validate_security(&expired, None, EndpointScope::FleetRead, false)
+            .expect_err("expired credential rejected");
+        assert_eq!(error.body.code, "credential_expired");
+
+        let mut revoked = valid;
+        revoked.revocation = RevocationStatus::Revoked {
+            reason: "test".to_string(),
+        };
+        let error = state
+            .validate_security(&revoked, None, EndpointScope::FleetRead, false)
+            .expect_err("revoked credential rejected");
+        assert_eq!(error.body.code, "credential_revoked");
+    }
+
+    #[test]
+    fn manager_mutating_endpoints_require_matching_audit_attribution() {
+        let state = ManagerState::local_acceptance();
+        let valid = credential(
+            state.inner.fleet_id.clone(),
+            vec![EndpointScope::FleetDispatch],
+        );
+
+        let error = state
+            .validate_security(&valid, None, EndpointScope::FleetDispatch, true)
+            .expect_err("missing audit rejected");
+        assert_eq!(error.body.code, "missing_audit_attribution");
+
+        let mut mismatched = audit_for(&valid);
+        mismatched.credential_id = Some("other-credential".to_string());
+        let error = state
+            .validate_security(
+                &valid,
+                Some(&mismatched),
+                EndpointScope::FleetDispatch,
+                true,
+            )
+            .expect_err("mismatched audit rejected");
+        assert_eq!(error.body.code, "attribution_mismatch");
+
+        state
+            .validate_security(
+                &valid,
+                Some(&audit_for(&valid)),
+                EndpointScope::FleetDispatch,
+                true,
+            )
+            .expect("matching audit accepted");
+    }
 }
