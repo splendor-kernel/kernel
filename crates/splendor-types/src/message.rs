@@ -495,6 +495,7 @@ pub struct Message {
     /// Whether the sender expects a response message.
     pub requires_response: bool,
     /// Timestamp when the message was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -508,6 +509,7 @@ struct MessageWire {
     payload: serde_json::Value,
     causal_parent: serde_json::Value,
     requires_response: bool,
+    #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
 }
 

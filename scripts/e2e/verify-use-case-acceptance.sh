@@ -10,7 +10,7 @@ REUSE_BUILD=0
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
+Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
 S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4-S10 intentionally report blocked/not-yet-covered until implemented.
 USAGE
@@ -32,7 +32,7 @@ done
 if [[ "${MODE}" == "scenario" && -z "${SCENARIO}" ]]; then
   SCENARIO="UC-E2E-S0"
 fi
-if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" ]]; then
+if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" && "${SCENARIO}" != "UC-E2E-S4" ]]; then
   echo "${SCENARIO} is not implemented; use --all to report future scenarios as blocked." >&2
   exit 2
 fi
@@ -119,6 +119,14 @@ case "${MODE}" in
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s3_multi_agent_delegation/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}"
+    fi
+    if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S4" ) || "${MODE}" == "all" ]]; then
+      python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s4_fleet_dispatch/run.py" \
+        --root "${ROOT_DIR}" \
+        --report-dir "${REPORT_DIR}" \
+        --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
+        --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}" \
+        --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-http://resident-cloud-node:8091}"
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \

@@ -400,6 +400,161 @@ paths:
                 $ref: '#/components/schemas/CapabilitiesResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /state-snapshots/export:
+    post:
+      summary: Export an explicit state handoff snapshot.
+      operationId: exportStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: State handoff snapshot exported.
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /state-snapshots/import:
+    post:
+      summary: Import an explicit state handoff snapshot.
+      operationId: importStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: State handoff snapshot imported.
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /fleet/nodes:
+    post:
+      summary: Register a fleet node.
+      operationId: registerNode
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Node registered. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      summary: List fleet nodes.
+      operationId: listNodes
+      responses:
+        '200': { description: Registry projection. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/instances:
+    post:
+      summary: Register a runtime instance.
+      operationId: registerInstance
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Instance registered. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/heartbeat:
+    post:
+      summary: Record node heartbeat.
+      operationId: heartbeatNode
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Heartbeat recorded. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/capabilities:
+    post:
+      summary: Advertise node capabilities.
+      operationId: advertiseCapabilities
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Capabilities advertised. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/placement/evaluate:
+    post:
+      summary: Evaluate placement against registered capabilities.
+      operationId: evaluatePlacement
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Placement decision. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders:
+    post:
+      summary: Submit a signed work order to the manager.
+      operationId: submitWorkOrder
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Work order accepted. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/revoke:
+    post:
+      summary: Revoke a submitted work order.
+      operationId: revokeWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Work order revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/dispatch:
+    post:
+      summary: Dispatch an accepted work order to a resident daemon.
+      operationId: dispatchWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Dispatch report. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/telemetry:
+    get:
+      summary: Read observational fleet telemetry.
+      operationId: getFleetTelemetry
+      responses:
+        '200': { description: Fleet telemetry. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/traces/sync:
+    post:
+      summary: Sync local trace buffer into central trace index.
+      operationId: syncTraceBuffer
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Trace sync report. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages:
+    post:
+      summary: Send a typed remote message.
+      operationId: sendMessage
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Message status. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages/{message_id}:
+    get:
+      summary: Read message delivery status.
+      operationId: getMessage
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Message status. }
+        '403': { $ref: '#/components/responses/Forbidden' }
 components:
   parameters:
     RunId:

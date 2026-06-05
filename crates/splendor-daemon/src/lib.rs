@@ -5,6 +5,8 @@
 //! gateway-mediated action submission. It is intentionally local/foundation-only:
 //! no fleet registry, remote scheduler, or production auth provider is included.
 
+pub mod manager;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -33,8 +35,8 @@ use splendor_types::{
     EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding,
     PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
     PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
-    TraceEvent, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
-    WorkOrderValidationContext, WorkOrderValidationError,
+    TraceEvent, TraceEventId, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope,
+    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -161,6 +163,14 @@ impl DaemonConfig {
             work_order_keyring,
         }
     }
+
+    /// Authenticated resident daemon configuration for acceptance/fleet tests.
+    pub fn resident(instance_id: splendor_types::InstanceId) -> Self {
+        let mut config = Self::local_dev();
+        config.expected_audience = CredentialAudience::Instance { instance_id };
+        config.insecure_dev_mode = None;
+        config
+    }
 }
 
 /// Builds the local daemon HTTP router.
@@ -176,6 +186,8 @@ pub fn router(state: DaemonState) -> Router {
         .route("/runs/:run_id/percepts", post(append_percept))
         .route("/runs/:run_id/policies/sync", post(sync_policy))
         .route("/runs/:run_id/state-head", get(state_head))
+        .route("/state-snapshots/export", post(export_state_snapshot))
+        .route("/state-snapshots/import", post(import_state_snapshot))
         .route("/runs/:run_id/traces", get(traces))
         .route("/runs/:run_id/traces/export", post(export_traces))
         .route("/runs/:run_id/replay", post(replay_run))
@@ -523,6 +535,43 @@ pub struct StateHeadResponse {
     pub data_hash: String,
     pub created_at: OffsetDateTime,
     pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotExportRequest {
+    pub run_id: RunId,
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub work_order_id: String,
+    pub source_instance_id: Option<String>,
+    pub receiver_instance_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotExportResponse {
+    pub run_id: RunId,
+    pub state_node_id: String,
+    pub trace_event_id: TraceId,
+    pub handoff: splendor_types::StateHandoff,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotImportRequest {
+    pub handoff: splendor_types::StateHandoff,
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotImportResponse {
+    pub run_id: RunId,
+    pub state_node_id: String,
+    pub trace_event_id: TraceId,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1388,6 +1437,170 @@ async fn state_head(
     }))
 }
 
+async fn export_state_snapshot(
+    State(state): State<DaemonState>,
+    Json(request): Json<StateSnapshotExportRequest>,
+) -> Result<Json<StateSnapshotExportResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    require_post_audit_attribution(
+        request.credential.as_ref(),
+        request.audit_attribution.as_ref(),
+    )?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs
+        .get_mut(&request.run_id)
+        .ok_or_else(|| invalid_run(&request.run_id))?;
+    state.validate_security(
+        DaemonEndpoint::StateHeadRead {
+            tenant_id: slot.tenant_id.clone(),
+            run_id: request.run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    let state_head = slot.state_head.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "state_head_not_found",
+            "run has no state head",
+        )
+    })?;
+    let snapshot_id = slot.state_store.snapshot(state_head).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "state_store_error",
+            error.to_string(),
+        )
+    })?;
+    let snapshot = slot
+        .state_store
+        .export_snapshot(&snapshot_id)
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state_store_error",
+                error.to_string(),
+            )
+        })?;
+    let handoff = splendor_types::StateHandoff {
+        schema_version: "splendor.state_handoff.v1".to_string(),
+        handoff_id: format!("handoff-{}", snapshot.snapshot_id),
+        mode: splendor_types::StateReferenceMode::SnapshotImport,
+        authority: splendor_types::StateHandoffAuthority {
+            tenant_id: slot.tenant_id.clone(),
+            agent_id: slot.agent_id.clone(),
+            run_id: request.run_id.clone(),
+            work_order_id: request.work_order_id,
+        },
+        source_instance_id: request.source_instance_id,
+        receiver_instance_id: request.receiver_instance_id,
+        previous_state_node_id: Some(state_head.to_string()),
+        snapshot,
+        source_trace_id: None,
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let event_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::StateHandoffExported {
+            handoff: splendor_types::StateHandoffTraceContext::exported(&handoff),
+        },
+    )?;
+    let mut handoff = handoff;
+    handoff.source_trace_id = Some(event_id.clone());
+    Ok(Json(StateSnapshotExportResponse {
+        run_id: request.run_id,
+        state_node_id: state_head.to_string(),
+        trace_event_id: event_id,
+        handoff,
+    }))
+}
+
+async fn import_state_snapshot(
+    State(state): State<DaemonState>,
+    Json(request): Json<StateSnapshotImportRequest>,
+) -> Result<Json<StateSnapshotImportResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    require_post_audit_attribution(
+        request.credential.as_ref(),
+        request.audit_attribution.as_ref(),
+    )?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let run_id = request.handoff.authority.run_id.clone();
+    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    state.validate_security(
+        DaemonEndpoint::StateHeadRead {
+            tenant_id: slot.tenant_id.clone(),
+            run_id: run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    if request.handoff.authority.tenant_id != slot.tenant_id
+        || request.handoff.authority.agent_id != slot.agent_id
+    {
+        let event_id = record_run_event_returning_id(
+            slot,
+            TraceEventKind::StateHandoffImportFailed {
+                handoff: splendor_types::StateHandoffTraceContext::exported(&request.handoff),
+                reason: "authority_mismatch".to_string(),
+            },
+        )?;
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "state_handoff_authority_mismatch",
+            "state handoff tenant/agent binding does not match target run",
+        )
+        .details(serde_json::json!({"trace_event_id": event_id})));
+    }
+    let metadata = splendor_store::StateMetadata {
+        created_at: OffsetDateTime::now_utc(),
+        label: Some("state_handoff_import".to_string()),
+        tenant_id: Some(slot.tenant_id.clone()),
+        agent_id: Some(slot.agent_id.clone()),
+        run_id: Some(run_id.clone()),
+        trace_event_id: request.handoff.source_trace_id.clone(),
+    };
+    let imported = match slot
+        .state_store
+        .import_handoff_snapshot(&request.handoff.snapshot, metadata)
+    {
+        Ok(imported) => imported,
+        Err(error) => {
+            let event_id = record_run_event_returning_id(
+                slot,
+                TraceEventKind::StateHandoffImportFailed {
+                    handoff: splendor_types::StateHandoffTraceContext::exported(&request.handoff),
+                    reason: error.to_string(),
+                },
+            )?;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "state_handoff_rejected",
+                error.to_string(),
+            )
+            .details(serde_json::json!({"trace_event_id": event_id})));
+        }
+    };
+    slot.state_head = Some(imported.node_id.clone());
+    let event_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::StateHandoffImported {
+            handoff: splendor_types::StateHandoffTraceContext::imported(
+                &request.handoff,
+                imported.node_id.to_string(),
+            ),
+        },
+    )?;
+    Ok(Json(StateSnapshotImportResponse {
+        run_id,
+        state_node_id: imported.node_id.to_string(),
+        trace_event_id: event_id,
+        accepted: true,
+    }))
+}
+
 async fn traces(
     Path(run_id): Path<RunId>,
     State(state): State<DaemonState>,
@@ -1801,6 +2014,16 @@ fn endpoint_scope_from_public_str(scope: &str) -> Option<EndpointScope> {
             Some(EndpointScope::ReplayCreate)
         }
         "messages_send" | "splendor.messages.send" => Some(EndpointScope::MessagesSend),
+        "messages_read" | "splendor.messages.read" => Some(EndpointScope::MessagesRead),
+        "work_orders_submit" | "splendor.work_orders.submit" => {
+            Some(EndpointScope::WorkOrdersSubmit)
+        }
+        "work_orders_revoke" | "splendor.work_orders.revoke" => {
+            Some(EndpointScope::WorkOrdersRevoke)
+        }
+        "fleet_read" | "splendor.fleet.read" => Some(EndpointScope::FleetRead),
+        "fleet_dispatch" | "splendor.fleet.dispatch" => Some(EndpointScope::FleetDispatch),
+        "state_handoff" | "splendor.state.handoff" => Some(EndpointScope::StateHandoff),
         "health_read" | "splendor.health.read" => Some(EndpointScope::HealthRead),
         "capabilities_read" | "splendor.capabilities.read" => Some(EndpointScope::CapabilitiesRead),
         "policies_sync" | "splendor.policies.sync" => Some(EndpointScope::PoliciesSync),
@@ -2122,6 +2345,22 @@ fn record_run_event(slot: &RunSlot, kind: TraceEventKind) -> Result<(), ApiError
     slot.scheduler
         .record_event_for_agent(&slot.agent_id, kind)
         .map(|_| ())
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "trace_error",
+                error.to_string(),
+            )
+        })
+}
+
+fn record_run_event_returning_id(
+    slot: &RunSlot,
+    kind: TraceEventKind,
+) -> Result<TraceEventId, ApiError> {
+    slot.scheduler
+        .record_event_for_agent(&slot.agent_id, kind)
+        .map(|event| event.trace_event_id)
         .map_err(|error| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,

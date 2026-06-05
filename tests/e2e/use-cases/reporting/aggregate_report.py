@@ -81,6 +81,32 @@ S3_REQUIRED_NEGATIVES = {
     "cross_tenant_message_attempt_rejected",
     "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger",
 }
+S4_REQUIRED_OPERATIONS = {
+    "registerNode",
+    "registerInstance",
+    "heartbeatNode",
+    "advertiseCapabilities",
+    "evaluatePlacement",
+    "submitWorkOrder",
+    "dispatchWorkOrder",
+    "sendMessage",
+    "exportStateSnapshot",
+    "importStateSnapshot",
+    "syncTraceBuffer",
+    "getFleetTelemetry",
+}
+S4_REQUIRED_NEGATIVES = {
+    "unsigned_work_order",
+    "expired_work_order",
+    "revoked_work_order",
+    "wrong_audience_work_order",
+    "wrong_tenant_credential",
+    "capability_mismatch",
+    "duplicate_remote_message",
+    "remote_message_delivery_failure",
+    "state_handoff_wrong_tenant_rejected",
+    "telemetry_non_authoritative",
+}
 
 
 def utc_now() -> str:
@@ -335,6 +361,12 @@ def render_markdown(report: dict) -> str:
             "- Local multi-agent delegation evidence is recorded in `artifacts/UC-E2E-S3/` when S3 runs.",
             "- S3 requires typed task request/response messages, parent/child runs, scoped specialist authority, gateway denial evidence, state commits, and replay causal graph reconstruction.",
             "- S3 is local-only and does not claim daemon message API, remote transport, fleet, governance, or physical/edge coverage.",
+            "",
+            "## S4 evidence",
+            "",
+            "- Fleet dispatch evidence is recorded in `artifacts/UC-E2E-S4/` when S4 runs.",
+            "- S4 requires public manager/resident HTTP APIs, same-image Splendor services, signed work-order validation, placement, remote messages, state handoff, trace sync, telemetry, and replay/audit evidence.",
+            "- S4 keeps telemetry observational only and leaves S5-S10 blocked until their own scenario evidence exists.",
             "",
             "## Non-goals observed",
             "",
@@ -752,6 +784,91 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S4"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "registry.json",
+        "capabilities.json",
+        "work-order-validation.json",
+        "placement-decision.json",
+        "dispatch-report.json",
+        "remote-message-report.json",
+        "state-handoff-report.json",
+        "trace-sync-report.json",
+        "fleet-telemetry.json",
+        "trace-export.jsonl",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s4_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s4_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s4_scenario_report_failed")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S4_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s4_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S4_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s4_missing_negative_cases:" + ",".join(missing_negatives))
+    same_image = scenario.get("same_image_fleet_evidence", {})
+    if same_image.get("all_same") is not True or same_image.get("same_build_target") != "runtime":
+        failures.append("s4_same_image_fleet_evidence_missing")
+    if len(same_image.get("splendor_services", [])) < 5:
+        failures.append("s4_same_image_missing_splendor_services")
+    placement = read_json(artifact_dir / "placement-decision.json")
+    if placement.get("status") != "selected" or placement.get("candidate_id") not in scenario.get("node_ids", []):
+        failures.append("s4_vpc_placement_not_selected")
+    dispatch = read_json(artifact_dir / "dispatch-report.json")
+    if dispatch.get("create_run_status") not in {200, 201} or dispatch.get("start_run_status") not in {200, 201}:
+        failures.append("s4_dispatch_did_not_create_and_start_resident_run")
+    remote = read_json(artifact_dir / "remote-message-report.json")
+    if remote.get("delivered", {}).get("delivery_status") != "delivered":
+        failures.append("s4_remote_message_not_delivered")
+    if remote.get("duplicate", {}).get("duplicate") is not True:
+        failures.append("s4_duplicate_message_not_detected")
+    if remote.get("failed", {}).get("delivery_status") != "failed":
+        failures.append("s4_remote_failure_not_trace_linked")
+    handoff = read_json(artifact_dir / "state-handoff-report.json")
+    if not handoff.get("exported", {}).get("handoff") or handoff.get("imported", {}).get("accepted") is not True:
+        failures.append("s4_state_handoff_export_import_missing")
+    if handoff.get("rejected", {}).get("status") not in {400, 403}:
+        failures.append("s4_bad_state_handoff_not_rejected")
+    telemetry = read_json(artifact_dir / "fleet-telemetry.json")
+    if telemetry.get("authority") != "observational_only":
+        failures.append("s4_telemetry_not_observational_only")
+    if len(telemetry.get("nodes", [])) < 2 or len(telemetry.get("instances", [])) < 2:
+        failures.append("s4_telemetry_missing_node_instance_status")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("remote_messages_resent") is not False:
+        failures.append("s4_replay_suppression_missing")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["same_image_fleet", "private_helper_only_e2e", "telemetry_authorizes_dispatch", "gateway_bypass", "replay_side_effects_allowed_default"]:
+        if key == "same_image_fleet":
+            if anti.get(key) is not True:
+                failures.append("s4_anti_drift_same_image_not_true")
+        elif anti.get(key) is not False:
+            failures.append(f"s4_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or len(scenario.get("node_ids", [])) < 2 or not scenario.get("work_order_ids") or not scenario.get("message_ids"):
+        failures.append("s4_missing_required_identity_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -823,6 +940,7 @@ def main() -> int:
     s1_scenario, s1_failures = load_s1_scenario(report_dir)
     s2_scenario, s2_failures = load_s2_scenario(report_dir)
     s3_scenario, s3_failures = load_s3_scenario(report_dir)
+    s4_scenario, s4_failures = load_s4_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -845,11 +963,18 @@ def main() -> int:
         else:
             scenarios.append(s3_scenario)
             blocking.extend(s3_failures)
+    if args.scenario == "UC-E2E-S4" or args.mode == "all":
+        active_ids.add("UC-E2E-S4")
+        if s4_scenario is None:
+            blocking.append("missing_uc_e2e_s4_scenario_report")
+        else:
+            scenarios.append(s4_scenario)
+            blocking.extend(s4_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s3-multi-agent-delegation",
+        "suite_version": "0.1-s4-fleet-dispatch",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -862,6 +987,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S1",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S2",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S3",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S4",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -892,7 +1018,8 @@ def main() -> int:
             "S0 does not mark later scenarios passing; UC-E2E-S1 is included only when executable scenario evidence is present.",
             "UC-E2E-S2 validates the local management API/client contract only when raw HTTP, TypeScript, Python SDK, and splendorctl executable workflow evidence is present.",
             "UC-E2E-S3 validates local multi-agent delegation through public crate APIs and splendorctl replay only; it does not claim daemon message API coverage.",
-            "S4-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S4 validates fleet dispatch through public manager and resident daemon HTTP APIs with same-image Splendor services.",
+            "S5-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
