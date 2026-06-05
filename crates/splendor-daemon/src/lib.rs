@@ -1135,9 +1135,6 @@ async fn create_run(
     engine.add_perceptor(QueuedPerceptor {
         queue: percept_queue.clone(),
     });
-    if policy_cache.snapshot().enforcement_required {
-        engine.set_policy_runtime_authority(Arc::new(policy_cache.clone()));
-    }
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), tenant_registry);
     scheduler.add_agent(engine);
 

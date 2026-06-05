@@ -15,9 +15,9 @@ use splendor_gateway::{
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ApprovalTraceContext, Constraint, ContentHash, EscalationContext, EscalationPolicy,
-    EscalationPolicyError, Feedback, Percept, PolicyBundleTraceContext, QuotaUsage, Reward, RunId,
-    SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
-    VerificationResult, WorkOrder,
+    EscalationPolicyError, Feedback, Percept, PolicyBundleId, PolicyBundleTraceContext, QuotaUsage,
+    Reward, RunId, SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind,
+    TraceIdentityContext, VerificationResult, WorkOrder,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -692,6 +692,10 @@ impl LoopEngine {
                 &mut outcome,
             );
 
+            if let Some(policy_expired) = action_policy_expired_trace_kind(&action, &outcome) {
+                self.record_action_event(tick_id, &action_id, policy_expired)?;
+            }
+
             self.record_action_event(
                 tick_id,
                 &action_id,
@@ -982,6 +986,38 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
         error: Some(message),
         completed_at: OffsetDateTime::now_utc(),
     }
+}
+
+fn action_policy_expired_trace_kind(
+    action: &Action,
+    outcome: &ActionOutcome,
+) -> Option<TraceEventKind> {
+    if outcome.verification.allowed
+        || !outcome
+            .verification
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_expired")
+    {
+        return None;
+    }
+    let artifacts = &outcome.verification.artifacts;
+    if artifacts.get("source")?.as_str()? != "policy_distribution_cache" {
+        return None;
+    }
+    let policy_bundle_id =
+        PolicyBundleId::try_new(artifacts.get("policy_bundle_id")?.as_str()?).ok()?;
+    let version = artifacts.get("version")?.as_str()?.to_string();
+    let action_name = artifacts
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(action.name.as_str())
+        .to_string();
+    Some(TraceEventKind::PolicyExpired {
+        policy_bundle_id,
+        version,
+        action: Some(action_name),
+    })
 }
 
 fn approval_artifact(result: &VerificationResult) -> Option<(String, ApprovalTraceContext)> {

@@ -144,6 +144,32 @@ impl ActionGateway for DenyGateway {
 }
 
 #[derive(Default)]
+struct ExpiredPolicyGateway;
+
+impl ActionGateway for ExpiredPolicyGateway {
+    fn submit(&self, action: ActionRequest) -> Result<ActionOutcome, GatewayError> {
+        Ok(ActionOutcome {
+            action_id: action.action_id,
+            status: ActionStatus::Denied,
+            verification: VerificationResult {
+                allowed: false,
+                reasons: vec!["policy_expired".to_string()],
+                artifacts: serde_json::json!({
+                    "source": "policy_distribution_cache",
+                    "policy_bundle_id": "policy_unit_expired",
+                    "version": "unit.v1",
+                    "action": action.action.name,
+                }),
+            },
+            post_verification: None,
+            output: None,
+            error: Some("policy_expired".to_string()),
+            completed_at: OffsetDateTime::now_utc(),
+        })
+    }
+}
+
+#[derive(Default)]
 struct StaticConstraintEngine;
 
 impl ConstraintEngine for StaticConstraintEngine {
@@ -1317,6 +1343,68 @@ fn loop_engine_rejects_policy_before_policy_invoked_when_bundle_expired() {
     assert!(!recorded
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::PolicyInvoked { .. })));
+}
+
+#[test]
+fn loop_engine_records_action_scoped_policy_expired_from_gateway_denial() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingTraceSink {
+        events: Arc::clone(&events),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink),
+        ..KernelRuntimeConfig::default()
+    });
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store, SnapshotPolicy::default());
+    let initial_state = StateData {
+        bytes: vec![1],
+        content_type: None,
+    };
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        graph,
+        initial_state,
+        Box::new(StaticPolicy),
+        Arc::new(ExpiredPolicyGateway),
+        runtime,
+    );
+
+    let outcome = engine.tick(1).expect("tick records denied action");
+    let denied_action_id = outcome.action_outcomes[0].action_id.clone();
+
+    let recorded = events.lock().expect("events lock");
+    let policy_expired = recorded
+        .iter()
+        .find(|event| matches!(event.kind, TraceEventKind::PolicyExpired { .. }))
+        .expect("action-scoped policy expired trace");
+    assert_eq!(
+        policy_expired.identity.action_id.as_ref(),
+        Some(&denied_action_id)
+    );
+    match &policy_expired.kind {
+        TraceEventKind::PolicyExpired {
+            policy_bundle_id,
+            version,
+            action,
+        } => {
+            assert_eq!(policy_bundle_id.as_str(), "policy_unit_expired");
+            assert_eq!(version, "unit.v1");
+            assert_eq!(action.as_deref(), Some("noop"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(recorded.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::ActionDenied { result, .. }
+            if event.identity.action_id.as_ref() == Some(&denied_action_id)
+                && result.reasons.iter().any(|reason| reason == "policy_expired")
+    )));
 }
 
 fn event_kind_label(kind: &TraceEventKind) -> &'static str {

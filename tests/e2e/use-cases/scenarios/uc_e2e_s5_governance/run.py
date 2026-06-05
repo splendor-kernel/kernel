@@ -361,6 +361,7 @@ def main() -> int:
     expired_policy_create = call("createRun", "POST", args.base_url, "/runs", create_run_payload("44444444-4444-4444-8444-444444444845", sign_work_order(root, artifact_dir, commands, work_order("44444444-4444-4444-8444-444444444845")), expired_policy["body"].get("envelope")))
     ttl_policy = call("publishPolicyBundle", "POST", args.manager_url, "/policies", {**sec(manager_cred), "policy_bundle": policy_bundle(policy_id="policy_uc_e2e_s5_runtime_expiry", expires_at=utc_seconds(3))})
     ttl_run_id = "44444444-4444-4444-8444-444444445245"
+    ttl_action_id = action_id_for_run(ttl_run_id)
     ttl_cred = daemon_credential(ttl_run_id)
     ttl_create = call("createRun", "POST", args.base_url, "/runs", create_run_payload(ttl_run_id, sign_work_order(root, artifact_dir, commands, work_order(ttl_run_id)), ttl_policy["body"].get("envelope"), policies=[]))
     time.sleep(4)
@@ -415,6 +416,9 @@ def main() -> int:
     cb_denied_breaker = cb_submit["body"].get("verification", {}).get("artifacts", {}).get("circuit_breaker", {})
     cb_denied_breaker_id = cb_denied_breaker.get("breaker_id") or cb_denied_breaker.get("circuit_breaker", {}).get("breaker_id")
     ttl_trace_ids = trace_event_id_map(ttl_traces["body"].get("records", []), {})
+    ttl_action_outcomes = ttl_start.get("body", {}).get("action_outcomes", [])
+    ttl_policy_denial = next((outcome for outcome in ttl_action_outcomes if outcome.get("action_id") == ttl_action_id and outcome.get("status") in {"Denied", "NeedsIntervention"} and "policy_expired" in outcome.get("verification", {}).get("reasons", [])), {})
+    ttl_policy_artifacts = ttl_policy_denial.get("verification", {}).get("artifacts", {})
     uncertainty_trace_ids = trace_event_id_map(uncertainty_traces["body"].get("records", []), {})
     manager_breaker_trace_id = breaker["body"].get("trace_event_id")
     breaker_payload_record = cb_payload["body"].get("breaker_record", {})
@@ -423,7 +427,7 @@ def main() -> int:
         {"case": "expired_approval_cannot_authorize_execution", "passed": expired["body"].get("status") == "Denied" and expired["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "expired"},
         {"case": "revoked_approval_cannot_authorize_execution", "passed": revoked["body"].get("status") == "Denied" and revoked["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "revoked"},
         {"case": "missing_policy_bundle_fails_closed", "passed": missing_policy["status"] == 400 and missing_policy["body"].get("code") == "missing_policy_bundle"},
-        {"case": "expired_policy_bundle_fails_closed", "passed": expired_policy_create["status"] == 403 and expired_policy_create["body"].get("code") == "expired_policy_bundle" and ttl_create["status"] == 200 and ttl_start["status"] in {200, 500} and bool(ttl_trace_ids.get("policy.expired"))},
+        {"case": "expired_policy_bundle_fails_closed", "passed": expired_policy_create["status"] == 403 and expired_policy_create["body"].get("code") == "expired_policy_bundle" and ttl_create["status"] == 200 and ttl_start["status"] == 200 and ttl_policy_artifacts.get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry" and ttl_policy_artifacts.get("action") == "artifact.publish_external" and bool(ttl_trace_ids.get("policy.expired"))},
         {"case": "revoked_policy_bundle_fails_closed", "passed": revoked_policy_create["status"] == 403 and revoked_policy_create["body"].get("code") == "revoked_policy_bundle"},
         {"case": "verifier_uncertainty_escalates_not_allow", "passed": uncertain_create["status"] == 200 and uncertainty["body"].get("status") in {"failed", "waiting_for_approval"} and bool(uncertainty_trace_ids.get("action.needs_intervention"))},
         {"case": "circuit_breaker_blocks_matching_action", "passed": cb_payload["status"] == 200 and breaker_payload_record.get("trace_event_id") == manager_breaker_trace_id and cb_sync["body"].get("accepted") is True and cb_submit["body"].get("status") == "Denied" and cb_denied_breaker_id == breaker_uuid},
@@ -477,7 +481,7 @@ def main() -> int:
     artifacts = {
         "scenario-report.json": scenario,
         "approval-flow.json": {"request": approval_request["body"], "grant": approval_grant["body"], "revoke": approval_revoke["body"], "denial": denial["body"], "expired": expired["body"], "revoked": revoked["body"]},
-        "policy-bundle-report.json": {"published": published["body"], "status": policy_status["body"], "revoked": revoked_policy["body"], "expired_policy_create": expired_policy_create, "runtime_expired_policy": {"published": ttl_policy["body"], "create": ttl_create, "start": ttl_start}, "revoked_policy_create": revoked_policy_create, "missing_policy_create": missing_policy},
+        "policy-bundle-report.json": {"published": published["body"], "status": policy_status["body"], "revoked": revoked_policy["body"], "expired_policy_create": expired_policy_create, "runtime_expired_policy": {"published": ttl_policy["body"], "create": ttl_create, "start": ttl_start, "run_id": ttl_run_id, "action_id": ttl_action_id, "action_name": "artifact.publish_external", "reason_code": "policy_expired", "denial": ttl_policy_denial}, "revoked_policy_create": revoked_policy_create, "missing_policy_create": missing_policy},
         "circuit-breaker-report.json": {"created": breaker["body"], "manager_sync_payload": cb_payload["body"], "synced": cb_sync["body"], "blocked_action": cb_submit["body"], "cleared": clear["body"], "clear_wrong_scope": clear_wrong_scope},
         "kill-switch-report.json": {"activated": kill["body"], "separate_lifecycle_cancel": cancel, "missing_ack": kill_missing_ack["body"]},
         "state-export.json": state_head["body"],

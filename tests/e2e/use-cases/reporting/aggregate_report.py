@@ -1098,15 +1098,43 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s5_revoked_policy_create_not_forbidden")
     runtime_expired = policy.get("runtime_expired_policy", {})
     runtime_start = runtime_expired.get("start", {})
-    if runtime_expired.get("create", {}).get("status") != 200 or runtime_start.get("status") not in {200, 500}:
+    ttl_run_id = runtime_expired.get("run_id")
+    ttl_action_id = runtime_expired.get("action_id")
+    ttl_action_name = runtime_expired.get("action_name")
+    ttl_denial = runtime_expired.get("denial", {})
+    ttl_denial_verification = ttl_denial.get("verification", {})
+    ttl_denial_artifacts = ttl_denial_verification.get("artifacts", {})
+    if runtime_expired.get("create", {}).get("status") != 200 or runtime_start.get("status") != 200:
         failures.append("s5_policy_expiry_not_runtime_exercised")
+    if ttl_denial.get("action_id") != ttl_action_id or ttl_denial.get("status") not in {"Denied", "NeedsIntervention"}:
+        failures.append("s5_policy_expiry_missing_action_level_outcome")
+    if runtime_expired.get("reason_code") != "policy_expired" or "policy_expired" not in ttl_denial_verification.get("reasons", []):
+        failures.append("s5_policy_expiry_missing_reason_code")
+    if ttl_denial_artifacts.get("policy_bundle_id") != "policy_uc_e2e_s5_runtime_expiry" or ttl_denial_artifacts.get("action") != "artifact.publish_external":
+        failures.append("s5_policy_expiry_action_artifacts_mismatch")
     policy_expired_records = [trace_by_id[trace_id] for trace_id in event_ids.get("policy.expired", []) if trace_id in trace_by_id]
+    ttl_policy_expired_records = [
+        record for record in policy_expired_records
+        if trace_record_kind_payload(record).get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry"
+        and trace_record_kind_payload(record).get("action") == ttl_action_name == "artifact.publish_external"
+        and record.get("payload", {}).get("run_id") == ttl_run_id
+        and record.get("payload", {}).get("identity", {}).get("action_id") == ttl_action_id
+    ]
+    if not ttl_policy_expired_records:
+        failures.append("s5_policy_expired_trace_not_linked_to_ttl_action")
+    ttl_action_records = [
+        trace_by_id[trace_id]
+        for trace_id in event_ids.get("action.denied", []) + event_ids.get("action.needs_intervention", [])
+        if trace_id in trace_by_id
+        and trace_by_id[trace_id].get("payload", {}).get("run_id") == ttl_run_id
+        and trace_by_id[trace_id].get("payload", {}).get("identity", {}).get("action_id") == ttl_action_id
+    ]
     if not any(
-        trace_record_kind_payload(record).get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry"
-        and record.get("payload", {}).get("run_id") in scenario.get("run_ids", [])
-        for record in policy_expired_records
+        "policy_expired" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        and "artifact.publish_external" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
+        for record in ttl_action_records
     ):
-        failures.append("s5_policy_expired_trace_not_linked_to_ttl_run")
+        failures.append("s5_policy_expired_action_denial_trace_missing")
     intervention_records = [trace_by_id[trace_id] for trace_id in event_ids.get("action.needs_intervention", []) if trace_id in trace_by_id]
     if not any(
         "approval_policy_expired" in json.dumps(trace_record_kind_payload(record), sort_keys=True)
