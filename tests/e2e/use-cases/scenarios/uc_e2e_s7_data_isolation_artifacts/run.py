@@ -206,6 +206,78 @@ def action_evidence(outcome: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def action_execution_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"data.read_fixture": 0, "artifact.create_internal": 0, "artifact.publish_external": 0}
+    for record in records:
+        if event_kind(record) != "ActionExecuted":
+            continue
+        payload = event_payload(record)
+        name = payload.get("action", {}).get("name")
+        if name in counts:
+            counts[name] += 1
+    return counts
+
+
+def resolve_action_trace_evidence(
+    records: list[dict[str, Any]], outcome: dict[str, Any], action_name: str
+) -> dict[str, Any]:
+    evidence = action_evidence(outcome)
+    output = evidence.get("output") if isinstance(evidence.get("output"), dict) else {}
+    artifact_path = evidence.get("artifact_path")
+    tenant_id = evidence.get("tenant_id")
+    integrity = evidence.get("integrity")
+    action_id = evidence.get("action_id")
+    for record in records:
+        if event_kind(record) != "ActionExecuted":
+            continue
+        payload = event_payload(record)
+        action = payload.get("action", {})
+        trace_output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        trace_path = trace_output.get("artifact_path") or action.get("params", {}).get("publish_ref")
+        if action.get("name") != action_name:
+            continue
+        if artifact_path and trace_path != artifact_path:
+            continue
+        if tenant_id and trace_output.get("tenant_id") != tenant_id:
+            continue
+        if integrity and trace_output.get("integrity") != integrity:
+            continue
+        if not evidence.get("artifact_path") and trace_path:
+            evidence["artifact_path"] = trace_path
+            artifact_path = trace_path
+        if not evidence.get("tenant_id") and isinstance(trace_path, str) and trace_path.startswith("artifact://"):
+            evidence["tenant_id"] = trace_path.removeprefix("artifact://").split("/", 1)[0]
+            tenant_id = evidence["tenant_id"]
+        evidence["trace_event_id"] = trace_id(record)
+        evidence["trace_run_id"] = record.get("run_id")
+        evidence["trace_action_name"] = action.get("name")
+        evidence["trace_artifact_path"] = trace_path
+        evidence["trace_integrity"] = trace_output.get("integrity")
+        evidence["trace_tenant_id"] = trace_output.get("tenant_id")
+        break
+    for record in records:
+        if event_kind(record) != "OutcomeRecorded":
+            continue
+        payload = event_payload(record).get("outcome", {})
+        candidates = payload.get("actions") if isinstance(payload.get("actions"), list) else [payload.get("action_outcome")]
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or candidate.get("action_id") != action_id:
+                continue
+            candidate_output = candidate.get("output") if isinstance(candidate.get("output"), dict) else {}
+            candidate_path = candidate_output.get("artifact_path") or candidate_output.get("publish_ref")
+            if artifact_path and candidate_path != artifact_path:
+                continue
+            if integrity and candidate_output.get("integrity") != integrity:
+                continue
+            evidence["outcome_trace_event_id"] = trace_id(record)
+            evidence["outcome_action_id"] = candidate.get("action_id")
+            evidence["outcome_artifact_path"] = candidate_path
+            evidence["outcome_integrity"] = candidate_output.get("integrity")
+            evidence["outcome_tenant_id"] = candidate_output.get("tenant_id")
+            return evidence
+    return evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -280,21 +352,31 @@ def main() -> int:
 
     traces_orch = call("exportTraces", "POST", args.vpc_url, f"/runs/{ORCH_RUN}/traces/export", {"credential": cred, "audit_attribution": audit(cred), "redaction_policy": "uc-e2e-s7-redacted", "start": None, "end": None})
     traces_spec = call("exportTraces", "POST", args.vpc_url, f"/runs/{SPEC_RUN}/traces/export", {"credential": cred, "audit_attribution": audit(cred), "redaction_policy": "uc-e2e-s7-redacted", "start": None, "end": None})
+    records_before_replay = traces_orch["body"].get("records", []) + traces_spec["body"].get("records", [])
+    action_counts_before_replay = action_execution_counts(records_before_replay)
     inspect_before_replay = call("inspectRunBeforeReplay", "GET", args.vpc_url, f"/runs/{SPEC_RUN}", headers=credential_header(cred))
+    inspect_orch_before_replay = call("inspectOrchestratorRunBeforeReplay", "GET", args.vpc_url, f"/runs/{ORCH_RUN}", headers=credential_header(cred))
     replay = call("replayRun", "POST", args.vpc_url, f"/runs/{SPEC_RUN}/replay", {"credential": cred, "audit_attribution": audit(cred), "mode": "inspect_only", "side_effects_allowed": False})
+    replay_orch = call("replayOrchestratorRun", "POST", args.vpc_url, f"/runs/{ORCH_RUN}/replay", {"credential": cred, "audit_attribution": audit(cred), "mode": "inspect_only", "side_effects_allowed": False})
     inspect_after_replay = call("inspectRunAfterReplay", "GET", args.vpc_url, f"/runs/{SPEC_RUN}", headers=credential_header(cred))
+    inspect_orch_after_replay = call("inspectOrchestratorRunAfterReplay", "GET", args.vpc_url, f"/runs/{ORCH_RUN}", headers=credential_header(cred))
     cross_tenant_replay = call("crossTenantReplay", "POST", args.vpc_url, f"/runs/{SPEC_RUN}/replay", {"credential": resident_credential(tenant=TENANT_B), "audit_attribution": audit(resident_credential(tenant=TENANT_B)), "mode": "inspect_only", "side_effects_allowed": False})
+    traces_orch_after_replay = call("exportTracesAfterReplay", "POST", args.vpc_url, f"/runs/{ORCH_RUN}/traces/export", {"credential": cred, "audit_attribution": audit(cred), "redaction_policy": "uc-e2e-s7-redacted", "start": None, "end": None})
+    traces_spec_after_replay = call("exportTracesAfterReplay", "POST", args.vpc_url, f"/runs/{SPEC_RUN}/traces/export", {"credential": cred, "audit_attribution": audit(cred), "redaction_policy": "uc-e2e-s7-redacted", "start": None, "end": None})
     manager_audit = call("managerAudit", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     state_head = call("getStateHead", "GET", args.vpc_url, f"/runs/{SPEC_RUN}/state-head", headers=credential_header(cred))
 
-    records = traces_orch["body"].get("records", []) + traces_spec["body"].get("records", [])
+    records = traces_orch_after_replay["body"].get("records", []) + traces_spec_after_replay["body"].get("records", [])
+    action_counts_after_replay = action_execution_counts(records)
     trace_text = json.dumps(records, sort_keys=True)
-    replay_text = json.dumps(replay["body"], sort_keys=True)
+    replay_text = json.dumps({"specialist": replay["body"], "orchestrator": replay_orch["body"]}, sort_keys=True)
     manager_body = manager_audit["body"]
     manager_events = manager_body if isinstance(manager_body, list) else manager_body.get("events", [])
-    event_ids = build_event_ids(records, manager_events, trace_export_id=traces_spec["body"].get("integrity_hash", ""), replay_id=replay["body"].get("replay_id", ""))
+    event_ids = build_event_ids(records, manager_events, trace_export_id=traces_spec_after_replay["body"].get("integrity_hash", ""), replay_id=",".join([replay["body"].get("replay_id", ""), replay_orch["body"].get("replay_id", "")]))
     adapter_before = inspect_before_denials["body"].get("adapter_executions")
     adapter_after = inspect_after["body"].get("adapter_executions")
+    adapter_before_replay = {"specialist": inspect_before_replay["body"].get("adapter_executions"), "orchestrator": inspect_orch_before_replay["body"].get("adapter_executions")}
+    adapter_after_replay = {"specialist": inspect_after_replay["body"].get("adapter_executions"), "orchestrator": inspect_orch_after_replay["body"].get("adapter_executions")}
     negatives = [
         {"case": "specialist_tenant_b_data_ref_denied_before_adapter", "passed": tenant_b_denial["body"].get("status") == "Denied" and "data_scope_denied" in tenant_b_denial["body"].get("verification", {}).get("reasons", []), "status": tenant_b_denial["body"].get("status"), "reason_codes": tenant_b_denial["body"].get("verification", {}).get("reasons", [])},
         {"case": "manager_credential_as_action_permission_denied", "passed": manager_permission_denial["status"] == 403, "status": manager_permission_denial["status"], "code": manager_permission_denial["body"].get("code")},
@@ -305,18 +387,22 @@ def main() -> int:
         {"case": "cross_tenant_replay_cannot_reveal_raw_payloads", "passed": cross_tenant_replay["status"] == 403 and RAW_A not in replay_text and RAW_B not in replay_text, "status": cross_tenant_replay["status"]},
         {"case": "artifact_path_collision_across_tenants_rejected", "passed": collision["body"].get("status") == "Denied" and "artifact_path_tenant_mismatch" in collision["body"].get("verification", {}).get("reasons", []), "status": collision["body"].get("status"), "reason_codes": collision["body"].get("verification", {}).get("reasons", [])},
         {"case": "denied_data_and_artifact_actions_did_not_reach_adapter", "passed": adapter_before == adapter_after, "adapter_executions_before": adapter_before, "adapter_executions_after": adapter_after},
-        {"case": "replay_did_not_reread_republish_or_rewrite_artifacts", "passed": inspect_before_replay["body"].get("adapter_executions") == inspect_after_replay["body"].get("adapter_executions"), "adapter_executions_before_replay": inspect_before_replay["body"].get("adapter_executions"), "adapter_executions_after_replay": inspect_after_replay["body"].get("adapter_executions")},
+        {"case": "replay_did_not_reread_republish_or_rewrite_artifacts", "passed": adapter_before_replay == adapter_after_replay and action_counts_before_replay == action_counts_after_replay, "adapter_executions_before_replay": adapter_before_replay, "adapter_executions_after_replay": adapter_after_replay, "action_execution_counts_before_replay": action_counts_before_replay, "action_execution_counts_after_replay": action_counts_after_replay, "orchestrator_replay_id": replay_orch["body"].get("replay_id"), "published_artifact_path": f"artifact://{TENANT_A}/board/report.md"},
     ]
-    internal_artifact_evidence = action_evidence(internal_artifact["body"])
-    approved_publish_evidence = action_evidence(approved_publish["body"])
-    positives = {"tenant_fixtures_separate": DATA_REF_A != DATA_REF_B and RAW_A != RAW_B, "specialist_work_order_narrow": "artifact.publish_external" not in spec_envelope.get("allowed_actions", []) and "artifact.publish_external" not in spec_envelope.get("allowed_permissions", []), "work_orders_accepted": len([e for e in manager_events if e.get("event_type") == "work_order.accepted"]) >= 2, "vpc_dispatch_used": any(row.get("operation_id") == "dispatchWorkOrder" and row.get("status") == 200 for row in api_rows), "typed_messages_delivered": sent["body"].get("delivery_status") == "delivered" and received["body"].get("receive_side_validated") is True and received["body"].get("read_trace_event_id") and response_sent["body"].get("delivery_status") == "delivered" and response_received["body"].get("receive_side_validated") is True and response_received["body"].get("read_trace_event_id"), "internal_artifact_recorded": internal_artifact["body"].get("status") == "Executed" and internal_artifact_evidence.get("artifact_path") == f"artifact://{TENANT_A}/board/specialist-analysis.md" and internal_artifact_evidence.get("integrity"), "approved_publish_executed": approved_publish["body"].get("status") == "Executed" and approved_publish_evidence.get("integrity"), "approval_action_trace_matched": approval_context.get("action_id") == approved_publish["body"].get("action_id") and action_causal_trace_id, "trace_redacted": RAW_A not in trace_text and RAW_B not in trace_text, "replay_inspect_only": replay["body"].get("mode") == "inspect_only"}
+    internal_artifact_evidence = resolve_action_trace_evidence(records, internal_artifact["body"], "artifact.create_internal")
+    approved_publish_evidence = resolve_action_trace_evidence(records, approved_publish["body"], "artifact.publish_external")
+    positives = {"tenant_fixtures_separate": DATA_REF_A != DATA_REF_B and RAW_A != RAW_B, "specialist_work_order_narrow": "artifact.publish_external" not in spec_envelope.get("allowed_actions", []) and "artifact.publish_external" not in spec_envelope.get("allowed_permissions", []), "work_orders_accepted": len([e for e in manager_events if e.get("event_type") == "work_order.accepted"]) >= 2, "vpc_dispatch_used": any(row.get("operation_id") == "dispatchWorkOrder" and row.get("status") == 200 for row in api_rows), "typed_messages_delivered": sent["body"].get("delivery_status") == "delivered" and received["body"].get("receive_side_validated") is True and received["body"].get("read_trace_event_id") and response_sent["body"].get("delivery_status") == "delivered" and response_received["body"].get("receive_side_validated") is True and response_received["body"].get("read_trace_event_id"), "internal_artifact_recorded": internal_artifact["body"].get("status") == "Executed" and internal_artifact_evidence.get("artifact_path") == f"artifact://{TENANT_A}/board/specialist-analysis.md" and internal_artifact_evidence.get("integrity") and internal_artifact_evidence.get("trace_event_id") in event_ids.get("artifact.created", []), "approved_publish_executed": approved_publish["body"].get("status") == "Executed" and approved_publish_evidence.get("integrity") and approved_publish_evidence.get("trace_event_id") in event_ids.get("artifact.publish.executed", []), "approval_action_trace_matched": approval_context.get("action_id") == approved_publish["body"].get("action_id") and action_causal_trace_id, "trace_redacted": RAW_A not in trace_text and RAW_B not in trace_text, "replay_inspect_only": replay["body"].get("mode") == "inspect_only" and replay_orch["body"].get("mode") == "inspect_only"}
     failures = [key for key, ok in positives.items() if not ok]
     failures.extend(f"negative_failed:{item['case']}" for item in negatives if item.get("passed") is not True)
     required_events = {"work_order.accepted", "data_scope.verified", "data_scope.denied", "message.sent", "message.received", "message.denied", "artifact.created", "artifact.publish.needs_approval", "artifact.publish.executed", "artifact.publish.denied", "trace.exported.redacted", "state.committed", "replay.explained"}
     failures.extend(f"missing_event:{event}" for event in sorted(required_events) if not event_ids.get(event))
+    replay_suppression = {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "external_publish_replayed": False, "internal_artifact_rewritten": False, "adapter_executions_before_replay": adapter_before_replay, "adapter_executions_after_replay": adapter_after_replay, "action_execution_counts_before_replay": action_counts_before_replay, "action_execution_counts_after_replay": action_counts_after_replay, "orchestrator_replay_id": replay_orch["body"].get("replay_id"), "specialist_replay_id": replay["body"].get("replay_id"), "approved_publish_artifact_path": approved_publish_evidence.get("artifact_path"), "approved_publish_trace_event_id": approved_publish_evidence.get("trace_event_id"), "internal_artifact_trace_event_id": internal_artifact_evidence.get("trace_event_id")}
 
     scenario = {"id": "UC-E2E-S7", "status": "passed" if not failures else "failed", "fr_coverage": ["UC-E2E-S7", "FR-0.1-05", "FR-0.1-08"], "components": ["central-manager", "resident-vpc-node", "work-order", "placement", "message-routing", "data-scope-verifier", "artifact-adapter", "approval", "trace-redaction", "replay/audit"], "positive_evidence": [key for key, ok in positives.items() if ok], "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True], "replay_evidence": ["replayRun public API returned inspect_only explanation; raw protected fixture strings absent; cross-tenant replay rejected; adapter execution count unchanged across replay"], "replay_mode": "inspect_only", "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "external_publish_replayed": False, "internal_artifact_rewritten": False, "adapter_executions_before_replay": inspect_before_replay["body"].get("adapter_executions"), "adapter_executions_after_replay": inspect_after_replay["body"].get("adapter_executions")}, "replay_artifacts": [str(artifact_dir / "replay-report.json")], "anti_drift_checks": ["public_manager_and_resident_http_used", "gateway_data_scope_verifier_before_adapter", "shared_specialist_scoped_work_order_only", "manager_credential_not_action_authority", "trace_redaction_required", "replay_no_artifact_publish"], "run_ids": [ORCH_RUN, SPEC_RUN], "trace_event_ids": sorted({tid for ids in event_ids.values() for tid in ids if tid}), "state_node_ids": [state_head["body"].get("state_node_id", "")], "state_hashes": [state_head["body"].get("data_hash", "")], "message_ids": [task_request["message"]["message_id"], task_response["message"]["message_id"], smuggle_message["message"]["message_id"]], "work_order_ids": [WORK_ORDER_ORCH, WORK_ORDER_SPEC], "approval_ids": [approval_context.get("approval_id", "")], "node_ids": [VPC_NODE], "api_operations": sorted({row["operation_id"] for row in api_rows}), "required_trace_event_ids": event_ids, "negative_cases": negatives, "positive_checks": positives, "scenario_failures": failures, "artifact_paths": []}
     artifacts = {"scenario-report.json": scenario, "tenant-data-fixtures.json": fixtures, "work-order-validation.json": {"orchestrator": orch_envelope, "specialist": spec_envelope}, "message-flow.json": {"request": sent["body"], "request_read": received["body"], "response": response_sent["body"], "response_read": response_received["body"], "smuggling_denial": smuggle}, "artifact-report.json": {"internal_artifact": internal_artifact["body"], "internal_artifact_evidence": internal_artifact_evidence, "publish_without_approval": publish_no_approval["body"], "approval_request": approval_request["body"], "grant": grant["body"], "approved_publish": approved_publish["body"], "approved_publish_evidence": approved_publish_evidence, "collision": collision["body"], "specialist_publish_denial": specialist_publish_denial["body"]}, "data-scope-report.json": {"tenant_b_denial": tenant_b_denial["body"], "manager_permission_denial": manager_permission_denial, "specialist_publish_denial": specialist_publish_denial["body"], "adapter_executions_before": adapter_before, "adapter_executions_after": adapter_after}, "state-export.json": state_head["body"], "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "external_publish_replayed": False, "raw_payloads_absent": RAW_A not in replay_text and RAW_B not in replay_text, "cross_tenant_replay": cross_tenant_replay, "adapter_executions_before_replay": inspect_before_replay["body"].get("adapter_executions"), "adapter_executions_after_replay": inspect_after_replay["body"].get("adapter_executions")}, "audit-report.json": {"events": manager_events, "in_scope_data_refs": [DATA_REF_A], "denied_data_refs": [DATA_REF_B], "negative_cases": negatives, "event_ids": event_ids}, "anti-drift-results.json": {"status": "passed" if not failures else "failed", "private_helper_only_e2e": False, "gateway_bypass": False, "specialist_broad_permission_inheritance": False, "manager_credential_authorizes_action": False, "trace_export_without_redaction_allowed": False, "replay_side_effects_allowed_default": False}, "stdout.log": "UC-E2E-S7 data-local analysis scenario completed through public manager and resident HTTP APIs\n", "stderr.log": ""}
+    scenario["replay_evidence"] = ["public replay APIs returned inspect_only explanations for specialist and orchestrator runs; raw protected fixture strings absent; cross-tenant replay rejected; adapter and trace-derived action execution counts unchanged across replay"]
+    scenario["replay_side_effect_suppression"] = replay_suppression
+    artifacts["replay-report.json"].update({"orchestrator_replay": replay_orch["body"], "adapter_executions_before_replay": adapter_before_replay, "adapter_executions_after_replay": adapter_after_replay, "action_execution_counts_before_replay": action_counts_before_replay, "action_execution_counts_after_replay": action_counts_after_replay, "approved_publish_artifact_path": approved_publish_evidence.get("artifact_path"), "approved_publish_trace_event_id": approved_publish_evidence.get("trace_event_id"), "internal_artifact_trace_event_id": internal_artifact_evidence.get("trace_event_id")})
     for name, data in artifacts.items():
         path = artifact_dir / name
         if isinstance(data, str):

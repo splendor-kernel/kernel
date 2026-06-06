@@ -1564,6 +1564,7 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if missing_events:
         failures.append("s7_missing_required_trace_events:" + ",".join(missing_events))
     trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
     trace_text = json.dumps(trace_records, sort_keys=True)
     fixtures = read_json(artifact_dir / "tenant-data-fixtures.json")
     protected = [
@@ -1582,14 +1583,64 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s7_internal_artifact_missing_identity_path_or_integrity")
     elif not str(internal.get("artifact_path", "")).startswith(f"artifact://{internal.get('tenant_id')}/"):
         failures.append("s7_internal_artifact_path_not_tenant_scoped")
+    internal_trace_id = internal.get("trace_event_id")
+    if not internal_trace_id:
+        failures.append("s7_internal_artifact_missing_trace_event_id")
+    elif internal_trace_id not in event_ids.get("artifact.created", []):
+        failures.append("s7_internal_artifact_trace_id_not_required_artifact_created")
+    elif internal_trace_id not in trace_by_id:
+        failures.append("s7_internal_artifact_trace_id_missing_from_export")
+    else:
+        payload = trace_record_kind_payload(trace_by_id[internal_trace_id])
+        action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
+        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        if trace_record_kind(trace_by_id[internal_trace_id]) != "action.executed" or action.get("name") != "artifact.create_internal":
+            failures.append("s7_internal_artifact_trace_not_create_execution")
+        if output.get("artifact_path") != internal.get("artifact_path"):
+            failures.append("s7_internal_artifact_trace_path_mismatch")
+        if output.get("tenant_id") != internal.get("tenant_id"):
+            failures.append("s7_internal_artifact_trace_tenant_mismatch")
+        if output.get("integrity") != internal.get("integrity"):
+            failures.append("s7_internal_artifact_trace_integrity_mismatch")
+    if internal.get("outcome_action_id") and internal.get("outcome_action_id") != internal.get("action_id"):
+        failures.append("s7_internal_artifact_outcome_action_mismatch")
+    if internal.get("outcome_artifact_path") and internal.get("outcome_artifact_path") != internal.get("artifact_path"):
+        failures.append("s7_internal_artifact_outcome_path_mismatch")
+    if internal.get("outcome_integrity") and internal.get("outcome_integrity") != internal.get("integrity"):
+        failures.append("s7_internal_artifact_outcome_integrity_mismatch")
     if artifact.get("publish_without_approval", {}).get("status") != "NeedsApproval":
         failures.append("s7_publish_without_approval_not_paused")
     if artifact.get("approved_publish", {}).get("status") != "Executed":
         failures.append("s7_approved_publish_not_executed")
     if artifact.get("approved_publish", {}).get("action_id") != artifact.get("publish_without_approval", {}).get("action_id"):
         failures.append("s7_approval_action_id_mismatch")
-    if not artifact.get("approved_publish_evidence", {}).get("integrity"):
+    publish_evidence = artifact.get("approved_publish_evidence", {})
+    if not publish_evidence.get("integrity"):
         failures.append("s7_approved_publish_missing_integrity")
+    publish_trace_id = publish_evidence.get("trace_event_id")
+    if not publish_trace_id:
+        failures.append("s7_approved_publish_missing_trace_event_id")
+    elif publish_trace_id not in event_ids.get("artifact.publish.executed", []):
+        failures.append("s7_approved_publish_trace_id_not_required_publish_executed")
+    elif publish_trace_id not in trace_by_id:
+        failures.append("s7_approved_publish_trace_id_missing_from_export")
+    else:
+        payload = trace_record_kind_payload(trace_by_id[publish_trace_id])
+        action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
+        params = action.get("params", {}) if isinstance(action.get("params"), dict) else {}
+        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        if trace_record_kind(trace_by_id[publish_trace_id]) != "action.executed" or action.get("name") != "artifact.publish_external":
+            failures.append("s7_approved_publish_trace_not_publish_execution")
+        trace_publish_path = output.get("publish_ref") or output.get("artifact_path") or params.get("publish_ref")
+        if trace_publish_path != publish_evidence.get("artifact_path"):
+            failures.append("s7_approved_publish_trace_path_mismatch")
+        trace_tenant_id = output.get("tenant_id")
+        if not trace_tenant_id and isinstance(trace_publish_path, str) and trace_publish_path.startswith("artifact://"):
+            trace_tenant_id = trace_publish_path.removeprefix("artifact://").split("/", 1)[0]
+        if trace_tenant_id != publish_evidence.get("tenant_id"):
+            failures.append("s7_approved_publish_trace_tenant_mismatch")
+        if output.get("integrity") != publish_evidence.get("integrity"):
+            failures.append("s7_approved_publish_trace_integrity_mismatch")
     if artifact.get("collision", {}).get("status") != "Denied":
         failures.append("s7_artifact_collision_not_denied")
     if artifact.get("specialist_publish_denial", {}).get("status") != "Denied":
@@ -1623,6 +1674,26 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s7_replay_suppression_or_redaction_missing")
     if replay.get("adapter_executions_before_replay") != replay.get("adapter_executions_after_replay"):
         failures.append("s7_replay_changed_adapter_execution_count")
+    before_counts = replay.get("action_execution_counts_before_replay")
+    after_counts = replay.get("action_execution_counts_after_replay")
+    if not isinstance(before_counts, dict) or not isinstance(after_counts, dict):
+        failures.append("s7_replay_missing_action_execution_counts")
+    elif before_counts != after_counts:
+        failures.append("s7_replay_changed_action_execution_counts")
+    else:
+        for action_name in ["data.read_fixture", "artifact.create_internal", "artifact.publish_external"]:
+            if action_name not in before_counts:
+                failures.append(f"s7_replay_missing_action_execution_count:{action_name}")
+        if before_counts.get("artifact.publish_external", 0) < 1:
+            failures.append("s7_replay_proof_missing_orchestrator_publish_execution")
+    if not replay.get("orchestrator_replay", {}).get("replay_id"):
+        failures.append("s7_replay_missing_orchestrator_replay_id")
+    if replay.get("approved_publish_artifact_path") != artifact.get("approved_publish_evidence", {}).get("artifact_path"):
+        failures.append("s7_replay_publish_artifact_path_mismatch")
+    if replay.get("approved_publish_trace_event_id") != artifact.get("approved_publish_evidence", {}).get("trace_event_id"):
+        failures.append("s7_replay_publish_trace_id_mismatch")
+    if replay.get("internal_artifact_trace_event_id") != artifact.get("internal_artifact_evidence", {}).get("trace_event_id"):
+        failures.append("s7_replay_internal_artifact_trace_id_mismatch")
     if replay.get("cross_tenant_replay", {}).get("status") != 403:
         failures.append("s7_cross_tenant_replay_not_rejected")
     audit = read_json(artifact_dir / "audit-report.json")
