@@ -576,7 +576,7 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SendMessageRequest' } } } }
       responses:
         '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
-        '403': { description: cross_tenant_message_read_denied or missing message read scope., content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /messages/{message_id}/read:
     post:
       summary: Read message delivery status.
@@ -586,7 +586,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
       responses:
         '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -629,7 +629,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
       responses:
         '200': { description: Agent inbox messages., content: { application/json: { schema: { $ref: '#/components/schemas/MessageListResponse' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -642,7 +642,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
       responses:
         '200': { description: Agent outbox messages., content: { application/json: { schema: { $ref: '#/components/schemas/MessageListResponse' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -655,7 +655,7 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
       responses:
         '200': { description: Message causal graph., content: { application/json: { schema: { $ref: '#/components/schemas/MessageCausalGraphResponse' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1395,6 +1395,16 @@ components:
             agent_id:
               type: [string, 'null']
               format: uuid
+    MessageReadRequest:
+      description: Message read/list/causal graph scope. Normal callers must provide tenant_id, run_id, and agent_id; missing_message_tenant_scope, missing_message_run_scope, missing_message_agent_scope, cross_tenant_message_read_denied, message_run_scope_denied, or message_agent_scope_denied fail closed.
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [tenant_id, run_id, agent_id]
+          properties:
+            tenant_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
     PublishPolicyBundleRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -1983,13 +1993,15 @@ components:
           type: boolean
           description: Ack/nack/read operations preserve message payload and grant no action authority.
     MessageDeliveryUpdateRequest:
+      description: Ack/nack scope. Normal callers must provide tenant_id, run_id, and the target recipient agent_id; missing_message_tenant_scope, missing_message_run_scope, missing_message_agent_scope, cross_tenant_message_read_denied, message_run_scope_denied, message_agent_scope_denied, or message_ack_agent_not_recipient fail closed.
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
         - type: object
-          required: [reason]
+          required: [tenant_id, run_id, agent_id, reason]
           properties:
-            tenant_id: { type: [string, 'null'], format: uuid }
-            agent_id: { type: [string, 'null'], format: uuid }
+            tenant_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
             reason: { type: [string, 'null'] }
             payload:
               $ref: '#/components/schemas/JsonValue'
@@ -1999,11 +2011,12 @@ components:
               description: Must be absent; present values are rejected because ack/nack cannot mutate payload.
     MessageListResponse:
       type: object
-      required: [agent_id, direction, tenant_id, messages, trace_event_id]
+      required: [agent_id, direction, tenant_id, run_id, messages, trace_event_id]
       properties:
         agent_id: { type: string, format: uuid }
         direction: { type: string, enum: [inbox, outbox] }
-        tenant_id: { type: [string, 'null'], format: uuid }
+        tenant_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
         messages:
           type: array
           items:
@@ -2031,10 +2044,11 @@ components:
         from_message_id: { type: [string, 'null'], format: uuid }
     MessageCausalGraphResponse:
       type: object
-      required: [run_id, tenant_id, nodes, edges, trace_event_id]
+      required: [run_id, tenant_id, agent_id, nodes, edges, trace_event_id]
       properties:
         run_id: { type: string, format: uuid }
-        tenant_id: { type: [string, 'null'], format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
         nodes:
           type: array
           items:

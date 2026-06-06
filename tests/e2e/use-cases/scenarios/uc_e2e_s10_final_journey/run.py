@@ -76,7 +76,9 @@ REQUIRED_NEGATIVES = {
     "specialist_permission_escalation_denied",
     "remote_duplicate_not_double_applied",
     "unsupported_message_schema_validation_rejected",
+    "omitted_message_read_scope_denied",
     "cross_tenant_message_read_rejected",
+    "unauthorized_ack_nack_denied",
     "ack_nack_scope_or_payload_mutation_denied",
     "raw_physical_control_rejected",
     "expired_approval_rejected",
@@ -317,6 +319,10 @@ def audit(credential: dict[str, Any]) -> dict[str, Any]:
 
 def sec(credential: dict[str, Any]) -> dict[str, Any]:
     return {"credential": credential, "audit_attribution": audit(credential)}
+
+
+def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant_id: str = TENANT_ID) -> dict[str, Any]:
+    return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
 
 
 def credential_header(credential: dict[str, Any]) -> dict[str, str]:
@@ -1024,31 +1030,35 @@ def main() -> int:
 
     task_request = typed_message(TASK_REQUEST_ID, ORCH_AGENT, SPECIALIST_AGENT, ORCH_RUN, "splendor.message.task_request.v1", {"parent_run_id": ORCH_RUN, "child_run_id": SPECIALIST_RUN, "target_agent_id": SPECIALIST_AGENT, "objective": "analyze scoped field-intelligence package", "data_refs": [DATA_REF], "permissions": ["data.read_fixture", "artifact.create_internal"], "delegated_authority": {"allowed_actions": ["data.read_fixture", "artifact.create_internal"], "allowed_adapters": ["fixture-data-store", "artifact-store"], "allowed_permissions": ["data.read_fixture", "artifact.create_internal"]}}, dispatch_spec["body"].get("trace_event_id") or dispatch_orch["body"].get("trace_event_id"), True)
     task_sent = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_ORCH, "message_envelope": task_request, "source_instance_id": VPC_INSTANCE, "target_instance_id": VPC_INSTANCE, "idempotency_key": "s10-task-request", "simulate_failure": None})
-    task_read = call("getMessage", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", sec(manager))
+    task_read = call("getMessage", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", message_scope(manager, ORCH_RUN, SPECIALIST_AGENT))
     task_response = typed_message(TASK_RESPONSE_ID, SPECIALIST_AGENT, ORCH_AGENT, ORCH_RUN, "splendor.message.task_response.v1", {"parent_run_id": ORCH_RUN, "child_run_id": SPECIALIST_RUN, "status": "completed", "output": {"analysis_ref": "analysis:s10:field-intel", "summary": "trace-safe field-intelligence summary", "data_refs": [DATA_REF], "raw_payload_included": False}, "failure": None}, task_sent["body"].get("trace_event_id") or dispatch_spec["body"].get("trace_event_id"), False)
     response_sent = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_SPECIALIST, "message_envelope": task_response, "source_instance_id": VPC_INSTANCE, "target_instance_id": VPC_INSTANCE, "idempotency_key": "s10-task-response", "simulate_failure": None})
-    response_read = call("getMessage", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/read", sec(manager))
+    response_read = call("getMessage", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/read", message_scope(manager, ORCH_RUN, ORCH_AGENT))
 
     cloud_proposal = typed_message(CLOUD_MESSAGE_ID, CLOUD_HELPER_AGENT, EDGE_AGENT, CLOUD_HELPER_RUN, "splendor.message.proposal_request.v1", {"task": "propose bounded inspection route", "edge_run_id": EDGE_RUN, "proposal_id": ROUTE_PROPOSAL_ID, "zone_ref": "zone:warehouse-a3", "actions": ["inspect_zone", "move_to_waypoint", "capture_image"], "direct_actuator_authority": False, "publication_authority": False}, dispatch_helper["body"].get("trace_event_id"), False)
     cloud_delivery = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_CLOUD_HELPER, "message_envelope": cloud_proposal, "source_instance_id": CLOUD_INSTANCE, "target_instance_id": EDGE_INSTANCE, "idempotency_key": "s10-cloud-helper-proposal", "simulate_failure": None})
     cloud_duplicate = typed_message(DUPLICATE_MESSAGE_ID, CLOUD_HELPER_AGENT, EDGE_AGENT, CLOUD_HELPER_RUN, "splendor.message.proposal_request.v1", cloud_proposal["message"]["payload"], dispatch_helper["body"].get("trace_event_id"), False)
     duplicate_delivery = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_CLOUD_HELPER, "message_envelope": cloud_duplicate, "source_instance_id": CLOUD_INSTANCE, "target_instance_id": EDGE_INSTANCE, "idempotency_key": "s10-cloud-helper-proposal", "simulate_failure": None})
-    cloud_read = call("getMessage", "POST", args.manager_url, f"/messages/{CLOUD_MESSAGE_ID}/read", sec(manager))
-    message_read_scope = {**sec(manager), "tenant_id": TENANT_ID}
+    cloud_read = call("getMessage", "POST", args.manager_url, f"/messages/{CLOUD_MESSAGE_ID}/read", message_scope(manager, CLOUD_HELPER_RUN, EDGE_AGENT))
     message_schemas = call("listMessageSchemas", "GET", args.manager_url, "/message-schemas", sec(manager))
     schema_validation = call("validateMessageSchema", "POST", args.manager_url, "/message-schemas/validate", {**sec(manager), "message_envelope": task_request})
     unsupported_schema_validation = call("validateMessageSchema", "POST", args.manager_url, "/message-schemas/validate", {**sec(manager), "schema": "splendor.message.unsupported.v2", "payload": {"unsupported": True}})
-    orchestrator_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{ORCH_AGENT}/outbox", message_read_scope)
-    specialist_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/inbox", message_read_scope)
-    specialist_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/outbox", message_read_scope)
-    edge_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{EDGE_AGENT}/inbox", message_read_scope)
-    causal_graph = call("getMessageCausalGraph", "GET", args.manager_url, f"/runs/{ORCH_RUN}/messages/causal-graph", message_read_scope)
-    ack_task = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "reason": "specialist consumed scoped task request"})
-    ack_response = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/ack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "reason": "orchestrator consumed scoped task response"})
-    nack_duplicate = call("nackMessage", "POST", args.manager_url, f"/messages/{DUPLICATE_MESSAGE_ID}/nack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": EDGE_AGENT, "reason": "duplicate idempotency marker was not double-applied"})
-    cross_tenant_read = call("getMessageCrossTenant", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", {**sec(manager), "tenant_id": "11111111-1111-4111-8111-222222222222"})
-    ack_scope_failure = call("ackMessageScopeFailure", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**sec(manager_credential(["messages_read"])), "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "reason": "missing send scope should fail closed"})
-    nack_payload_mutation_denial = call("nackMessagePayloadMutationDenied", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/nack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "reason": "payload mutation attempt must be rejected", "payload": {"mutated": True}})
+    orchestrator_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{ORCH_AGENT}/outbox", message_scope(manager, ORCH_RUN, ORCH_AGENT))
+    specialist_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/inbox", message_scope(manager, ORCH_RUN, SPECIALIST_AGENT))
+    specialist_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/outbox", message_scope(manager, ORCH_RUN, SPECIALIST_AGENT))
+    edge_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{EDGE_AGENT}/inbox", message_scope(manager, CLOUD_HELPER_RUN, EDGE_AGENT))
+    causal_graph = call("getMessageCausalGraph", "GET", args.manager_url, f"/runs/{ORCH_RUN}/messages/causal-graph", message_scope(manager, ORCH_RUN, ORCH_AGENT))
+    omitted_scope_read = call("getMessageOmittedScope", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", {**sec(manager), "run_id": ORCH_RUN, "agent_id": SPECIALIST_AGENT})
+    cross_tenant_read = call("getMessageCrossTenant", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", message_scope(manager, ORCH_RUN, SPECIALIST_AGENT, tenant_id="11111111-1111-4111-8111-222222222222"))
+    unrelated_agent_read = call("getMessageUnrelatedAgent", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", message_scope(manager, ORCH_RUN, CLOUD_HELPER_AGENT))
+    ack_scope_failure = call("ackMessageScopeFailure", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**message_scope(manager_credential(["messages_read"]), ORCH_RUN, SPECIALIST_AGENT), "reason": "missing send scope should fail closed"})
+    ack_source_denial = call("ackMessageSourceAgentDenied", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**message_scope(manager, ORCH_RUN, ORCH_AGENT), "reason": "source agent must not consume target inbox message"})
+    nack_unrelated_denial = call("nackMessageUnrelatedAgentDenied", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/nack", {**message_scope(manager, ORCH_RUN, EDGE_AGENT), "reason": "unrelated agent must not fail target inbox message"})
+    ack_cross_tenant_denial = call("ackMessageCrossTenantDenied", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**message_scope(manager, ORCH_RUN, SPECIALIST_AGENT, tenant_id="11111111-1111-4111-8111-222222222222"), "reason": "cross tenant ack should fail closed"})
+    nack_payload_mutation_denial = call("nackMessagePayloadMutationDenied", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/nack", {**message_scope(manager, ORCH_RUN, ORCH_AGENT), "reason": "payload mutation attempt must be rejected", "payload": {"mutated": True}})
+    ack_task = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**message_scope(manager, ORCH_RUN, SPECIALIST_AGENT), "reason": "specialist consumed scoped task request"})
+    ack_response = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/ack", {**message_scope(manager, ORCH_RUN, ORCH_AGENT), "reason": "orchestrator consumed scoped task response"})
+    nack_duplicate = call("nackMessage", "POST", args.manager_url, f"/messages/{DUPLICATE_MESSAGE_ID}/nack", {**message_scope(manager, CLOUD_HELPER_RUN, EDGE_AGENT), "reason": "duplicate idempotency marker was not double-applied"})
     helper_publish_denial = call("submitAction", "POST", args.cloud_url, "/actions", {"run_id": CLOUD_HELPER_RUN, "tenant_id": TENANT_ID, "agent_id": CLOUD_HELPER_AGENT, "credential": cloud_cred, "audit_attribution": audit(cloud_cred), "causal_trace_id": cloud_delivery["body"].get("trace_event_id"), "action": action("artifact.publish_external", "artifact.publish_external", "External", publish_ref=EXTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
 
     device_profile = {"node_id": EDGE_NODE, "tenant_id": TENANT_ID, "device_kind": "drone_sim", "capabilities": ["camera.rgb", "battery", "geofence", "privacy_zone"] + [f"physical.action.{name}" for name in ALLOWED_PHYSICAL_ACTIONS], "allowed_physical_actions": ALLOWED_PHYSICAL_ACTIONS, "forbidden_action_classes": FORBIDDEN_PHYSICAL_ACTIONS, "safety_constraints": {"max_altitude_m": 30, "allowed_zones": ["zone:warehouse-a3"], "privacy_zones": ["privacy_zone:warehouse-a3-public"], "min_battery_percent": 0.25}, "runtime_mode": "resident", "safety_status": {"battery_percent": 0.82, "emergency_stop": "clear", "human_proximity": "clear", "privacy": "clear"}, "policy_cache": {"policy_id": "policy_uc_e2e_s10_edge_cache", "loaded": True, "ttl_seconds": 3600, "expires_at": utc(60), "expired": False}, "trace_buffer": {"enabled": True, "buffered_records": 0, "integrity": "hash_chain"}, "registered_at": utc(0)}
@@ -1185,7 +1195,9 @@ def main() -> int:
         {"case": "specialist_permission_escalation_denied", "passed": specialist_escalation["body"].get("status") == "Denied", "status": specialist_escalation["body"].get("status"), "reason_codes": specialist_escalation["body"].get("verification", {}).get("reasons", [])},
         {"case": "remote_duplicate_not_double_applied", "passed": duplicate_delivery["body"].get("duplicate") is True and duplicate_delivery["body"].get("idempotency_key") == "s10-cloud-helper-proposal", "duplicate": duplicate_delivery["body"].get("duplicate")},
         {"case": "unsupported_message_schema_validation_rejected", "passed": unsupported_schema_validation["status"] == 200 and unsupported_schema_validation["body"].get("valid") is False and unsupported_schema_validation["body"].get("supported") is False, "status": unsupported_schema_validation["status"], "reason": unsupported_schema_validation["body"].get("reason")},
+        {"case": "omitted_message_read_scope_denied", "passed": omitted_scope_read["status"] == 403 and omitted_scope_read["body"].get("code") == "missing_message_tenant_scope", "status": omitted_scope_read["status"], "code": omitted_scope_read["body"].get("code")},
         {"case": "cross_tenant_message_read_rejected", "passed": cross_tenant_read["status"] == 403 and cross_tenant_read["body"].get("code") == "cross_tenant_message_read_denied", "status": cross_tenant_read["status"], "code": cross_tenant_read["body"].get("code")},
+        {"case": "unauthorized_ack_nack_denied", "passed": unrelated_agent_read["status"] == 403 and ack_source_denial["status"] == 403 and ack_source_denial["body"].get("code") == "message_ack_agent_not_recipient" and nack_unrelated_denial["status"] == 403 and ack_cross_tenant_denial["status"] == 403, "unrelated_read_status": unrelated_agent_read["status"], "unrelated_read_code": unrelated_agent_read["body"].get("code"), "ack_source_status": ack_source_denial["status"], "ack_source_code": ack_source_denial["body"].get("code"), "nack_unrelated_status": nack_unrelated_denial["status"], "nack_unrelated_code": nack_unrelated_denial["body"].get("code"), "ack_cross_tenant_status": ack_cross_tenant_denial["status"], "ack_cross_tenant_code": ack_cross_tenant_denial["body"].get("code")},
         {"case": "ack_nack_scope_or_payload_mutation_denied", "passed": ack_scope_failure["status"] == 403 and nack_payload_mutation_denial["status"] == 400 and nack_payload_mutation_denial["body"].get("code") == "message_payload_mutation_forbidden", "ack_scope_status": ack_scope_failure["status"], "nack_mutation_status": nack_payload_mutation_denial["status"], "nack_mutation_code": nack_payload_mutation_denial["body"].get("code")},
         {"case": "raw_physical_control_rejected", "passed": all(item["status"] == 400 and item["body"].get("code") == "low_level_physical_action_rejected" for item in raw_physical), "statuses": [item["status"] for item in raw_physical]},
         {"case": "expired_approval_rejected", "passed": expired_approval["body"].get("status") == "Denied" and expired_approval["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "expired", "status": expired_approval["body"].get("status")},
@@ -1196,7 +1208,7 @@ def main() -> int:
     ]
     contract_report = read_json(report_dir / "contract-status.json")
     contract_unblocked = not any(group.get("status") == "blocked_not_yet_covered" for group in contract_report.get("blocked_not_yet_covered", []))
-    message_api_operations = {"listMessageSchemas", "validateMessageSchema", "listInbox", "listOutbox", "getMessageCausalGraph", "ackMessage", "nackMessage"}
+    message_api_operations = {"getMessage", "listMessageSchemas", "validateMessageSchema", "listInbox", "listOutbox", "getMessageCausalGraph", "ackMessage", "nackMessage"}
     positives = {
         "api_contract_passed": contract_report.get("status") == "passed" and contract_unblocked,
         "nodes_and_instances_registered": node_list["status"] == 200 and all(item["status"] == 200 for item in node_registrations + instance_registrations),

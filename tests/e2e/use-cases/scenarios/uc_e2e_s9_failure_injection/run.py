@@ -176,6 +176,10 @@ def sec(credential: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"credential": credential, "audit_attribution": audit(credential)}
 
 
+def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant_id: str = TENANT_ID) -> dict[str, Any]:
+    return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
+
+
 def credential_header(credential: dict[str, Any]) -> dict[str, str]:
     return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
 
@@ -577,13 +581,13 @@ def main() -> int:
     telemetry_read = call("getFleetTelemetry", "POST", args.manager_url, "/fleet/telemetry/read", sec(manager))
     manager_audit = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     governance_audit = call("exportGovernanceAudit", "POST", args.manager_url, "/governance/audit/export", {**sec(manager), "run_id": RUN_ID})
-    message_before = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", sec(manager))
+    message_before = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", message_scope(manager, RUN_ID, HELPER_AGENT_ID))
     replay_before = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
     replay_audit_before = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     replay = call("replayRun", "POST", args.base_url, f"/runs/{RUN_ID}/replay", {"credential": run_cred, "audit_attribution": audit(run_cred), "mode": "inspect_only", "side_effects_allowed": False})
     replay_after = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
     replay_audit_after = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
-    message_after = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", sec(manager))
+    message_after = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", message_scope(manager, RUN_ID, HELPER_AGENT_ID))
 
     s1 = load_source(artifacts_root, "UC-E2E-S1")
     s4 = load_source(artifacts_root, "UC-E2E-S4")

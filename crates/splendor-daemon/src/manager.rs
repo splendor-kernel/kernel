@@ -322,6 +322,18 @@ pub struct ManagerReadRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageReadRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
+    #[serde(default)]
+    pub run_id: Option<RunId>,
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageStatusReport {
     pub message_id: MessageId,
     pub work_order_id: String,
@@ -359,6 +371,8 @@ pub struct MessageDeliveryUpdateRequest {
     #[serde(default)]
     pub tenant_id: Option<TenantId>,
     #[serde(default)]
+    pub run_id: Option<RunId>,
+    #[serde(default)]
     pub agent_id: Option<AgentId>,
     #[serde(default)]
     pub reason: Option<String>,
@@ -372,7 +386,8 @@ pub struct MessageDeliveryUpdateRequest {
 pub struct MessageListResponse {
     pub agent_id: AgentId,
     pub direction: String,
-    pub tenant_id: Option<TenantId>,
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
     pub messages: Vec<MessageStatusReport>,
     pub trace_event_id: String,
 }
@@ -400,7 +415,8 @@ pub struct MessageCausalGraphEdge {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageCausalGraphResponse {
     pub run_id: RunId,
-    pub tenant_id: Option<TenantId>,
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
     pub nodes: Vec<MessageCausalGraphNode>,
     pub edges: Vec<MessageCausalGraphEdge>,
     pub trace_event_id: String,
@@ -1448,23 +1464,113 @@ fn ensure_supported_message_schema(schema: &str) -> Result<(), ManagerApiError> 
 fn ensure_message_visibility(
     report: &MessageStatusReport,
     tenant_id: Option<&TenantId>,
+    run_id: Option<&RunId>,
     agent_id: Option<&AgentId>,
 ) -> Result<(), ManagerApiError> {
-    if let Some(tenant_id) = tenant_id {
-        if tenant_id != &report.tenant_id {
-            return Err(ManagerApiError::forbidden(
-                "cross_tenant_message_read_denied",
-                "message tenant does not match requested tenant scope",
-            ));
-        }
+    let tenant_id = tenant_id.ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_tenant_scope",
+            "message read/update requires tenant_id scope",
+        )
+    })?;
+    if tenant_id != &report.tenant_id {
+        return Err(ManagerApiError::forbidden(
+            "cross_tenant_message_read_denied",
+            "message tenant does not match requested tenant scope",
+        ));
     }
-    if let Some(agent_id) = agent_id {
-        if agent_id != &report.source_agent_id && agent_id != &report.target_agent_id {
-            return Err(ManagerApiError::forbidden(
-                "message_agent_scope_denied",
-                "message is outside requested agent scope",
-            ));
-        }
+    let run_id = run_id.ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_run_scope",
+            "message read/update requires run_id scope",
+        )
+    })?;
+    if run_id != &report.run_id {
+        return Err(ManagerApiError::forbidden(
+            "message_run_scope_denied",
+            "message run does not match requested run scope",
+        ));
+    }
+    let agent_id = agent_id.ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_agent_scope",
+            "message read/update requires agent_id scope",
+        )
+    })?;
+    if agent_id != &report.source_agent_id && agent_id != &report.target_agent_id {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            "message is outside requested agent scope",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_message_list_scope(
+    path_agent_id: &AgentId,
+    request: &MessageReadRequest,
+) -> Result<(TenantId, RunId, AgentId), ManagerApiError> {
+    let tenant_id = request.tenant_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_tenant_scope",
+            "message list requires tenant_id scope",
+        )
+    })?;
+    let run_id = request.run_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_run_scope",
+            "message list requires run_id scope",
+        )
+    })?;
+    let agent_id = request.agent_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_agent_scope",
+            "message list requires agent_id scope",
+        )
+    })?;
+    if &agent_id != path_agent_id {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            "message list request agent does not match path agent",
+        ));
+    }
+    Ok((tenant_id, run_id, agent_id))
+}
+
+fn ensure_message_collection_scope(
+    reports: &[MessageStatusReport],
+    tenant_id: &TenantId,
+    run_id: &RunId,
+    agent_id: &AgentId,
+    context: &str,
+) -> Result<(), ManagerApiError> {
+    let run_reports = reports
+        .iter()
+        .filter(|report| &report.run_id == run_id)
+        .collect::<Vec<_>>();
+    if !run_reports.is_empty()
+        && !run_reports
+            .iter()
+            .any(|report| &report.tenant_id == tenant_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "cross_tenant_message_read_denied",
+            format!("{context} tenant scope does not match run messages"),
+        ));
+    }
+    let scoped_reports = run_reports
+        .into_iter()
+        .filter(|report| &report.tenant_id == tenant_id)
+        .collect::<Vec<_>>();
+    if !scoped_reports.is_empty()
+        && !scoped_reports.iter().any(|report| {
+            &report.source_agent_id == agent_id || &report.target_agent_id == agent_id
+        })
+    {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            format!("{context} is outside requested agent scope"),
+        ));
     }
     Ok(())
 }
@@ -1482,15 +1588,15 @@ fn ensure_message_update_scope(
     ensure_message_visibility(
         report,
         request.tenant_id.as_ref(),
+        request.run_id.as_ref(),
         request.agent_id.as_ref(),
     )?;
-    if let Some(agent_id) = &request.agent_id {
-        if agent_id != &report.target_agent_id {
-            return Err(ManagerApiError::forbidden(
-                "message_ack_agent_not_recipient",
-                "ack/nack must be scoped to the target agent when an agent scope is supplied",
-            ));
-        }
+    let agent_id = request.agent_id.as_ref().expect("validated agent scope");
+    if agent_id != &report.target_agent_id {
+        return Err(ManagerApiError::forbidden(
+            "message_ack_agent_not_recipient",
+            "ack/nack must be scoped to the target agent",
+        ));
     }
     Ok(())
 }
@@ -1814,7 +1920,7 @@ fn task_response_child_run_id(message: &Message) -> Option<&str> {
 async fn get_message(
     Path(message_id): Path<MessageId>,
     State(state): State<ManagerState>,
-    Json(request): Json<ManagerReadRequest>,
+    Json(request): Json<MessageReadRequest>,
 ) -> Result<Json<MessageStatusReport>, ManagerApiError> {
     state.validate_security(
         &request.security.credential,
@@ -1833,6 +1939,7 @@ async fn get_message(
     ensure_message_visibility(
         &report,
         request.tenant_id.as_ref(),
+        request.run_id.as_ref(),
         request.agent_id.as_ref(),
     )?;
     let read_trace_event_id = state.audit(
@@ -1958,7 +2065,7 @@ async fn nack_message(
 async fn list_inbox(
     Path(agent_id): Path<AgentId>,
     State(state): State<ManagerState>,
-    Json(request): Json<ManagerReadRequest>,
+    Json(request): Json<MessageReadRequest>,
 ) -> Result<Json<MessageListResponse>, ManagerApiError> {
     state.validate_security(
         &request.security.credential,
@@ -1966,37 +2073,34 @@ async fn list_inbox(
         EndpointScope::MessagesRead,
         false,
     )?;
-    if request
-        .agent_id
-        .as_ref()
-        .is_some_and(|requested| requested != &agent_id)
-    {
-        return Err(ManagerApiError::forbidden(
-            "message_agent_scope_denied",
-            "inbox request agent does not match path agent",
-        ));
-    }
-    let messages = state
+    let (tenant_id, run_id, scoped_agent_id) = ensure_message_list_scope(&agent_id, &request)?;
+    let reports = state
         .inner
         .messages
         .lock()
         .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
         .values()
-        .filter(|report| report.target_agent_id == agent_id)
-        .filter(|report| {
-            request
-                .tenant_id
-                .as_ref()
-                .map(|tenant_id| tenant_id == &report.tenant_id)
-                .unwrap_or(true)
-        })
         .cloned()
+        .collect::<Vec<_>>();
+    ensure_message_collection_scope(
+        &reports,
+        &tenant_id,
+        &run_id,
+        &scoped_agent_id,
+        "message inbox",
+    )?;
+    let messages = reports
+        .into_iter()
+        .filter(|report| report.target_agent_id == agent_id)
+        .filter(|report| report.tenant_id == tenant_id)
+        .filter(|report| report.run_id == run_id)
         .collect::<Vec<_>>();
     let trace_event_id = state.audit(
         "message.inbox.listed",
         serde_json::json!({
             "agent_id": agent_id,
-            "tenant_id": request.tenant_id,
+            "tenant_id": tenant_id,
+            "run_id": run_id,
             "message_count": messages.len(),
             "authority_granted": false,
         }),
@@ -2004,7 +2108,8 @@ async fn list_inbox(
     Ok(Json(MessageListResponse {
         agent_id,
         direction: "inbox".to_string(),
-        tenant_id: request.tenant_id,
+        tenant_id,
+        run_id,
         messages,
         trace_event_id,
     }))
@@ -2013,7 +2118,7 @@ async fn list_inbox(
 async fn list_outbox(
     Path(agent_id): Path<AgentId>,
     State(state): State<ManagerState>,
-    Json(request): Json<ManagerReadRequest>,
+    Json(request): Json<MessageReadRequest>,
 ) -> Result<Json<MessageListResponse>, ManagerApiError> {
     state.validate_security(
         &request.security.credential,
@@ -2021,37 +2126,34 @@ async fn list_outbox(
         EndpointScope::MessagesRead,
         false,
     )?;
-    if request
-        .agent_id
-        .as_ref()
-        .is_some_and(|requested| requested != &agent_id)
-    {
-        return Err(ManagerApiError::forbidden(
-            "message_agent_scope_denied",
-            "outbox request agent does not match path agent",
-        ));
-    }
-    let messages = state
+    let (tenant_id, run_id, scoped_agent_id) = ensure_message_list_scope(&agent_id, &request)?;
+    let reports = state
         .inner
         .messages
         .lock()
         .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
         .values()
-        .filter(|report| report.source_agent_id == agent_id)
-        .filter(|report| {
-            request
-                .tenant_id
-                .as_ref()
-                .map(|tenant_id| tenant_id == &report.tenant_id)
-                .unwrap_or(true)
-        })
         .cloned()
+        .collect::<Vec<_>>();
+    ensure_message_collection_scope(
+        &reports,
+        &tenant_id,
+        &run_id,
+        &scoped_agent_id,
+        "message outbox",
+    )?;
+    let messages = reports
+        .into_iter()
+        .filter(|report| report.source_agent_id == agent_id)
+        .filter(|report| report.tenant_id == tenant_id)
+        .filter(|report| report.run_id == run_id)
         .collect::<Vec<_>>();
     let trace_event_id = state.audit(
         "message.outbox.listed",
         serde_json::json!({
             "agent_id": agent_id,
-            "tenant_id": request.tenant_id,
+            "tenant_id": tenant_id,
+            "run_id": run_id,
             "message_count": messages.len(),
             "authority_granted": false,
         }),
@@ -2059,7 +2161,8 @@ async fn list_outbox(
     Ok(Json(MessageListResponse {
         agent_id,
         direction: "outbox".to_string(),
-        tenant_id: request.tenant_id,
+        tenant_id,
+        run_id,
         messages,
         trace_event_id,
     }))
@@ -2068,7 +2171,7 @@ async fn list_outbox(
 async fn get_message_causal_graph(
     Path(run_id): Path<RunId>,
     State(state): State<ManagerState>,
-    Json(request): Json<ManagerReadRequest>,
+    Json(request): Json<MessageReadRequest>,
 ) -> Result<Json<MessageCausalGraphResponse>, ManagerApiError> {
     state.validate_security(
         &request.security.credential,
@@ -2076,21 +2179,65 @@ async fn get_message_causal_graph(
         EndpointScope::MessagesRead,
         false,
     )?;
+    let tenant_id = request.tenant_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_tenant_scope",
+            "message causal graph requires tenant_id scope",
+        )
+    })?;
+    let scoped_run_id = request.run_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_run_scope",
+            "message causal graph requires run_id scope",
+        )
+    })?;
+    if scoped_run_id != run_id {
+        return Err(ManagerApiError::forbidden(
+            "message_run_scope_denied",
+            "message causal graph path run does not match requested run scope",
+        ));
+    }
+    let scoped_agent_id = request.agent_id.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "missing_message_agent_scope",
+            "message causal graph requires agent_id scope",
+        )
+    })?;
     let reports = state
         .inner
         .messages
         .lock()
         .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
         .values()
-        .filter(|report| report.run_id == run_id)
-        .filter(|report| {
-            request
-                .tenant_id
-                .as_ref()
-                .map(|tenant_id| tenant_id == &report.tenant_id)
-                .unwrap_or(true)
-        })
         .cloned()
+        .collect::<Vec<_>>();
+    ensure_message_collection_scope(
+        &reports,
+        &tenant_id,
+        &run_id,
+        &scoped_agent_id,
+        "message causal graph",
+    )?;
+    let scoped_reports = reports
+        .into_iter()
+        .filter(|report| report.run_id == run_id)
+        .filter(|report| report.tenant_id == tenant_id)
+        .collect::<Vec<_>>();
+    if !scoped_reports.is_empty()
+        && !scoped_reports.iter().any(|report| {
+            report.source_agent_id == scoped_agent_id || report.target_agent_id == scoped_agent_id
+        })
+    {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            "message causal graph is outside requested agent scope",
+        ));
+    }
+    let reports = scoped_reports
+        .into_iter()
+        .filter(|report| {
+            report.source_agent_id == scoped_agent_id || report.target_agent_id == scoped_agent_id
+        })
         .collect::<Vec<_>>();
     let trace_to_message = reports
         .iter()
@@ -2127,7 +2274,8 @@ async fn get_message_causal_graph(
         "message.causal_graph.read",
         serde_json::json!({
             "run_id": run_id,
-            "tenant_id": request.tenant_id,
+            "tenant_id": tenant_id,
+            "agent_id": scoped_agent_id,
             "node_count": nodes.len(),
             "edge_count": edges.len(),
             "authority_granted": false,
@@ -2135,7 +2283,8 @@ async fn get_message_causal_graph(
     )?;
     Ok(Json(MessageCausalGraphResponse {
         run_id,
-        tenant_id: request.tenant_id,
+        tenant_id,
+        agent_id: scoped_agent_id,
         nodes,
         edges,
         trace_event_id,
@@ -3162,6 +3311,58 @@ mod tests {
             audit_attribution: audit_for(&credential),
             credential,
         }
+    }
+
+    fn message_read_request(
+        security: ManagerSecurityFields,
+        tenant_id: Option<TenantId>,
+        run_id: Option<RunId>,
+        agent_id: Option<AgentId>,
+    ) -> MessageReadRequest {
+        MessageReadRequest {
+            security,
+            tenant_id,
+            run_id,
+            agent_id,
+        }
+    }
+
+    fn message_update_request(
+        security: ManagerSecurityFields,
+        tenant_id: Option<TenantId>,
+        run_id: Option<RunId>,
+        agent_id: Option<AgentId>,
+        reason: &str,
+    ) -> MessageDeliveryUpdateRequest {
+        MessageDeliveryUpdateRequest {
+            security,
+            tenant_id,
+            run_id,
+            agent_id,
+            reason: Some(reason.to_string()),
+            payload: None,
+            payload_patch: None,
+        }
+    }
+
+    fn assert_message_authority_preserved(
+        before: &MessageStatusReport,
+        after: &MessageStatusReport,
+    ) {
+        assert_eq!(after.message_id, before.message_id);
+        assert_eq!(after.work_order_id, before.work_order_id);
+        assert_eq!(after.tenant_id, before.tenant_id);
+        assert_eq!(after.run_id, before.run_id);
+        assert_eq!(after.source_agent_id, before.source_agent_id);
+        assert_eq!(after.target_agent_id, before.target_agent_id);
+        assert_eq!(after.schema, before.schema);
+        assert_eq!(after.causal_parent, before.causal_parent);
+        assert_eq!(after.idempotency_key, before.idempotency_key);
+        assert_eq!(after.source_instance_id, before.source_instance_id);
+        assert_eq!(after.target_instance_id, before.target_instance_id);
+        assert_eq!(after.route_permission, before.route_permission);
+        assert_eq!(after.remote_state_mutated, before.remote_state_mutated);
+        assert!(after.payload_preserved);
     }
 
     fn spawn_resident_mock() -> String {
@@ -4514,31 +4715,166 @@ mod tests {
         let cross_tenant = get_message(
             Path(message_id.clone()),
             State(state.clone()),
-            Json(ManagerReadRequest {
-                security: read_security.clone(),
-                tenant_id: Some(other_tenant),
-                agent_id: None,
-            }),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(other_tenant.clone()),
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+            )),
         )
         .await
         .expect_err("cross-tenant read denied");
         assert_eq!(cross_tenant.body.code, "cross_tenant_message_read_denied");
 
+        let omitted_tenant = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                None,
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("omitted tenant scope denied");
+        assert_eq!(omitted_tenant.body.code, "missing_message_tenant_scope");
+
+        let omitted_run = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                None,
+                Some(target_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("omitted run scope denied");
+        assert_eq!(omitted_run.body.code, "missing_message_run_scope");
+
+        let omitted_agent = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                None,
+            )),
+        )
+        .await
+        .expect_err("omitted agent scope denied");
+        assert_eq!(omitted_agent.body.code, "missing_message_agent_scope");
+
+        let unrelated_agent =
+            AgentId::parse("99999999-9999-4999-8999-999999999999").expect("agent");
+        let unrelated_read = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(unrelated_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("unrelated agent read denied");
+        assert_eq!(unrelated_read.body.code, "message_agent_scope_denied");
+
+        let wrong_run = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(RunId::parse("77777777-7777-4777-8777-777777777777").expect("run")),
+                Some(target_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("wrong run read denied");
+        assert_eq!(wrong_run.body.code, "message_run_scope_denied");
+
         let missing_send_scope = ack_message(
             Path(message_id.clone()),
             State(state.clone()),
-            Json(MessageDeliveryUpdateRequest {
-                security: read_security.clone(),
-                tenant_id: Some(tenant_id.clone()),
-                agent_id: Some(target_agent.clone()),
-                reason: Some("missing send scope".to_string()),
-                payload: None,
-                payload_patch: None,
-            }),
+            Json(message_update_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+                "missing send scope",
+            )),
         )
         .await
         .expect_err("ack requires messages_send scope");
         assert_eq!(missing_send_scope.body.code, "missing_scope");
+
+        let ack_missing_tenant = ack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_update_request(
+                send_security.clone(),
+                None,
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+                "missing tenant scope",
+            )),
+        )
+        .await
+        .expect_err("ack requires tenant scope");
+        assert_eq!(ack_missing_tenant.body.code, "missing_message_tenant_scope");
+
+        let ack_missing_run = ack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_update_request(
+                send_security.clone(),
+                Some(tenant_id.clone()),
+                None,
+                Some(target_agent.clone()),
+                "missing run scope",
+            )),
+        )
+        .await
+        .expect_err("ack requires run scope");
+        assert_eq!(ack_missing_run.body.code, "missing_message_run_scope");
+
+        let ack_source_agent = ack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(message_update_request(
+                send_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(source_agent.clone()),
+                "source cannot consume its own outbound message",
+            )),
+        )
+        .await
+        .expect_err("source agent cannot ack target message");
+        assert_eq!(
+            ack_source_agent.body.code,
+            "message_ack_agent_not_recipient"
+        );
+
+        let nack_unrelated_agent = nack_message(
+            Path(response_message_id.clone()),
+            State(state.clone()),
+            Json(message_update_request(
+                send_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(unrelated_agent),
+                "unrelated agent cannot fail delivery",
+            )),
+        )
+        .await
+        .expect_err("unrelated agent cannot nack target message");
+        assert_eq!(nack_unrelated_agent.body.code, "message_agent_scope_denied");
 
         let payload_mutation = nack_message(
             Path(message_id.clone()),
@@ -4546,6 +4882,7 @@ mod tests {
             Json(MessageDeliveryUpdateRequest {
                 security: send_security.clone(),
                 tenant_id: Some(tenant_id.clone()),
+                run_id: Some(run_id.clone()),
                 agent_id: Some(target_agent.clone()),
                 reason: Some("payload mutation attempt".to_string()),
                 payload: Some(serde_json::json!({"mutated": true})),
@@ -4559,17 +4896,25 @@ mod tests {
             "message_payload_mutation_forbidden"
         );
 
+        let before_ack = state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .get(&message_id.to_string())
+            .cloned()
+            .expect("message exists");
+
         let acked = ack_message(
             Path(message_id.clone()),
             State(state.clone()),
-            Json(MessageDeliveryUpdateRequest {
-                security: send_security.clone(),
-                tenant_id: Some(tenant_id.clone()),
-                agent_id: Some(target_agent.clone()),
-                reason: Some("target consumed message".to_string()),
-                payload: None,
-                payload_patch: None,
-            }),
+            Json(message_update_request(
+                send_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+                "target consumed message",
+            )),
         )
         .await
         .expect("ack records delivery status only")
@@ -4577,15 +4922,44 @@ mod tests {
         assert_eq!(acked.delivery_status, "consumed");
         assert!(acked.payload_preserved);
         assert!(acked.ack_trace_event_id.is_some());
+        assert_message_authority_preserved(&before_ack, &acked);
+
+        let before_nack = state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .get(&response_message_id.to_string())
+            .cloned()
+            .expect("response message exists");
+        let nacked = nack_message(
+            Path(response_message_id.clone()),
+            State(state.clone()),
+            Json(message_update_request(
+                send_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(source_agent.clone()),
+                "orchestrator records response failure metadata",
+            )),
+        )
+        .await
+        .expect("nack records delivery status only")
+        .0;
+        assert_eq!(nacked.delivery_status, "failed");
+        assert!(nacked.payload_preserved);
+        assert!(nacked.nack_trace_event_id.is_some());
+        assert_message_authority_preserved(&before_nack, &nacked);
 
         let inbox = list_inbox(
             Path(target_agent.clone()),
             State(state.clone()),
-            Json(ManagerReadRequest {
-                security: read_security.clone(),
-                tenant_id: Some(tenant_id.clone()),
-                agent_id: Some(target_agent.clone()),
-            }),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+            )),
         )
         .await
         .expect("inbox read")
@@ -4594,11 +4968,12 @@ mod tests {
         let outbox = list_outbox(
             Path(source_agent.clone()),
             State(state.clone()),
-            Json(ManagerReadRequest {
-                security: read_security.clone(),
-                tenant_id: Some(tenant_id.clone()),
-                agent_id: Some(source_agent.clone()),
-            }),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(source_agent.clone()),
+            )),
         )
         .await
         .expect("outbox read")
@@ -4607,24 +4982,77 @@ mod tests {
         let agent_mismatch = list_inbox(
             Path(target_agent.clone()),
             State(state.clone()),
-            Json(ManagerReadRequest {
-                security: read_security.clone(),
-                tenant_id: Some(tenant_id.clone()),
-                agent_id: Some(source_agent),
-            }),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(source_agent.clone()),
+            )),
         )
         .await
         .expect_err("path/request agent mismatch denied");
         assert_eq!(agent_mismatch.body.code, "message_agent_scope_denied");
 
+        let cross_tenant_list = list_inbox(
+            Path(target_agent.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(other_tenant.clone()),
+                Some(run_id.clone()),
+                Some(target_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("cross-tenant list denied");
+        assert_eq!(
+            cross_tenant_list.body.code,
+            "cross_tenant_message_read_denied"
+        );
+
+        let graph_cross_tenant = get_message_causal_graph(
+            Path(run_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(other_tenant),
+                Some(run_id.clone()),
+                Some(source_agent.clone()),
+            )),
+        )
+        .await
+        .expect_err("cross-tenant graph denied");
+        assert_eq!(
+            graph_cross_tenant.body.code,
+            "cross_tenant_message_read_denied"
+        );
+
+        let graph_unrelated_agent = get_message_causal_graph(
+            Path(run_id.clone()),
+            State(state.clone()),
+            Json(message_read_request(
+                read_security.clone(),
+                Some(tenant_id.clone()),
+                Some(run_id.clone()),
+                Some(AgentId::parse("88888888-8888-4888-8888-888888888888").expect("agent")),
+            )),
+        )
+        .await
+        .expect_err("unrelated graph denied");
+        assert_eq!(
+            graph_unrelated_agent.body.code,
+            "message_agent_scope_denied"
+        );
+
         let graph = get_message_causal_graph(
             Path(run_id),
             State(state),
-            Json(ManagerReadRequest {
-                security: read_security,
-                tenant_id: Some(tenant_id),
-                agent_id: None,
-            }),
+            Json(message_read_request(
+                read_security,
+                Some(tenant_id),
+                Some(RunId::parse("44444444-4444-4444-8444-444444444444").expect("run")),
+                Some(source_agent),
+            )),
         )
         .await
         .expect("causal graph reads")
@@ -4851,11 +5279,12 @@ mod tests {
         let read = get_message(
             Path(delivered.0.message_id.clone()),
             State(state.clone()),
-            Json(ManagerReadRequest {
-                security: security.clone(),
-                tenant_id: None,
-                agent_id: None,
-            }),
+            Json(message_read_request(
+                security.clone(),
+                Some(work_order.work_order.tenant_id.clone()),
+                work_order.work_order.run_id.clone(),
+                Some(work_order.work_order.agent_id.clone()),
+            )),
         )
         .await
         .expect("message read");
@@ -5069,11 +5498,12 @@ mod tests {
         let missing_message = get_message(
             Path(MessageId::parse("55555555-5555-4555-8555-555555555554").expect("message")),
             State(state),
-            Json(ManagerReadRequest {
+            Json(message_read_request(
                 security,
-                tenant_id: None,
-                agent_id: None,
-            }),
+                Some(TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant")),
+                Some(RunId::parse("44444444-4444-4444-8444-444444444444").expect("run")),
+                Some(AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent")),
+            )),
         )
         .await
         .expect_err("missing message rejected");

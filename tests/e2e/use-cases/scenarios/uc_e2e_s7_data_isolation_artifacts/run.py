@@ -101,6 +101,10 @@ def sec(credential: dict[str, Any]) -> dict[str, Any]:
     return {"credential": credential, "audit_attribution": audit(credential)}
 
 
+def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant_id: str = TENANT_A) -> dict[str, Any]:
+    return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
+
+
 def credential_header(credential: dict[str, Any]) -> dict[str, str]:
     return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
 
@@ -322,10 +326,10 @@ def main() -> int:
     causal_anchor = dispatch_reports[WORK_ORDER_SPEC]["body"].get("trace_event_id")
     task_request = {"message": {"message_id": "55555555-5555-4555-8555-555555555707", "source_agent_id": ORCH, "target_agent_id": SPEC, "run_id": ORCH_RUN, "schema": "splendor.message.task_request.v1", "payload": {"parent_run_id": ORCH_RUN, "child_run_id": SPEC_RUN, "target_agent_id": SPEC, "objective": "analyze scoped board pack", "data_refs": [DATA_REF_A], "permissions": ["data.read_fixture"], "delegated_authority": {"allowed_actions": ["data.read_fixture", "artifact.create_internal"], "allowed_adapters": ["fixture-data-store", "artifact-store"], "allowed_permissions": ["data.read_fixture", "artifact.create_internal"]}}, "causal_parent": causal_anchor, "requires_response": True, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
     sent = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_ORCH, "message_envelope": task_request, "source_instance_id": VPC_INSTANCE, "target_instance_id": VPC_INSTANCE, "idempotency_key": "s7-task-request", "simulate_failure": None})
-    received = call("getMessage", "POST", args.manager_url, f"/messages/{task_request['message']['message_id']}/read", sec(manager))
+    received = call("getMessage", "POST", args.manager_url, f"/messages/{task_request['message']['message_id']}/read", message_scope(manager, ORCH_RUN, SPEC))
     task_response = {"message": {"message_id": "55555555-5555-4555-8555-555555555708", "source_agent_id": SPEC, "target_agent_id": ORCH, "run_id": ORCH_RUN, "schema": "splendor.message.task_response.v1", "payload": {"parent_run_id": ORCH_RUN, "child_run_id": SPEC_RUN, "status": "completed", "output": {"analysis_ref": "analysis:s7:tenant-a", "data_refs": [DATA_REF_A], "summary": "tenant A scoped margin and revenue trend summary", "raw_payload_included": False}, "failure": None}, "causal_parent": sent["body"].get("trace_event_id") or causal_anchor, "requires_response": False, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
     response_sent = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_SPEC, "message_envelope": task_response, "source_instance_id": VPC_INSTANCE, "target_instance_id": VPC_INSTANCE, "idempotency_key": "s7-task-response", "simulate_failure": None})
-    response_received = call("getMessage", "POST", args.manager_url, f"/messages/{task_response['message']['message_id']}/read", sec(manager))
+    response_received = call("getMessage", "POST", args.manager_url, f"/messages/{task_response['message']['message_id']}/read", message_scope(manager, ORCH_RUN, ORCH))
 
     cred = resident_credential()
     inspect_before = call("inspectRunBeforeNegatives", "GET", args.vpc_url, f"/runs/{SPEC_RUN}", headers=credential_header(cred))

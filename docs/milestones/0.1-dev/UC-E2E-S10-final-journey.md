@@ -27,7 +27,7 @@ Validate the final `0.1-dev` use-case acceptance journey after prior UC-E2E scen
 - `bash scripts/e2e/verify-use-case-acceptance.sh --all` includes S10.
 - S10 writes acceptance artifacts under `target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S10/`.
 - The acceptance manager registration boundary now treats identical duplicate node/instance registration requests as idempotent success while still rejecting incompatible duplicate metadata; this lets S10 run after prerequisite scenarios without counting duplicate rejection as success.
-- No OpenAPI, primitive schema, or stable SDK contract is changed.
+- Message read/list/causal-graph and ack/nack OpenAPI request schemas now require explicit non-null tenant/run/agent scope for the acceptance caller path; no broad fleet-admin message-read path is introduced.
 
 ## Runtime Primitive Impact
 
@@ -74,7 +74,7 @@ The report aggregator rejects missing event IDs, non-UUID event IDs, required ev
 
 ## Controlled Negative Branches
 
-S10 includes independent negative branches for invalid work order, unauthorized data ref, specialist permission escalation, duplicate remote delivery, raw physical action, expired approval, circuit-breaker blocked publish, kill-switch cancellation, tampered trace/state import, and unsafe replay mode.
+S10 includes independent negative branches for invalid work order, unauthorized data ref, specialist permission escalation, duplicate remote delivery, unsupported/omitted-scope/cross-tenant/unrelated-agent message API access, unauthorized ack/nack attempts, raw physical action, expired approval, circuit-breaker blocked publish, kill-switch cancellation, tampered trace/state import, and unsafe replay mode.
 
 ## Replay Behavior
 

@@ -114,12 +114,12 @@ MESSAGE_RESPONSE_REFS = {
 
 MESSAGE_REQUEST_REFS = {
     "sendMessage": "SendMessageRequest",
-    "getMessage": "ManagerReadRequest",
+    "getMessage": "MessageReadRequest",
     "ackMessage": "MessageDeliveryUpdateRequest",
     "nackMessage": "MessageDeliveryUpdateRequest",
-    "listInbox": "ManagerReadRequest",
-    "listOutbox": "ManagerReadRequest",
-    "getMessageCausalGraph": "ManagerReadRequest",
+    "listInbox": "MessageReadRequest",
+    "listOutbox": "MessageReadRequest",
+    "getMessageCausalGraph": "MessageReadRequest",
     "validateMessageSchema": "MessageSchemaValidationRequest",
     "listMessageSchemas": "ManagerReadRequest",
 }
@@ -199,6 +199,36 @@ def require_non_null_authority_fields(text: str, schema_name: str) -> list[str]:
         expected_ref = "CallerCredential" if field == "credential" else "AuditAttribution"
         if f"#/components/schemas/{expected_ref}" not in field_block:
             failures.append(f"{schema_name}.{field}_missing_ref")
+    return failures
+
+
+def require_schema_required_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    matches = re.findall(r"required:\s*\[([^\]]+)\]", block)
+    required_fields = set()
+    for match in matches:
+        required_fields.update(item.strip().strip("'\"") for item in match.split(","))
+    missing = sorted(field for field in fields if field not in required_fields)
+    return [f"{schema_name}.{field}_not_required" for field in missing]
+
+
+def require_non_null_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    failures: list[str] = []
+    for field in sorted(fields):
+        field_match = re.search(rf"^\s+{re.escape(field)}:\s*(.*)$", block, re.MULTILINE)
+        if not field_match:
+            failures.append(f"{schema_name}.{field}")
+            continue
+        inline = field_match.group(1)
+        next_field = re.search(r"^\s{12}[A-Za-z0-9_]+:\s*", block[field_match.end() :], re.MULTILINE)
+        field_block = inline + "\n" + (block[field_match.end() : field_match.end() + next_field.start()] if next_field else block[field_match.end() :])
+        if "'null'" in field_block or '"null"' in field_block or "type: [" in field_block:
+            failures.append(f"{schema_name}.{field}_allows_null")
     return failures
 
 
@@ -390,11 +420,21 @@ def main() -> int:
             },
         )
     )
-    for schema_name in ["MessageDeliveryUpdateRequest", "MessageSchemaValidationRequest"]:
+    for schema_name in ["MessageReadRequest", "MessageDeliveryUpdateRequest", "MessageSchemaValidationRequest"]:
         block = schema_block(text, schema_name)
         if "#/components/schemas/ManagerSecurityFields" not in block:
             schema_failures_for_messages.append(f"{schema_name}.missing_ManagerSecurityFields_ref")
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_required_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
     schema_failures_for_messages.extend(require_schema_fields(text, "MessageDeliveryUpdateRequest", {"reason"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_required_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageListResponse", {"tenant_id", "run_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageListResponse", {"tenant_id", "run_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageCausalGraphResponse", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageCausalGraphResponse", {"tenant_id", "run_id", "agent_id"}))
     schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaValidationRequest", {"message_envelope", "schema", "payload"}))
     schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaValidationReport", {"valid", "supported", "schema", "delivery_authority_granted", "trace_event_id"}))
     schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaListResponse", {"schemas", "delivery_authority_granted", "trace_event_id"}))
@@ -407,6 +447,10 @@ def main() -> int:
         "splendor.message.task_response.v1",
         "splendor.message.proposal_request.v1",
         "delivery_authority_granted",
+        "missing_message_tenant_scope",
+        "missing_message_run_scope",
+        "missing_message_agent_scope",
+        "message_ack_agent_not_recipient",
     ]
     for marker in required_message_markers:
         if marker not in text:
