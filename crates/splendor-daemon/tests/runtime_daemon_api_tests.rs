@@ -687,7 +687,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         trace_export["record_count"].as_u64(),
-        Some(traces.records.len() as u64)
+        Some(traces.records.len() as u64 + 1)
     );
     assert!(trace_export["integrity_hash"]
         .as_str()

@@ -256,6 +256,48 @@ S6_DENIED_SIMULATOR_LABELS = {
     "operator_wrong_scope_denied",
     "operator_expired_evidence_denied",
 }
+S7_REQUIRED_OPERATIONS = {
+    "registerNode",
+    "registerInstance",
+    "heartbeatNode",
+    "advertiseCapabilities",
+    "evaluatePlacement",
+    "submitWorkOrder",
+    "dispatchWorkOrder",
+    "sendMessage",
+    "getMessage",
+    "submitAction",
+    "requestApproval",
+    "grantApproval",
+    "getStateHead",
+    "exportTraces",
+    "replayRun",
+}
+S7_REQUIRED_NEGATIVES = {
+    "specialist_tenant_b_data_ref_denied_before_adapter",
+    "manager_credential_as_action_permission_denied",
+    "message_payload_data_ref_permission_smuggling_denied",
+    "trace_export_without_redaction_policy_rejected",
+    "external_artifact_publish_without_approval_pauses",
+    "cross_tenant_replay_cannot_reveal_raw_payloads",
+    "artifact_path_collision_across_tenants_rejected",
+    "denied_data_and_artifact_actions_did_not_reach_adapter",
+}
+S7_REQUIRED_EVENTS = {
+    "work_order.accepted",
+    "data_scope.verified",
+    "data_scope.denied",
+    "message.sent",
+    "message.received",
+    "message.denied",
+    "artifact.created",
+    "artifact.publish.needs_approval",
+    "artifact.publish.executed",
+    "artifact.publish.denied",
+    "trace.exported.redacted",
+    "state.committed",
+    "replay.explained",
+}
 
 
 def utc_now() -> str:
@@ -1471,6 +1513,99 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S7"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "tenant-data-fixtures.json",
+        "work-order-validation.json",
+        "message-flow.json",
+        "artifact-report.json",
+        "data-scope-report.json",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s7_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s7_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s7_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s7_scenario_failure:{failure}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S7_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s7_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S7_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s7_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S7_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s7_negative_case_not_asserted:{case}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S7_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s7_missing_required_trace_events:" + ",".join(missing_events))
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_text = json.dumps(trace_records, sort_keys=True)
+    fixtures = read_json(artifact_dir / "tenant-data-fixtures.json")
+    protected = [
+        tenant.get("protected_raw_fixture", "")
+        for tenant in fixtures.get("tenants", {}).values()
+        if tenant.get("protected_raw_fixture")
+    ]
+    for raw in protected:
+        if raw in trace_text:
+            failures.append("s7_trace_export_contains_raw_protected_fixture")
+    artifact = read_json(artifact_dir / "artifact-report.json")
+    if artifact.get("publish_without_approval", {}).get("status") != "NeedsApproval":
+        failures.append("s7_publish_without_approval_not_paused")
+    if artifact.get("approved_publish", {}).get("status") != "Executed":
+        failures.append("s7_approved_publish_not_executed")
+    if artifact.get("collision", {}).get("status") != "Denied":
+        failures.append("s7_artifact_collision_not_denied")
+    data_scope = read_json(artifact_dir / "data-scope-report.json")
+    if data_scope.get("tenant_b_denial", {}).get("status") != "Denied":
+        failures.append("s7_tenant_b_data_ref_not_denied")
+    if data_scope.get("adapter_executions_before") != data_scope.get("adapter_executions_after"):
+        failures.append("s7_denied_data_or_artifact_reached_adapter")
+    message = read_json(artifact_dir / "message-flow.json")
+    if message.get("request", {}).get("delivery_status") != "delivered" or message.get("received", {}).get("receive_side_validated") is not True:
+        failures.append("s7_task_messages_not_delivered")
+    if message.get("smuggling_denial", {}).get("status") != 403:
+        failures.append("s7_smuggling_message_not_rejected")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("external_publish_replayed") is not False or replay.get("raw_payloads_absent") is not True:
+        failures.append("s7_replay_suppression_or_redaction_missing")
+    if replay.get("cross_tenant_replay", {}).get("status") != 403:
+        failures.append("s7_cross_tenant_replay_not_rejected")
+    audit = read_json(artifact_dir / "audit-report.json")
+    if not audit.get("in_scope_data_refs") or not audit.get("denied_data_refs"):
+        failures.append("s7_audit_missing_data_ref_scope_evidence")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "specialist_broad_permission_inheritance", "manager_credential_authorizes_action", "trace_export_without_redaction_allowed", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s7_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes") or not scenario.get("work_order_ids") or not scenario.get("message_ids") or not scenario.get("approval_ids"):
+        failures.append("s7_missing_identity_state_message_approval_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -1545,6 +1680,7 @@ def main() -> int:
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
     s5_scenario, s5_failures = load_s5_scenario(report_dir)
     s6_scenario, s6_failures = load_s6_scenario(report_dir)
+    s7_scenario, s7_failures = load_s7_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -1588,11 +1724,18 @@ def main() -> int:
         else:
             scenarios.append(s6_scenario)
             blocking.extend(s6_failures)
+    if args.scenario == "UC-E2E-S7" or args.mode == "all":
+        active_ids.add("UC-E2E-S7")
+        if s7_scenario is None:
+            blocking.append("missing_uc_e2e_s7_scenario_report")
+        else:
+            scenarios.append(s7_scenario)
+            blocking.extend(s7_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s6-physical-edge",
+        "suite_version": "0.1-s7-data-isolation-artifacts",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -1608,6 +1751,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S4",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S5",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S6",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S7",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -1641,7 +1785,8 @@ def main() -> int:
             "UC-E2E-S4 validates fleet dispatch through public manager and resident daemon HTTP APIs with same-image Splendor services.",
             "UC-E2E-S5 validates governance through public manager and daemon HTTP APIs without enterprise UI or direct governance-plane runtime mutation.",
             "UC-E2E-S6 validates physical/edge orchestration through public resident-edge daemon HTTP APIs without low-level robot control.",
-            "S7-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S7 validates data-local artifact and cross-tenant isolation through public manager and resident daemon HTTP APIs without enterprise data workspace UI.",
+            "S8-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],

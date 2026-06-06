@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
     AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
-    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
@@ -452,15 +452,168 @@ impl ActionAdapter for RecordingAdapter {
         }
         let execution = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
         let simulator = submit_device_sim_action(action, execution)?;
-        Ok(AdapterResult {
-            output: serde_json::json!({
+        let output = if action.action.name == "data.read_fixture" {
+            let data_ref = action
+                .action
+                .params
+                .get("data_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            serde_json::json!({
+                "adapter": "fixture-data-store",
+                "execution": execution,
+                "action": action.action.name,
+                "data_ref": data_ref,
+                "raw_payload_included": false,
+                "analysis_summary": "trace-safe aggregate analysis for scoped data ref",
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "data_ref": data_ref, "fixture": "uc-e2e-s7"})),
+            })
+        } else if action.action.name == "artifact.create_internal" {
+            let path = action
+                .action
+                .params
+                .get("artifact_path")
+                .or_else(|| action.action.params.get("artifact_ref"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("artifact://unknown");
+            serde_json::json!({
+                "adapter": "artifact-store",
+                "execution": execution,
+                "action": action.action.name,
+                "artifact_path": path,
+                "tenant_id": action.tenant_id,
+                "raw_payload_included": false,
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "artifact_path": path, "kind": "internal"})),
+            })
+        } else if action.action.name == "artifact.publish_external" {
+            serde_json::json!({
+                "adapter": "artifact-store",
+                "execution": execution,
+                "action": action.action.name,
+                "published": true,
+                "external_store": "fake-artifact-store",
+                "raw_payload_included": false,
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "action": action.action.name, "kind": "external_publish"})),
+            })
+        } else {
+            serde_json::json!({
                 "adapter": "daemon.recording",
                 "execution": execution,
                 "action": action.action.name,
                 "device_sim": simulator,
-            }),
+            })
+        };
+        Ok(AdapterResult {
+            output,
             satisfied_postconditions: action.action.postconditions.clone(),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DataArtifactBoundaryVerifier {
+    tenant_id: TenantId,
+    allowed_data_refs: Vec<String>,
+}
+
+impl DataArtifactBoundaryVerifier {
+    fn new(tenant_id: TenantId, allowed_data_refs: Vec<String>) -> Self {
+        Self {
+            tenant_id,
+            allowed_data_refs,
+        }
+    }
+
+    fn requested_data_refs(action: &ActionRequest) -> Vec<String> {
+        let mut refs = Vec::new();
+        if let Some(value) = action
+            .action
+            .params
+            .get("data_ref")
+            .and_then(serde_json::Value::as_str)
+        {
+            refs.push(value.to_string());
+        }
+        if let Some(values) = action
+            .action
+            .params
+            .get("data_refs")
+            .and_then(serde_json::Value::as_array)
+        {
+            refs.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+        refs
+    }
+}
+
+impl ResourceBoundaryVerifier for DataArtifactBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> splendor_types::VerificationResult {
+        let requested_refs = Self::requested_data_refs(action);
+        for data_ref in &requested_refs {
+            if !self
+                .allowed_data_refs
+                .iter()
+                .any(|allowed| allowed == data_ref)
+            {
+                return splendor_types::VerificationResult {
+                    allowed: false,
+                    reasons: vec!["data_scope_denied".to_string()],
+                    artifacts: serde_json::json!({
+                        "source": "data_scope_verifier",
+                        "reason_code": "data_scope_denied",
+                        "requested_data_ref": data_ref,
+                        "allowed_data_refs": self.allowed_data_refs,
+                    }),
+                };
+            }
+        }
+
+        if action.action.name.starts_with("artifact.") {
+            let tenant_id = self.tenant_id.to_string();
+            for field in ["artifact_path", "artifact_ref", "publish_ref"] {
+                if let Some(path) = action
+                    .action
+                    .params
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if path.starts_with("artifact://")
+                        && !path.starts_with(&format!("artifact://{tenant_id}/"))
+                    {
+                        return splendor_types::VerificationResult {
+                            allowed: false,
+                            reasons: vec!["artifact_path_tenant_mismatch".to_string()],
+                            artifacts: serde_json::json!({
+                                "source": "artifact_scope_verifier",
+                                "reason_code": "artifact_path_tenant_mismatch",
+                                "field": field,
+                                "artifact_path": path,
+                                "tenant_id": tenant_id,
+                            }),
+                        };
+                    }
+                }
+            }
+        }
+
+        splendor_types::VerificationResult {
+            allowed: true,
+            reasons: vec!["data_scope_verified".to_string()],
+            artifacts: serde_json::json!({
+                "source": "data_scope_verifier",
+                "reason_code": "data_scope_verified",
+                "data_refs": requested_refs,
+            }),
+        }
     }
 }
 
@@ -1309,6 +1462,10 @@ async fn create_run(
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
+    gateway.set_resource_boundary_verifier(Arc::new(DataArtifactBoundaryVerifier::new(
+        request.tenant_id.clone(),
+        validated_work_order.data_refs.clone(),
+    )));
     if !request.approval_policies.is_empty() {
         gateway.set_approval_verifier(Arc::new(PolicyApprovalVerifier::new(
             request.approval_policies.clone(),
@@ -2064,7 +2221,7 @@ async fn export_traces(
         request.credential.as_ref(),
         request.audit_attribution.as_ref(),
     )?;
-    state.validate_security(
+    let security = state.validate_security(
         DaemonEndpoint::TraceRead {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
@@ -2073,6 +2230,11 @@ async fn export_traces(
         request.credential,
         None,
         request.audit_attribution,
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.traces.export.redacted",
+        security.audit_attribution,
     )?;
     let records = match (request.start, request.end) {
         (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
@@ -2109,13 +2271,13 @@ async fn replay_run(
             "local daemon replay is inspect-only and must not allow side effects",
         ));
     }
-    let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
-    let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     require_post_audit_attribution(
         request.credential.as_ref(),
         request.audit_attribution.as_ref(),
     )?;
-    state.validate_security(
+    let security = state.validate_security(
         DaemonEndpoint::ReplayCreate {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
@@ -2123,6 +2285,11 @@ async fn replay_run(
         request.credential,
         None,
         request.audit_attribution,
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.replay.explained",
+        security.audit_attribution,
     )?;
     let records = slot
         .trace_store
@@ -3717,6 +3884,16 @@ fn trace_export_integrity_hash(records: &[TraceRecord]) -> String {
         .map(|record| record.event_hash.to_string())
         .unwrap_or_else(|| "empty".to_string());
     format!("trace-chain:v1:{}:{last_event_hash}", records.len())
+}
+
+fn stable_json_hash(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv64:{hash:016x}")
 }
 
 fn trace_error(error: TraceStoreError) -> ApiError {

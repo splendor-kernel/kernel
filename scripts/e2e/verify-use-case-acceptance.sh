@@ -10,9 +10,9 @@ REUSE_BUILD=0
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--scenario UC-E2E-S5|--scenario UC-E2E-S6|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
+Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--scenario UC-E2E-S5|--scenario UC-E2E-S6|--scenario UC-E2E-S7|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
-S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4 is the fleet dispatch acceptance gate. S5 is the governance acceptance gate. S6 is the physical/edge safety acceptance gate. S7-S10 intentionally report blocked/not-yet-covered until implemented.
+S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4 is the fleet dispatch acceptance gate. S5 is the governance acceptance gate. S6 is the physical/edge safety acceptance gate. S7 is the data-local isolation/artifact gate. S8-S10 intentionally report blocked/not-yet-covered until implemented.
 USAGE
 }
 
@@ -32,7 +32,7 @@ done
 if [[ "${MODE}" == "scenario" && -z "${SCENARIO}" ]]; then
   SCENARIO="UC-E2E-S0"
 fi
-if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" && "${SCENARIO}" != "UC-E2E-S4" && "${SCENARIO}" != "UC-E2E-S5" && "${SCENARIO}" != "UC-E2E-S6" ]]; then
+if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" && "${SCENARIO}" != "UC-E2E-S4" && "${SCENARIO}" != "UC-E2E-S5" && "${SCENARIO}" != "UC-E2E-S6" && "${SCENARIO}" != "UC-E2E-S7" ]]; then
   echo "${SCENARIO} is not implemented; use --all to report future scenarios as blocked." >&2
   exit 2
 fi
@@ -140,6 +140,13 @@ case "${MODE}" in
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
         --edge-url "${SPLENDOR_EDGE_NODE_URL:-http://resident-edge-node:8093}"
+    fi
+    if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S7" ) || "${MODE}" == "all" ]]; then
+      python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s7_data_isolation_artifacts/run.py" \
+        --root "${ROOT_DIR}" \
+        --report-dir "${REPORT_DIR}" \
+        --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
+        --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}"
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \
