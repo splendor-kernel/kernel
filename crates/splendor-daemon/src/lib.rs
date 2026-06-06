@@ -268,6 +268,7 @@ struct RunSlot {
     percept_queue: PerceptQueue,
     allowed_percept_schemas: Vec<String>,
     allowed_percept_sources: Vec<String>,
+    allowed_actions: Vec<String>,
     state_head: Option<StateNodeId>,
     adapter_executions: Arc<AtomicU64>,
     approval_evidence: ApprovalEvidenceSlot,
@@ -1587,6 +1588,7 @@ async fn create_run(
         percept_queue,
         allowed_percept_schemas: request.allowed_percept_schemas,
         allowed_percept_sources: request.allowed_percept_sources,
+        allowed_actions: validated_work_order.allowed_actions.clone(),
         state_head: None,
         adapter_executions,
         approval_evidence,
@@ -2379,6 +2381,51 @@ async fn submit_action(
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.approval_evidence,
     };
+    if !slot
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed == &action_request.action.name)
+    {
+        let verification = splendor_types::VerificationResult {
+            allowed: false,
+            reasons: vec!["action_not_allowed".to_string()],
+            artifacts: serde_json::json!({
+                "context": {
+                    "source": "signed_work_order_action_scope",
+                    "tenant_id": action_request.tenant_id,
+                    "agent_id": action_request.agent_id,
+                    "run_id": action_request.run_id,
+                    "action_id": action_request.action_id,
+                    "action": action_request.action.name,
+                    "adapter": action_request.adapter,
+                }
+            }),
+        };
+        let outcome = ActionOutcome {
+            action_id: action_request.action_id,
+            status: ActionStatus::Denied,
+            verification,
+            post_verification: None,
+            output: None,
+            error: Some("action_not_allowed".to_string()),
+            completed_at: OffsetDateTime::now_utc(),
+        };
+        record_run_event(
+            slot,
+            TraceEventKind::ActionVerificationCompleted {
+                action: request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+        record_run_event(
+            slot,
+            TraceEventKind::ActionDenied {
+                action: request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+        return Ok(Json(outcome));
+    }
     let outcome = slot.gateway.submit(action_request).map_err(|error| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4642,6 +4689,7 @@ mod tests {
             percept_queue: PerceptQueue::default(),
             allowed_percept_schemas: Vec::new(),
             allowed_percept_sources: Vec::new(),
+            allowed_actions: Vec::new(),
             state_head: None,
             adapter_executions: Arc::new(AtomicU64::new(0)),
             approval_evidence: ApprovalEvidenceSlot::default(),

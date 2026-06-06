@@ -276,12 +276,14 @@ S7_REQUIRED_OPERATIONS = {
 S7_REQUIRED_NEGATIVES = {
     "specialist_tenant_b_data_ref_denied_before_adapter",
     "manager_credential_as_action_permission_denied",
+    "specialist_external_publish_denied_by_narrow_work_order",
     "message_payload_data_ref_permission_smuggling_denied",
     "trace_export_without_redaction_policy_rejected",
     "external_artifact_publish_without_approval_pauses",
     "cross_tenant_replay_cannot_reveal_raw_payloads",
     "artifact_path_collision_across_tenants_rejected",
     "denied_data_and_artifact_actions_did_not_reach_adapter",
+    "replay_did_not_reread_republish_or_rewrite_artifacts",
 }
 S7_REQUIRED_EVENTS = {
     "work_order.accepted",
@@ -1573,30 +1575,63 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if raw in trace_text:
             failures.append("s7_trace_export_contains_raw_protected_fixture")
     artifact = read_json(artifact_dir / "artifact-report.json")
+    internal = artifact.get("internal_artifact_evidence", {})
+    if artifact.get("internal_artifact", {}).get("status") != "Executed":
+        failures.append("s7_internal_artifact_not_executed")
+    if not internal.get("action_id") or not internal.get("artifact_path") or not internal.get("integrity") or not internal.get("tenant_id"):
+        failures.append("s7_internal_artifact_missing_identity_path_or_integrity")
+    elif not str(internal.get("artifact_path", "")).startswith(f"artifact://{internal.get('tenant_id')}/"):
+        failures.append("s7_internal_artifact_path_not_tenant_scoped")
     if artifact.get("publish_without_approval", {}).get("status") != "NeedsApproval":
         failures.append("s7_publish_without_approval_not_paused")
     if artifact.get("approved_publish", {}).get("status") != "Executed":
         failures.append("s7_approved_publish_not_executed")
+    if artifact.get("approved_publish", {}).get("action_id") != artifact.get("publish_without_approval", {}).get("action_id"):
+        failures.append("s7_approval_action_id_mismatch")
+    if not artifact.get("approved_publish_evidence", {}).get("integrity"):
+        failures.append("s7_approved_publish_missing_integrity")
     if artifact.get("collision", {}).get("status") != "Denied":
         failures.append("s7_artifact_collision_not_denied")
+    if artifact.get("specialist_publish_denial", {}).get("status") != "Denied":
+        failures.append("s7_specialist_publish_not_denied")
     data_scope = read_json(artifact_dir / "data-scope-report.json")
     if data_scope.get("tenant_b_denial", {}).get("status") != "Denied":
         failures.append("s7_tenant_b_data_ref_not_denied")
+    if data_scope.get("manager_permission_denial", {}).get("status") != 403:
+        failures.append("s7_manager_credential_did_not_fail_daemon_action_auth")
     if data_scope.get("adapter_executions_before") != data_scope.get("adapter_executions_after"):
         failures.append("s7_denied_data_or_artifact_reached_adapter")
     message = read_json(artifact_dir / "message-flow.json")
-    if message.get("request", {}).get("delivery_status") != "delivered" or message.get("received", {}).get("receive_side_validated") is not True:
+    if message.get("request", {}).get("delivery_status") != "delivered" or message.get("response", {}).get("delivery_status") != "delivered":
         failures.append("s7_task_messages_not_delivered")
+    request_send = message.get("request", {}).get("trace_event_id")
+    request_read = message.get("request_read", {}).get("read_trace_event_id")
+    response_send = message.get("response", {}).get("trace_event_id")
+    response_read = message.get("response_read", {}).get("read_trace_event_id")
+    if message.get("request_read", {}).get("receive_side_validated") is not True or message.get("response_read", {}).get("receive_side_validated") is not True:
+        failures.append("s7_task_messages_not_read_validated")
+    if not request_read or not response_read or request_read == request_send or response_read == response_send:
+        failures.append("s7_missing_explicit_distinct_receive_trace")
     if message.get("smuggling_denial", {}).get("status") != 403:
         failures.append("s7_smuggling_message_not_rejected")
+    work_orders = read_json(artifact_dir / "work-order-validation.json")
+    specialist = work_orders.get("specialist", {})
+    if "artifact.publish_external" in specialist.get("allowed_actions", []) or "artifact.publish_external" in specialist.get("allowed_permissions", []):
+        failures.append("s7_specialist_work_order_overbroad")
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("external_publish_replayed") is not False or replay.get("raw_payloads_absent") is not True:
         failures.append("s7_replay_suppression_or_redaction_missing")
+    if replay.get("adapter_executions_before_replay") != replay.get("adapter_executions_after_replay"):
+        failures.append("s7_replay_changed_adapter_execution_count")
     if replay.get("cross_tenant_replay", {}).get("status") != 403:
         failures.append("s7_cross_tenant_replay_not_rejected")
     audit = read_json(artifact_dir / "audit-report.json")
     if not audit.get("in_scope_data_refs") or not audit.get("denied_data_refs"):
         failures.append("s7_audit_missing_data_ref_scope_evidence")
+    if set(["message.sent", "message.received"]) - set(event_ids):
+        failures.append("s7_missing_message_trace_evidence")
+    elif set(event_ids.get("message.sent", [])) & set(event_ids.get("message.received", [])):
+        failures.append("s7_message_receive_trace_reuses_send_trace")
     anti = read_json(artifact_dir / "anti-drift-results.json")
     for key in ["private_helper_only_e2e", "gateway_bypass", "specialist_broad_permission_inheritance", "manager_credential_authorizes_action", "trace_export_without_redaction_allowed", "replay_side_effects_allowed_default"]:
         if anti.get(key) is not False:

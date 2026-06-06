@@ -14,11 +14,12 @@ use splendor_types::{
     select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
     CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CredentialAudience,
     CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus,
-    InstanceId, InstanceRegistration, InstanceTelemetry, MessageEnvelope, MessageId, NodeHeartbeat,
-    NodeId, NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
-    PlacementExecutionMode, PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope,
-    RevocationStatus, RunId, RunStatus, RunTelemetry, TelemetryRuntimeMode, TenantId,
-    TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    InstanceId, InstanceRegistration, InstanceTelemetry, Message, MessageEnvelope, MessageId,
+    NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
+    PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
+    PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus, RunTelemetry,
+    TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -320,6 +321,8 @@ pub struct MessageStatusReport {
     pub route_permission: Option<String>,
     pub remote_state_mutated: bool,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_trace_event_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1357,6 +1360,7 @@ async fn send_message(
         route_permission,
         remote_state_mutated: false,
         reason,
+        read_trace_event_id: None,
     };
     state
         .inner
@@ -1386,7 +1390,11 @@ fn validate_remote_message_authority(
             "remote message work order must bind a run id",
         )
     })?;
-    if message.run_id != *work_order_run_id {
+    let message_run_authorized = message.run_id == *work_order_run_id
+        || task_response_child_run_id(message)
+            .map(|child_run_id| child_run_id == work_order_run_id.to_string())
+            .unwrap_or(false);
+    if !message_run_authorized {
         return Err(ManagerApiError::forbidden(
             "message_run_mismatch",
             "message run_id does not match work-order authority",
@@ -1487,6 +1495,17 @@ fn message_payload_smuggles_authority(
     })
 }
 
+fn task_response_child_run_id(message: &Message) -> Option<&str> {
+    if message.schema == "splendor.message.task_response.v1" {
+        message
+            .payload
+            .get("child_run_id")
+            .and_then(serde_json::Value::as_str)
+    } else {
+        None
+    }
+}
+
 async fn get_message(
     Path(message_id): Path<MessageId>,
     State(state): State<ManagerState>,
@@ -1498,7 +1517,7 @@ async fn get_message(
         EndpointScope::MessagesRead,
         false,
     )?;
-    let report = state
+    let mut report = state
         .inner
         .messages
         .lock()
@@ -1506,6 +1525,24 @@ async fn get_message(
         .get(&message_id.to_string())
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
+    let read_trace_event_id = state.audit(
+        "remote_message.received",
+        serde_json::json!({
+            "message_id": message_id,
+            "delivery_trace_event_id": report.trace_event_id,
+            "work_order_id": report.work_order_id,
+            "delivery_status": report.delivery_status,
+            "receive_side_validated": report.receive_side_validated,
+            "remote_state_mutated": false,
+        }),
+    )?;
+    report.read_trace_event_id = Some(read_trace_event_id.clone());
+    state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .insert(message_id.to_string(), report.clone());
     Ok(Json(report))
 }
 
