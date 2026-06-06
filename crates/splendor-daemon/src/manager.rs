@@ -196,6 +196,16 @@ pub fn router(state: ManagerState) -> Router {
         .route("/fleet/traces/sync", post(sync_trace_buffer))
         .route("/messages", post(send_message))
         .route("/messages/:message_id/read", post(get_message))
+        .route("/messages/:message_id/ack", post(ack_message))
+        .route("/messages/:message_id/nack", post(nack_message))
+        .route("/agents/:agent_id/inbox", get(list_inbox))
+        .route("/agents/:agent_id/outbox", get(list_outbox))
+        .route(
+            "/runs/:run_id/messages/causal-graph",
+            get(get_message_causal_graph),
+        )
+        .route("/message-schemas", get(list_message_schemas))
+        .route("/message-schemas/validate", post(validate_message_schema))
         .route("/policies", post(publish_policy_bundle))
         .route("/policies/:policy_id/read", post(get_policy_status))
         .route("/policies/:policy_id/revoke", post(revoke_policy_bundle))
@@ -305,12 +315,22 @@ pub struct SendMessageRequest {
 pub struct ManagerReadRequest {
     #[serde(flatten)]
     pub security: ManagerSecurityFields,
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageStatusReport {
     pub message_id: MessageId,
     pub work_order_id: String,
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub schema: String,
+    pub causal_parent: Option<String>,
     pub delivery_status: String,
     pub trace_event_id: String,
     pub duplicate: bool,
@@ -325,6 +345,103 @@ pub struct MessageStatusReport {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_trace_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_trace_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nack_trace_event_id: Option<String>,
+    pub payload_preserved: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageDeliveryUpdateRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub payload_patch: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageListResponse {
+    pub agent_id: AgentId,
+    pub direction: String,
+    pub tenant_id: Option<TenantId>,
+    pub messages: Vec<MessageStatusReport>,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageCausalGraphNode {
+    pub message_id: MessageId,
+    pub work_order_id: String,
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub schema: String,
+    pub delivery_status: String,
+    pub trace_event_id: String,
+    pub causal_parent: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageCausalGraphEdge {
+    pub from_trace_event_id: String,
+    pub to_message_id: MessageId,
+    pub to_trace_event_id: String,
+    pub from_message_id: Option<MessageId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageCausalGraphResponse {
+    pub run_id: RunId,
+    pub tenant_id: Option<TenantId>,
+    pub nodes: Vec<MessageCausalGraphNode>,
+    pub edges: Vec<MessageCausalGraphEdge>,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSchemaValidationRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    #[serde(default)]
+    pub message_envelope: Option<MessageEnvelope>,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSchemaValidationReport {
+    pub valid: bool,
+    pub supported: bool,
+    pub schema: String,
+    pub schema_version: Option<String>,
+    pub reason: Option<String>,
+    pub delivery_authority_granted: bool,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupportedMessageSchema {
+    pub schema: String,
+    pub version: String,
+    pub description: String,
+    pub delivery_authority_granted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSchemaListResponse {
+    pub schemas: Vec<SupportedMessageSchema>,
+    pub delivery_authority_granted: bool,
+    pub trace_event_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1288,6 +1405,96 @@ async fn sync_trace_buffer(
     Ok(Json(report))
 }
 
+fn supported_message_schemas() -> Vec<SupportedMessageSchema> {
+    vec![
+        SupportedMessageSchema {
+            schema: "splendor.message.task_request.v1".to_string(),
+            version: "v1".to_string(),
+            description: "Scoped task/delegation request between agents".to_string(),
+            delivery_authority_granted: false,
+        },
+        SupportedMessageSchema {
+            schema: "splendor.message.task_response.v1".to_string(),
+            version: "v1".to_string(),
+            description: "Scoped task/delegation response between agents".to_string(),
+            delivery_authority_granted: false,
+        },
+        SupportedMessageSchema {
+            schema: "splendor.message.proposal_request.v1".to_string(),
+            version: "v1".to_string(),
+            description: "Non-authoritative remote proposal request".to_string(),
+            delivery_authority_granted: false,
+        },
+    ]
+}
+
+fn is_supported_message_schema(schema: &str) -> bool {
+    supported_message_schemas()
+        .iter()
+        .any(|supported| supported.schema == schema)
+}
+
+fn ensure_supported_message_schema(schema: &str) -> Result<(), ManagerApiError> {
+    if is_supported_message_schema(schema) {
+        Ok(())
+    } else {
+        Err(ManagerApiError::bad_request(
+            "unsupported_message_schema",
+            "manager transport only accepts stable proposal/task message schemas",
+        ))
+    }
+}
+
+fn ensure_message_visibility(
+    report: &MessageStatusReport,
+    tenant_id: Option<&TenantId>,
+    agent_id: Option<&AgentId>,
+) -> Result<(), ManagerApiError> {
+    if let Some(tenant_id) = tenant_id {
+        if tenant_id != &report.tenant_id {
+            return Err(ManagerApiError::forbidden(
+                "cross_tenant_message_read_denied",
+                "message tenant does not match requested tenant scope",
+            ));
+        }
+    }
+    if let Some(agent_id) = agent_id {
+        if agent_id != &report.source_agent_id && agent_id != &report.target_agent_id {
+            return Err(ManagerApiError::forbidden(
+                "message_agent_scope_denied",
+                "message is outside requested agent scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_message_update_scope(
+    report: &MessageStatusReport,
+    request: &MessageDeliveryUpdateRequest,
+) -> Result<(), ManagerApiError> {
+    if request.payload.is_some() || request.payload_patch.is_some() {
+        return Err(ManagerApiError::bad_request(
+            "message_payload_mutation_forbidden",
+            "ack/nack records delivery metadata only and cannot mutate message payload",
+        ));
+    }
+    ensure_message_visibility(
+        report,
+        request.tenant_id.as_ref(),
+        request.agent_id.as_ref(),
+    )?;
+    if let Some(agent_id) = &request.agent_id {
+        if agent_id != &report.target_agent_id {
+            return Err(ManagerApiError::forbidden(
+                "message_ack_agent_not_recipient",
+                "ack/nack must be scoped to the target agent when an agent scope is supplied",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn send_message(
     State(state): State<ManagerState>,
     Json(request): Json<SendMessageRequest>,
@@ -1314,20 +1521,12 @@ async fn send_message(
             "remote message requires an explicit idempotency marker",
         ));
     }
-    if !matches!(
-        request.message_envelope.message.schema.as_str(),
-        "splendor.message.proposal_request.v1"
-            | "splendor.message.task_request.v1"
-            | "splendor.message.task_response.v1"
-    ) {
+    if let Err(error) = ensure_supported_message_schema(&request.message_envelope.message.schema) {
         state.audit(
             "remote_message.rejected",
             serde_json::json!({"message_id": request.message_envelope.message.message_id, "reason": "unsupported_message_schema", "schema": request.message_envelope.message.schema}),
         )?;
-        return Err(ManagerApiError::bad_request(
-            "unsupported_message_schema",
-            "manager transport only accepts stable proposal/task message schemas",
-        ));
+        return Err(error);
     }
     let source_instance = InstanceId::parse(&request.source_instance_id)
         .map_err(|e| ManagerApiError::bad_request("invalid_source_instance", e.to_string()))?;
@@ -1400,11 +1599,27 @@ async fn send_message(
                     "message idempotency index is stale",
                 )
             })?;
-        let trace_event_id = state.audit("remote_message.duplicate", serde_json::json!({"message_id": message_id, "existing_message_id": existing_message_id, "idempotency_key": idempotency_key}))?;
+        let trace_event_id = state.audit("remote_message.duplicate", serde_json::json!({"message_id": message_id, "existing_message_id": existing_message_id, "idempotency_key": idempotency_key, "remote_state_mutated": false}))?;
         let mut duplicate = existing;
         duplicate.trace_event_id = trace_event_id;
         duplicate.duplicate = true;
-        duplicate.message_id = message_id;
+        duplicate.message_id = message_id.clone();
+        duplicate.run_id = request.message_envelope.message.run_id.clone();
+        duplicate.source_agent_id = request.message_envelope.message.source_agent_id.clone();
+        duplicate.target_agent_id = request.message_envelope.message.target_agent_id.clone();
+        duplicate.schema = request.message_envelope.message.schema.clone();
+        duplicate.causal_parent = request
+            .message_envelope
+            .message
+            .causal_parent
+            .as_ref()
+            .map(ToString::to_string);
+        state
+            .inner
+            .messages
+            .lock()
+            .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+            .insert(message_id.to_string(), duplicate.clone());
         return Ok(Json(duplicate));
     }
     let mut messages = state
@@ -1424,6 +1639,17 @@ async fn send_message(
     let report = MessageStatusReport {
         message_id: message_id.clone(),
         work_order_id: request.work_order_id,
+        tenant_id: work_order.work_order.tenant_id.clone(),
+        run_id: request.message_envelope.message.run_id.clone(),
+        source_agent_id: request.message_envelope.message.source_agent_id.clone(),
+        target_agent_id: request.message_envelope.message.target_agent_id.clone(),
+        schema: request.message_envelope.message.schema.clone(),
+        causal_parent: request
+            .message_envelope
+            .message
+            .causal_parent
+            .as_ref()
+            .map(ToString::to_string),
         delivery_status: status,
         trace_event_id,
         duplicate: false,
@@ -1437,6 +1663,9 @@ async fn send_message(
         remote_state_mutated: false,
         reason,
         read_trace_event_id: None,
+        ack_trace_event_id: None,
+        nack_trace_event_id: None,
+        payload_preserved: true,
     };
     state
         .inner
@@ -1601,12 +1830,21 @@ async fn get_message(
         .get(&message_id.to_string())
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
+    ensure_message_visibility(
+        &report,
+        request.tenant_id.as_ref(),
+        request.agent_id.as_ref(),
+    )?;
     let read_trace_event_id = state.audit(
         "remote_message.received",
         serde_json::json!({
             "message_id": message_id,
             "delivery_trace_event_id": report.trace_event_id,
             "work_order_id": report.work_order_id,
+            "tenant_id": report.tenant_id,
+            "run_id": report.run_id,
+            "source_agent_id": report.source_agent_id,
+            "target_agent_id": report.target_agent_id,
             "delivery_status": report.delivery_status,
             "receive_side_validated": report.receive_side_validated,
             "remote_state_mutated": false,
@@ -1620,6 +1858,376 @@ async fn get_message(
         .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
         .insert(message_id.to_string(), report.clone());
     Ok(Json(report))
+}
+
+async fn ack_message(
+    Path(message_id): Path<MessageId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<MessageDeliveryUpdateRequest>,
+) -> Result<Json<MessageStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesSend,
+        true,
+    )?;
+    let mut report = state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .get(&message_id.to_string())
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
+    ensure_message_update_scope(&report, &request)?;
+    let trace_event_id = state.audit(
+        "message.acknowledged",
+        serde_json::json!({
+            "message_id": message_id,
+            "work_order_id": report.work_order_id,
+            "tenant_id": report.tenant_id,
+            "run_id": report.run_id,
+            "target_agent_id": report.target_agent_id,
+            "reason": request.reason,
+            "payload_preserved": true,
+            "remote_state_mutated": false,
+            "authority_granted": false,
+        }),
+    )?;
+    report.delivery_status = "consumed".to_string();
+    report.ack_trace_event_id = Some(trace_event_id);
+    report.payload_preserved = true;
+    state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .insert(message_id.to_string(), report.clone());
+    Ok(Json(report))
+}
+
+async fn nack_message(
+    Path(message_id): Path<MessageId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<MessageDeliveryUpdateRequest>,
+) -> Result<Json<MessageStatusReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesSend,
+        true,
+    )?;
+    let mut report = state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .get(&message_id.to_string())
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
+    ensure_message_update_scope(&report, &request)?;
+    let trace_event_id = state.audit(
+        "message.nacked",
+        serde_json::json!({
+            "message_id": message_id,
+            "work_order_id": report.work_order_id,
+            "tenant_id": report.tenant_id,
+            "run_id": report.run_id,
+            "target_agent_id": report.target_agent_id,
+            "reason": request.reason,
+            "payload_preserved": true,
+            "remote_state_mutated": false,
+            "authority_granted": false,
+        }),
+    )?;
+    report.delivery_status = "failed".to_string();
+    report.nack_trace_event_id = Some(trace_event_id);
+    report.payload_preserved = true;
+    if report.reason.is_none() {
+        report.reason = request.reason;
+    }
+    state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .insert(message_id.to_string(), report.clone());
+    Ok(Json(report))
+}
+
+async fn list_inbox(
+    Path(agent_id): Path<AgentId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
+) -> Result<Json<MessageListResponse>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
+    if request
+        .agent_id
+        .as_ref()
+        .is_some_and(|requested| requested != &agent_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            "inbox request agent does not match path agent",
+        ));
+    }
+    let messages = state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .values()
+        .filter(|report| report.target_agent_id == agent_id)
+        .filter(|report| {
+            request
+                .tenant_id
+                .as_ref()
+                .map(|tenant_id| tenant_id == &report.tenant_id)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_event_id = state.audit(
+        "message.inbox.listed",
+        serde_json::json!({
+            "agent_id": agent_id,
+            "tenant_id": request.tenant_id,
+            "message_count": messages.len(),
+            "authority_granted": false,
+        }),
+    )?;
+    Ok(Json(MessageListResponse {
+        agent_id,
+        direction: "inbox".to_string(),
+        tenant_id: request.tenant_id,
+        messages,
+        trace_event_id,
+    }))
+}
+
+async fn list_outbox(
+    Path(agent_id): Path<AgentId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
+) -> Result<Json<MessageListResponse>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
+    if request
+        .agent_id
+        .as_ref()
+        .is_some_and(|requested| requested != &agent_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "message_agent_scope_denied",
+            "outbox request agent does not match path agent",
+        ));
+    }
+    let messages = state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .values()
+        .filter(|report| report.source_agent_id == agent_id)
+        .filter(|report| {
+            request
+                .tenant_id
+                .as_ref()
+                .map(|tenant_id| tenant_id == &report.tenant_id)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_event_id = state.audit(
+        "message.outbox.listed",
+        serde_json::json!({
+            "agent_id": agent_id,
+            "tenant_id": request.tenant_id,
+            "message_count": messages.len(),
+            "authority_granted": false,
+        }),
+    )?;
+    Ok(Json(MessageListResponse {
+        agent_id,
+        direction: "outbox".to_string(),
+        tenant_id: request.tenant_id,
+        messages,
+        trace_event_id,
+    }))
+}
+
+async fn get_message_causal_graph(
+    Path(run_id): Path<RunId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
+) -> Result<Json<MessageCausalGraphResponse>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
+    let reports = state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .values()
+        .filter(|report| report.run_id == run_id)
+        .filter(|report| {
+            request
+                .tenant_id
+                .as_ref()
+                .map(|tenant_id| tenant_id == &report.tenant_id)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_to_message = reports
+        .iter()
+        .map(|report| (report.trace_event_id.clone(), report.message_id.clone()))
+        .collect::<HashMap<_, _>>();
+    let nodes = reports
+        .iter()
+        .map(|report| MessageCausalGraphNode {
+            message_id: report.message_id.clone(),
+            work_order_id: report.work_order_id.clone(),
+            source_agent_id: report.source_agent_id.clone(),
+            target_agent_id: report.target_agent_id.clone(),
+            schema: report.schema.clone(),
+            delivery_status: report.delivery_status.clone(),
+            trace_event_id: report.trace_event_id.clone(),
+            causal_parent: report.causal_parent.clone(),
+        })
+        .collect::<Vec<_>>();
+    let edges = reports
+        .iter()
+        .filter_map(|report| {
+            report
+                .causal_parent
+                .as_ref()
+                .map(|parent| MessageCausalGraphEdge {
+                    from_trace_event_id: parent.clone(),
+                    to_message_id: report.message_id.clone(),
+                    to_trace_event_id: report.trace_event_id.clone(),
+                    from_message_id: trace_to_message.get(parent).cloned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let trace_event_id = state.audit(
+        "message.causal_graph.read",
+        serde_json::json!({
+            "run_id": run_id,
+            "tenant_id": request.tenant_id,
+            "node_count": nodes.len(),
+            "edge_count": edges.len(),
+            "authority_granted": false,
+        }),
+    )?;
+    Ok(Json(MessageCausalGraphResponse {
+        run_id,
+        tenant_id: request.tenant_id,
+        nodes,
+        edges,
+        trace_event_id,
+    }))
+}
+
+async fn list_message_schemas(
+    State(state): State<ManagerState>,
+    Json(request): Json<ManagerReadRequest>,
+) -> Result<Json<MessageSchemaListResponse>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
+    let trace_event_id = state.audit(
+        "message.schemas.listed",
+        serde_json::json!({"schema_count": supported_message_schemas().len(), "authority_granted": false}),
+    )?;
+    Ok(Json(MessageSchemaListResponse {
+        schemas: supported_message_schemas(),
+        delivery_authority_granted: false,
+        trace_event_id,
+    }))
+}
+
+async fn validate_message_schema(
+    State(state): State<ManagerState>,
+    Json(request): Json<MessageSchemaValidationRequest>,
+) -> Result<Json<MessageSchemaValidationReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::MessagesRead,
+        false,
+    )?;
+    let (schema, validation_result) = if let Some(envelope) = request.message_envelope {
+        let schema = envelope.message.schema.clone();
+        let result = envelope
+            .validate()
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                ensure_supported_message_schema(&schema).map_err(|error| error.body.message)
+            });
+        (schema, result)
+    } else if let Some(schema) = request.schema {
+        let result = splendor_types::MessageSchemaVersion::from_schema(&schema)
+            .map_err(|error| error.to_string())
+            .and_then(|_| {
+                ensure_supported_message_schema(&schema).map_err(|error| error.body.message)
+            });
+        if request
+            .payload
+            .as_ref()
+            .is_some_and(serde_json::Value::is_null)
+        {
+            (schema, Err("message payload is required".to_string()))
+        } else {
+            (schema, result)
+        }
+    } else {
+        return Err(ManagerApiError::bad_request(
+            "missing_message_schema",
+            "schema validation requires a message_envelope or schema field",
+        ));
+    };
+    let valid = validation_result.is_ok();
+    let reason = validation_result.err();
+    let schema_version = splendor_types::MessageSchemaVersion::from_schema(&schema)
+        .ok()
+        .map(|version| version.suffix().to_string());
+    let supported = is_supported_message_schema(&schema);
+    let trace_event_id = state.audit(
+        "message.schema_validated",
+        serde_json::json!({
+            "schema": schema,
+            "valid": valid,
+            "supported": supported,
+            "reason": reason,
+            "delivery_authority_granted": false,
+        }),
+    )?;
+    Ok(Json(MessageSchemaValidationReport {
+        valid,
+        supported,
+        schema,
+        schema_version,
+        reason,
+        delivery_authority_granted: false,
+        trace_event_id,
+    }))
 }
 
 async fn publish_policy_bundle(
@@ -3024,6 +3632,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -3036,6 +3646,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -3467,6 +4079,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -3760,6 +4374,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_public_api_handlers_fail_closed_and_preserve_payload() {
+        let state = ManagerState::local_acceptance();
+        let read_security = manager_security(&state, vec![EndpointScope::MessagesRead]);
+        let send_security = manager_security(&state, vec![EndpointScope::MessagesSend]);
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let other_tenant = TenantId::parse("99999999-9999-4999-8999-999999999999").expect("tenant");
+        let source_agent = AgentId::parse("22222222-2222-4222-8222-222222222222").expect("source");
+        let target_agent = AgentId::parse("33333333-3333-4333-8333-333333333333").expect("target");
+        let run_id = RunId::parse("44444444-4444-4444-8444-444444444444").expect("run");
+        let message_id = MessageId::parse("55555555-5555-4555-8555-555555555554").expect("message");
+        let response_message_id =
+            MessageId::parse("55555555-5555-4555-8555-555555555555").expect("message");
+        let delivery_trace_event_id = uuid::Uuid::new_v4().to_string();
+        let response_trace_event_id = uuid::Uuid::new_v4().to_string();
+        state.inner.messages.lock().expect("message lock").insert(
+            message_id.to_string(),
+            MessageStatusReport {
+                message_id: message_id.clone(),
+                work_order_id: "wo_message_public_api".to_string(),
+                tenant_id: tenant_id.clone(),
+                run_id: run_id.clone(),
+                source_agent_id: source_agent.clone(),
+                target_agent_id: target_agent.clone(),
+                schema: "splendor.message.task_request.v1".to_string(),
+                causal_parent: None,
+                delivery_status: "delivered".to_string(),
+                trace_event_id: delivery_trace_event_id.clone(),
+                duplicate: false,
+                idempotency_key: Some("message-public-api-once".to_string()),
+                source_instance_id: "00000000-0000-4000-8000-000000000302".to_string(),
+                target_instance_id: "00000000-0000-4000-8000-000000000304".to_string(),
+                recipient_validated: true,
+                receive_side_validated: true,
+                work_order_authority_validated: true,
+                route_permission: Some(format!("message.remote.proposal:{target_agent}")),
+                remote_state_mutated: false,
+                reason: None,
+                read_trace_event_id: None,
+                ack_trace_event_id: None,
+                nack_trace_event_id: None,
+                payload_preserved: true,
+            },
+        );
+        state.inner.messages.lock().expect("message lock").insert(
+            response_message_id.to_string(),
+            MessageStatusReport {
+                message_id: response_message_id.clone(),
+                work_order_id: "wo_message_public_api".to_string(),
+                tenant_id: tenant_id.clone(),
+                run_id: run_id.clone(),
+                source_agent_id: target_agent.clone(),
+                target_agent_id: source_agent.clone(),
+                schema: "splendor.message.task_response.v1".to_string(),
+                causal_parent: Some(delivery_trace_event_id.clone()),
+                delivery_status: "delivered".to_string(),
+                trace_event_id: response_trace_event_id,
+                duplicate: false,
+                idempotency_key: Some("message-public-api-response-once".to_string()),
+                source_instance_id: "00000000-0000-4000-8000-000000000304".to_string(),
+                target_instance_id: "00000000-0000-4000-8000-000000000302".to_string(),
+                recipient_validated: true,
+                receive_side_validated: true,
+                work_order_authority_validated: true,
+                route_permission: Some(format!("message.remote.proposal:{source_agent}")),
+                remote_state_mutated: false,
+                reason: None,
+                read_trace_event_id: None,
+                ack_trace_event_id: None,
+                nack_trace_event_id: None,
+                payload_preserved: true,
+            },
+        );
+
+        let schemas = list_message_schemas(
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: read_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: None,
+            }),
+        )
+        .await
+        .expect("schema list reads")
+        .0;
+        assert!(!schemas.delivery_authority_granted);
+        assert!(schemas
+            .schemas
+            .iter()
+            .any(|schema| schema.schema == "splendor.message.task_request.v1"));
+
+        let envelope: MessageEnvelope = serde_json::from_value(serde_json::json!({
+            "message": {
+                "message_id": message_id,
+                "source_agent_id": source_agent,
+                "target_agent_id": target_agent,
+                "run_id": run_id,
+                "schema": "splendor.message.proposal_request.v1",
+                "payload": {"task": "unit public message API"},
+                "causal_parent": null,
+                "requires_response": true,
+                "created_at": now_rfc3339()
+            },
+            "schema_version": "v1",
+            "delivery_status": "pending",
+            "trace_links": {}
+        }))
+        .expect("message envelope parses");
+        let validation = validate_message_schema(
+            State(state.clone()),
+            Json(MessageSchemaValidationRequest {
+                security: read_security.clone(),
+                message_envelope: Some(envelope),
+                schema: None,
+                payload: None,
+            }),
+        )
+        .await
+        .expect("supported schema validates")
+        .0;
+        assert!(validation.valid);
+        assert!(!validation.delivery_authority_granted);
+
+        let unsupported = validate_message_schema(
+            State(state.clone()),
+            Json(MessageSchemaValidationRequest {
+                security: read_security.clone(),
+                message_envelope: None,
+                schema: Some("splendor.message.unsupported.v2".to_string()),
+                payload: Some(serde_json::json!({"unsupported": true})),
+            }),
+        )
+        .await
+        .expect("unsupported schema reports validation failure")
+        .0;
+        assert!(!unsupported.valid);
+        assert!(!unsupported.supported);
+
+        let cross_tenant = get_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: read_security.clone(),
+                tenant_id: Some(other_tenant),
+                agent_id: None,
+            }),
+        )
+        .await
+        .expect_err("cross-tenant read denied");
+        assert_eq!(cross_tenant.body.code, "cross_tenant_message_read_denied");
+
+        let missing_send_scope = ack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(MessageDeliveryUpdateRequest {
+                security: read_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(target_agent.clone()),
+                reason: Some("missing send scope".to_string()),
+                payload: None,
+                payload_patch: None,
+            }),
+        )
+        .await
+        .expect_err("ack requires messages_send scope");
+        assert_eq!(missing_send_scope.body.code, "missing_scope");
+
+        let payload_mutation = nack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(MessageDeliveryUpdateRequest {
+                security: send_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(target_agent.clone()),
+                reason: Some("payload mutation attempt".to_string()),
+                payload: Some(serde_json::json!({"mutated": true})),
+                payload_patch: None,
+            }),
+        )
+        .await
+        .expect_err("nack cannot mutate payload");
+        assert_eq!(
+            payload_mutation.body.code,
+            "message_payload_mutation_forbidden"
+        );
+
+        let acked = ack_message(
+            Path(message_id.clone()),
+            State(state.clone()),
+            Json(MessageDeliveryUpdateRequest {
+                security: send_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(target_agent.clone()),
+                reason: Some("target consumed message".to_string()),
+                payload: None,
+                payload_patch: None,
+            }),
+        )
+        .await
+        .expect("ack records delivery status only")
+        .0;
+        assert_eq!(acked.delivery_status, "consumed");
+        assert!(acked.payload_preserved);
+        assert!(acked.ack_trace_event_id.is_some());
+
+        let inbox = list_inbox(
+            Path(target_agent.clone()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: read_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(target_agent.clone()),
+            }),
+        )
+        .await
+        .expect("inbox read")
+        .0;
+        assert_eq!(inbox.messages.len(), 1);
+        let outbox = list_outbox(
+            Path(source_agent.clone()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: read_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(source_agent.clone()),
+            }),
+        )
+        .await
+        .expect("outbox read")
+        .0;
+        assert_eq!(outbox.messages.len(), 1);
+        let agent_mismatch = list_inbox(
+            Path(target_agent.clone()),
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security: read_security.clone(),
+                tenant_id: Some(tenant_id.clone()),
+                agent_id: Some(source_agent),
+            }),
+        )
+        .await
+        .expect_err("path/request agent mismatch denied");
+        assert_eq!(agent_mismatch.body.code, "message_agent_scope_denied");
+
+        let graph = get_message_causal_graph(
+            Path(run_id),
+            State(state),
+            Json(ManagerReadRequest {
+                security: read_security,
+                tenant_id: Some(tenant_id),
+                agent_id: None,
+            }),
+        )
+        .await
+        .expect("causal graph reads")
+        .0;
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from_message_id.as_ref(), Some(&message_id));
+    }
+
+    #[tokio::test]
     async fn manager_handlers_enforce_s4_security_authority_and_audit_paths() {
         let state = ManagerState::local_acceptance();
         let all_scopes = vec![
@@ -3820,6 +4695,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -3976,6 +4853,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -4000,14 +4879,23 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
         .expect("telemetry read");
         assert_eq!(telemetry.0.authority, TelemetryAuthority::ObservationalOnly);
-        let audit = audit_events(State(state.clone()), Json(ManagerReadRequest { security }))
-            .await
-            .expect("audit read");
+        let audit = audit_events(
+            State(state.clone()),
+            Json(ManagerReadRequest {
+                security,
+                tenant_id: None,
+                agent_id: None,
+            }),
+        )
+        .await
+        .expect("audit read");
         assert!(audit
             .0
             .iter()
@@ -4042,6 +4930,8 @@ mod tests {
             State(state.clone()),
             Json(ManagerReadRequest {
                 security: missing_audit,
+                tenant_id: None,
+                agent_id: None,
             }),
         )
         .await
@@ -4179,7 +5069,11 @@ mod tests {
         let missing_message = get_message(
             Path(MessageId::parse("55555555-5555-4555-8555-555555555554").expect("message")),
             State(state),
-            Json(ManagerReadRequest { security }),
+            Json(ManagerReadRequest {
+                security,
+                tenant_id: None,
+                agent_id: None,
+            }),
         )
         .await
         .expect_err("missing message rejected");
@@ -4265,6 +5159,8 @@ mod tests {
             Some(
                 serde_json::to_value(ManagerReadRequest {
                     security: security.clone(),
+                    tenant_id: None,
+                    agent_id: None,
                 })
                 .expect("telemetry request"),
             ),

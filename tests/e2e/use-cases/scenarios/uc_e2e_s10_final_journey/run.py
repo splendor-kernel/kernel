@@ -75,6 +75,9 @@ REQUIRED_NEGATIVES = {
     "unauthorized_data_ref_denied",
     "specialist_permission_escalation_denied",
     "remote_duplicate_not_double_applied",
+    "unsupported_message_schema_validation_rejected",
+    "cross_tenant_message_read_rejected",
+    "ack_nack_scope_or_payload_mutation_denied",
     "raw_physical_control_rejected",
     "expired_approval_rejected",
     "circuit_breaker_blocks_matching_publish_attempt",
@@ -90,6 +93,7 @@ REQUIRED_POSITIVES = {
     "signed_work_order_accepted_and_placed_on_vpc",
     "data_local_analysis_executed",
     "shared_specialist_typed_response_delivered",
+    "message_public_api_surface_exercised",
     "cloud_helper_proposal_only",
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
@@ -1030,6 +1034,21 @@ def main() -> int:
     cloud_duplicate = typed_message(DUPLICATE_MESSAGE_ID, CLOUD_HELPER_AGENT, EDGE_AGENT, CLOUD_HELPER_RUN, "splendor.message.proposal_request.v1", cloud_proposal["message"]["payload"], dispatch_helper["body"].get("trace_event_id"), False)
     duplicate_delivery = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_CLOUD_HELPER, "message_envelope": cloud_duplicate, "source_instance_id": CLOUD_INSTANCE, "target_instance_id": EDGE_INSTANCE, "idempotency_key": "s10-cloud-helper-proposal", "simulate_failure": None})
     cloud_read = call("getMessage", "POST", args.manager_url, f"/messages/{CLOUD_MESSAGE_ID}/read", sec(manager))
+    message_read_scope = {**sec(manager), "tenant_id": TENANT_ID}
+    message_schemas = call("listMessageSchemas", "GET", args.manager_url, "/message-schemas", sec(manager))
+    schema_validation = call("validateMessageSchema", "POST", args.manager_url, "/message-schemas/validate", {**sec(manager), "message_envelope": task_request})
+    unsupported_schema_validation = call("validateMessageSchema", "POST", args.manager_url, "/message-schemas/validate", {**sec(manager), "schema": "splendor.message.unsupported.v2", "payload": {"unsupported": True}})
+    orchestrator_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{ORCH_AGENT}/outbox", message_read_scope)
+    specialist_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/inbox", message_read_scope)
+    specialist_outbox = call("listOutbox", "GET", args.manager_url, f"/agents/{SPECIALIST_AGENT}/outbox", message_read_scope)
+    edge_inbox = call("listInbox", "GET", args.manager_url, f"/agents/{EDGE_AGENT}/inbox", message_read_scope)
+    causal_graph = call("getMessageCausalGraph", "GET", args.manager_url, f"/runs/{ORCH_RUN}/messages/causal-graph", message_read_scope)
+    ack_task = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "reason": "specialist consumed scoped task request"})
+    ack_response = call("ackMessage", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/ack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "reason": "orchestrator consumed scoped task response"})
+    nack_duplicate = call("nackMessage", "POST", args.manager_url, f"/messages/{DUPLICATE_MESSAGE_ID}/nack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": EDGE_AGENT, "reason": "duplicate idempotency marker was not double-applied"})
+    cross_tenant_read = call("getMessageCrossTenant", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/read", {**sec(manager), "tenant_id": "11111111-1111-4111-8111-222222222222"})
+    ack_scope_failure = call("ackMessageScopeFailure", "POST", args.manager_url, f"/messages/{TASK_REQUEST_ID}/ack", {**sec(manager_credential(["messages_read"])), "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "reason": "missing send scope should fail closed"})
+    nack_payload_mutation_denial = call("nackMessagePayloadMutationDenied", "POST", args.manager_url, f"/messages/{TASK_RESPONSE_ID}/nack", {**sec(manager), "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "reason": "payload mutation attempt must be rejected", "payload": {"mutated": True}})
     helper_publish_denial = call("submitAction", "POST", args.cloud_url, "/actions", {"run_id": CLOUD_HELPER_RUN, "tenant_id": TENANT_ID, "agent_id": CLOUD_HELPER_AGENT, "credential": cloud_cred, "audit_attribution": audit(cloud_cred), "causal_trace_id": cloud_delivery["body"].get("trace_event_id"), "action": action("artifact.publish_external", "artifact.publish_external", "External", publish_ref=EXTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
 
     device_profile = {"node_id": EDGE_NODE, "tenant_id": TENANT_ID, "device_kind": "drone_sim", "capabilities": ["camera.rgb", "battery", "geofence", "privacy_zone"] + [f"physical.action.{name}" for name in ALLOWED_PHYSICAL_ACTIONS], "allowed_physical_actions": ALLOWED_PHYSICAL_ACTIONS, "forbidden_action_classes": FORBIDDEN_PHYSICAL_ACTIONS, "safety_constraints": {"max_altitude_m": 30, "allowed_zones": ["zone:warehouse-a3"], "privacy_zones": ["privacy_zone:warehouse-a3-public"], "min_battery_percent": 0.25}, "runtime_mode": "resident", "safety_status": {"battery_percent": 0.82, "emergency_stop": "clear", "human_proximity": "clear", "privacy": "clear"}, "policy_cache": {"policy_id": "policy_uc_e2e_s10_edge_cache", "loaded": True, "ttl_seconds": 3600, "expires_at": utc(60), "expired": False}, "trace_buffer": {"enabled": True, "buffered_records": 0, "integrity": "hash_chain"}, "registered_at": utc(0)}
@@ -1165,6 +1184,9 @@ def main() -> int:
         {"case": "unauthorized_data_ref_denied", "passed": unauthorized_data["body"].get("status") == "Denied" and "data_scope_denied" in unauthorized_data["body"].get("verification", {}).get("reasons", []), "status": unauthorized_data["body"].get("status"), "reason_codes": unauthorized_data["body"].get("verification", {}).get("reasons", [])},
         {"case": "specialist_permission_escalation_denied", "passed": specialist_escalation["body"].get("status") == "Denied", "status": specialist_escalation["body"].get("status"), "reason_codes": specialist_escalation["body"].get("verification", {}).get("reasons", [])},
         {"case": "remote_duplicate_not_double_applied", "passed": duplicate_delivery["body"].get("duplicate") is True and duplicate_delivery["body"].get("idempotency_key") == "s10-cloud-helper-proposal", "duplicate": duplicate_delivery["body"].get("duplicate")},
+        {"case": "unsupported_message_schema_validation_rejected", "passed": unsupported_schema_validation["status"] == 200 and unsupported_schema_validation["body"].get("valid") is False and unsupported_schema_validation["body"].get("supported") is False, "status": unsupported_schema_validation["status"], "reason": unsupported_schema_validation["body"].get("reason")},
+        {"case": "cross_tenant_message_read_rejected", "passed": cross_tenant_read["status"] == 403 and cross_tenant_read["body"].get("code") == "cross_tenant_message_read_denied", "status": cross_tenant_read["status"], "code": cross_tenant_read["body"].get("code")},
+        {"case": "ack_nack_scope_or_payload_mutation_denied", "passed": ack_scope_failure["status"] == 403 and nack_payload_mutation_denial["status"] == 400 and nack_payload_mutation_denial["body"].get("code") == "message_payload_mutation_forbidden", "ack_scope_status": ack_scope_failure["status"], "nack_mutation_status": nack_payload_mutation_denial["status"], "nack_mutation_code": nack_payload_mutation_denial["body"].get("code")},
         {"case": "raw_physical_control_rejected", "passed": all(item["status"] == 400 and item["body"].get("code") == "low_level_physical_action_rejected" for item in raw_physical), "statuses": [item["status"] for item in raw_physical]},
         {"case": "expired_approval_rejected", "passed": expired_approval["body"].get("status") == "Denied" and expired_approval["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "expired", "status": expired_approval["body"].get("status")},
         {"case": "circuit_breaker_blocks_matching_publish_attempt", "passed": breaker_payload["status"] == 200 and breaker_sync["body"].get("accepted") is True and breaker_block["body"].get("status") == "Denied", "status": breaker_block["body"].get("status")},
@@ -1172,13 +1194,17 @@ def main() -> int:
         {"case": "tampered_trace_state_import_rejected", "passed": trace_sync_tampered["status"] == 403 and tampered_state_import["status"] == 403, "trace_status": trace_sync_tampered["status"], "state_status": tampered_state_import["status"]},
         {"case": "replay_side_effect_mode_rejected_by_default", "passed": unsafe_replay["status"] in {400, 403} and replay_counts_before == replay_counts_after, "status": unsafe_replay["status"]},
     ]
+    contract_report = read_json(report_dir / "contract-status.json")
+    contract_unblocked = not any(group.get("status") == "blocked_not_yet_covered" for group in contract_report.get("blocked_not_yet_covered", []))
+    message_api_operations = {"listMessageSchemas", "validateMessageSchema", "listInbox", "listOutbox", "getMessageCausalGraph", "ackMessage", "nackMessage"}
     positives = {
-        "api_contract_passed": read_json(report_dir / "contract-status.json").get("status") == "passed",
+        "api_contract_passed": contract_report.get("status") == "passed" and contract_unblocked,
         "nodes_and_instances_registered": node_list["status"] == 200 and all(item["status"] == 200 for item in node_registrations + instance_registrations),
         "policy_bundle_published_with_ttl": policy["body"].get("status") == "published" and policy_status["body"].get("status") == "published" and bool(policy["body"].get("envelope", {}).get("expires_at")),
         "signed_work_order_accepted_and_placed_on_vpc": placement["body"].get("status") == "selected" and placement["body"].get("candidate_id") == VPC_NODE and dispatch_orch["body"].get("create_run_status") in {200, 201},
         "data_local_analysis_executed": data_analysis["body"].get("status") == "Executed" and data_analysis["body"].get("output", {}).get("data_ref") == DATA_REF,
         "shared_specialist_typed_response_delivered": specialist_data["body"].get("status") == "Executed" and task_sent["body"].get("delivery_status") == "delivered" and task_read["body"].get("receive_side_validated") is True and response_sent["body"].get("delivery_status") == "delivered" and response_read["body"].get("receive_side_validated") is True,
+        "message_public_api_surface_exercised": {row["operation_id"] for row in api_rows} >= message_api_operations and schema_validation["body"].get("valid") is True and message_schemas["body"].get("delivery_authority_granted") is False and orchestrator_outbox["body"].get("messages") and specialist_inbox["body"].get("messages") and specialist_outbox["body"].get("messages") and edge_inbox["body"].get("messages") and len(causal_graph["body"].get("nodes", [])) >= 2 and ack_task["body"].get("delivery_status") == "consumed" and ack_response["body"].get("delivery_status") == "consumed" and nack_duplicate["body"].get("payload_preserved") is True,
         "cloud_helper_proposal_only": cloud_delivery["body"].get("delivery_status") == "delivered" and cloud_read["body"].get("receive_side_validated") is True and cloud_proposal["message"]["payload"].get("direct_actuator_authority") is False and cloud_proposal["message"]["payload"].get("publication_authority") is False and helper_publish_denial["body"].get("status") == "Denied" and cloud_direct_denial["body"].get("status") == "Denied",
         "edge_bounded_inspection_executed": device_register["status"] == 200 and device_status["status"] == 200 and policy_cache["body"].get("loaded") is True and inspect_zone["body"].get("status") == "Executed" and waypoint["body"].get("status") == "Executed" and all(item.get("total_delta") == item.get("expected_sim_delta") for item in simulator_evidence),
         "internal_artifact_created": internal_artifact["body"].get("status") == "Executed" and internal_evidence.get("artifact_path") == INTERNAL_ARTIFACT and bool(internal_evidence.get("trace_event_id")),
@@ -1201,6 +1227,24 @@ def main() -> int:
     action_ids = collect_action_ids(records, [data_analysis, specialist_data, helper_publish_denial, inspect_zone, waypoint, cloud_direct_denial, internal_artifact, publish_needs_approval, approved_publish, expired_approval, unauthorized_data, specialist_escalation, breaker_block])
     artifact_ids = sorted(value for value in {INTERNAL_ARTIFACT, EXTERNAL_ARTIFACT, internal_evidence.get("artifact_path") or "", publish_evidence.get("artifact_path") or ""} if value)
     replay_report = {"mode": "inspect_only", "side_effects_allowed_default": False, "side_effects_executed": replay_counts_before != replay_counts_after, "orchestrator_replay": replay_orch["body"], "edge_replay": replay_edge["body"], "unsafe_replay_negative": unsafe_replay, "action_execution_counts": action_counts, "counts_before_replay": replay_counts_before, "counts_after_replay": replay_counts_after, "simulator_before_replay": sim_before_replay, "simulator_after_replay": sim_after_replay}
+    message_api_report = {
+        "operations": sorted({row["operation_id"] for row in api_rows if row["operation_id"] in message_api_operations}),
+        "schemas": message_schemas["body"],
+        "schema_validation": schema_validation["body"],
+        "unsupported_schema_validation": unsupported_schema_validation["body"],
+        "orchestrator_outbox_count": len(orchestrator_outbox["body"].get("messages", [])),
+        "specialist_inbox_count": len(specialist_inbox["body"].get("messages", [])),
+        "specialist_outbox_count": len(specialist_outbox["body"].get("messages", [])),
+        "edge_inbox_count": len(edge_inbox["body"].get("messages", [])),
+        "causal_graph": {"node_count": len(causal_graph["body"].get("nodes", [])), "edge_count": len(causal_graph["body"].get("edges", [])), "trace_event_id": causal_graph["body"].get("trace_event_id")},
+        "ack_task": ack_task,
+        "ack_response": ack_response,
+        "nack_duplicate": nack_duplicate,
+        "cross_tenant_read": cross_tenant_read,
+        "ack_scope_failure": ack_scope_failure,
+        "nack_payload_mutation_denial": nack_payload_mutation_denial,
+        "authority_granted_by_read_validation": False,
+    }
     audit_package = {
         "schema_version": "splendor.audit_package.v1",
         "package_id": "audit_uc_e2e_s10_final_journey",
@@ -1257,7 +1301,7 @@ def main() -> int:
                 "SDK/API",
             ]
         },
-        "evidence_artifacts": ["scenario-report.json", "journey-report.json", "trace-export.jsonl", "state-handoff-report.json", "replay-report.json", "audit-package.json"],
+        "evidence_artifacts": ["scenario-report.json", "journey-report.json", "message-api-report.json", "trace-export.jsonl", "state-handoff-report.json", "replay-report.json", "audit-package.json"],
     }
     human_summary = "\n".join(
         [
@@ -1330,6 +1374,7 @@ def main() -> int:
         "registry-report.json": {"node_registrations": node_registrations, "instance_registrations": instance_registrations, "list_nodes": node_list, "all_registration_requests_accepted": all(item["status"] == 200 for item in node_registrations + instance_registrations), "duplicate_registration_rejections_treated_as_success": False},
         "journey-report.json": {"positive_checks": positives, "run_dispatch": {"orchestrator": dispatch_orch["body"], "specialist": dispatch_spec["body"], "cloud_helper": dispatch_helper["body"]}, "data_analysis": data_analysis["body"], "device": {"register": device_register["body"], "status": device_status["body"], "policy_cache": policy_cache["body"], "simulator_evidence": simulator_evidence}, "state_before": state_before["body"], "state_after": state_after["body"]},
         "message-flow.json": {"task_request": task_sent["body"], "task_request_read": task_read["body"], "task_response": response_sent["body"], "task_response_read": response_read["body"], "cloud_proposal": cloud_delivery["body"], "cloud_proposal_read": cloud_read["body"], "duplicate": duplicate_delivery["body"]},
+        "message-api-report.json": message_api_report,
         "artifact-publication-report.json": {"internal_artifact": internal_artifact["body"], "internal_artifact_evidence": internal_evidence, "publish_needs_approval": publish_needs_approval["body"], "approval_request": approval_request["body"], "approval_grant": approval_grant["body"], "approved_publish": approved_publish["body"], "approved_publish_evidence": publish_evidence, "expired_approval": expired_approval["body"], "publish_execution_count_for_positive_run": len(orch_publish_executions)},
         "cloud-helper-report.json": {"proposal": cloud_proposal, "delivery": cloud_delivery["body"], "read": cloud_read["body"], "duplicate": duplicate_delivery["body"], "publish_denial": helper_publish_denial["body"], "device_direct_denial": cloud_direct_denial["body"]},
         "edge-inspection-report.json": {"device_profile": device_register["body"], "start": edge_start["body"], "inspect_zone": inspect_zone["body"], "move_to_waypoint": waypoint["body"], "offline_sensor": offline_sensor["body"], "upload_summary": upload_summary["body"], "device_trace_sync": device_trace_sync["body"], "simulator_evidence": simulator_evidence},
