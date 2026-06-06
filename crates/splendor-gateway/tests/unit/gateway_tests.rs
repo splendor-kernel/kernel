@@ -263,6 +263,9 @@ fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
         allowed_zones: vec!["zone:A".to_string()],
         battery_percent: Some(80.0),
         min_battery_percent: Some(30.0),
+        policy_cache_expired: false,
+        high_risk: false,
+        cloud_helper_direct_authority: false,
         emergency_stop_engaged: Some(false),
         collision_risk: Some(SimulatedRiskLevel::Low),
         altitude_m: Some(10.0),
@@ -518,7 +521,7 @@ fn safety_geofence_denial_prevents_adapter_execution() {
 }
 
 #[test]
-fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence() {
+fn safety_low_battery_intervention_prevents_adapter_execution_with_trace_safe_evidence() {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
         quota: VerificationResult::allow(),
@@ -532,7 +535,7 @@ fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence
 
     let outcome = gateway.submit(physical_request()).expect("outcome");
 
-    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
     assert!(outcome
         .verification
         .reasons
@@ -548,6 +551,42 @@ fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence
         .to_string()
         .contains("status:battery.latest"));
     assert!(!outcome.verification.artifacts.to_string().contains("raw"));
+}
+
+#[test]
+fn safety_s6_policy_cache_and_cloud_helper_denials_prevent_adapter_execution() {
+    for (snapshot, reason) in [
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.policy_cache_expired = true;
+            snapshot.high_risk = true;
+            (snapshot, "policy_cache_expired")
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.cloud_helper_direct_authority = true;
+            (snapshot, "cloud_helper_direct_authority_denied")
+        },
+    ] {
+        let tenant_access = Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        });
+        let mut gateway = VerifiedActionGateway::new(tenant_access);
+        let adapter = Arc::new(CountingAdapter::default());
+        gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+        gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+        let outcome = gateway.submit(physical_request()).expect("outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert!(outcome.verification.reasons.contains(&reason.to_string()));
+        assert_eq!(
+            outcome.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
+        );
+        assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    }
 }
 
 #[test]

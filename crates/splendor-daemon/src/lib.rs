@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
     AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
+    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
@@ -31,17 +32,19 @@ use splendor_store::{
     TraceStore, TraceStoreError,
 };
 use splendor_types::{
-    validate_policy_bundle, AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    AuditAttribution, CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience,
-    CredentialBinding, DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError,
-    DaemonSecurityRequest, EndpointScope, GatewayVerificationState, InsecureDevMode,
-    LocalTransportBinding, PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring,
-    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
-    RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId, WorkOrder,
-    WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
-    WorkOrderValidationError,
+    is_allowed_physical_action, validate_policy_bundle, AppPrincipal, ApprovalEvidence,
+    ApprovalPolicy, ApprovalTraceContext, AuditAttribution, CallerCredential, CircuitBreaker,
+    ClientPrincipal, CredentialAudience, CredentialBinding, DaemonEndpoint, DaemonSecurityDecision,
+    DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
+    InsecureDevMode, LocalTransportBinding, NodeId, PerceptProvenance, PolicyBundleEnvelope,
+    PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
+    PolicyBundleValidationError, RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId,
+    WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::format_description::well_known::Rfc3339;
@@ -60,6 +63,9 @@ struct DaemonInner {
     policy_bundle_keyring: PolicyBundleKeyring,
     work_order_keyring: WorkOrderKeyring,
     runtime_available: AtomicBool,
+    device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
+    operator_interventions: Mutex<HashMap<String, OperatorInterventionRecord>>,
+    device_audit: Mutex<Vec<DeviceAuditEvent>>,
 }
 
 impl DaemonState {
@@ -83,6 +89,9 @@ impl DaemonState {
                 policy_bundle_keyring: config.policy_bundle_keyring,
                 work_order_keyring: config.work_order_keyring,
                 runtime_available: AtomicBool::new(true),
+                device_profiles: Mutex::new(HashMap::new()),
+                operator_interventions: Mutex::new(HashMap::new()),
+                device_audit: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -199,6 +208,29 @@ pub fn router(state: DaemonState) -> Router {
         .route("/runs/:run_id/traces/export", post(export_traces))
         .route("/runs/:run_id/replay", post(replay_run))
         .route("/actions", post(submit_action))
+        .route("/devices/profiles", post(register_device_profile))
+        .route("/devices/:node_id/status", get(get_device_status))
+        .route(
+            "/devices/:node_id/policy-cache",
+            get(get_policy_cache_status),
+        )
+        .route("/devices/:node_id/actions", post(submit_physical_action))
+        .route(
+            "/operator/interventions",
+            post(request_operator_intervention),
+        )
+        .route(
+            "/operator/interventions/:intervention_id/grant",
+            post(grant_operator_intervention),
+        )
+        .route(
+            "/operator/interventions/:intervention_id/deny",
+            post(deny_operator_intervention),
+        )
+        .route(
+            "/devices/:node_id/trace-buffer/sync",
+            post(sync_device_trace_buffer),
+        )
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/capabilities", get(capabilities))
@@ -230,6 +262,7 @@ struct RunSlot {
     state_store: Arc<dyn StateStore>,
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
+    tenant_registry: TenantRegistry,
     circuit_breakers: SharedCircuitBreakerEvaluator,
     policy_cache: PolicyCache,
     percept_queue: PerceptQueue,
@@ -418,15 +451,92 @@ impl ActionAdapter for RecordingAdapter {
             ));
         }
         let execution = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
+        let simulator = submit_device_sim_action(action, execution)?;
         Ok(AdapterResult {
             output: serde_json::json!({
                 "adapter": "daemon.recording",
                 "execution": execution,
                 "action": action.action.name,
+                "device_sim": simulator,
             }),
             satisfied_postconditions: action.action.postconditions.clone(),
         })
     }
+}
+
+fn submit_device_sim_action(
+    action: &ActionRequest,
+    execution: u64,
+) -> Result<Option<serde_json::Value>, AdapterError> {
+    let Ok(base_url) = std::env::var("SPLENDOR_DEVICE_SIM_URL") else {
+        return Ok(None);
+    };
+    submit_device_sim_action_to(&base_url, action, execution)
+}
+
+fn submit_device_sim_action_to(
+    base_url: &str,
+    action: &ActionRequest,
+    execution: u64,
+) -> Result<Option<serde_json::Value>, AdapterError> {
+    let (host, port) = parse_http_host_port(base_url)?;
+    let body = serde_json::json!({
+        "action_id": action.action_id,
+        "action_name": action.action.name,
+        "tenant_id": action.tenant_id,
+        "agent_id": action.agent_id,
+        "run_id": action.run_id,
+        "adapter_execution": execution,
+        "params": action.action.params,
+    });
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_payload_error:{error}")))?;
+    let mut stream = TcpStream::connect((host.as_str(), port))
+        .map_err(|error| AdapterError::Failed(format!("device_sim_connect_error:{error}")))?;
+    let request = format!(
+        "POST /actions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(&body_bytes))
+        .map_err(|error| AdapterError::Failed(format!("device_sim_write_error:{error}")))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_read_error:{error}")))?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if !status_line.contains(" 200 ") {
+        return Err(AdapterError::Failed(format!(
+            "device_sim_status_error:{status_line}"
+        )));
+    }
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| AdapterError::Failed("device_sim_missing_body".to_string()))?;
+    let parsed = serde_json::from_str(body)
+        .map_err(|error| AdapterError::Failed(format!("device_sim_response_error:{error}")))?;
+    Ok(Some(parsed))
+}
+
+fn parse_http_host_port(base_url: &str) -> Result<(String, u16), AdapterError> {
+    let rest = base_url
+        .strip_prefix("http://")
+        .ok_or_else(|| AdapterError::Failed("device_sim_url_must_be_http".to_string()))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| AdapterError::Failed("device_sim_url_missing_port".to_string()))?;
+    if host.trim().is_empty() {
+        return Err(AdapterError::Failed(
+            "device_sim_url_missing_host".to_string(),
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| AdapterError::Failed(format!("device_sim_url_bad_port:{error}")))?;
+    Ok((host.to_string(), port))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -752,6 +862,172 @@ pub struct SubmitActionRequest {
     pub satisfied_preconditions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_evidence: Option<ApprovalEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceRuntimeProfile {
+    pub node_id: NodeId,
+    pub tenant_id: TenantId,
+    pub device_kind: String,
+    pub capabilities: Vec<String>,
+    pub allowed_physical_actions: Vec<String>,
+    pub forbidden_action_classes: Vec<String>,
+    pub safety_constraints: serde_json::Value,
+    pub runtime_mode: String,
+    pub safety_status: serde_json::Value,
+    pub policy_cache: DevicePolicyCacheStatus,
+    pub trace_buffer: DeviceTraceBufferStatus,
+    pub registered_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DevicePolicyCacheStatus {
+    pub policy_id: String,
+    pub loaded: bool,
+    pub ttl_seconds: u64,
+    pub expires_at: String,
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferStatus {
+    pub enabled: bool,
+    pub buffered_records: usize,
+    pub integrity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RegisterDeviceProfileRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub profile: DeviceRuntimeProfile,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RegisterDeviceProfileResponse {
+    pub profile: DeviceRuntimeProfile,
+    pub trace_event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SafetyContext {
+    #[serde(default)]
+    pub allowed_zone_refs: Vec<String>,
+    pub zone_ref: Option<String>,
+    pub altitude_m: Option<f64>,
+    pub max_altitude_m: Option<f64>,
+    pub battery_percent: Option<f64>,
+    #[serde(default)]
+    pub privacy_clear: bool,
+    #[serde(default)]
+    pub human_proximity_clear: bool,
+    #[serde(default)]
+    pub emergency_stop_clear: bool,
+    #[serde(default)]
+    pub offline: bool,
+    #[serde(default)]
+    pub policy_cache_expired: bool,
+    #[serde(default)]
+    pub high_risk: bool,
+    #[serde(default)]
+    pub cloud_helper_direct_authority: bool,
+    pub cloud_helper_proposal_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SubmitPhysicalActionRequest {
+    #[serde(flatten)]
+    pub action_request: SubmitActionRequest,
+    pub safety_context: SafetyContext,
+    pub operator_intervention_evidence: Option<OperatorInterventionEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionEvidence {
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub action_name: String,
+    pub decision: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub agent_id: splendor_types::AgentId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub action_name: String,
+    pub reason: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorDecisionRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub reason: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorInterventionRecord {
+    pub intervention_id: String,
+    pub tenant_id: TenantId,
+    pub agent_id: splendor_types::AgentId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub action_name: String,
+    pub status: String,
+    pub reason: String,
+    pub expires_at: String,
+    pub trace_event_id: String,
+    pub evidence: Option<OperatorInterventionEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferSyncRequest {
+    pub credential: Option<CallerCredential>,
+    pub audit_attribution: Option<AuditAttribution>,
+    pub run_id: RunId,
+    pub records: Vec<TraceRecord>,
+    #[serde(default)]
+    pub simulate_tamper: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceTraceBufferSyncResponse {
+    pub accepted: bool,
+    pub accepted_records: usize,
+    pub trace_event_id: String,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DeviceAuditEvent {
+    pub trace_event_id: String,
+    pub event_type: String,
+    pub audit: AuditAttribution,
+    pub details: serde_json::Value,
+    pub timestamp: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1135,7 +1411,8 @@ async fn create_run(
     engine.add_perceptor(QueuedPerceptor {
         queue: percept_queue.clone(),
     });
-    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), tenant_registry);
+    let mut scheduler =
+        Scheduler::with_registry(SchedulerConfig::default(), tenant_registry.clone());
     scheduler.add_agent(engine);
 
     let slot = RunSlot {
@@ -1147,6 +1424,7 @@ async fn create_run(
         state_store,
         trace_store,
         gateway,
+        tenant_registry,
         circuit_breakers,
         policy_cache,
         percept_queue,
@@ -2035,6 +2313,776 @@ async fn submit_action(
     Ok(Json(outcome))
 }
 
+async fn register_device_profile(
+    State(state): State<DaemonState>,
+    Json(request): Json<RegisterDeviceProfileRequest>,
+) -> Result<Json<RegisterDeviceProfileResponse>, ApiError> {
+    state.ensure_runtime_available()?;
+    validate_device_profile_payload(&request.profile)?;
+    let security = state.validate_security(
+        DaemonEndpoint::DeviceProfileRegister {
+            tenant_id: request.profile.tenant_id.clone(),
+            node_id: request.profile.node_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let mut profile = request.profile;
+    profile.registered_at = now_rfc3339();
+    state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .insert(profile.node_id.clone(), profile.clone());
+    let audit_attribution = required_audit(security.audit_attribution)?;
+    let trace_event_id = record_device_audit(
+        &state,
+        "device.profile.registered",
+        audit_attribution,
+        serde_json::json!({"node_id": profile.node_id, "device_kind": profile.device_kind}),
+    )?;
+    Ok(Json(RegisterDeviceProfileResponse {
+        profile,
+        trace_event_id,
+    }))
+}
+
+async fn get_device_status(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceRuntimeProfile>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id.clone(),
+            node_id,
+        },
+        credential,
+        None,
+        None,
+    )?;
+    Ok(Json(profile))
+}
+
+async fn get_policy_cache_status(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> Result<Json<DevicePolicyCacheStatus>, ApiError> {
+    let credential = caller_credential_from_headers(&headers)?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id.clone(),
+            node_id,
+        },
+        credential,
+        None,
+        None,
+    )?;
+    Ok(Json(profile.policy_cache))
+}
+
+async fn submit_physical_action(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<SubmitPhysicalActionRequest>,
+) -> Result<Json<ActionOutcome>, ApiError> {
+    state.ensure_runtime_available()?;
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    if profile.tenant_id != request.action_request.tenant_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wrong_scope",
+            "device tenant does not match action tenant",
+        ));
+    }
+    let action_name = request.action_request.action.name.clone();
+    if matches_forbidden_physical_action(&action_name) || !is_allowed_physical_action(&action_name)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "low_level_physical_action_rejected",
+            "physical endpoint accepts only bounded high-level actions",
+        ));
+    }
+    if !profile
+        .allowed_physical_actions
+        .iter()
+        .any(|allowed| allowed == &action_name)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "physical_action_not_profile_allowed",
+            "device profile does not allow action",
+        ));
+    }
+
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs
+        .get_mut(&request.action_request.run_id)
+        .ok_or_else(|| invalid_run(&request.action_request.run_id))?;
+    if request.action_request.tenant_id != slot.tenant_id
+        || request.action_request.agent_id != slot.agent_id
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wrong_scope",
+            "action tenant or agent does not match the run",
+        ));
+    }
+    let security = state.validate_security(
+        DaemonEndpoint::ActionSubmit {
+            tenant_id: request.action_request.tenant_id.clone(),
+            run_id: request.action_request.run_id.clone(),
+            trace_linked: request.action_request.causal_trace_id.is_some(),
+            gateway_verification: GatewayVerificationState::Required,
+        },
+        request.action_request.credential.clone(),
+        None,
+        request.action_request.audit_attribution.clone(),
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.devices.actions.submit",
+        security.audit_attribution.clone(),
+    )?;
+    record_physical_run_event(
+        slot,
+        "safety.verification.started",
+        &request.action_request.action,
+        serde_json::json!({"node_id": node_id, "action": action_name}),
+    )?;
+    if let Some(proposal_id) = &request.safety_context.cloud_helper_proposal_id {
+        record_physical_run_event(
+            slot,
+            "cloud_helper.proposal.received",
+            &request.action_request.action,
+            serde_json::json!({"proposal_id": proposal_id, "direct_authority": request.safety_context.cloud_helper_direct_authority}),
+        )?;
+    }
+    if request.safety_context.offline {
+        record_physical_run_event(
+            slot,
+            "offline.entered",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id}),
+        )?;
+    }
+
+    if request.safety_context.offline
+        && request.safety_context.policy_cache_expired
+        && request.safety_context.high_risk
+    {
+        record_physical_run_event(
+            slot,
+            "policy.cache.expired",
+            &request.action_request.action,
+            serde_json::json!({"policy_id": profile.policy_cache.policy_id, "action": action_name}),
+        )?;
+    }
+    if let Some(evidence) = &request.operator_intervention_evidence {
+        let expires_at = OffsetDateTime::parse(&evidence.expires_at, &Rfc3339).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "operator_intervention_bad_expiry",
+                "operator intervention expiry is invalid",
+            )
+        })?;
+        if expires_at <= OffsetDateTime::now_utc() {
+            record_physical_run_event(
+                slot,
+                "operator.intervention.expired",
+                &request.action_request.action,
+                serde_json::json!({"intervention_id": evidence.intervention_id, "action": action_name}),
+            )?;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "operator_intervention_expired",
+                "operator intervention evidence expired",
+            ));
+        }
+        validate_operator_evidence(
+            &state,
+            evidence,
+            &request.action_request.run_id,
+            &action_name,
+        )?;
+    }
+
+    record_physical_run_event(
+        slot,
+        "safety.verification.completed",
+        &request.action_request.action,
+        serde_json::json!({"allowed": true, "node_id": node_id}),
+    )?;
+    let action_request = ActionRequest {
+        action_id: request.action_request.action_id.clone().unwrap_or_default(),
+        tenant_id: request.action_request.tenant_id.clone(),
+        agent_id: request.action_request.agent_id.clone(),
+        run_id: request.action_request.run_id.clone(),
+        action: request.action_request.action.clone(),
+        adapter: request.action_request.adapter.clone(),
+        quota_usage: request
+            .action_request
+            .quota_usage
+            .unwrap_or_else(splendor_types::QuotaUsage::single_action),
+        satisfied_preconditions: request.action_request.satisfied_preconditions.clone(),
+        requested_at: OffsetDateTime::now_utc(),
+        approval_evidence: request.action_request.approval_evidence.clone(),
+    };
+    let mut physical_gateway = VerifiedActionGateway::new(Arc::new(slot.tenant_registry.clone()));
+    physical_gateway.set_circuit_breaker_evaluator(Arc::new(slot.circuit_breakers.clone()));
+    physical_gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
+        simulated_safety_snapshot(&request, &profile, &action_name),
+    )));
+    physical_gateway.register_adapter(
+        action_name.clone(),
+        action_request
+            .adapter
+            .clone()
+            .unwrap_or_else(|| "device-sim".to_string()),
+        Arc::new(RecordingAdapter {
+            executions: Arc::clone(&slot.adapter_executions),
+        }),
+    );
+    let physical_gateway: Arc<dyn ActionGateway> = Arc::new(PolicyDistributionGateway::new(
+        Arc::new(physical_gateway),
+        Arc::new(slot.policy_cache.clone()),
+    ));
+    let outcome = physical_gateway.submit(action_request).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway_error",
+            error.to_string(),
+        )
+    })?;
+    if outcome.status == ActionStatus::Executed {
+        record_run_event(
+            slot,
+            TraceEventKind::ActionExecuted {
+                action: request.action_request.action.clone(),
+                outcome: outcome.output.clone().unwrap_or(serde_json::Value::Null),
+            },
+        )?;
+    } else {
+        record_physical_denial(
+            slot,
+            &request.action_request.action,
+            &outcome,
+            "safety.verification.denied",
+        )?;
+    }
+    record_run_event(
+        slot,
+        TraceEventKind::OutcomeRecorded {
+            outcome: serde_json::json!({"source": "daemon.physical_action", "action_outcome": outcome}),
+            feedback: None,
+            reward: None,
+        },
+    )?;
+    if request.safety_context.offline {
+        record_physical_run_event(
+            slot,
+            "trace.buffer.appended",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id, "action": action_name}),
+        )?;
+        record_physical_run_event(
+            slot,
+            "offline.exited",
+            &request.action_request.action,
+            serde_json::json!({"node_id": node_id}),
+        )?;
+    }
+    Ok(Json(outcome))
+}
+
+async fn request_operator_intervention(
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorInterventionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    state.ensure_runtime_available()?;
+    let security = state.validate_security(
+        DaemonEndpoint::OperatorIntervene {
+            tenant_id: request.tenant_id.clone(),
+            run_id: request.run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let trace_event_id = record_device_audit(
+        &state,
+        "operator.intervention.requested",
+        required_audit(security.audit_attribution)?,
+        serde_json::json!({"intervention_id": request.intervention_id, "run_id": request.run_id, "action": request.action_name, "reason": request.reason}),
+    )?;
+    let record = OperatorInterventionRecord {
+        intervention_id: request.intervention_id.clone(),
+        tenant_id: request.tenant_id,
+        agent_id: request.agent_id,
+        run_id: request.run_id,
+        node_id: request.node_id,
+        action_name: request.action_name,
+        status: "requested".to_string(),
+        reason: request.reason,
+        expires_at: request.expires_at,
+        trace_event_id,
+        evidence: None,
+    };
+    state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?
+        .insert(request.intervention_id, record.clone());
+    Ok(Json(record))
+}
+
+async fn grant_operator_intervention(
+    Path(intervention_id): Path<String>,
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorDecisionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    decide_operator_intervention(state, intervention_id, request, "granted").await
+}
+
+async fn deny_operator_intervention(
+    Path(intervention_id): Path<String>,
+    State(state): State<DaemonState>,
+    Json(request): Json<OperatorDecisionRequest>,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    decide_operator_intervention(state, intervention_id, request, "denied").await
+}
+
+async fn decide_operator_intervention(
+    state: DaemonState,
+    intervention_id: String,
+    request: OperatorDecisionRequest,
+    status: &str,
+) -> Result<Json<OperatorInterventionRecord>, ApiError> {
+    let mut interventions = state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?;
+    let record = interventions.get_mut(&intervention_id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "operator_intervention_not_found",
+            "operator intervention not found",
+        )
+    })?;
+    let security = state.validate_security(
+        DaemonEndpoint::OperatorIntervene {
+            tenant_id: record.tenant_id.clone(),
+            run_id: record.run_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution.clone(),
+    )?;
+    let event = if status == "granted" {
+        "operator.intervention.granted"
+    } else {
+        "operator.intervention.denied"
+    };
+    let trace_event_id = record_device_audit(
+        &state,
+        event,
+        required_audit(security.audit_attribution)?,
+        serde_json::json!({"intervention_id": intervention_id, "reason": request.reason}),
+    )?;
+    record.status = status.to_string();
+    record.reason = request.reason;
+    record.trace_event_id = trace_event_id;
+    record.evidence = Some(OperatorInterventionEvidence {
+        intervention_id: record.intervention_id.clone(),
+        tenant_id: record.tenant_id.clone(),
+        run_id: record.run_id.clone(),
+        action_name: record.action_name.clone(),
+        decision: if status == "granted" {
+            "granted"
+        } else {
+            "denied"
+        }
+        .to_string(),
+        expires_at: request
+            .expires_at
+            .unwrap_or_else(|| record.expires_at.clone()),
+    });
+    Ok(Json(record.clone()))
+}
+
+async fn sync_device_trace_buffer(
+    Path(node_id): Path<NodeId>,
+    State(state): State<DaemonState>,
+    Json(request): Json<DeviceTraceBufferSyncRequest>,
+) -> Result<Json<DeviceTraceBufferSyncResponse>, ApiError> {
+    let profile = state
+        .inner
+        .device_profiles
+        .lock()
+        .map_err(|_| lock_error())?
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "device_not_registered",
+                "device profile not registered",
+            )
+        })?;
+    let security = state.validate_security(
+        DaemonEndpoint::DeviceRead {
+            tenant_id: profile.tenant_id,
+            node_id: node_id.clone(),
+        },
+        request.credential,
+        None,
+        request.audit_attribution,
+    )?;
+    let audit_attribution = required_audit(security.audit_attribution)?;
+    let mut expected = None;
+    let mut expected_prev_hash = None;
+    for record in &request.records {
+        if let Some(prev) = expected {
+            if record.sequence <= prev {
+                let trace_event_id = record_device_audit(
+                    &state,
+                    "trace.sync.failed",
+                    audit_attribution.clone(),
+                    serde_json::json!({"node_id": node_id, "reason": "trace_sync_reordered"}),
+                )?;
+                return Ok(Json(DeviceTraceBufferSyncResponse {
+                    accepted: false,
+                    accepted_records: 0,
+                    trace_event_id,
+                    reason_code: Some("trace_sync_reordered".to_string()),
+                }));
+            }
+        }
+        if record.prev_event_hash != expected_prev_hash {
+            let trace_event_id = record_device_audit(
+                &state,
+                "trace.sync.failed",
+                audit_attribution.clone(),
+                serde_json::json!({"node_id": node_id, "reason": "trace_sync_hash_chain_mismatch"}),
+            )?;
+            return Ok(Json(DeviceTraceBufferSyncResponse {
+                accepted: false,
+                accepted_records: 0,
+                trace_event_id,
+                reason_code: Some("trace_sync_hash_chain_mismatch".to_string()),
+            }));
+        }
+        expected = Some(record.sequence);
+        expected_prev_hash = Some(record.event_hash.clone());
+    }
+    if request.simulate_tamper {
+        let trace_event_id = record_device_audit(
+            &state,
+            "trace.sync.failed",
+            audit_attribution,
+            serde_json::json!({"node_id": node_id, "reason": "trace_sync_tampered"}),
+        )?;
+        return Ok(Json(DeviceTraceBufferSyncResponse {
+            accepted: false,
+            accepted_records: 0,
+            trace_event_id,
+            reason_code: Some("trace_sync_tampered".to_string()),
+        }));
+    }
+    let trace_event_id = record_device_audit(
+        &state,
+        "trace.sync.completed",
+        audit_attribution,
+        serde_json::json!({"node_id": node_id, "accepted_records": request.records.len()}),
+    )?;
+    Ok(Json(DeviceTraceBufferSyncResponse {
+        accepted: true,
+        accepted_records: request.records.len(),
+        trace_event_id,
+        reason_code: None,
+    }))
+}
+
+fn validate_device_profile_payload(profile: &DeviceRuntimeProfile) -> Result<(), ApiError> {
+    if profile.device_kind != "drone_sim" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_device_kind",
+            "S6 acceptance supports drone_sim only",
+        ));
+    }
+    if profile.runtime_mode != "resident" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "device_requires_resident_runtime",
+            "physical edge acceptance requires resident runtime mode",
+        ));
+    }
+    for action in &profile.allowed_physical_actions {
+        if matches_forbidden_physical_action(action) || !is_allowed_physical_action(action) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "low_level_physical_action_rejected",
+                "device profile contains unsupported physical action",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn matches_forbidden_physical_action(action: &str) -> bool {
+    let normalized = action
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    FORBIDDEN_PHYSICAL_ACTION_PATTERNS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+}
+
+fn simulated_safety_snapshot(
+    request: &SubmitPhysicalActionRequest,
+    profile: &DeviceRuntimeProfile,
+    action_name: &str,
+) -> SimulatedSafetySnapshot {
+    let is_safe_low_battery_action = matches!(
+        action_name,
+        "return_to_base" | "dock" | "read_battery" | "read_sensor_summary"
+    );
+    let configured_min_battery = profile
+        .safety_constraints
+        .get("min_battery_percent")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.20);
+    SimulatedSafetySnapshot {
+        current_zone: request.safety_context.zone_ref.clone(),
+        allowed_zones: request.safety_context.allowed_zone_refs.clone(),
+        battery_percent: request.safety_context.battery_percent,
+        min_battery_percent: Some(if is_safe_low_battery_action {
+            0.0
+        } else {
+            configured_min_battery
+        }),
+        policy_cache_expired: request.safety_context.policy_cache_expired,
+        high_risk: request.safety_context.high_risk,
+        cloud_helper_direct_authority: request.safety_context.cloud_helper_direct_authority,
+        emergency_stop_engaged: Some(!request.safety_context.emergency_stop_clear),
+        collision_risk: Some(SimulatedRiskLevel::Low),
+        altitude_m: request.safety_context.altitude_m,
+        max_altitude_m: request.safety_context.max_altitude_m,
+        privacy_zone_active: Some(!request.safety_context.privacy_clear),
+        proximity_m: Some(if request.safety_context.human_proximity_clear {
+            2.0
+        } else {
+            0.0
+        }),
+        min_proximity_m: Some(1.0),
+        sensor_refs: vec![profile.node_id.to_string()],
+    }
+}
+
+fn record_physical_denial(
+    slot: &RunSlot,
+    action: &Action,
+    outcome: &ActionOutcome,
+    event_type: &str,
+) -> Result<(), ApiError> {
+    record_physical_run_event(
+        slot,
+        event_type,
+        action,
+        serde_json::json!({"verification": outcome.verification, "status": outcome.status}),
+    )?;
+    match outcome.status {
+        ActionStatus::NeedsIntervention => record_run_event(
+            slot,
+            TraceEventKind::ActionNeedsIntervention {
+                action: action.clone(),
+                result: outcome.verification.clone(),
+            },
+        ),
+        _ => record_run_event(
+            slot,
+            TraceEventKind::ActionDenied {
+                action: action.clone(),
+                result: outcome.verification.clone(),
+            },
+        ),
+    }
+}
+
+fn record_physical_run_event(
+    slot: &RunSlot,
+    event_type: &str,
+    _action: &Action,
+    details: serde_json::Value,
+) -> Result<String, ApiError> {
+    let _ = details;
+    let trace_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::DaemonAudit {
+            endpoint: event_type.to_string(),
+            audit: AuditAttribution {
+                principal: ClientPrincipal {
+                    app: AppPrincipal {
+                        app_principal_id: "runtime_physical_edge".to_string(),
+                        label: Some("runtime physical edge".to_string()),
+                    },
+                    client_principal_id: "runtime_physical_edge".to_string(),
+                    label: Some("runtime physical edge".to_string()),
+                },
+                credential_id: Some("runtime_physical_edge".to_string()),
+                requested_at: OffsetDateTime::now_utc(),
+            },
+        },
+    )?;
+    Ok(trace_id.to_string())
+}
+
+fn record_device_audit(
+    state: &DaemonState,
+    event_type: &str,
+    audit: AuditAttribution,
+    details: serde_json::Value,
+) -> Result<String, ApiError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    state
+        .inner
+        .device_audit
+        .lock()
+        .map_err(|_| lock_error())?
+        .push(DeviceAuditEvent {
+            trace_event_id: event_id.clone(),
+            event_type: event_type.to_string(),
+            audit,
+            details,
+            timestamp: now_rfc3339(),
+        });
+    Ok(event_id)
+}
+
+fn required_audit(audit: Option<AuditAttribution>) -> Result<AuditAttribution, ApiError> {
+    audit.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing_audit_attribution",
+            "mutating physical/edge request requires audit attribution",
+        )
+    })
+}
+
+fn validate_operator_evidence(
+    state: &DaemonState,
+    evidence: &OperatorInterventionEvidence,
+    run_id: &RunId,
+    action_name: &str,
+) -> Result<(), ApiError> {
+    let interventions = state
+        .inner
+        .operator_interventions
+        .lock()
+        .map_err(|_| lock_error())?;
+    let record = interventions
+        .get(&evidence.intervention_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "operator_intervention_unknown",
+                "operator intervention evidence is unknown",
+            )
+        })?;
+    if &record.run_id != run_id
+        || record.action_name != action_name
+        || record.status != "granted"
+        || evidence.decision != "granted"
+        || evidence.run_id != *run_id
+        || evidence.action_name != action_name
+        || evidence.tenant_id != record.tenant_id
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "operator_intervention_scope_mismatch",
+            "operator intervention evidence is outside scope",
+        ));
+    }
+    let expires_at = OffsetDateTime::parse(&evidence.expires_at, &Rfc3339).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator_intervention_bad_expiry",
+            "operator intervention expiry is invalid",
+        )
+    })?;
+    if expires_at <= OffsetDateTime::now_utc() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "operator_intervention_expired",
+            "operator intervention evidence expired",
+        ));
+    }
+    Ok(())
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
 fn caller_credential_from_headers(
     headers: &HeaderMap,
 ) -> Result<Option<CallerCredential>, ApiError> {
@@ -2181,6 +3229,11 @@ fn endpoint_scope_from_public_str(scope: &str) -> Option<EndpointScope> {
         "instances_heartbeat" | "splendor.instances.heartbeat" => {
             Some(EndpointScope::InstancesHeartbeat)
         }
+        "device_register" | "splendor.device.register" => Some(EndpointScope::DeviceRegister),
+        "device_read" | "splendor.device.read" => Some(EndpointScope::DeviceRead),
+        "operator_intervene" | "splendor.operator.intervene" => {
+            Some(EndpointScope::OperatorIntervene)
+        }
         _ => None,
     }
 }
@@ -2248,6 +3301,14 @@ async fn capabilities(
             "POST /runs/{run_id}/traces/export".to_string(),
             "POST /runs/{run_id}/replay".to_string(),
             "POST /actions".to_string(),
+            "POST /devices/profiles".to_string(),
+            "GET /devices/{node_id}/status".to_string(),
+            "GET /devices/{node_id}/policy-cache".to_string(),
+            "POST /devices/{node_id}/actions".to_string(),
+            "POST /operator/interventions".to_string(),
+            "POST /operator/interventions/{intervention_id}/grant".to_string(),
+            "POST /operator/interventions/{intervention_id}/deny".to_string(),
+            "POST /devices/{node_id}/trace-buffer/sync".to_string(),
             "GET /health".to_string(),
             "GET /version".to_string(),
             "GET /capabilities".to_string(),
@@ -2807,7 +3868,317 @@ pub fn local_percept(schema: impl Into<String>, payload: serde_json::Value) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
     use splendor_store::{InMemoryTraceStore, TraceStore};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    fn unit_audit() -> AuditAttribution {
+        AuditAttribution {
+            principal: ClientPrincipal {
+                app: AppPrincipal {
+                    app_principal_id: "unit_app".to_string(),
+                    label: Some("unit app".to_string()),
+                },
+                client_principal_id: "unit_client".to_string(),
+                label: Some("unit client".to_string()),
+            },
+            credential_id: Some("unit_credential".to_string()),
+            requested_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn unit_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile {
+        DeviceRuntimeProfile {
+            node_id,
+            tenant_id,
+            device_kind: "drone_sim".to_string(),
+            capabilities: vec!["motion.waypoint".to_string(), "dock".to_string()],
+            allowed_physical_actions: vec![
+                "move_to_waypoint".to_string(),
+                "return_to_base".to_string(),
+                "dock".to_string(),
+                "read_battery".to_string(),
+            ],
+            forbidden_action_classes: FORBIDDEN_PHYSICAL_ACTION_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+            safety_constraints: serde_json::json!({"min_battery_percent": 0.25}),
+            runtime_mode: "resident".to_string(),
+            safety_status: serde_json::json!({"emergency_stop_clear": true}),
+            policy_cache: DevicePolicyCacheStatus {
+                policy_id: "policy_unit".to_string(),
+                loaded: true,
+                ttl_seconds: 300,
+                expires_at: now_rfc3339(),
+                expired: false,
+            },
+            trace_buffer: DeviceTraceBufferStatus {
+                enabled: true,
+                buffered_records: 0,
+                integrity: "hash_chain_v1".to_string(),
+            },
+            registered_at: "pending".to_string(),
+        }
+    }
+
+    fn physical_action(name: &str) -> Action {
+        Action {
+            name: name.to_string(),
+            params: serde_json::json!({"zone_ref": "zone_a"}),
+            side_effect_class: splendor_types::SideEffectClass::Custom(
+                "physical.high_level".to_string(),
+            ),
+            cost_estimate: None,
+            required_permissions: vec!["device.motion".to_string()],
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        }
+    }
+
+    fn safe_context() -> SafetyContext {
+        SafetyContext {
+            allowed_zone_refs: vec!["zone_a".to_string()],
+            zone_ref: Some("zone_a".to_string()),
+            altitude_m: Some(10.0),
+            max_altitude_m: Some(30.0),
+            battery_percent: Some(0.80),
+            privacy_clear: true,
+            human_proximity_clear: true,
+            emergency_stop_clear: true,
+            offline: false,
+            policy_cache_expired: false,
+            high_risk: false,
+            cloud_helper_direct_authority: false,
+            cloud_helper_proposal_id: None,
+        }
+    }
+
+    async fn create_unit_run(
+        state: &DaemonState,
+        tenant_id: TenantId,
+        agent_id: splendor_types::AgentId,
+        run_id: RunId,
+    ) {
+        let work_order = WorkOrder {
+            schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+            work_order_id: splendor_types::WorkOrderId::try_new("wo_unit_physical")
+                .expect("work order id"),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: Some(run_id),
+            objective: "unit physical run".to_string(),
+            allowed_actions: vec![
+                "move_to_waypoint".to_string(),
+                "return_to_base".to_string(),
+                "dock".to_string(),
+                "read_battery".to_string(),
+            ],
+            allowed_adapters: vec!["device-sim".to_string()],
+            allowed_permissions: vec!["device.motion".to_string()],
+            data_refs: vec!["device:unit".to_string()],
+            quotas: splendor_types::WorkOrderQuotaPolicy {
+                max_actions_per_tick: Some(10),
+                ..splendor_types::WorkOrderQuotaPolicy::default()
+            },
+            placement: splendor_types::WorkOrderPlacement::default(),
+            issued_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+            revocation: splendor_types::RevocationStatus::Active,
+        };
+        let request = CreateRunRequest {
+            tenant_id,
+            agent_id,
+            work_order: WorkOrderEnvelope::signed_with_shared_secret(
+                work_order,
+                "work-order-local-key",
+                b"splendor-local-work-order-secret",
+            )
+            .expect("signed work order"),
+            credential: None,
+            audit_attribution: Some(unit_audit()),
+            allowed_actions: Vec::new(),
+            allowed_adapters: Vec::new(),
+            allowed_permissions: Vec::new(),
+            policy_actions: Vec::new(),
+            policy_bundle_required: false,
+            policy_bundle: None,
+            registered_actions: Vec::new(),
+            approval_policies: Vec::new(),
+            circuit_breakers: Vec::new(),
+            allowed_percept_schemas: Vec::new(),
+            allowed_percept_sources: Vec::new(),
+            initial_state: None,
+            snapshot_interval: None,
+        };
+        let _ = create_run(State(state.clone()), Json(request))
+            .await
+            .expect("create run");
+    }
+
+    fn physical_request(
+        run_id: RunId,
+        tenant_id: TenantId,
+        agent_id: splendor_types::AgentId,
+        action_name: &str,
+        safety_context: SafetyContext,
+    ) -> SubmitPhysicalActionRequest {
+        SubmitPhysicalActionRequest {
+            action_request: SubmitActionRequest {
+                action_id: Some(ActionId::new()),
+                run_id,
+                tenant_id,
+                agent_id,
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                causal_trace_id: Some(TraceId::new()),
+                action: physical_action(action_name),
+                adapter: Some("device-sim".to_string()),
+                quota_usage: Some(splendor_types::QuotaUsage::single_action()),
+                satisfied_preconditions: Vec::new(),
+                approval_evidence: None,
+            },
+            safety_context,
+            operator_intervention_evidence: None,
+        }
+    }
+
+    fn unit_action_request(action_name: &str) -> ActionRequest {
+        ActionRequest {
+            action_id: ActionId::new(),
+            tenant_id: TenantId::new(),
+            agent_id: splendor_types::AgentId::new(),
+            run_id: RunId::new(),
+            action: physical_action(action_name),
+            adapter: Some("device-sim".to_string()),
+            quota_usage: splendor_types::QuotaUsage::single_action(),
+            satisfied_preconditions: Vec::new(),
+            requested_at: OffsetDateTime::now_utc(),
+            approval_evidence: None,
+        }
+    }
+
+    #[test]
+    fn device_sim_url_parser_and_disabled_env_path_are_explicit() {
+        assert_eq!(
+            parse_http_host_port("http://device-sim:8086/path").expect("valid url"),
+            ("device-sim".to_string(), 8086)
+        );
+        for invalid in [
+            "https://device-sim:8086",
+            "http://device-sim",
+            "http://:8086",
+            "http://device-sim:not-a-port",
+        ] {
+            assert!(parse_http_host_port(invalid).is_err());
+        }
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+        assert!(
+            submit_device_sim_action(&unit_action_request("read_battery"), 7)
+                .expect("disabled simulator is allowed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn device_sim_submit_posts_gateway_executed_action_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let bytes = stream.read(&mut buffer).expect("read simulator request");
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                let text = String::from_utf8_lossy(&request);
+                if text.contains("\"action_name\":\"inspect_zone\"")
+                    && text.contains("\"adapter_execution\":42")
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /actions HTTP/1.1"));
+            assert!(request.contains("\"action_name\":\"inspect_zone\""));
+            assert!(request.contains("\"adapter_execution\":42"));
+            let body = serde_json::json!({"accepted": true, "counter": 1});
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.to_string().len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write simulator response");
+        });
+        let response = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("inspect_zone"),
+            42,
+        )
+        .expect("submit to simulator")
+        .expect("simulator response");
+        assert_eq!(response["accepted"], true);
+        assert_eq!(response["counter"], 1);
+        handle.join().expect("simulator thread joins");
+    }
+
+    #[test]
+    fn device_sim_submit_rejects_non_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer).expect("read request bytes");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("write failure response");
+        });
+        let error = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("read_battery"),
+            1,
+        )
+        .expect_err("non-200 simulator responses fail closed");
+        assert!(error.to_string().contains("device_sim_"));
+        handle.join().expect("simulator thread joins");
+    }
+
+    #[test]
+    fn device_sim_submit_rejects_malformed_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
+        let addr = listener.local_addr().expect("simulator addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept simulator request");
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer).expect("read request bytes");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+                )
+                .expect("write malformed success response");
+        });
+        let error = submit_device_sim_action_to(
+            &format!("http://{addr}"),
+            &unit_action_request("read_battery"),
+            1,
+        )
+        .expect_err("malformed simulator bodies fail closed");
+        assert!(error.to_string().contains("device_sim_"));
+        handle.join().expect("simulator thread joins");
+    }
 
     #[test]
     fn helper_error_mappings_and_local_percept_are_stable() {
@@ -3088,6 +4459,7 @@ mod tests {
             state_store: Arc::new(InMemoryStateStore::default()),
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
+            tenant_registry: TenantRegistry::new(),
             circuit_breakers: SharedCircuitBreakerEvaluator::default(),
             policy_cache: PolicyCache::new(PolicyCacheConfig::default()),
             percept_queue: PerceptQueue::default(),
@@ -3139,5 +4511,678 @@ mod tests {
         let allowed =
             evaluator.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
         assert!(allowed.allowed);
+    }
+
+    #[tokio::test]
+    async fn device_profile_read_and_trace_sync_paths_are_covered() {
+        let state = DaemonState::local_dev();
+        let node_id = NodeId::new();
+        let tenant_id = TenantId::new();
+        let profile = unit_profile(node_id.clone(), tenant_id);
+        let registered = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: profile.clone(),
+            }),
+        )
+        .await
+        .expect("register device profile")
+        .0;
+        assert_eq!(registered.profile.node_id, node_id);
+        assert!(OffsetDateTime::parse(&registered.profile.registered_at, &Rfc3339).is_ok());
+
+        let status = get_device_status(
+            Path(node_id.clone()),
+            State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("device status")
+        .0;
+        assert_eq!(status.device_kind, "drone_sim");
+        let policy = get_policy_cache_status(
+            Path(node_id.clone()),
+            State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("policy cache")
+        .0;
+        assert!(policy.loaded);
+
+        let missing =
+            get_device_status(Path(NodeId::new()), State(state.clone()), HeaderMap::new())
+                .await
+                .expect_err("unregistered device denied");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.body.code, "device_not_registered");
+
+        let missing_policy =
+            get_policy_cache_status(Path(NodeId::new()), State(state.clone()), HeaderMap::new())
+                .await
+                .expect_err("unregistered policy cache denied");
+        assert_eq!(missing_policy.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_policy.body.code, "device_not_registered");
+
+        let run_id = RunId::new();
+        let trace_store = InMemoryTraceStore::default();
+        trace_store
+            .append(&run_id.to_string(), serde_json::json!({"event": "first"}))
+            .expect("append first");
+        trace_store
+            .append(&run_id.to_string(), serde_json::json!({"event": "second"}))
+            .expect("append second");
+        let records = trace_store.read(&run_id.to_string()).expect("read records");
+        let first = records[0].clone();
+        let second = records[1].clone();
+        let synced = sync_device_trace_buffer(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(DeviceTraceBufferSyncRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                run_id: run_id.clone(),
+                records: vec![first.clone(), second.clone()],
+                simulate_tamper: false,
+            }),
+        )
+        .await
+        .expect("trace sync")
+        .0;
+        assert!(synced.accepted);
+        assert_eq!(synced.accepted_records, 2);
+        assert!(synced.reason_code.is_none());
+
+        let mut reordered = second;
+        reordered.sequence = first.sequence;
+        let rejected = sync_device_trace_buffer(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(DeviceTraceBufferSyncRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                run_id: run_id.clone(),
+                records: vec![first.clone(), reordered],
+                simulate_tamper: false,
+            }),
+        )
+        .await
+        .expect("reordered trace sync returns denial response")
+        .0;
+        assert!(!rejected.accepted);
+        assert_eq!(
+            rejected.reason_code.as_deref(),
+            Some("trace_sync_reordered")
+        );
+
+        let tampered = sync_device_trace_buffer(
+            Path(node_id),
+            State(state.clone()),
+            Json(DeviceTraceBufferSyncRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                run_id: run_id.clone(),
+                records: vec![first],
+                simulate_tamper: true,
+            }),
+        )
+        .await
+        .expect("tampered trace sync returns denial response")
+        .0;
+        assert!(!tampered.accepted);
+        assert_eq!(tampered.reason_code.as_deref(), Some("trace_sync_tampered"));
+
+        let missing_sync = sync_device_trace_buffer(
+            Path(NodeId::new()),
+            State(state),
+            Json(DeviceTraceBufferSyncRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                run_id,
+                records: Vec::new(),
+                simulate_tamper: false,
+            }),
+        )
+        .await
+        .expect_err("unregistered trace sync denied");
+        assert_eq!(missing_sync.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_sync.body.code, "device_not_registered");
+    }
+
+    #[tokio::test]
+    async fn operator_intervention_lifecycle_and_evidence_fail_closed() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::minutes(15))
+            .format(&Rfc3339)
+            .expect("expiry");
+
+        let requested = request_operator_intervention(
+            State(state.clone()),
+            Json(OperatorInterventionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                intervention_id: "intervention_unit".to_string(),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                node_id,
+                action_name: "move_to_waypoint".to_string(),
+                reason: "operator review".to_string(),
+                expires_at: expires_at.clone(),
+            }),
+        )
+        .await
+        .expect("request intervention")
+        .0;
+        assert_eq!(requested.status, "requested");
+        assert!(requested.evidence.is_none());
+
+        let granted = grant_operator_intervention(
+            Path("intervention_unit".to_string()),
+            State(state.clone()),
+            Json(OperatorDecisionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                reason: "cleared".to_string(),
+                expires_at: Some(expires_at.clone()),
+            }),
+        )
+        .await
+        .expect("grant intervention")
+        .0;
+        assert_eq!(granted.status, "granted");
+        let evidence = granted.evidence.clone().expect("grant evidence");
+        validate_operator_evidence(&state, &evidence, &run_id, "move_to_waypoint")
+            .expect("granted evidence validates");
+
+        let scope_error = validate_operator_evidence(&state, &evidence, &run_id, "dock")
+            .expect_err("wrong action denied");
+        assert_eq!(scope_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            scope_error.body.code,
+            "operator_intervention_scope_mismatch"
+        );
+
+        let unknown = OperatorInterventionEvidence {
+            intervention_id: "missing_intervention".to_string(),
+            ..evidence.clone()
+        };
+        let unknown_error =
+            validate_operator_evidence(&state, &unknown, &run_id, "move_to_waypoint")
+                .expect_err("unknown intervention denied");
+        assert_eq!(unknown_error.body.code, "operator_intervention_unknown");
+
+        let denied = deny_operator_intervention(
+            Path("intervention_unit".to_string()),
+            State(state.clone()),
+            Json(OperatorDecisionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                reason: "operator denied".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("deny intervention")
+        .0;
+        assert_eq!(denied.status, "denied");
+        let denied_evidence = denied.evidence.expect("denial evidence");
+        let denied_error =
+            validate_operator_evidence(&state, &denied_evidence, &run_id, "move_to_waypoint")
+                .expect_err("denied evidence fails closed");
+        assert_eq!(
+            denied_error.body.code,
+            "operator_intervention_scope_mismatch"
+        );
+
+        let missing = grant_operator_intervention(
+            Path("intervention_missing".to_string()),
+            State(state),
+            Json(OperatorDecisionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                reason: "missing".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("missing intervention denied");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.body.code, "operator_intervention_not_found");
+    }
+
+    #[tokio::test]
+    async fn physical_action_paths_execute_and_deny_safely() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        create_unit_run(&state, tenant_id.clone(), agent_id.clone(), run_id.clone()).await;
+        let _ = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+            }),
+        )
+        .await
+        .expect("register profile");
+
+        let executed = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect("execute bounded action")
+        .0;
+        assert_eq!(executed.status, ActionStatus::Executed);
+
+        let mut geofence = safe_context();
+        geofence.zone_ref = Some("zone_b".to_string());
+        let denied = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                geofence,
+            )),
+        )
+        .await
+        .expect("geofence returns denied outcome")
+        .0;
+        assert_eq!(denied.status, ActionStatus::Denied);
+        assert_eq!(denied.verification.reasons, vec!["geofence_violation"]);
+        assert_eq!(
+            denied.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
+        );
+
+        let mut low_battery = safe_context();
+        low_battery.battery_percent = Some(0.10);
+        let intervention = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                low_battery,
+            )),
+        )
+        .await
+        .expect("low battery denied by safety verifier")
+        .0;
+        assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
+        assert!(intervention
+            .verification
+            .reasons
+            .contains(&"battery_below_minimum".to_string()));
+        assert_eq!(
+            intervention.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
+        );
+
+        let mut stale_policy = safe_context();
+        stale_policy.offline = true;
+        stale_policy.policy_cache_expired = true;
+        stale_policy.high_risk = true;
+        let expired_policy = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                stale_policy,
+            )),
+        )
+        .await
+        .expect("expired offline policy denies high-risk action")
+        .0;
+        assert_eq!(expired_policy.status, ActionStatus::Denied);
+        assert_eq!(
+            expired_policy.verification.reasons,
+            vec!["policy_cache_expired"]
+        );
+
+        let mut direct_cloud = safe_context();
+        direct_cloud.cloud_helper_direct_authority = true;
+        direct_cloud.cloud_helper_proposal_id = Some("proposal_unit".to_string());
+        let cloud_denied = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                direct_cloud,
+            )),
+        )
+        .await
+        .expect("cloud helper direct authority denied")
+        .0;
+        assert_eq!(cloud_denied.status, ActionStatus::Denied);
+        assert_eq!(
+            cloud_denied.verification.reasons,
+            vec!["cloud_helper_direct_authority_denied"]
+        );
+
+        let profile_scope_error = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "inspect_zone",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect_err("profile allowlist denies action");
+        assert_eq!(profile_scope_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            profile_scope_error.body.code,
+            "physical_action_not_profile_allowed"
+        );
+
+        let mut wrong_tenant = physical_request(
+            run_id,
+            TenantId::new(),
+            agent_id,
+            "move_to_waypoint",
+            safe_context(),
+        );
+        wrong_tenant.action_request.audit_attribution = Some(unit_audit());
+        let wrong_scope = submit_physical_action(Path(node_id), State(state), Json(wrong_tenant))
+            .await
+            .expect_err("wrong tenant denied");
+        assert_eq!(wrong_scope.status, StatusCode::FORBIDDEN);
+        assert_eq!(wrong_scope.body.code, "wrong_scope");
+    }
+
+    #[test]
+    fn physical_helper_boundaries_fail_closed_and_preserve_safety_snapshot() {
+        let tenant_id = TenantId::new();
+        let node_id = NodeId::new();
+        let mut profile = unit_profile(node_id.clone(), tenant_id.clone());
+        validate_device_profile_payload(&profile).expect("valid profile");
+
+        profile.device_kind = "generic_device".to_string();
+        let bad_kind = validate_device_profile_payload(&profile).expect_err("kind denied");
+        assert_eq!(bad_kind.status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_kind.body.code, "unsupported_device_kind");
+
+        profile = unit_profile(node_id.clone(), tenant_id.clone());
+        profile.runtime_mode = "ephemeral".to_string();
+        let bad_mode = validate_device_profile_payload(&profile).expect_err("mode denied");
+        assert_eq!(bad_mode.body.code, "device_requires_resident_runtime");
+
+        profile = unit_profile(node_id.clone(), tenant_id.clone());
+        profile
+            .allowed_physical_actions
+            .push("inspect_zone".to_string());
+        validate_device_profile_payload(&profile).expect("additional bounded action");
+        let generated_forbidden = [FORBIDDEN_PHYSICAL_ACTION_PATTERNS[0], "unit"].join("_");
+        profile
+            .allowed_physical_actions
+            .push(generated_forbidden.clone());
+        let bad_action = validate_device_profile_payload(&profile).expect_err("action denied");
+        assert_eq!(bad_action.body.code, "low_level_physical_action_rejected");
+        assert!(matches_forbidden_physical_action(&generated_forbidden));
+        assert!(matches_forbidden_physical_action(
+            &generated_forbidden.replace('_', "-")
+        ));
+        assert!(!matches_forbidden_physical_action("move_to_waypoint"));
+
+        let request = physical_request(
+            RunId::new(),
+            tenant_id,
+            splendor_types::AgentId::new(),
+            "return_to_base",
+            SafetyContext {
+                battery_percent: Some(0.05),
+                altitude_m: Some(12.0),
+                max_altitude_m: Some(40.0),
+                privacy_clear: false,
+                human_proximity_clear: false,
+                emergency_stop_clear: false,
+                ..safe_context()
+            },
+        );
+        let snapshot = simulated_safety_snapshot(
+            &request,
+            &unit_profile(node_id, request.action_request.tenant_id.clone()),
+            "return_to_base",
+        );
+        assert_eq!(snapshot.min_battery_percent, Some(0.0));
+        assert_eq!(snapshot.altitude_m, Some(12.0));
+        assert_eq!(snapshot.max_altitude_m, Some(40.0));
+        assert_eq!(snapshot.emergency_stop_engaged, Some(true));
+        assert_eq!(snapshot.privacy_zone_active, Some(true));
+        assert_eq!(snapshot.proximity_m, Some(0.0));
+
+        let missing_audit = required_audit(None).expect_err("audit required");
+        assert_eq!(missing_audit.status, StatusCode::FORBIDDEN);
+        assert_eq!(missing_audit.body.code, "missing_audit_attribution");
+    }
+
+    #[tokio::test]
+    async fn device_audit_records_details_and_registration_fails_when_runtime_unavailable() {
+        let state = DaemonState::local_dev();
+        let audit_id = record_device_audit(
+            &state,
+            "device.audit.unit",
+            unit_audit(),
+            serde_json::json!({"node_id": "node_unit", "accepted": true}),
+        )
+        .expect("device audit");
+        {
+            let audit_events = state.inner.device_audit.lock().expect("audit lock");
+            assert_eq!(audit_events.len(), 1);
+            assert_eq!(audit_events[0].trace_event_id, audit_id);
+            assert_eq!(audit_events[0].event_type, "device.audit.unit");
+            assert_eq!(audit_events[0].details["accepted"], serde_json::json!(true));
+        }
+
+        state.set_runtime_available(false);
+        let denied = register_device_profile(
+            State(state),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(NodeId::new(), TenantId::new()),
+            }),
+        )
+        .await
+        .expect_err("unavailable runtime denies registration");
+        assert_eq!(denied.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(denied.body.code, "runtime_unavailable");
+    }
+
+    #[tokio::test]
+    async fn physical_action_boundary_errors_are_explicit() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+
+        let unregistered = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect_err("unregistered device denied");
+        assert_eq!(unregistered.status, StatusCode::NOT_FOUND);
+        assert_eq!(unregistered.body.code, "device_not_registered");
+
+        create_unit_run(&state, tenant_id.clone(), agent_id.clone(), run_id.clone()).await;
+        let _ = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+            }),
+        )
+        .await
+        .expect("register profile");
+
+        let unsupported_action = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "unknown_physical_action",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect_err("unsupported action denied");
+        assert_eq!(unsupported_action.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            unsupported_action.body.code,
+            "low_level_physical_action_rejected"
+        );
+
+        let wrong_agent = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                splendor_types::AgentId::new(),
+                "move_to_waypoint",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect_err("wrong agent denied");
+        assert_eq!(wrong_agent.status, StatusCode::FORBIDDEN);
+        assert_eq!(wrong_agent.body.code, "wrong_scope");
+
+        let mut intervention_context = safe_context();
+        intervention_context.privacy_clear = false;
+        let intervention = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                intervention_context,
+            )),
+        )
+        .await
+        .expect("privacy risk denied by safety verifier")
+        .0;
+        assert_eq!(intervention.status, ActionStatus::Denied);
+        assert_eq!(
+            intervention.verification.reasons,
+            vec!["privacy_zone_active"]
+        );
+
+        let mut bad_expiry = physical_request(
+            run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+            "move_to_waypoint",
+            safe_context(),
+        );
+        bad_expiry.operator_intervention_evidence = Some(OperatorInterventionEvidence {
+            intervention_id: "intervention_bad_expiry".to_string(),
+            tenant_id: tenant_id.clone(),
+            run_id: run_id.clone(),
+            action_name: "move_to_waypoint".to_string(),
+            decision: "granted".to_string(),
+            expires_at: "not-rfc3339".to_string(),
+        });
+        let bad_expiry_error = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(bad_expiry),
+        )
+        .await
+        .expect_err("bad expiry denied");
+        assert_eq!(bad_expiry_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_expiry_error.body.code,
+            "operator_intervention_bad_expiry"
+        );
+
+        let mut expired = physical_request(
+            run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+            "move_to_waypoint",
+            safe_context(),
+        );
+        expired.operator_intervention_evidence = Some(OperatorInterventionEvidence {
+            intervention_id: "intervention_expired".to_string(),
+            tenant_id: tenant_id.clone(),
+            run_id: run_id.clone(),
+            action_name: "move_to_waypoint".to_string(),
+            decision: "granted".to_string(),
+            expires_at: (OffsetDateTime::now_utc() - time::Duration::minutes(1))
+                .format(&Rfc3339)
+                .expect("expiry"),
+        });
+        let expired_error =
+            submit_physical_action(Path(node_id.clone()), State(state.clone()), Json(expired))
+                .await
+                .expect_err("expired intervention denied");
+        assert_eq!(expired_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(expired_error.body.code, "operator_intervention_expired");
+
+        let mut offline_safe = safe_context();
+        offline_safe.offline = true;
+        offline_safe.battery_percent = Some(0.05);
+        let safe_return = submit_physical_action(
+            Path(node_id),
+            State(state),
+            Json(physical_request(
+                run_id,
+                tenant_id,
+                agent_id,
+                "return_to_base",
+                offline_safe,
+            )),
+        )
+        .await
+        .expect("safe return action executes while offline")
+        .0;
+        assert_eq!(safe_return.status, ActionStatus::Executed);
     }
 }

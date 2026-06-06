@@ -145,13 +145,29 @@ fn valid_run_create_request_is_authorized() {
 fn endpoint_scope_strings_cover_daemon_and_registry_surface() {
     let cases = [
         (EndpointScope::RunsCreate, "splendor.runs.create"),
+        (EndpointScope::RunsStart, "splendor.runs.start"),
+        (EndpointScope::RunsRead, "splendor.runs.read"),
+        (EndpointScope::RunsPause, "splendor.runs.pause"),
         (EndpointScope::RunsResume, "splendor.runs.resume"),
+        (EndpointScope::RunsStop, "splendor.runs.stop"),
         (EndpointScope::PerceptsAppend, "splendor.percepts.append"),
         (EndpointScope::ActionsSubmit, "splendor.actions.submit"),
         (EndpointScope::TracesRead, "splendor.traces.read"),
         (EndpointScope::StateRead, "splendor.state.read"),
         (EndpointScope::ReplayCreate, "splendor.replay.create"),
         (EndpointScope::MessagesSend, "splendor.messages.send"),
+        (EndpointScope::MessagesRead, "splendor.messages.read"),
+        (
+            EndpointScope::WorkOrdersSubmit,
+            "splendor.work_orders.submit",
+        ),
+        (
+            EndpointScope::WorkOrdersRevoke,
+            "splendor.work_orders.revoke",
+        ),
+        (EndpointScope::FleetRead, "splendor.fleet.read"),
+        (EndpointScope::FleetDispatch, "splendor.fleet.dispatch"),
+        (EndpointScope::StateHandoff, "splendor.state.handoff"),
         (EndpointScope::HealthRead, "splendor.health.read"),
         (
             EndpointScope::CapabilitiesRead,
@@ -167,6 +183,19 @@ fn endpoint_scope_strings_cover_daemon_and_registry_surface() {
         (
             EndpointScope::InstancesHeartbeat,
             "splendor.instances.heartbeat",
+        ),
+        (EndpointScope::PoliciesPublish, "splendor.policies.publish"),
+        (EndpointScope::PoliciesRevoke, "splendor.policies.revoke"),
+        (EndpointScope::ApprovalsManage, "splendor.approvals.manage"),
+        (
+            EndpointScope::GovernanceControl,
+            "splendor.governance.control",
+        ),
+        (EndpointScope::DeviceRegister, "splendor.device.register"),
+        (EndpointScope::DeviceRead, "splendor.device.read"),
+        (
+            EndpointScope::OperatorIntervene,
+            "splendor.operator.intervene",
         ),
     ];
 

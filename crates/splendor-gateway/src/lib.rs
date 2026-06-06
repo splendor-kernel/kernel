@@ -287,6 +287,12 @@ pub struct SimulatedSafetySnapshot {
     pub allowed_zones: Vec<String>,
     pub battery_percent: Option<f64>,
     pub min_battery_percent: Option<f64>,
+    #[serde(default)]
+    pub policy_cache_expired: bool,
+    #[serde(default)]
+    pub high_risk: bool,
+    #[serde(default)]
+    pub cloud_helper_direct_authority: bool,
     pub emergency_stop_engaged: Option<bool>,
     pub collision_risk: Option<SimulatedRiskLevel>,
     pub altitude_m: Option<f64>,
@@ -1330,6 +1336,26 @@ fn normalize_physical_token(value: &str) -> String {
 
 fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerification {
     let verifier = "simulated_safety_verifier";
+    if snapshot.cloud_helper_direct_authority {
+        return simulated_deny(
+            verifier,
+            "cloud_helper_authority",
+            "cloud_helper_direct_authority_denied",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if snapshot.policy_cache_expired && snapshot.high_risk {
+        return simulated_deny(
+            verifier,
+            "policy_cache",
+            "policy_cache_expired",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
     if snapshot.emergency_stop_engaged.is_none() {
         return simulated_uncertain(verifier, "emergency_stop", snapshot, Vec::new(), Vec::new());
     }
@@ -1353,7 +1379,7 @@ fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerifi
         );
     }
     if snapshot.battery_percent < snapshot.min_battery_percent {
-        return simulated_deny(
+        return simulated_intervention(
             verifier,
             "battery",
             "battery_below_minimum",
@@ -1466,6 +1492,23 @@ fn simulated_deny(
 ) -> SafetyVerification {
     SafetyVerification::Denied(
         SafetyEvidence::new(verifier, check, SafetyCheckStatus::Deny, reason)
+            .with_sensor_refs(snapshot.sensor_refs.clone())
+            .with_zone_refs(zone_refs)
+            .with_thresholds(thresholds)
+            .into_verification(),
+    )
+}
+
+fn simulated_intervention(
+    verifier: &str,
+    check: &str,
+    reason: &str,
+    snapshot: &SimulatedSafetySnapshot,
+    zone_refs: Vec<String>,
+    thresholds: Vec<SafetyThresholdEvidence>,
+) -> SafetyVerification {
+    SafetyVerification::NeedsIntervention(
+        SafetyEvidence::new(verifier, check, SafetyCheckStatus::Uncertain, reason)
             .with_sensor_refs(snapshot.sensor_refs.clone())
             .with_zone_refs(zone_refs)
             .with_thresholds(thresholds)

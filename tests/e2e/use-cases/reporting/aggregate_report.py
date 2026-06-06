@@ -173,6 +173,89 @@ S5_REQUIRED_EVENTS = {
     "kill_switch.activated",
     "governance.audit.exported",
 }
+S6_REQUIRED_OPERATIONS = {
+    "registerDeviceProfile",
+    "getDeviceStatus",
+    "getPolicyCacheStatus",
+    "createRun",
+    "startRun",
+    "submitPhysicalAction",
+    "requestOperatorIntervention",
+    "grantOperatorIntervention",
+    "denyOperatorIntervention",
+    "syncDeviceTraceBuffer",
+    "exportTraces",
+    "replayRun",
+    "registerNode",
+    "heartbeatNode",
+    "registerInstance",
+    "submitWorkOrder",
+    "sendMessage",
+    "getMessage",
+    "managerAudit",
+}
+S6_REQUIRED_NEGATIVES = {
+    "forbidden_low_level_actions_rejected",
+    "geofence_breach_denied_before_adapter",
+    "low_battery_forces_return_to_base_or_intervention",
+    "expired_policy_cache_denies_high_risk_offline",
+    "cloud_helper_direct_action_attempt_denied",
+    "operator_approval_outside_scope_rejected",
+    "operator_approval_after_expiry_rejected",
+    "trace_sync_tamper_or_reordering_detected",
+}
+S6_REQUIRED_SECURITY_NEGATIVES = {
+    "device_endpoint_missing_credential_rejected",
+    "device_endpoint_wrong_audience_rejected",
+    "device_endpoint_wrong_tenant_rejected",
+}
+S6_REQUIRED_EVENTS = {
+    "device.profile.registered",
+    "policy.cache.loaded",
+    "policy.cache.expired",
+    "cloud_helper.proposal.received",
+    "safety.verification.started",
+    "safety.verification.completed",
+    "safety.verification.denied",
+    "action.executed",
+    "action.denied",
+    "action.needs_intervention",
+    "operator.intervention.requested",
+    "operator.intervention.granted",
+    "operator.intervention.denied",
+    "operator.intervention.expired",
+    "offline.entered",
+    "offline.exited",
+    "trace.buffer.appended",
+    "trace.sync.completed",
+    "trace.sync.failed",
+}
+S6_REQUIRED_SIMULATED_ACTION_LABELS = {
+    "read_battery_policy_warmup": 1,
+    "inspect_zone_from_typed_cloud_proposal": 1,
+    "move_to_waypoint_from_typed_cloud_proposal": 1,
+    "capture_image": 1,
+    "read_sensor_summary_offline": 1,
+    "return_to_base_low_battery_safe": 1,
+    "upload_trace_summary": 1,
+    "ambiguous_privacy_denied_until_operator": 0,
+    "operator_granted_capture": 1,
+    "geofence_breach_denied": 0,
+    "low_battery_needs_intervention": 0,
+    "expired_policy_cache_denied": 0,
+    "cloud_helper_direct_authority_denied": 0,
+    "operator_wrong_scope_denied": 0,
+    "operator_expired_evidence_denied": 0,
+}
+S6_DENIED_SIMULATOR_LABELS = {
+    "ambiguous_privacy_denied_until_operator",
+    "geofence_breach_denied",
+    "low_battery_needs_intervention",
+    "expired_policy_cache_denied",
+    "cloud_helper_direct_authority_denied",
+    "operator_wrong_scope_denied",
+    "operator_expired_evidence_denied",
+}
 
 
 def utc_now() -> str:
@@ -1193,6 +1276,201 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S6"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "device-profile.json",
+        "device-status.json",
+        "policy-cache-status.json",
+        "cloud-helper-message.json",
+        "cloud-helper-proposal.json",
+        "device-safety-evidence.json",
+        "operator-intervention.json",
+        "trace-sync-report.json",
+        "device-sim-counters.json",
+        "security-negatives.json",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s6_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s6_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s6_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s6_scenario_failure:{failure}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S6_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s6_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S6_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s6_missing_negative_cases:" + ",".join(missing_negatives))
+    missing_security_negatives = sorted(S6_REQUIRED_SECURITY_NEGATIVES - set(negatives))
+    if missing_security_negatives:
+        failures.append("s6_missing_security_negative_cases:" + ",".join(missing_security_negatives))
+    for case in (S6_REQUIRED_NEGATIVES | S6_REQUIRED_SECURITY_NEGATIVES) & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s6_negative_case_not_asserted:{case}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S6_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s6_missing_required_trace_events:" + ",".join(missing_events))
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s6_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s6_trace_event_id_not_uuid:{event_name}:{trace_id}")
+    profile = read_json(artifact_dir / "device-profile.json")
+    profile_body = profile.get("profile", profile)
+    if profile_body.get("device_kind") != "drone_sim" or profile_body.get("runtime_mode") != "resident":
+        failures.append("s6_device_profile_not_resident_drone_sim")
+    forbidden = set(profile_body.get("forbidden_action_classes", []))
+    if not {"set_motor_pwm", "disable_firmware_safety", "bypass_collision_avoidance", "ignore_emergency_stop"} <= forbidden:
+        failures.append("s6_device_profile_missing_forbidden_action_classes")
+    allowed = set(profile_body.get("allowed_physical_actions", []))
+    if not {"read_battery", "read_sensor_summary", "inspect_zone", "move_to_waypoint", "capture_image", "return_to_base", "upload_trace_summary"} <= allowed:
+        failures.append("s6_device_profile_missing_high_level_actions")
+    cache = read_json(artifact_dir / "policy-cache-status.json")
+    if cache.get("loaded") is not True or cache.get("expired") is not False:
+        failures.append("s6_policy_cache_status_not_loaded")
+    helper = read_json(artifact_dir / "cloud-helper-proposal.json")
+    public_message = read_json(artifact_dir / "cloud-helper-message.json")
+    helper_message = helper.get("message", {})
+    helper_payload = helper.get("proposal", {})
+    if helper_payload.get("direct_actuator_authority") is not False:
+        failures.append("s6_cloud_helper_has_direct_actuator_authority")
+    for field in ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "causal_parent", "created_at"]:
+        if not helper_message.get(field):
+            failures.append(f"s6_cloud_helper_missing_typed_message_field:{field}")
+    if helper_message.get("message_id") not in scenario.get("message_ids", []):
+        failures.append("s6_cloud_helper_message_id_missing_from_scenario")
+    if helper_message.get("schema") != "splendor.message.proposal_request.v1":
+        failures.append("s6_cloud_helper_wrong_message_schema")
+    if helper_message.get("requires_response") is not False:
+        failures.append("s6_cloud_helper_requires_response_unexpected")
+    if public_message.get("work_order_submit", {}).get("accepted") is not True:
+        failures.append("s6_cloud_helper_work_order_not_accepted_by_manager")
+    delivery = public_message.get("delivery", {})
+    received = public_message.get("received", {})
+    if delivery.get("message_id") != helper_message.get("message_id"):
+        failures.append("s6_cloud_helper_public_delivery_message_id_mismatch")
+    if delivery.get("delivery_status") != "delivered":
+        failures.append("s6_cloud_helper_public_delivery_not_delivered")
+    if delivery.get("receive_side_validated") is not True:
+        failures.append("s6_cloud_helper_public_delivery_not_receive_validated")
+    if delivery.get("remote_state_mutated") is not False:
+        failures.append("s6_cloud_helper_public_delivery_mutated_remote_state")
+    if received.get("message_id") != helper_message.get("message_id"):
+        failures.append("s6_cloud_helper_public_read_message_id_mismatch")
+    if public_message.get("manager_audit_contains_message_id") is not True:
+        failures.append("s6_cloud_helper_message_missing_from_manager_audit")
+    if public_message.get("trace_payload_contains_message_id") is not True:
+        failures.append("s6_cloud_helper_message_id_missing_from_trace_payload")
+    if public_message.get("trace_payload_contains_proposal_id") is not True:
+        failures.append("s6_cloud_helper_proposal_id_missing_from_trace_payload")
+    if helper_payload.get("proposal_id") != helper.get("local_validation_inputs", {}).get("inspect_zone", {}).get("cloud_helper_proposal_id"):
+        failures.append("s6_inspect_zone_not_linked_to_cloud_helper_proposal")
+    if helper.get("local_validation_outcomes", {}).get("inspect_zone", {}).get("status") != "Executed":
+        failures.append("s6_inspect_zone_not_executed_through_physical_endpoint")
+    if helper.get("direct_attempt", {}).get("status") != "Denied":
+        failures.append("s6_cloud_helper_direct_attempt_not_denied")
+    safety = read_json(artifact_dir / "device-safety-evidence.json")
+    if safety.get("positive", {}).get("safe_actions_executed") is not True:
+        failures.append("s6_safe_high_level_actions_not_executed")
+    safe_actions = safety.get("safe_actions", {})
+    if safe_actions.get("inspect_zone", {}).get("status") != "Executed":
+        failures.append("s6_safety_evidence_missing_inspect_zone_execution")
+    denials = safety.get("denials", {})
+    expected_denials = {
+        "geofence": ("Denied", "geofence_violation"),
+        "low_battery": ("NeedsIntervention", "battery_below_minimum"),
+        "expired_policy": ("Denied", "policy_cache_expired"),
+        "cloud_direct": ("Denied", "cloud_helper_direct_authority_denied"),
+    }
+    for key, (expected_status, expected_reason) in expected_denials.items():
+        if not denials.get(key):
+            failures.append(f"s6_missing_safety_denial:{key}")
+        elif denials.get(key, {}).get("status") != expected_status:
+            failures.append(f"s6_safety_denial_wrong_status:{key}")
+        elif expected_reason not in denials.get(key, {}).get("verification", {}).get("reasons", []):
+            failures.append(f"s6_safety_denial_missing_reason_code:{key}:{expected_reason}")
+        elif denials.get(key, {}).get("verification", {}).get("artifacts", {}).get("source") != "safety_verifier":
+            failures.append(f"s6_safety_denial_not_from_safety_verifier:{key}")
+    operator = read_json(artifact_dir / "operator-intervention.json")
+    if operator.get("ambiguous", {}).get("status") != "Denied":
+        failures.append("s6_ambiguous_action_not_denied")
+    elif operator.get("ambiguous", {}).get("verification", {}).get("artifacts", {}).get("source") != "safety_verifier":
+        failures.append("s6_ambiguous_action_not_from_safety_verifier")
+    if operator.get("grant", {}).get("status") != "granted" or operator.get("granted_capture", {}).get("status") != "Executed":
+        failures.append("s6_operator_grant_did_not_scope_execution")
+    if operator.get("wrong_scope", {}).get("status") != 403 or operator.get("expired", {}).get("status") != 403:
+        failures.append("s6_operator_scope_or_expiry_not_rejected")
+    trace_sync = read_json(artifact_dir / "trace-sync-report.json")
+    if trace_sync.get("completed", {}).get("accepted") is not True:
+        failures.append("s6_trace_sync_not_completed")
+    if trace_sync.get("tamper", {}).get("accepted") is not False or trace_sync.get("reordered", {}).get("accepted") is not False:
+        failures.append("s6_trace_sync_tamper_or_reorder_not_detected")
+    if trace_sync.get("tamper", {}).get("reason_code") != "trace_sync_hash_chain_mismatch":
+        failures.append("s6_trace_sync_tamper_wrong_reason")
+    if trace_sync.get("tampered_record_mutation") != "prev_event_hash" or trace_sync.get("reordered_records") is not True:
+        failures.append("s6_trace_sync_not_mutating_real_records")
+    simulator = read_json(artifact_dir / "device-sim-counters.json")
+    simulator_evidence = {item.get("label"): item for item in simulator.get("evidence", [])}
+    missing_sim_labels = sorted(set(S6_REQUIRED_SIMULATED_ACTION_LABELS) - set(simulator_evidence))
+    if missing_sim_labels:
+        failures.append("s6_missing_simulator_counter_labels:" + ",".join(missing_sim_labels))
+    for label, expected_delta in S6_REQUIRED_SIMULATED_ACTION_LABELS.items():
+        item = simulator_evidence.get(label, {})
+        if item.get("expected_sim_delta") != expected_delta or item.get("total_delta") != expected_delta:
+            failures.append(f"s6_simulator_counter_delta_mismatch:{label}")
+        if expected_delta == 1 and item.get("action_delta") != 1:
+            failures.append(f"s6_simulator_action_delta_mismatch:{label}")
+        if label in S6_DENIED_SIMULATOR_LABELS and item.get("total_delta") != 0:
+            failures.append(f"s6_denied_action_reached_simulator:{label}")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("simulator_actuator_calls_replayed") is not False:
+        failures.append("s6_replay_suppression_missing")
+    if replay.get("simulator_counter_before") != replay.get("simulator_counter_after"):
+        failures.append("s6_replay_changed_simulator_counters")
+    if simulator.get("before_replay") != simulator.get("after_replay"):
+        failures.append("s6_device_sim_counter_artifact_replay_changed")
+    security = read_json(artifact_dir / "security-negatives.json")
+    if security.get("missing_credential_status", {}).get("status") not in {401, 403} or security.get("missing_credential_action", {}).get("status") not in {401, 403}:
+        failures.append("s6_missing_credential_not_rejected")
+    for key in ["wrong_audience_status", "wrong_tenant_status", "wrong_audience_action", "wrong_tenant_action"]:
+        if security.get(key, {}).get("status") != 403:
+            failures.append(f"s6_security_negative_not_forbidden:{key}")
+    audit = read_json(artifact_dir / "audit-report.json")
+    if audit.get("cloud_helper_direct_action_authorized") is not False or audit.get("cloud_helper_authority") != "proposal_only":
+        failures.append("s6_audit_does_not_prove_cloud_helper_proposal_only")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "raw_physical_action_accepted", "cloud_helper_direct_actuator_authority", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s6_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes") or not scenario.get("work_order_ids") or not scenario.get("node_ids"):
+        failures.append("s6_missing_identity_state_work_order_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -1266,6 +1544,7 @@ def main() -> int:
     s3_scenario, s3_failures = load_s3_scenario(report_dir)
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
     s5_scenario, s5_failures = load_s5_scenario(report_dir)
+    s6_scenario, s6_failures = load_s6_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -1302,11 +1581,18 @@ def main() -> int:
         else:
             scenarios.append(s5_scenario)
             blocking.extend(s5_failures)
+    if args.scenario == "UC-E2E-S6" or args.mode == "all":
+        active_ids.add("UC-E2E-S6")
+        if s6_scenario is None:
+            blocking.append("missing_uc_e2e_s6_scenario_report")
+        else:
+            scenarios.append(s6_scenario)
+            blocking.extend(s6_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s5-governance",
+        "suite_version": "0.1-s6-physical-edge",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -1321,6 +1607,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S3",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S4",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S5",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S6",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -1353,7 +1640,8 @@ def main() -> int:
             "UC-E2E-S3 validates local multi-agent delegation through public crate APIs and splendorctl replay only; it does not claim daemon message API coverage.",
             "UC-E2E-S4 validates fleet dispatch through public manager and resident daemon HTTP APIs with same-image Splendor services.",
             "UC-E2E-S5 validates governance through public manager and daemon HTTP APIs without enterprise UI or direct governance-plane runtime mutation.",
-            "S5-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S6 validates physical/edge orchestration through public resident-edge daemon HTTP APIs without low-level robot control.",
+            "S7-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
