@@ -262,42 +262,6 @@ def public_replay_execution(base_url: str, run_id: str, credential: dict[str, An
     }
 
 
-def collect_explanations(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected = {
-        "approval": ("UC-E2E-S5", "approval_denial_blocks_pending_action"),
-        "denial": ("UC-E2E-S1", "deny_url"),
-        "quota_failure": ("UC-E2E-S3", "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger"),
-        "work_order_rejection": ("UC-E2E-S4", "unsigned_work_order"),
-        "data_scope_denial": ("UC-E2E-S7", "specialist_tenant_b_data_ref_denied_before_adapter"),
-        "safety_denial": ("UC-E2E-S6", "geofence_breach_denied_before_adapter"),
-    }
-    explanations: list[dict[str, Any]] = []
-    by_id = {source["scenario_id"]: source for source in sources}
-    for category, (scenario_id, case_name) in selected.items():
-        source = by_id[scenario_id]
-        candidates = source["report"].get("negative_cases") or source["audit_export"].get("negative_cases") or source["audit_export"].get("denials") or []
-        match = next((item for item in candidates if item.get("case") == case_name), {})
-        reason_codes = match.get("reason_codes") or match.get("reasons") or []
-        if not reason_codes:
-            for key in ["code", "reason", "status"]:
-                if match.get(key):
-                    reason_codes.append(str(match[key]))
-        if not reason_codes:
-            reason_codes.append(case_name)
-        explanations.append(
-            {
-                "category": category,
-                "scenario_id": scenario_id,
-                "case": case_name,
-                "reason_codes": sorted({str(code) for code in reason_codes if str(code)}),
-                "source_status": match.get("status"),
-                "source_passed": match.get("passed", True),
-                "trace_event_ids": match.get("trace_event_ids") or [],
-            }
-        )
-    return explanations
-
-
 def collect_explanations_with_public_tool(root: Path, commands: Path, sources: list[dict[str, Any]], artifact_dir: Path) -> list[dict[str, Any]]:
     selected = {
         "approval": ("UC-E2E-S5", "approval_denial_blocks_pending_action"),
@@ -432,6 +396,47 @@ def schema_migration_report(root: Path, artifacts_root: Path, artifact_dir: Path
     }
 
 
+def validate_replay_modes(root: Path, commands: Path, source_by_id: dict[str, dict[str, Any]], clean_dir: Path, audit_path: Path, artifact_dir: Path) -> dict[str, Any]:
+    mode_sources = {
+        "inspect_only": "UC-E2E-S4",
+        "read_only_re_evaluation": "UC-E2E-S1",
+        "policy_comparison": "UC-E2E-S3",
+        "verifier_explanation": "UC-E2E-S5",
+    }
+    modes: dict[str, Any] = {}
+    outputs = []
+    for mode, scenario_id in mode_sources.items():
+        source = source_by_id[scenario_id]
+        trace_path = clean_dir / scenario_id / "trace-export.jsonl"
+        state_path = clean_dir / scenario_id / "state-export.json"
+        proc = run_cmd(
+            splendorctl(root)
+            + [
+                "acceptance",
+                "replay-mode",
+                "--mode",
+                mode,
+                "--trace",
+                str(trace_path),
+                "--state",
+                str(state_path),
+                "--audit",
+                str(audit_path),
+                "--scenario-report",
+                str(source["artifact_dir"] / "scenario-report.json"),
+                "--source",
+                scenario_id,
+            ],
+            root,
+            commands,
+        )
+        evidence = json.loads(proc.stdout)
+        modes[mode] = evidence
+        outputs.append({"command": "acceptance replay-mode", "mode": mode, "source": scenario_id, "stdout": evidence, "public_command_exit": proc.returncode})
+    write_json(artifact_dir / "replay-mode-public-evidence.json", {"schema_version": "splendor.acceptance.replay_modes.v1", "modes": modes, "outputs": outputs})
+    return {"modes": modes, "outputs": outputs}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -564,12 +569,19 @@ def main() -> int:
                 replay_api_runs.append(public_replay_execution(base_url, run_id, replay_credential(instance_id), scenario_id))
     side_effect_counts_before = {item["label"] + ":" + item["run_id"]: item["adapter_executions_before"] for item in replay_api_runs}
     side_effect_counts_after = {item["label"] + ":" + item["run_id"]: item["adapter_executions_after"] for item in replay_api_runs}
-    replay_modes = {
-        "inspect_only": {"status": "completed", "side_effects_executed": False},
-        "read_only_re_evaluation": {"status": "completed", "allowed_only_for": ["read_only", "redacted_trace", "state_hash_validation"], "side_effects_executed": False},
-        "policy_comparison": {"status": "completed", "old_policy_ref": "prior-scenario-policy", "new_policy_ref": "uc-e2e-s8-comparison-policy", "side_effects_executed": False},
-        "verifier_explanation": {"status": "completed", "side_effects_executed": False},
-    }
+    explanations = collect_explanations_with_public_tool(root, commands, sources, artifact_dir)
+    verifier_mode_audit = artifact_dir / "verifier-explanation-mode-audit.json"
+    write_json(
+        verifier_mode_audit,
+        {
+            "schema_version": "splendor.acceptance.verifier_explanation_mode_audit.v1",
+            "source": "splendorctl acceptance audit-check",
+            "explanations": explanations,
+        },
+    )
+    replay_mode_report = validate_replay_modes(root, commands, source_by_id, clean_dir, verifier_mode_audit, artifact_dir)
+    replay_modes = replay_mode_report["modes"]
+    public_command_outputs.extend(replay_mode_report["outputs"])
     unsafe_replay_negative = next((item["unsafe_replay"] | {"http_status": item["unsafe_status"]} for item in replay_api_runs if item["unsafe_status"] in {400, 403}), {"status": "rejected", "reason_code": "side_effectful_replay_requires_explicit_gate", "http_status": 403})
     unsafe_replay_negative["status"] = "rejected" if unsafe_replay_negative.get("http_status") in {400, 403} else unsafe_replay_negative.get("status", "accepted")
     unsafe_replay_negative.setdefault("reason_code", unsafe_replay_negative.get("code", "side_effectful_replay_requires_explicit_gate"))
@@ -604,7 +616,6 @@ def main() -> int:
     trace_events.append(event("schema.migrated", "UC-E2E-S8", {"migrated_count": len(schema_report["migrated"]), "target": "splendor.0.1.stable.v1"}))
     trace_events.append(event("schema.rejected", "UC-E2E-S8", schema_report["unsupported_schema_negative"]))
 
-    explanations = collect_explanations_with_public_tool(root, commands, sources, artifact_dir)
     audit_package = {
         "schema_version": "splendor.audit_package.v1",
         "package_id": "audit_uc_e2e_s8_replay_audit_compat",
@@ -655,6 +666,16 @@ def main() -> int:
             failures.append(f"public_replay_counter_missing:{item['label']}:{item['run_id']}")
         if item["adapter_executions_before"] != item["adapter_executions_after"]:
             failures.append(f"public_replay_changed_adapter_counter:{item['label']}:{item['run_id']}")
+    for mode in ["inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"]:
+        evidence = replay_modes.get(mode, {})
+        if evidence.get("status") != "completed" or evidence.get("public_command") != "splendorctl acceptance replay-mode":
+            failures.append(f"public_replay_mode_validator_missing:{mode}")
+        if evidence.get("side_effects_executed") is not False or evidence.get("side_effects_allowed") is not False:
+            failures.append(f"public_replay_mode_side_effects_allowed:{mode}")
+        if not str(evidence.get("trace_digest", "")).startswith(("sha256:", "blake3:")) or not str(evidence.get("state_digest", "")).startswith(("sha256:", "blake3:")):
+            failures.append(f"public_replay_mode_missing_source_digest:{mode}")
+        if not evidence.get("matching_state_hashes"):
+            failures.append(f"public_replay_mode_state_hash_missing:{mode}")
 
     event_ids: dict[str, list[str]] = {}
     for row in trace_events:
@@ -704,6 +725,7 @@ def main() -> int:
         "adapter_executions_after": side_effect_counts_after,
         "public_replay_api_runs": replay_api_runs,
         "modes": replay_modes,
+        "public_replay_mode_outputs": replay_mode_report["outputs"],
         "unsafe_replay_negative": unsafe_replay_negative,
         "real_credential_negative": real_credential_negative,
         "source_scenarios": SOURCE_SCENARIOS,
@@ -755,7 +777,7 @@ def main() -> int:
         "audit-package.json": audit_package,
         "audit-report.json": audit_package,
         "anti-drift-results.json": anti,
-        "public-boundary-evidence.json": {"commands": public_command_outputs, "replay_api_runs": replay_api_runs, "real_credential_negative": real_credential_negative, "schema_public_command": schema_report.get("public_command")},
+        "public-boundary-evidence.json": {"commands": public_command_outputs, "replay_api_runs": replay_api_runs, "replay_mode_outputs": replay_mode_report["outputs"], "real_credential_negative": real_credential_negative, "schema_public_command": schema_report.get("public_command")},
     }
     for name, data in artifacts.items():
         path = artifact_dir / name

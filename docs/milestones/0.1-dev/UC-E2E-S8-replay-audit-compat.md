@@ -39,6 +39,7 @@ S8 public validators are exposed through `splendorctl acceptance`:
 - `validate-import` verifies trace chain hashes and state hash linkage from exported artifacts;
 - `compat` verifies supported schema fixtures can migrate to `splendor.0.1.stable.v1` and rejects unsupported or mismatched schema evidence;
 - `audit-check` verifies denial, approval, quota, work-order, data-scope, and safety evidence carries explicit reason codes;
+- `replay-mode` verifies each replay-mode claim from exported trace, state, audit, and scenario artifacts, records source digests, and reports `side_effects_executed: false` without executing adapters;
 - `replay-credential-check` rejects real external replay credential fixtures.
 
 ## 5. Runtime Primitives Touched
@@ -91,6 +92,8 @@ S8 validates four replay modes without side effects:
 - policy comparison;
 - verifier explanation.
 
+Inspect-only replay additionally calls the documented daemon replay API and compares adapter execution counters before and after the replay request. Read-only re-evaluation, policy comparison, and verifier explanation are validated by `splendorctl acceptance replay-mode` against exported artifacts instead of hardcoded scenario claims.
+
 Side-effectful replay requests are rejected unless separately gated and explicitly marked. S8 records the negative case `side_effectful_replay_mode_rejected_without_gate` and verifies `side_effects_allowed_default: false`.
 
 ## 10. Failure Behavior
@@ -125,6 +128,7 @@ Expected S8 artifacts include:
 - `artifacts/UC-E2E-S8/state-import-report.json`
 - `artifacts/UC-E2E-S8/tamper-report.json`
 - `artifacts/UC-E2E-S8/replay-report.json`
+- `artifacts/UC-E2E-S8/replay-mode-public-evidence.json`
 - `artifacts/UC-E2E-S8/schema-migration-report.json`
 - `artifacts/UC-E2E-S8/audit-package.json`
 - `artifacts/UC-E2E-S8/public-boundary-evidence.json`
@@ -147,6 +151,13 @@ splendorctl acceptance audit-check \
   --scenario-report target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/scenario-report.json \
   --case deny_url \
   --category denial
+splendorctl acceptance replay-mode \
+  --mode read_only_re_evaluation \
+  --trace target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S8/clean-import-workspace/UC-E2E-S1/trace-export.jsonl \
+  --state target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S8/clean-import-workspace/UC-E2E-S1/state-export.json \
+  --audit target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S8/verifier-explanation-mode-audit.json \
+  --scenario-report target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/scenario-report.json \
+  --source UC-E2E-S1
 python3 tests/e2e/use-cases/reporting/aggregate_report.py \
   --root . \
   --report-dir target/splendor-e2e/use-case-acceptance \

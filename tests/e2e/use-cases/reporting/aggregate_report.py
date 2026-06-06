@@ -1881,10 +1881,29 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"s8_public_replay_counter_changed:{item.get('label')}:{item.get('run_id')}")
     modes = replay.get("modes", {})
     for mode in ["inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"]:
-        if modes.get(mode, {}).get("status") != "completed":
+        evidence = modes.get(mode, {})
+        if evidence.get("status") != "completed":
             failures.append(f"s8_replay_mode_not_completed:{mode}")
+        if evidence.get("schema_version") != "splendor.acceptance.replay_mode.v1":
+            failures.append(f"s8_replay_mode_missing_public_schema:{mode}")
+        if evidence.get("public_command") != "splendorctl acceptance replay-mode":
+            failures.append(f"s8_replay_mode_missing_public_command:{mode}")
+        if evidence.get("side_effects_allowed") is not False or evidence.get("side_effects_executed") is not False:
+            failures.append(f"s8_replay_mode_side_effectful:{mode}")
+        for key in ["trace_digest", "state_digest", "audit_digest", "scenario_report_digest", "trace_chain_hash"]:
+            if not str(evidence.get(key, "")).startswith(("sha256:", "blake3:")):
+                failures.append(f"s8_replay_mode_missing_digest:{mode}:{key}")
+        if not evidence.get("matching_state_hashes"):
+            failures.append(f"s8_replay_mode_missing_state_hash_evidence:{mode}")
+        if evidence.get("trace_records", 0) <= 0:
+            failures.append(f"s8_replay_mode_empty_trace:{mode}")
     if modes.get("policy_comparison", {}).get("side_effects_executed") is not False:
         failures.append("s8_policy_comparison_executed_side_effect")
+    replay_mode_outputs = replay.get("public_replay_mode_outputs", []) or public_boundary.get("replay_mode_outputs", [])
+    output_modes = {item.get("mode") for item in replay_mode_outputs if item.get("command") == "acceptance replay-mode" and item.get("public_command_exit") == 0}
+    missing_output_modes = sorted({"inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"} - output_modes)
+    if missing_output_modes:
+        failures.append("s8_public_replay_mode_outputs_missing:" + ",".join(missing_output_modes))
     unsafe = replay.get("unsafe_replay_negative", {})
     if unsafe.get("status") != "rejected" or unsafe.get("side_effects_allowed_default") is not False:
         failures.append("s8_unsafe_replay_not_rejected")
