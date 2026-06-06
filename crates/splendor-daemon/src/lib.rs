@@ -4284,6 +4284,142 @@ mod tests {
         }
     }
 
+    fn unit_daemon_action_request(
+        tenant_id: TenantId,
+        action_name: &str,
+        params: serde_json::Value,
+    ) -> ActionRequest {
+        ActionRequest {
+            action_id: ActionId::new(),
+            tenant_id,
+            agent_id: splendor_types::AgentId::new(),
+            run_id: RunId::new(),
+            action: Action {
+                name: action_name.to_string(),
+                params,
+                side_effect_class: splendor_types::SideEffectClass::External,
+                cost_estimate: None,
+                required_permissions: vec![action_name.to_string()],
+                preconditions: Vec::new(),
+                postconditions: vec!["recorded".to_string()],
+            },
+            adapter: Some("artifact-store".to_string()),
+            quota_usage: splendor_types::QuotaUsage::single_action(),
+            satisfied_preconditions: Vec::new(),
+            requested_at: OffsetDateTime::now_utc(),
+            approval_evidence: None,
+        }
+    }
+
+    #[test]
+    fn data_artifact_boundary_and_recording_adapter_cover_s7_paths() {
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+        let tenant_id = TenantId::new();
+        let allowed_ref = "dataset:tenant-a.finance.board_pack.v1".to_string();
+        let verifier =
+            DataArtifactBoundaryVerifier::new(tenant_id.clone(), vec![allowed_ref.clone()]);
+
+        let data_action = unit_daemon_action_request(
+            tenant_id.clone(),
+            "data.read_fixture",
+            serde_json::json!({"data_ref": allowed_ref, "data_refs": ["dataset:tenant-a.finance.board_pack.v1"]}),
+        );
+        let allowed = verifier.verify_resource_boundary(&data_action, Some("fixture-data-store"));
+        assert!(allowed.allowed);
+        assert!(allowed
+            .reasons
+            .iter()
+            .any(|reason| reason == "data_scope_verified"));
+
+        let denied_data = unit_daemon_action_request(
+            tenant_id.clone(),
+            "data.read_fixture",
+            serde_json::json!({"data_refs": ["dataset:tenant-b.finance.board_pack.v1"]}),
+        );
+        let denied = verifier.verify_resource_boundary(&denied_data, Some("fixture-data-store"));
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "data_scope_denied"));
+
+        let artifact_mismatch = unit_daemon_action_request(
+            tenant_id.clone(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_ref": "artifact://wrong-tenant/board.md"}),
+        );
+        let denied = verifier.verify_resource_boundary(&artifact_mismatch, Some("artifact-store"));
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "artifact_path_tenant_mismatch"));
+
+        let executions = Arc::new(AtomicU64::new(0));
+        let adapter = RecordingAdapter {
+            executions: Arc::clone(&executions),
+        };
+        let data_output = adapter.execute(&data_action).expect("data output").output;
+        assert_eq!(data_output["adapter"], "fixture-data-store");
+        assert_eq!(data_output["raw_payload_included"], false);
+
+        let internal_artifact = unit_daemon_action_request(
+            tenant_id.clone(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_path": format!("artifact://{tenant_id}/board.md")}),
+        );
+        let output = adapter
+            .execute(&internal_artifact)
+            .expect("internal artifact output")
+            .output;
+        assert_eq!(output["adapter"], "artifact-store");
+        assert_eq!(output["tenant_id"], tenant_id.to_string());
+
+        let publish = unit_daemon_action_request(
+            tenant_id,
+            "artifact.publish_external",
+            serde_json::json!({"publish_ref": "artifact://tenant-a/board.md"}),
+        );
+        let output = adapter.execute(&publish).expect("publish output").output;
+        assert_eq!(output["published"], true);
+        assert_eq!(output["external_store"], "fake-artifact-store");
+
+        let generic = unit_daemon_action_request(
+            TenantId::new(),
+            "daemon.record",
+            serde_json::json!({"note": "generic"}),
+        );
+        let output = adapter.execute(&generic).expect("generic output").output;
+        assert_eq!(output["adapter"], "daemon.recording");
+        assert_eq!(output["device_sim"], serde_json::Value::Null);
+
+        let fail = unit_daemon_action_request(
+            TenantId::new(),
+            "artifact.create_internal",
+            serde_json::json!({"fail_adapter": true}),
+        );
+        assert!(adapter.execute(&fail).is_err());
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn resident_daemon_config_requires_authenticated_caller() {
+        let instance_id = splendor_types::InstanceId::new();
+        let config = DaemonConfig::resident(instance_id.clone());
+        assert!(config.insecure_dev_mode.is_none());
+        assert_eq!(
+            config.expected_audience,
+            CredentialAudience::Instance { instance_id }
+        );
+
+        let state = DaemonState::new(config);
+        let denied = state
+            .validate_security(DaemonEndpoint::Health, None, None, None)
+            .expect_err("resident daemon must not accept anonymous requests");
+        assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.body.code, "anonymous_non_dev_call");
+    }
+
     #[test]
     fn device_sim_url_parser_and_disabled_env_path_are_explicit() {
         assert_eq!(
@@ -4736,6 +4872,37 @@ mod tests {
         let allowed =
             evaluator.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
         assert!(allowed.allowed);
+
+        let poisoned = SharedCircuitBreakerEvaluator::default();
+        let poison_handle = poisoned.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_handle.breakers.lock().expect("lock breakers");
+            panic!("poison circuit breaker lock for fail-closed verification");
+        }));
+
+        let denied =
+            poisoned.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "circuit_breaker_state_unavailable"));
+
+        let action = unit_daemon_action_request(
+            TenantId::new(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_ref":"artifact://tenant/unit.md"}),
+        );
+        let denied = poisoned.verify_action(
+            &action,
+            Some("artifact-store"),
+            &splendor_types::RuntimeIdentityContext::default(),
+        );
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "circuit_breaker_state_unavailable"));
     }
 
     #[tokio::test]
