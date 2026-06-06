@@ -687,7 +687,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         trace_export["record_count"].as_u64(),
-        Some(traces.records.len() as u64)
+        Some(traces.records.len() as u64 + 1)
     );
     assert!(trace_export["integrity_hash"]
         .as_str()
@@ -1643,8 +1643,8 @@ async fn revoked_policy_bundle_blocks_existing_side_effects() {
     let submit = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),
-        tenant_id,
-        agent_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
         credential: None,
         audit_attribution: Some(attribution()),
         causal_trace_id,
@@ -2213,11 +2213,11 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     let submit = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),
-        tenant_id,
-        agent_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
         credential: None,
         audit_attribution: Some(attribution()),
-        causal_trace_id,
+        causal_trace_id: causal_trace_id.clone(),
         action: denied_action,
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -2238,6 +2238,34 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         .reasons
         .iter()
         .any(|reason| reason == "permission_denied"));
+    let disallowed_submit = SubmitActionRequest {
+        action_id: None,
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id,
+        action: action("outside_work_order"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: None,
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(disallowed_submit).expect("disallowed submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "action_not_allowed"));
     let (status, traces): (StatusCode, TracePageResponse) = call_empty(
         app,
         Method::GET,

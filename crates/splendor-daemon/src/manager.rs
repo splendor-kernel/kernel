@@ -14,11 +14,12 @@ use splendor_types::{
     select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
     CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CredentialAudience,
     CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus,
-    InstanceId, InstanceRegistration, InstanceTelemetry, MessageEnvelope, MessageId, NodeHeartbeat,
-    NodeId, NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
-    PlacementExecutionMode, PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope,
-    RevocationStatus, RunId, RunStatus, RunTelemetry, TelemetryRuntimeMode, TenantId,
-    TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    InstanceId, InstanceRegistration, InstanceTelemetry, Message, MessageEnvelope, MessageId,
+    NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
+    PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
+    PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus, RunTelemetry,
+    TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -320,6 +321,8 @@ pub struct MessageStatusReport {
     pub route_permission: Option<String>,
     pub remote_state_mutated: bool,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_trace_event_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1056,7 +1059,15 @@ fn resident_create_run_payload(
     let allowed_permissions = &work_order.work_order.allowed_permissions;
     let mut registered_actions = Vec::new();
     let mut policy_actions = Vec::new();
+    let mut approval_policies = Vec::new();
     for (action, adapter, permission, side_effect_class, params) in [
+        (
+            "data.read_fixture",
+            "fixture-data-store",
+            "data.read_fixture",
+            "ReadOnly",
+            serde_json::json!({"data_ref": work_order.work_order.data_refs.first().cloned().unwrap_or_else(|| "dataset:missing".to_string())}),
+        ),
         (
             "sql.read_fixture",
             "fixture-sql",
@@ -1069,13 +1080,20 @@ fn resident_create_run_payload(
             "artifact-store",
             "artifact.create_internal",
             "External",
-            serde_json::json!({"artifact":"internal-proposal"}),
+            serde_json::json!({"artifact":"internal-proposal", "artifact_path": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
+        ),
+        (
+            "artifact.publish_external",
+            "artifact-store",
+            "artifact.publish_external",
+            "External",
+            serde_json::json!({"publish_ref": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
         ),
     ] {
         let action_allowed = allowed_actions.iter().any(|item| item == action);
         let adapter_allowed = allowed_adapters.iter().any(|item| item == adapter);
         let permission_allowed = allowed_permissions.iter().any(|item| item == permission);
-        if action_allowed || adapter_allowed || permission_allowed {
+        if action_allowed || permission_allowed {
             if !(action_allowed && adapter_allowed && permission_allowed) {
                 return Err(ManagerApiError::forbidden(
                     "work_order_authority_incomplete",
@@ -1091,6 +1109,21 @@ fn resident_create_run_payload(
                 "quota_usage": {"actions": 1, "action_duration_ms": 0, "filesystem_read_bytes": 0, "filesystem_write_bytes": 0, "network_read_bytes": 0, "network_write_bytes": 0, "http_requests": 0},
                 "satisfied_preconditions": []
             }));
+            if action == "artifact.publish_external" {
+                approval_policies.push(serde_json::json!({
+                    "schema_version": "splendor.approval_policy.v1",
+                    "policy_id": format!("policy_{work_order_id}_artifact_publish_external", work_order_id = work_order.work_order.work_order_id),
+                    "tenant_id": work_order.work_order.tenant_id,
+                    "agent_id": work_order.work_order.agent_id,
+                    "action_name": "artifact.publish_external",
+                    "adapter": "artifact-store",
+                    "required_permission": "artifact.publish_external",
+                    "side_effect_class": "External",
+                    "risk_level": "high",
+                    "reason": "external artifact publication requires scoped approval",
+                    "expires_at": null
+                }));
+            }
         }
     }
     if allowed_actions
@@ -1122,6 +1155,7 @@ fn resident_create_run_payload(
         "allowed_permissions": allowed_permissions,
         "registered_actions": registered_actions,
         "policy_actions": policy_actions,
+        "approval_policies": approval_policies,
         "allowed_percept_schemas": [],
         "allowed_percept_sources": [],
         "initial_state": {"dispatch":"uc-e2e-s4"},
@@ -1204,14 +1238,19 @@ async fn send_message(
             "remote message requires an explicit idempotency marker",
         ));
     }
-    if request.message_envelope.message.schema != "splendor.message.proposal_request.v1" {
+    if !matches!(
+        request.message_envelope.message.schema.as_str(),
+        "splendor.message.proposal_request.v1"
+            | "splendor.message.task_request.v1"
+            | "splendor.message.task_response.v1"
+    ) {
         state.audit(
             "remote_message.rejected",
             serde_json::json!({"message_id": request.message_envelope.message.message_id, "reason": "unsupported_message_schema", "schema": request.message_envelope.message.schema}),
         )?;
         return Err(ManagerApiError::bad_request(
             "unsupported_message_schema",
-            "S4 manager transport only accepts proposal request messages",
+            "manager transport only accepts stable proposal/task message schemas",
         ));
     }
     let source_instance = InstanceId::parse(&request.source_instance_id)
@@ -1321,6 +1360,7 @@ async fn send_message(
         route_permission,
         remote_state_mutated: false,
         reason,
+        read_trace_event_id: None,
     };
     state
         .inner
@@ -1350,7 +1390,11 @@ fn validate_remote_message_authority(
             "remote message work order must bind a run id",
         )
     })?;
-    if message.run_id != *work_order_run_id {
+    let message_run_authorized = message.run_id == *work_order_run_id
+        || task_response_child_run_id(message)
+            .map(|child_run_id| child_run_id == work_order_run_id.to_string())
+            .unwrap_or(false);
+    if !message_run_authorized {
         return Err(ManagerApiError::forbidden(
             "message_run_mismatch",
             "message run_id does not match work-order authority",
@@ -1408,7 +1452,58 @@ fn validate_remote_message_authority(
             "target agent is not authorized by the submitted work order route permission",
         ));
     }
+    if message_payload_smuggles_authority(&message.payload, work_order) {
+        return Err(ManagerApiError::forbidden(
+            "message_payload_scope_smuggling",
+            "message payload cannot grant data refs or permissions outside work-order authority",
+        ));
+    }
     Ok(())
+}
+
+fn message_payload_smuggles_authority(
+    payload: &serde_json::Value,
+    work_order: &WorkOrderEnvelope,
+) -> bool {
+    let allowed_data_refs = &work_order.work_order.data_refs;
+    let allowed_permissions = &work_order.work_order.allowed_permissions;
+    let data_refs: Vec<&str> = payload
+        .get("data_refs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if data_refs
+        .iter()
+        .any(|data_ref| !allowed_data_refs.iter().any(|allowed| allowed == *data_ref))
+    {
+        return true;
+    }
+    let permissions: Vec<&str> = payload
+        .get("permissions")
+        .or_else(|| payload.get("allowed_permissions"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    permissions.iter().any(|permission| {
+        !allowed_permissions
+            .iter()
+            .any(|allowed| allowed == *permission)
+    })
+}
+
+fn task_response_child_run_id(message: &Message) -> Option<&str> {
+    if message.schema == "splendor.message.task_response.v1" {
+        message
+            .payload
+            .get("child_run_id")
+            .and_then(serde_json::Value::as_str)
+    } else {
+        None
+    }
 }
 
 async fn get_message(
@@ -1422,7 +1517,7 @@ async fn get_message(
         EndpointScope::MessagesRead,
         false,
     )?;
-    let report = state
+    let mut report = state
         .inner
         .messages
         .lock()
@@ -1430,6 +1525,24 @@ async fn get_message(
         .get(&message_id.to_string())
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("message_not_found", "message not found"))?;
+    let read_trace_event_id = state.audit(
+        "remote_message.received",
+        serde_json::json!({
+            "message_id": message_id,
+            "delivery_trace_event_id": report.trace_event_id,
+            "work_order_id": report.work_order_id,
+            "delivery_status": report.delivery_status,
+            "receive_side_validated": report.receive_side_validated,
+            "remote_state_mutated": false,
+        }),
+    )?;
+    report.read_trace_event_id = Some(read_trace_event_id.clone());
+    state
+        .inner
+        .messages
+        .lock()
+        .map_err(|_| ManagerApiError::internal("message_lock", "message lock unavailable"))?
+        .insert(message_id.to_string(), report.clone());
     Ok(Json(report))
 }
 

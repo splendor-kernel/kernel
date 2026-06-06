@@ -243,7 +243,7 @@ def main() -> int:
 
     cred = manager_credential()
     nodes = [
-        node_registration(VPC_NODE_ID, "vpc.worker", "customer_vpc", "vpc", args.vpc_url, ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal", "runtime.resident"]),
+        node_registration(VPC_NODE_ID, "vpc.worker", "customer_vpc", "vpc", args.vpc_url, ["sql.read_fixture", "data.read_fixture", "artifact.create_internal", "artifact.publish_external", "message.remote.proposal", "runtime.resident"]),
         node_registration(CLOUD_NODE_ID, "cloud.worker", "resident_cloud_pool", "cloud", args.cloud_url, ["message.remote.proposal", "runtime.resident"]),
         node_registration(EDGE_NODE_ID, "edge.appliance", "edge_device", "device", "http://resident-edge-node:8093", ["runtime.resident", "trace.buffer.local"]),
     ]

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
     AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
-    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
@@ -268,6 +268,7 @@ struct RunSlot {
     percept_queue: PerceptQueue,
     allowed_percept_schemas: Vec<String>,
     allowed_percept_sources: Vec<String>,
+    allowed_actions: Vec<String>,
     state_head: Option<StateNodeId>,
     adapter_executions: Arc<AtomicU64>,
     approval_evidence: ApprovalEvidenceSlot,
@@ -452,15 +453,168 @@ impl ActionAdapter for RecordingAdapter {
         }
         let execution = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
         let simulator = submit_device_sim_action(action, execution)?;
-        Ok(AdapterResult {
-            output: serde_json::json!({
+        let output = if action.action.name == "data.read_fixture" {
+            let data_ref = action
+                .action
+                .params
+                .get("data_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            serde_json::json!({
+                "adapter": "fixture-data-store",
+                "execution": execution,
+                "action": action.action.name,
+                "data_ref": data_ref,
+                "raw_payload_included": false,
+                "analysis_summary": "trace-safe aggregate analysis for scoped data ref",
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "data_ref": data_ref, "fixture": "uc-e2e-s7"})),
+            })
+        } else if action.action.name == "artifact.create_internal" {
+            let path = action
+                .action
+                .params
+                .get("artifact_path")
+                .or_else(|| action.action.params.get("artifact_ref"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("artifact://unknown");
+            serde_json::json!({
+                "adapter": "artifact-store",
+                "execution": execution,
+                "action": action.action.name,
+                "artifact_path": path,
+                "tenant_id": action.tenant_id,
+                "raw_payload_included": false,
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "artifact_path": path, "kind": "internal"})),
+            })
+        } else if action.action.name == "artifact.publish_external" {
+            serde_json::json!({
+                "adapter": "artifact-store",
+                "execution": execution,
+                "action": action.action.name,
+                "published": true,
+                "external_store": "fake-artifact-store",
+                "raw_payload_included": false,
+                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "action": action.action.name, "kind": "external_publish"})),
+            })
+        } else {
+            serde_json::json!({
                 "adapter": "daemon.recording",
                 "execution": execution,
                 "action": action.action.name,
                 "device_sim": simulator,
-            }),
+            })
+        };
+        Ok(AdapterResult {
+            output,
             satisfied_postconditions: action.action.postconditions.clone(),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DataArtifactBoundaryVerifier {
+    tenant_id: TenantId,
+    allowed_data_refs: Vec<String>,
+}
+
+impl DataArtifactBoundaryVerifier {
+    fn new(tenant_id: TenantId, allowed_data_refs: Vec<String>) -> Self {
+        Self {
+            tenant_id,
+            allowed_data_refs,
+        }
+    }
+
+    fn requested_data_refs(action: &ActionRequest) -> Vec<String> {
+        let mut refs = Vec::new();
+        if let Some(value) = action
+            .action
+            .params
+            .get("data_ref")
+            .and_then(serde_json::Value::as_str)
+        {
+            refs.push(value.to_string());
+        }
+        if let Some(values) = action
+            .action
+            .params
+            .get("data_refs")
+            .and_then(serde_json::Value::as_array)
+        {
+            refs.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+        refs
+    }
+}
+
+impl ResourceBoundaryVerifier for DataArtifactBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> splendor_types::VerificationResult {
+        let requested_refs = Self::requested_data_refs(action);
+        for data_ref in &requested_refs {
+            if !self
+                .allowed_data_refs
+                .iter()
+                .any(|allowed| allowed == data_ref)
+            {
+                return splendor_types::VerificationResult {
+                    allowed: false,
+                    reasons: vec!["data_scope_denied".to_string()],
+                    artifacts: serde_json::json!({
+                        "source": "data_scope_verifier",
+                        "reason_code": "data_scope_denied",
+                        "requested_data_ref": data_ref,
+                        "allowed_data_refs": self.allowed_data_refs,
+                    }),
+                };
+            }
+        }
+
+        if action.action.name.starts_with("artifact.") {
+            let tenant_id = self.tenant_id.to_string();
+            for field in ["artifact_path", "artifact_ref", "publish_ref"] {
+                if let Some(path) = action
+                    .action
+                    .params
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if path.starts_with("artifact://")
+                        && !path.starts_with(&format!("artifact://{tenant_id}/"))
+                    {
+                        return splendor_types::VerificationResult {
+                            allowed: false,
+                            reasons: vec!["artifact_path_tenant_mismatch".to_string()],
+                            artifacts: serde_json::json!({
+                                "source": "artifact_scope_verifier",
+                                "reason_code": "artifact_path_tenant_mismatch",
+                                "field": field,
+                                "artifact_path": path,
+                                "tenant_id": tenant_id,
+                            }),
+                        };
+                    }
+                }
+            }
+        }
+
+        splendor_types::VerificationResult {
+            allowed: true,
+            reasons: vec!["data_scope_verified".to_string()],
+            artifacts: serde_json::json!({
+                "source": "data_scope_verifier",
+                "reason_code": "data_scope_verified",
+                "data_refs": requested_refs,
+            }),
+        }
     }
 }
 
@@ -1309,6 +1463,10 @@ async fn create_run(
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
+    gateway.set_resource_boundary_verifier(Arc::new(DataArtifactBoundaryVerifier::new(
+        request.tenant_id.clone(),
+        validated_work_order.data_refs.clone(),
+    )));
     if !request.approval_policies.is_empty() {
         gateway.set_approval_verifier(Arc::new(PolicyApprovalVerifier::new(
             request.approval_policies.clone(),
@@ -1430,6 +1588,7 @@ async fn create_run(
         percept_queue,
         allowed_percept_schemas: request.allowed_percept_schemas,
         allowed_percept_sources: request.allowed_percept_sources,
+        allowed_actions: validated_work_order.allowed_actions.clone(),
         state_head: None,
         adapter_executions,
         approval_evidence,
@@ -2064,7 +2223,7 @@ async fn export_traces(
         request.credential.as_ref(),
         request.audit_attribution.as_ref(),
     )?;
-    state.validate_security(
+    let security = state.validate_security(
         DaemonEndpoint::TraceRead {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
@@ -2073,6 +2232,11 @@ async fn export_traces(
         request.credential,
         None,
         request.audit_attribution,
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.traces.export.redacted",
+        security.audit_attribution,
     )?;
     let records = match (request.start, request.end) {
         (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
@@ -2109,13 +2273,13 @@ async fn replay_run(
             "local daemon replay is inspect-only and must not allow side effects",
         ));
     }
-    let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
-    let slot = runs.get(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
     require_post_audit_attribution(
         request.credential.as_ref(),
         request.audit_attribution.as_ref(),
     )?;
-    state.validate_security(
+    let security = state.validate_security(
         DaemonEndpoint::ReplayCreate {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
@@ -2123,6 +2287,11 @@ async fn replay_run(
         request.credential,
         None,
         request.audit_attribution,
+    )?;
+    record_daemon_audit(
+        slot,
+        "splendor.replay.explained",
+        security.audit_attribution,
     )?;
     let records = slot
         .trace_store
@@ -2212,6 +2381,51 @@ async fn submit_action(
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.approval_evidence,
     };
+    if !slot
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed == &action_request.action.name)
+    {
+        let verification = splendor_types::VerificationResult {
+            allowed: false,
+            reasons: vec!["action_not_allowed".to_string()],
+            artifacts: serde_json::json!({
+                "context": {
+                    "source": "signed_work_order_action_scope",
+                    "tenant_id": action_request.tenant_id,
+                    "agent_id": action_request.agent_id,
+                    "run_id": action_request.run_id,
+                    "action_id": action_request.action_id,
+                    "action": action_request.action.name,
+                    "adapter": action_request.adapter,
+                }
+            }),
+        };
+        let outcome = ActionOutcome {
+            action_id: action_request.action_id,
+            status: ActionStatus::Denied,
+            verification,
+            post_verification: None,
+            output: None,
+            error: Some("action_not_allowed".to_string()),
+            completed_at: OffsetDateTime::now_utc(),
+        };
+        record_run_event(
+            slot,
+            TraceEventKind::ActionVerificationCompleted {
+                action: request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+        record_run_event(
+            slot,
+            TraceEventKind::ActionDenied {
+                action: request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+        return Ok(Json(outcome));
+    }
     let outcome = slot.gateway.submit(action_request).map_err(|error| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3719,6 +3933,16 @@ fn trace_export_integrity_hash(records: &[TraceRecord]) -> String {
     format!("trace-chain:v1:{}:{last_event_hash}", records.len())
 }
 
+fn stable_json_hash(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv64:{hash:016x}")
+}
+
 fn trace_error(error: TraceStoreError) -> ApiError {
     match error {
         TraceStoreError::RunNotFound => ApiError::new(
@@ -4058,6 +4282,142 @@ mod tests {
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
         }
+    }
+
+    fn unit_daemon_action_request(
+        tenant_id: TenantId,
+        action_name: &str,
+        params: serde_json::Value,
+    ) -> ActionRequest {
+        ActionRequest {
+            action_id: ActionId::new(),
+            tenant_id,
+            agent_id: splendor_types::AgentId::new(),
+            run_id: RunId::new(),
+            action: Action {
+                name: action_name.to_string(),
+                params,
+                side_effect_class: splendor_types::SideEffectClass::External,
+                cost_estimate: None,
+                required_permissions: vec![action_name.to_string()],
+                preconditions: Vec::new(),
+                postconditions: vec!["recorded".to_string()],
+            },
+            adapter: Some("artifact-store".to_string()),
+            quota_usage: splendor_types::QuotaUsage::single_action(),
+            satisfied_preconditions: Vec::new(),
+            requested_at: OffsetDateTime::now_utc(),
+            approval_evidence: None,
+        }
+    }
+
+    #[test]
+    fn data_artifact_boundary_and_recording_adapter_cover_s7_paths() {
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+        let tenant_id = TenantId::new();
+        let allowed_ref = "dataset:tenant-a.finance.board_pack.v1".to_string();
+        let verifier =
+            DataArtifactBoundaryVerifier::new(tenant_id.clone(), vec![allowed_ref.clone()]);
+
+        let data_action = unit_daemon_action_request(
+            tenant_id.clone(),
+            "data.read_fixture",
+            serde_json::json!({"data_ref": allowed_ref, "data_refs": ["dataset:tenant-a.finance.board_pack.v1"]}),
+        );
+        let allowed = verifier.verify_resource_boundary(&data_action, Some("fixture-data-store"));
+        assert!(allowed.allowed);
+        assert!(allowed
+            .reasons
+            .iter()
+            .any(|reason| reason == "data_scope_verified"));
+
+        let denied_data = unit_daemon_action_request(
+            tenant_id.clone(),
+            "data.read_fixture",
+            serde_json::json!({"data_refs": ["dataset:tenant-b.finance.board_pack.v1"]}),
+        );
+        let denied = verifier.verify_resource_boundary(&denied_data, Some("fixture-data-store"));
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "data_scope_denied"));
+
+        let artifact_mismatch = unit_daemon_action_request(
+            tenant_id.clone(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_ref": "artifact://wrong-tenant/board.md"}),
+        );
+        let denied = verifier.verify_resource_boundary(&artifact_mismatch, Some("artifact-store"));
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "artifact_path_tenant_mismatch"));
+
+        let executions = Arc::new(AtomicU64::new(0));
+        let adapter = RecordingAdapter {
+            executions: Arc::clone(&executions),
+        };
+        let data_output = adapter.execute(&data_action).expect("data output").output;
+        assert_eq!(data_output["adapter"], "fixture-data-store");
+        assert_eq!(data_output["raw_payload_included"], false);
+
+        let internal_artifact = unit_daemon_action_request(
+            tenant_id.clone(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_path": format!("artifact://{tenant_id}/board.md")}),
+        );
+        let output = adapter
+            .execute(&internal_artifact)
+            .expect("internal artifact output")
+            .output;
+        assert_eq!(output["adapter"], "artifact-store");
+        assert_eq!(output["tenant_id"], tenant_id.to_string());
+
+        let publish = unit_daemon_action_request(
+            tenant_id,
+            "artifact.publish_external",
+            serde_json::json!({"publish_ref": "artifact://tenant-a/board.md"}),
+        );
+        let output = adapter.execute(&publish).expect("publish output").output;
+        assert_eq!(output["published"], true);
+        assert_eq!(output["external_store"], "fake-artifact-store");
+
+        let generic = unit_daemon_action_request(
+            TenantId::new(),
+            "daemon.record",
+            serde_json::json!({"note": "generic"}),
+        );
+        let output = adapter.execute(&generic).expect("generic output").output;
+        assert_eq!(output["adapter"], "daemon.recording");
+        assert_eq!(output["device_sim"], serde_json::Value::Null);
+
+        let fail = unit_daemon_action_request(
+            TenantId::new(),
+            "artifact.create_internal",
+            serde_json::json!({"fail_adapter": true}),
+        );
+        assert!(adapter.execute(&fail).is_err());
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn resident_daemon_config_requires_authenticated_caller() {
+        let instance_id = splendor_types::InstanceId::new();
+        let config = DaemonConfig::resident(instance_id.clone());
+        assert!(config.insecure_dev_mode.is_none());
+        assert_eq!(
+            config.expected_audience,
+            CredentialAudience::Instance { instance_id }
+        );
+
+        let state = DaemonState::new(config);
+        let denied = state
+            .validate_security(DaemonEndpoint::Health, None, None, None)
+            .expect_err("resident daemon must not accept anonymous requests");
+        assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.body.code, "anonymous_non_dev_call");
     }
 
     #[test]
@@ -4465,6 +4825,7 @@ mod tests {
             percept_queue: PerceptQueue::default(),
             allowed_percept_schemas: Vec::new(),
             allowed_percept_sources: Vec::new(),
+            allowed_actions: Vec::new(),
             state_head: None,
             adapter_executions: Arc::new(AtomicU64::new(0)),
             approval_evidence: ApprovalEvidenceSlot::default(),
@@ -4511,6 +4872,37 @@ mod tests {
         let allowed =
             evaluator.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
         assert!(allowed.allowed);
+
+        let poisoned = SharedCircuitBreakerEvaluator::default();
+        let poison_handle = poisoned.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_handle.breakers.lock().expect("lock breakers");
+            panic!("poison circuit breaker lock for fail-closed verification");
+        }));
+
+        let denied =
+            poisoned.verify_runtime_admission(&splendor_types::RuntimeIdentityContext::default());
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "circuit_breaker_state_unavailable"));
+
+        let action = unit_daemon_action_request(
+            TenantId::new(),
+            "artifact.create_internal",
+            serde_json::json!({"artifact_ref":"artifact://tenant/unit.md"}),
+        );
+        let denied = poisoned.verify_action(
+            &action,
+            Some("artifact-store"),
+            &splendor_types::RuntimeIdentityContext::default(),
+        );
+        assert!(!denied.allowed);
+        assert!(denied
+            .reasons
+            .iter()
+            .any(|reason| reason == "circuit_breaker_state_unavailable"));
     }
 
     #[tokio::test]

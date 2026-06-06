@@ -256,6 +256,50 @@ S6_DENIED_SIMULATOR_LABELS = {
     "operator_wrong_scope_denied",
     "operator_expired_evidence_denied",
 }
+S7_REQUIRED_OPERATIONS = {
+    "registerNode",
+    "registerInstance",
+    "heartbeatNode",
+    "advertiseCapabilities",
+    "evaluatePlacement",
+    "submitWorkOrder",
+    "dispatchWorkOrder",
+    "sendMessage",
+    "getMessage",
+    "submitAction",
+    "requestApproval",
+    "grantApproval",
+    "getStateHead",
+    "exportTraces",
+    "replayRun",
+}
+S7_REQUIRED_NEGATIVES = {
+    "specialist_tenant_b_data_ref_denied_before_adapter",
+    "manager_credential_as_action_permission_denied",
+    "specialist_external_publish_denied_by_narrow_work_order",
+    "message_payload_data_ref_permission_smuggling_denied",
+    "trace_export_without_redaction_policy_rejected",
+    "external_artifact_publish_without_approval_pauses",
+    "cross_tenant_replay_cannot_reveal_raw_payloads",
+    "artifact_path_collision_across_tenants_rejected",
+    "denied_data_and_artifact_actions_did_not_reach_adapter",
+    "replay_did_not_reread_republish_or_rewrite_artifacts",
+}
+S7_REQUIRED_EVENTS = {
+    "work_order.accepted",
+    "data_scope.verified",
+    "data_scope.denied",
+    "message.sent",
+    "message.received",
+    "message.denied",
+    "artifact.created",
+    "artifact.publish.needs_approval",
+    "artifact.publish.executed",
+    "artifact.publish.denied",
+    "trace.exported.redacted",
+    "state.committed",
+    "replay.explained",
+}
 
 
 def utc_now() -> str:
@@ -1471,6 +1515,203 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S7"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "tenant-data-fixtures.json",
+        "work-order-validation.json",
+        "message-flow.json",
+        "artifact-report.json",
+        "data-scope-report.json",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s7_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s7_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s7_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s7_scenario_failure:{failure}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S7_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s7_missing_required_api_operations:" + ",".join(missing_ops))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S7_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s7_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S7_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s7_negative_case_not_asserted:{case}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S7_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s7_missing_required_trace_events:" + ",".join(missing_events))
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    trace_by_id = {trace_record_id(record): record for record in trace_records if trace_record_id(record)}
+    trace_text = json.dumps(trace_records, sort_keys=True)
+    fixtures = read_json(artifact_dir / "tenant-data-fixtures.json")
+    protected = [
+        tenant.get("protected_raw_fixture", "")
+        for tenant in fixtures.get("tenants", {}).values()
+        if tenant.get("protected_raw_fixture")
+    ]
+    for raw in protected:
+        if raw in trace_text:
+            failures.append("s7_trace_export_contains_raw_protected_fixture")
+    artifact = read_json(artifact_dir / "artifact-report.json")
+    internal = artifact.get("internal_artifact_evidence", {})
+    if artifact.get("internal_artifact", {}).get("status") != "Executed":
+        failures.append("s7_internal_artifact_not_executed")
+    if not internal.get("action_id") or not internal.get("artifact_path") or not internal.get("integrity") or not internal.get("tenant_id"):
+        failures.append("s7_internal_artifact_missing_identity_path_or_integrity")
+    elif not str(internal.get("artifact_path", "")).startswith(f"artifact://{internal.get('tenant_id')}/"):
+        failures.append("s7_internal_artifact_path_not_tenant_scoped")
+    internal_trace_id = internal.get("trace_event_id")
+    if not internal_trace_id:
+        failures.append("s7_internal_artifact_missing_trace_event_id")
+    elif internal_trace_id not in event_ids.get("artifact.created", []):
+        failures.append("s7_internal_artifact_trace_id_not_required_artifact_created")
+    elif internal_trace_id not in trace_by_id:
+        failures.append("s7_internal_artifact_trace_id_missing_from_export")
+    else:
+        payload = trace_record_kind_payload(trace_by_id[internal_trace_id])
+        action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
+        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        if trace_record_kind(trace_by_id[internal_trace_id]) != "action.executed" or action.get("name") != "artifact.create_internal":
+            failures.append("s7_internal_artifact_trace_not_create_execution")
+        if output.get("artifact_path") != internal.get("artifact_path"):
+            failures.append("s7_internal_artifact_trace_path_mismatch")
+        if output.get("tenant_id") != internal.get("tenant_id"):
+            failures.append("s7_internal_artifact_trace_tenant_mismatch")
+        if output.get("integrity") != internal.get("integrity"):
+            failures.append("s7_internal_artifact_trace_integrity_mismatch")
+    if internal.get("outcome_action_id") and internal.get("outcome_action_id") != internal.get("action_id"):
+        failures.append("s7_internal_artifact_outcome_action_mismatch")
+    if internal.get("outcome_artifact_path") and internal.get("outcome_artifact_path") != internal.get("artifact_path"):
+        failures.append("s7_internal_artifact_outcome_path_mismatch")
+    if internal.get("outcome_integrity") and internal.get("outcome_integrity") != internal.get("integrity"):
+        failures.append("s7_internal_artifact_outcome_integrity_mismatch")
+    if artifact.get("publish_without_approval", {}).get("status") != "NeedsApproval":
+        failures.append("s7_publish_without_approval_not_paused")
+    if artifact.get("approved_publish", {}).get("status") != "Executed":
+        failures.append("s7_approved_publish_not_executed")
+    if artifact.get("approved_publish", {}).get("action_id") != artifact.get("publish_without_approval", {}).get("action_id"):
+        failures.append("s7_approval_action_id_mismatch")
+    publish_evidence = artifact.get("approved_publish_evidence", {})
+    if not publish_evidence.get("integrity"):
+        failures.append("s7_approved_publish_missing_integrity")
+    publish_trace_id = publish_evidence.get("trace_event_id")
+    if not publish_trace_id:
+        failures.append("s7_approved_publish_missing_trace_event_id")
+    elif publish_trace_id not in event_ids.get("artifact.publish.executed", []):
+        failures.append("s7_approved_publish_trace_id_not_required_publish_executed")
+    elif publish_trace_id not in trace_by_id:
+        failures.append("s7_approved_publish_trace_id_missing_from_export")
+    else:
+        payload = trace_record_kind_payload(trace_by_id[publish_trace_id])
+        action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
+        params = action.get("params", {}) if isinstance(action.get("params"), dict) else {}
+        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        if trace_record_kind(trace_by_id[publish_trace_id]) != "action.executed" or action.get("name") != "artifact.publish_external":
+            failures.append("s7_approved_publish_trace_not_publish_execution")
+        trace_publish_path = output.get("publish_ref") or output.get("artifact_path") or params.get("publish_ref")
+        if trace_publish_path != publish_evidence.get("artifact_path"):
+            failures.append("s7_approved_publish_trace_path_mismatch")
+        trace_tenant_id = output.get("tenant_id")
+        if not trace_tenant_id and isinstance(trace_publish_path, str) and trace_publish_path.startswith("artifact://"):
+            trace_tenant_id = trace_publish_path.removeprefix("artifact://").split("/", 1)[0]
+        if trace_tenant_id != publish_evidence.get("tenant_id"):
+            failures.append("s7_approved_publish_trace_tenant_mismatch")
+        if output.get("integrity") != publish_evidence.get("integrity"):
+            failures.append("s7_approved_publish_trace_integrity_mismatch")
+    if artifact.get("collision", {}).get("status") != "Denied":
+        failures.append("s7_artifact_collision_not_denied")
+    if artifact.get("specialist_publish_denial", {}).get("status") != "Denied":
+        failures.append("s7_specialist_publish_not_denied")
+    data_scope = read_json(artifact_dir / "data-scope-report.json")
+    if data_scope.get("tenant_b_denial", {}).get("status") != "Denied":
+        failures.append("s7_tenant_b_data_ref_not_denied")
+    if data_scope.get("manager_permission_denial", {}).get("status") != 403:
+        failures.append("s7_manager_credential_did_not_fail_daemon_action_auth")
+    if data_scope.get("adapter_executions_before") != data_scope.get("adapter_executions_after"):
+        failures.append("s7_denied_data_or_artifact_reached_adapter")
+    message = read_json(artifact_dir / "message-flow.json")
+    if message.get("request", {}).get("delivery_status") != "delivered" or message.get("response", {}).get("delivery_status") != "delivered":
+        failures.append("s7_task_messages_not_delivered")
+    request_send = message.get("request", {}).get("trace_event_id")
+    request_read = message.get("request_read", {}).get("read_trace_event_id")
+    response_send = message.get("response", {}).get("trace_event_id")
+    response_read = message.get("response_read", {}).get("read_trace_event_id")
+    if message.get("request_read", {}).get("receive_side_validated") is not True or message.get("response_read", {}).get("receive_side_validated") is not True:
+        failures.append("s7_task_messages_not_read_validated")
+    if not request_read or not response_read or request_read == request_send or response_read == response_send:
+        failures.append("s7_missing_explicit_distinct_receive_trace")
+    if message.get("smuggling_denial", {}).get("status") != 403:
+        failures.append("s7_smuggling_message_not_rejected")
+    work_orders = read_json(artifact_dir / "work-order-validation.json")
+    specialist = work_orders.get("specialist", {})
+    if "artifact.publish_external" in specialist.get("allowed_actions", []) or "artifact.publish_external" in specialist.get("allowed_permissions", []):
+        failures.append("s7_specialist_work_order_overbroad")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("external_publish_replayed") is not False or replay.get("raw_payloads_absent") is not True:
+        failures.append("s7_replay_suppression_or_redaction_missing")
+    if replay.get("adapter_executions_before_replay") != replay.get("adapter_executions_after_replay"):
+        failures.append("s7_replay_changed_adapter_execution_count")
+    before_counts = replay.get("action_execution_counts_before_replay")
+    after_counts = replay.get("action_execution_counts_after_replay")
+    if not isinstance(before_counts, dict) or not isinstance(after_counts, dict):
+        failures.append("s7_replay_missing_action_execution_counts")
+    elif before_counts != after_counts:
+        failures.append("s7_replay_changed_action_execution_counts")
+    else:
+        for action_name in ["data.read_fixture", "artifact.create_internal", "artifact.publish_external"]:
+            if action_name not in before_counts:
+                failures.append(f"s7_replay_missing_action_execution_count:{action_name}")
+        if before_counts.get("artifact.publish_external", 0) < 1:
+            failures.append("s7_replay_proof_missing_orchestrator_publish_execution")
+    if not replay.get("orchestrator_replay", {}).get("replay_id"):
+        failures.append("s7_replay_missing_orchestrator_replay_id")
+    if replay.get("approved_publish_artifact_path") != artifact.get("approved_publish_evidence", {}).get("artifact_path"):
+        failures.append("s7_replay_publish_artifact_path_mismatch")
+    if replay.get("approved_publish_trace_event_id") != artifact.get("approved_publish_evidence", {}).get("trace_event_id"):
+        failures.append("s7_replay_publish_trace_id_mismatch")
+    if replay.get("internal_artifact_trace_event_id") != artifact.get("internal_artifact_evidence", {}).get("trace_event_id"):
+        failures.append("s7_replay_internal_artifact_trace_id_mismatch")
+    if replay.get("cross_tenant_replay", {}).get("status") != 403:
+        failures.append("s7_cross_tenant_replay_not_rejected")
+    audit = read_json(artifact_dir / "audit-report.json")
+    if not audit.get("in_scope_data_refs") or not audit.get("denied_data_refs"):
+        failures.append("s7_audit_missing_data_ref_scope_evidence")
+    if set(["message.sent", "message.received"]) - set(event_ids):
+        failures.append("s7_missing_message_trace_evidence")
+    elif set(event_ids.get("message.sent", [])) & set(event_ids.get("message.received", [])):
+        failures.append("s7_message_receive_trace_reuses_send_trace")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "specialist_broad_permission_inheritance", "manager_credential_authorizes_action", "trace_export_without_redaction_allowed", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s7_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes") or not scenario.get("work_order_ids") or not scenario.get("message_ids") or not scenario.get("approval_ids"):
+        failures.append("s7_missing_identity_state_message_approval_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -1545,6 +1786,7 @@ def main() -> int:
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
     s5_scenario, s5_failures = load_s5_scenario(report_dir)
     s6_scenario, s6_failures = load_s6_scenario(report_dir)
+    s7_scenario, s7_failures = load_s7_scenario(report_dir)
     active_ids: set[str] = set()
     if args.scenario == "UC-E2E-S1" or args.mode == "all":
         active_ids.add("UC-E2E-S1")
@@ -1588,11 +1830,18 @@ def main() -> int:
         else:
             scenarios.append(s6_scenario)
             blocking.extend(s6_failures)
+    if args.scenario == "UC-E2E-S7" or args.mode == "all":
+        active_ids.add("UC-E2E-S7")
+        if s7_scenario is None:
+            blocking.append("missing_uc_e2e_s7_scenario_report")
+        else:
+            scenarios.append(s7_scenario)
+            blocking.extend(s7_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s6-physical-edge",
+        "suite_version": "0.1-s7-data-isolation-artifacts",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -1608,6 +1857,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S4",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S5",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S6",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S7",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -1641,7 +1891,8 @@ def main() -> int:
             "UC-E2E-S4 validates fleet dispatch through public manager and resident daemon HTTP APIs with same-image Splendor services.",
             "UC-E2E-S5 validates governance through public manager and daemon HTTP APIs without enterprise UI or direct governance-plane runtime mutation.",
             "UC-E2E-S6 validates physical/edge orchestration through public resident-edge daemon HTTP APIs without low-level robot control.",
-            "S7-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S7 validates data-local artifact and cross-tenant isolation through public manager and resident daemon HTTP APIs without enterprise data workspace UI.",
+            "S8-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
