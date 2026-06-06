@@ -6,7 +6,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use splendor_kernel::{FleetTelemetryCollector, InMemoryNodeRegistry, NodeRegistry};
+use splendor_kernel::{
+    FleetTelemetryCollector, InMemoryNodeRegistry, NodeRegistry, NodeRegistryError,
+};
 use splendor_store::{
     CentralTraceIndex, InMemoryCentralTraceIndex, TraceSyncBatch, TraceSyncReport,
 };
@@ -579,6 +581,33 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok","component":"splendor-manager"}))
 }
 
+fn node_registration_matches_existing(
+    existing: &NodeRegistration,
+    requested: &NodeRegistration,
+) -> bool {
+    existing.node_id == requested.node_id
+        && existing.kind == requested.kind
+        && existing.scope == requested.scope
+        && existing.capability_document == requested.capability_document
+        && existing.runtime_version == requested.runtime_version
+        && existing.health.status == requested.health.status
+        && existing.health.metadata == requested.health.metadata
+}
+
+fn instance_registration_matches_existing(
+    existing: &InstanceRegistration,
+    requested: &InstanceRegistration,
+) -> bool {
+    existing.instance_id == requested.instance_id
+        && existing.node_id == requested.node_id
+        && existing.runtime_mode == requested.runtime_mode
+        && existing.hosted_tenants == requested.hosted_tenants
+        && existing.supported_features == requested.supported_features
+        && existing.runtime_version == requested.runtime_version
+        && existing.health.status == requested.health.status
+        && existing.health.metadata == requested.health.metadata
+}
+
 async fn register_node(
     State(state): State<ManagerState>,
     Json(request): Json<RegisterNodeRequest>,
@@ -589,11 +618,32 @@ async fn register_node(
         EndpointScope::NodesRegister,
         true,
     )?;
-    let record = state
-        .inner
-        .registry
-        .register_node(request.registration)
-        .map_err(|e| ManagerApiError::bad_request("node_registration_rejected", e.to_string()))?;
+    let requested = request.registration;
+    let (record, registered_new) = match state.inner.registry.register_node(requested.clone()) {
+        Ok(record) => (record, true),
+        Err(NodeRegistryError::DuplicateNode(node_id)) => {
+            let record = state.inner.registry.node(&node_id).map_err(|e| {
+                ManagerApiError::bad_request("node_registration_rejected", e.to_string())
+            })?;
+            if !node_registration_matches_existing(&record.registration, &requested) {
+                return Err(ManagerApiError::bad_request(
+                    "node_registration_rejected",
+                    format!("node {node_id} is already registered with incompatible metadata"),
+                ));
+            }
+            state.audit(
+                "node.registration_idempotent",
+                serde_json::json!({"node_id": record.registration.node_id, "idempotent": true}),
+            )?;
+            (record, false)
+        }
+        Err(error) => {
+            return Err(ManagerApiError::bad_request(
+                "node_registration_rejected",
+                error.to_string(),
+            ))
+        }
+    };
     state
         .inner
         .telemetry
@@ -603,10 +653,12 @@ async fn register_node(
             record.registration.node_id.clone(),
             record.last_heartbeat_at,
         );
-    state.audit(
-        "node.registered",
-        serde_json::json!({"node_id": record.registration.node_id}),
-    )?;
+    if registered_new {
+        state.audit(
+            "node.registered",
+            serde_json::json!({"node_id": record.registration.node_id}),
+        )?;
+    }
     Ok(Json(record.registration))
 }
 
@@ -620,13 +672,34 @@ async fn register_instance(
         EndpointScope::InstancesRegister,
         true,
     )?;
-    let record = state
-        .inner
-        .registry
-        .register_instance(request.registration)
-        .map_err(|e| {
-            ManagerApiError::bad_request("instance_registration_rejected", e.to_string())
-        })?;
+    let requested = request.registration;
+    let (record, registered_new) = match state.inner.registry.register_instance(requested.clone()) {
+        Ok(record) => (record, true),
+        Err(NodeRegistryError::DuplicateInstance(instance_id)) => {
+            let record = state.inner.registry.instance(&instance_id).map_err(|e| {
+                ManagerApiError::bad_request("instance_registration_rejected", e.to_string())
+            })?;
+            if !instance_registration_matches_existing(&record.registration, &requested) {
+                return Err(ManagerApiError::bad_request(
+                    "instance_registration_rejected",
+                    format!(
+                        "instance {instance_id} is already registered with incompatible metadata"
+                    ),
+                ));
+            }
+            state.audit(
+                "instance.registration_idempotent",
+                serde_json::json!({"node_id": record.registration.node_id, "instance_id": record.registration.instance_id, "idempotent": true}),
+            )?;
+            (record, false)
+        }
+        Err(error) => {
+            return Err(ManagerApiError::bad_request(
+                "instance_registration_rejected",
+                error.to_string(),
+            ))
+        }
+    };
     let mode = TelemetryRuntimeMode::Resident;
     state
         .inner
@@ -641,7 +714,9 @@ async fn register_instance(
             record.registration.supported_features.clone(),
             record.last_heartbeat_at,
         ));
-    state.audit("instance.registered", serde_json::json!({"node_id": record.registration.node_id, "instance_id": record.registration.instance_id}))?;
+    if registered_new {
+        state.audit("instance.registered", serde_json::json!({"node_id": record.registration.node_id, "instance_id": record.registration.instance_id}))?;
+    }
     Ok(Json(record.registration))
 }
 
@@ -829,7 +904,8 @@ async fn evaluate_placement(
     )?;
     let candidates = placement_candidates(&state)?;
     let decision = select_placement(&request.request, &candidates);
-    if let Some(work_order_id) = request.work_order_id {
+    let work_order_id = request.work_order_id.clone();
+    if let Some(work_order_id) = work_order_id.clone() {
         state
             .inner
             .placements
@@ -837,7 +913,7 @@ async fn evaluate_placement(
             .map_err(|_| ManagerApiError::internal("placement_lock", "placement lock unavailable"))?
             .insert(work_order_id, decision.clone());
     }
-    state.audit("placement.evaluated", serde_json::json!({"status": decision.status, "candidate_id": decision.candidate_id, "reasons": decision.reasons}))?;
+    state.audit("placement.evaluated", serde_json::json!({"work_order_id": work_order_id, "status": decision.status, "candidate_id": decision.candidate_id, "reasons": decision.reasons}))?;
     Ok(Json(decision))
 }
 
@@ -2706,6 +2782,102 @@ mod tests {
         .await
         .expect_err("capability advertisement requires node scope");
         assert_eq!(advertise_error.body.code, "missing_scope");
+    }
+
+    #[tokio::test]
+    async fn manager_registration_handlers_are_idempotent_for_matching_records() {
+        let state = ManagerState::local_acceptance();
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+            ],
+        );
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000704",
+            "http://127.0.0.1:1",
+            "resident_cloud_pool",
+            "cloud",
+            vec!["runtime.resident", "message.remote"],
+        );
+        let first_node = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("initial node registration accepted");
+        let second_node = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("matching duplicate node registration accepted idempotently");
+        assert_eq!(first_node.0.node_id, second_node.0.node_id);
+
+        let mut incompatible_node = node.clone();
+        incompatible_node
+            .capability_document
+            .capabilities
+            .push("different.capability".to_string());
+        let error = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: incompatible_node,
+            }),
+        )
+        .await
+        .expect_err("incompatible duplicate node metadata rejected");
+        assert_eq!(error.body.code, "node_registration_rejected");
+
+        let instance = instance(
+            "00000000-0000-4000-8000-000000000704",
+            "00000000-0000-4000-8000-000000000705",
+            &tenant_id,
+        );
+        let first_instance = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance.clone(),
+            }),
+        )
+        .await
+        .expect("initial instance registration accepted");
+        let second_instance = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance.clone(),
+            }),
+        )
+        .await
+        .expect("matching duplicate instance registration accepted idempotently");
+        assert_eq!(first_instance.0.instance_id, second_instance.0.instance_id);
+
+        let mut incompatible_instance = instance;
+        incompatible_instance
+            .supported_features
+            .push("different.feature".to_string());
+        let error = register_instance(
+            State(state),
+            Json(RegisterInstanceRequest {
+                security,
+                registration: incompatible_instance,
+            }),
+        )
+        .await
+        .expect_err("incompatible duplicate instance metadata rejected");
+        assert_eq!(error.body.code, "instance_registration_rejected");
     }
 
     #[test]

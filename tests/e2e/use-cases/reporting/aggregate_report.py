@@ -415,6 +415,186 @@ S9_MANAGER_EVENT_ORIGINALS = {
 S9_SOURCE_EVENT_ORIGINALS = {
     "policy.expired": {"policy.expired"},
 }
+S10_REQUIRED_POSITIVES = {
+    "api_contract_passed",
+    "nodes_and_instances_registered",
+    "policy_bundle_published_with_ttl",
+    "signed_work_order_accepted_and_placed_on_vpc",
+    "data_local_analysis_executed",
+    "shared_specialist_typed_response_delivered",
+    "cloud_helper_proposal_only",
+    "edge_bounded_inspection_executed",
+    "internal_artifact_created",
+    "external_publication_approval_gated_and_executed_once",
+    "state_handoff_imported_and_resumed_once",
+    "central_trace_aggregation_completed",
+    "audit_and_replay_explain_without_side_effects",
+}
+S10_REQUIRED_NEGATIVES = {
+    "invalid_work_order_rejected_before_run_start",
+    "unauthorized_data_ref_denied",
+    "specialist_permission_escalation_denied",
+    "remote_duplicate_not_double_applied",
+    "raw_physical_control_rejected",
+    "expired_approval_rejected",
+    "circuit_breaker_blocks_matching_publish_attempt",
+    "kill_switch_cancels_separate_run",
+    "tampered_trace_state_import_rejected",
+    "replay_side_effect_mode_rejected_by_default",
+}
+S10_REQUIRED_EVENTS = {
+    "work_order.accepted",
+    "placement.evaluated",
+    "data_scope.verified",
+    "message.sent",
+    "message.received",
+    "cloud_helper.proposal.received",
+    "safety.verification.completed",
+    "action.executed",
+    "action.denied",
+    "action.needs_approval",
+    "approval.granted",
+    "artifact.created",
+    "artifact.publish.executed",
+    "state.committed",
+    "state.exported",
+    "state.imported",
+    "run.resumed",
+    "trace.sync.completed",
+    "replay.explained",
+    "governance.audit.exported",
+    "circuit_breaker.tripped",
+    "kill_switch.activated",
+}
+S10_REQUIRED_OPERATIONS = {
+    "registerNode",
+    "registerInstance",
+    "heartbeatNode",
+    "advertiseCapabilities",
+    "listNodes",
+    "publishPolicyBundle",
+    "getPolicyStatus",
+    "submitWorkOrder",
+    "evaluatePlacement",
+    "dispatchWorkOrder",
+    "sendMessage",
+    "getMessage",
+    "createRun",
+    "startRun",
+    "pauseRun",
+    "resumeRun",
+    "submitAction",
+    "registerDeviceProfile",
+    "getDeviceStatus",
+    "getPolicyCacheStatus",
+    "submitPhysicalAction",
+    "exportStateSnapshot",
+    "importStateSnapshot",
+    "requestApproval",
+    "grantApproval",
+    "createCircuitBreaker",
+    "readCircuitBreakerSyncPayload",
+    "syncCircuitBreakers",
+    "activateKillSwitch",
+    "exportTraces",
+    "syncTraceBuffer",
+    "syncDeviceTraceBuffer",
+    "getFleetTelemetry",
+    "replayRun",
+    "exportGovernanceAudit",
+    "managerAudit",
+}
+S10_REQUIRED_PRIMITIVES = {
+    "tenant",
+    "agent",
+    "runtime_context",
+    "run",
+    "tick",
+    "policy",
+    "action_gateway",
+    "verifier",
+    "adapter",
+    "quota",
+    "state_graph",
+    "trace_store",
+    "message",
+    "replay",
+    "work_order",
+    "approval",
+    "fleet_identity",
+    "node_registry",
+    "governance",
+    "device_profile",
+    "SDK/API",
+}
+S10_RUN_IDS = {
+    "44444444-4444-4444-8444-444444448810",
+    "44444444-4444-4444-8444-444444448811",
+    "44444444-4444-4444-8444-444444448812",
+    "44444444-4444-4444-8444-444444448813",
+    "44444444-4444-4444-8444-444444448814",
+    "44444444-4444-4444-8444-444444448815",
+}
+S10_WORK_ORDER_IDS = {
+    "wo_uc_e2e_s10_field_intelligence",
+    "wo_uc_e2e_s10_scoped_specialist",
+    "wo_uc_e2e_s10_cloud_helper_proposal",
+    "wo_uc_e2e_s10_edge_inspection",
+    "wo_uc_e2e_s10_circuit_branch",
+    "wo_uc_e2e_s10_kill_branch",
+}
+S10_MESSAGE_IDS = {
+    "55555555-5555-4555-8555-555555558810",
+    "55555555-5555-4555-8555-555555558811",
+    "55555555-5555-4555-8555-555555558812",
+    "55555555-5555-4555-8555-555555558813",
+}
+S10_NODE_IDS = {
+    "00000000-0000-4000-8000-000000000204",
+    "00000000-0000-4000-8000-000000000404",
+    "00000000-0000-4000-8000-000000000604",
+}
+S10_INSTANCE_IDS = {
+    "00000000-0000-4000-8000-000000000302",
+    "00000000-0000-4000-8000-000000000304",
+    "00000000-0000-4000-8000-000000000306",
+}
+S10_ALLOWED_EVIDENCE_SOURCES = {
+    "runtime_trace_export",
+    "manager_audit_export",
+    "public_api_response",
+}
+S10_RUNTIME_EVENT_ORIGINALS = {
+    "data_scope.verified": {"verification.completed"},
+    "safety.verification.completed": {"verification.completed", "action.executed", "action.denied", "action.needs_approval", "action.needs_intervention", "outcome.recorded", "daemon.audit"},
+    "action.executed": {"action.executed"},
+    "action.denied": {"action.denied"},
+    "action.needs_approval": {"action.needs_approval"},
+    "artifact.created": {"action.executed"},
+    "artifact.publish.executed": {"action.executed"},
+    "state.committed": {"state.committed"},
+    "run.resumed": {"run.resumed"},
+    "replay.explained": {"daemon.audit"},
+}
+S10_MANAGER_EVENT_ORIGINALS = {
+    "work_order.accepted": {"work_order.accepted"},
+    "placement.evaluated": {"placement.evaluated"},
+    "message.sent": {"remote_message.delivered"},
+    "message.received": {"remote_message.received"},
+    "cloud_helper.proposal.received": {"remote_message.delivered", "remote_message.received"},
+    "approval.granted": {"approval.granted"},
+    "governance.audit.exported": {"governance.audit.exported"},
+    "circuit_breaker.tripped": {"circuit_breaker.tripped"},
+    "kill_switch.activated": {"kill_switch.activated"},
+}
+S10_RESPONSE_EVENT_ORIGINALS = {
+    "cloud_helper.proposal.received": {"sendMessage"},
+    "approval.granted": {"grantApproval"},
+    "state.exported": {"exportStateSnapshot"},
+    "state.imported": {"importStateSnapshot"},
+    "trace.sync.completed": {"syncTraceBuffer", "syncDeviceTraceBuffer"},
+    "governance.audit.exported": {"exportGovernanceAudit"},
+}
 
 
 def utc_now() -> str:
@@ -580,6 +760,20 @@ def index_manager_audit_events(events: list[dict]) -> dict[str, dict]:
     }
 
 
+def collect_values_for_key(value: object, key: str) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            if item_key == key and isinstance(item_value, str) and item_value.strip():
+                found.append(item_value)
+            else:
+                found.extend(collect_values_for_key(item_value, key))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(collect_values_for_key(item, key))
+    return found
+
+
 def validate_s9_required_event_evidence(
     *,
     scenario: dict,
@@ -605,6 +799,20 @@ def validate_s9_required_event_evidence(
 
     runtime_index = index_trace_records(trace_records)
     manager_index = index_manager_audit_events(manager_events)
+    runtime_records_by_id: dict[str, list[dict]] = {}
+    for record in trace_records:
+        trace_id = trace_record_id(record)
+        if trace_id:
+            runtime_records_by_id.setdefault(trace_id, []).append(
+                {
+                    "record": record,
+                    "kind": trace_record_kind(record),
+                    "run_id": trace_record_run_id(record),
+                    "action_id": trace_record_action_id(record),
+                    "message_id": trace_record_message_id(record),
+                    "state_node_id": trace_record_state_node_id(record),
+                }
+            )
     source_indexes = {
         source_id: index_trace_records(records)
         for source_id, records in source_trace_records.items()
@@ -724,6 +932,162 @@ def validate_s9_required_event_evidence(
                 if event_name == "policy.expired":
                     if details.get("reason_code") != "policy_expired" or not row.get("run_id") or not row.get("action_id"):
                         failures.append("s9_policy_expired_missing_action_correlation")
+
+    return failures
+
+
+def validate_s10_required_event_evidence(
+    *,
+    scenario: dict,
+    audit: dict,
+    trace_records: list[dict],
+    manager_events: list[dict],
+    response_ids: set[str],
+) -> list[str]:
+    def runtime_kind_matches(actual: str, expected: object) -> bool:
+        return actual == expected or (actual == "DaemonAudit" and expected == "daemon.audit")
+
+    failures: list[str] = []
+    scenario_evidence = scenario.get("required_event_evidence", {})
+    audit_evidence = audit.get("machine_readable", {}).get("required_event_evidence", {})
+    event_ids = scenario.get("required_trace_event_ids", {})
+    if not isinstance(scenario_evidence, dict):
+        return ["s10_required_event_evidence_not_object"]
+    if not isinstance(audit_evidence, dict):
+        failures.append("s10_audit_required_event_evidence_not_object")
+        audit_evidence = {}
+
+    manager_index = index_manager_audit_events(manager_events)
+    runtime_records_by_id: dict[str, list[dict]] = {}
+    for record in trace_records:
+        trace_id = trace_record_id(record)
+        if trace_id:
+            runtime_records_by_id.setdefault(trace_id, []).append(
+                {
+                    "record": record,
+                    "kind": trace_record_kind(record),
+                    "run_id": trace_record_run_id(record),
+                    "action_id": trace_record_action_id(record),
+                    "message_id": trace_record_message_id(record),
+                    "state_node_id": trace_record_state_node_id(record),
+                }
+            )
+    for record in trace_records:
+        if record.get("event_type") or record.get("scenario_id"):
+            failures.append("s10_trace_export_contains_synthetic_top_level_event")
+        if trace_record_kind(record) in S10_REQUIRED_EVENTS and not trace_record_id(record):
+            failures.append(f"s10_required_runtime_trace_missing_trace_id:{trace_record_kind(record)}")
+
+    for event_name in sorted(S10_REQUIRED_EVENTS):
+        rows = scenario_evidence.get(event_name)
+        if not isinstance(rows, list) or not rows:
+            failures.append(f"s10_required_event_evidence_missing:{event_name}")
+            continue
+        ids_from_rows = sorted({row.get("trace_event_id") for row in rows if isinstance(row, dict)})
+        ids_from_report = sorted(event_ids.get(event_name, []))
+        if ids_from_rows != ids_from_report:
+            failures.append(f"s10_required_event_ids_do_not_match_evidence:{event_name}")
+        audit_ids = sorted({row.get("trace_event_id") for row in audit_evidence.get(event_name, []) if isinstance(row, dict)})
+        if audit_ids and audit_ids != ids_from_rows:
+            failures.append(f"s10_audit_event_evidence_mismatch:{event_name}")
+
+        for row in rows:
+            if not isinstance(row, dict):
+                failures.append(f"s10_required_event_evidence_row_not_object:{event_name}")
+                continue
+            trace_id = row.get("trace_event_id")
+            source = row.get("source")
+            original = row.get("original_event_type")
+            details = row.get("details") if isinstance(row.get("details"), dict) else {}
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s10_required_event_evidence_trace_id_not_uuid:{event_name}:{trace_id}")
+            if source not in S10_ALLOWED_EVIDENCE_SOURCES:
+                failures.append(f"s10_required_event_forbidden_source:{event_name}:{source}")
+                continue
+            if source in {"synthetic", "manual", "scenario_python", "scenario_report"}:
+                failures.append(f"s10_required_event_synthetic_source:{event_name}:{source}")
+
+            has_s10_correlation = any(
+                [
+                    row.get("run_id") in S10_RUN_IDS,
+                    row.get("work_order_id") in S10_WORK_ORDER_IDS,
+                    row.get("message_id") in S10_MESSAGE_IDS,
+                    row.get("node_id") in S10_NODE_IDS,
+                    row.get("instance_id") in S10_INSTANCE_IDS,
+                    row.get("circuit_breaker_id") == "55555555-5555-4555-8555-555555558816",
+                    row.get("kill_switch_id") == "ks_uc_e2e_s10_controlled_branch",
+                    row.get("approval_id") and row.get("run_id") == "44444444-4444-4444-8444-444444448810",
+                    details.get("proposal_id") == "route-proposal-s10-zone-a3",
+                ]
+            )
+            if not has_s10_correlation:
+                failures.append(f"s10_required_event_missing_s10_correlation:{event_name}:{trace_id}")
+
+            if source == "runtime_trace_export":
+                if original not in S10_RUNTIME_EVENT_ORIGINALS.get(event_name, set()):
+                    failures.append(f"s10_runtime_event_wrong_original:{event_name}:{original}")
+                observed_candidates = runtime_records_by_id.get(str(trace_id), [])
+                observed = next(
+                    (
+                        candidate
+                        for candidate in observed_candidates
+                        if runtime_kind_matches(candidate["kind"], original) and candidate["run_id"] == row.get("run_id")
+                    ),
+                    None,
+                ) or next(
+                    (
+                        candidate
+                        for candidate in observed_candidates
+                        if runtime_kind_matches(candidate["kind"], original)
+                    ),
+                    None,
+                )
+                if not observed:
+                    failures.append(f"s10_runtime_event_missing_from_trace_export:{event_name}:{trace_id}")
+                    continue
+                if row.get("artifact") != "trace-export.jsonl":
+                    failures.append(f"s10_runtime_event_wrong_artifact:{event_name}:{row.get('artifact')}")
+                if row.get("run_id") != observed["run_id"] or row.get("run_id") not in S10_RUN_IDS:
+                    failures.append(f"s10_runtime_event_run_mismatch:{event_name}")
+                if row.get("action_id") and observed["action_id"] and row.get("action_id") != observed["action_id"]:
+                    failures.append(f"s10_runtime_event_action_mismatch:{event_name}")
+                if event_name == "data_scope.verified" and details.get("action") != "data.read_fixture":
+                    failures.append("s10_data_scope_verified_wrong_action")
+                if event_name == "artifact.created" and details.get("action") != "artifact.create_internal":
+                    failures.append("s10_artifact_created_wrong_action")
+                if event_name == "artifact.publish.executed" and details.get("action") != "artifact.publish_external":
+                    failures.append("s10_artifact_publish_wrong_action")
+                if event_name == "safety.verification.completed" and not details.get("contains_safety_verifier_evidence"):
+                    failures.append("s10_safety_event_missing_evidence_marker")
+
+            elif source == "manager_audit_export":
+                if original not in S10_MANAGER_EVENT_ORIGINALS.get(event_name, set()):
+                    failures.append(f"s10_manager_event_wrong_original:{event_name}:{original}")
+                observed = manager_index.get(str(trace_id))
+                if not observed:
+                    failures.append(f"s10_manager_event_missing_from_audit_export:{event_name}:{trace_id}")
+                    continue
+                if row.get("artifact") != "manager-audit-export.json":
+                    failures.append(f"s10_manager_event_wrong_artifact:{event_name}:{row.get('artifact')}")
+                if observed.get("event_type") != original:
+                    failures.append(f"s10_manager_event_type_mismatch:{event_name}:{original}:{observed.get('event_type')}")
+                observed_details = observed.get("details", {}) if isinstance(observed.get("details"), dict) else {}
+                if row.get("work_order_id") and observed_details.get("work_order_id") != row.get("work_order_id"):
+                    failures.append(f"s10_manager_event_work_order_mismatch:{event_name}")
+                if row.get("message_id") and observed_details.get("message_id") != row.get("message_id"):
+                    failures.append(f"s10_manager_event_message_mismatch:{event_name}")
+                if event_name == "placement.evaluated" and observed_details.get("work_order_id") not in S10_WORK_ORDER_IDS:
+                    failures.append("s10_placement_event_missing_work_order_correlation")
+                if event_name == "circuit_breaker.tripped" and observed_details.get("breaker_id") != "55555555-5555-4555-8555-555555558816":
+                    failures.append("s10_circuit_breaker_event_wrong_id")
+                if event_name == "kill_switch.activated" and observed_details.get("kill_switch_id") != "ks_uc_e2e_s10_controlled_branch":
+                    failures.append("s10_kill_switch_event_wrong_id")
+
+            elif source == "public_api_response":
+                if original not in S10_RESPONSE_EVENT_ORIGINALS.get(event_name, set()):
+                    failures.append(f"s10_response_event_wrong_original:{event_name}:{original}")
+                if str(trace_id) not in response_ids:
+                    failures.append(f"s10_response_event_missing_from_public_artifacts:{event_name}:{trace_id}")
 
     return failures
 
@@ -940,7 +1304,13 @@ def render_markdown(report: dict) -> str:
             "",
             "- Failure injection evidence is recorded in `artifacts/UC-E2E-S9/` when S9 runs.",
             "- S9 requires public daemon/manager API traffic, deterministic adapter/verifier/quota/message/placement/governance failures, bounded retry counts, idempotency markers, and replay side-effect suppression.",
-            "- S9 consumes S1/S4/S5 source artifacts for trace/state/remote/governance failure evidence and leaves S10 blocked until its own scenario exists.",
+            "- S9 consumes S1/S4/S5 source artifacts for trace/state/remote/governance failure evidence.",
+            "",
+            "## S10 evidence",
+            "",
+            "- Final cross-component journey evidence is recorded in `artifacts/UC-E2E-S10/` when S10 runs.",
+            "- S10 requires API contract validation, topology hash, signed work-order placement, typed specialist/cloud helper messages, edge simulator safety verification, approval-gated artifact publication, one state handoff/resume, central trace aggregation, audit, replay, and anti-drift/FR coverage matrix evidence.",
+            "- S10 keeps cloud helpers proposal-only, telemetry observational only, replay side-effect-free by default, and physical actions high-level only.",
             "",
             "## Non-goals observed",
             "",
@@ -2441,6 +2811,231 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S10"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "human-summary.md",
+        "api-contract-report.json",
+        "topology.json",
+        "registry-report.json",
+        "journey-report.json",
+        "message-flow.json",
+        "artifact-publication-report.json",
+        "cloud-helper-report.json",
+        "edge-inspection-report.json",
+        "state-handoff-report.json",
+        "trace-sync-report.json",
+        "governance-branches.json",
+        "negative-branches.json",
+        "fleet-telemetry.json",
+        "state-export.json",
+        "trace-export.jsonl",
+        "replay-report.json",
+        "audit-package.json",
+        "audit-report.json",
+        "manager-audit-export.json",
+        "fr-primitive-coverage-matrix.json",
+        "anti-drift-results.json",
+        "api-traffic.ndjson",
+        "commands.log",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s10_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s10_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s10_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s10_scenario_failure:{failure}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S10_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s10_missing_required_api_operations:" + ",".join(missing_ops))
+    positives = scenario.get("positive_checks", {})
+    missing_positives = sorted(S10_REQUIRED_POSITIVES - set(positives))
+    if missing_positives:
+        failures.append("s10_missing_positive_checks:" + ",".join(missing_positives))
+    for key in S10_REQUIRED_POSITIVES & set(positives):
+        if positives.get(key) is not True:
+            failures.append(f"s10_positive_check_not_asserted:{key}")
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S10_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s10_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S10_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s10_negative_case_not_asserted:{case}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S10_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s10_missing_required_trace_events:" + ",".join(missing_events))
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s10_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s10_trace_event_id_not_uuid:{event_name}:{trace_id}")
+
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    for record in trace_records:
+        if record.get("event_type") or record.get("scenario_id"):
+            failures.append("s10_trace_export_contains_synthetic_top_level_event")
+            break
+    trace_ids = {trace_record_id(record) for record in trace_records if trace_record_id(record)}
+    manager_export = read_json(artifact_dir / "manager-audit-export.json")
+    manager_events: list[dict] = []
+    if isinstance(manager_export.get("audit_read"), list):
+        manager_events.extend(manager_export["audit_read"])
+    if isinstance(manager_export.get("governance_export", {}).get("events"), list):
+        manager_events.extend(manager_export["governance_export"]["events"])
+    manager_ids = {event.get("trace_event_id") for event in manager_events if event.get("trace_event_id")}
+    response_ids: set[str] = set()
+    for name in [
+        "journey-report.json",
+        "message-flow.json",
+        "artifact-publication-report.json",
+        "cloud-helper-report.json",
+        "edge-inspection-report.json",
+        "state-handoff-report.json",
+        "trace-sync-report.json",
+        "governance-branches.json",
+        "replay-report.json",
+        "audit-package.json",
+    ]:
+        response_ids.update(collect_values_for_key(read_json(artifact_dir / name), "trace_event_id"))
+    backed_ids = trace_ids | manager_ids | response_ids
+    for event_name, ids in event_ids.items():
+        for trace_id in ids:
+            if trace_id not in backed_ids:
+                failures.append(f"s10_required_event_id_not_backed_by_exported_evidence:{event_name}:{trace_id}")
+    audit_package = read_json(artifact_dir / "audit-package.json")
+    failures.extend(
+        validate_s10_required_event_evidence(
+            scenario=scenario,
+            audit=audit_package,
+            trace_records=trace_records,
+            manager_events=manager_events,
+            response_ids=response_ids,
+        )
+    )
+
+    required_identity_fields = {
+        "run_ids",
+        "trace_event_ids",
+        "state_node_ids",
+        "state_hashes",
+        "message_ids",
+        "work_order_ids",
+        "approval_ids",
+        "node_ids",
+        "instance_ids",
+        "action_ids",
+        "policy_ids",
+        "circuit_breaker_ids",
+        "kill_switch_ids",
+        "artifact_ids",
+    }
+    for key in sorted(required_identity_fields):
+        if not scenario.get(key):
+            failures.append(f"s10_missing_required_identity_field:{key}")
+    if len(scenario.get("run_ids", [])) < 6 or len(scenario.get("message_ids", [])) < 4 or len(scenario.get("node_ids", [])) < 3 or len(scenario.get("instance_ids", [])) < 3:
+        failures.append("s10_identity_cardinality_too_low")
+
+    contract_report = read_json(artifact_dir / "api-contract-report.json")
+    if contract_report.get("contract", {}).get("status") != "passed" or not str(contract_report.get("digest", "")).startswith("sha256:"):
+        failures.append("s10_api_contract_report_not_passed")
+    topology = read_json(artifact_dir / "topology.json")
+    if not str(topology.get("topology_hash", "")).startswith("sha256:") or len(topology.get("services", [])) < 5:
+        failures.append("s10_topology_hash_or_services_missing")
+    registry = read_json(artifact_dir / "registry-report.json")
+    if registry.get("all_registration_requests_accepted") is not True or registry.get("duplicate_registration_rejections_treated_as_success") is not False:
+        failures.append("s10_registry_registration_requests_not_accepted")
+    for group in ["node_registrations", "instance_registrations"]:
+        for item in registry.get(group, []):
+            if item.get("status") != 200:
+                failures.append(f"s10_registry_status_not_accepted:{group}:{item.get('status')}")
+    journey = read_json(artifact_dir / "journey-report.json")
+    if journey.get("data_analysis", {}).get("status") != "Executed":
+        failures.append("s10_journey_data_analysis_not_executed")
+    artifact = read_json(artifact_dir / "artifact-publication-report.json")
+    if artifact.get("publish_needs_approval", {}).get("status") != "NeedsApproval":
+        failures.append("s10_publish_did_not_pause_for_approval")
+    if artifact.get("approved_publish", {}).get("status") != "Executed" or artifact.get("publish_execution_count_for_positive_run") != 1:
+        failures.append("s10_publish_not_executed_once_after_approval")
+    internal = artifact.get("internal_artifact_evidence", {})
+    approved = artifact.get("approved_publish_evidence", {})
+    for label, evidence in {"internal": internal, "approved_publish": approved}.items():
+        if not evidence.get("artifact_path") or not evidence.get("integrity") or not evidence.get("trace_event_id"):
+            failures.append(f"s10_artifact_evidence_missing:{label}")
+
+    cloud = read_json(artifact_dir / "cloud-helper-report.json")
+    proposal = cloud.get("proposal", {}).get("message", {}).get("payload", {})
+    if proposal.get("direct_actuator_authority") is not False or proposal.get("publication_authority") is not False:
+        failures.append("s10_cloud_helper_not_proposal_only")
+    if cloud.get("publish_denial", {}).get("status") != "Denied" or cloud.get("device_direct_denial", {}).get("status") != "Denied":
+        failures.append("s10_cloud_helper_direct_authority_not_denied")
+    edge = read_json(artifact_dir / "edge-inspection-report.json")
+    simulator_evidence = edge.get("simulator_evidence", [])
+    for item in simulator_evidence:
+        if item.get("total_delta") != item.get("expected_sim_delta"):
+            failures.append(f"s10_simulator_delta_mismatch:{item.get('label')}")
+    if edge.get("inspect_zone", {}).get("status") != "Executed" or edge.get("device_trace_sync", {}).get("accepted") is not True:
+        failures.append("s10_edge_inspection_or_trace_sync_missing")
+    state = read_json(artifact_dir / "state-handoff-report.json")
+    if state.get("imported", {}).get("accepted") is not True or state.get("cloud_resume", {}).get("status") not in {"running", "waiting_for_approval", "completed"}:
+        failures.append("s10_state_handoff_resume_missing")
+    if state.get("tampered_state_import", {}).get("status") != 403:
+        failures.append("s10_tampered_state_import_not_rejected")
+    trace_sync = read_json(artifact_dir / "trace-sync-report.json")
+    for key in ["vpc", "edge", "cloud"]:
+        if trace_sync.get(key, {}).get("accepted_records", 0) <= 0:
+            failures.append(f"s10_trace_sync_missing_records:{key}")
+    if trace_sync.get("tampered", {}).get("status") != 403:
+        failures.append("s10_tampered_trace_sync_not_rejected")
+    governance = read_json(artifact_dir / "governance-branches.json")
+    if governance.get("circuit_breaker", {}).get("blocked_action", {}).get("status") != "Denied":
+        failures.append("s10_circuit_breaker_branch_not_denied")
+    if governance.get("kill_switch", {}).get("activated", {}).get("cancel_status") != 200:
+        failures.append("s10_kill_switch_branch_not_cancelled")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("side_effects_executed") is not False:
+        failures.append("s10_replay_suppression_missing")
+    if replay.get("counts_before_replay") != replay.get("counts_after_replay"):
+        failures.append("s10_replay_changed_public_counters")
+    if replay.get("unsafe_replay_negative", {}).get("status") not in {400, 403}:
+        failures.append("s10_unsafe_replay_not_rejected")
+    audit = read_json(artifact_dir / "audit-package.json")
+    human = audit.get("human_readable", {})
+    if human.get("replay_side_effects_executed") is not False or human.get("telemetry_authorized_actions") is not False or human.get("physical_actions_high_level_only") is not True:
+        failures.append("s10_audit_human_summary_invariant_missing")
+    coverage = read_json(artifact_dir / "fr-primitive-coverage-matrix.json")
+    if set(coverage.get("primitives", {})) < S10_REQUIRED_PRIMITIVES:
+        failures.append("s10_primitive_coverage_matrix_incomplete")
+    required_fr_groups = {"FR-0.01-01..07", "FR-0.02-01..10", "FR-0.03-01..11", "FR-0.04-01..10", "FR-0.05-01..10", "FR-0.1-01..08"}
+    if set(coverage.get("fr_groups", {})) != required_fr_groups:
+        failures.append("s10_fr_coverage_matrix_incomplete")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "synthetic_required_evidence", "telemetry_authorizes_action_or_placement", "cloud_helper_direct_authority", "raw_physical_action_accepted", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s10_anti_drift_expected_false:{key}")
+    if anti.get("coverage_matrix_present") is not True:
+        failures.append("s10_anti_drift_coverage_matrix_missing")
+    if sorted(anti.get("derived_from_required_event_evidence", [])) != sorted(S10_REQUIRED_EVENTS):
+        failures.append("s10_anti_drift_not_derived_from_event_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -2518,75 +3113,83 @@ def main() -> int:
     s7_scenario, s7_failures = load_s7_scenario(report_dir)
     s8_scenario, s8_failures = load_s8_scenario(report_dir)
     s9_scenario, s9_failures = load_s9_scenario(report_dir)
+    s10_scenario, s10_failures = load_s10_scenario(report_dir)
     active_ids: set[str] = set()
-    if args.scenario in {"UC-E2E-S1", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S1", "UC-E2E-S8", "UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S1")
         if s1_scenario is None:
             blocking.append("missing_uc_e2e_s1_scenario_report")
         else:
             scenarios.append(s1_scenario)
             blocking.extend(s1_failures)
-    if args.scenario in {"UC-E2E-S2", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S2", "UC-E2E-S8", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S2")
         if s2_scenario is None:
             blocking.append("missing_uc_e2e_s2_scenario_report")
         else:
             scenarios.append(s2_scenario)
             blocking.extend(s2_failures)
-    if args.scenario in {"UC-E2E-S3", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S3", "UC-E2E-S8", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S3")
         if s3_scenario is None:
             blocking.append("missing_uc_e2e_s3_scenario_report")
         else:
             scenarios.append(s3_scenario)
             blocking.extend(s3_failures)
-    if args.scenario in {"UC-E2E-S4", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S4", "UC-E2E-S8", "UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S4")
         if s4_scenario is None:
             blocking.append("missing_uc_e2e_s4_scenario_report")
         else:
             scenarios.append(s4_scenario)
             blocking.extend(s4_failures)
-    if args.scenario in {"UC-E2E-S5", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S5", "UC-E2E-S8", "UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S5")
         if s5_scenario is None:
             blocking.append("missing_uc_e2e_s5_scenario_report")
         else:
             scenarios.append(s5_scenario)
             blocking.extend(s5_failures)
-    if args.scenario in {"UC-E2E-S6", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S6", "UC-E2E-S8", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S6")
         if s6_scenario is None:
             blocking.append("missing_uc_e2e_s6_scenario_report")
         else:
             scenarios.append(s6_scenario)
             blocking.extend(s6_failures)
-    if args.scenario in {"UC-E2E-S7", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S7", "UC-E2E-S8", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S7")
         if s7_scenario is None:
             blocking.append("missing_uc_e2e_s7_scenario_report")
         else:
             scenarios.append(s7_scenario)
             blocking.extend(s7_failures)
-    if args.scenario == "UC-E2E-S8" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S8", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S8")
         if s8_scenario is None:
             blocking.append("missing_uc_e2e_s8_scenario_report")
         else:
             scenarios.append(s8_scenario)
             blocking.extend(s8_failures)
-    if args.scenario == "UC-E2E-S9" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S9")
         if s9_scenario is None:
             blocking.append("missing_uc_e2e_s9_scenario_report")
         else:
             scenarios.append(s9_scenario)
             blocking.extend(s9_failures)
+    if args.scenario == "UC-E2E-S10" or args.mode == "all":
+        active_ids.add("UC-E2E-S10")
+        if s10_scenario is None:
+            blocking.append("missing_uc_e2e_s10_scenario_report")
+        else:
+            scenarios.append(s10_scenario)
+            blocking.extend(s10_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s9-failure-injection",
+        "suite_version": "0.1-s10-final-journey",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -2605,6 +3208,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S7",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S8",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S9",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S10",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -2641,7 +3245,7 @@ def main() -> int:
             "UC-E2E-S7 validates data-local artifact and cross-tenant isolation through public manager and resident daemon HTTP APIs without enterprise data workspace UI.",
             "UC-E2E-S8 validates replay/audit/schema compatibility by importing prior scenario artifacts and rejects tampered, unsupported, unsafe, or reason-less evidence.",
             "UC-E2E-S9 validates deterministic failure injection, quota pressure, bounded retry, idempotency markers, and fail-closed races through public daemon/manager APIs plus S1/S4/S5 source artifacts.",
-            "S10 remains blocked until its own executable scenario evidence is present.",
+            "UC-E2E-S10 validates the final cross-component field-intelligence journey through public manager, daemon, governance, message, state, trace, device, replay, and CLI signing boundaries.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
