@@ -3782,12 +3782,53 @@ struct FailingTraceStore {
     failed: Mutex<bool>,
 }
 
+fn append_failure_evidence_event(
+    store: &dyn TraceStore,
+    run_id: &str,
+    failure_kind: &str,
+    details: serde_json::Value,
+) -> Result<(), TraceStoreError> {
+    let next_sequence = match store.read(run_id) {
+        Ok(records) => records.len() as u64,
+        Err(TraceStoreError::RunNotFound) => 0,
+        Err(error) => return Err(error),
+    };
+    let parsed_run_id = RunId::parse(run_id).map_err(|_| {
+        TraceStoreError::InvalidTimestamp(format!("invalid_run_id_for_failure_evidence:{run_id}"))
+    })?;
+    let trace_event_id = TraceEventId::from_run_sequence(&parsed_run_id, next_sequence).to_string();
+    store.append(
+        run_id,
+        serde_json::json!({
+            "kind": {
+                failure_kind: details,
+            },
+            "trace_event_id": trace_event_id,
+            "identity": {
+                "run_id": run_id,
+            },
+            "timestamp": OffsetDateTime::now_utc().to_string(),
+        }),
+    )?;
+    Ok(())
+}
+
 impl TraceStore for FailingTraceStore {
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
         if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
             let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
             if !*failed {
                 *failed = true;
+                append_failure_evidence_event(
+                    &self.inner,
+                    run_id,
+                    "TraceWriteFailed",
+                    serde_json::json!({
+                        "failed_event": self.fail_on_event,
+                        "side_effect_executed": false,
+                        "failure_injection": "splendorctl_public_run_config",
+                    }),
+                )?;
                 return Err(TraceStoreError::InvalidTimestamp(format!(
                     "injected_trace_write_failure:{}",
                     self.fail_on_event
@@ -4119,9 +4160,35 @@ fn run_from_config(
     }
 
     let cycles = cycles_override.or(config.cycles).unwrap_or(1);
-    scheduler
-        .run_cycles(cycles)
-        .map_err(|error| format!("Scheduler failed: {error}"))?;
+    if let Err(error) = scheduler.run_cycles(cycles) {
+        if config
+            .failure_injection
+            .as_ref()
+            .and_then(|injection| injection.state_commit_fail)
+            .unwrap_or(false)
+        {
+            for agent_config in &config.agents {
+                let run_id = resolve_run_id(&config, agent_config, work_order.as_ref())?;
+                let run_id_string = run_id.to_string();
+                append_failure_evidence_event(
+                    trace_store.as_ref(),
+                    &run_id_string,
+                    "StateCommitFailed",
+                    serde_json::json!({
+                        "reason": "injected_state_commit_failure",
+                        "next_tick_advanced": false,
+                        "failure_injection": "splendorctl_public_run_config",
+                    }),
+                )
+                .map_err(|trace_error| {
+                    format!(
+                        "Scheduler failed: {error}; failed to record state commit failure evidence: {trace_error}"
+                    )
+                })?;
+            }
+        }
+        return Err(format!("Scheduler failed: {error}"));
+    }
     Ok(())
 }
 
