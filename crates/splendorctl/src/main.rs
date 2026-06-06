@@ -3647,6 +3647,7 @@ struct RunConfig {
 struct FailureInjectionConfig {
     trace_fail_on_event: Option<String>,
     state_commit_fail: Option<bool>,
+    verifier_unavailable_actions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4530,9 +4531,12 @@ fn build_gateway(
         ));
     }
     gateway.set_circuit_breaker_evaluator(evaluator);
-    gateway.set_resource_boundary_verifier(Arc::new(LocalResourceBoundaryVerifier::from_config(
-        config.adapters.as_ref(),
-    )));
+    gateway.set_resource_boundary_verifier(Arc::new(
+        LocalResourceBoundaryVerifier::from_config_with_failure_injection(
+            config.adapters.as_ref(),
+            config.failure_injection.as_ref(),
+        ),
+    ));
     let actions = collect_action_configs(config)?;
     for action in actions {
         let adapter_id = action
@@ -4550,15 +4554,28 @@ fn build_gateway(
 #[derive(Clone, Debug, Default)]
 struct LocalResourceBoundaryVerifier {
     http_allowed_domains: Vec<String>,
+    unavailable_actions: BTreeSet<String>,
 }
 
 impl LocalResourceBoundaryVerifier {
     fn from_config(config: Option<&AdaptersConfig>) -> Self {
+        Self::from_config_with_failure_injection(config, None)
+    }
+
+    fn from_config_with_failure_injection(
+        config: Option<&AdaptersConfig>,
+        failure_injection: Option<&FailureInjectionConfig>,
+    ) -> Self {
         Self {
             http_allowed_domains: config
                 .and_then(|adapters| adapters.http.as_ref())
                 .map(|http| http.allowed_domains.clone())
                 .unwrap_or_default(),
+            unavailable_actions: failure_injection
+                .and_then(|injection| injection.verifier_unavailable_actions.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         }
     }
 }
@@ -4569,6 +4586,9 @@ impl ResourceBoundaryVerifier for LocalResourceBoundaryVerifier {
         action: &splendor_gateway::ActionRequest,
         adapter: Option<&str>,
     ) -> splendor_types::VerificationResult {
+        if self.unavailable_actions.contains(&action.action.name) {
+            return verifier_unavailable_denied(&action.action.name, adapter);
+        }
         match adapter {
             Some("http") => self.verify_http(action),
             Some("filesystem") => self.verify_filesystem(action),
@@ -4656,6 +4676,28 @@ fn boundary_denied(
             "verifier": verifier,
             "adapter_execution": "not_attempted",
             "evidence": evidence,
+        }),
+    }
+}
+
+fn verifier_unavailable_denied(
+    action: &str,
+    adapter: Option<&str>,
+) -> splendor_types::VerificationResult {
+    splendor_types::VerificationResult {
+        allowed: false,
+        reasons: vec!["verifier_unavailable".to_string()],
+        artifacts: serde_json::json!({
+            "source": "resource_boundary_verifier",
+            "verifier": "resource_boundary_verifier",
+            "verifier_status": "unavailable",
+            "adapter_execution": "not_attempted",
+            "failure_injection": "splendorctl_public_run_config",
+            "evidence": {
+                "action": action,
+                "adapter": adapter,
+                "reason": "required verifier unavailable; fail closed before adapter execution",
+            },
         }),
     }
 }

@@ -726,6 +726,28 @@ def trace_record_action_name(record: dict) -> str:
     return str(action.get("name") or "")
 
 
+def trace_record_reasons(record: dict) -> list[str]:
+    payload = trace_record_kind_payload(record)
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    reasons = result.get("reasons")
+    if not isinstance(reasons, list):
+        outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
+        action_outcome = outcome.get("action_outcome") if isinstance(outcome.get("action_outcome"), dict) else {}
+        verification = action_outcome.get("verification") if isinstance(action_outcome.get("verification"), dict) else {}
+        reasons = verification.get("reasons")
+    return [str(reason) for reason in reasons] if isinstance(reasons, list) else []
+
+
+def value_contains_key_value(value: object, key: str, expected: object) -> bool:
+    if isinstance(value, dict):
+        if value.get(key) == expected:
+            return True
+        return any(value_contains_key_value(child, key, expected) for child in value.values())
+    if isinstance(value, list):
+        return any(value_contains_key_value(child, key, expected) for child in value)
+    return False
+
+
 def trace_record_message_id(record: dict) -> str:
     identity = record.get("payload", {}).get("identity", {})
     return str(identity.get("message_id") or "")
@@ -880,6 +902,22 @@ def validate_s9_required_event_evidence(
                         failures.append(f"s9_runtime_event_action_correlation_missing:{event_name}")
                     elif details.get("action") and trace_record_action_name(observed["record"]) != details.get("action"):
                         failures.append(f"s9_runtime_event_action_name_mismatch:{event_name}")
+                if event_name == "verifier.unavailable":
+                    observed_payload = trace_record_kind_payload(observed["record"])
+                    observed_reasons = trace_record_reasons(observed["record"])
+                    observed_text = json.dumps(observed_payload, sort_keys=True)
+                    if "verifier_unavailable" not in observed_reasons:
+                        failures.append("s9_verifier_unavailable_missing_runtime_reason")
+                    if any(forbidden in observed_text for forbidden in ["policy_expired", "approval_policy_expired"]):
+                        failures.append("s9_verifier_unavailable_confused_with_policy_or_approval_expiry")
+                    if not value_contains_key_value(observed_payload, "verifier_status", "unavailable"):
+                        failures.append("s9_verifier_unavailable_missing_verifier_status")
+                    if not value_contains_key_value(observed_payload, "adapter_execution", "not_attempted"):
+                        failures.append("s9_verifier_unavailable_adapter_not_blocked")
+                    if details.get("failure_injection") != "verifier_unavailable_actions" or details.get("public_path") != "splendorctl run --config":
+                        failures.append("s9_verifier_unavailable_public_cli_path_missing")
+                    if details.get("http_counter_before") != details.get("http_counter_after"):
+                        failures.append("s9_verifier_unavailable_adapter_counter_changed")
                 if event_name in {"trace.write_failed", "state.commit_failed", "run.paused", "run.cancelled"} and not row.get("run_id"):
                     failures.append(f"s9_runtime_event_run_correlation_missing:{event_name}")
                 if event_name == "trace.write_failed" and details.get("http_counter_before") != details.get("http_counter_after"):
@@ -2648,6 +2686,7 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "api-traffic.ndjson",
         "trace-export.jsonl",
         "fault-injection-report.json",
+        "verifier-unavailable-report.json",
         "quota-retry-report.json",
         "idempotency-report.json",
         "failure-matrix.json",
@@ -2714,6 +2753,19 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     fault = read_json(artifact_dir / "fault-injection-report.json")
     if set(fault.get("source_scenarios", [])) != S9_REQUIRED_SOURCE_SCENARIOS:
         failures.append("s9_fault_report_missing_source_scenarios")
+    verifier_report = read_json(artifact_dir / "verifier-unavailable-report.json")
+    verifier_counter = verifier_report.get("adapter_counter", {})
+    if verifier_report.get("public_path") != "splendorctl run --config + splendorctl trace export" or verifier_report.get("denied_action") != "http_get":
+        failures.append("s9_verifier_unavailable_report_missing_public_cli_path")
+    if verifier_counter.get("http_counter_before") != verifier_counter.get("http_counter_after"):
+        failures.append("s9_verifier_unavailable_report_counter_changed")
+    verifier_evidence_ids = [
+        row.get("trace_event_id")
+        for row in verifier_report.get("required_event_evidence", [])
+        if isinstance(row, dict)
+    ]
+    if sorted(verifier_evidence_ids) != sorted(event_ids.get("verifier.unavailable", [])):
+        failures.append("s9_verifier_unavailable_report_evidence_mismatch")
     audit = read_json(artifact_dir / "audit-report.json")
     manager_export = read_json(artifact_dir / "manager-audit-export.json")
     manager_events = []
