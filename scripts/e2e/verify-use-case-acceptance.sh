@@ -151,7 +151,10 @@ case "${MODE}" in
     if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S8" ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s8_replay_audit_compat/run.py" \
         --root "${ROOT_DIR}" \
-        --report-dir "${REPORT_DIR}"
+        --report-dir "${REPORT_DIR}" \
+        --base-url "${SPLENDOR_DAEMON_URL:-http://splendor-daemon-local:8080}" \
+        --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}" \
+        --edge-url "${SPLENDOR_EDGE_NODE_URL:-http://resident-edge-node:8093}"
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \

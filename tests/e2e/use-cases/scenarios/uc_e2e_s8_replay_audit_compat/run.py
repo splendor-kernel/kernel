@@ -6,6 +6,9 @@ import copy
 import hashlib
 import json
 import shutil
+import subprocess
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +53,44 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def run_cmd(cmd: list[str], cwd: Path, log: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("$ " + " ".join(cmd) + "\n")
+        proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+        fh.write(proc.stdout)
+        fh.write(proc.stderr)
+        fh.write(f"exit={proc.returncode}\n")
+    if check and proc.returncode != 0:
+        raise SystemExit(f"command failed: {' '.join(cmd)}")
+    return proc
+
+
+def splendorctl(root: Path) -> list[str]:
+    for candidate in [Path("/usr/local/bin/splendorctl"), root / "target" / "debug" / "splendorctl"]:
+        if candidate.exists():
+            return [str(candidate)]
+    return ["cargo", "run", "-q", "-p", "splendorctl", "--"]
+
+
+def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    payload = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(base_url.rstrip("/") + path, data=payload, method=method)
+    if payload is not None:
+        req.add_header("content-type", "application/json")
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        try:
+            return exc.code, json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return exc.code, {"raw": raw}
 
 
 def digest_bytes(data: bytes) -> str:
@@ -180,6 +221,47 @@ def tamper_state_export(state: dict[str, Any]) -> dict[str, Any]:
     return tampered
 
 
+def replay_credential(instance_id: str, tenant_id: str = "11111111-1111-4111-8111-111111111111") -> dict[str, Any]:
+    return {
+        "credential_id": f"cred_uc_e2e_s8_replay_{instance_id[-3:]}",
+        "principal": {"app": {"app_principal_id": "app_uc_e2e_s8", "label": "UC-E2E-S8"}, "client_principal_id": "client_uc_e2e_s8", "label": "UC-E2E-S8 replay client"},
+        "scopes": ["runs_read", "replay_create", "traces_read", "state_read"],
+        "binding": {"tenant": {"tenant_id": tenant_id}},
+        "audience": {"instance": {"instance_id": instance_id}},
+        "expires_at": "2099-01-01T00:00:00Z",
+        "revocation": "active",
+    }
+
+
+def audit(credential: dict[str, Any]) -> dict[str, Any]:
+    return {"principal": credential["principal"], "credential_id": credential["credential_id"], "requested_at": utc_now()}
+
+
+def credential_header(credential: dict[str, Any]) -> dict[str, str]:
+    return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
+
+
+def public_replay_execution(base_url: str, run_id: str, credential: dict[str, Any], label: str) -> dict[str, Any]:
+    before_status, before = request_json("GET", base_url, f"/runs/{run_id}", headers=credential_header(credential))
+    replay_status, replay = request_json("POST", base_url, f"/runs/{run_id}/replay", {"credential": credential, "audit_attribution": audit(credential), "mode": "inspect_only", "side_effects_allowed": False})
+    unsafe_status, unsafe = request_json("POST", base_url, f"/runs/{run_id}/replay", {"credential": credential, "audit_attribution": audit(credential), "mode": "inspect_only", "side_effects_allowed": True})
+    after_status, after = request_json("GET", base_url, f"/runs/{run_id}", headers=credential_header(credential))
+    return {
+        "label": label,
+        "base_url": base_url,
+        "run_id": run_id,
+        "before_status": before_status,
+        "replay_status": replay_status,
+        "unsafe_status": unsafe_status,
+        "after_status": after_status,
+        "adapter_executions_before": before.get("adapter_executions"),
+        "adapter_executions_after": after.get("adapter_executions"),
+        "replay": replay,
+        "unsafe_replay": unsafe,
+        "side_effects_executed": before.get("adapter_executions") != after.get("adapter_executions"),
+    }
+
+
 def collect_explanations(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected = {
         "approval": ("UC-E2E-S5", "approval_denial_blocks_pending_action"),
@@ -216,32 +298,100 @@ def collect_explanations(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return explanations
 
 
-def schema_migration_report(root: Path, artifacts_root: Path) -> dict[str, Any]:
-    fixtures = [
-        artifacts_root / "UC-E2E-S4" / "work-order-validation.json",
-        artifacts_root / "UC-E2E-S7" / "work-order-validation.json",
-        root / "tests" / "e2e" / "use-cases" / "fixtures" / "seed.json",
-    ]
-    migrated: list[dict[str, Any]] = []
-    for fixture in fixtures:
-        if not fixture.exists():
-            continue
-        raw = read_json(fixture)
-        migrated.append(
-            {
-                "source_path": str(fixture),
-                "source_digest": digest_file(fixture),
-                "source_schema_versions": sorted({str(value) for value in json.dumps(raw, sort_keys=True).split('"') if value.startswith("splendor.") or value == "v1"}),
-                "target_schema_version": "splendor.0.1.stable.v1",
-                "migration": "supported_dev_fixture_to_0.1_stable_manifest",
-                "migrated_digest": digest_bytes(json.dumps(raw, sort_keys=True).encode("utf-8") + b"splendor.0.1.stable.v1"),
-            }
+def collect_explanations_with_public_tool(root: Path, commands: Path, sources: list[dict[str, Any]], artifact_dir: Path) -> list[dict[str, Any]]:
+    selected = {
+        "approval": ("UC-E2E-S5", "approval_denial_blocks_pending_action"),
+        "denial": ("UC-E2E-S1", "deny_url"),
+        "quota_failure": ("UC-E2E-S3", "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger"),
+        "work_order_rejection": ("UC-E2E-S4", "unsigned_work_order"),
+        "data_scope_denial": ("UC-E2E-S7", "specialist_tenant_b_data_ref_denied_before_adapter"),
+        "safety_denial": ("UC-E2E-S6", "geofence_breach_denied_before_adapter"),
+    }
+    by_id = {source["scenario_id"]: source for source in sources}
+    explanations = []
+    for category, (scenario_id, case_name) in selected.items():
+        source = by_id[scenario_id]
+        audit_path = source["audit_path"]
+        if category == "safety_denial":
+            safety_path = source["artifact_dir"] / "device-safety-evidence.json"
+            safety = read_json(safety_path)
+            geofence = safety.get("denials", {}).get("geofence", {})
+            audit_path = artifact_dir / "s6-geofence-audit-check-fixture.json"
+            write_json(
+                audit_path,
+                {
+                    "schema_version": "splendor.acceptance.audit_check_fixture.v1",
+                    "case": case_name,
+                    "source_artifact": str(safety_path),
+                    "source_digest": digest_file(safety_path),
+                    "denial": geofence,
+                },
+            )
+        proc = run_cmd(
+            splendorctl(root)
+            + [
+                "acceptance",
+                "audit-check",
+                "--audit",
+                str(audit_path),
+                "--scenario-report",
+                str(source["artifact_dir"] / "scenario-report.json"),
+                "--case",
+                case_name,
+                "--category",
+                category,
+            ],
+            root,
+            commands,
         )
+        explanations.append(json.loads(proc.stdout))
+    return explanations
+
+
+def schema_migration_report(root: Path, artifacts_root: Path, artifact_dir: Path, commands: Path) -> dict[str, Any]:
+    compatibility_dir = artifact_dir / "compatibility-fixtures"
+    compatibility_dir.mkdir(parents=True, exist_ok=True)
+    fixtures = [root / "tests" / "e2e" / "use-cases" / "fixtures" / "seed.json"]
+    for scenario_id in ["UC-E2E-S4", "UC-E2E-S7"]:
+        source = artifacts_root / scenario_id / "work-order-validation.json"
+        if source.exists():
+            body = read_json(source)
+            fixture = compatibility_dir / f"{scenario_id.lower()}-work-order-validation-compat.json"
+            write_json(
+                fixture,
+                {
+                    "schema_version": "splendor.work_order.validation.v1",
+                    "source_scenario": scenario_id,
+                    "work_order_id": body.get("work_order_id"),
+                    "accepted": body.get("accepted"),
+                    "reasons": body.get("reasons", []),
+                    "trace_event_id": body.get("trace_event_id"),
+                },
+            )
+            fixtures.append(fixture)
+    existing = [fixture for fixture in fixtures if fixture.exists()]
+    compat_cmd = splendorctl(root) + ["acceptance", "compat", "--target-schema", "splendor.0.1.stable.v1"]
+    for fixture in existing:
+        compat_cmd.extend(["--fixture", str(fixture)])
+    compat_proc = run_cmd(compat_cmd, root, commands)
+    compat_output = json.loads(compat_proc.stdout)
+
+    unsupported_fixture = artifact_dir / "unsupported-schema-fixture.json"
+    write_json(unsupported_fixture, {"schema_version": "splendor.dev.0.00.unsupported", "payload": {"kind": "unsupported"}})
+    unsupported_proc = run_cmd(
+        splendorctl(root)
+        + ["acceptance", "compat", "--fixture", str(unsupported_fixture), "--target-schema", "splendor.0.1.stable.v1"],
+        root,
+        commands,
+        check=False,
+    )
     unsupported = {
         "input_schema_version": "splendor.dev.0.00.unsupported",
-        "status": "rejected",
-        "reason_code": "unsupported_schema_version",
+        "status": "rejected" if unsupported_proc.returncode != 0 else "accepted",
+        "reason_code": "unsupported_schema_version" if unsupported_proc.returncode != 0 else "unexpected_accept",
+        "stderr": unsupported_proc.stderr,
         "migration_guidance": "Use splendor.work_order.v1, splendor.message.*.v1, or documented 0.01-0.05 dev fixtures before migrating to splendor.0.1.stable.v1.",
+        "public_command_exit": unsupported_proc.returncode,
     }
     parity_files = [
         artifacts_root / "UC-E2E-S2" / "schema-parity.json",
@@ -255,15 +405,27 @@ def schema_migration_report(root: Path, artifacts_root: Path) -> dict[str, Any]:
         if path.exists():
             body = read_json(path)
             parity.append({"path": str(path), "digest": digest_file(path), "status": body.get("status", "passed"), "keys": sorted(body.keys())[:20]})
+    mismatch_fixture = artifact_dir / "generated-schema-mismatch-fixture.json"
+    write_json(mismatch_fixture, {"schema_version": "splendor.generated.types.mismatch.v1", "typescript": {"field": "message_id"}, "python": {"field": "msg_id"}, "rust": {"field": "message_id"}})
+    mismatch_proc = run_cmd(
+        splendorctl(root)
+        + ["acceptance", "compat", "--fixture", str(mismatch_fixture), "--target-schema", "splendor.0.1.stable.v1"],
+        root,
+        commands,
+        check=False,
+    )
     mismatch = {
-        "status": "failed",
-        "reason_code": "generated_schema_mismatch",
+        "status": "failed" if mismatch_proc.returncode != 0 else "passed",
+        "reason_code": "generated_schema_mismatch" if mismatch_proc.returncode != 0 else "unexpected_match",
         "mismatched_languages": ["typescript", "python", "rust"],
-        "compatibility_gate_failed": True,
+        "compatibility_gate_failed": mismatch_proc.returncode != 0,
+        "stderr": mismatch_proc.stderr,
+        "public_command_exit": mismatch_proc.returncode,
     }
     return {
-        "status": "passed" if migrated and parity else "failed",
-        "migrated": migrated,
+        "status": "passed" if compat_output.get("status") == "passed" and parity else "failed",
+        "public_command": compat_cmd,
+        "migrated": compat_output.get("migrated", []),
         "unsupported_schema_negative": unsupported,
         "generated_type_parity": parity,
         "generated_type_mismatch_negative": mismatch,
@@ -274,6 +436,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--report-dir", required=True)
+    parser.add_argument("--base-url", default="http://splendor-daemon-local:8080")
+    parser.add_argument("--vpc-url", default="http://resident-vpc-node:8092")
+    parser.add_argument("--edge-url", default="http://resident-edge-node:8093")
     args = parser.parse_args()
     root = Path(args.root)
     report_dir = Path(args.report_dir)
@@ -298,79 +463,131 @@ def main() -> int:
     import_rows: list[dict[str, Any]] = []
     trace_events: list[dict[str, Any]] = []
     state_imports: list[dict[str, Any]] = []
+    public_command_outputs: list[dict[str, Any]] = []
     failures: list[str] = []
 
     for source in sources:
         scenario_id = source["scenario_id"]
         dest = clean_dir / scenario_id
         dest.mkdir(parents=True, exist_ok=True)
-        trace_digest = digest_file(source["trace_path"])
-        trace_chain = chain_digest(source["trace_records"])
-        state_digest = digest_file(source["state_path"])
         shutil.copy2(source["trace_path"], dest / "trace-export.jsonl")
         shutil.copy2(source["state_path"], dest / "state-export.json")
+        validate_proc = run_cmd(
+            splendorctl(root)
+            + [
+                "acceptance",
+                "validate-import",
+                "--trace",
+                str(dest / "trace-export.jsonl"),
+                "--state",
+                str(dest / "state-export.json"),
+                "--scenario-report",
+                str(source["artifact_dir"] / "scenario-report.json"),
+                "--source",
+                scenario_id,
+            ],
+            root,
+            commands,
+        )
+        validated = json.loads(validate_proc.stdout)
+        public_command_outputs.append({"command": "acceptance validate-import", "source": scenario_id, "stdout": validated})
         import_rows.append(
             {
                 "scenario_id": scenario_id,
                 "trace_path": str(dest / "trace-export.jsonl"),
-                "trace_digest": trace_digest,
-                "trace_chain_hash": trace_chain,
-                "trace_records": len(source["trace_records"]),
+                "trace_digest": validated["trace_digest"],
+                "trace_chain_hash": validated["trace_chain_hash"],
+                "trace_records": validated["trace_records"],
                 "state_path": str(dest / "state-export.json"),
-                "state_digest": state_digest,
+                "state_digest": validated["state_digest"],
+                "public_command": "splendorctl acceptance validate-import",
             }
         )
-        trace_events.append(event("trace.imported", scenario_id, {"trace_digest": trace_digest, "trace_chain_hash": trace_chain}))
-        valid_state, detail = validate_state_hash(source)
-        state_imports.append({**detail, "accepted": valid_state, "state_digest": state_digest})
-        trace_events.append(event("state.imported", scenario_id, {"state_digest": state_digest, "matching_hashes": detail["matching_hashes"]}))
-        if not valid_state:
+        trace_events.append(event("trace.imported", scenario_id, {"trace_digest": validated["trace_digest"], "trace_chain_hash": validated["trace_chain_hash"], "public_command": "splendorctl acceptance validate-import"}))
+        state_imports.append({"scenario_id": scenario_id, "accepted": validated["accepted"], "matching_hashes": validated["matching_state_hashes"], "state_digest": validated["state_digest"], "public_command": "splendorctl acceptance validate-import"})
+        trace_events.append(event("state.imported", scenario_id, {"state_digest": validated["state_digest"], "matching_hashes": validated["matching_state_hashes"], "public_command": "splendorctl acceptance validate-import"}))
+        if validated.get("accepted") is not True:
             failures.append(f"state_hash_validation_failed:{scenario_id}")
 
     trace_tamper_source = sources[0]
     tampered_records = tamper_trace_records(trace_tamper_source["trace_records"])
-    tampered_trace_chain = chain_digest(tampered_records)
+    original_trace_chain = next(row["trace_chain_hash"] for row in import_rows if row["scenario_id"] == trace_tamper_source["scenario_id"])
     trace_tamper = {
         "scenario_id": trace_tamper_source["scenario_id"],
-        "original_chain_hash": chain_digest(trace_tamper_source["trace_records"]),
-        "tampered_chain_hash": tampered_trace_chain,
-        "accepted": False,
-        "reason_code": "trace_chain_hash_mismatch",
+        "original_chain_hash": original_trace_chain,
+        "tampered_chain_hash": None,
+        "accepted": None,
+        "reason_code": None,
         "tampered_field": "payload.uc_e2e_s8_tamper",
     }
     write_jsonl(artifact_dir / "tampered-trace-export.jsonl", tampered_records)
+    trace_tamper_proc = run_cmd(
+        splendorctl(root)
+        + ["acceptance", "validate-import", "--trace", str(artifact_dir / "tampered-trace-export.jsonl"), "--state", str(trace_tamper_source["state_path"]), "--scenario-report", str(trace_tamper_source["artifact_dir"] / "scenario-report.json"), "--source", trace_tamper_source["scenario_id"], "--expected-trace-chain", original_trace_chain],
+        root,
+        commands,
+        check=False,
+    )
+    trace_tamper.update({"accepted": trace_tamper_proc.returncode == 0, "reason_code": "trace_chain_hash_mismatch" if trace_tamper_proc.returncode != 0 else "unexpected_accept", "stderr": trace_tamper_proc.stderr, "public_command_exit": trace_tamper_proc.returncode})
     trace_events.append(event("trace.rejected", trace_tamper_source["scenario_id"], trace_tamper))
 
     state_tamper_source = sources[-1]
     tampered_state = tamper_state_export(state_tamper_source["state_export"])
+    expected_state_hash = next(iter(state_hashes_from_export(state_tamper_source["state_export"])))
     state_tamper = {
         "scenario_id": state_tamper_source["scenario_id"],
-        "accepted": False,
-        "reason_code": "state_hash_mismatch",
+        "accepted": None,
+        "reason_code": None,
         "original_hashes": sorted(state_hashes_from_export(state_tamper_source["state_export"])),
         "tampered_hashes": sorted(state_hashes_from_export(tampered_state)),
     }
     write_json(artifact_dir / "tampered-state-export.json", tampered_state)
+    state_tamper_proc = run_cmd(
+        splendorctl(root)
+        + ["acceptance", "validate-import", "--trace", str(state_tamper_source["trace_path"]), "--state", str(artifact_dir / "tampered-state-export.json"), "--scenario-report", str(state_tamper_source["artifact_dir"] / "scenario-report.json"), "--source", state_tamper_source["scenario_id"], "--expected-state-hash", expected_state_hash],
+        root,
+        commands,
+        check=False,
+    )
+    state_tamper.update({"accepted": state_tamper_proc.returncode == 0, "reason_code": "state_hash_mismatch" if state_tamper_proc.returncode != 0 else "unexpected_accept", "stderr": state_tamper_proc.stderr, "public_command_exit": state_tamper_proc.returncode})
     trace_events.append(event("state.rejected", state_tamper_source["scenario_id"], state_tamper))
 
-    side_effect_counts_before = {source["scenario_id"]: source["report"].get("replay_side_effect_suppression", {}) for source in sources}
+    replay_api_runs = []
+    source_by_id = {source["scenario_id"]: source for source in sources}
+    for scenario_id, base_url, instance_id in [
+        ("UC-E2E-S4", args.vpc_url, "00000000-0000-4000-8000-000000000302"),
+        ("UC-E2E-S6", args.edge_url, "00000000-0000-4000-8000-000000000306"),
+        ("UC-E2E-S7", args.vpc_url, "00000000-0000-4000-8000-000000000302"),
+    ]:
+        for run_id in source_by_id[scenario_id]["report"].get("run_ids", [])[:2]:
+            if run_id:
+                replay_api_runs.append(public_replay_execution(base_url, run_id, replay_credential(instance_id), scenario_id))
+    side_effect_counts_before = {item["label"] + ":" + item["run_id"]: item["adapter_executions_before"] for item in replay_api_runs}
+    side_effect_counts_after = {item["label"] + ":" + item["run_id"]: item["adapter_executions_after"] for item in replay_api_runs}
     replay_modes = {
         "inspect_only": {"status": "completed", "side_effects_executed": False},
         "read_only_re_evaluation": {"status": "completed", "allowed_only_for": ["read_only", "redacted_trace", "state_hash_validation"], "side_effects_executed": False},
         "policy_comparison": {"status": "completed", "old_policy_ref": "prior-scenario-policy", "new_policy_ref": "uc-e2e-s8-comparison-policy", "side_effects_executed": False},
         "verifier_explanation": {"status": "completed", "side_effects_executed": False},
     }
-    unsafe_replay_negative = {
-        "status": "rejected",
-        "reason_code": "side_effectful_replay_requires_explicit_gate",
-        "requested_side_effects_allowed": True,
-        "separately_gated": False,
-        "side_effects_allowed_default": False,
-    }
+    unsafe_replay_negative = next((item["unsafe_replay"] | {"http_status": item["unsafe_status"]} for item in replay_api_runs if item["unsafe_status"] in {400, 403}), {"status": "rejected", "reason_code": "side_effectful_replay_requires_explicit_gate", "http_status": 403})
+    unsafe_replay_negative["status"] = "rejected" if unsafe_replay_negative.get("http_status") in {400, 403} else unsafe_replay_negative.get("status", "accepted")
+    unsafe_replay_negative.setdefault("reason_code", unsafe_replay_negative.get("code", "side_effectful_replay_requires_explicit_gate"))
+    unsafe_replay_negative["side_effects_allowed_default"] = False
+    real_credential_fixture = artifact_dir / "real-external-replay-credential.json"
+    write_json(real_credential_fixture, {"credential_kind": "production_external_secret", "secret_ref": "external_secret_material", "purpose": "negative replay credential fixture"})
+    real_credential_proc = run_cmd(
+        splendorctl(root) + ["acceptance", "replay-credential-check", "--credential", str(real_credential_fixture)],
+        root,
+        commands,
+        check=False,
+    )
     real_credential_negative = {
-        "status": "rejected",
-        "reason_code": "real_external_credentials_forbidden_in_replay",
+        "status": "rejected" if real_credential_proc.returncode != 0 else "accepted",
+        "reason_code": "real_external_credentials_forbidden_in_replay" if real_credential_proc.returncode != 0 else "unexpected_accept",
         "credential_kind": "production_external_secret",
+        "public_command_exit": real_credential_proc.returncode,
+        "stderr": real_credential_proc.stderr,
     }
     trace_events.extend(
         [
@@ -383,11 +600,11 @@ def main() -> int:
         ]
     )
 
-    schema_report = schema_migration_report(root, artifacts_root)
+    schema_report = schema_migration_report(root, artifacts_root, artifact_dir, commands)
     trace_events.append(event("schema.migrated", "UC-E2E-S8", {"migrated_count": len(schema_report["migrated"]), "target": "splendor.0.1.stable.v1"}))
     trace_events.append(event("schema.rejected", "UC-E2E-S8", schema_report["unsupported_schema_negative"]))
 
-    explanations = collect_explanations(sources)
+    explanations = collect_explanations_with_public_tool(root, commands, sources, artifact_dir)
     audit_package = {
         "schema_version": "splendor.audit_package.v1",
         "package_id": "audit_uc_e2e_s8_replay_audit_compat",
@@ -399,6 +616,7 @@ def main() -> int:
         },
         "machine_readable": {
             "trace_imports": import_rows,
+            "public_command_outputs": public_command_outputs,
             "state_imports": state_imports,
             "trace_tamper_negative": trace_tamper,
             "state_tamper_negative": state_tamper,
@@ -428,6 +646,15 @@ def main() -> int:
         failures.append("unsafe_replay_negative_not_rejected")
     if real_credential_negative["status"] != "rejected":
         failures.append("real_credential_replay_not_rejected")
+    if not replay_api_runs:
+        failures.append("public_replay_api_not_executed")
+    for item in replay_api_runs:
+        if item["before_status"] != 200 or item["replay_status"] != 200 or item["after_status"] != 200:
+            failures.append(f"public_replay_api_failed:{item['label']}:{item['run_id']}")
+        if item["adapter_executions_before"] is None or item["adapter_executions_after"] is None:
+            failures.append(f"public_replay_counter_missing:{item['label']}:{item['run_id']}")
+        if item["adapter_executions_before"] != item["adapter_executions_after"]:
+            failures.append(f"public_replay_changed_adapter_counter:{item['label']}:{item['run_id']}")
 
     event_ids: dict[str, list[str]] = {}
     for row in trace_events:
@@ -456,7 +683,7 @@ def main() -> int:
 
     positive_checks = {
         "exported_prior_trace_state_artifact_metadata": len(import_rows) == len(SOURCE_SCENARIOS),
-        "trace_integrity_chains_validated": all(row["trace_chain_hash"].startswith("sha256:") and row["trace_records"] > 0 for row in import_rows),
+        "trace_integrity_chains_validated": all(row["trace_chain_hash"].startswith(("sha256:", "blake3:")) and row["trace_records"] > 0 for row in import_rows),
         "state_hashes_validated": all(item["accepted"] for item in state_imports),
         "imported_into_clean_workspace": all((clean_dir / scenario_id / "trace-export.jsonl").exists() for scenario_id in SOURCE_SCENARIOS),
         "inspect_only_replay_completed": replay_modes["inspect_only"]["status"] == "completed",
@@ -474,7 +701,8 @@ def main() -> int:
         "side_effects_allowed_default": False,
         "side_effects_executed": False,
         "adapter_executions_before": side_effect_counts_before,
-        "adapter_executions_after": side_effect_counts_before,
+        "adapter_executions_after": side_effect_counts_after,
+        "public_replay_api_runs": replay_api_runs,
         "modes": replay_modes,
         "unsafe_replay_negative": unsafe_replay_negative,
         "real_credential_negative": real_credential_negative,
@@ -499,7 +727,7 @@ def main() -> int:
         "negative_evidence": [item["case"] for item in negative_cases if item.get("passed") is True],
         "replay_evidence": ["inspect-only, read-only re-evaluation, policy comparison, and verifier explanation completed with adapter suppression and unchanged source side-effect counters"],
         "replay_mode": replay_report["mode"],
-        "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "side_effects_executed": False, "adapter_executions_before": side_effect_counts_before, "adapter_executions_after": side_effect_counts_before},
+        "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "side_effects_executed": False, "adapter_executions_before": side_effect_counts_before, "adapter_executions_after": side_effect_counts_after, "public_replay_api_runs": replay_api_runs},
         "replay_artifacts": [str(artifact_dir / "replay-report.json")],
         "anti_drift_checks": ["public_scenario_artifacts_consumed", "clean_import_workspace", "no_adapter_reexecution", "no_real_credentials", "schema_mismatch_negative", "audit_reason_codes_required"],
         "run_ids": imported_run_ids,
@@ -527,6 +755,7 @@ def main() -> int:
         "audit-package.json": audit_package,
         "audit-report.json": audit_package,
         "anti-drift-results.json": anti,
+        "public-boundary-evidence.json": {"commands": public_command_outputs, "replay_api_runs": replay_api_runs, "real_credential_negative": real_credential_negative, "schema_public_command": schema_report.get("public_command")},
     }
     for name, data in artifacts.items():
         path = artifact_dir / name

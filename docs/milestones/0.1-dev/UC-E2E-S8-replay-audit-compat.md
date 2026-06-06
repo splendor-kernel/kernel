@@ -32,7 +32,14 @@ bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S8
 
 The aggregate report now recognizes S8 as executable and keeps only S9-S10 blocked/not-yet-covered after S0-S8 pass.
 
-S8 uses the public acceptance artifact boundary from prior scenarios: `scenario-report.json`, `trace-export.jsonl`, `state-export.json`, `replay-report.json`, `audit-report.json`, and schema parity artifacts. It does not call private Rust internals.
+S8 uses the public acceptance artifact boundary from prior scenarios: `scenario-report.json`, `trace-export.jsonl`, `state-export.json`, `replay-report.json`, `audit-report.json`, and schema parity artifacts. It also records public command/API evidence in `artifacts/UC-E2E-S8/public-boundary-evidence.json`. It does not call private Rust internals.
+
+S8 public validators are exposed through `splendorctl acceptance`:
+
+- `validate-import` verifies trace chain hashes and state hash linkage from exported artifacts;
+- `compat` verifies supported schema fixtures can migrate to `splendor.0.1.stable.v1` and rejects unsupported or mismatched schema evidence;
+- `audit-check` verifies denial, approval, quota, work-order, data-scope, and safety evidence carries explicit reason codes;
+- `replay-credential-check` rejects real external replay credential fixtures.
 
 ## 5. Runtime Primitives Touched
 
@@ -72,6 +79,8 @@ S8 copies prior `state-export.json` artifacts into `artifacts/UC-E2E-S8/clean-im
 ## 8. Verifier/Gateway Behavior Added Or Changed
 
 S8 does not introduce a new gateway path. It explains prior verifier decisions from public scenario artifacts for approvals, ordinary denials, quota failures, work-order rejection, data-scope denial, and safety denial. Audit export fails if any required negative path omits reason codes.
+
+Safety-denial explanation consumes `UC-E2E-S6/device-safety-evidence.json` through a derived S8 audit-check fixture that records the source artifact digest and copies the explicit geofence denial reason. This keeps the public validator authoritative without claiming private helper-only evidence.
 
 ## 9. Replay Behavior
 
@@ -118,12 +127,26 @@ Expected S8 artifacts include:
 - `artifacts/UC-E2E-S8/replay-report.json`
 - `artifacts/UC-E2E-S8/schema-migration-report.json`
 - `artifacts/UC-E2E-S8/audit-package.json`
+- `artifacts/UC-E2E-S8/public-boundary-evidence.json`
 - `artifacts/UC-E2E-S8/trace-export.jsonl`
 
 ## 12. Example Commands Or Fixtures
 
 ```bash
 bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S8
+splendorctl acceptance validate-import \
+  --trace target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/trace-export.jsonl \
+  --state target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/state-export.json \
+  --scenario-report target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/scenario-report.json \
+  --source UC-E2E-S1
+splendorctl acceptance compat \
+  --target-schema splendor.0.1.stable.v1 \
+  --fixture tests/e2e/use-cases/fixtures/seed.json
+splendorctl acceptance audit-check \
+  --audit target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/audit-report.json \
+  --scenario-report target/splendor-e2e/use-case-acceptance/artifacts/UC-E2E-S1/scenario-report.json \
+  --case deny_url \
+  --category denial
 python3 tests/e2e/use-cases/reporting/aggregate_report.py \
   --root . \
   --report-dir target/splendor-e2e/use-case-acceptance \

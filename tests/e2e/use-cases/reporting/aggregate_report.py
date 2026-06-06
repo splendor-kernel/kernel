@@ -1780,6 +1780,7 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "schema-migration-report.json",
         "audit-package.json",
         "audit-report.json",
+        "public-boundary-evidence.json",
         "anti-drift-results.json",
         "tampered-trace-export.jsonl",
         "tampered-state-export.json",
@@ -1823,6 +1824,12 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if missing_exported_events:
         failures.append("s8_trace_export_missing_event_types:" + ",".join(missing_exported_events))
     trace_import = read_json(artifact_dir / "trace-import-report.json")
+    public_boundary = read_json(artifact_dir / "public-boundary-evidence.json")
+    public_commands = public_boundary.get("commands", [])
+    if len(public_commands) < len(S8_REQUIRED_SOURCE_SCENARIOS):
+        failures.append("s8_public_import_command_outputs_missing")
+    if not all(item.get("command") == "acceptance validate-import" and item.get("stdout", {}).get("accepted") is True for item in public_commands if item.get("command") == "acceptance validate-import"):
+        failures.append("s8_public_import_command_not_authoritative")
     imports = trace_import.get("imports", [])
     if len(imports) != len(S8_REQUIRED_SOURCE_SCENARIOS):
         failures.append("s8_trace_import_wrong_source_count")
@@ -1832,12 +1839,14 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for row in imports:
         if row.get("scenario_id") not in S8_REQUIRED_SOURCE_SCENARIOS:
             failures.append(f"s8_unknown_import_source:{row.get('scenario_id')}")
-        if not str(row.get("trace_digest", "")).startswith("sha256:") or not str(row.get("trace_chain_hash", "")).startswith("sha256:"):
+        if not str(row.get("trace_digest", "")).startswith(("sha256:", "blake3:")) or not str(row.get("trace_chain_hash", "")).startswith(("sha256:", "blake3:")):
             failures.append(f"s8_import_missing_trace_hashes:{row.get('scenario_id')}")
         if row.get("trace_records", 0) <= 0:
             failures.append(f"s8_import_empty_trace:{row.get('scenario_id')}")
-        if not str(row.get("state_digest", "")).startswith("sha256:"):
+        if not str(row.get("state_digest", "")).startswith(("sha256:", "blake3:")):
             failures.append(f"s8_import_missing_state_digest:{row.get('scenario_id')}")
+        if row.get("public_command") != "splendorctl acceptance validate-import":
+            failures.append(f"s8_import_missing_public_command:{row.get('scenario_id')}")
     state_import = read_json(artifact_dir / "state-import-report.json")
     for row in state_import.get("imports", []):
         if row.get("accepted") is not True or not row.get("matching_hashes"):
@@ -1847,15 +1856,29 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     state_tamper = tamper.get("state", {})
     if trace_tamper.get("accepted") is not False or trace_tamper.get("reason_code") != "trace_chain_hash_mismatch":
         failures.append("s8_tampered_trace_not_rejected")
+    if trace_tamper.get("public_command_exit") == 0:
+        failures.append("s8_tampered_trace_public_validator_did_not_fail")
     if trace_tamper.get("original_chain_hash") == trace_tamper.get("tampered_chain_hash"):
         failures.append("s8_tampered_trace_chain_unchanged")
     if state_tamper.get("accepted") is not False or state_tamper.get("reason_code") != "state_hash_mismatch":
         failures.append("s8_tampered_state_not_rejected")
+    if state_tamper.get("public_command_exit") == 0:
+        failures.append("s8_tampered_state_public_validator_did_not_fail")
     if set(state_tamper.get("original_hashes", [])) == set(state_tamper.get("tampered_hashes", [])):
         failures.append("s8_tampered_state_hashes_unchanged")
     replay = read_json(artifact_dir / "replay-report.json")
     if replay.get("side_effects_allowed_default") is not False or replay.get("side_effects_executed") is not False:
         failures.append("s8_replay_side_effect_suppression_missing")
+    public_replays = replay.get("public_replay_api_runs", []) or public_boundary.get("replay_api_runs", [])
+    if not public_replays:
+        failures.append("s8_public_replay_api_runs_missing")
+    for item in public_replays:
+        if item.get("before_status") != 200 or item.get("replay_status") != 200 or item.get("after_status") != 200:
+            failures.append(f"s8_public_replay_api_status_failed:{item.get('label')}:{item.get('run_id')}")
+        if item.get("adapter_executions_before") is None or item.get("adapter_executions_after") is None:
+            failures.append(f"s8_public_replay_counter_missing:{item.get('label')}:{item.get('run_id')}")
+        if item.get("adapter_executions_before") != item.get("adapter_executions_after"):
+            failures.append(f"s8_public_replay_counter_changed:{item.get('label')}:{item.get('run_id')}")
     modes = replay.get("modes", {})
     for mode in ["inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"]:
         if modes.get(mode, {}).get("status") != "completed":
@@ -1867,17 +1890,25 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         failures.append("s8_unsafe_replay_not_rejected")
     if replay.get("real_credential_negative", {}).get("status") != "rejected":
         failures.append("s8_real_credential_replay_not_rejected")
+    if replay.get("real_credential_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_real_credential_public_validator_did_not_fail")
     if replay.get("adapter_executions_before") != replay.get("adapter_executions_after"):
         failures.append("s8_replay_changed_source_adapter_counts")
     schema = read_json(artifact_dir / "schema-migration-report.json")
     if schema.get("status") != "passed" or not schema.get("migrated"):
         failures.append("s8_schema_migration_not_passed")
+    if not schema.get("public_command"):
+        failures.append("s8_schema_migration_missing_public_command")
     if schema.get("unsupported_schema_negative", {}).get("status") != "rejected" or not schema.get("unsupported_schema_negative", {}).get("migration_guidance"):
         failures.append("s8_unsupported_schema_not_rejected_with_guidance")
+    if schema.get("unsupported_schema_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_unsupported_schema_public_command_did_not_fail")
     if not schema.get("generated_type_parity"):
         failures.append("s8_generated_type_parity_missing")
     if schema.get("generated_type_mismatch_negative", {}).get("compatibility_gate_failed") is not True:
         failures.append("s8_schema_mismatch_negative_not_failed")
+    if schema.get("generated_type_mismatch_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_schema_mismatch_public_command_did_not_fail")
     audit = read_json(artifact_dir / "audit-package.json")
     machine = audit.get("machine_readable", {})
     explanations = machine.get("verifier_explanations", [])
