@@ -55,6 +55,19 @@ struct ManagerInner {
     kill_switches: Mutex<HashMap<String, KillSwitchReport>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MessageIdempotencyScope {
+    tenant_id: TenantId,
+    work_order_id: String,
+    run_id: RunId,
+    source_agent_id: AgentId,
+    target_agent_id: AgentId,
+    schema: String,
+    source_instance_id: String,
+    target_instance_id: String,
+    route_permission: Option<String>,
+}
+
 impl ManagerState {
     pub fn local_acceptance() -> Self {
         let fleet_id = std::env::var("SPLENDOR_FLEET_ID")
@@ -1648,16 +1661,14 @@ async fn send_message(
         .registry
         .instance(&target_instance)
         .map_err(|e| ManagerApiError::not_found("target_instance_not_found", e.to_string()))?;
-    let work_order = state
-        .inner
-        .work_orders
-        .lock()
-        .map_err(|_| ManagerApiError::internal("work_order_lock", "work order lock unavailable"))?
-        .get(&request.work_order_id)
-        .cloned()
-        .ok_or_else(|| {
-            ManagerApiError::not_found("work_order_not_found", "work order not submitted")
-        })?;
+    let work_order = load_current_message_work_order(&state, &request.work_order_id).inspect_err(
+        |error| {
+            let _ = state.audit(
+                "remote_message.rejected",
+                serde_json::json!({"message_id": request.message_envelope.message.message_id, "work_order_id": request.work_order_id.clone(), "reason": error.body.code}),
+            );
+        },
+    )?;
     validate_remote_message_authority(
         &request,
         &work_order,
@@ -1667,7 +1678,7 @@ async fn send_message(
     .inspect_err(|error| {
         let _ = state.audit(
             "remote_message.rejected",
-            serde_json::json!({"message_id": request.message_envelope.message.message_id, "work_order_id": request.work_order_id, "reason": error.body.code}),
+            serde_json::json!({"message_id": request.message_envelope.message.message_id, "work_order_id": request.work_order_id.clone(), "reason": error.body.code}),
         );
     })?;
     let message_id = request.message_envelope.message.message_id.clone();
@@ -1675,6 +1686,8 @@ async fn send_message(
         "message.remote.proposal:{}",
         request.message_envelope.message.target_agent_id
     ));
+    let requested_idempotency_scope =
+        message_idempotency_scope_for_request(&request, &work_order, route_permission.clone());
     let idempotency_key = request
         .idempotency_key
         .clone()
@@ -1705,6 +1718,23 @@ async fn send_message(
                     "message idempotency index is stale",
                 )
             })?;
+        if message_idempotency_scope_from_report(&existing) != requested_idempotency_scope {
+            state.audit(
+                "remote_message.rejected",
+                serde_json::json!({
+                    "message_id": message_id,
+                    "existing_message_id": existing_message_id,
+                    "idempotency_key": idempotency_key,
+                    "work_order_id": request.work_order_id.clone(),
+                    "reason": "message_idempotency_scope_mismatch",
+                    "remote_state_mutated": false,
+                }),
+            )?;
+            return Err(ManagerApiError::forbidden(
+                "message_idempotency_scope_mismatch",
+                "idempotency key was already used for a different tenant/work-order/message route",
+            ));
+        }
         let trace_event_id = state.audit("remote_message.duplicate", serde_json::json!({"message_id": message_id, "existing_message_id": existing_message_id, "idempotency_key": idempotency_key, "remote_state_mutated": false}))?;
         let mut duplicate = existing;
         duplicate.trace_event_id = trace_event_id;
@@ -1786,6 +1816,79 @@ async fn send_message(
         .insert(idempotency_key, message_id.to_string());
     messages.insert(message_id.to_string(), report.clone());
     Ok(Json(report))
+}
+
+fn load_current_message_work_order(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<WorkOrderEnvelope, ManagerApiError> {
+    if state
+        .inner
+        .revoked_work_orders
+        .lock()
+        .map_err(|_| ManagerApiError::internal("revocation_lock", "revocation lock unavailable"))?
+        .contains(work_order_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "revoked_work_order",
+            "work order was revoked",
+        ));
+    }
+    let work_order = state
+        .inner
+        .work_orders
+        .lock()
+        .map_err(|_| ManagerApiError::internal("work_order_lock", "work order lock unavailable"))?
+        .get(work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::not_found("work_order_not_found", "work order not submitted")
+        })?;
+    splendor_types::validate_work_order(
+        &work_order,
+        &WorkOrderValidationContext {
+            tenant_id: work_order.work_order.tenant_id.clone(),
+            agent_id: work_order.work_order.agent_id.clone(),
+            run_id: work_order.work_order.run_id.clone(),
+            expected_placement_target: None,
+            now: OffsetDateTime::now_utc(),
+        },
+        &state.inner.work_order_keyring,
+    )
+    .map_err(|error| ManagerApiError::forbidden(error.reason_code(), error.to_string()))?;
+    Ok(work_order)
+}
+
+fn message_idempotency_scope_for_request(
+    request: &SendMessageRequest,
+    work_order: &WorkOrderEnvelope,
+    route_permission: Option<String>,
+) -> MessageIdempotencyScope {
+    MessageIdempotencyScope {
+        tenant_id: work_order.work_order.tenant_id.clone(),
+        work_order_id: request.work_order_id.clone(),
+        run_id: request.message_envelope.message.run_id.clone(),
+        source_agent_id: request.message_envelope.message.source_agent_id.clone(),
+        target_agent_id: request.message_envelope.message.target_agent_id.clone(),
+        schema: request.message_envelope.message.schema.clone(),
+        source_instance_id: request.source_instance_id.clone(),
+        target_instance_id: request.target_instance_id.clone(),
+        route_permission,
+    }
+}
+
+fn message_idempotency_scope_from_report(report: &MessageStatusReport) -> MessageIdempotencyScope {
+    MessageIdempotencyScope {
+        tenant_id: report.tenant_id.clone(),
+        work_order_id: report.work_order_id.clone(),
+        run_id: report.run_id.clone(),
+        source_agent_id: report.source_agent_id.clone(),
+        target_agent_id: report.target_agent_id.clone(),
+        schema: report.schema.clone(),
+        source_instance_id: report.source_instance_id.clone(),
+        target_instance_id: report.target_instance_id.clone(),
+        route_permission: report.route_permission.clone(),
+    }
 }
 
 fn validate_remote_message_authority(
@@ -3219,14 +3322,32 @@ mod tests {
     }
 
     fn test_work_order(target_agent: &str) -> WorkOrderEnvelope {
+        test_work_order_with(
+            "wo_test_remote",
+            target_agent,
+            RunId::parse("44444444-4444-4444-8444-444444444444").expect("run"),
+            OffsetDateTime::now_utc() + Duration::minutes(10),
+        )
+    }
+
+    fn test_work_order_with(
+        work_order_id: &str,
+        target_agent: &str,
+        run_id: RunId,
+        expires_at: OffsetDateTime,
+    ) -> WorkOrderEnvelope {
+        let issued_at = if expires_at > OffsetDateTime::now_utc() {
+            OffsetDateTime::now_utc() - Duration::minutes(1)
+        } else {
+            expires_at - Duration::minutes(1)
+        };
         let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
         let agent_id =
             splendor_types::AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent");
-        let run_id = RunId::parse("44444444-4444-4444-8444-444444444444").expect("run");
         WorkOrderEnvelope::signed_with_shared_secret(
             WorkOrder {
                 schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
-                work_order_id: WorkOrderId::try_new("wo_test_remote").expect("work order id"),
+                work_order_id: WorkOrderId::try_new(work_order_id).expect("work order id"),
                 tenant_id,
                 agent_id,
                 run_id: Some(run_id),
@@ -3257,14 +3378,88 @@ mod tests {
                     max_runtime_ms: Some(30_000),
                     execution_mode: PlacementExecutionMode::Live,
                 },
-                issued_at: OffsetDateTime::now_utc() - Duration::minutes(1),
-                expires_at: OffsetDateTime::now_utc() + Duration::minutes(10),
+                issued_at,
+                expires_at,
                 revocation: RevocationStatus::Active,
             },
             "work-order-local-key",
             b"splendor-local-work-order-secret",
         )
         .expect("signed work order")
+    }
+
+    async fn register_message_route(
+        state: &ManagerState,
+        security: &ManagerSecurityFields,
+        tenant_id: &TenantId,
+    ) {
+        for registration in [
+            node(
+                &state.inner.fleet_id,
+                "00000000-0000-4000-8000-000000000204",
+                "http://127.0.0.1:1",
+                "customer_vpc",
+                "vpc",
+                vec!["message.remote.proposal", "runtime.resident"],
+            ),
+            node(
+                &state.inner.fleet_id,
+                "00000000-0000-4000-8000-000000000404",
+                "http://127.0.0.1:1",
+                "resident_cloud_pool",
+                "cloud",
+                vec!["message.remote.proposal", "runtime.resident"],
+            ),
+        ] {
+            let _ = register_node(
+                State(state.clone()),
+                Json(RegisterNodeRequest {
+                    security: security.clone(),
+                    registration,
+                }),
+            )
+            .await
+            .expect("message route node registered");
+        }
+        for registration in [
+            instance(
+                "00000000-0000-4000-8000-000000000204",
+                "00000000-0000-4000-8000-000000000302",
+                tenant_id,
+            ),
+            instance(
+                "00000000-0000-4000-8000-000000000404",
+                "00000000-0000-4000-8000-000000000304",
+                tenant_id,
+            ),
+        ] {
+            let _ = register_instance(
+                State(state.clone()),
+                Json(RegisterInstanceRequest {
+                    security: security.clone(),
+                    registration,
+                }),
+            )
+            .await
+            .expect("message route instance registered");
+        }
+    }
+
+    async fn submit_test_work_order(
+        state: &ManagerState,
+        security: &ManagerSecurityFields,
+        work_order: WorkOrderEnvelope,
+    ) {
+        let _ = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order,
+                expected_audience: "central-manager".to_string(),
+            }),
+        )
+        .await
+        .expect("work order accepted");
     }
 
     fn instance(node_id: &str, instance_id: &str, tenant_id: &TenantId) -> InstanceRegistration {
@@ -5329,6 +5524,177 @@ mod tests {
             .0
             .iter()
             .any(|event| event.event_type == "remote_message.rejected"));
+    }
+
+    #[tokio::test]
+    async fn send_message_revalidates_revoked_work_order() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::WorkOrdersSubmit,
+                EndpointScope::WorkOrdersRevoke,
+                EndpointScope::MessagesSend,
+            ],
+        );
+        let target_agent = "33333333-3333-4333-8333-333333333333";
+        let work_order = test_work_order(target_agent);
+        let tenant_id = work_order.work_order.tenant_id.clone();
+        let run_id = work_order.work_order.run_id.clone().expect("run id");
+        register_message_route(&state, &security, &tenant_id).await;
+        submit_test_work_order(&state, &security, work_order).await;
+        let _ = revoke_work_order(
+            Path("wo_test_remote".to_string()),
+            State(state.clone()),
+            Json(RevokeWorkOrderRequest {
+                security: security.clone(),
+                reason: "security review revoked authority".to_string(),
+            }),
+        )
+        .await
+        .expect("work order revoked");
+
+        let request = send_request(security.credential.clone(), target_agent, run_id);
+        let message_id = request.message_envelope.message.message_id.clone();
+        let error = send_message(State(state.clone()), Json(request))
+            .await
+            .expect_err("revoked work order must not authorize message send");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "revoked_work_order");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&message_id.to_string()));
+        assert!(state
+            .inner
+            .audit
+            .lock()
+            .expect("audit lock")
+            .iter()
+            .any(|event| event.event_type == "remote_message.rejected"
+                && event
+                    .details
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("revoked_work_order")));
+    }
+
+    #[tokio::test]
+    async fn send_message_revalidates_expired_work_order() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::MessagesSend,
+            ],
+        );
+        let target_agent = "33333333-3333-4333-8333-333333333333";
+        let run_id = RunId::parse("44444444-4444-4444-8444-444444444444").expect("run");
+        let expired_work_order = test_work_order_with(
+            "wo_test_remote_expired",
+            target_agent,
+            run_id.clone(),
+            OffsetDateTime::now_utc() - Duration::seconds(1),
+        );
+        let tenant_id = expired_work_order.work_order.tenant_id.clone();
+        register_message_route(&state, &security, &tenant_id).await;
+        state
+            .inner
+            .work_orders
+            .lock()
+            .expect("work order lock")
+            .insert("wo_test_remote_expired".to_string(), expired_work_order);
+
+        let mut request = send_request(security.credential.clone(), target_agent, run_id);
+        request.work_order_id = "wo_test_remote_expired".to_string();
+        request.idempotency_key = Some("expired-message-authority".to_string());
+        let message_id = request.message_envelope.message.message_id.clone();
+        let error = send_message(State(state.clone()), Json(request))
+            .await
+            .expect_err("expired work order must not authorize message send");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "expired_work_order");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&message_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_cross_scope_idempotency_key_collision() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::WorkOrdersSubmit,
+                EndpointScope::MessagesSend,
+            ],
+        );
+        let target_one = "33333333-3333-4333-8333-333333333333";
+        let target_two = "33333333-3333-4333-8333-333333333334";
+        let work_order_one = test_work_order(target_one);
+        let tenant_id = work_order_one.work_order.tenant_id.clone();
+        let run_one = work_order_one.work_order.run_id.clone().expect("run one");
+        let run_two = RunId::parse("44444444-4444-4444-8444-444444444445").expect("run two");
+        let work_order_two = test_work_order_with(
+            "wo_test_remote_second",
+            target_two,
+            run_two.clone(),
+            OffsetDateTime::now_utc() + Duration::minutes(10),
+        );
+        register_message_route(&state, &security, &tenant_id).await;
+        submit_test_work_order(&state, &security, work_order_one).await;
+        submit_test_work_order(&state, &security, work_order_two).await;
+
+        let first = send_request(security.credential.clone(), target_one, run_one);
+        let delivered = send_message(State(state.clone()), Json(first))
+            .await
+            .expect("first scoped message delivered")
+            .0;
+        assert!(!delivered.duplicate);
+
+        let mut colliding = send_request(security.credential.clone(), target_two, run_two);
+        colliding.work_order_id = "wo_test_remote_second".to_string();
+        colliding.message_envelope.message.message_id =
+            MessageId::parse("55555555-5555-4555-8555-555555555558").expect("message id");
+        colliding.idempotency_key = Some("proposal-once".to_string());
+        let colliding_message_id = colliding.message_envelope.message.message_id.clone();
+        let error = send_message(State(state.clone()), Json(colliding))
+            .await
+            .expect_err("cross-scope idempotency key collision must fail closed");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "message_idempotency_scope_mismatch");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&colliding_message_id.to_string()));
+        assert!(state
+            .inner
+            .audit
+            .lock()
+            .expect("audit lock")
+            .iter()
+            .any(|event| event.event_type == "remote_message.rejected"
+                && event
+                    .details
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("message_idempotency_scope_mismatch")));
     }
 
     #[tokio::test]
