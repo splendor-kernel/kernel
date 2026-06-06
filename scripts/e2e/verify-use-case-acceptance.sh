@@ -10,9 +10,9 @@ REUSE_BUILD=0
 
 usage() {
   cat <<'USAGE'
-Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--scenario UC-E2E-S5|--scenario UC-E2E-S6|--scenario UC-E2E-S7|--scenario UC-E2E-S8|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
+Usage: bash scripts/e2e/verify-use-case-acceptance.sh [--all|--scenario UC-E2E-S0|--scenario UC-E2E-S1|--scenario UC-E2E-S2|--scenario UC-E2E-S3|--scenario UC-E2E-S4|--scenario UC-E2E-S5|--scenario UC-E2E-S6|--scenario UC-E2E-S7|--scenario UC-E2E-S8|--scenario UC-E2E-S9|--contract-only|--anti-drift-only] [--reuse-build] [--inside-compose]
 
-S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4 is the fleet dispatch acceptance gate. S5 is the governance acceptance gate. S6 is the physical/edge safety acceptance gate. S7 is the data-local isolation/artifact gate. S8 is the replay/audit/schema compatibility gate. S9-S10 intentionally report blocked/not-yet-covered until implemented.
+S0 is a static/container-harness gate. S1 is the local governed loop gate. S2 is the management API/client contract gate. S3 is the local multi-agent delegation gate. S4 is the fleet dispatch acceptance gate. S5 is the governance acceptance gate. S6 is the physical/edge safety acceptance gate. S7 is the data-local isolation/artifact gate. S8 is the replay/audit/schema compatibility gate. S9 is the failure injection/fail-closed gate. S10 intentionally reports blocked/not-yet-covered until implemented.
 USAGE
 }
 
@@ -32,7 +32,7 @@ done
 if [[ "${MODE}" == "scenario" && -z "${SCENARIO}" ]]; then
   SCENARIO="UC-E2E-S0"
 fi
-if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" && "${SCENARIO}" != "UC-E2E-S4" && "${SCENARIO}" != "UC-E2E-S5" && "${SCENARIO}" != "UC-E2E-S6" && "${SCENARIO}" != "UC-E2E-S7" && "${SCENARIO}" != "UC-E2E-S8" ]]; then
+if [[ "${MODE}" == "scenario" && "${SCENARIO}" != "UC-E2E-S0" && "${SCENARIO}" != "UC-E2E-S1" && "${SCENARIO}" != "UC-E2E-S2" && "${SCENARIO}" != "UC-E2E-S3" && "${SCENARIO}" != "UC-E2E-S4" && "${SCENARIO}" != "UC-E2E-S5" && "${SCENARIO}" != "UC-E2E-S6" && "${SCENARIO}" != "UC-E2E-S7" && "${SCENARIO}" != "UC-E2E-S8" && "${SCENARIO}" != "UC-E2E-S9" ]]; then
   echo "${SCENARIO} is not implemented; use --all to report future scenarios as blocked." >&2
   exit 2
 fi
@@ -104,7 +104,7 @@ case "${MODE}" in
     python3 "${ROOT_DIR}/tests/e2e/use-cases/contract/public_boundary_probe.py" \
       --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}" \
       --out "${REPORT_DIR}/artifacts/UC-E2E-S0/public-boundary.json"
-    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S1" || "${SCENARIO}" == "UC-E2E-S8" ) ) || "${MODE}" == "all" ]]; then
+    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S1" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S9" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s1_local_loop/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}"
@@ -120,7 +120,7 @@ case "${MODE}" in
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}"
     fi
-    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S4" || "${SCENARIO}" == "UC-E2E-S8" ) ) || "${MODE}" == "all" ]]; then
+    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S4" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S9" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s4_fleet_dispatch/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
@@ -128,7 +128,7 @@ case "${MODE}" in
         --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}" \
         --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-http://resident-cloud-node:8091}"
     fi
-    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S5" || "${SCENARIO}" == "UC-E2E-S8" ) ) || "${MODE}" == "all" ]]; then
+    if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S5" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S9" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s5_governance/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
@@ -155,6 +155,15 @@ case "${MODE}" in
         --base-url "${SPLENDOR_DAEMON_URL:-http://splendor-daemon-local:8080}" \
         --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}" \
         --edge-url "${SPLENDOR_EDGE_NODE_URL:-http://resident-edge-node:8093}"
+    fi
+    if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S9" ) || "${MODE}" == "all" ]]; then
+      python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s9_failure_injection/run.py" \
+        --root "${ROOT_DIR}" \
+        --report-dir "${REPORT_DIR}" \
+        --base-url "${SPLENDOR_DAEMON_URL:-http://splendor-daemon-local:8080}" \
+        --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
+        --vpc-url "${SPLENDOR_VPC_NODE_URL:-http://resident-vpc-node:8092}" \
+        --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-http://resident-cloud-node:8091}"
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \

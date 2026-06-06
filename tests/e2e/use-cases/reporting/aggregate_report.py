@@ -333,6 +333,52 @@ S8_REQUIRED_EXPLANATION_CATEGORIES = {
     "data_scope_denial",
     "safety_denial",
 }
+S9_REQUIRED_SOURCE_SCENARIOS = {"UC-E2E-S1", "UC-E2E-S4", "UC-E2E-S5"}
+S9_REQUIRED_OPERATIONS = {
+    "createRun",
+    "submitAction",
+    "inspectRun",
+    "getStateHead",
+    "exportTraces",
+    "replayRun",
+    "registerNode",
+    "registerInstance",
+    "heartbeatNode",
+    "advertiseCapabilities",
+    "evaluatePlacement",
+    "submitWorkOrder",
+    "sendMessage",
+    "syncTraceBuffer",
+}
+S9_REQUIRED_EVENTS = {
+    "adapter.failed",
+    "verifier.unavailable",
+    "quota.exceeded",
+    "trace.write_failed",
+    "state.commit_failed",
+    "message.delivery_failed",
+    "node.stale",
+    "policy.expired",
+    "circuit_breaker.tripped",
+    "kill_switch.activated",
+    "run.paused",
+    "run.denied",
+    "run.cancelled",
+}
+S9_REQUIRED_NEGATIVES = {
+    "adapter_returns_failure_no_fake_success_committed",
+    "verifier_unavailable_denies_or_intervenes",
+    "policy_unavailable_or_expired_denies_high_risk",
+    "trace_write_failure_before_side_effect_blocks_execution",
+    "trace_write_failure_after_outcome_audit_visible_no_hidden_continuation",
+    "state_commit_failure_prevents_next_tick",
+    "remote_message_transport_failure_records_delivery_failure",
+    "node_heartbeat_stale_denies_placement",
+    "quota_exceeded_denies_not_silently_retried",
+    "circuit_breaker_wins_pending_approval_race",
+    "kill_switch_wins_resume_race_fail_closed",
+    "telemetry_stale_missing_cannot_authorize",
+}
 
 
 def utc_now() -> str:
@@ -633,6 +679,12 @@ def render_markdown(report: dict) -> str:
             "- Replay/audit/schema compatibility evidence is recorded in `artifacts/UC-E2E-S8/` when S8 runs.",
             "- S8 imports S1/S3/S4/S5/S6/S7 trace and state artifacts into a clean workspace, validates trace chains and state hashes, rejects tampered copies, and emits replay/schema/audit events.",
             "- S8 keeps replay inspect/read-only/comparison/explanation-only by default and rejects side-effectful replay without a separate explicit gate.",
+            "",
+            "## S9 evidence",
+            "",
+            "- Failure injection evidence is recorded in `artifacts/UC-E2E-S9/` when S9 runs.",
+            "- S9 requires public daemon/manager API traffic, deterministic adapter/verifier/quota/message/placement/governance failures, bounded retry counts, idempotency markers, and replay side-effect suppression.",
+            "- S9 consumes S1/S4/S5 source artifacts for trace/state/remote/governance failure evidence and leaves S10 blocked until its own scenario exists.",
             "",
             "## Non-goals observed",
             "",
@@ -1958,6 +2010,129 @@ def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S9"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "api-traffic.ndjson",
+        "trace-export.jsonl",
+        "fault-injection-report.json",
+        "quota-retry-report.json",
+        "idempotency-report.json",
+        "failure-matrix.json",
+        "trace-sync-report.json",
+        "fleet-telemetry.json",
+        "governance-race-report.json",
+        "state-export.json",
+        "replay-report.json",
+        "audit-report.json",
+        "anti-drift-results.json",
+        "commands.log",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s9_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s9_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s9_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s9_scenario_failure:{failure}")
+    sources = set(scenario.get("source_scenarios", []))
+    if sources != S9_REQUIRED_SOURCE_SCENARIOS:
+        failures.append("s9_wrong_source_scenarios:" + ",".join(sorted(sources)))
+    for source_id in S9_REQUIRED_SOURCE_SCENARIOS:
+        source_report = report_dir / "artifacts" / source_id / "scenario-report.json"
+        if not source_report.exists():
+            failures.append(f"s9_missing_source_scenario_report:{source_id}")
+        elif read_json(source_report).get("status") != "passed":
+            failures.append(f"s9_source_scenario_not_passed:{source_id}")
+    operations = set(scenario.get("api_operations", []))
+    missing_ops = sorted(S9_REQUIRED_OPERATIONS - operations)
+    if missing_ops:
+        failures.append("s9_missing_required_api_operations:" + ",".join(missing_ops))
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S9_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s9_missing_required_trace_events:" + ",".join(missing_events))
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s9_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s9_trace_event_id_not_uuid:{event_name}:{trace_id}")
+    trace_records = read_jsonl(artifact_dir / "trace-export.jsonl")
+    event_types = {record.get("event_type") for record in trace_records if record.get("event_type")}
+    missing_exported_events = sorted(S9_REQUIRED_EVENTS - event_types)
+    if missing_exported_events:
+        failures.append("s9_trace_export_missing_event_types:" + ",".join(missing_exported_events))
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S9_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s9_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S9_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s9_negative_case_not_asserted:{case}")
+        if not negatives.get(case, {}).get("reason_codes"):
+            failures.append(f"s9_negative_missing_reason_codes:{case}")
+    positive = scenario.get("positive_checks", {})
+    for key in ["bounded_success_fixture_completed", "quotas_consumed_predictably", "bounded_retry_for_idempotent_read_only_action", "idempotency_marker_prevents_duplicate_side_effect_application", "recoverable_trace_sync_resumes_without_integrity_loss"]:
+        if positive.get(key) is not True:
+            failures.append(f"s9_positive_check_missing:{key}")
+    fault = read_json(artifact_dir / "fault-injection-report.json")
+    if set(fault.get("source_scenarios", [])) != S9_REQUIRED_SOURCE_SCENARIOS:
+        failures.append("s9_fault_report_missing_source_scenarios")
+    quota = read_json(artifact_dir / "quota-retry-report.json")
+    retry_counts = quota.get("bounded_retry_counts", {})
+    if retry_counts.get("max_attempts") != 2 or retry_counts.get("s9.idempotent_read") != 2:
+        failures.append("s9_bounded_retry_counts_invalid")
+    if quota.get("quota_first", {}).get("status") != "Executed" or quota.get("quota_second", {}).get("status") not in {"Denied", "NeedsIntervention"}:
+        failures.append("s9_quota_outcomes_invalid")
+    idempotency = read_json(artifact_dir / "idempotency-report.json")
+    if idempotency.get("duplicate", {}).get("duplicate") is not True or idempotency.get("duplicate", {}).get("idempotency_key") != "s9-side-effect-once":
+        failures.append("s9_idempotency_duplicate_not_proven")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("mode") != "inspect_only" or replay.get("side_effects_allowed_default") is not False or replay.get("side_effects_executed") is not False:
+        failures.append("s9_replay_suppression_missing")
+    if replay.get("action_execution_counts_before_replay") != replay.get("action_execution_counts_after_replay"):
+        failures.append("s9_replay_changed_action_counts")
+    if replay.get("bounded_retry_counts", {}).get("max_attempts") != 2:
+        failures.append("s9_replay_missing_bounded_retry_counts")
+    markers = set(replay.get("idempotency_markers", []))
+    if {"s9-read-once", "s9-side-effect-once", "s9-transport-fail"} - markers:
+        failures.append("s9_replay_missing_idempotency_markers")
+    trace_sync = read_json(artifact_dir / "trace-sync-report.json")
+    if trace_sync.get("recovered", {}).get("accepted_records", 0) <= 0:
+        failures.append("s9_trace_sync_recovery_missing")
+    telemetry = read_json(artifact_dir / "fleet-telemetry.json")
+    if telemetry.get("authority") != "observational_only" or telemetry.get("stale_placement", {}).get("status") != "rejected":
+        failures.append("s9_telemetry_or_stale_placement_authoritative")
+    governance = read_json(artifact_dir / "governance-race-report.json")
+    if governance.get("circuit_breaker", {}).get("blocked_action", {}).get("status") != "Denied":
+        failures.append("s9_circuit_breaker_race_not_denied")
+    if governance.get("kill_switch", {}).get("missing_ack", {}).get("fail_closed") is not True:
+        failures.append("s9_kill_switch_race_not_fail_closed")
+    audit = read_json(artifact_dir / "audit-report.json")
+    if not audit.get("bounded_retry_counts") or not audit.get("idempotency_markers"):
+        failures.append("s9_audit_missing_retry_or_idempotency")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "static_s9_evidence", "unbounded_retry", "fake_success_after_adapter_failure", "verifier_or_policy_fail_open", "telemetry_authorizes_action_or_placement", "replay_side_effects_allowed_default"]:
+        if anti.get(key) is not False:
+            failures.append(f"s9_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or not scenario.get("trace_event_ids") or not scenario.get("state_node_ids") or not scenario.get("state_hashes") or not scenario.get("message_ids") or not scenario.get("work_order_ids") or not scenario.get("approval_ids") or not scenario.get("node_ids"):
+        failures.append("s9_missing_identity_state_message_work_order_approval_node_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -2034,8 +2209,9 @@ def main() -> int:
     s6_scenario, s6_failures = load_s6_scenario(report_dir)
     s7_scenario, s7_failures = load_s7_scenario(report_dir)
     s8_scenario, s8_failures = load_s8_scenario(report_dir)
+    s9_scenario, s9_failures = load_s9_scenario(report_dir)
     active_ids: set[str] = set()
-    if args.scenario in {"UC-E2E-S1", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S1", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
         active_ids.add("UC-E2E-S1")
         if s1_scenario is None:
             blocking.append("missing_uc_e2e_s1_scenario_report")
@@ -2056,14 +2232,14 @@ def main() -> int:
         else:
             scenarios.append(s3_scenario)
             blocking.extend(s3_failures)
-    if args.scenario in {"UC-E2E-S4", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S4", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
         active_ids.add("UC-E2E-S4")
         if s4_scenario is None:
             blocking.append("missing_uc_e2e_s4_scenario_report")
         else:
             scenarios.append(s4_scenario)
             blocking.extend(s4_failures)
-    if args.scenario in {"UC-E2E-S5", "UC-E2E-S8"} or args.mode == "all":
+    if args.scenario in {"UC-E2E-S5", "UC-E2E-S8", "UC-E2E-S9"} or args.mode == "all":
         active_ids.add("UC-E2E-S5")
         if s5_scenario is None:
             blocking.append("missing_uc_e2e_s5_scenario_report")
@@ -2091,11 +2267,18 @@ def main() -> int:
         else:
             scenarios.append(s8_scenario)
             blocking.extend(s8_failures)
+    if args.scenario == "UC-E2E-S9" or args.mode == "all":
+        active_ids.add("UC-E2E-S9")
+        if s9_scenario is None:
+            blocking.append("missing_uc_e2e_s9_scenario_report")
+        else:
+            scenarios.append(s9_scenario)
+            blocking.extend(s9_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s8-replay-audit-compat",
+        "suite_version": "0.1-s9-failure-injection",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -2113,6 +2296,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S6",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S7",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S8",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S9",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -2148,7 +2332,8 @@ def main() -> int:
             "UC-E2E-S6 validates physical/edge orchestration through public resident-edge daemon HTTP APIs without low-level robot control.",
             "UC-E2E-S7 validates data-local artifact and cross-tenant isolation through public manager and resident daemon HTTP APIs without enterprise data workspace UI.",
             "UC-E2E-S8 validates replay/audit/schema compatibility by importing prior scenario artifacts and rejects tampered, unsupported, unsafe, or reason-less evidence.",
-            "S9-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S9 validates deterministic failure injection, quota pressure, bounded retry, idempotency markers, and fail-closed races through public daemon/manager APIs plus S1/S4/S5 source artifacts.",
+            "S10 remains blocked until its own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],
