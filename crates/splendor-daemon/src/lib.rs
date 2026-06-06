@@ -2513,21 +2513,6 @@ async fn submit_physical_action(
         )?;
     }
 
-    if request.safety_context.cloud_helper_direct_authority {
-        let outcome = physical_outcome(
-            &request,
-            ActionStatus::Denied,
-            "cloud_helper_direct_authority_denied",
-            serde_json::json!({"cloud_helper_can_propose_only": true}),
-        );
-        record_physical_denial(
-            slot,
-            &request.action_request.action,
-            &outcome,
-            "safety.verification.denied",
-        )?;
-        return Ok(Json(outcome));
-    }
     if request.safety_context.offline
         && request.safety_context.policy_cache_expired
         && request.safety_context.high_risk
@@ -2538,82 +2523,6 @@ async fn submit_physical_action(
             &request.action_request.action,
             serde_json::json!({"policy_id": profile.policy_cache.policy_id, "action": action_name}),
         )?;
-        let outcome = physical_outcome(
-            &request,
-            ActionStatus::Denied,
-            "policy_cache_expired",
-            serde_json::json!({"offline": true, "high_risk": true}),
-        );
-        record_physical_denial(
-            slot,
-            &request.action_request.action,
-            &outcome,
-            "safety.verification.denied",
-        )?;
-        return Ok(Json(outcome));
-    }
-    if let Some(zone_ref) = &request.safety_context.zone_ref {
-        if !request
-            .safety_context
-            .allowed_zone_refs
-            .iter()
-            .any(|allowed| allowed == zone_ref)
-        {
-            let outcome = physical_outcome(
-                &request,
-                ActionStatus::Denied,
-                "geofence_breach",
-                serde_json::json!({"zone_ref": zone_ref, "allowed_zone_refs": request.safety_context.allowed_zone_refs}),
-            );
-            record_physical_denial(
-                slot,
-                &request.action_request.action,
-                &outcome,
-                "safety.verification.denied",
-            )?;
-            return Ok(Json(outcome));
-        }
-    }
-    if request
-        .safety_context
-        .battery_percent
-        .is_some_and(|battery| battery < 0.20)
-        && !matches!(
-            action_name.as_str(),
-            "return_to_base" | "dock" | "read_battery" | "read_sensor_summary"
-        )
-    {
-        let outcome = physical_outcome(
-            &request,
-            ActionStatus::NeedsIntervention,
-            "low_battery_return_to_base_required",
-            serde_json::json!({"battery_percent": request.safety_context.battery_percent, "allowed_safe_actions": ["return_to_base", "dock"]}),
-        );
-        record_physical_denial(
-            slot,
-            &request.action_request.action,
-            &outcome,
-            "action.needs_intervention",
-        )?;
-        return Ok(Json(outcome));
-    }
-    if !request.safety_context.privacy_clear
-        || !request.safety_context.human_proximity_clear
-        || !request.safety_context.emergency_stop_clear
-    {
-        let outcome = physical_outcome(
-            &request,
-            ActionStatus::NeedsIntervention,
-            "operator_intervention_required",
-            serde_json::json!({"privacy_clear": request.safety_context.privacy_clear, "human_proximity_clear": request.safety_context.human_proximity_clear, "emergency_stop_clear": request.safety_context.emergency_stop_clear}),
-        );
-        record_physical_denial(
-            slot,
-            &request.action_request.action,
-            &outcome,
-            "action.needs_intervention",
-        )?;
-        return Ok(Json(outcome));
     }
     if let Some(evidence) = &request.operator_intervention_evidence {
         let expires_at = OffsetDateTime::parse(&evidence.expires_at, &Rfc3339).map_err(|_| {
@@ -2986,27 +2895,6 @@ fn matches_forbidden_physical_action(action: &str) -> bool {
         .any(|pattern| normalized.contains(pattern))
 }
 
-fn physical_outcome(
-    request: &SubmitPhysicalActionRequest,
-    status: ActionStatus,
-    reason: &str,
-    evidence: serde_json::Value,
-) -> ActionOutcome {
-    ActionOutcome {
-        action_id: request.action_request.action_id.clone().unwrap_or_default(),
-        status,
-        verification: splendor_types::VerificationResult {
-            allowed: status == ActionStatus::Executed,
-            reasons: vec![reason.to_string()],
-            artifacts: serde_json::json!({"safety": evidence, "reason_code": reason}),
-        },
-        post_verification: None,
-        output: None,
-        error: Some(reason.to_string()),
-        completed_at: OffsetDateTime::now_utc(),
-    }
-}
-
 fn simulated_safety_snapshot(
     request: &SubmitPhysicalActionRequest,
     profile: &DeviceRuntimeProfile,
@@ -3030,6 +2918,9 @@ fn simulated_safety_snapshot(
         } else {
             configured_min_battery
         }),
+        policy_cache_expired: request.safety_context.policy_cache_expired,
+        high_risk: request.safety_context.high_risk,
+        cloud_helper_direct_authority: request.safety_context.cloud_helper_direct_authority,
         emergency_stop_engaged: Some(!request.safety_context.emergency_stop_clear),
         collision_risk: Some(SimulatedRiskLevel::Low),
         altitude_m: request.safety_context.altitude_m,
@@ -4918,7 +4809,11 @@ mod tests {
         .expect("geofence returns denied outcome")
         .0;
         assert_eq!(denied.status, ActionStatus::Denied);
-        assert_eq!(denied.verification.reasons, vec!["geofence_breach"]);
+        assert_eq!(denied.verification.reasons, vec!["geofence_violation"]);
+        assert_eq!(
+            denied.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
+        );
 
         let mut low_battery = safe_context();
         low_battery.battery_percent = Some(0.10);
@@ -4934,12 +4829,16 @@ mod tests {
             )),
         )
         .await
-        .expect("low battery requests intervention")
+        .expect("low battery denied by safety verifier")
         .0;
         assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
+        assert!(intervention
+            .verification
+            .reasons
+            .contains(&"battery_below_minimum".to_string()));
         assert_eq!(
-            intervention.verification.reasons,
-            vec!["low_battery_return_to_base_required"]
+            intervention.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
         );
 
         let mut stale_policy = safe_context();
@@ -5084,16 +4983,6 @@ mod tests {
         assert_eq!(snapshot.privacy_zone_active, Some(true));
         assert_eq!(snapshot.proximity_m, Some(0.0));
 
-        let outcome = physical_outcome(
-            &request,
-            ActionStatus::Denied,
-            "unit_denial",
-            serde_json::json!({"evidence": true}),
-        );
-        assert_eq!(outcome.status, ActionStatus::Denied);
-        assert!(!outcome.verification.allowed);
-        assert_eq!(outcome.error.as_deref(), Some("unit_denial"));
-
         let missing_audit = required_audit(None).expect_err("audit required");
         assert_eq!(missing_audit.status, StatusCode::FORBIDDEN);
         assert_eq!(missing_audit.body.code, "missing_audit_attribution");
@@ -5217,12 +5106,12 @@ mod tests {
             )),
         )
         .await
-        .expect("privacy risk needs intervention")
+        .expect("privacy risk denied by safety verifier")
         .0;
-        assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
+        assert_eq!(intervention.status, ActionStatus::Denied);
         assert_eq!(
             intervention.verification.reasons,
-            vec!["operator_intervention_required"]
+            vec!["privacy_zone_active"]
         );
 
         let mut bad_expiry = physical_request(

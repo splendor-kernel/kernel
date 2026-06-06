@@ -186,6 +186,13 @@ S6_REQUIRED_OPERATIONS = {
     "syncDeviceTraceBuffer",
     "exportTraces",
     "replayRun",
+    "registerNode",
+    "heartbeatNode",
+    "registerInstance",
+    "submitWorkOrder",
+    "sendMessage",
+    "getMessage",
+    "managerAudit",
 }
 S6_REQUIRED_NEGATIVES = {
     "forbidden_low_level_actions_rejected",
@@ -1283,6 +1290,7 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "device-profile.json",
         "device-status.json",
         "policy-cache-status.json",
+        "cloud-helper-message.json",
         "cloud-helper-proposal.json",
         "device-safety-evidence.json",
         "operator-intervention.json",
@@ -1345,6 +1353,7 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if cache.get("loaded") is not True or cache.get("expired") is not False:
         failures.append("s6_policy_cache_status_not_loaded")
     helper = read_json(artifact_dir / "cloud-helper-proposal.json")
+    public_message = read_json(artifact_dir / "cloud-helper-message.json")
     helper_message = helper.get("message", {})
     helper_payload = helper.get("proposal", {})
     if helper_payload.get("direct_actuator_authority") is not False:
@@ -1354,10 +1363,30 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
             failures.append(f"s6_cloud_helper_missing_typed_message_field:{field}")
     if helper_message.get("message_id") not in scenario.get("message_ids", []):
         failures.append("s6_cloud_helper_message_id_missing_from_scenario")
-    if helper_message.get("schema") != "splendor.message.task_request.v1":
+    if helper_message.get("schema") != "splendor.message.proposal_request.v1":
         failures.append("s6_cloud_helper_wrong_message_schema")
     if helper_message.get("requires_response") is not False:
         failures.append("s6_cloud_helper_requires_response_unexpected")
+    if public_message.get("work_order_submit", {}).get("accepted") is not True:
+        failures.append("s6_cloud_helper_work_order_not_accepted_by_manager")
+    delivery = public_message.get("delivery", {})
+    received = public_message.get("received", {})
+    if delivery.get("message_id") != helper_message.get("message_id"):
+        failures.append("s6_cloud_helper_public_delivery_message_id_mismatch")
+    if delivery.get("delivery_status") != "delivered":
+        failures.append("s6_cloud_helper_public_delivery_not_delivered")
+    if delivery.get("receive_side_validated") is not True:
+        failures.append("s6_cloud_helper_public_delivery_not_receive_validated")
+    if delivery.get("remote_state_mutated") is not False:
+        failures.append("s6_cloud_helper_public_delivery_mutated_remote_state")
+    if received.get("message_id") != helper_message.get("message_id"):
+        failures.append("s6_cloud_helper_public_read_message_id_mismatch")
+    if public_message.get("manager_audit_contains_message_id") is not True:
+        failures.append("s6_cloud_helper_message_missing_from_manager_audit")
+    if public_message.get("trace_payload_contains_message_id") is not True:
+        failures.append("s6_cloud_helper_message_id_missing_from_trace_payload")
+    if public_message.get("trace_payload_contains_proposal_id") is not True:
+        failures.append("s6_cloud_helper_proposal_id_missing_from_trace_payload")
     if helper_payload.get("proposal_id") != helper.get("local_validation_inputs", {}).get("inspect_zone", {}).get("cloud_helper_proposal_id"):
         failures.append("s6_inspect_zone_not_linked_to_cloud_helper_proposal")
     if helper.get("local_validation_outcomes", {}).get("inspect_zone", {}).get("status") != "Executed":
@@ -1371,16 +1400,26 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if safe_actions.get("inspect_zone", {}).get("status") != "Executed":
         failures.append("s6_safety_evidence_missing_inspect_zone_execution")
     denials = safety.get("denials", {})
-    for key in ["geofence", "low_battery", "expired_policy", "cloud_direct"]:
+    expected_denials = {
+        "geofence": ("Denied", "geofence_violation"),
+        "low_battery": ("NeedsIntervention", "battery_below_minimum"),
+        "expired_policy": ("Denied", "policy_cache_expired"),
+        "cloud_direct": ("Denied", "cloud_helper_direct_authority_denied"),
+    }
+    for key, (expected_status, expected_reason) in expected_denials.items():
         if not denials.get(key):
             failures.append(f"s6_missing_safety_denial:{key}")
-        elif denials.get(key, {}).get("status") not in {"Denied", "NeedsIntervention"}:
+        elif denials.get(key, {}).get("status") != expected_status:
             failures.append(f"s6_safety_denial_wrong_status:{key}")
-        elif not denials.get(key, {}).get("verification", {}).get("reasons"):
-            failures.append(f"s6_safety_denial_missing_reason_codes:{key}")
+        elif expected_reason not in denials.get(key, {}).get("verification", {}).get("reasons", []):
+            failures.append(f"s6_safety_denial_missing_reason_code:{key}:{expected_reason}")
+        elif denials.get(key, {}).get("verification", {}).get("artifacts", {}).get("source") != "safety_verifier":
+            failures.append(f"s6_safety_denial_not_from_safety_verifier:{key}")
     operator = read_json(artifact_dir / "operator-intervention.json")
-    if operator.get("ambiguous", {}).get("status") != "NeedsIntervention":
-        failures.append("s6_ambiguous_action_not_needs_intervention")
+    if operator.get("ambiguous", {}).get("status") != "Denied":
+        failures.append("s6_ambiguous_action_not_denied")
+    elif operator.get("ambiguous", {}).get("verification", {}).get("artifacts", {}).get("source") != "safety_verifier":
+        failures.append("s6_ambiguous_action_not_from_safety_verifier")
     if operator.get("grant", {}).get("status") != "granted" or operator.get("granted_capture", {}).get("status") != "Executed":
         failures.append("s6_operator_grant_did_not_scope_execution")
     if operator.get("wrong_scope", {}).get("status") != 403 or operator.get("expired", {}).get("status") != 403:

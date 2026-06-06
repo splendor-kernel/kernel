@@ -263,6 +263,9 @@ fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
         allowed_zones: vec!["zone:A".to_string()],
         battery_percent: Some(80.0),
         min_battery_percent: Some(30.0),
+        policy_cache_expired: false,
+        high_risk: false,
+        cloud_helper_direct_authority: false,
         emergency_stop_engaged: Some(false),
         collision_risk: Some(SimulatedRiskLevel::Low),
         altitude_m: Some(10.0),
@@ -518,7 +521,7 @@ fn safety_geofence_denial_prevents_adapter_execution() {
 }
 
 #[test]
-fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence() {
+fn safety_low_battery_intervention_prevents_adapter_execution_with_trace_safe_evidence() {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
         quota: VerificationResult::allow(),
@@ -532,7 +535,7 @@ fn safety_low_battery_denial_prevents_adapter_execution_with_trace_safe_evidence
 
     let outcome = gateway.submit(physical_request()).expect("outcome");
 
-    assert!(matches!(outcome.status, ActionStatus::Denied));
+    assert!(matches!(outcome.status, ActionStatus::NeedsIntervention));
     assert!(outcome
         .verification
         .reasons
