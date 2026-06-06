@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.server
 import json
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +26,11 @@ ADAPTER_FAIL_RUN_ID = "44444444-4444-4444-8444-444444449902"
 VERIFIER_RUN_ID = "44444444-4444-4444-8444-444444449903"
 CB_RACE_RUN_ID = "44444444-4444-4444-8444-444444449904"
 KILL_RACE_RUN_ID = "44444444-4444-4444-8444-444444449905"
+RETRY_RUN_ID = "44444444-4444-4444-8444-444444449906"
+UNSAFE_RETRY_RUN_ID = "44444444-4444-4444-8444-444444449907"
+DENY_RUN_ID = "44444444-4444-4444-8444-444444449908"
+TRACE_FAIL_RUN_ID = "44444444-4444-4444-8444-444444449909"
+STATE_FAIL_RUN_ID = "44444444-4444-4444-8444-444444449910"
 VPC_NODE_ID = "00000000-0000-4000-8000-000000000204"
 VPC_INSTANCE_ID = "00000000-0000-4000-8000-000000000302"
 CLOUD_NODE_ID = "00000000-0000-4000-8000-000000000404"
@@ -47,6 +54,26 @@ REQUIRED_TRACE_EVENTS = {
     "run.denied",
     "run.cancelled",
 }
+
+
+class FixtureHandler(http.server.BaseHTTPRequestHandler):
+    counter = 0
+
+    def do_GET(self):  # noqa: N802
+        type(self).counter += 1
+        if self.path == "/allowed/s9-failure-fixture":
+            body = json.dumps({"fixture": "uc-e2e-s9", "status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *_: object) -> None:
+        return
 
 
 def utc(offset_minutes: int = 0) -> str:
@@ -164,7 +191,7 @@ def work_order(run_id: str = RUN_ID, *, quota_max: int = 6, actions: list[str] |
         "objective": "UC-E2E-S9 deterministic failure injection and fail-closed validation",
         "allowed_actions": allowed,
         "allowed_adapters": ["artifact-store", "fixture-data", "daemon.recording", "remote-message"],
-        "allowed_permissions": permissions or allowed + [f"message.remote.proposal:{HELPER_AGENT_ID}"],
+        "allowed_permissions": permissions if permissions is not None else allowed + [f"message.remote.proposal:{HELPER_AGENT_ID}"],
         "data_refs": ["dataset:uc-e2e-s9.fixture", "artifact:uc-e2e-s9.internal"],
         "quotas": {"max_actions_per_tick": quota_max, "max_action_duration_ms": 30000, "max_http_requests_per_minute": 3},
         "placement": {"target": "resident_cloud_pool", "data_locality": "cloud", "requires_gpu": False, "required_capabilities": ["artifact.create_internal", "message.remote.proposal"]},
@@ -230,19 +257,151 @@ def instance_registration(node_id: str, instance_id: str) -> dict[str, Any]:
     return {"instance_id": instance_id, "node_id": node_id, "runtime_mode": "resident", "hosted_tenants": [TENANT_ID], "supported_features": ["gateway.verified", "trace.buffer.local", "message.remote"], "runtime_version": "0.1-acceptance", "health": {"status": "healthy", "observed_at": utc(0), "metadata": {}}, "registered_at": utc(0)}
 
 
-def trace_event(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    return {"trace_event_id": str(uuid.uuid4()), "event_type": event_type, "scenario_id": "UC-E2E-S9", "occurred_at": utc(0), "payload": payload}
+def approval_policy(action_name: str, permission: str, *, expires_minutes: int = 60) -> dict[str, Any]:
+    return {
+        "schema_version": "splendor.approval_policy.v1",
+        "policy_id": f"policy_uc_e2e_s9_{action_name.replace('.', '_')}",
+        "tenant_id": TENANT_ID,
+        "agent_id": AGENT_ID,
+        "action_name": action_name,
+        "adapter": "daemon.recording",
+        "required_permission": permission,
+        "side_effect_class": "External",
+        "risk_level": "high",
+        "reason": "UC-E2E-S9 verifier uncertainty/approval gate failure injection",
+        "expires_at": utc(expires_minutes),
+    }
+
+
+def cli_work_order(run_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": f"{WORK_ORDER_ID}_cli_{run_id[-3:]}",
+        "tenant_id": TENANT_ID,
+        "agent_id": AGENT_ID,
+        "run_id": run_id,
+        "objective": "UC-E2E-S9 public CLI trace/state failure injection",
+        "allowed_actions": ["http_get", "write_file"],
+        "allowed_adapters": ["http", "filesystem"],
+        "allowed_permissions": ["s9.http.read", "s9.artifact.write"],
+        "data_refs": ["fixture:http://local/allowed/s9-failure-fixture", "sandbox://uc-e2e-s9/failure.txt"],
+        "quotas": {"max_actions_per_tick": 4, "max_http_requests_per_minute": 4, "max_filesystem_write_bytes": 4096},
+        "placement": {"target": "local_resident", "requires_gpu": False},
+        "issued_at": utc(-1),
+        "expires_at": utc(60),
+        "revocation": "active",
+    }
+
+
+def cli_action_http(port: int) -> dict[str, Any]:
+    return {"name": "http_get", "adapter": "http", "params": {"url": f"http://127.0.0.1:{port}/allowed/s9-failure-fixture"}, "required_permissions": ["s9.http.read"], "usage": {"actions": 1, "http_requests": 1, "network_read_bytes": 128}}
+
+
+def cli_action_write() -> dict[str, Any]:
+    return {"name": "write_file", "adapter": "filesystem", "params": {"path": "artifacts/failure.txt", "contents": "UC-E2E-S9 failure fixture\n"}, "required_permissions": ["s9.artifact.write"], "usage": {"actions": 1, "filesystem_write_bytes": 28}}
+
+
+def cli_config(root: Path, artifact_dir: Path, envelope: dict[str, Any], run_id: str, port: int, injection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trace_db": str(artifact_dir / f"{run_id}.trace.db"),
+        "state_db": str(artifact_dir / f"{run_id}.state.db"),
+        "run_id": run_id,
+        "cycles": 2 if injection.get("state_commit_fail") else 1,
+        "work_order": {**envelope, "verification_secret": SECRET, "expected_placement_target": "local_resident"},
+        "failure_injection": injection,
+        "adapters": {
+            "http": {"allowed_domains": ["127.0.0.1"], "allowed_methods": ["GET"], "timeout_ms": 2000},
+            "filesystem": {"base_dir": str(artifact_dir / "cli-sandbox"), "max_write_bytes": 4096},
+        },
+        "tenants": [{"id": TENANT_ID, "allowed_actions": ["http_get", "write_file"], "allowed_adapters": ["http", "filesystem"], "allowed_permissions": ["s9.http.read", "s9.artifact.write"], "quotas": {"max_actions_per_tick": 4, "max_http_requests_per_minute": 4, "max_filesystem_write_bytes": 4096}}],
+        "agents": [{
+            "id": AGENT_ID,
+            "tenant_id": TENANT_ID,
+            "run_id": run_id,
+            "snapshot_interval": 1,
+            "initial_state": "{\"scenario\":\"UC-E2E-S9\"}",
+            "allowed_permissions": ["s9.http.read", "s9.artifact.write"],
+            "percepts": [{"schema": "splendor.percept.s9_failure.v1", "payload": {"url": f"http://127.0.0.1:{port}/allowed/s9-failure-fixture"}, "source": "uc-e2e-s9", "detail": "public CLI failure injection fixture"}],
+            "policy": {"type": "static", "next_state": "{\"failure\":\"injected\"}", "actions": [cli_action_http(port), cli_action_write()]},
+        }],
+    }
 
 
 def trace_kind(record: dict[str, Any]) -> str:
     payload = record.get("payload", {})
     kind = payload.get("kind")
     key = next(iter(kind.keys())) if isinstance(kind, dict) and kind else str(kind)
-    return {"ActionExecuted": "action.executed", "ActionDenied": "action.denied", "ActionFailed": "action.failed", "StateCommitted": "state.committed", "OutcomeRecorded": "outcome.recorded", "RunPaused": "run.paused", "RunStopped": "run.cancelled", "PolicyExpired": "policy.expired"}.get(key, key)
+    return {"LoopTickStarted": "tick.started", "LoopTickCompleted": "tick.completed", "ActionExecuted": "action.executed", "ActionDenied": "action.denied", "ActionFailed": "action.failed", "ActionNeedsApproval": "action.needs_approval", "ActionNeedsIntervention": "action.needs_intervention", "StateCommitted": "state.committed", "OutcomeRecorded": "outcome.recorded", "RunPaused": "run.paused", "RunStopped": "run.cancelled", "PolicyExpired": "policy.expired", "TraceWriteFailed": "trace.write_failed", "StateCommitFailed": "state.commit_failed"}.get(key, key)
 
 
 def trace_id(record: dict[str, Any]) -> str:
     return str(record.get("payload", {}).get("trace_event_id") or record.get("trace_event_id") or "")
+
+
+def trace_identity(record: dict[str, Any]) -> dict[str, Any]:
+    return record.get("payload", {}).get("identity") or record.get("identity") or {}
+
+
+def trace_action(record: dict[str, Any]) -> dict[str, Any]:
+    kind = record.get("payload", {}).get("kind", {})
+    if not isinstance(kind, dict) or not kind:
+        return {}
+    body = next(iter(kind.values()))
+    if not isinstance(body, dict):
+        return {}
+    action = body.get("action") or body.get("result", {}).get("action")
+    return action if isinstance(action, dict) else {}
+
+
+def trace_kind_body(record: dict[str, Any]) -> dict[str, Any]:
+    kind = record.get("payload", {}).get("kind", {})
+    if not isinstance(kind, dict) or not kind:
+        return {}
+    body = next(iter(kind.values()))
+    return body if isinstance(body, dict) else {}
+
+
+def trace_action_id(record: dict[str, Any]) -> str | None:
+    identity = trace_identity(record)
+    if identity.get("action_id"):
+        return str(identity["action_id"])
+    body = trace_kind_body(record)
+    result = body.get("result") if isinstance(body.get("result"), dict) else {}
+    artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
+    context = artifacts.get("context") if isinstance(artifacts.get("context"), dict) else {}
+    approval = artifacts.get("approval") if isinstance(artifacts.get("approval"), dict) else {}
+    outcome = body.get("outcome") if isinstance(body.get("outcome"), dict) else {}
+    action_outcome = outcome.get("action_outcome") if isinstance(outcome.get("action_outcome"), dict) else {}
+    approval_payload = body.get("approval") if isinstance(body.get("approval"), dict) else {}
+    return context.get("action_id") or approval.get("action_id") or action_outcome.get("action_id") or approval_payload.get("action_id")
+
+
+def trace_reasons(record: dict[str, Any]) -> list[str]:
+    body = trace_kind_body(record)
+    result = body.get("result") if isinstance(body.get("result"), dict) else {}
+    reasons = result.get("reasons") or body.get("reasons") or []
+    return [str(reason) for reason in reasons]
+
+
+def add_event_evidence(evidence: dict[str, list[dict[str, Any]]], event: str, *, trace_event_id: str, source: str, original_event_type: str, artifact: str, run_id: str | None = None, action_id: str | None = None, message_id: str | None = None, state_node_id: str | None = None, details: dict[str, Any] | None = None) -> None:
+    if not trace_event_id:
+        return
+    row = {
+        "trace_event_id": trace_event_id,
+        "source": source,
+        "original_event_type": original_event_type,
+        "artifact": artifact,
+        "run_id": run_id,
+        "action_id": action_id,
+        "message_id": message_id,
+        "state_node_id": state_node_id,
+        "details": details or {},
+    }
+    evidence.setdefault(event, []).append(row)
+
+
+def evidence_ids(evidence: dict[str, list[dict[str, Any]]]) -> dict[str, list[str]]:
+    return {event: [row["trace_event_id"] for row in rows if row.get("trace_event_id")] for event, rows in evidence.items()}
 
 
 def load_source(artifacts_root: Path, scenario_id: str) -> dict[str, Any]:
@@ -254,6 +413,35 @@ def load_source(artifacts_root: Path, scenario_id: str) -> dict[str, Any]:
         "trace": read_jsonl(artifact_dir / "trace-export.jsonl"),
         "dir": artifact_dir,
     }
+
+
+def run_cli_failure_case(root: Path, artifact_dir: Path, commands: Path, run_id: str, port: int, case: str, injection: dict[str, Any]) -> dict[str, Any]:
+    envelope = sign_work_order(root, artifact_dir, commands, cli_work_order(run_id))
+    config = cli_config(root, artifact_dir, envelope, run_id, port, injection)
+    config_path = artifact_dir / f"{case}.config.json"
+    write_json(config_path, config)
+    before = FixtureHandler.counter
+    result = run_cmd(splendorctl(root) + ["run", "--config", str(config_path)], root, commands, check=False)
+    export = run_cmd(splendorctl(root) + ["trace", "export", "--db", config["trace_db"], "--run", run_id], root, commands, check=False)
+    records = read_jsonl_from_text(export.stdout) if export.returncode == 0 else []
+    return {
+        "case": case,
+        "run_id": run_id,
+        "work_order_id": envelope["work_order_id"],
+        "exit": result.returncode,
+        "stderr": result.stderr[-1000:],
+        "http_counter_before": before,
+        "http_counter_after": FixtureHandler.counter,
+        "trace_export_exit": export.returncode,
+        "records": records,
+        "events": [trace_kind(record) for record in records],
+        "trace_db": config["trace_db"],
+        "state_db": config["state_db"],
+    }
+
+
+def read_jsonl_from_text(text: str) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def main() -> int:
@@ -269,12 +457,19 @@ def main() -> int:
     report_dir = Path(args.report_dir)
     artifacts_root = report_dir / "artifacts"
     artifact_dir = artifacts_root / "UC-E2E-S9"
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     commands = artifact_dir / "commands.log"
     commands.write_text("bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S9\n", encoding="utf-8")
     (artifact_dir / "stdout.log").write_text("UC-E2E-S9 failure injection scenario completed through public daemon/manager APIs\n", encoding="utf-8")
     (artifact_dir / "stderr.log").write_text("", encoding="utf-8")
     api_rows: list[dict[str, Any]] = []
+    FixtureHandler.counter = 0
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    http_thread.start()
+    fixture_port = int(httpd.server_address[1])
 
     def call(operation: str, method: str, base: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
         status, data = request_json(method, base, path, body, headers)
@@ -295,12 +490,25 @@ def main() -> int:
     for inst in [instance_registration(VPC_NODE_ID, VPC_INSTANCE_ID), instance_registration(CLOUD_NODE_ID, CLOUD_INSTANCE_ID)]:
         call("registerInstance", "POST", args.manager_url, "/fleet/instances", {**sec(manager), "registration": inst})
 
+    trace_failure_cli = run_cli_failure_case(root, artifact_dir, commands, TRACE_FAIL_RUN_ID, fixture_port, "trace_write_failure", {"trace_fail_on_event": "ActionVerificationStarted"})
+    state_failure_cli = run_cli_failure_case(root, artifact_dir, commands, STATE_FAIL_RUN_ID, fixture_port, "state_commit_failure", {"state_commit_fail": True})
+
     envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID))
     call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(manager), "work_order": envelope, "expected_audience": "central-manager"})
     create = call("createRun", "POST", args.base_url, "/runs", create_run_payload(RUN_ID, envelope))
     run_cred = daemon_credential(RUN_ID)
     success_action = call("submitAction", "POST", args.base_url, "/actions", {"run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": run_cred, "audit_attribution": audit(run_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.idempotent_read", {"idempotency_key": "s9-read-once"}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(actions=1, http_requests=1), "satisfied_preconditions": []})
-    retry_action = call("submitAction", "POST", args.base_url, "/actions", {"action_id": "55555555-5555-4555-8555-555555559901", "run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": run_cred, "audit_attribution": audit(run_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.idempotent_read", {"idempotency_key": "s9-read-once", "retry_attempt": 1}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(actions=1, http_requests=1), "satisfied_preconditions": []})
+
+    retry_envelope = sign_work_order(root, artifact_dir, commands, work_order(RETRY_RUN_ID, quota_max=2, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]))
+    call("createRun", "POST", args.base_url, "/runs", create_run_payload(RETRY_RUN_ID, retry_envelope, quota_max=2))
+    retry_cred = daemon_credential(RETRY_RUN_ID)
+    retry_attempts = []
+    for attempt in [1, 2, 3]:
+        retry_attempts.append(call("submitAction", "POST", args.base_url, "/actions", {"action_id": f"55555555-5555-4555-8555-5555555598{attempt:02d}", "run_id": RETRY_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": retry_cred, "audit_attribution": audit(retry_cred), "causal_trace_id": f"55555555-5555-4555-8555-5555555597{attempt:02d}", "action": action("s9.idempotent_read", {"idempotency_key": "s9-read-once", "retry_attempt": attempt, "retryable": True, "max_attempts": 2}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(actions=1, http_requests=1), "satisfied_preconditions": []}))
+    unsafe_envelope = sign_work_order(root, artifact_dir, commands, work_order(UNSAFE_RETRY_RUN_ID, quota_max=2, actions=["s9.unsafe_retry"], permissions=[]))
+    call("createRun", "POST", args.base_url, "/runs", create_run_payload(UNSAFE_RETRY_RUN_ID, unsafe_envelope, quota_max=2))
+    unsafe_cred = daemon_credential(UNSAFE_RETRY_RUN_ID)
+    unsafe_retry = call("submitAction", "POST", args.base_url, "/actions", {"action_id": "55555555-5555-4555-8555-555555559899", "run_id": UNSAFE_RETRY_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": unsafe_cred, "audit_attribution": audit(unsafe_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559798", "action": action("s9.unsafe_retry", {"retry_attempt": 1, "retryable": False, "idempotency_key": None}, ["s9.unsafe_retry"], "External"), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
     duplicate_message = {"message": {"message_id": "55555555-5555-4555-8555-555555559902", "source_agent_id": AGENT_ID, "target_agent_id": HELPER_AGENT_ID, "run_id": RUN_ID, "schema": "splendor.message.proposal_request.v1", "payload": {"request": "idempotent side-effect marker", "mutation_authority": False}, "causal_parent": None, "requires_response": True, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
     delivered = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": envelope["work_order_id"], "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "s9-side-effect-once", "simulate_failure": None})
     duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": envelope["work_order_id"], "message_envelope": {**duplicate_message, "message": {**duplicate_message["message"], "message_id": "55555555-5555-4555-8555-555555559903"}}, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "s9-side-effect-once", "simulate_failure": None})
@@ -318,22 +526,64 @@ def main() -> int:
     quota_first = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
     quota_second = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
 
-    verifier_envelope = sign_work_order(root, artifact_dir, commands, work_order(VERIFIER_RUN_ID, actions=["s9.verifier"], permissions=["s9.verifier.required"]))
-    call("createRun", "POST", args.base_url, "/runs", create_run_payload(VERIFIER_RUN_ID, verifier_envelope))
+    verifier_envelope = sign_work_order(root, artifact_dir, commands, work_order(VERIFIER_RUN_ID, actions=["s9.verifier"], permissions=["s9.verifier"]))
+    call("createRun", "POST", args.base_url, "/runs", create_run_payload(VERIFIER_RUN_ID, verifier_envelope, approval_policies=[approval_policy("s9.verifier", "s9.verifier", expires_minutes=-1)]))
     verifier_cred = daemon_credential(VERIFIER_RUN_ID)
-    verifier_unavailable = call("submitAction", "POST", args.base_url, "/actions", {"run_id": VERIFIER_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": verifier_cred, "audit_attribution": audit(verifier_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.verifier", {}, ["s9.verifier.unavailable"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
+    verifier_unavailable = call("submitAction", "POST", args.base_url, "/actions", {"run_id": VERIFIER_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": verifier_cred, "audit_attribution": audit(verifier_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559903", "action": action("s9.verifier", {}, ["s9.verifier"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
 
     stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager), "work_order_id": "s9-stale-placement", "request": {"target": "resident_cloud_pool", "required_capabilities": ["s9.stale.only"], "data_locality": "cloud", "dedicated_instance": False, "execution_mode": "live"}})
     failed_message = {**duplicate_message, "message": {**duplicate_message["message"], "message_id": "55555555-5555-4555-8555-555555559904"}}
     remote_failure = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": envelope["work_order_id"], "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "s9-transport-fail", "simulate_failure": "toxiproxy_transport_failure"})
 
+    deny_envelope = sign_work_order(root, artifact_dir, commands, work_order(DENY_RUN_ID, actions=["s9.approval_required"], permissions=["s9.approval_required"]))
+    deny_action_id = "55555555-5555-4555-8555-555555559908"
+    deny_policy_actions = [{"action_id": deny_action_id, "action": action("s9.approval_required", {}, ["s9.approval_required"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []}]
+    call("createRun", "POST", args.base_url, "/runs", create_run_payload(DENY_RUN_ID, deny_envelope, policy_actions=deny_policy_actions, approval_policies=[approval_policy("s9.approval_required", "s9.approval_required")]))
+    deny_cred = daemon_credential(DENY_RUN_ID)
+    deny_start = call("startRun", "POST", args.base_url, f"/runs/{DENY_RUN_ID}/start", {"credential": deny_cred, "audit_attribution": audit(deny_cred), "reason": "uc_e2e_s9_pending_approval"})
+    approval_artifact = deny_start["body"].get("action_outcomes", [{}])[0].get("verification", {}).get("artifacts", {}).get("approval", {})
+    approval_context = approval_artifact.get("approval") or approval_artifact
+    approval_request = call("requestApproval", "POST", args.manager_url, "/approvals", {**sec(manager), "approval_id": approval_context.get("approval_id"), "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "run_id": DENY_RUN_ID, "action_id": approval_context.get("action_id"), "action_name": "s9.approval_required", "adapter": "daemon.recording", "policy_id": approval_context.get("policy_id") or "policy_uc_e2e_s9_s9_approval_required", "risk_level": "high", "audience": "daemon_local", "expires_at": utc(30), "reason": "S9 pending approval branch"})
+    approval_denial = call("denyApproval", "POST", args.manager_url, f"/approvals/{approval_context.get('approval_id')}/deny", {**sec(manager), "reason": "S9 operator denial for fail-closed run"})
+    deny_resume = call("resumeRun", "POST", args.base_url, f"/runs/{DENY_RUN_ID}/resume", {"credential": deny_cred, "work_order": deny_envelope, "audit_attribution": audit(deny_cred), "reason": "approval_denied", "approval_evidence": approval_denial["body"].get("evidence")})
+
+    cb_breaker_id = "55555555-5555-4555-8555-555555559911"
+    cb_envelope = sign_work_order(root, artifact_dir, commands, work_order(CB_RACE_RUN_ID, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]))
+    call("createRun", "POST", args.base_url, "/runs", create_run_payload(CB_RACE_RUN_ID, cb_envelope))
+    cb_cred = daemon_credential(CB_RACE_RUN_ID)
+    cb_created = call("createCircuitBreaker", "POST", args.manager_url, "/governance/circuit-breakers", {**sec(manager), "breaker_id": cb_breaker_id, "tenant_id": TENANT_ID, "adapter": "daemon.recording", "action": "s9.idempotent_read", "reason": "S9 circuit breaker race wins"})
+    cb_payload = call("readCircuitBreakerSyncPayload", "POST", args.manager_url, f"/governance/circuit-breakers/{cb_breaker_id}/sync-payload", {**sec(manager), "run_id": CB_RACE_RUN_ID, "reason": "S9 manager-propagated breaker"})
+    cb_sync = call("syncCircuitBreakers", "POST", args.base_url, f"/runs/{CB_RACE_RUN_ID}/governance/circuit-breakers/sync", {"credential": cb_cred, "audit_attribution": audit(cb_cred), "circuit_breakers": cb_payload["body"].get("circuit_breakers", []), "reason": cb_payload["body"].get("reason")})
+    cb_blocked = call("submitAction", "POST", args.base_url, "/actions", {"run_id": CB_RACE_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": cb_cred, "audit_attribution": audit(cb_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559912", "action": action("s9.idempotent_read", {"idempotency_key": "s9-cb-race"}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
+
+    kill_envelope = sign_work_order(root, artifact_dir, commands, work_order(KILL_RACE_RUN_ID, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]))
+    kill_cred = daemon_credential(KILL_RACE_RUN_ID, instance_id=CLOUD_INSTANCE_ID)
+    kill_create_payload = create_run_payload(KILL_RACE_RUN_ID, kill_envelope)
+    kill_create_payload["credential"] = kill_cred
+    kill_create_payload["audit_attribution"] = audit(kill_cred)
+    call("createRun", "POST", args.cloud_url, "/runs", kill_create_payload)
+    kill_switch = call("activateKillSwitch", "POST", args.manager_url, "/governance/kill-switches", {**sec(manager), "kill_switch_id": "ks_uc_e2e_s9_run", "run_id": KILL_RACE_RUN_ID, "tenant_id": TENANT_ID, "node_id": CLOUD_NODE_ID, "instance_id": CLOUD_INSTANCE_ID, "reason": "S9 kill switch wins resume race", "propagation_ack_required": True})
+    kill_missing_ack = call("activateKillSwitch", "POST", args.manager_url, "/governance/kill-switches", {**sec(manager), "kill_switch_id": "ks_uc_e2e_s9_missing_ack", "run_id": KILL_RACE_RUN_ID, "tenant_id": TENANT_ID, "node_id": None, "instance_id": None, "reason": "S9 missing ack fail closed", "propagation_ack_required": True})
+
     traces = call("exportTraces", "POST", args.base_url, f"/runs/{RUN_ID}/traces/export", {"credential": run_cred, "audit_attribution": audit(run_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     adapter_traces = call("exportTraces", "POST", args.base_url, f"/runs/{ADAPTER_FAIL_RUN_ID}/traces/export", {"credential": adapter_cred, "audit_attribution": audit(adapter_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     quota_traces = call("exportTraces", "POST", args.base_url, f"/runs/{QUOTA_RUN_ID}/traces/export", {"credential": quota_cred, "audit_attribution": audit(quota_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     verifier_traces = call("exportTraces", "POST", args.base_url, f"/runs/{VERIFIER_RUN_ID}/traces/export", {"credential": verifier_cred, "audit_attribution": audit(verifier_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    retry_traces = call("exportTraces", "POST", args.base_url, f"/runs/{RETRY_RUN_ID}/traces/export", {"credential": retry_cred, "audit_attribution": audit(retry_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    unsafe_traces = call("exportTraces", "POST", args.base_url, f"/runs/{UNSAFE_RETRY_RUN_ID}/traces/export", {"credential": unsafe_cred, "audit_attribution": audit(unsafe_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    deny_traces = call("exportTraces", "POST", args.base_url, f"/runs/{DENY_RUN_ID}/traces/export", {"credential": deny_cred, "audit_attribution": audit(deny_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    cb_traces = call("exportTraces", "POST", args.base_url, f"/runs/{CB_RACE_RUN_ID}/traces/export", {"credential": cb_cred, "audit_attribution": audit(cb_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    kill_traces = call("exportTraces", "POST", args.cloud_url, f"/runs/{KILL_RACE_RUN_ID}/traces/export", {"credential": kill_cred, "audit_attribution": audit(kill_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
+    telemetry_read = call("getFleetTelemetry", "POST", args.manager_url, "/fleet/telemetry/read", sec(manager))
+    manager_audit = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
+    governance_audit = call("exportGovernanceAudit", "POST", args.manager_url, "/governance/audit/export", {**sec(manager), "run_id": RUN_ID})
+    message_before = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", sec(manager))
     replay_before = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
+    replay_audit_before = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     replay = call("replayRun", "POST", args.base_url, f"/runs/{RUN_ID}/replay", {"credential": run_cred, "audit_attribution": audit(run_cred), "mode": "inspect_only", "side_effects_allowed": False})
     replay_after = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
+    replay_audit_after = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
+    message_after = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", sec(manager))
 
     s1 = load_source(artifacts_root, "UC-E2E-S1")
     s4 = load_source(artifacts_root, "UC-E2E-S4")
@@ -347,64 +597,108 @@ def main() -> int:
     s5_kill = read_json(s5["dir"] / "kill-switch-report.json")
     s5_approval = read_json(s5["dir"] / "approval-flow.json")
 
-    records = traces["body"].get("records", []) + adapter_traces["body"].get("records", []) + quota_traces["body"].get("records", []) + verifier_traces["body"].get("records", [])
-    synthetic_events = [
-        trace_event("adapter.failed", {"source": "public_daemon_submit_action", "run_id": ADAPTER_FAIL_RUN_ID, "status": adapter_failure["body"].get("status"), "reason_code": adapter_failure["body"].get("error", "adapter_failed")}),
-        trace_event("verifier.unavailable", {"source": "public_daemon_submit_action", "run_id": VERIFIER_RUN_ID, "status": verifier_unavailable["body"].get("status"), "reasons": verifier_unavailable["body"].get("verification", {}).get("reasons", [])}),
-        trace_event("quota.exceeded", {"source": "public_daemon_submit_action", "run_id": QUOTA_RUN_ID, "status": quota_second["body"].get("status"), "reasons": quota_second["body"].get("verification", {}).get("reasons", [])}),
-        trace_event("trace.write_failed", {"source_scenario": "UC-E2E-S1", "case": "forced_trace_write_failure_blocks_side_effect", "http_counter_before": s1_audit_denials.get("forced_trace_write_failure_blocks_side_effect", {}).get("http_counter_before"), "http_counter_after": s1_audit_denials.get("forced_trace_write_failure_blocks_side_effect", {}).get("http_counter_after")}),
-        trace_event("state.commit_failed", {"source_scenario": "UC-E2E-S1", "case": "forced_state_commit_failure_prevents_next_tick", "tick_start_count": s1_audit_denials.get("forced_state_commit_failure_prevents_next_tick", {}).get("tick_start_count")}),
-        trace_event("message.delivery_failed", {"source": "public_manager_send_message", "message_id": failed_message["message"]["message_id"], "delivery_status": remote_failure["body"].get("delivery_status")}),
-        trace_event("node.stale", {"source": "public_manager_placement", "status": stale_placement["body"].get("status"), "reasons": stale_placement["body"].get("reasons", [])}),
-        trace_event("policy.expired", {"source_scenario": "UC-E2E-S5", "runtime_expired_policy": s5_policy.get("runtime_expired_policy", {}).get("reason_code")}),
-        trace_event("circuit_breaker.tripped", {"source_scenario": "UC-E2E-S5", "blocked_status": s5_breaker.get("blocked_action", {}).get("status"), "pending_approval_id": s5_approval.get("request", {}).get("approval_id")}),
-        trace_event("kill_switch.activated", {"source_scenario": "UC-E2E-S5", "fail_closed": s5_kill.get("missing_ack", {}).get("fail_closed")}),
-        trace_event("run.paused", {"source_scenario": "UC-E2E-S5", "approval_request_status": s5_approval.get("request", {}).get("status")}),
-        trace_event("run.denied", {"source": "policy_or_verifier_failure", "status": verifier_unavailable["body"].get("status")}),
-        trace_event("run.cancelled", {"source_scenario": "UC-E2E-S5", "kill_switch_cancel_status": s5_kill.get("activated", {}).get("cancel_status")}),
-    ]
-
-    event_ids: dict[str, list[str]] = {}
+    records = (
+        traces["body"].get("records", [])
+        + adapter_traces["body"].get("records", [])
+        + quota_traces["body"].get("records", [])
+        + verifier_traces["body"].get("records", [])
+        + retry_traces["body"].get("records", [])
+        + unsafe_traces["body"].get("records", [])
+        + deny_traces["body"].get("records", [])
+        + cb_traces["body"].get("records", [])
+        + kill_traces["body"].get("records", [])
+        + trace_failure_cli["records"]
+        + state_failure_cli["records"]
+    )
+    manager_events: list[dict[str, Any]] = []
+    if isinstance(manager_audit.get("body"), list):
+        manager_events.extend(manager_audit["body"])
+    governance_events = governance_audit.get("body", {}).get("events", []) if isinstance(governance_audit.get("body"), dict) else []
+    if isinstance(governance_events, list):
+        manager_events.extend(governance_events)
+    event_evidence: dict[str, list[dict[str, Any]]] = {}
     for rec in records:
         kind = trace_kind(rec)
-        if kind:
-            event_ids.setdefault(kind, []).append(trace_id(rec))
-    for rec in synthetic_events:
-        event_ids.setdefault(rec["event_type"], []).append(rec["trace_event_id"])
+        identity = trace_identity(rec)
+        action_name = trace_action(rec).get("name")
+        reasons = trace_reasons(rec)
+        run_id = rec.get("run_id") or identity.get("run_id")
+        action_id = trace_action_id(rec)
+        state_node_id = identity.get("state_node_id")
+        if kind == "action.failed" and run_id == ADAPTER_FAIL_RUN_ID and action_name == "s9.adapter_failure":
+            adapter_action_id = action_id or adapter_failure["body"].get("action_id")
+            add_event_evidence(event_evidence, "adapter.failed", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=adapter_action_id, details={"action": action_name, "status": adapter_failure["body"].get("status"), "outcome_action_id": adapter_failure["body"].get("action_id"), "api_operation": "submitAction"})
+        if kind in {"action.denied", "action.needs_intervention"} and run_id == VERIFIER_RUN_ID and any(reason in {"approval_policy_expired", "verifier_unavailable"} for reason in reasons):
+            add_event_evidence(event_evidence, "verifier.unavailable", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"reasons": reasons, "status": verifier_unavailable["body"].get("status")})
+        if kind == "action.denied" and run_id == QUOTA_RUN_ID and quota_second["body"].get("status") in {"Denied", "NeedsIntervention"}:
+            add_event_evidence(event_evidence, "quota.exceeded", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"reasons": reasons})
+        if kind == "trace.write_failed" and run_id == TRACE_FAIL_RUN_ID:
+            add_event_evidence(event_evidence, "trace.write_failed", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, details={"http_counter_before": trace_failure_cli["http_counter_before"], "http_counter_after": trace_failure_cli["http_counter_after"]})
+        if kind == "state.commit_failed" and run_id == STATE_FAIL_RUN_ID:
+            add_event_evidence(event_evidence, "state.commit_failed", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, details={"events": state_failure_cli["events"]})
+        if kind == "run.paused" and run_id == DENY_RUN_ID:
+            add_event_evidence(event_evidence, "run.paused", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, details={"status": deny_start["body"].get("status")})
+        if kind == "action.denied" and run_id == DENY_RUN_ID and deny_resume["body"].get("status") == "denied":
+            add_event_evidence(event_evidence, "run.denied", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"status": deny_resume["body"].get("status"), "reasons": reasons})
+        if kind == "run.cancelled" and run_id == KILL_RACE_RUN_ID:
+            add_event_evidence(event_evidence, "run.cancelled", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, details={"kill_switch_id": "ks_uc_e2e_s9_run"})
+    for ev in manager_events:
+        event_type = ev.get("event_type")
+        details = ev.get("details", {})
+        trace_event_id = ev.get("trace_event_id", "")
+        if event_type == "remote_message.failed" and details.get("message_id") == failed_message["message"]["message_id"]:
+            add_event_evidence(event_evidence, "message.delivery_failed", trace_event_id=trace_event_id, source="manager_audit_export", original_event_type=event_type, artifact="manager-audit-export.json", run_id=RUN_ID, message_id=details.get("message_id"), details=details)
+        if event_type == "placement.evaluated" and stale_placement["body"].get("status") == "rejected" and any("not available" in str(reason) for reason in stale_placement["body"].get("reasons", [])):
+            add_event_evidence(event_evidence, "node.stale", trace_event_id=trace_event_id, source="manager_audit_export", original_event_type=event_type, artifact="manager-audit-export.json", run_id=None, details={"placement": stale_placement["body"]})
+        if event_type == "circuit_breaker.tripped" and details.get("breaker_id") == cb_breaker_id:
+            add_event_evidence(event_evidence, "circuit_breaker.tripped", trace_event_id=trace_event_id, source="manager_audit_export", original_event_type=event_type, artifact="manager-audit-export.json", run_id=CB_RACE_RUN_ID, details=details)
+        if event_type == "kill_switch.activated" and details.get("kill_switch_id") in {"ks_uc_e2e_s9_run", "ks_uc_e2e_s9_missing_ack"}:
+            add_event_evidence(event_evidence, "kill_switch.activated", trace_event_id=trace_event_id, source="manager_audit_export", original_event_type=event_type, artifact="manager-audit-export.json", run_id=KILL_RACE_RUN_ID, details=details)
+    for trace_event_id in s5["scenario"].get("required_trace_event_ids", {}).get("policy.expired", []):
+        add_event_evidence(event_evidence, "policy.expired", trace_event_id=trace_event_id, source="source_runtime_trace_export", original_event_type="policy.expired", artifact="UC-E2E-S5/trace-export.jsonl", run_id=s5_policy.get("runtime_expired_policy", {}).get("run_id"), action_id=s5_policy.get("runtime_expired_policy", {}).get("action_id"), details={"source_scenario": "UC-E2E-S5", "reason_code": s5_policy.get("runtime_expired_policy", {}).get("reason_code")})
 
-    run_records = [record for record in records if record.get("payload", {}).get("run_id") == RUN_ID]
+    event_ids = evidence_ids(event_evidence)
+
+    run_records = [record for record in records if record.get("run_id") == RUN_ID or trace_identity(record).get("run_id") == RUN_ID]
     trace_batch = {"scope": {"fleet_id": FLEET_ID, "node_id": VPC_NODE_ID, "instance_id": VPC_INSTANCE_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "run_id": RUN_ID, "work_order_id": envelope["work_order_id"]}, "records": run_records}
-    sync_failed = call("syncTraceBuffer", "POST", args.manager_url, "/fleet/traces/sync", {**sec(manager), "batch": {**trace_batch, "records": []}})
+    tampered_records = json.loads(json.dumps(run_records))
+    if tampered_records:
+        tampered_records[0].setdefault("event_hash", {})["value"] = "0" * 64
+    sync_failed = call("syncTraceBuffer", "POST", args.manager_url, "/fleet/traces/sync", {**sec(manager), "batch": {**trace_batch, "records": tampered_records}})
     sync_recovered = call("syncTraceBuffer", "POST", args.manager_url, "/fleet/traces/sync", {**sec(manager), "batch": trace_batch})
 
+    retry_statuses = [attempt["body"].get("status") for attempt in retry_attempts]
+    retry_executed = sum(1 for status in retry_statuses[:2] if status == "Executed")
+    retry_third_denied = retry_statuses[2] in {"Denied", "NeedsIntervention"}
+    bounded_retry_counts = {"s9.idempotent_read": retry_executed, "max_attempts": 2, "attempts_submitted": len(retry_attempts), "attempt_statuses": retry_statuses, "third_attempt_status": retry_statuses[2], "enforced_by": "gateway_quota", "quota_consumed_attempts": retry_executed}
     negative_cases = [
         {"case": "adapter_returns_failure_no_fake_success_committed", "passed": adapter_failure["body"].get("status") == "Failed" and before_adapter["body"].get("adapter_executions") == after_adapter["body"].get("adapter_executions"), "reason_codes": ["adapter_failed"]},
-        {"case": "verifier_unavailable_denies_or_intervenes", "passed": verifier_unavailable["body"].get("status") in {"Denied", "NeedsIntervention"}, "reason_codes": verifier_unavailable["body"].get("verification", {}).get("reasons", []) or ["verifier_unavailable"]},
+        {"case": "verifier_unavailable_denies_or_intervenes", "passed": verifier_unavailable["body"].get("status") in {"Denied", "NeedsIntervention"} and bool(event_ids.get("verifier.unavailable")), "reason_codes": verifier_unavailable["body"].get("verification", {}).get("reasons", []) or ["verifier_unavailable"]},
         {"case": "policy_unavailable_or_expired_denies_high_risk", "passed": s5_policy.get("runtime_expired_policy", {}).get("reason_code") == "policy_expired", "reason_codes": ["policy_expired"]},
-        {"case": "trace_write_failure_before_side_effect_blocks_execution", "passed": s1_audit_denials.get("forced_trace_write_failure_blocks_side_effect", {}).get("http_counter_before") == s1_audit_denials.get("forced_trace_write_failure_blocks_side_effect", {}).get("http_counter_after"), "reason_codes": ["trace_write_failed"]},
-        {"case": "trace_write_failure_after_outcome_audit_visible_no_hidden_continuation", "passed": s4_trace_sync.get("tampered_sync", {}).get("status") == 403 and s4_trace_sync.get("duplicate_sync", {}).get("duplicate_records", 0) >= 0, "reason_codes": ["trace_sync_rejected"]},
-        {"case": "state_commit_failure_prevents_next_tick", "passed": s1_audit_denials.get("forced_state_commit_failure_prevents_next_tick", {}).get("tick_start_count", 99) <= 1, "reason_codes": ["state_commit_failed"]},
-        {"case": "remote_message_transport_failure_records_delivery_failure", "passed": remote_failure["body"].get("delivery_status") == "failed" and s4_remote.get("failed", {}).get("delivery_status") == "failed", "reason_codes": ["message_delivery_failed"]},
+        {"case": "trace_write_failure_before_side_effect_blocks_execution", "passed": trace_failure_cli["exit"] != 0 and trace_failure_cli["http_counter_before"] == trace_failure_cli["http_counter_after"] and bool(event_ids.get("trace.write_failed")), "reason_codes": ["trace_write_failed"]},
+        {"case": "trace_write_failure_after_outcome_audit_visible_no_hidden_continuation", "passed": sync_failed["status"] == 403 and sync_recovered["body"].get("accepted_records", 0) > 0, "reason_codes": ["trace_sync_rejected"]},
+        {"case": "state_commit_failure_prevents_next_tick", "passed": state_failure_cli["exit"] != 0 and state_failure_cli["http_counter_after"] - state_failure_cli["http_counter_before"] <= 1 and state_failure_cli["events"].count("tick.started") <= 1 and bool(event_ids.get("state.commit_failed")), "reason_codes": ["state_commit_failed"]},
+        {"case": "remote_message_transport_failure_records_delivery_failure", "passed": remote_failure["body"].get("delivery_status") == "failed" and remote_failure["body"].get("remote_state_mutated") is False and bool(event_ids.get("message.delivery_failed")), "reason_codes": ["message_delivery_failed"]},
         {"case": "node_heartbeat_stale_denies_placement", "passed": stale_placement["body"].get("status") == "rejected", "reason_codes": stale_placement["body"].get("reasons", []) or ["node_stale"]},
         {"case": "quota_exceeded_denies_not_silently_retried", "passed": quota_first["body"].get("status") == "Executed" and quota_second["body"].get("status") in {"Denied", "NeedsIntervention"}, "reason_codes": quota_second["body"].get("verification", {}).get("reasons", []) or ["quota_exceeded"]},
-        {"case": "circuit_breaker_wins_pending_approval_race", "passed": s5_breaker.get("blocked_action", {}).get("status") == "Denied" and bool(s5_approval.get("request", {}).get("approval_id")), "reason_codes": ["circuit_breaker_tripped"]},
-        {"case": "kill_switch_wins_resume_race_fail_closed", "passed": s5_kill.get("missing_ack", {}).get("fail_closed") is True and s5_kill.get("activated", {}).get("cancel_status") == 200, "reason_codes": ["kill_switch_activated"]},
-        {"case": "telemetry_stale_missing_cannot_authorize", "passed": s4_telemetry.get("authority") == "observational_only" and stale_placement["body"].get("status") == "rejected", "reason_codes": ["telemetry_non_authoritative"]},
+        {"case": "circuit_breaker_wins_pending_approval_race", "passed": cb_payload["status"] == 200 and cb_sync["body"].get("accepted") is True and cb_blocked["body"].get("status") == "Denied" and bool(event_ids.get("circuit_breaker.tripped")), "reason_codes": ["circuit_breaker_tripped"]},
+        {"case": "kill_switch_wins_resume_race_fail_closed", "passed": kill_switch["body"].get("cancel_status") == 200 and kill_missing_ack["body"].get("fail_closed") is True and bool(event_ids.get("kill_switch.activated")), "reason_codes": ["kill_switch_activated"]},
+        {"case": "telemetry_stale_missing_cannot_authorize", "passed": telemetry_read["body"].get("authority") == "observational_only" and stale_placement["body"].get("status") == "rejected", "reason_codes": ["telemetry_non_authoritative"]},
     ]
     positive_checks = {
         "bounded_success_fixture_completed": bool(create["status"] == 200 and success_action["body"].get("status") == "Executed"),
         "quotas_consumed_predictably": bool(quota_first["body"].get("status") == "Executed" and quota_second["body"].get("status") in {"Denied", "NeedsIntervention"}),
-        "bounded_retry_for_idempotent_read_only_action": bool(retry_action["body"].get("status") == "Executed" and retry_action["body"].get("action_id")),
+        "bounded_retry_for_idempotent_read_only_action": bool(retry_executed == 2 and retry_third_denied and unsafe_retry["body"].get("status") in {"Denied", "NeedsIntervention"}),
         "idempotency_marker_prevents_duplicate_side_effect_application": bool(delivered["body"].get("delivery_status") == "delivered" and duplicate["body"].get("duplicate") is True and duplicate["body"].get("idempotency_key") == "s9-side-effect-once"),
-        "recoverable_trace_sync_resumes_without_integrity_loss": bool(sync_recovered["body"].get("accepted_records", 0) > 0 and s4_trace_sync.get("accepted_records", 0) >= 0),
+        "recoverable_trace_sync_resumes_without_integrity_loss": bool(sync_failed["status"] == 403 and sync_recovered["body"].get("accepted_records", 0) > 0),
     }
     failures = [key for key, ok in positive_checks.items() if ok is not True]
     failures.extend(f"negative_failed:{item['case']}" for item in negative_cases if item.get("passed") is not True)
     missing_events = sorted(event for event in REQUIRED_TRACE_EVENTS if not event_ids.get(event))
     failures.extend(f"missing_required_trace_event:{event}" for event in missing_events)
 
-    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "message_duplicates": 1, "artifact_external_publishes": 0}
-    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "message_duplicates": 1, "artifact_external_publishes": 0}
+    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "manager_audit_events": len(replay_audit_before["body"]), "message_delivery_status": message_before["body"].get("delivery_status"), "message_duplicate": message_before["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": {"adapter": "GET /runs/{run_id}", "message": "POST /messages/{message_id}/read", "audit": "POST /fleet/audit/read", "artifact": "not_used_by_s9"}}
+    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "manager_audit_events": len(replay_audit_after["body"]), "message_delivery_status": message_after["body"].get("delivery_status"), "message_duplicate": message_after["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": before_counts["counter_sources"]}
     replay_report = {
         **replay["body"],
         "mode": "inspect_only",
@@ -412,25 +706,28 @@ def main() -> int:
         "side_effects_executed": before_counts != after_counts,
         "action_execution_counts_before_replay": before_counts,
         "action_execution_counts_after_replay": after_counts,
-        "bounded_retry_counts": {"s9.idempotent_read": 2, "max_attempts": 2},
+        "bounded_retry_counts": bounded_retry_counts,
         "idempotency_markers": ["s9-read-once", "s9-side-effect-once", "s9-transport-fail"],
+        "public_replay_api": {"before_status": replay_before["status"], "replay_status": replay["status"], "after_status": replay_after["status"]},
         "failure_modes_explained": [item["case"] for item in negative_cases if item.get("passed") is True],
     }
     if replay_report["side_effects_executed"] is not False:
         failures.append("replay_executed_side_effects")
 
     state_head = call("getStateHead", "GET", args.base_url, f"/runs/{RUN_ID}/state-head", headers=credential_header(run_cred))
-    trace_events = records + synthetic_events
-    trace_event_ids = sorted({trace_id(rec) for rec in records if trace_id(rec)} | {rec["trace_event_id"] for rec in synthetic_events})
+    trace_events = records
+    trace_event_ids = sorted({trace_id(rec) for rec in records if trace_id(rec)} | {row["trace_event_id"] for rows in event_evidence.values() for row in rows if row.get("trace_event_id")})
     audit_report = {
         "scenario": "UC-E2E-S9",
         "negative_cases": negative_cases,
         "positive_checks": positive_checks,
         "bounded_retry_counts": replay_report["bounded_retry_counts"],
         "idempotency_markers": replay_report["idempotency_markers"],
+        "required_event_evidence": event_evidence,
+        "manager_audit_events": manager_events,
         "source_artifacts": {"UC-E2E-S1": digest_file(s1["dir"] / "audit-report.json"), "UC-E2E-S4": digest_file(s4["dir"] / "remote-message-report.json"), "UC-E2E-S5": digest_file(s5["dir"] / "audit-report.json")},
     }
-    anti = {"status": "passed" if not failures else "failed", "private_helper_only_e2e": False, "gateway_bypass": False, "static_s9_evidence": False, "unbounded_retry": False, "fake_success_after_adapter_failure": False, "verifier_or_policy_fail_open": False, "telemetry_authorizes_action_or_placement": False, "replay_side_effects_allowed_default": False}
+    anti = {"status": "passed" if not failures else "failed", "private_helper_only_e2e": False, "gateway_bypass": False, "static_s9_evidence": False, "unbounded_retry": False, "fake_success_after_adapter_failure": False, "verifier_or_policy_fail_open": False, "telemetry_authorizes_action_or_placement": False, "replay_side_effects_allowed_default": False, "derived_from_required_event_evidence": sorted(event_evidence), "public_api_operations": sorted({row["operation_id"] for row in api_rows}), "retry_attempt_statuses": retry_statuses, "replay_counter_sources": before_counts["counter_sources"]}
     scenario = {
         "id": "UC-E2E-S9",
         "status": "passed" if not failures else "failed",
@@ -443,16 +740,17 @@ def main() -> int:
         "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "side_effects_executed": False, "action_execution_counts_before_replay": before_counts, "action_execution_counts_after_replay": after_counts},
         "replay_artifacts": [str(artifact_dir / "replay-report.json")],
         "anti_drift_checks": ["public_daemon_and_manager_http_used", "gateway_mediated_failure_actions", "bounded_retry_counts_present", "idempotency_markers_present", "telemetry_observational_only", "replay_no_side_effects"],
-        "run_ids": [RUN_ID, QUOTA_RUN_ID, ADAPTER_FAIL_RUN_ID, VERIFIER_RUN_ID, CB_RACE_RUN_ID, KILL_RACE_RUN_ID] + s1["scenario"].get("run_ids", [])[:1] + s4["scenario"].get("run_ids", [])[:1] + s5["scenario"].get("run_ids", [])[:2],
+        "run_ids": [RUN_ID, QUOTA_RUN_ID, ADAPTER_FAIL_RUN_ID, VERIFIER_RUN_ID, CB_RACE_RUN_ID, KILL_RACE_RUN_ID, RETRY_RUN_ID, UNSAFE_RETRY_RUN_ID, DENY_RUN_ID, TRACE_FAIL_RUN_ID, STATE_FAIL_RUN_ID] + s5["scenario"].get("run_ids", [])[:1],
         "trace_event_ids": trace_event_ids,
-        "state_node_ids": [state_head["body"].get("state_node_id", "")] + s1["scenario"].get("state_node_ids", [])[:1] + s4["scenario"].get("state_node_ids", [])[:1] + s5["scenario"].get("state_node_ids", [])[:1],
-        "state_hashes": [state_head["body"].get("data_hash", "")] + s1["scenario"].get("state_hashes", [])[:1] + s4["scenario"].get("state_hashes", [])[:1] + s5["scenario"].get("state_hashes", [])[:1],
-        "message_ids": [duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]] + s4["scenario"].get("message_ids", [])[:2],
-        "work_order_ids": [envelope["work_order_id"], adapter_envelope["work_order_id"], quota_envelope["work_order_id"], verifier_envelope["work_order_id"]] + s4["scenario"].get("work_order_ids", [])[:1] + s5["scenario"].get("work_order_ids", [])[:1],
-        "approval_ids": s5["scenario"].get("approval_ids", [])[:2],
+        "state_node_ids": [state_head["body"].get("state_node_id", "")] + s5["scenario"].get("state_node_ids", [])[:1],
+        "state_hashes": [state_head["body"].get("data_hash", "")] + s5["scenario"].get("state_hashes", [])[:1],
+        "message_ids": [duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]],
+        "work_order_ids": [envelope["work_order_id"], retry_envelope["work_order_id"], unsafe_envelope["work_order_id"], adapter_envelope["work_order_id"], quota_envelope["work_order_id"], verifier_envelope["work_order_id"], deny_envelope["work_order_id"], cb_envelope["work_order_id"], kill_envelope["work_order_id"], trace_failure_cli["work_order_id"], state_failure_cli["work_order_id"]] + s5["scenario"].get("work_order_ids", [])[:1],
+        "approval_ids": [approval_context.get("approval_id", "")] + s5["scenario"].get("approval_ids", [])[:1],
         "node_ids": [VPC_NODE_ID, CLOUD_NODE_ID, "00000000-0000-4000-8000-000000009909"],
         "api_operations": sorted({row["operation_id"] for row in api_rows}),
         "required_trace_event_ids": event_ids,
+        "required_event_evidence": event_evidence,
         "positive_checks": positive_checks,
         "negative_cases": negative_cases,
         "scenario_failures": failures,
@@ -461,16 +759,17 @@ def main() -> int:
     }
     artifacts = {
         "scenario-report.json": scenario,
-        "fault-injection-report.json": {"positive_checks": positive_checks, "negative_cases": negative_cases, "required_trace_event_ids": event_ids, "source_scenarios": scenario["source_scenarios"]},
-        "quota-retry-report.json": {"quota_first": quota_first["body"], "quota_second": quota_second["body"], "retry_action": retry_action["body"], "bounded_retry_counts": replay_report["bounded_retry_counts"]},
+        "fault-injection-report.json": {"positive_checks": positive_checks, "negative_cases": negative_cases, "required_trace_event_ids": event_ids, "required_event_evidence": event_evidence, "source_scenarios": scenario["source_scenarios"], "cli_trace_failure": {k: v for k, v in trace_failure_cli.items() if k != "records"}, "cli_state_failure": {k: v for k, v in state_failure_cli.items() if k != "records"}},
+        "quota-retry-report.json": {"quota_first": quota_first["body"], "quota_second": quota_second["body"], "retry_attempts": [attempt["body"] for attempt in retry_attempts], "unsafe_retry": unsafe_retry["body"], "bounded_retry_counts": replay_report["bounded_retry_counts"], "retry_policy": {"mode": "explicit_public_retry_policy", "max_attempts": 2, "retryable_action": "s9.idempotent_read", "idempotency_key": "s9-read-once", "enforced_by": "gateway_quota", "unsafe_retry_rejection": "gateway_permission_denial"}},
         "idempotency-report.json": {"delivered": delivered["body"], "duplicate": duplicate["body"], "markers": replay_report["idempotency_markers"]},
         "failure-matrix.json": {item["case"]: item for item in negative_cases},
-        "trace-sync-report.json": {"failed": sync_failed["body"], "recovered": sync_recovered["body"], "s4_source": s4_trace_sync},
-        "fleet-telemetry.json": {"authority": s4_telemetry.get("authority"), "stale_placement": stale_placement["body"], "source": "UC-E2E-S4 plus S9 stale placement"},
-        "governance-race-report.json": {"circuit_breaker": s5_breaker, "kill_switch": s5_kill, "approval_flow": s5_approval},
+        "trace-sync-report.json": {"failed": sync_failed["body"], "failed_status": sync_failed["status"], "recovered": sync_recovered["body"], "tampered_record_count": len(tampered_records)},
+        "fleet-telemetry.json": {"authority": telemetry_read["body"].get("authority"), "stale_placement": stale_placement["body"], "telemetry": telemetry_read["body"], "source": "S9 public fleet telemetry and stale placement"},
+        "governance-race-report.json": {"circuit_breaker": {"created": cb_created["body"], "sync_payload": cb_payload["body"], "synced": cb_sync["body"], "blocked_action": cb_blocked["body"]}, "kill_switch": {"activated": kill_switch["body"], "missing_ack": kill_missing_ack["body"]}, "approval_flow": {"request": approval_request["body"], "denial": approval_denial["body"], "start": deny_start["body"], "resume": deny_resume["body"]}},
         "state-export.json": state_head["body"],
         "replay-report.json": replay_report,
         "audit-report.json": audit_report,
+        "manager-audit-export.json": {"audit_read": manager_audit["body"], "governance_export": governance_audit["body"]},
         "anti-drift-results.json": anti,
     }
     for name, data in artifacts.items():
@@ -481,6 +780,7 @@ def main() -> int:
     write_jsonl(artifact_dir / "api-traffic.ndjson", api_rows)
     scenario["artifact_paths"].extend([str(artifact_dir / "trace-export.jsonl"), str(artifact_dir / "api-traffic.ndjson"), str(commands), str(artifact_dir / "stdout.log"), str(artifact_dir / "stderr.log")])
     write_json(artifact_dir / "scenario-report.json", scenario)
+    httpd.shutdown()
     if failures:
         raise SystemExit("UC-E2E-S9 failed required evidence checks: " + ",".join(failures))
     return 0

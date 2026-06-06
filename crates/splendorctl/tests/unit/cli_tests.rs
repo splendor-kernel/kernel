@@ -5591,8 +5591,19 @@ fn failure_injection_trace_store_fails_once_then_delegates() {
         .to_string()
         .contains("injected_trace_write_failure:tick.started"));
 
+    let records = TraceStore::read(&store, &run_id).expect("failure evidence record");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        trace_payload_kind(&records[0].payload),
+        Some("TraceWriteFailed".to_string())
+    );
+    assert_eq!(
+        records[0].payload["kind"]["TraceWriteFailed"]["failed_event"],
+        "tick.started"
+    );
+
     let sequence = TraceStore::append(&store, &run_id, payload).expect("second append succeeds");
-    assert_eq!(sequence, 0);
+    assert_eq!(sequence, 1);
     let object_kind_payload = serde_json::json!({"kind": {"tick.completed": {"tick_id": 1}}});
     assert_eq!(
         trace_payload_kind(&object_kind_payload),
@@ -5600,12 +5611,12 @@ fn failure_injection_trace_store_fails_once_then_delegates() {
     );
     let second_sequence =
         TraceStore::append(&store, &run_id, object_kind_payload).expect("append object kind");
-    assert_eq!(second_sequence, 1);
+    assert_eq!(second_sequence, 2);
 
     let records = TraceStore::read(&store, &run_id).expect("records");
-    assert_eq!(records.len(), 2);
-    let range = TraceStore::read_range(&store, &run_id, 0, 2).expect("range");
-    assert_eq!(range.len(), 2);
+    assert_eq!(records.len(), 3);
+    let range = TraceStore::read_range(&store, &run_id, 0, 3).expect("range");
+    assert_eq!(range.len(), 3);
 }
 
 #[test]

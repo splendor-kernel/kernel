@@ -7,10 +7,11 @@ Validate the post-implementation acceptance path for deterministic runtime failu
 ## Functional Scope
 
 - Adds `tests/e2e/use-cases/scenarios/uc_e2e_s9_failure_injection/run.py` as the S9 scenario runner.
-- Drives public daemon and manager HTTP APIs for run creation, gateway action submission, quota pressure, adapter failure, remote message failure, stale placement, trace sync recovery, state read, trace export, and inspect-only replay.
-- Reuses prior public scenario evidence from S1, S4, and S5 for trace write failure, state commit failure, remote message/trace sync behavior, policy expiry, circuit breaker, kill switch, and telemetry non-authority.
+- Drives public daemon and manager HTTP APIs for run creation, gateway action submission, quota pressure, adapter failure, remote message failure, approval denial/resume, circuit-breaker sync, kill-switch activation, stale placement, trace sync recovery, state read, trace export, fleet telemetry/audit reads, and inspect-only replay.
+- Exercises trace-store and state-store failure injection through public `splendorctl run --config` invocations, then exports the resulting trace-store evidence with `splendorctl trace export`.
+- Reuses prior public S5 source trace evidence only for `policy.expired`; S1 and S4 remain prerequisite source scenarios whose own loaders must pass before S9 can aggregate.
 - Updates `scripts/e2e/verify-use-case-acceptance.sh` so `--scenario UC-E2E-S9` pre-runs required source scenarios and `--all` includes S0-S9.
-- Updates `aggregate_report.py` so S9 is rejected unless machine-readable positive, negative, replay, trace, state, API, retry, idempotency, and anti-drift evidence exists.
+- Updates `aggregate_report.py` so S9 is rejected unless machine-readable positive, negative, replay, trace, state, API, retry, idempotency, audit, provenance, and anti-drift evidence exists.
 
 ## Non-Goals
 
@@ -38,9 +39,9 @@ Validate the post-implementation acceptance path for deterministic runtime failu
 | Policy | validates expired/unavailable policy fail-closed evidence from S5 |
 | Gateway | validates action submission remains gateway-mediated for success, failure, and denial |
 | Verifier | validates unavailable/uncertain verifier behavior denies or intervenes |
-| State graph | validates source state commit failure prevents next tick and S9 state head is explicit |
-| Trace store | validates required failure trace events and trace sync recovery/tamper evidence |
-| Replay | validates inspect-only replay does not alter adapter/message/artifact counters |
+| State graph | validates S9 public state commit failure evidence prevents the next tick and S9 state head is explicit |
+| Trace store | validates S9 public trace write failure evidence, required failure trace events, and trace sync recovery/tamper evidence |
+| Replay | validates inspect-only replay does not alter adapter/message/audit/artifact counters read through public APIs |
 | Message | validates delivery failure and idempotency marker behavior |
 | Work order | validates scoped signed work orders for S9 actions/messages |
 | Governance | validates circuit breaker and kill switch race fail-closed evidence |
@@ -63,13 +64,19 @@ S9 requires trace/audit evidence for:
 - `run.denied`
 - `run.cancelled`
 
-The scenario records these in `trace-export.jsonl` and maps each event to `required_trace_event_ids` in `scenario-report.json`.
+The scenario records required S9 evidence as `required_event_evidence`, and the aggregator derives `required_trace_event_ids` from those provenance rows. Accepted sources are limited to:
+
+- S9 runtime trace export (`trace-export.jsonl`) for gateway/runtime events.
+- Manager audit export (`manager-audit-export.json`) for remote message, placement, circuit breaker, and kill-switch events.
+- Source runtime trace export (`UC-E2E-S5/trace-export.jsonl`) for `policy.expired`.
+
+Synthetic, manual, static, scenario-self-attested, or UUID-only rows are rejected.
 
 ## State Behavior
 
 - S9 reads a public state head for the bounded success run.
-- S1 source evidence proves forced state commit failure does not advance a next tick.
-- Aggregation requires state node IDs and state hashes from S9 plus S1/S4/S5 source evidence.
+- A public `splendorctl run --config` state-commit failure fixture appends `state.commit_failed` evidence before returning failure.
+- Aggregation requires state node IDs and state hashes from S9 plus prerequisite source evidence.
 
 ## Gateway and Verifier Behavior
 
@@ -82,7 +89,7 @@ The scenario records these in `trace-export.jsonl` and maps each event to `requi
 
 - Replay mode is `inspect_only`.
 - `side_effects_allowed_default` is `false`.
-- Replay records before/after counters for adapter executions, message duplicates, and external publication count.
+- Replay records before/after counters for adapter executions, message state, manager audit event count, and external publication count; S9 verifies the first three are read through public daemon/manager APIs.
 - Audit includes bounded retry counts and idempotency markers.
 
 ## Failure Behavior
@@ -96,6 +103,7 @@ S9 covers adapter failure, verifier unavailability, policy expiry, trace write f
 | integration | Run public daemon/manager S9 flow | `scenario-report.json`, `api-traffic.ndjson` |
 | negative | Validate fail-closed failure matrix | `failure-matrix.json`, `fault-injection-report.json` |
 | trace | Required S9 failure event IDs | `trace-export.jsonl`, `required_trace_event_ids` |
+| provenance | Required S9 failure event provenance | `required_event_evidence`, `manager-audit-export.json`, source `trace-export.jsonl` |
 | replay | Confirm no replay side effects | `replay-report.json` |
 | audit | Bounded retry/idempotency explanation | `audit-report.json`, `quota-retry-report.json`, `idempotency-report.json` |
 
