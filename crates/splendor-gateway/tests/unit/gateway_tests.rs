@@ -554,6 +554,42 @@ fn safety_low_battery_intervention_prevents_adapter_execution_with_trace_safe_ev
 }
 
 #[test]
+fn safety_s6_policy_cache_and_cloud_helper_denials_prevent_adapter_execution() {
+    for (snapshot, reason) in [
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.policy_cache_expired = true;
+            snapshot.high_risk = true;
+            (snapshot, "policy_cache_expired")
+        },
+        {
+            let mut snapshot = safe_safety_snapshot();
+            snapshot.cloud_helper_direct_authority = true;
+            (snapshot, "cloud_helper_direct_authority_denied")
+        },
+    ] {
+        let tenant_access = Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        });
+        let mut gateway = VerifiedActionGateway::new(tenant_access);
+        let adapter = Arc::new(CountingAdapter::default());
+        gateway.register_adapter("move_to_waypoint", "robotics", adapter.clone());
+        gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(snapshot)));
+
+        let outcome = gateway.submit(physical_request()).expect("outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert!(outcome.verification.reasons.contains(&reason.to_string()));
+        assert_eq!(
+            outcome.verification.artifacts["source"].as_str(),
+            Some("safety_verifier")
+        );
+        assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    }
+}
+
+#[test]
 fn safety_emergency_stop_denial_prevents_adapter_execution() {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
