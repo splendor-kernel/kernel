@@ -5056,6 +5056,115 @@ fn run_from_config_validates_signed_work_order_and_records_metadata() {
 }
 
 #[test]
+fn run_from_config_trace_failure_injection_records_runtime_evidence_and_blocks_side_effect() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let fs_base = dir.path().join("fs");
+    let tenant_uuid = Uuid::new_v4();
+    let agent_uuid = Uuid::new_v4();
+    let run_uuid = Uuid::new_v4();
+    let run_id: RunId = run_uuid.into();
+    let work_order = signed_work_order_block(
+        tenant_uuid.into(),
+        agent_uuid.into(),
+        run_id.clone(),
+        vec!["write_file".to_string()],
+    );
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nfailure_injection:\n  trace_fail_on_event: ActionVerificationStarted\ntenants:\n  - id: {}\n    allowed_actions: [\"write_file\"]\n    allowed_adapters: [\"filesystem\"]\n    allowed_permissions: [\"fs.write\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    allowed_permissions: [\"fs.write\"]\n    policy:\n      type: static\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          required_permissions: [\"fs.write\"]\n          params:\n            path: \"blocked.txt\"\n            contents: \"blocked\"\nadapters:\n  filesystem:\n    base_dir: {}\n{}",
+        trace_path.display(),
+        state_path.display(),
+        run_uuid,
+        tenant_uuid,
+        agent_uuid,
+        tenant_uuid,
+        run_uuid,
+        fs_base.display(),
+        work_order,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    let error = run_from_config(&config_path, Some(1), false)
+        .expect_err("trace failure injection must fail closed");
+    assert!(error.contains("injected_trace_write_failure:ActionVerificationStarted"));
+    assert!(!fs_base
+        .join(tenant_uuid.to_string())
+        .join("blocked.txt")
+        .exists());
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let evidence = records
+        .iter()
+        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
+        .expect("trace-write failure evidence");
+    assert_eq!(
+        evidence.payload["kind"]["TraceWriteFailed"]["failed_event"],
+        "ActionVerificationStarted"
+    );
+    assert_eq!(
+        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn run_from_config_state_failure_injection_records_evidence_and_prevents_next_tick() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let tenant_uuid = Uuid::new_v4();
+    let agent_uuid = Uuid::new_v4();
+    let run_uuid = Uuid::new_v4();
+    let run_id: RunId = run_uuid.into();
+    let work_order = signed_work_order_block(
+        tenant_uuid.into(),
+        agent_uuid.into(),
+        run_id.clone(),
+        vec!["noop".to_string()],
+    );
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nfailure_injection:\n  state_commit_fail: true\ntenants:\n  - id: {}\n    allowed_actions: [\"noop\"]\n    allowed_adapters: [\"filesystem\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    policy:\n      type: static\n      actions: []\n      next_state: committed\n{}",
+        trace_path.display(),
+        state_path.display(),
+        run_uuid,
+        tenant_uuid,
+        agent_uuid,
+        tenant_uuid,
+        run_uuid,
+        work_order,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    let error = run_from_config(&config_path, Some(2), false)
+        .expect_err("state failure injection must fail closed");
+    assert!(error.contains("injected_state_commit_failure"));
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let tick_starts = records
+        .iter()
+        .filter(|record| trace_payload_kind(&record.payload).as_deref() == Some("LoopTickStarted"))
+        .count();
+    assert_eq!(tick_starts, 1);
+    let evidence = records
+        .iter()
+        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("StateCommitFailed"))
+        .expect("state commit failure evidence");
+    assert_eq!(
+        evidence.payload["kind"]["StateCommitFailed"]["next_tick_advanced"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        evidence.payload["kind"]["StateCommitFailed"]["failure_injection"],
+        "splendorctl_public_run_config"
+    );
+}
+
+#[test]
 fn run_from_config_bad_work_order_signature_records_audit_without_starting_run() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");
