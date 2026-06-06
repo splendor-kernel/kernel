@@ -300,6 +300,39 @@ S7_REQUIRED_EVENTS = {
     "state.committed",
     "replay.explained",
 }
+S8_REQUIRED_SOURCE_SCENARIOS = {"UC-E2E-S1", "UC-E2E-S3", "UC-E2E-S4", "UC-E2E-S5", "UC-E2E-S6", "UC-E2E-S7"}
+S8_REQUIRED_EVENTS = {
+    "replay.started",
+    "replay.completed",
+    "replay.failed",
+    "replay.adapter_suppressed",
+    "replay.policy_compared",
+    "replay.verifier_explained",
+    "trace.imported",
+    "trace.rejected",
+    "state.imported",
+    "state.rejected",
+    "schema.migrated",
+    "schema.rejected",
+    "audit.exported",
+}
+S8_REQUIRED_NEGATIVES = {
+    "tampered_trace_chain_detected",
+    "state_hash_mismatch_prevents_replay_continuation",
+    "unsupported_schema_version_rejected_with_migration_guidance",
+    "side_effectful_replay_mode_rejected_without_gate",
+    "replay_cannot_use_real_external_credentials",
+    "generated_schema_mismatch_fails_compatibility_gate",
+    "audit_export_requires_denial_reason_codes",
+}
+S8_REQUIRED_EXPLANATION_CATEGORIES = {
+    "approval",
+    "denial",
+    "quota_failure",
+    "work_order_rejection",
+    "data_scope_denial",
+    "safety_denial",
+}
 
 
 def utc_now() -> str:
@@ -582,6 +615,24 @@ def render_markdown(report: dict) -> str:
             "- Governance evidence is recorded in `artifacts/UC-E2E-S5/` when S5 runs.",
             "- S5 requires public daemon and manager APIs, scoped approval grant/deny/revoke, policy bundle TTL/revocation, circuit breaker, kill switch, audit export, and inspect-only replay evidence.",
             "- S5 keeps governance runtime-enforced and does not claim enterprise approval UI or product workflow coverage.",
+            "",
+            "## S6 evidence",
+            "",
+            "- Physical/edge safety evidence is recorded in `artifacts/UC-E2E-S6/` when S6 runs.",
+            "- S6 requires public resident-edge daemon APIs, high-level physical actions only, local safety verifier denial, operator intervention, trace buffer sync, and inspect-only replay evidence.",
+            "- S6 keeps device simulation beyond Splendor adapter boundaries and does not claim real-time robotics control.",
+            "",
+            "## S7 evidence",
+            "",
+            "- Data-local isolation and artifact evidence is recorded in `artifacts/UC-E2E-S7/` when S7 runs.",
+            "- S7 requires scoped work orders, typed specialist messages, data-scope denial, trace redaction, governed artifact publish, and replay without rereading or republishing artifacts.",
+            "- S7 does not claim enterprise data workspace UI coverage.",
+            "",
+            "## S8 evidence",
+            "",
+            "- Replay/audit/schema compatibility evidence is recorded in `artifacts/UC-E2E-S8/` when S8 runs.",
+            "- S8 imports S1/S3/S4/S5/S6/S7 trace and state artifacts into a clean workspace, validates trace chains and state hashes, rejects tampered copies, and emits replay/schema/audit events.",
+            "- S8 keeps replay inspect/read-only/comparison/explanation-only by default and rejects side-effectful replay without a separate explicit gate.",
             "",
             "## Non-goals observed",
             "",
@@ -1712,6 +1763,201 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     return scenario, failures
 
 
+def load_s8_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+    artifact_dir = report_dir / "artifacts" / "UC-E2E-S8"
+    scenario_path = artifact_dir / "scenario-report.json"
+    if not scenario_path.exists():
+        return None, []
+    scenario = read_json(scenario_path)
+    failures: list[str] = []
+    required = [
+        "scenario-report.json",
+        "trace-export.jsonl",
+        "trace-import-report.json",
+        "state-import-report.json",
+        "tamper-report.json",
+        "replay-report.json",
+        "schema-migration-report.json",
+        "audit-package.json",
+        "audit-report.json",
+        "public-boundary-evidence.json",
+        "anti-drift-results.json",
+        "tampered-trace-export.jsonl",
+        "tampered-state-export.json",
+        "commands.log",
+        "stdout.log",
+        "stderr.log",
+    ]
+    for name in required:
+        path = artifact_dir / name
+        if not path.exists():
+            failures.append(f"missing_required_s8_artifact:{name}")
+        elif path.stat().st_size == 0 and name != "stderr.log":
+            failures.append(f"empty_required_s8_artifact:{name}")
+    if scenario.get("status") != "passed":
+        failures.append("s8_scenario_report_failed")
+    for failure in scenario.get("scenario_failures", []):
+        failures.append(f"s8_scenario_failure:{failure}")
+    sources = set(scenario.get("source_scenarios", []))
+    if sources != S8_REQUIRED_SOURCE_SCENARIOS:
+        failures.append("s8_wrong_source_scenarios:" + ",".join(sorted(sources)))
+    for source_id in S8_REQUIRED_SOURCE_SCENARIOS:
+        source_report = report_dir / "artifacts" / source_id / "scenario-report.json"
+        if not source_report.exists():
+            failures.append(f"s8_missing_source_scenario_report:{source_id}")
+        elif read_json(source_report).get("status") != "passed":
+            failures.append(f"s8_source_scenario_not_passed:{source_id}")
+    event_ids = scenario.get("required_trace_event_ids", {})
+    missing_events = sorted(event for event in S8_REQUIRED_EVENTS if not event_ids.get(event))
+    if missing_events:
+        failures.append("s8_missing_required_trace_events:" + ",".join(missing_events))
+    for event_name, ids in event_ids.items():
+        if not isinstance(ids, list):
+            failures.append(f"s8_trace_event_ids_not_list:{event_name}")
+            continue
+        for trace_id in ids:
+            if not is_canonical_uuid(trace_id):
+                failures.append(f"s8_trace_event_id_not_uuid:{event_name}:{trace_id}")
+    trace_events = read_jsonl(artifact_dir / "trace-export.jsonl")
+    event_types = {record.get("event_type") for record in trace_events}
+    missing_exported_events = sorted(S8_REQUIRED_EVENTS - event_types)
+    if missing_exported_events:
+        failures.append("s8_trace_export_missing_event_types:" + ",".join(missing_exported_events))
+    trace_import = read_json(artifact_dir / "trace-import-report.json")
+    public_boundary = read_json(artifact_dir / "public-boundary-evidence.json")
+    public_commands = public_boundary.get("commands", [])
+    if len(public_commands) < len(S8_REQUIRED_SOURCE_SCENARIOS):
+        failures.append("s8_public_import_command_outputs_missing")
+    if not all(item.get("command") == "acceptance validate-import" and item.get("stdout", {}).get("accepted") is True for item in public_commands if item.get("command") == "acceptance validate-import"):
+        failures.append("s8_public_import_command_not_authoritative")
+    imports = trace_import.get("imports", [])
+    if len(imports) != len(S8_REQUIRED_SOURCE_SCENARIOS):
+        failures.append("s8_trace_import_wrong_source_count")
+    clean_workspace = trace_import.get("clean_workspace", "")
+    if "clean-import-workspace" not in str(clean_workspace):
+        failures.append("s8_clean_import_workspace_missing")
+    for row in imports:
+        if row.get("scenario_id") not in S8_REQUIRED_SOURCE_SCENARIOS:
+            failures.append(f"s8_unknown_import_source:{row.get('scenario_id')}")
+        if not str(row.get("trace_digest", "")).startswith(("sha256:", "blake3:")) or not str(row.get("trace_chain_hash", "")).startswith(("sha256:", "blake3:")):
+            failures.append(f"s8_import_missing_trace_hashes:{row.get('scenario_id')}")
+        if row.get("trace_records", 0) <= 0:
+            failures.append(f"s8_import_empty_trace:{row.get('scenario_id')}")
+        if not str(row.get("state_digest", "")).startswith(("sha256:", "blake3:")):
+            failures.append(f"s8_import_missing_state_digest:{row.get('scenario_id')}")
+        if row.get("public_command") != "splendorctl acceptance validate-import":
+            failures.append(f"s8_import_missing_public_command:{row.get('scenario_id')}")
+    state_import = read_json(artifact_dir / "state-import-report.json")
+    for row in state_import.get("imports", []):
+        if row.get("accepted") is not True or not row.get("matching_hashes"):
+            failures.append(f"s8_state_import_not_hash_validated:{row.get('scenario_id')}")
+    tamper = read_json(artifact_dir / "tamper-report.json")
+    trace_tamper = tamper.get("trace", {})
+    state_tamper = tamper.get("state", {})
+    if trace_tamper.get("accepted") is not False or trace_tamper.get("reason_code") != "trace_chain_hash_mismatch":
+        failures.append("s8_tampered_trace_not_rejected")
+    if trace_tamper.get("public_command_exit") == 0:
+        failures.append("s8_tampered_trace_public_validator_did_not_fail")
+    if trace_tamper.get("original_chain_hash") == trace_tamper.get("tampered_chain_hash"):
+        failures.append("s8_tampered_trace_chain_unchanged")
+    if state_tamper.get("accepted") is not False or state_tamper.get("reason_code") != "state_hash_mismatch":
+        failures.append("s8_tampered_state_not_rejected")
+    if state_tamper.get("public_command_exit") == 0:
+        failures.append("s8_tampered_state_public_validator_did_not_fail")
+    if set(state_tamper.get("original_hashes", [])) == set(state_tamper.get("tampered_hashes", [])):
+        failures.append("s8_tampered_state_hashes_unchanged")
+    replay = read_json(artifact_dir / "replay-report.json")
+    if replay.get("side_effects_allowed_default") is not False or replay.get("side_effects_executed") is not False:
+        failures.append("s8_replay_side_effect_suppression_missing")
+    public_replays = replay.get("public_replay_api_runs", []) or public_boundary.get("replay_api_runs", [])
+    if not public_replays:
+        failures.append("s8_public_replay_api_runs_missing")
+    for item in public_replays:
+        if item.get("before_status") != 200 or item.get("replay_status") != 200 or item.get("after_status") != 200:
+            failures.append(f"s8_public_replay_api_status_failed:{item.get('label')}:{item.get('run_id')}")
+        if item.get("adapter_executions_before") is None or item.get("adapter_executions_after") is None:
+            failures.append(f"s8_public_replay_counter_missing:{item.get('label')}:{item.get('run_id')}")
+        if item.get("adapter_executions_before") != item.get("adapter_executions_after"):
+            failures.append(f"s8_public_replay_counter_changed:{item.get('label')}:{item.get('run_id')}")
+    modes = replay.get("modes", {})
+    for mode in ["inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"]:
+        evidence = modes.get(mode, {})
+        if evidence.get("status") != "completed":
+            failures.append(f"s8_replay_mode_not_completed:{mode}")
+        if evidence.get("schema_version") != "splendor.acceptance.replay_mode.v1":
+            failures.append(f"s8_replay_mode_missing_public_schema:{mode}")
+        if evidence.get("public_command") != "splendorctl acceptance replay-mode":
+            failures.append(f"s8_replay_mode_missing_public_command:{mode}")
+        if evidence.get("side_effects_allowed") is not False or evidence.get("side_effects_executed") is not False:
+            failures.append(f"s8_replay_mode_side_effectful:{mode}")
+        for key in ["trace_digest", "state_digest", "audit_digest", "scenario_report_digest", "trace_chain_hash"]:
+            if not str(evidence.get(key, "")).startswith(("sha256:", "blake3:")):
+                failures.append(f"s8_replay_mode_missing_digest:{mode}:{key}")
+        if not evidence.get("matching_state_hashes"):
+            failures.append(f"s8_replay_mode_missing_state_hash_evidence:{mode}")
+        if evidence.get("trace_records", 0) <= 0:
+            failures.append(f"s8_replay_mode_empty_trace:{mode}")
+    if modes.get("policy_comparison", {}).get("side_effects_executed") is not False:
+        failures.append("s8_policy_comparison_executed_side_effect")
+    replay_mode_outputs = replay.get("public_replay_mode_outputs", []) or public_boundary.get("replay_mode_outputs", [])
+    output_modes = {item.get("mode") for item in replay_mode_outputs if item.get("command") == "acceptance replay-mode" and item.get("public_command_exit") == 0}
+    missing_output_modes = sorted({"inspect_only", "read_only_re_evaluation", "policy_comparison", "verifier_explanation"} - output_modes)
+    if missing_output_modes:
+        failures.append("s8_public_replay_mode_outputs_missing:" + ",".join(missing_output_modes))
+    unsafe = replay.get("unsafe_replay_negative", {})
+    if unsafe.get("status") != "rejected" or unsafe.get("side_effects_allowed_default") is not False:
+        failures.append("s8_unsafe_replay_not_rejected")
+    if replay.get("real_credential_negative", {}).get("status") != "rejected":
+        failures.append("s8_real_credential_replay_not_rejected")
+    if replay.get("real_credential_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_real_credential_public_validator_did_not_fail")
+    if replay.get("adapter_executions_before") != replay.get("adapter_executions_after"):
+        failures.append("s8_replay_changed_source_adapter_counts")
+    schema = read_json(artifact_dir / "schema-migration-report.json")
+    if schema.get("status") != "passed" or not schema.get("migrated"):
+        failures.append("s8_schema_migration_not_passed")
+    if not schema.get("public_command"):
+        failures.append("s8_schema_migration_missing_public_command")
+    if schema.get("unsupported_schema_negative", {}).get("status") != "rejected" or not schema.get("unsupported_schema_negative", {}).get("migration_guidance"):
+        failures.append("s8_unsupported_schema_not_rejected_with_guidance")
+    if schema.get("unsupported_schema_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_unsupported_schema_public_command_did_not_fail")
+    if not schema.get("generated_type_parity"):
+        failures.append("s8_generated_type_parity_missing")
+    if schema.get("generated_type_mismatch_negative", {}).get("compatibility_gate_failed") is not True:
+        failures.append("s8_schema_mismatch_negative_not_failed")
+    if schema.get("generated_type_mismatch_negative", {}).get("public_command_exit") == 0:
+        failures.append("s8_schema_mismatch_public_command_did_not_fail")
+    audit = read_json(artifact_dir / "audit-package.json")
+    machine = audit.get("machine_readable", {})
+    explanations = machine.get("verifier_explanations", [])
+    categories = {item.get("category") for item in explanations}
+    missing_categories = sorted(S8_REQUIRED_EXPLANATION_CATEGORIES - categories)
+    if missing_categories:
+        failures.append("s8_missing_verifier_explanation_categories:" + ",".join(missing_categories))
+    for item in explanations:
+        if not item.get("reason_codes"):
+            failures.append(f"s8_audit_explanation_missing_reason_codes:{item.get('category')}")
+    if audit.get("human_readable", {}).get("replay_side_effects_executed") is not False:
+        failures.append("s8_audit_human_summary_allows_replay_side_effects")
+    negatives = {item.get("case"): item for item in scenario.get("negative_cases", [])}
+    missing_negatives = sorted(S8_REQUIRED_NEGATIVES - set(negatives))
+    if missing_negatives:
+        failures.append("s8_missing_negative_cases:" + ",".join(missing_negatives))
+    for case in S8_REQUIRED_NEGATIVES & set(negatives):
+        if negatives.get(case, {}).get("passed") is not True:
+            failures.append(f"s8_negative_case_not_asserted:{case}")
+        if not negatives.get(case, {}).get("reason_codes"):
+            failures.append(f"s8_negative_missing_reason_codes:{case}")
+    anti = read_json(artifact_dir / "anti-drift-results.json")
+    for key in ["private_helper_only_e2e", "gateway_bypass", "replay_side_effects_allowed_default", "real_external_credentials_used", "static_s8_evidence", "unsupported_schema_silently_accepted", "audit_denial_reason_codes_omitted"]:
+        if anti.get(key) is not False:
+            failures.append(f"s8_anti_drift_expected_false:{key}")
+    if not scenario.get("run_ids") or not scenario.get("trace_event_ids") or not scenario.get("state_hashes") or not scenario.get("work_order_ids"):
+        failures.append("s8_missing_imported_identity_state_work_order_evidence")
+    return scenario, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -1787,61 +2033,69 @@ def main() -> int:
     s5_scenario, s5_failures = load_s5_scenario(report_dir)
     s6_scenario, s6_failures = load_s6_scenario(report_dir)
     s7_scenario, s7_failures = load_s7_scenario(report_dir)
+    s8_scenario, s8_failures = load_s8_scenario(report_dir)
     active_ids: set[str] = set()
-    if args.scenario == "UC-E2E-S1" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S1", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S1")
         if s1_scenario is None:
             blocking.append("missing_uc_e2e_s1_scenario_report")
         else:
             scenarios.append(s1_scenario)
             blocking.extend(s1_failures)
-    if args.scenario == "UC-E2E-S2" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S2", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S2")
         if s2_scenario is None:
             blocking.append("missing_uc_e2e_s2_scenario_report")
         else:
             scenarios.append(s2_scenario)
             blocking.extend(s2_failures)
-    if args.scenario == "UC-E2E-S3" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S3", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S3")
         if s3_scenario is None:
             blocking.append("missing_uc_e2e_s3_scenario_report")
         else:
             scenarios.append(s3_scenario)
             blocking.extend(s3_failures)
-    if args.scenario == "UC-E2E-S4" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S4", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S4")
         if s4_scenario is None:
             blocking.append("missing_uc_e2e_s4_scenario_report")
         else:
             scenarios.append(s4_scenario)
             blocking.extend(s4_failures)
-    if args.scenario == "UC-E2E-S5" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S5", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S5")
         if s5_scenario is None:
             blocking.append("missing_uc_e2e_s5_scenario_report")
         else:
             scenarios.append(s5_scenario)
             blocking.extend(s5_failures)
-    if args.scenario == "UC-E2E-S6" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S6", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S6")
         if s6_scenario is None:
             blocking.append("missing_uc_e2e_s6_scenario_report")
         else:
             scenarios.append(s6_scenario)
             blocking.extend(s6_failures)
-    if args.scenario == "UC-E2E-S7" or args.mode == "all":
+    if args.scenario in {"UC-E2E-S7", "UC-E2E-S8"} or args.mode == "all":
         active_ids.add("UC-E2E-S7")
         if s7_scenario is None:
             blocking.append("missing_uc_e2e_s7_scenario_report")
         else:
             scenarios.append(s7_scenario)
             blocking.extend(s7_failures)
+    if args.scenario == "UC-E2E-S8" or args.mode == "all":
+        active_ids.add("UC-E2E-S8")
+        if s8_scenario is None:
+            blocking.append("missing_uc_e2e_s8_scenario_report")
+        else:
+            scenarios.append(s8_scenario)
+            blocking.extend(s8_failures)
     blocked_ids = [sid for sid in FUTURE_SCENARIOS if sid not in active_ids]
 
     report = {
         "suite_id": "splendor-use-case-e2e-through-0.1",
-        "suite_version": "0.1-s7-data-isolation-artifacts",
+        "suite_version": "0.1-s8-replay-audit-compat",
         "source_revision": git_revision(root),
         "started_at": utc_now(),
         "completed_at": utc_now(),
@@ -1858,6 +2112,7 @@ def main() -> int:
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S5",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S6",
             "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S7",
+            "bash scripts/e2e/verify-use-case-acceptance.sh --scenario UC-E2E-S8",
             "docker compose -f tests/e2e/use-cases/docker-compose.acceptance.yml config",
         ],
         "api_contract_versions": {
@@ -1892,7 +2147,8 @@ def main() -> int:
             "UC-E2E-S5 validates governance through public manager and daemon HTTP APIs without enterprise UI or direct governance-plane runtime mutation.",
             "UC-E2E-S6 validates physical/edge orchestration through public resident-edge daemon HTTP APIs without low-level robot control.",
             "UC-E2E-S7 validates data-local artifact and cross-tenant isolation through public manager and resident daemon HTTP APIs without enterprise data workspace UI.",
-            "S8-S10 remain blocked until their own executable scenario evidence is present.",
+            "UC-E2E-S8 validates replay/audit/schema compatibility by importing prior scenario artifacts and rejects tampered, unsupported, unsafe, or reason-less evidence.",
+            "S9-S10 remain blocked until their own executable scenario evidence is present.",
             "No production OAuth/PKI, Kubernetes, SaaS UI, marketplace, real robot/cloud/database dependency, or low-level physical control is added.",
             "Daemon startup remains loopback-only; compose shares the daemon network namespace and does not publish daemon ports.",
         ],

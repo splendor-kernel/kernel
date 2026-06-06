@@ -15,6 +15,52 @@ use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+fn write_temp_json(value: serde_json::Value) -> NamedTempFile {
+    let file = NamedTempFile::new().expect("temp json");
+    std::fs::write(file.path(), serde_json::to_string(&value).expect("json")).expect("write json");
+    file
+}
+
+fn write_temp_text(value: &str) -> NamedTempFile {
+    let file = NamedTempFile::new().expect("temp text");
+    std::fs::write(file.path(), value).expect("write text");
+    file
+}
+
+fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn acceptance_fixture_files() -> (NamedTempFile, NamedTempFile, NamedTempFile, NamedTempFile) {
+    let state_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let trace = write_temp_text(
+        r#"{"event_type":"tick.started","sequence":1,"payload":{"side_effects_executed":false}}
+{"event_type":"state.committed","sequence":2,"state_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+"#,
+    );
+    let state = write_temp_json(serde_json::json!({
+        "state_node_id": "state_acceptance_1",
+        "state_hash": state_hash,
+    }));
+    let scenario = write_temp_json(serde_json::json!({
+        "state_hashes": [state_hash],
+        "negative_cases": [{
+            "case": "deny_url",
+            "reason_codes": ["tenant_action_denied"],
+            "trace_event_ids": ["trace_evt_acceptance_1"]
+        }],
+    }));
+    let audit = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.audit_package.v1",
+        "negative_cases": [{
+            "case": "deny_url",
+            "reason_codes": ["tenant_action_denied"],
+            "trace_event_ids": ["trace_evt_acceptance_1"]
+        }],
+    }));
+    (trace, state, scenario, audit)
+}
+
 fn valid_trace_records_for(run_id: &RunId) -> Vec<splendor_store::TraceRecord> {
     let store = splendor_store::InMemoryTraceStore::default();
     let timestamp = OffsetDateTime::now_utc();
@@ -677,6 +723,153 @@ fn parse_args_accepts_audit_export_filters() {
         }
         _ => panic!("unexpected command"),
     }
+}
+
+#[test]
+fn parse_args_accepts_acceptance_subcommands() {
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "validate-import".to_string(),
+        "--trace".to_string(),
+        "trace.jsonl".to_string(),
+        "--state".to_string(),
+        "state.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--source".to_string(),
+        "UC-E2E-S1".to_string(),
+        "--expected-trace-chain".to_string(),
+        "blake3:expected".to_string(),
+        "--expected-state-hash".to_string(),
+        "sha256:expected".to_string(),
+    ])
+    .expect("validate-import parses");
+    assert!(matches!(command, Command::AcceptanceValidateImport { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "compat".to_string(),
+        "--fixture".to_string(),
+        "fixture.json".to_string(),
+        "--target-schema".to_string(),
+        "splendor.0.1.stable.v1".to_string(),
+    ])
+    .expect("compat parses");
+    assert!(matches!(command, Command::AcceptanceCompat { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "audit-check".to_string(),
+        "--audit".to_string(),
+        "audit.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--case".to_string(),
+        "deny_url".to_string(),
+        "--category".to_string(),
+        "denial".to_string(),
+    ])
+    .expect("audit-check parses");
+    assert!(matches!(command, Command::AcceptanceAuditCheck { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "replay-mode".to_string(),
+        "--mode".to_string(),
+        "inspect_only".to_string(),
+        "--trace".to_string(),
+        "trace.jsonl".to_string(),
+        "--state".to_string(),
+        "state.json".to_string(),
+        "--audit".to_string(),
+        "audit.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--source".to_string(),
+        "UC-E2E-S4".to_string(),
+    ])
+    .expect("replay-mode parses");
+    assert!(matches!(command, Command::AcceptanceReplayMode { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "replay-credential-check".to_string(),
+        "--credential".to_string(),
+        "credential.json".to_string(),
+    ])
+    .expect("replay-credential-check parses");
+    assert!(matches!(
+        command,
+        Command::AcceptanceReplayCredentialCheck { .. }
+    ));
+}
+
+#[test]
+fn parse_args_rejects_acceptance_error_paths() {
+    let error = parse_args(args(&["acceptance"])).expect_err("missing acceptance subcommand");
+    assert!(error.contains("splendorctl acceptance"));
+
+    let error = parse_args(args(&["acceptance", "unknown"])).expect_err("unknown acceptance");
+    assert!(error.contains("Unknown acceptance subcommand"));
+
+    let error =
+        parse_args(args(&["acceptance", "validate-import", "--help"])).expect_err("validate help");
+    assert!(error.contains("acceptance validate-import"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "validate-import",
+        "--trace",
+        "trace.jsonl",
+        "--bad",
+    ]))
+    .expect_err("validate unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "compat"])).expect_err("compat missing fixture");
+    assert!(error.contains("Missing required --fixture"));
+
+    let error = parse_args(args(&["acceptance", "compat", "--help"])).expect_err("compat help");
+    assert!(error.contains("acceptance compat"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "audit-check",
+        "--audit",
+        "audit.json",
+        "--unknown",
+    ]))
+    .expect_err("audit unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "audit-check", "--help"])).expect_err("audit help");
+    assert!(error.contains("acceptance audit-check"));
+
+    let error =
+        parse_args(args(&["acceptance", "replay-mode", "--help"])).expect_err("replay-mode help");
+    assert!(error.contains("acceptance replay-mode"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "replay-mode",
+        "--mode",
+        "inspect_only",
+        "--unknown",
+    ]))
+    .expect_err("replay mode unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "replay-credential-check", "--help"]))
+        .expect_err("credential help");
+    assert!(error.contains("acceptance replay-credential-check"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "replay-credential-check",
+        "--unknown",
+    ]))
+    .expect_err("credential unknown arg");
+    assert!(error.contains("Unknown argument"));
 }
 
 #[test]
@@ -3989,12 +4182,372 @@ fn state_head_errors_without_state_commit() {
 }
 
 #[test]
+fn acceptance_validate_import_accepts_and_rejects_tampered_artifacts() {
+    let (trace, state, scenario, _audit) = acceptance_fixture_files();
+    let expected_state_hash =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect("valid import accepted");
+
+    let scenario_without_hashes = write_temp_json(serde_json::json!({
+        "state_hashes": [],
+    }));
+    acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario_without_hashes.path(),
+        "UC-E2E-S1",
+        None,
+        Some(expected_state_hash),
+    )
+    .expect("explicit expected state hash can prove imported state");
+
+    let empty_trace = write_temp_text("");
+    let error = acceptance_validate_import(
+        empty_trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect_err("empty trace rejected");
+    assert!(error.contains("empty_trace"));
+
+    let records = std::fs::read_to_string(trace.path())
+        .expect("trace")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+        .collect::<Vec<_>>();
+    let original_chain = acceptance_trace_chain_hash(&records).expect("trace chain");
+    let tampered_trace = write_temp_text(
+        r#"{"event_type":"tick.started","sequence":1,"payload":{"side_effects_executed":true}}
+"#,
+    );
+    let error = acceptance_validate_import(
+        tampered_trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        Some(&original_chain),
+        None,
+    )
+    .expect_err("tampered trace rejected");
+    assert!(error.contains("trace_chain_hash_mismatch"));
+
+    let error = acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    )
+    .expect_err("state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+
+    let mismatched_scenario = write_temp_json(serde_json::json!({
+        "state_hashes": ["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+    }));
+    let error = acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        mismatched_scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect_err("scenario/state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+}
+
+#[test]
+fn run_with_args_executes_acceptance_subcommands() {
+    let (trace, state, scenario, audit) = acceptance_fixture_files();
+    let fixture = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": "wo_acceptance",
+    }));
+    let credential = write_temp_json(serde_json::json!({
+        "credential_kind": "local_acceptance_fixture",
+        "secret_ref": "dev_fixture_only",
+    }));
+
+    run_with_args(args(&[
+        "acceptance",
+        "validate-import",
+        "--trace",
+        &trace.path().display().to_string(),
+        "--state",
+        &state.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--source",
+        "UC-E2E-S1",
+    ]))
+    .expect("validate-import command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "compat",
+        "--fixture",
+        &fixture.path().display().to_string(),
+        "--target-schema",
+        "splendor.0.1.stable.v1",
+    ]))
+    .expect("compat command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "audit-check",
+        "--audit",
+        &audit.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--case",
+        "deny_url",
+        "--category",
+        "denial",
+    ]))
+    .expect("audit-check command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "replay-mode",
+        "--mode",
+        "inspect_only",
+        "--trace",
+        &trace.path().display().to_string(),
+        "--state",
+        &state.path().display().to_string(),
+        "--audit",
+        &audit.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--source",
+        "UC-E2E-S8",
+    ]))
+    .expect("replay-mode command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "replay-credential-check",
+        "--credential",
+        &credential.path().display().to_string(),
+    ]))
+    .expect("replay credential command executes");
+}
+
+#[test]
+fn acceptance_compat_accepts_supported_and_rejects_bad_fixtures() {
+    let supported = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": "wo_acceptance",
+    }));
+    acceptance_compat(&[supported.path().to_path_buf()], "splendor.0.1.stable.v1")
+        .expect("supported fixture migrates");
+    let error = acceptance_compat(&[supported.path().to_path_buf()], "splendor.future.v2")
+        .expect_err("unsupported target rejected");
+    assert!(error.contains("unsupported_target_schema"));
+
+    let unsupported = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.dev.0.00.unsupported",
+    }));
+    let error = acceptance_compat(
+        &[unsupported.path().to_path_buf()],
+        "splendor.0.1.stable.v1",
+    )
+    .expect_err("unsupported schema rejected");
+    assert!(error.contains("unsupported_schema_version"));
+
+    let mismatch = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.generated.types.mismatch.v1",
+    }));
+    let error = acceptance_compat(&[mismatch.path().to_path_buf()], "splendor.0.1.stable.v1")
+        .expect_err("generated mismatch rejected");
+    assert!(error.contains("generated_schema_mismatch"));
+}
+
+#[test]
+fn acceptance_audit_check_requires_explicit_reason_codes() {
+    let (_trace, _state, scenario, audit) = acceptance_fixture_files();
+    acceptance_audit_check(audit.path(), scenario.path(), "deny_url", "denial")
+        .expect("audit reason codes accepted");
+
+    let scalar_audit = write_temp_json(serde_json::json!({
+        "denials": [{
+            "case": "scalar_reason",
+            "reason_code": "adapter_denied",
+            "reasons": ["quota_exceeded"],
+            "trace_event_id": "trace_evt_scalar"
+        }],
+    }));
+    acceptance_audit_check(
+        scalar_audit.path(),
+        scenario.path(),
+        "scalar_reason",
+        "denial",
+    )
+    .expect("scalar reason and trace id accepted");
+
+    let empty_audit = write_temp_json(serde_json::json!({
+        "negative_cases": [{"case": "missing_reason"}],
+    }));
+    let empty_scenario = write_temp_json(serde_json::json!({
+        "negative_cases": [{"case": "missing_reason"}],
+    }));
+    let error = acceptance_audit_check(
+        empty_audit.path(),
+        empty_scenario.path(),
+        "missing_reason",
+        "denial",
+    )
+    .expect_err("missing reason rejected");
+    assert!(error.contains("missing_denial_reason_codes"));
+}
+
+#[test]
+fn acceptance_json_collectors_cover_nested_arrays_and_parse_failures() {
+    let state_hash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let value = serde_json::json!([
+        {"state_hash": state_hash, "state_node_id": "state_nested"},
+        {"schema_version": "splendor.message.task_request.v1"}
+    ]);
+    assert!(acceptance_state_hashes(&value).contains(state_hash));
+    assert!(acceptance_state_node_ids(&value).contains("state_nested"));
+    assert!(acceptance_schema_versions(&value).contains("splendor.message.task_request.v1"));
+
+    let mut values = BTreeSet::new();
+    collect_named_string_values(
+        &serde_json::json!([
+            {"reason": "nested_reason"},
+            {"reasons": ["array_reason", ""]},
+            {"reason_codes": 7}
+        ]),
+        &["reason", "reasons", "reason_codes"],
+        &mut values,
+    );
+    assert!(values.contains("nested_reason"));
+    assert!(values.contains("array_reason"));
+
+    let malformed = write_temp_text("{");
+    let error = read_json_value(malformed.path()).expect_err("malformed json rejected");
+    assert!(error.contains("Malformed JSON"));
+
+    let missing = malformed.path().with_file_name("missing-acceptance.json");
+    let error = read_json_value(&missing).expect_err("missing json rejected");
+    assert!(error.contains("Failed to read"));
+}
+
+#[test]
+fn acceptance_replay_mode_covers_supported_modes_and_fail_closed_paths() {
+    let (trace, state, scenario, audit) = acceptance_fixture_files();
+    for mode in [
+        "inspect_only",
+        "read_only_re_evaluation",
+        "policy_comparison",
+        "verifier_explanation",
+    ] {
+        acceptance_replay_mode(
+            mode,
+            trace.path(),
+            state.path(),
+            audit.path(),
+            scenario.path(),
+            "UC-E2E-S8",
+        )
+        .expect("replay mode accepted");
+    }
+
+    let error = acceptance_replay_mode(
+        "side_effectful_live_replay",
+        trace.path(),
+        state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("unsupported replay mode rejected");
+    assert!(error.contains("unsupported_mode"));
+
+    let empty_trace = write_temp_text("");
+    let error = acceptance_replay_mode(
+        "inspect_only",
+        empty_trace.path(),
+        state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("empty trace rejected");
+    assert!(error.contains("empty_trace"));
+
+    let mismatched_state = write_temp_json(serde_json::json!({
+        "state_node_id": "state_other",
+        "state_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }));
+    let error = acceptance_replay_mode(
+        "inspect_only",
+        trace.path(),
+        mismatched_state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+
+    let audit_without_reason = write_temp_json(serde_json::json!({"negative_cases": []}));
+    let error = acceptance_replay_mode(
+        "verifier_explanation",
+        trace.path(),
+        state.path(),
+        audit_without_reason.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("verifier explanation requires reasons");
+    assert!(error.contains("missing_verifier_reason_codes"));
+}
+
+#[test]
+fn acceptance_replay_credential_check_rejects_external_credentials() {
+    let allowed = write_temp_json(serde_json::json!({
+        "credential_kind": "local_acceptance_fixture",
+        "secret_ref": "dev_fixture_only",
+    }));
+    acceptance_replay_credential_check(allowed.path()).expect("dev fixture accepted");
+
+    let production = write_temp_json(serde_json::json!({
+        "credential_kind": "production_external_secret",
+        "secret_ref": "external_secret_material",
+    }));
+    let error = acceptance_replay_credential_check(production.path())
+        .expect_err("production credential rejected");
+    assert!(error.contains("real_external_credentials_forbidden"));
+}
+
+#[test]
 fn usage_mentions_trace_export() {
     let text = usage();
     assert!(text.contains("trace export"));
     assert!(text.contains("state head"));
     assert!(text.contains("replay"));
     assert!(text.contains("audit export"));
+    assert!(text.contains("acceptance validate-import"));
+    assert!(text.contains("acceptance compat"));
+    assert!(text.contains("acceptance audit-check"));
+    assert!(text.contains("acceptance replay-mode"));
+    assert!(text.contains("acceptance replay-credential-check"));
     assert!(text.contains("run"));
     assert!(text.contains("--version"));
 }
