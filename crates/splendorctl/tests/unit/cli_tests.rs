@@ -5,14 +5,61 @@ use splendor_types::{
     CircuitBreakerId, CircuitBreakerState, ContentHash, EscalationContext, EscalationDecision,
     EscalationId, EscalationScope, EscalationTrigger, Feedback, GovernanceIssuer,
     GovernanceObjectRef, GovernanceScope, GovernanceState, GovernanceTraceLink,
-    GovernanceTransition, GovernanceTransitionRejection, InterventionId, KillSwitchId, MessageId,
-    MessageTraceContext, Percept, PerceptProvenance, Reward, RunId, SideEffectClass, SnapshotId,
-    StateHandoffTraceContext, StateReferenceMode, TenantId, TickId, TraceEvent, TraceEventId,
-    TraceEventKind, TraceId, TraceIdentityContext, VerificationResult,
+    GovernanceTransition, GovernanceTransitionRejection, InterventionId, KillSwitchId,
+    LocalDelegationTraceContext, MessageId, MessageTraceContext, Percept, PerceptProvenance,
+    Reward, RunId, SideEffectClass, SnapshotId, StateHandoffTraceContext, StateReferenceMode,
+    TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext,
+    VerificationResult,
 };
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+fn write_temp_json(value: serde_json::Value) -> NamedTempFile {
+    let file = NamedTempFile::new().expect("temp json");
+    std::fs::write(file.path(), serde_json::to_string(&value).expect("json")).expect("write json");
+    file
+}
+
+fn write_temp_text(value: &str) -> NamedTempFile {
+    let file = NamedTempFile::new().expect("temp text");
+    std::fs::write(file.path(), value).expect("write text");
+    file
+}
+
+fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn acceptance_fixture_files() -> (NamedTempFile, NamedTempFile, NamedTempFile, NamedTempFile) {
+    let state_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let trace = write_temp_text(
+        r#"{"event_type":"tick.started","sequence":1,"payload":{"side_effects_executed":false}}
+{"event_type":"state.committed","sequence":2,"state_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+"#,
+    );
+    let state = write_temp_json(serde_json::json!({
+        "state_node_id": "state_acceptance_1",
+        "state_hash": state_hash,
+    }));
+    let scenario = write_temp_json(serde_json::json!({
+        "state_hashes": [state_hash],
+        "negative_cases": [{
+            "case": "deny_url",
+            "reason_codes": ["tenant_action_denied"],
+            "trace_event_ids": ["trace_evt_acceptance_1"]
+        }],
+    }));
+    let audit = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.audit_package.v1",
+        "negative_cases": [{
+            "case": "deny_url",
+            "reason_codes": ["tenant_action_denied"],
+            "trace_event_ids": ["trace_evt_acceptance_1"]
+        }],
+    }));
+    (trace, state, scenario, audit)
+}
 
 fn valid_trace_records_for(run_id: &RunId) -> Vec<splendor_store::TraceRecord> {
     let store = splendor_store::InMemoryTraceStore::default();
@@ -119,6 +166,252 @@ fn fixed_message_id(value: u128) -> MessageId {
 
 fn fixed_action_id(value: u128) -> ActionId {
     Uuid::from_u128(value).into()
+}
+
+#[test]
+fn daemon_request_refuses_anonymous_mutating_fallback() {
+    let err = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/runs".to_string(),
+    ])
+    .expect_err("token is required");
+    assert!(err.contains("anonymous daemon fallback is not allowed"));
+}
+
+#[test]
+fn daemon_request_parses_local_get_with_credential_header() {
+    let command = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/health".to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+        "--caller-credential".to_string(),
+        "cred.json".to_string(),
+    ])
+    .expect("daemon command parses");
+    match command {
+        Command::DaemonRequest {
+            method,
+            url,
+            credential_path,
+            token,
+            ..
+        } => {
+            assert_eq!(method, "GET");
+            assert_eq!(url, "http://127.0.0.1:8077/health");
+            assert_eq!(credential_path.unwrap(), PathBuf::from("cred.json"));
+            assert_eq!(token, "token");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_request_rejects_missing_or_null_mutating_authority_body() {
+    for body in [
+        r#"{"audit_attribution":{"credential_id":"cred"}}"#,
+        r#"{"credential":{"credential_id":"cred"}}"#,
+        r#"{"credential":null,"audit_attribution":{"credential_id":"cred"}}"#,
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":null}"#,
+    ] {
+        let file = NamedTempFile::new().expect("body file");
+        std::fs::write(file.path(), body).expect("write body");
+        let err = daemon_request(
+            "POST",
+            "http://127.0.0.1:8077/runs/test/replay",
+            Some(file.path()),
+            None,
+            "token",
+        )
+        .expect_err("null or missing authority rejected before send");
+        assert!(err.contains("credential and audit_attribution"));
+    }
+}
+
+fn spawn_local_daemon_response(
+    status: u16,
+    body: &'static str,
+) -> (String, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept daemon request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write daemon response");
+        String::from_utf8(request).expect("request utf8")
+    });
+    (format!("http://{}:{}/runs", addr.ip(), addr.port()), handle)
+}
+
+#[test]
+fn daemon_request_sends_authorized_local_request_with_sanitized_credential() {
+    let body = NamedTempFile::new().expect("body");
+    std::fs::write(
+        body.path(),
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":{"caller":"cli-test"}}"#,
+    )
+    .expect("write body");
+    let credential = NamedTempFile::new().expect("credential");
+    std::fs::write(credential.path(), "caller\ncredential\r\n").expect("write credential");
+    let (url, handle) = spawn_local_daemon_response(200, r#"{"ok":true}"#);
+
+    daemon_request(
+        "POST",
+        &url,
+        Some(body.path()),
+        Some(credential.path()),
+        "token",
+    )
+    .expect("authorized local request succeeds");
+
+    let request = handle.join().expect("daemon request captured");
+    assert!(request.starts_with("POST /runs HTTP/1.1"));
+    assert!(request.contains("Authorization: Bearer token"));
+    assert!(request.contains("X-Splendor-Caller-Credential: callercredential"));
+    assert!(request.contains("Content-Type: application/json"));
+    assert!(request.contains("audit_attribution"));
+}
+
+#[test]
+fn local_daemon_http_errors_and_malformed_responses_are_explicit() {
+    let (url, handle) = spawn_local_daemon_response(403, r#"{"error":"denied"}"#);
+    let parsed = parse_local_http_url(&url).expect("parse local url");
+    let err = send_local_http(
+        &parsed.host,
+        parsed.port,
+        "GET",
+        &parsed.path,
+        "token",
+        None,
+        None,
+    )
+    .expect_err("http errors are surfaced");
+    assert!(err.contains("HTTP 403"));
+    let _ = handle.join().expect("daemon request captured");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind malformed daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept malformed request");
+        stream.write_all(b"not-http").expect("write malformed");
+    });
+    let err = send_local_http(
+        &addr.ip().to_string(),
+        addr.port(),
+        "GET",
+        "/health",
+        "token",
+        None,
+        None,
+    )
+    .expect_err("malformed response rejected");
+    assert!(
+        err.contains("malformed HTTP response") || err.contains("Failed to read daemon response"),
+        "unexpected malformed response error: {err}"
+    );
+    handle.join().expect("malformed daemon joined");
+}
+
+#[test]
+fn daemon_url_refuses_non_local_hosts() {
+    let err = parse_local_http_url("http://0.0.0.0:8077/health").expect_err("non-local refused");
+    assert!(err.contains("refuses non-local"));
+}
+
+#[test]
+fn parse_args_rejects_daemon_and_work_order_error_paths() {
+    let daemon_missing = parse_args(vec!["daemon".to_string()]).expect_err("daemon usage");
+    assert!(daemon_missing.contains("splendorctl"));
+
+    let daemon_unknown = parse_args(vec!["daemon".to_string(), "unknown".to_string()])
+        .expect_err("unknown daemon subcommand");
+    assert!(daemon_unknown.contains("Unknown daemon subcommand"));
+
+    let daemon_help = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("daemon help");
+    assert!(daemon_help.contains("splendorctl"));
+
+    let blank_token = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/health".to_string(),
+        "--token".to_string(),
+        " ".to_string(),
+    ])
+    .expect_err("blank token rejected");
+    assert!(blank_token.contains("anonymous daemon fallback"));
+
+    let mutating_without_body = parse_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        "http://127.0.0.1:8077/runs".to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+    ])
+    .expect_err("mutating request requires body");
+    assert!(mutating_without_body.contains("credential and audit attribution"));
+
+    let work_order_missing =
+        parse_args(vec!["work-order".to_string()]).expect_err("work order usage");
+    assert!(work_order_missing.contains("splendorctl"));
+
+    let work_order_unknown = parse_args(vec!["work-order".to_string(), "unknown".to_string()])
+        .expect_err("unknown work-order subcommand");
+    assert!(work_order_unknown.contains("Unknown work-order subcommand"));
+
+    let work_order_help = parse_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--help".to_string(),
+    ])
+    .expect_err("work order help");
+    assert!(work_order_help.contains("splendorctl"));
 }
 
 fn fixed_approval_id(value: u128) -> ApprovalId {
@@ -430,6 +723,153 @@ fn parse_args_accepts_audit_export_filters() {
         }
         _ => panic!("unexpected command"),
     }
+}
+
+#[test]
+fn parse_args_accepts_acceptance_subcommands() {
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "validate-import".to_string(),
+        "--trace".to_string(),
+        "trace.jsonl".to_string(),
+        "--state".to_string(),
+        "state.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--source".to_string(),
+        "UC-E2E-S1".to_string(),
+        "--expected-trace-chain".to_string(),
+        "blake3:expected".to_string(),
+        "--expected-state-hash".to_string(),
+        "sha256:expected".to_string(),
+    ])
+    .expect("validate-import parses");
+    assert!(matches!(command, Command::AcceptanceValidateImport { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "compat".to_string(),
+        "--fixture".to_string(),
+        "fixture.json".to_string(),
+        "--target-schema".to_string(),
+        "splendor.0.1.stable.v1".to_string(),
+    ])
+    .expect("compat parses");
+    assert!(matches!(command, Command::AcceptanceCompat { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "audit-check".to_string(),
+        "--audit".to_string(),
+        "audit.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--case".to_string(),
+        "deny_url".to_string(),
+        "--category".to_string(),
+        "denial".to_string(),
+    ])
+    .expect("audit-check parses");
+    assert!(matches!(command, Command::AcceptanceAuditCheck { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "replay-mode".to_string(),
+        "--mode".to_string(),
+        "inspect_only".to_string(),
+        "--trace".to_string(),
+        "trace.jsonl".to_string(),
+        "--state".to_string(),
+        "state.json".to_string(),
+        "--audit".to_string(),
+        "audit.json".to_string(),
+        "--scenario-report".to_string(),
+        "scenario.json".to_string(),
+        "--source".to_string(),
+        "UC-E2E-S4".to_string(),
+    ])
+    .expect("replay-mode parses");
+    assert!(matches!(command, Command::AcceptanceReplayMode { .. }));
+
+    let command = parse_args(vec![
+        "acceptance".to_string(),
+        "replay-credential-check".to_string(),
+        "--credential".to_string(),
+        "credential.json".to_string(),
+    ])
+    .expect("replay-credential-check parses");
+    assert!(matches!(
+        command,
+        Command::AcceptanceReplayCredentialCheck { .. }
+    ));
+}
+
+#[test]
+fn parse_args_rejects_acceptance_error_paths() {
+    let error = parse_args(args(&["acceptance"])).expect_err("missing acceptance subcommand");
+    assert!(error.contains("splendorctl acceptance"));
+
+    let error = parse_args(args(&["acceptance", "unknown"])).expect_err("unknown acceptance");
+    assert!(error.contains("Unknown acceptance subcommand"));
+
+    let error =
+        parse_args(args(&["acceptance", "validate-import", "--help"])).expect_err("validate help");
+    assert!(error.contains("acceptance validate-import"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "validate-import",
+        "--trace",
+        "trace.jsonl",
+        "--bad",
+    ]))
+    .expect_err("validate unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "compat"])).expect_err("compat missing fixture");
+    assert!(error.contains("Missing required --fixture"));
+
+    let error = parse_args(args(&["acceptance", "compat", "--help"])).expect_err("compat help");
+    assert!(error.contains("acceptance compat"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "audit-check",
+        "--audit",
+        "audit.json",
+        "--unknown",
+    ]))
+    .expect_err("audit unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "audit-check", "--help"])).expect_err("audit help");
+    assert!(error.contains("acceptance audit-check"));
+
+    let error =
+        parse_args(args(&["acceptance", "replay-mode", "--help"])).expect_err("replay-mode help");
+    assert!(error.contains("acceptance replay-mode"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "replay-mode",
+        "--mode",
+        "inspect_only",
+        "--unknown",
+    ]))
+    .expect_err("replay mode unknown arg");
+    assert!(error.contains("Unknown argument"));
+
+    let error = parse_args(args(&["acceptance", "replay-credential-check", "--help"]))
+        .expect_err("credential help");
+    assert!(error.contains("acceptance replay-credential-check"));
+
+    let error = parse_args(args(&[
+        "acceptance",
+        "replay-credential-check",
+        "--unknown",
+    ]))
+    .expect_err("credential unknown arg");
+    assert!(error.contains("Unknown argument"));
 }
 
 #[test]
@@ -1078,6 +1518,66 @@ fn replay_reconstructs_local_multi_agent_harness_deterministically() {
         + usize::from(lifecycles.contains(&"expired"))
         + isolation_denials.len();
     assert!(denial_failure_scenarios >= 3);
+}
+
+fn test_delegation_context(parent_run_id: RunId) -> LocalDelegationTraceContext {
+    LocalDelegationTraceContext {
+        parent_run_id: parent_run_id.clone(),
+        child_run_id: fixed_run_id(0x111),
+        parent_trace_id: Some(TraceId::from_run_sequence(&parent_run_id, 7)),
+        request_message_id: Some(fixed_message_id(0x112)),
+        response_message_id: Some(fixed_message_id(0x113)),
+        source_agent_id: fixed_agent_id(0x114),
+        target_agent_id: fixed_agent_id(0x115),
+        objective: "scoped specialist work".to_string(),
+    }
+}
+
+#[test]
+fn replay_parent_child_run_covers_local_delegation_lifecycle_variants() {
+    let run_id = fixed_run_id(0x110);
+    let delegation = test_delegation_context(run_id.clone());
+    let timestamp = OffsetDateTime::UNIX_EPOCH;
+    let failure = splendor_types::TaskFailure {
+        code: "child_failed".to_string(),
+        reason: "specialist denied scoped work".to_string(),
+        retryable: false,
+        trace_id: Some(TraceId::from_run_sequence(&run_id, 12)),
+    };
+
+    let variants = vec![
+        TraceEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunStarted {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunCompleted {
+            delegation: delegation.clone(),
+        },
+        TraceEventKind::ChildRunFailed {
+            delegation: delegation.clone(),
+            failure,
+        },
+        TraceEventKind::DelegationRejected {
+            delegation: delegation.clone(),
+            reason: "target_agent_tenant_mismatch".to_string(),
+        },
+    ];
+
+    for (sequence, kind) in variants.into_iter().enumerate() {
+        let event = TraceEvent::new(run_id.clone(), sequence as u64, timestamp, kind);
+        let replay = replay_parent_child_run(&event)
+            .expect("delegation replay parses")
+            .expect("delegation replay event");
+        assert_eq!(replay.parent_run_id, run_id);
+        assert_eq!(replay.child_run_id, delegation.child_run_id);
+        assert_eq!(replay.parent_agent_id, delegation.source_agent_id);
+        assert_eq!(replay.child_agent_id, delegation.target_agent_id);
+        assert_eq!(replay.causal_parent, delegation.parent_trace_id);
+        assert_eq!(replay.source_message_id, delegation.request_message_id);
+        assert!(!replay.side_effects_replayed);
+    }
 }
 
 #[test]
@@ -2822,6 +3322,162 @@ fn replay_rejects_message_context_run_mismatch() {
 }
 
 #[test]
+fn audit_filter_helpers_cover_governance_and_artifact_branches() {
+    let run_id = fixed_run_id(0x180);
+    let tenant_id: TenantId = Uuid::from_u128(0x181).into();
+    let agent_id = fixed_agent_id(0x182);
+    let action_id = fixed_action_id(0x183);
+    let timestamp = OffsetDateTime::UNIX_EPOCH;
+    let approval = ApprovalTraceContext {
+        approval_id: ApprovalId::new(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: "artifact.publish".to_string(),
+        adapter: Some("artifact-store".to_string()),
+        decision: Some(ApprovalDecision::Denied),
+        reason: Some("policy".to_string()),
+        policy_id: Some("approval-policy".to_string()),
+        risk_level: Some("high".to_string()),
+        issued_at: Some(timestamp),
+        expires_at: Some(timestamp + time::Duration::hours(1)),
+        revoked: false,
+    };
+    let denied = TraceEvent::new(
+        run_id.clone(),
+        1,
+        timestamp,
+        TraceEventKind::ApprovalDenied {
+            approval: approval.clone(),
+            reason: "operator_denied".to_string(),
+        },
+    );
+    assert!(event_has_tenant(&denied, &tenant_id.to_string()));
+    assert!(event_has_agent(&denied, &agent_id.to_string()));
+    assert!(event_has_action(&denied, &action_id.to_string()));
+    assert!(event_has_action(&denied, "artifact.publish"));
+    assert!(event_has_adapter(
+        &denied,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let escalation = EscalationContext {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: Some(action_id.clone()),
+        action_name: Some("artifact.publish".to_string()),
+        adapter: Some("artifact-store".to_string()),
+        trigger: EscalationTrigger::RepeatedAdapterFailure,
+        scope: EscalationScope::Action,
+        decision: EscalationDecision::NeedsIntervention,
+        reason: "failure threshold".to_string(),
+        observed_count: 3,
+        threshold: 3,
+        evidence: serde_json::json!({"adapter":"artifact-store"}),
+        decided_at: timestamp,
+    };
+    let escalation_event = TraceEvent::new(
+        run_id.clone(),
+        2,
+        timestamp,
+        TraceEventKind::EscalationTriggered { escalation },
+    );
+    assert!(event_has_action(&escalation_event, &action_id.to_string()));
+    assert!(event_has_adapter(
+        &escalation_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let breaker = splendor_types::CircuitBreakerTraceContext::try_new(
+        CircuitBreakerId::try_new("cb_adapter").expect("breaker"),
+        splendor_types::CircuitBreakerScope::Adapter("artifact-store".to_string()),
+        CircuitBreakerState::Tripped,
+        "adapter outage",
+        "test",
+        timestamp,
+    )
+    .expect("breaker context");
+    let breaker_event = TraceEvent::new(
+        run_id.clone(),
+        3,
+        timestamp,
+        TraceEventKind::CircuitBreakerTripped { breaker },
+    );
+    assert!(event_has_adapter(
+        &breaker_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let result = VerificationResult {
+        allowed: false,
+        reasons: vec!["adapter circuit breaker".to_string()],
+        artifacts: serde_json::json!({
+            "context": {
+                "tenant_id": tenant_id.to_string(),
+                "agent_id": agent_id.to_string(),
+                "action_id": action_id.to_string(),
+                "action": "artifact.publish",
+                "adapter": "artifact-store"
+            },
+            "circuit_breaker": {
+                "scope": "adapter",
+                "scope_value": "artifact-store"
+            }
+        }),
+    };
+    let action = Action {
+        name: "artifact.publish".to_string(),
+        params: serde_json::json!({}),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let result_event = TraceEvent::new(
+        run_id.clone(),
+        4,
+        timestamp,
+        TraceEventKind::ActionFailed {
+            action,
+            error: "adapter failed".to_string(),
+            result,
+        },
+    );
+    assert!(event_has_tenant(&result_event, &tenant_id.to_string()));
+    assert!(event_has_agent(&result_event, &agent_id.to_string()));
+    assert!(event_has_action(&result_event, &action_id.to_string()));
+    assert!(event_has_action(&result_event, "artifact.publish"));
+    assert!(event_has_adapter(
+        &result_event,
+        "artifact-store",
+        &BTreeMap::new()
+    ));
+
+    let rejected = TraceEvent::new(
+        run_id,
+        5,
+        timestamp,
+        TraceEventKind::WorkOrderRejected {
+            work_order_id: Some(
+                splendor_types::WorkOrderId::try_new("wo_rejected").expect("work order id"),
+            ),
+            tenant_id: Some(tenant_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            run_id: None,
+            reason: "bad_signature".to_string(),
+        },
+    );
+    assert!(event_has_tenant(&rejected, &tenant_id.to_string()));
+    assert!(event_has_agent(&rejected, &agent_id.to_string()));
+}
+
+#[test]
 fn replay_rejects_child_run_parent_mismatch() {
     let state_temp = NamedTempFile::new().expect("state db");
     let state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
@@ -3526,12 +4182,372 @@ fn state_head_errors_without_state_commit() {
 }
 
 #[test]
+fn acceptance_validate_import_accepts_and_rejects_tampered_artifacts() {
+    let (trace, state, scenario, _audit) = acceptance_fixture_files();
+    let expected_state_hash =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect("valid import accepted");
+
+    let scenario_without_hashes = write_temp_json(serde_json::json!({
+        "state_hashes": [],
+    }));
+    acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario_without_hashes.path(),
+        "UC-E2E-S1",
+        None,
+        Some(expected_state_hash),
+    )
+    .expect("explicit expected state hash can prove imported state");
+
+    let empty_trace = write_temp_text("");
+    let error = acceptance_validate_import(
+        empty_trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect_err("empty trace rejected");
+    assert!(error.contains("empty_trace"));
+
+    let records = std::fs::read_to_string(trace.path())
+        .expect("trace")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+        .collect::<Vec<_>>();
+    let original_chain = acceptance_trace_chain_hash(&records).expect("trace chain");
+    let tampered_trace = write_temp_text(
+        r#"{"event_type":"tick.started","sequence":1,"payload":{"side_effects_executed":true}}
+"#,
+    );
+    let error = acceptance_validate_import(
+        tampered_trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        Some(&original_chain),
+        None,
+    )
+    .expect_err("tampered trace rejected");
+    assert!(error.contains("trace_chain_hash_mismatch"));
+
+    let error = acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        scenario.path(),
+        "UC-E2E-S1",
+        None,
+        Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    )
+    .expect_err("state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+
+    let mismatched_scenario = write_temp_json(serde_json::json!({
+        "state_hashes": ["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+    }));
+    let error = acceptance_validate_import(
+        trace.path(),
+        state.path(),
+        mismatched_scenario.path(),
+        "UC-E2E-S1",
+        None,
+        None,
+    )
+    .expect_err("scenario/state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+}
+
+#[test]
+fn run_with_args_executes_acceptance_subcommands() {
+    let (trace, state, scenario, audit) = acceptance_fixture_files();
+    let fixture = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": "wo_acceptance",
+    }));
+    let credential = write_temp_json(serde_json::json!({
+        "credential_kind": "local_acceptance_fixture",
+        "secret_ref": "dev_fixture_only",
+    }));
+
+    run_with_args(args(&[
+        "acceptance",
+        "validate-import",
+        "--trace",
+        &trace.path().display().to_string(),
+        "--state",
+        &state.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--source",
+        "UC-E2E-S1",
+    ]))
+    .expect("validate-import command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "compat",
+        "--fixture",
+        &fixture.path().display().to_string(),
+        "--target-schema",
+        "splendor.0.1.stable.v1",
+    ]))
+    .expect("compat command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "audit-check",
+        "--audit",
+        &audit.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--case",
+        "deny_url",
+        "--category",
+        "denial",
+    ]))
+    .expect("audit-check command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "replay-mode",
+        "--mode",
+        "inspect_only",
+        "--trace",
+        &trace.path().display().to_string(),
+        "--state",
+        &state.path().display().to_string(),
+        "--audit",
+        &audit.path().display().to_string(),
+        "--scenario-report",
+        &scenario.path().display().to_string(),
+        "--source",
+        "UC-E2E-S8",
+    ]))
+    .expect("replay-mode command executes");
+
+    run_with_args(args(&[
+        "acceptance",
+        "replay-credential-check",
+        "--credential",
+        &credential.path().display().to_string(),
+    ]))
+    .expect("replay credential command executes");
+}
+
+#[test]
+fn acceptance_compat_accepts_supported_and_rejects_bad_fixtures() {
+    let supported = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": "wo_acceptance",
+    }));
+    acceptance_compat(&[supported.path().to_path_buf()], "splendor.0.1.stable.v1")
+        .expect("supported fixture migrates");
+    let error = acceptance_compat(&[supported.path().to_path_buf()], "splendor.future.v2")
+        .expect_err("unsupported target rejected");
+    assert!(error.contains("unsupported_target_schema"));
+
+    let unsupported = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.dev.0.00.unsupported",
+    }));
+    let error = acceptance_compat(
+        &[unsupported.path().to_path_buf()],
+        "splendor.0.1.stable.v1",
+    )
+    .expect_err("unsupported schema rejected");
+    assert!(error.contains("unsupported_schema_version"));
+
+    let mismatch = write_temp_json(serde_json::json!({
+        "schema_version": "splendor.generated.types.mismatch.v1",
+    }));
+    let error = acceptance_compat(&[mismatch.path().to_path_buf()], "splendor.0.1.stable.v1")
+        .expect_err("generated mismatch rejected");
+    assert!(error.contains("generated_schema_mismatch"));
+}
+
+#[test]
+fn acceptance_audit_check_requires_explicit_reason_codes() {
+    let (_trace, _state, scenario, audit) = acceptance_fixture_files();
+    acceptance_audit_check(audit.path(), scenario.path(), "deny_url", "denial")
+        .expect("audit reason codes accepted");
+
+    let scalar_audit = write_temp_json(serde_json::json!({
+        "denials": [{
+            "case": "scalar_reason",
+            "reason_code": "adapter_denied",
+            "reasons": ["quota_exceeded"],
+            "trace_event_id": "trace_evt_scalar"
+        }],
+    }));
+    acceptance_audit_check(
+        scalar_audit.path(),
+        scenario.path(),
+        "scalar_reason",
+        "denial",
+    )
+    .expect("scalar reason and trace id accepted");
+
+    let empty_audit = write_temp_json(serde_json::json!({
+        "negative_cases": [{"case": "missing_reason"}],
+    }));
+    let empty_scenario = write_temp_json(serde_json::json!({
+        "negative_cases": [{"case": "missing_reason"}],
+    }));
+    let error = acceptance_audit_check(
+        empty_audit.path(),
+        empty_scenario.path(),
+        "missing_reason",
+        "denial",
+    )
+    .expect_err("missing reason rejected");
+    assert!(error.contains("missing_denial_reason_codes"));
+}
+
+#[test]
+fn acceptance_json_collectors_cover_nested_arrays_and_parse_failures() {
+    let state_hash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let value = serde_json::json!([
+        {"state_hash": state_hash, "state_node_id": "state_nested"},
+        {"schema_version": "splendor.message.task_request.v1"}
+    ]);
+    assert!(acceptance_state_hashes(&value).contains(state_hash));
+    assert!(acceptance_state_node_ids(&value).contains("state_nested"));
+    assert!(acceptance_schema_versions(&value).contains("splendor.message.task_request.v1"));
+
+    let mut values = BTreeSet::new();
+    collect_named_string_values(
+        &serde_json::json!([
+            {"reason": "nested_reason"},
+            {"reasons": ["array_reason", ""]},
+            {"reason_codes": 7}
+        ]),
+        &["reason", "reasons", "reason_codes"],
+        &mut values,
+    );
+    assert!(values.contains("nested_reason"));
+    assert!(values.contains("array_reason"));
+
+    let malformed = write_temp_text("{");
+    let error = read_json_value(malformed.path()).expect_err("malformed json rejected");
+    assert!(error.contains("Malformed JSON"));
+
+    let missing = malformed.path().with_file_name("missing-acceptance.json");
+    let error = read_json_value(&missing).expect_err("missing json rejected");
+    assert!(error.contains("Failed to read"));
+}
+
+#[test]
+fn acceptance_replay_mode_covers_supported_modes_and_fail_closed_paths() {
+    let (trace, state, scenario, audit) = acceptance_fixture_files();
+    for mode in [
+        "inspect_only",
+        "read_only_re_evaluation",
+        "policy_comparison",
+        "verifier_explanation",
+    ] {
+        acceptance_replay_mode(
+            mode,
+            trace.path(),
+            state.path(),
+            audit.path(),
+            scenario.path(),
+            "UC-E2E-S8",
+        )
+        .expect("replay mode accepted");
+    }
+
+    let error = acceptance_replay_mode(
+        "side_effectful_live_replay",
+        trace.path(),
+        state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("unsupported replay mode rejected");
+    assert!(error.contains("unsupported_mode"));
+
+    let empty_trace = write_temp_text("");
+    let error = acceptance_replay_mode(
+        "inspect_only",
+        empty_trace.path(),
+        state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("empty trace rejected");
+    assert!(error.contains("empty_trace"));
+
+    let mismatched_state = write_temp_json(serde_json::json!({
+        "state_node_id": "state_other",
+        "state_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }));
+    let error = acceptance_replay_mode(
+        "inspect_only",
+        trace.path(),
+        mismatched_state.path(),
+        audit.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("state mismatch rejected");
+    assert!(error.contains("state_hash_mismatch"));
+
+    let audit_without_reason = write_temp_json(serde_json::json!({"negative_cases": []}));
+    let error = acceptance_replay_mode(
+        "verifier_explanation",
+        trace.path(),
+        state.path(),
+        audit_without_reason.path(),
+        scenario.path(),
+        "UC-E2E-S8",
+    )
+    .expect_err("verifier explanation requires reasons");
+    assert!(error.contains("missing_verifier_reason_codes"));
+}
+
+#[test]
+fn acceptance_replay_credential_check_rejects_external_credentials() {
+    let allowed = write_temp_json(serde_json::json!({
+        "credential_kind": "local_acceptance_fixture",
+        "secret_ref": "dev_fixture_only",
+    }));
+    acceptance_replay_credential_check(allowed.path()).expect("dev fixture accepted");
+
+    let production = write_temp_json(serde_json::json!({
+        "credential_kind": "production_external_secret",
+        "secret_ref": "external_secret_material",
+    }));
+    let error = acceptance_replay_credential_check(production.path())
+        .expect_err("production credential rejected");
+    assert!(error.contains("real_external_credentials_forbidden"));
+}
+
+#[test]
 fn usage_mentions_trace_export() {
     let text = usage();
     assert!(text.contains("trace export"));
     assert!(text.contains("state head"));
     assert!(text.contains("replay"));
     assert!(text.contains("audit export"));
+    assert!(text.contains("acceptance validate-import"));
+    assert!(text.contains("acceptance compat"));
+    assert!(text.contains("acceptance audit-check"));
+    assert!(text.contains("acceptance replay-mode"));
+    assert!(text.contains("acceptance replay-credential-check"));
     assert!(text.contains("run"));
     assert!(text.contains("--version"));
 }
@@ -4419,6 +5435,7 @@ fn build_gateway_rejects_missing_adapter() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = std::collections::HashMap::new();
@@ -4427,6 +5444,208 @@ fn build_gateway_rejects_missing_adapter() {
         Err(error) => error,
     };
     assert!(error.contains("Adapter not configured"));
+}
+
+fn resource_boundary_request(params: serde_json::Value) -> splendor_gateway::ActionRequest {
+    splendor_gateway::ActionRequest {
+        action_id: ActionId::new(),
+        action: Action {
+            name: "resource.check".to_string(),
+            params,
+            side_effect_class: SideEffectClass::External,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        },
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: RunId::new(),
+        adapter: None,
+        quota_usage: QuotaUsage::single_action(),
+        satisfied_preconditions: Vec::new(),
+        requested_at: OffsetDateTime::now_utc(),
+        approval_evidence: None,
+    }
+}
+
+#[test]
+fn local_resource_boundary_verifier_covers_http_and_filesystem_paths() {
+    let adapters = AdaptersConfig {
+        filesystem: Some(FilesystemConfig {
+            base_dir: PathBuf::from("/tmp/splendor-test"),
+            max_read_bytes: None,
+            max_write_bytes: None,
+            max_list_entries: None,
+        }),
+        http: Some(HttpConfig {
+            allowed_domains: vec![
+                "example.com".to_string(),
+                "*.trusted.test".to_string(),
+                ".suffix.test".to_string(),
+            ],
+            allowed_methods: None,
+            max_request_bytes: None,
+            max_response_bytes: None,
+            timeout_ms: None,
+        }),
+    };
+    let verifier = LocalResourceBoundaryVerifier::from_config(Some(&adapters));
+    let permissive = LocalResourceBoundaryVerifier::from_config(None);
+
+    let unknown_adapter = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "https://blocked.test"})),
+        Some("unknown"),
+    );
+    assert!(unknown_adapter.allowed);
+    assert!(!domain_allowed(
+        &permissive.http_allowed_domains,
+        "example.com"
+    ));
+
+    let missing_url = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({})),
+        Some("http"),
+    );
+    assert!(!missing_url.allowed);
+    assert_eq!(missing_url.reasons, vec!["network_scope_missing_url"]);
+
+    let invalid_url = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "ftp://example.com"})),
+        Some("http"),
+    );
+    assert!(!invalid_url.allowed);
+    assert_eq!(invalid_url.reasons, vec!["network_scope_invalid_url"]);
+
+    let denied_host = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({"url": "https://evil.test/path"})),
+        Some("http"),
+    );
+    assert!(!denied_host.allowed);
+    assert_eq!(denied_host.reasons, vec!["network_scope_denied"]);
+    assert_eq!(
+        denied_host.artifacts["adapter_execution"],
+        serde_json::json!("not_attempted")
+    );
+
+    for url in [
+        "https://example.com/path",
+        "https://api.trusted.test/v1",
+        "https://child.suffix.test/data",
+    ] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"url": url})),
+            Some("http"),
+        );
+        assert!(result.allowed, "expected URL to be allowed: {url}");
+    }
+    assert_eq!(
+        http_host("https://user:pass@example.com:443/secret"),
+        Some("example.com".to_string())
+    );
+    assert_eq!(http_host("https://"), None);
+
+    let missing_path = verifier.verify_resource_boundary(
+        &resource_boundary_request(serde_json::json!({})),
+        Some("filesystem"),
+    );
+    assert!(!missing_path.allowed);
+    assert_eq!(missing_path.reasons, vec!["filesystem_scope_missing_path"]);
+
+    for path in ["../secret.txt", "/etc/passwd"] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"path": path})),
+            Some("filesystem"),
+        );
+        assert!(!result.allowed, "expected path to be denied: {path}");
+        assert_eq!(result.reasons, vec!["filesystem_scope_denied"]);
+    }
+
+    for path in ["safe/file.txt", "./safe/file.txt"] {
+        let result = verifier.verify_resource_boundary(
+            &resource_boundary_request(serde_json::json!({"path": path})),
+            Some("filesystem"),
+        );
+        assert!(result.allowed, "expected path to be allowed: {path}");
+    }
+}
+
+#[test]
+fn failure_injection_trace_store_fails_once_then_delegates() {
+    let db = NamedTempFile::new().expect("trace db");
+    let store = FailingTraceStore {
+        inner: SqliteTraceStore::open(db.path()).expect("trace store"),
+        fail_on_event: "tick.started".to_string(),
+        failed: Mutex::new(false),
+    };
+    let run_id = RunId::new().to_string();
+    let payload = serde_json::json!({"kind": "tick.started", "tick_id": 1});
+
+    assert_eq!(
+        trace_payload_kind(&payload),
+        Some("tick.started".to_string())
+    );
+    let error =
+        TraceStore::append(&store, &run_id, payload.clone()).expect_err("first append fails");
+    assert!(error
+        .to_string()
+        .contains("injected_trace_write_failure:tick.started"));
+
+    let sequence = TraceStore::append(&store, &run_id, payload).expect("second append succeeds");
+    assert_eq!(sequence, 0);
+    let object_kind_payload = serde_json::json!({"kind": {"tick.completed": {"tick_id": 1}}});
+    assert_eq!(
+        trace_payload_kind(&object_kind_payload),
+        Some("tick.completed".to_string())
+    );
+    let second_sequence =
+        TraceStore::append(&store, &run_id, object_kind_payload).expect("append object kind");
+    assert_eq!(second_sequence, 1);
+
+    let records = TraceStore::read(&store, &run_id).expect("records");
+    assert_eq!(records.len(), 2);
+    let range = TraceStore::read_range(&store, &run_id, 0, 2).expect("range");
+    assert_eq!(range.len(), 2);
+}
+
+#[test]
+fn failure_injection_state_store_fails_once_then_delegates() {
+    let db = NamedTempFile::new().expect("state db");
+    let store = FailingStateStore {
+        inner: SqliteStateStore::open(db.path()).expect("state store"),
+        fail_commit: true,
+        failed: Mutex::new(false),
+    };
+    let data_ref = StateStore::put_state(
+        &store,
+        StateData {
+            bytes: b"state".to_vec(),
+            content_type: Some("text/plain".to_string()),
+        },
+    )
+    .expect("state data");
+    let metadata = || StateMetadata {
+        created_at: OffsetDateTime::now_utc(),
+        label: Some("unit".to_string()),
+        tenant_id: Some(TenantId::new()),
+        agent_id: Some(AgentId::new()),
+        run_id: Some(RunId::new()),
+        trace_event_id: Some(TraceEventId::new()),
+    };
+
+    let error = StateStore::commit_node(&store, Vec::new(), data_ref.clone(), metadata())
+        .expect_err("first commit fails");
+    assert!(error.to_string().contains("injected_state_commit_failure"));
+
+    let node_id = StateStore::commit_node(&store, Vec::new(), data_ref.clone(), metadata())
+        .expect("second commit succeeds");
+    let node = StateStore::get_node(&store, &node_id).expect("node");
+    assert_eq!(node.id, node_id);
+    let loaded = StateStore::get_state(&store, &data_ref).expect("state");
+    assert_eq!(loaded.bytes, b"state".to_vec());
+    let snapshot_id = StateStore::snapshot(&store, &node_id).expect("snapshot");
+    let snapshot = StateStore::load_snapshot(&store, &snapshot_id).expect("load snapshot");
+    assert_eq!(snapshot.node_id, node_id);
 }
 
 #[test]
@@ -4501,6 +5720,74 @@ fn parse_args_rejects_unknown_run_argument() {
     ])
     .expect_err("error");
     assert!(error.contains("Unknown argument"));
+}
+
+#[test]
+fn work_order_sign_parses_and_signs_fixture() {
+    let input = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .expect("work order file");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let now = OffsetDateTime::now_utc();
+    let order = WorkOrder {
+        schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_cli_sign").expect("work order id"),
+        tenant_id,
+        agent_id,
+        run_id: Some(run_id),
+        objective: "sign local fixture".to_string(),
+        allowed_actions: vec!["write_file".to_string()],
+        allowed_adapters: vec!["filesystem".to_string()],
+        allowed_permissions: vec!["fs.write".to_string()],
+        data_refs: vec!["dataset:fixture".to_string()],
+        quotas: splendor_types::WorkOrderQuotaPolicy {
+            max_actions_per_tick: Some(1),
+            ..splendor_types::WorkOrderQuotaPolicy::default()
+        },
+        placement: splendor_types::WorkOrderPlacement {
+            target: "local_resident".to_string(),
+            data_locality: Some("local".to_string()),
+            requires_gpu: Some(false),
+            ..splendor_types::WorkOrderPlacement::default()
+        },
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        revocation: splendor_types::RevocationStatus::Active,
+    };
+    std::fs::write(
+        input.path(),
+        serde_json::to_string(&order).expect("encode work order"),
+    )
+    .expect("write work order");
+
+    let command = parse_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--input".to_string(),
+        input.path().to_string_lossy().to_string(),
+        "--key-id".to_string(),
+        "local-key".to_string(),
+        "--secret".to_string(),
+        "secret".to_string(),
+    ])
+    .expect("parse sign command");
+    match command {
+        Command::WorkOrderSign {
+            input_path,
+            key_id,
+            secret,
+        } => {
+            assert_eq!(input_path, input.path());
+            assert_eq!(key_id, "local-key");
+            assert_eq!(secret, "secret");
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    sign_work_order(input.path(), "local-key", "secret").expect("sign work order");
 }
 
 #[test]
@@ -4810,6 +6097,85 @@ fn run_with_args_trace_export_succeeds() {
 }
 
 #[test]
+fn run_with_args_daemon_request_succeeds() {
+    let body = NamedTempFile::new().expect("body");
+    std::fs::write(
+        body.path(),
+        r#"{"credential":{"credential_id":"cred"},"audit_attribution":{"caller":"cli-test"}}"#,
+    )
+    .expect("write body");
+    let (url, handle) = spawn_local_daemon_response(200, r#"{"accepted":true}"#);
+
+    run_with_args(vec![
+        "daemon".to_string(),
+        "request".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "--url".to_string(),
+        url,
+        "--body".to_string(),
+        body.path().display().to_string(),
+        "--token".to_string(),
+        "token".to_string(),
+    ])
+    .expect("daemon request");
+
+    let request = handle.join().expect("daemon request captured");
+    assert!(request.starts_with("POST /runs HTTP/1.1"));
+    assert!(request.contains("Authorization: Bearer token"));
+}
+
+#[test]
+fn run_with_args_work_order_sign_succeeds() {
+    let input = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .expect("work order file");
+    let order = WorkOrder {
+        schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+        work_order_id: WorkOrderId::try_new("wo_cli_run_with_args").expect("work order id"),
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: Some(RunId::new()),
+        objective: "sign via command dispatch".to_string(),
+        allowed_actions: vec!["write_file".to_string()],
+        allowed_adapters: vec!["filesystem".to_string()],
+        allowed_permissions: vec!["fs.write".to_string()],
+        data_refs: vec!["dataset:fixture".to_string()],
+        quotas: splendor_types::WorkOrderQuotaPolicy {
+            max_actions_per_tick: Some(1),
+            ..splendor_types::WorkOrderQuotaPolicy::default()
+        },
+        placement: splendor_types::WorkOrderPlacement {
+            target: "local_resident".to_string(),
+            data_locality: Some("local".to_string()),
+            requires_gpu: Some(false),
+            ..splendor_types::WorkOrderPlacement::default()
+        },
+        issued_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(10),
+        revocation: splendor_types::RevocationStatus::Active,
+    };
+    std::fs::write(
+        input.path(),
+        serde_json::to_string(&order).expect("order json"),
+    )
+    .expect("write work order");
+
+    run_with_args(vec![
+        "work-order".to_string(),
+        "sign".to_string(),
+        "--input".to_string(),
+        input.path().display().to_string(),
+        "--key-id".to_string(),
+        "local-key".to_string(),
+        "--secret".to_string(),
+        "local-secret".to_string(),
+    ])
+    .expect("work order sign");
+}
+
+#[test]
 fn run_with_args_replay_succeeds() {
     let trace_temp = NamedTempFile::new().expect("trace db");
     let state_temp = NamedTempFile::new().expect("state db");
@@ -5035,6 +6401,7 @@ fn build_gateway_success() {
         work_order: None,
         runtime_identity: None,
         circuit_breakers: None,
+        failure_injection: None,
     };
     let registry = build_registry_with_work_order(&config, None).expect("registry");
     let adapters = build_adapters(config.adapters.as_ref()).expect("adapters");

@@ -1,5 +1,9 @@
 # Single Agent Loop
 
+Stability note: this is a legacy dev example, not a stable 0.1 SDK/API example.
+Use `examples/python-sdk-basic/`, `examples/typescript-daemon-client/`, and
+`examples/daemon-client-local/` for stable 0.1 API-surface examples.
+
 This example runs a single agent with the filesystem adapter enabled. Each tick
 writes a file into `examples/single_agent_loop/data` and records trace/state
 data in SQLite.

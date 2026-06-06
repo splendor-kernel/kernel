@@ -1,5 +1,12 @@
 import { SplendorClient } from "@splendor/client";
-import type { AuditAttribution, CreateRunRequest, LifecycleRequest, Percept, WorkOrderEnvelope } from "@splendor/types";
+import type {
+  AuditAttribution,
+  CallerCredential,
+  CreateRunRequest,
+  LifecycleRequest,
+  Percept,
+  WorkOrderEnvelope
+} from "@splendor/types";
 
 const tenantId = "00000000-0000-0000-0000-000000000001";
 const agentId = "00000000-0000-0000-0000-000000000002";
@@ -12,6 +19,16 @@ const audit: AuditAttribution = {
   },
   credential_id: "cred_example",
   requested_at: new Date().toISOString()
+};
+
+const credential: CallerCredential = {
+  credential_id: "cred_example",
+  principal: audit.principal,
+  scopes: ["runs_create", "runs_start", "percepts_append", "traces_read", "state_read", "replay_create"],
+  binding: { tenant: { tenant_id: tenantId } },
+  audience: { daemon: { daemon_id: "daemon_local" } },
+  expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+  revocation: "active"
 };
 
 const workOrder: WorkOrderEnvelope = {
@@ -52,7 +69,7 @@ const createRunRequest: CreateRunRequest = {
   tenant_id: tenantId,
   agent_id: agentId,
   work_order: workOrder,
-  credential: null,
+  credential,
   audit_attribution: audit,
   allowed_actions: ["example.noop"],
   allowed_adapters: ["daemon.local"],
@@ -69,7 +86,7 @@ const createRunRequest: CreateRunRequest = {
 };
 
 const lifecycle: LifecycleRequest = {
-  credential: null,
+  credential,
   work_order: null,
   audit_attribution: audit,
   reason: "typescript daemon client example",
@@ -91,7 +108,9 @@ if (!token) {
 const client = new SplendorClient({
   baseUrl: process.env.SPLENDOR_DAEMON_URL ?? "http://127.0.0.1:8077",
   token,
-  defaultAudit: audit
+  apiVersion: "0.1",
+  defaultAudit: audit,
+  defaultCredential: credential
 });
 
 const created = await client.createRun(createRunRequest);

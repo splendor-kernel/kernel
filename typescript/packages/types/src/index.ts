@@ -26,6 +26,135 @@ export type PolicyBundleId = string;
 
 export const CIRCUIT_BREAKER_SCHEMA_VERSION = "splendor.circuit_breaker.v1" as const;
 
+export const STABLE_0_1_PRIMITIVES = [
+  "Tenant",
+  "Agent",
+  "Run",
+  "Tick",
+  "Action",
+  "Percept",
+  "Message",
+  "StateNode",
+  "TraceEvent",
+  "WorkOrder",
+  "Approval",
+  "Policy",
+  "Constraint",
+  "Verifier",
+  "Adapter",
+  "Feedback",
+  "Reward"
+] as const;
+
+export type StablePrimitiveName = (typeof STABLE_0_1_PRIMITIVES)[number];
+
+export const STABLE_0_1_REQUIRED_FIELDS = {
+  Tenant: ["tenant_id", "allowed_actions", "allowed_adapters"],
+  Agent: ["agent_id", "tenant_id"],
+  Run: ["run_id", "tenant_id", "agent_id", "status"],
+  Tick: ["run_id", "tick_id", "started_at"],
+  Action: ["name", "params", "side_effect_class", "required_permissions", "preconditions", "postconditions"],
+  Percept: ["schema", "payload", "provenance", "timestamp"],
+  Message: [
+    "message_id",
+    "source_agent_id",
+    "target_agent_id",
+    "run_id",
+    "schema",
+    "payload",
+    "causal_parent",
+    "requires_response",
+    "created_at"
+  ],
+  StateNode: ["state_node_id", "tenant_id", "agent_id", "run_id", "parents", "state_hash", "trace_event_id", "created_at"],
+  TraceEvent: ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"],
+  WorkOrder: [
+    "schema_version",
+    "work_order_id",
+    "tenant_id",
+    "agent_id",
+    "objective",
+    "allowed_actions",
+    "allowed_adapters",
+    "allowed_permissions",
+    "data_refs",
+    "quotas",
+    "placement",
+    "issued_at",
+    "expires_at",
+    "revocation",
+    "signature"
+  ],
+  Approval: ["schema_version", "approval_id", "tenant_id", "agent_id", "run_id", "decision", "issued_at", "expires_at"],
+  Policy: ["schema_version", "policy_id", "tenant_id", "agent_id"],
+  Constraint: ["id", "kind", "scope", "predicate"],
+  Verifier: ["verifier", "category", "result"],
+  Adapter: ["name", "capabilities", "execute"],
+  Feedback: ["kind", "payload", "recorded_at"],
+  Reward: ["value", "recorded_at"]
+} as const satisfies Record<StablePrimitiveName, readonly string[]>;
+
+export const STABLE_0_1_RESERVED_EXTENSION_KEYS = [
+  "fleet_id",
+  "node_id",
+  "instance_id",
+  "tenant_id",
+  "agent_id",
+  "runtime_context_id",
+  "run_id",
+  "tick_id",
+  "action_id",
+  "state_node_id",
+  "trace_event_id",
+  "message_id",
+  "work_order_id",
+  "approval_id",
+  "artifact_id",
+  "authority",
+  "permission",
+  "permissions",
+  "allowed_actions",
+  "allowed_adapters",
+  "allowed_permissions",
+  "scope",
+  "scope_type",
+  "policy",
+  "policy_bundle",
+  "work_order",
+  "approval",
+  "approval_token",
+  "signature",
+  "credential",
+  "secret",
+  "token",
+  "adapter",
+  "quota",
+  "verifier",
+  "gateway"
+] as const;
+
+export const STABLE_0_1_ENUM_VALUES = {
+  action_status: ["Executed", "Denied", "NeedsApproval", "NeedsIntervention", "Failed"],
+  approval_decision: ["Granted", "Denied"],
+  constraint_kind: ["Hard", "Soft"],
+  constraint_scope: ["Global", "Action", "State"],
+  message_delivery_status: ["pending", "queued", "delivered", "rejected", "expired", "consumed"],
+  run_status: [
+    "pending",
+    "running",
+    "paused",
+    "waiting_for_approval",
+    "interrupted",
+    "resuming",
+    "completed",
+    "failed",
+    "cancelled",
+    "denied",
+    "expired"
+  ],
+  side_effect_class: ["ReadOnly", "Filesystem", "Network", "External"]
+} as const;
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export interface JsonObject {
@@ -940,9 +1069,22 @@ export type EndpointScope =
   | "state_read"
   | "replay_create"
   | "messages_send"
+  | "messages_read"
+  | "work_orders_submit"
+  | "work_orders_revoke"
+  | "fleet_read"
+  | "fleet_dispatch"
+  | "state_handoff"
   | "health_read"
   | "capabilities_read"
   | "policies_sync"
+  | "policies_publish"
+  | "policies_revoke"
+  | "approvals_manage"
+  | "governance_control"
+  | "device_register"
+  | "device_read"
+  | "operator_intervene"
   | "nodes_register"
   | "instances_register"
   | "nodes_heartbeat"
@@ -1051,6 +1193,7 @@ export interface CreateRunRequest {
   policy_bundle: PolicyBundleEnvelope | null;
   registered_actions: RegisteredAction[];
   approval_policies: ApprovalPolicy[];
+  circuit_breakers: CircuitBreaker[];
   allowed_percept_schemas: string[];
   allowed_percept_sources: string[];
   initial_state: JsonValue | null;
@@ -1126,7 +1269,10 @@ export interface AppendPerceptResponse {
 }
 
 export interface ReplayRequest {
-  credential: CallerCredential | null;
+  credential: CallerCredential;
+  audit_attribution: AuditAttribution;
+  mode: "inspect_only";
+  side_effects_allowed: false;
 }
 
 export interface ReplayResponse {
@@ -1151,7 +1297,24 @@ export interface TracePageResponse {
   records: TraceRecord[];
 }
 
+export interface TraceExportRequest {
+  credential: CallerCredential;
+  audit_attribution: AuditAttribution;
+  redaction_policy: string | null;
+  start: number | null;
+  end: number | null;
+}
+
+export interface TraceExportResponse {
+  run_id: RunId;
+  records: TraceRecord[];
+  record_count: number;
+  redaction_policy: string;
+  integrity_hash: string;
+}
+
 export interface SubmitActionRequest {
+  action_id: ActionId | null;
   run_id: RunId;
   tenant_id: TenantId;
   agent_id: AgentId;
@@ -1169,6 +1332,14 @@ export interface HealthResponse {
   status: string;
   local_only: boolean;
   runtime_available: boolean;
+}
+
+export interface VersionResponse {
+  daemon_api_version: string;
+  compatibility_line: string;
+  openapi_version: string;
+  local_only: boolean;
+  schema_versions: string[];
 }
 
 export interface CapabilitiesResponse {
@@ -1279,6 +1450,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "policy_bundle",
     "registered_actions",
     "approval_policies",
+    "circuit_breakers",
     "allowed_percept_schemas",
     "allowed_percept_sources",
     "initial_state",
@@ -1309,8 +1481,11 @@ export const CANONICAL_SCHEMA_FIELDS = {
   ],
   policy_sync_response: ["run_id", "accepted", "policy_bundle", "cache_status"],
   trace_page_response: ["run_id", "records"],
+  trace_export_request: ["credential", "audit_attribution", "redaction_policy", "start", "end"],
+  trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
   replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
   submit_action_request: [
+    "action_id",
     "run_id",
     "tenant_id",
     "agent_id",
@@ -1324,6 +1499,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "approval_evidence"
   ],
   health_response: ["status", "local_only", "runtime_available"],
+  version_response: ["daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"],
   capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints"]
 } as const satisfies {
   message: readonly (keyof Message)[];
@@ -1351,9 +1527,12 @@ export const CANONICAL_SCHEMA_FIELDS = {
   policy_cache_status_response: readonly (keyof PolicyCacheStatusResponse)[];
   policy_sync_response: readonly (keyof PolicySyncResponse)[];
   trace_page_response: readonly (keyof TracePageResponse)[];
+  trace_export_request: readonly (keyof TraceExportRequest)[];
+  trace_export_response: readonly (keyof TraceExportResponse)[];
   replay_response: readonly (keyof ReplayResponse)[];
   submit_action_request: readonly (keyof SubmitActionRequest)[];
   health_response: readonly (keyof HealthResponse)[];
+  version_response: readonly (keyof VersionResponse)[];
   capabilities_response: readonly (keyof CapabilitiesResponse)[];
 };
 
@@ -1465,13 +1644,26 @@ export const ENDPOINT_SCOPE_VALUES = [
   "StateRead",
   "ReplayCreate",
   "MessagesSend",
+  "MessagesRead",
+  "WorkOrdersSubmit",
+  "WorkOrdersRevoke",
+  "FleetRead",
+  "FleetDispatch",
+  "StateHandoff",
   "HealthRead",
   "CapabilitiesRead",
   "PoliciesSync",
   "NodesRegister",
   "InstancesRegister",
   "NodesHeartbeat",
-  "InstancesHeartbeat"
+  "InstancesHeartbeat",
+  "PoliciesPublish",
+  "PoliciesRevoke",
+  "ApprovalsManage",
+  "GovernanceControl",
+  "DeviceRegister",
+  "DeviceRead",
+  "OperatorIntervene"
 ] as const;
 
 export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
@@ -1487,9 +1679,22 @@ export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
   state_read: "splendor.state.read",
   replay_create: "splendor.replay.create",
   messages_send: "splendor.messages.send",
+  messages_read: "splendor.messages.read",
+  work_orders_submit: "splendor.work_orders.submit",
+  work_orders_revoke: "splendor.work_orders.revoke",
+  fleet_read: "splendor.fleet.read",
+  fleet_dispatch: "splendor.fleet.dispatch",
+  state_handoff: "splendor.state.handoff",
   health_read: "splendor.health.read",
   capabilities_read: "splendor.capabilities.read",
   policies_sync: "splendor.policies.sync",
+  policies_publish: "splendor.policies.publish",
+  policies_revoke: "splendor.policies.revoke",
+  approvals_manage: "splendor.approvals.manage",
+  governance_control: "splendor.governance.control",
+  device_register: "splendor.device.register",
+  device_read: "splendor.device.read",
+  operator_intervene: "splendor.operator.intervene",
   nodes_register: "splendor.nodes.register",
   instances_register: "splendor.instances.register",
   nodes_heartbeat: "splendor.nodes.heartbeat",

@@ -1,8 +1,10 @@
 # TypeScript daemon client example
 
-This example shows the minimal 0.02-S6 TypeScript control-plane path. It assumes
-a Splendor runtime daemon is already running and enforcing the 0.02 daemon
-security boundary.
+This example shows the stable 0.1 TypeScript daemon-client control-plane path. It
+assumes a Splendor runtime daemon is already running and enforcing the layered
+daemon security boundary.
+
+Stable API reference: `docs/sdk/typescript/stable-0.1.md`.
 
 The TypeScript client does not execute policies, verifiers, adapters, state
 commits, trace writes, or replay. It only sends authenticated requests to the

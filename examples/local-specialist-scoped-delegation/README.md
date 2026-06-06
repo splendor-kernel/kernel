@@ -1,5 +1,9 @@
 # Local specialist scoped delegation
 
+Stability note: this is a legacy dev delegation example, not a stable 0.1 SDK/API
+example. Stable 0.1 API surfaces are documented under
+`docs/spec/0.1/api-stability.md`.
+
 This fixture documents the 0.02-S3 local pattern for preventing permission
 laundering between an orchestrator and a shared specialist in one Splendor
 instance.

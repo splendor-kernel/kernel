@@ -1,8 +1,88 @@
 # Runtime Daemon API Reference
 
-The runtime daemon API is the 0.02-S5 local control boundary for Splendor runs.
+The runtime daemon API is the local control boundary for Splendor runs. In the
+0.1 compatibility line, the stable endpoint names and request/response shapes are
+documented here. The OpenAPI document remains versioned to the current runtime
+daemon API metadata and carries a separate 0.1 compatibility note.
+The implementation remains local/foundation-oriented; it is not a fleet manager
+or production auth provider.
+
+Historically this surface was introduced in 0.02-S5. 0.1 stabilizes the public
+daemon boundary without promising private handler internals.
+
+## Stable 0.1 compatibility boundary
+
+Stable 0.1 daemon clients may rely on:
+
+- endpoint names listed in the endpoint summary;
+- JSON request/response shapes documented by OpenAPI and reference docs;
+- structured daemon errors with `code`, `message`, and `details`;
+- endpoint scopes from the daemon security boundary;
+- signed, unexpired, unrevoked work-order requirement for run create/resume;
+- gateway-mediated `/actions` submissions;
+- inspect-only replay default;
+- no silent fallback to unauthenticated non-dev communication.
+
+Executable public client coverage for UC-E2E-S2 now includes the raw documented
+HTTP path, `@splendor/client`, `python.splendor.daemon_client.SplendorDaemonClient`,
+and `splendorctl daemon request`. Each client path creates a run from a signed
+work order, appends a percept, starts a tick, submits the allowed action through
+`POST /actions`, reads state/traces, exports traces, requests inspect-only replay,
+and cancels the run. These clients are wrappers around daemon endpoints only; they
+do not execute adapters directly or treat management credentials as action
+authority.
+
+Stable 0.1 clients must not rely on private Rust handler names, in-memory run slot
+layout, local queue internals, exact test fixture IDs, native Node bindings,
+browser runtime execution, production OAuth/PKI behavior, or remote fleet
+transport.
+
+## Version headers and negotiation
+
+Stable clients should send:
+
+```text
+X-Splendor-API-Version: 0.1
+X-Splendor-Client: <client-name>
+```
+
+The current TypeScript client sends `X-Splendor-API-Version` and lets callers
+override the value. Its default remains `0.02-dev`, and daemon capabilities still
+advertise the current runtime daemon API line until the daemon actively validates
+0.1 compatibility headers.
+
+Current limitation: the daemon route implementation does not actively negotiate
+API versions or reject unsupported `X-Splendor-API-Version` values. Compatibility
+is therefore validated through the OpenAPI contract, SDK docs/tests, and the 0.1
+conformance suite, not by runtime version negotiation.
+
+Future active negotiation must fail closed on unsupported versions and document
+accepted version ranges before becoming stable.
+
+The Python daemon client and `splendorctl daemon request` send the same version
+and client attribution headers. `splendorctl daemon request` is intentionally
+narrow and local: it accepts only explicit `http://127.0.0.1`, `localhost`, or
+loopback daemon URLs, requires a caller token, supports caller-credential header
+files for read requests, and requires JSON body files containing credentials for
+mutating requests. It is a daemon-management wrapper, not a gateway bypass.
+
+## Layered daemon authorization
+
+Daemon communication must preserve these layers:
+
+```text
+transport security -> caller authentication -> endpoint scopes -> signed work order -> tenant/agent/run checks -> gateway verification
+```
+
+A caller token authenticates the app. A signed work order authorizes run creation
+or resume. The Action Gateway authorizes side effects. No layer replaces the
+others.
+
+The runtime daemon API was originally the 0.02-S5 local control boundary for
+Splendor runs.
 It exposes a minimal HTTP surface for creating, starting, pausing, resuming,
-stopping, inspecting, replaying, and safely submitting actions to a local runtime.
+stopping/cancelling, inspecting, exporting traces, replaying, and safely
+submitting actions to a local runtime.
 
 This API strengthens the `SDK/API`, `runtime context`, `percept`, `state graph`,
 `trace store`, `action gateway`, and `replay` primitives. It is local-only and
@@ -18,13 +98,16 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/pause` | Mark a local run paused | `splendor.runs.pause` |
 | `POST` | `/runs/{run_id}/resume` | Resume a paused run and execute one tick | `splendor.runs.resume` |
 | `POST` | `/runs/{run_id}/stop` | Mark a local run stopped | `splendor.runs.stop` |
+| `POST` | `/runs/{run_id}/cancel` | Cancel a local run while preserving trace/state evidence | `splendor.runs.stop` |
 | `POST` | `/runs/{run_id}/percepts` | Append a daemon-submitted percept queue entry | `splendor.percepts.append` |
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
 | `GET` | `/runs/{run_id}/traces` | Read ordered trace records; requires `redaction_policy` | `splendor.traces.read` |
+| `POST` | `/runs/{run_id}/traces/export` | Export ordered trace records with redaction policy and integrity metadata | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/replay` | Start inspect-only replay summary | `splendor.replay.create` |
 | `POST` | `/actions` | Submit an action through the run gateway | `splendor.actions.submit` |
 | `GET` | `/health` | Read local daemon health | `splendor.health.read` |
+| `GET` | `/version` | Read daemon/runtime/schema compatibility metadata | `splendor.health.read` |
 | `GET` | `/capabilities` | Read local daemon capabilities | `splendor.capabilities.read` |
 
 The OpenAPI description is maintained in
@@ -119,7 +202,10 @@ Response fields include:
 
 Trace responses return `TraceRecord` values from the run's trace store. Records
 are returned in monotonic sequence order. Range reads use `start` inclusive and
-`end` exclusive semantics from `TraceStore::read_range`.
+`end` exclusive semantics from `TraceStore::read_range`. `GET /runs/{run_id}/traces`
+and `POST /runs/{run_id}/traces/export` both require an explicit
+`redaction_policy`; the export response also includes a deterministic
+`integrity_hash` summary over the returned trace chain.
 
 Lifecycle and daemon-specific events added for 0.02-S5:
 
@@ -134,6 +220,10 @@ PerceptsAppended
 `DaemonAudit { endpoint, audit }` is emitted for accepted mutating daemon calls
 after S0 security validation and before the runtime mutation, preserving caller
 identity and credential attribution in the run trace.
+
+Trace export is a POST audit boundary even though it uses the trace-read scope:
+its request body must include non-null `credential` and `audit_attribution`, and
+the audit principal and `credential_id` must match the caller credential.
 
 Policy distribution events added in 0.04-S5:
 
@@ -170,6 +260,10 @@ with event counts and `approval_events`. It does not invoke perceptors, policies
 gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
 
+Replay request bodies must include non-null `credential` and
+`audit_attribution`; both principal identity and `credential_id` are validated
+before replay evidence is read.
+
 `approval_events` reports approval lifecycle events with lifecycle label,
 approval context, optional reason, trace event ID, and sequence. It explains why
 approval was required and what grant, denial, unsupported schema, expiry, or
@@ -203,12 +297,42 @@ Required 0.02-S5 failures include:
 Gateway denials are action outcomes, not HTTP transport failures, because the
 gateway successfully evaluated and denied the requested action.
 
+Stable client handling rules:
+
+- parse `code` as the programmatic daemon error discriminator;
+- treat `message` as human-readable diagnostics, not an authorization fact;
+- treat `details` as structured diagnostics whose exact keys may vary by code;
+- handle HTTP `503 runtime_unavailable` as fail-closed runtime unavailability;
+- handle gateway `Denied`, `NeedsApproval`, and `NeedsIntervention` as action
+  outcomes where adapter execution did not occur;
+- never retry side-effectful actions blindly after transport, verifier, gateway,
+  state, or trace failures.
+
+Client transport errors that happen before a daemon response should use the
+client's stable error wrapper. For `@splendor/client`, this is
+`SplendorClientError` with `status: 0` and `code: "network_error"`.
+
+Conformance failures use the report shape documented in
+`docs/spec/0.1/conformance.md` and include `case_id`, `primitive`,
+`requirement`, `path`, `status`, and `message`.
+
 ## Compatibility notes
 
-This is a development API for 0.02-S5 and is not the 0.1 stable compatibility
-surface. The endpoint names are intentionally aligned with the planned daemon
-boundary so the TypeScript client sprint can target the same contract without
-duplicating runtime semantics.
+This reference is part of the 0.1 stable compatibility surface for documented
+daemon endpoints and error shapes. It does not stabilize private Rust internals,
+production authentication infrastructure, native Node bindings, browser runtime
+behavior, fleet scheduling, or undocumented API fields.
+
+Run 0.1 conformance validation from the repository root:
+
+```bash
+python conformance/0.1/run-conformance.py
+```
+
+The conformance suite proves stable fixture compatibility for runtime loop order,
+gateway paths, trace/state/replay behavior, messages, work orders, governance,
+adapter manifests, and S1 primitive examples. It is not a production use-case E2E
+or physical safety certification claim.
 
 ## Non-goals
 
@@ -218,4 +342,4 @@ duplicating runtime semantics.
 - No approval queue UI, notification system, new escalation or circuit-breaker
   management API, or workflow DSL.
 - No background resident scheduler.
-- No TypeScript client implementation in this sprint.
+- No native Node binding or browser runtime guarantee.

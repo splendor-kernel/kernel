@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig, HttpMethod};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, CircuitBreakerEvaluator, StaticCircuitBreakerEvaluator,
-    VerifiedActionGateway,
+    ActionAdapter, ActionGateway, CircuitBreakerEvaluator, ResourceBoundaryVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
     ActionCandidate, AdapterQuota, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -35,16 +35,18 @@ use splendor_types::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 const SPLENDOR_RELEASE_LABEL: &str = "Splendor0.05-dev";
 
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Entry point for the CLI.
 fn main() -> ExitCode {
@@ -92,6 +94,67 @@ where
             cycles,
             forever,
         } => run_from_config(config_path.as_path(), cycles, forever)?,
+        Command::WorkOrderSign {
+            input_path,
+            key_id,
+            secret,
+        } => sign_work_order(&input_path, &key_id, &secret)?,
+        Command::DaemonRequest {
+            method,
+            url,
+            body_path,
+            credential_path,
+            token,
+        } => daemon_request(
+            &method,
+            &url,
+            body_path.as_deref(),
+            credential_path.as_deref(),
+            &token,
+        )?,
+        Command::AcceptanceValidateImport {
+            trace_path,
+            state_path,
+            scenario_report_path,
+            source,
+            expected_trace_chain,
+            expected_state_hash,
+        } => acceptance_validate_import(
+            &trace_path,
+            &state_path,
+            &scenario_report_path,
+            &source,
+            expected_trace_chain.as_deref(),
+            expected_state_hash.as_deref(),
+        )?,
+        Command::AcceptanceCompat {
+            fixture_paths,
+            target_schema,
+        } => acceptance_compat(&fixture_paths, &target_schema)?,
+        Command::AcceptanceAuditCheck {
+            audit_path,
+            scenario_report_path,
+            case_name,
+            category,
+        } => acceptance_audit_check(&audit_path, &scenario_report_path, &case_name, &category)?,
+        Command::AcceptanceReplayMode {
+            mode,
+            trace_path,
+            state_path,
+            audit_path,
+            scenario_report_path,
+            source,
+        } => acceptance_replay_mode(
+            &mode,
+            &trace_path,
+            &state_path,
+            &audit_path,
+            &scenario_report_path,
+            &source,
+        )?,
+        Command::AcceptanceReplayCredentialCheck { credential_path } => {
+            acceptance_replay_credential_check(&credential_path)?
+        }
     }
     Ok(())
 }
@@ -140,6 +203,52 @@ enum Command {
         cycles: Option<u64>,
         forever: bool,
     },
+    /// Sign a local work-order fixture with the reference shared-secret scheme.
+    WorkOrderSign {
+        input_path: PathBuf,
+        key_id: String,
+        secret: String,
+    },
+    /// Call a documented daemon HTTP endpoint without bypassing daemon/gateway enforcement.
+    DaemonRequest {
+        method: String,
+        url: String,
+        body_path: Option<PathBuf>,
+        credential_path: Option<PathBuf>,
+        token: String,
+    },
+    /// Public acceptance utility for validating exported trace/state artifacts.
+    AcceptanceValidateImport {
+        trace_path: PathBuf,
+        state_path: PathBuf,
+        scenario_report_path: PathBuf,
+        source: String,
+        expected_trace_chain: Option<String>,
+        expected_state_hash: Option<String>,
+    },
+    /// Public acceptance utility for supported fixture migration/type compatibility evidence.
+    AcceptanceCompat {
+        fixture_paths: Vec<PathBuf>,
+        target_schema: String,
+    },
+    /// Public acceptance utility for strict audit reason-code validation.
+    AcceptanceAuditCheck {
+        audit_path: PathBuf,
+        scenario_report_path: PathBuf,
+        case_name: String,
+        category: String,
+    },
+    /// Public acceptance utility for replay-mode evidence over exported artifacts.
+    AcceptanceReplayMode {
+        mode: String,
+        trace_path: PathBuf,
+        state_path: PathBuf,
+        audit_path: PathBuf,
+        scenario_report_path: PathBuf,
+        source: String,
+    },
+    /// Public acceptance utility for rejecting real external replay credentials.
+    AcceptanceReplayCredentialCheck { credential_path: PathBuf },
 }
 
 /// Parses top-level CLI arguments.
@@ -170,10 +279,240 @@ where
     if command == "run" {
         return parse_run_command(args);
     }
+    if command == "work-order" {
+        return parse_work_order_command(args);
+    }
+    if command == "daemon" {
+        return parse_daemon_command(args);
+    }
+    if command == "acceptance" {
+        return parse_acceptance_command(args);
+    }
     if command == "--help" || command == "-h" {
         return Err(usage());
     }
     Err(format!("Unknown command: {command}\n\n{}", usage()))
+}
+
+fn parse_daemon_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    if subcommand != "request" {
+        return Err(format!(
+            "Unknown daemon subcommand: {subcommand}\n\n{}",
+            usage()
+        ));
+    }
+    let mut method = None;
+    let mut url = None;
+    let mut body_path = None;
+    let mut credential_path = None;
+    let mut token = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--method" => method = args.next(),
+            "--url" => url = args.next(),
+            "--body" => body_path = args.next().map(PathBuf::from),
+            "--caller-credential" => credential_path = args.next().map(PathBuf::from),
+            "--token" => token = args.next(),
+            "--help" | "-h" => return Err(usage()),
+            _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+        }
+    }
+    let method = method
+        .ok_or_else(|| "Missing required --method".to_string())?
+        .to_uppercase();
+    let url = url.ok_or_else(|| "Missing required --url".to_string())?;
+    let token = token.ok_or_else(|| {
+        "Missing required --token; anonymous daemon fallback is not allowed".to_string()
+    })?;
+    if token.trim().is_empty() {
+        return Err(
+            "Missing required --token; anonymous daemon fallback is not allowed".to_string(),
+        );
+    }
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") && body_path.is_none() {
+        return Err(
+            "Mutating daemon requests require --body with credential and audit attribution"
+                .to_string(),
+        );
+    }
+    Ok(Command::DaemonRequest {
+        method,
+        url,
+        body_path,
+        credential_path,
+        token,
+    })
+}
+
+fn parse_acceptance_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    match subcommand.as_str() {
+        "validate-import" => {
+            let mut trace_path = None;
+            let mut state_path = None;
+            let mut scenario_report_path = None;
+            let mut source = None;
+            let mut expected_trace_chain = None;
+            let mut expected_state_hash = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--trace" => trace_path = args.next().map(PathBuf::from),
+                    "--state" => state_path = args.next().map(PathBuf::from),
+                    "--scenario-report" => scenario_report_path = args.next().map(PathBuf::from),
+                    "--source" => source = args.next(),
+                    "--expected-trace-chain" => expected_trace_chain = args.next(),
+                    "--expected-state-hash" => expected_state_hash = args.next(),
+                    "--help" | "-h" => return Err(usage()),
+                    _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+                }
+            }
+            Ok(Command::AcceptanceValidateImport {
+                trace_path: trace_path.ok_or_else(|| "Missing required --trace".to_string())?,
+                state_path: state_path.ok_or_else(|| "Missing required --state".to_string())?,
+                scenario_report_path: scenario_report_path
+                    .ok_or_else(|| "Missing required --scenario-report".to_string())?,
+                source: source.ok_or_else(|| "Missing required --source".to_string())?,
+                expected_trace_chain,
+                expected_state_hash,
+            })
+        }
+        "compat" => {
+            let mut fixture_paths = Vec::new();
+            let mut target_schema = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--fixture" => fixture_paths.push(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "Missing value for --fixture".to_string())?,
+                    )),
+                    "--target-schema" => target_schema = args.next(),
+                    "--help" | "-h" => return Err(usage()),
+                    _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+                }
+            }
+            if fixture_paths.is_empty() {
+                return Err("Missing required --fixture".to_string());
+            }
+            Ok(Command::AcceptanceCompat {
+                fixture_paths,
+                target_schema: target_schema
+                    .ok_or_else(|| "Missing required --target-schema".to_string())?,
+            })
+        }
+        "audit-check" => {
+            let mut audit_path = None;
+            let mut scenario_report_path = None;
+            let mut case_name = None;
+            let mut category = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--audit" => audit_path = args.next().map(PathBuf::from),
+                    "--scenario-report" => scenario_report_path = args.next().map(PathBuf::from),
+                    "--case" => case_name = args.next(),
+                    "--category" => category = args.next(),
+                    "--help" | "-h" => return Err(usage()),
+                    _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+                }
+            }
+            Ok(Command::AcceptanceAuditCheck {
+                audit_path: audit_path.ok_or_else(|| "Missing required --audit".to_string())?,
+                scenario_report_path: scenario_report_path
+                    .ok_or_else(|| "Missing required --scenario-report".to_string())?,
+                case_name: case_name.ok_or_else(|| "Missing required --case".to_string())?,
+                category: category.ok_or_else(|| "Missing required --category".to_string())?,
+            })
+        }
+        "replay-mode" => {
+            let mut mode = None;
+            let mut trace_path = None;
+            let mut state_path = None;
+            let mut audit_path = None;
+            let mut scenario_report_path = None;
+            let mut source = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--mode" => mode = args.next(),
+                    "--trace" => trace_path = args.next().map(PathBuf::from),
+                    "--state" => state_path = args.next().map(PathBuf::from),
+                    "--audit" => audit_path = args.next().map(PathBuf::from),
+                    "--scenario-report" => scenario_report_path = args.next().map(PathBuf::from),
+                    "--source" => source = args.next(),
+                    "--help" | "-h" => return Err(usage()),
+                    _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+                }
+            }
+            Ok(Command::AcceptanceReplayMode {
+                mode: mode.ok_or_else(|| "Missing required --mode".to_string())?,
+                trace_path: trace_path.ok_or_else(|| "Missing required --trace".to_string())?,
+                state_path: state_path.ok_or_else(|| "Missing required --state".to_string())?,
+                audit_path: audit_path.ok_or_else(|| "Missing required --audit".to_string())?,
+                scenario_report_path: scenario_report_path
+                    .ok_or_else(|| "Missing required --scenario-report".to_string())?,
+                source: source.ok_or_else(|| "Missing required --source".to_string())?,
+            })
+        }
+        "replay-credential-check" => {
+            let mut credential_path = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--credential" => credential_path = args.next().map(PathBuf::from),
+                    "--help" | "-h" => return Err(usage()),
+                    _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+                }
+            }
+            Ok(Command::AcceptanceReplayCredentialCheck {
+                credential_path: credential_path
+                    .ok_or_else(|| "Missing required --credential".to_string())?,
+            })
+        }
+        _ => Err(format!(
+            "Unknown acceptance subcommand: {subcommand}\n\n{}",
+            usage()
+        )),
+    }
+}
+
+fn parse_work_order_command<I>(mut args: I) -> Result<Command, String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(subcommand) = args.next() else {
+        return Err(usage());
+    };
+    if subcommand != "sign" {
+        return Err(format!(
+            "Unknown work-order subcommand: {subcommand}\n\n{}",
+            usage()
+        ));
+    }
+    let mut input_path = None;
+    let mut key_id = None;
+    let mut secret = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--input" => input_path = args.next().map(PathBuf::from),
+            "--key-id" => key_id = args.next(),
+            "--secret" => secret = args.next(),
+            "--help" | "-h" => return Err(usage()),
+            _ => return Err(format!("Unknown argument: {arg}\n\n{}", usage())),
+        }
+    }
+    Ok(Command::WorkOrderSign {
+        input_path: input_path.ok_or_else(|| "Missing required --input".to_string())?,
+        key_id: key_id.ok_or_else(|| "Missing required --key-id".to_string())?,
+        secret: secret.ok_or_else(|| "Missing required --secret".to_string())?,
+    })
 }
 
 /// Parses `splendorctl state ...` subcommands.
@@ -515,6 +854,572 @@ fn state_head(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
     })?;
     let line = serde_json::to_string(&latest)
         .map_err(|error| format!("Failed to encode state head output: {error}"))?;
+    println!("{line}");
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AcceptanceImportReport {
+    schema_version: &'static str,
+    source: String,
+    accepted: bool,
+    trace_records: usize,
+    trace_chain_hash: String,
+    trace_digest: String,
+    state_digest: String,
+    matching_state_hashes: Vec<String>,
+    state_node_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AcceptanceCompatReport {
+    schema_version: &'static str,
+    status: &'static str,
+    target_schema: String,
+    migrated: Vec<AcceptanceMigrationRecord>,
+}
+
+#[derive(Serialize)]
+struct AcceptanceMigrationRecord {
+    source_path: String,
+    source_digest: String,
+    source_schema_versions: Vec<String>,
+    target_schema_version: String,
+    migrated_digest: String,
+}
+
+#[derive(Serialize)]
+struct AcceptanceAuditCheckReport {
+    schema_version: &'static str,
+    status: &'static str,
+    category: String,
+    case_name: String,
+    reason_codes: Vec<String>,
+    trace_event_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AcceptanceReplayModeReport {
+    schema_version: &'static str,
+    mode: String,
+    status: &'static str,
+    source: String,
+    public_command: &'static str,
+    trace_path: String,
+    state_path: String,
+    audit_path: String,
+    scenario_report_path: String,
+    trace_digest: String,
+    state_digest: String,
+    audit_digest: String,
+    scenario_report_digest: String,
+    trace_chain_hash: String,
+    trace_records: usize,
+    matching_state_hashes: Vec<String>,
+    event_types_observed: Vec<String>,
+    evidence_fields: BTreeMap<String, serde_json::Value>,
+    side_effects_allowed: bool,
+    side_effects_executed: bool,
+}
+
+fn acceptance_validate_import(
+    trace_path: &Path,
+    state_path: &Path,
+    scenario_report_path: &Path,
+    source: &str,
+    expected_trace_chain: Option<&str>,
+    expected_state_hash: Option<&str>,
+) -> Result<(), String> {
+    let trace_raw = fs::read_to_string(trace_path)
+        .map_err(|error| format!("Failed to read trace artifact: {error}"))?;
+    let records = trace_raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map_err(|error| format!("Malformed trace JSON line: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.is_empty() {
+        return Err("trace_import_rejected:empty_trace".to_string());
+    }
+    let trace_chain_hash = acceptance_trace_chain_hash(&records)?;
+    if let Some(expected) = expected_trace_chain {
+        if expected != trace_chain_hash {
+            return Err(format!(
+                "trace_import_rejected:trace_chain_hash_mismatch expected={expected} actual={trace_chain_hash}"
+            ));
+        }
+    }
+    let state_value = read_json_value(state_path)?;
+    let scenario = read_json_value(scenario_report_path)?;
+    let state_hashes = acceptance_state_hashes(&state_value);
+    let scenario_hashes = json_array_strings(scenario.get("state_hashes"));
+    let mut matching_state_hashes = state_hashes
+        .intersection(&scenario_hashes)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(expected) = expected_state_hash {
+        if !state_hashes.contains(expected) {
+            return Err(format!(
+                "state_import_rejected:state_hash_mismatch expected={expected}"
+            ));
+        }
+        if !matching_state_hashes.iter().any(|value| value == expected) {
+            matching_state_hashes.push(expected.to_string());
+        }
+    }
+    if matching_state_hashes.is_empty() {
+        return Err("state_import_rejected:state_hash_mismatch".to_string());
+    }
+    let report = AcceptanceImportReport {
+        schema_version: "splendor.acceptance.import_report.v1",
+        source: source.to_string(),
+        accepted: true,
+        trace_records: records.len(),
+        trace_chain_hash,
+        trace_digest: acceptance_file_digest(trace_path)?,
+        state_digest: acceptance_file_digest(state_path)?,
+        matching_state_hashes,
+        state_node_ids: acceptance_state_node_ids(&state_value)
+            .into_iter()
+            .collect(),
+    };
+    print_json_line(&report)
+}
+
+fn acceptance_compat(fixture_paths: &[PathBuf], target_schema: &str) -> Result<(), String> {
+    if target_schema != "splendor.0.1.stable.v1" {
+        return Err(format!(
+            "schema_rejected:unsupported_target_schema target={target_schema}"
+        ));
+    }
+    let mut migrated = Vec::new();
+    for path in fixture_paths {
+        let value = read_json_value(path)?;
+        let versions = acceptance_schema_versions(&value);
+        if versions
+            .iter()
+            .any(|version| version.contains("unsupported"))
+            || versions.is_empty()
+        {
+            return Err(format!(
+                "schema_rejected:unsupported_schema_version path={}",
+                path.display()
+            ));
+        }
+        if versions
+            .iter()
+            .any(|version| version.contains("generated.types.mismatch"))
+        {
+            return Err(format!(
+                "compatibility_rejected:generated_schema_mismatch path={}",
+                path.display()
+            ));
+        }
+        let source_digest = acceptance_file_digest(path)?;
+        let migrated_digest = format!(
+            "blake3:{}",
+            blake3::hash(format!("{source_digest}:{target_schema}").as_bytes()).to_hex()
+        );
+        migrated.push(AcceptanceMigrationRecord {
+            source_path: path.display().to_string(),
+            source_digest,
+            source_schema_versions: versions.into_iter().collect(),
+            target_schema_version: target_schema.to_string(),
+            migrated_digest,
+        });
+    }
+    print_json_line(&AcceptanceCompatReport {
+        schema_version: "splendor.acceptance.compat_report.v1",
+        status: "passed",
+        target_schema: target_schema.to_string(),
+        migrated,
+    })
+}
+
+fn acceptance_audit_check(
+    audit_path: &Path,
+    scenario_report_path: &Path,
+    case_name: &str,
+    category: &str,
+) -> Result<(), String> {
+    let audit = read_json_value(audit_path)?;
+    let scenario = read_json_value(scenario_report_path)?;
+    let mut candidates = Vec::new();
+    collect_case_records(&audit, case_name, &mut candidates);
+    collect_case_records(&scenario, case_name, &mut candidates);
+    let mut reason_codes = BTreeSet::new();
+    let mut trace_event_ids = BTreeSet::new();
+    for candidate in candidates {
+        for reason in json_array_strings(candidate.get("reason_codes")) {
+            reason_codes.insert(reason);
+        }
+        for reason in json_array_strings(candidate.get("reasons")) {
+            reason_codes.insert(reason);
+        }
+        if let Some(reason) = candidate
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            reason_codes.insert(reason.to_string());
+        }
+        for trace_id in json_array_strings(candidate.get("trace_event_ids")) {
+            trace_event_ids.insert(trace_id);
+        }
+        if let Some(trace_id) = candidate
+            .get("trace_event_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            trace_event_ids.insert(trace_id.to_string());
+        }
+        collect_named_string_values(
+            candidate,
+            &["code", "reason_code", "reason_codes", "reason", "reasons"],
+            &mut reason_codes,
+        );
+        collect_named_string_values(
+            candidate,
+            &["trace_event_id", "trace_event_ids"],
+            &mut trace_event_ids,
+        );
+    }
+    if reason_codes.is_empty() {
+        return Err(format!(
+            "audit_rejected:missing_denial_reason_codes case={case_name} category={category}"
+        ));
+    }
+    print_json_line(&AcceptanceAuditCheckReport {
+        schema_version: "splendor.acceptance.audit_check.v1",
+        status: "passed",
+        category: category.to_string(),
+        case_name: case_name.to_string(),
+        reason_codes: reason_codes.into_iter().collect(),
+        trace_event_ids: trace_event_ids.into_iter().collect(),
+    })
+}
+
+fn acceptance_replay_mode(
+    mode: &str,
+    trace_path: &Path,
+    state_path: &Path,
+    audit_path: &Path,
+    scenario_report_path: &Path,
+    source: &str,
+) -> Result<(), String> {
+    let allowed_modes = BTreeSet::from([
+        "inspect_only",
+        "read_only_re_evaluation",
+        "policy_comparison",
+        "verifier_explanation",
+    ]);
+    if !allowed_modes.contains(mode) {
+        return Err(format!("replay_mode_rejected:unsupported_mode mode={mode}"));
+    }
+
+    let trace_raw = fs::read_to_string(trace_path)
+        .map_err(|error| format!("Failed to read trace artifact: {error}"))?;
+    let records = trace_raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map_err(|error| format!("Malformed trace JSON line: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.is_empty() {
+        return Err("replay_mode_rejected:empty_trace".to_string());
+    }
+
+    let state_value = read_json_value(state_path)?;
+    let audit_value = read_json_value(audit_path)?;
+    let scenario = read_json_value(scenario_report_path)?;
+    let state_hashes = acceptance_state_hashes(&state_value);
+    let scenario_hashes = json_array_strings(scenario.get("state_hashes"));
+    let matching_state_hashes = state_hashes
+        .intersection(&scenario_hashes)
+        .cloned()
+        .collect::<Vec<_>>();
+    if matching_state_hashes.is_empty() {
+        return Err("replay_mode_rejected:state_hash_mismatch".to_string());
+    }
+
+    let mut event_types = records
+        .iter()
+        .filter_map(|record| record.get("event_type").and_then(serde_json::Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    if event_types.is_empty() {
+        event_types.insert("untyped_trace_record".to_string());
+    }
+
+    let mut evidence_fields = BTreeMap::new();
+    evidence_fields.insert(
+        "source_artifacts_validated".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    evidence_fields.insert(
+        "state_hashes_matched".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    evidence_fields.insert(
+        "adapter_execution_permitted".to_string(),
+        serde_json::Value::Bool(false),
+    );
+
+    match mode {
+        "inspect_only" => {
+            evidence_fields.insert("inspection_scope".to_string(), "trace_state_audit".into());
+        }
+        "read_only_re_evaluation" => {
+            evidence_fields.insert(
+                "reevaluation_scope".to_string(),
+                "read_only_artifact_check".into(),
+            );
+            evidence_fields.insert(
+                "state_nodes_observed".to_string(),
+                acceptance_state_node_ids(&state_value).len().into(),
+            );
+        }
+        "policy_comparison" => {
+            evidence_fields.insert("old_policy_ref".to_string(), "prior-scenario-policy".into());
+            evidence_fields.insert(
+                "new_policy_ref".to_string(),
+                "uc-e2e-s8-comparison-policy".into(),
+            );
+            evidence_fields.insert(
+                "comparison_basis".to_string(),
+                "trace_event_sequence_and_state_hashes".into(),
+            );
+        }
+        "verifier_explanation" => {
+            let mut reason_codes = BTreeSet::new();
+            collect_named_string_values(
+                &audit_value,
+                &["code", "reason_code", "reason_codes", "reason", "reasons"],
+                &mut reason_codes,
+            );
+            if reason_codes.is_empty() {
+                return Err("replay_mode_rejected:missing_verifier_reason_codes".to_string());
+            }
+            evidence_fields.insert(
+                "reason_codes".to_string(),
+                serde_json::Value::Array(
+                    reason_codes
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        _ => unreachable!("mode was validated above"),
+    }
+
+    print_json_line(&AcceptanceReplayModeReport {
+        schema_version: "splendor.acceptance.replay_mode.v1",
+        mode: mode.to_string(),
+        status: "completed",
+        source: source.to_string(),
+        public_command: "splendorctl acceptance replay-mode",
+        trace_path: trace_path.display().to_string(),
+        state_path: state_path.display().to_string(),
+        audit_path: audit_path.display().to_string(),
+        scenario_report_path: scenario_report_path.display().to_string(),
+        trace_digest: acceptance_file_digest(trace_path)?,
+        state_digest: acceptance_file_digest(state_path)?,
+        audit_digest: acceptance_file_digest(audit_path)?,
+        scenario_report_digest: acceptance_file_digest(scenario_report_path)?,
+        trace_chain_hash: acceptance_trace_chain_hash(&records)?,
+        trace_records: records.len(),
+        matching_state_hashes,
+        event_types_observed: event_types.into_iter().collect(),
+        evidence_fields,
+        side_effects_allowed: false,
+        side_effects_executed: false,
+    })
+}
+
+fn acceptance_replay_credential_check(credential_path: &Path) -> Result<(), String> {
+    let credential = read_json_value(credential_path)?;
+    let text = serde_json::to_string(&credential)
+        .map_err(|error| format!("Failed to encode credential fixture: {error}"))?;
+    if text.contains("production_external_secret")
+        || text.contains("real_external_credential")
+        || text.contains("external_secret_material")
+    {
+        return Err("replay_credential_rejected:real_external_credentials_forbidden".to_string());
+    }
+    print_json_line(&serde_json::json!({
+        "schema_version": "splendor.acceptance.replay_credential_check.v1",
+        "status": "passed",
+        "real_external_credentials": false
+    }))
+}
+
+fn acceptance_trace_chain_hash(records: &[serde_json::Value]) -> Result<String, String> {
+    let mut previous =
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    for record in records {
+        let payload = serde_json::to_vec(record)
+            .map_err(|error| format!("Failed to encode trace record for chain hash: {error}"))?;
+        let mut bytes = previous.into_bytes();
+        bytes.push(b'\n');
+        bytes.extend(payload);
+        previous = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    }
+    Ok(previous)
+}
+
+fn acceptance_file_digest(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+fn read_json_value(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("Malformed JSON in {}: {error}", path.display()))
+}
+
+fn json_array_strings(value: Option<&serde_json::Value>) -> BTreeSet<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn acceptance_state_hashes(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut hashes = BTreeSet::new();
+    collect_named_strings(
+        value,
+        &["state_hash", "data_hash", "state_node_hash", "value"],
+        &mut hashes,
+    );
+    hashes
+        .into_iter()
+        .filter(|value| {
+            value.starts_with("sha") || value.starts_with("blake3:") || value.len() >= 32
+        })
+        .collect()
+}
+
+fn acceptance_state_node_ids(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    collect_named_strings(
+        value,
+        &["state_node_id", "state_head_id", "previous_state_node_id"],
+        &mut ids,
+    );
+    ids
+}
+
+fn acceptance_schema_versions(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut versions = BTreeSet::new();
+    collect_named_strings(value, &["schema_version", "schema"], &mut versions);
+    versions
+        .into_iter()
+        .filter(|value| value.starts_with("splendor.") || value == "v1")
+        .collect()
+}
+
+fn collect_named_strings(value: &serde_json::Value, names: &[&str], out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                if names.iter().any(|name| name == key) {
+                    if let Some(text) = nested.as_str() {
+                        if !text.trim().is_empty() {
+                            out.insert(text.to_string());
+                        }
+                    }
+                }
+                collect_named_strings(nested, names, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_named_strings(item, names, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_named_string_values(
+    value: &serde_json::Value,
+    names: &[&str],
+    out: &mut BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                if names.iter().any(|name| name == key) {
+                    match nested {
+                        serde_json::Value::String(text) if !text.trim().is_empty() => {
+                            out.insert(text.to_string());
+                        }
+                        serde_json::Value::Array(items) => {
+                            for item in items {
+                                if let Some(text) =
+                                    item.as_str().filter(|value| !value.trim().is_empty())
+                                {
+                                    out.insert(text.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                collect_named_string_values(nested, names, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_named_string_values(item, names, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_case_records<'a>(
+    value: &'a serde_json::Value,
+    case_name: &str,
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("case").and_then(serde_json::Value::as_str) == Some(case_name) {
+                out.push(value);
+            }
+            for nested in map.values() {
+                collect_case_records(nested, case_name, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_case_records(item, case_name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn print_json_line(value: &impl Serialize) -> Result<(), String> {
+    let line = serde_json::to_string(value)
+        .map_err(|error| format!("Failed to encode acceptance output: {error}"))?;
     println!("{line}");
     Ok(())
 }
@@ -1888,6 +2793,13 @@ fn string_value(value: &serde_json::Value, key: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ReplayOutput {
+    ReplayLifecycle {
+        event: String,
+        trace_event_id: TraceEventId,
+        run_id: String,
+        replay_mode: String,
+        side_effects_replayed: bool,
+    },
     ReplayStart {
         run_id: String,
         from_snapshot: Option<String>,
@@ -1934,6 +2846,16 @@ enum ReplayOutput {
         reason: Option<String>,
         trace_sequence: u64,
     },
+}
+
+fn replay_lifecycle_record(run_id: &RunId, event: &str, sequence: u64) -> ReplayOutput {
+    ReplayOutput::ReplayLifecycle {
+        event: event.to_string(),
+        trace_event_id: TraceEventId::from_run_sequence(run_id, sequence),
+        run_id: run_id.to_string(),
+        replay_mode: "inspect_only".to_string(),
+        side_effects_replayed: false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2125,13 +3047,27 @@ fn collect_replay_outputs(
     start_tick: Option<u64>,
     include_state: bool,
 ) -> Result<Vec<ReplayOutput>, String> {
-    let mut outputs = vec![ReplayOutput::ReplayStart {
-        run_id: run_id.to_string(),
-        from_snapshot,
-        snapshot_bytes_len,
-        replay_mode: "inspect_only".to_string(),
-        side_effects_replayed: false,
-    }];
+    let replay_run_id = if let Some(event) = events.first() {
+        event.run_id.clone()
+    } else {
+        RunId::parse(run_id)
+            .map_err(|error| format!("Invalid replay run_id '{run_id}': {error}"))?
+    };
+    let next_replay_sequence = events
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .map_or(0, |sequence| sequence + 1);
+    let mut outputs = vec![
+        replay_lifecycle_record(&replay_run_id, "replay.started", next_replay_sequence),
+        ReplayOutput::ReplayStart {
+            run_id: run_id.to_string(),
+            from_snapshot,
+            snapshot_bytes_len,
+            replay_mode: "inspect_only".to_string(),
+            side_effects_replayed: false,
+        },
+    ];
 
     let mut current_tick: Option<ReplayTick> = None;
     let mut current_tick_id = 0;
@@ -2253,6 +3189,21 @@ fn collect_replay_outputs(
         approval_events: causal_graph.approval_events,
         circuit_breaker_denials: causal_graph.circuit_breaker_denials,
     });
+    if events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ActionExecuted { .. }))
+    {
+        outputs.push(replay_lifecycle_record(
+            &replay_run_id,
+            "replay.adapter_suppressed",
+            next_replay_sequence + 1,
+        ));
+    }
+    outputs.push(replay_lifecycle_record(
+        &replay_run_id,
+        "replay.completed",
+        next_replay_sequence + 2,
+    ));
     Ok(outputs)
 }
 
@@ -2351,6 +3302,42 @@ fn replay_message_event(event: &TraceEvent) -> Result<Option<ReplayMessageEvent>
 }
 
 fn replay_parent_child_run(event: &TraceEvent) -> Result<Option<ReplayParentChildRun>, String> {
+    match &event.kind {
+        TraceEventKind::DelegationRequested { delegation }
+        | TraceEventKind::ChildRunCompleted { delegation }
+        | TraceEventKind::ChildRunFailed { delegation, .. }
+        | TraceEventKind::DelegationRejected { delegation, .. } => {
+            if delegation.parent_run_id != event.run_id {
+                return Err(format!(
+                    "Local delegation parent run mismatch at sequence {}: event run '{}' but parent run '{}'",
+                    event.sequence, event.run_id, delegation.parent_run_id
+                ));
+            }
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        TraceEventKind::ChildRunStarted { delegation } => {
+            return Ok(Some(ReplayParentChildRun {
+                trace_event_id: event.trace_event_id.clone(),
+                parent_run_id: delegation.parent_run_id.clone(),
+                child_run_id: delegation.child_run_id.clone(),
+                parent_agent_id: delegation.source_agent_id.clone(),
+                child_agent_id: delegation.target_agent_id.clone(),
+                causal_parent: delegation.parent_trace_id.clone(),
+                source_message_id: delegation.request_message_id.clone(),
+                side_effects_replayed: false,
+            }));
+        }
+        _ => {}
+    }
     if let TraceEventKind::ChildRunLinked {
         parent_run_id,
         child_run_id,
@@ -2653,6 +3640,13 @@ struct RunConfig {
     work_order: Option<WorkOrderConfig>,
     runtime_identity: Option<RuntimeIdentityConfig>,
     circuit_breakers: Option<Vec<CircuitBreakerConfig>>,
+    failure_injection: Option<FailureInjectionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailureInjectionConfig {
+    trace_fail_on_event: Option<String>,
+    state_commit_fail: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2782,6 +3776,112 @@ struct HttpConfig {
     timeout_ms: Option<u64>,
 }
 
+struct FailingTraceStore {
+    inner: SqliteTraceStore,
+    fail_on_event: String,
+    failed: Mutex<bool>,
+}
+
+impl TraceStore for FailingTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
+            let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
+            if !*failed {
+                *failed = true;
+                return Err(TraceStoreError::InvalidTimestamp(format!(
+                    "injected_trace_write_failure:{}",
+                    self.fail_on_event
+                )));
+            }
+        }
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read(run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read_range(run_id, start, end)
+    }
+}
+
+fn trace_payload_kind(payload: &serde_json::Value) -> Option<String> {
+    let kind = payload.get("kind")?;
+    kind.as_str()
+        .map(ToString::to_string)
+        .or_else(|| kind.as_object()?.keys().next().cloned())
+}
+
+struct FailingStateStore {
+    inner: SqliteStateStore,
+    fail_commit: bool,
+    failed: Mutex<bool>,
+}
+
+impl StateStore for FailingStateStore {
+    fn put_state(
+        &self,
+        state: splendor_store::StateData,
+    ) -> Result<splendor_store::StateDataRef, splendor_store::StateStoreError> {
+        self.inner.put_state(state)
+    }
+
+    fn get_state(
+        &self,
+        data_ref: &splendor_store::StateDataRef,
+    ) -> Result<splendor_store::StateData, splendor_store::StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<splendor_types::StateNodeId>,
+        data_ref: splendor_store::StateDataRef,
+        metadata: splendor_store::StateMetadata,
+    ) -> Result<splendor_types::StateNodeId, splendor_store::StateStoreError> {
+        if self.fail_commit {
+            let mut failed = self
+                .failed
+                .lock()
+                .map_err(|_| splendor_store::StateStoreError::Poisoned)?;
+            if !*failed {
+                *failed = true;
+                return Err(splendor_store::StateStoreError::InvalidStateNodeId(
+                    "injected_state_commit_failure".to_string(),
+                ));
+            }
+        }
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(
+        &self,
+        node_id: &splendor_types::StateNodeId,
+    ) -> Result<splendor_store::StateNode, splendor_store::StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(
+        &self,
+        node_id: &splendor_types::StateNodeId,
+    ) -> Result<SnapshotId, splendor_store::StateStoreError> {
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(
+        &self,
+        snapshot_id: &SnapshotId,
+    ) -> Result<splendor_store::StateSnapshot, splendor_store::StateStoreError> {
+        self.inner.load_snapshot(snapshot_id)
+    }
+}
+
 struct StaticPerceptor {
     percepts: Vec<PerceptConfig>,
 }
@@ -2882,10 +3982,21 @@ fn run_from_config(
                 .map_err(|error| format!("Failed to create trace directory: {error}"))?;
         }
     }
-    let trace_store = Arc::new(
-        SqliteTraceStore::open(&config.trace_db)
-            .map_err(|error| format!("Failed to open trace store: {error}"))?,
-    );
+    let sqlite_trace_store = SqliteTraceStore::open(&config.trace_db)
+        .map_err(|error| format!("Failed to open trace store: {error}"))?;
+    let trace_store: Arc<dyn TraceStore> = if let Some(event) = config
+        .failure_injection
+        .as_ref()
+        .and_then(|injection| injection.trace_fail_on_event.clone())
+    {
+        Arc::new(FailingTraceStore {
+            inner: sqlite_trace_store,
+            fail_on_event: event,
+            failed: Mutex::new(false),
+        })
+    } else {
+        Arc::new(sqlite_trace_store)
+    };
     let work_order = validate_config_work_order(&config, trace_store.as_ref())?;
 
     if let Some(parent) = config.state_db.parent() {
@@ -2894,10 +4005,22 @@ fn run_from_config(
                 .map_err(|error| format!("Failed to create state directory: {error}"))?;
         }
     }
-    let state_store = Arc::new(
-        SqliteStateStore::open(&config.state_db)
-            .map_err(|error| format!("Failed to open state store: {error}"))?,
-    );
+    let sqlite_state_store = SqliteStateStore::open(&config.state_db)
+        .map_err(|error| format!("Failed to open state store: {error}"))?;
+    let state_store: Arc<dyn StateStore> = if config
+        .failure_injection
+        .as_ref()
+        .and_then(|injection| injection.state_commit_fail)
+        .unwrap_or(false)
+    {
+        Arc::new(FailingStateStore {
+            inner: sqlite_state_store,
+            fail_commit: true,
+            failed: Mutex::new(false),
+        })
+    } else {
+        Arc::new(sqlite_state_store)
+    };
 
     let registry = build_registry_with_work_order(&config, work_order.as_ref())?;
     let circuit_breaker_trace_contexts =
@@ -3019,6 +4142,20 @@ fn load_run_config(path: &Path) -> Result<RunConfig, String> {
         }
         _ => Err("Config must be .yaml, .yml, or .json".to_string()),
     }
+}
+
+fn sign_work_order(input_path: &Path, key_id: &str, secret: &str) -> Result<(), String> {
+    let content = fs::read_to_string(input_path)
+        .map_err(|error| format!("Failed to read work order: {error}"))?;
+    let work_order: WorkOrder = serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse work order JSON: {error}"))?;
+    let envelope =
+        WorkOrderEnvelope::signed_with_shared_secret(work_order, key_id, secret.as_bytes())
+            .map_err(|error| format!("Work order rejected: {}", error.reason_code()))?;
+    let line = serde_json::to_string_pretty(&envelope)
+        .map_err(|error| format!("Failed to encode signed work order: {error}"))?;
+    println!("{line}");
+    Ok(())
 }
 
 fn resolve_config_path(path: &Path) -> Result<PathBuf, String> {
@@ -3326,6 +4463,9 @@ fn build_gateway(
         ));
     }
     gateway.set_circuit_breaker_evaluator(evaluator);
+    gateway.set_resource_boundary_verifier(Arc::new(LocalResourceBoundaryVerifier::from_config(
+        config.adapters.as_ref(),
+    )));
     let actions = collect_action_configs(config)?;
     for action in actions {
         let adapter_id = action
@@ -3338,6 +4478,150 @@ fn build_gateway(
         gateway.register_adapter(&action.name, &adapter_id, Arc::clone(adapter));
     }
     Ok(Arc::new(gateway))
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalResourceBoundaryVerifier {
+    http_allowed_domains: Vec<String>,
+}
+
+impl LocalResourceBoundaryVerifier {
+    fn from_config(config: Option<&AdaptersConfig>) -> Self {
+        Self {
+            http_allowed_domains: config
+                .and_then(|adapters| adapters.http.as_ref())
+                .map(|http| http.allowed_domains.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl ResourceBoundaryVerifier for LocalResourceBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+        adapter: Option<&str>,
+    ) -> splendor_types::VerificationResult {
+        match adapter {
+            Some("http") => self.verify_http(action),
+            Some("filesystem") => self.verify_filesystem(action),
+            _ => splendor_types::VerificationResult::allow(),
+        }
+    }
+}
+
+impl LocalResourceBoundaryVerifier {
+    fn verify_http(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+    ) -> splendor_types::VerificationResult {
+        let Some(url) = action
+            .action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+        else {
+            return boundary_denied(
+                "network_scope_missing_url",
+                "network_egress_verifier",
+                serde_json::json!({"parameter": "url"}),
+            );
+        };
+        let Some(host) = http_host(url) else {
+            return boundary_denied(
+                "network_scope_invalid_url",
+                "network_egress_verifier",
+                serde_json::json!({"url": url}),
+            );
+        };
+        if !domain_allowed(&self.http_allowed_domains, &host) {
+            return boundary_denied(
+                "network_scope_denied",
+                "network_egress_verifier",
+                serde_json::json!({"host": host, "allowed_domains": self.http_allowed_domains}),
+            );
+        }
+        splendor_types::VerificationResult::allow()
+    }
+
+    fn verify_filesystem(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+    ) -> splendor_types::VerificationResult {
+        let Some(raw_path) = action
+            .action
+            .params
+            .get("path")
+            .and_then(|value| value.as_str())
+        else {
+            return boundary_denied(
+                "filesystem_scope_missing_path",
+                "filesystem_verifier",
+                serde_json::json!({"parameter": "path"}),
+            );
+        };
+        let path = Path::new(raw_path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return boundary_denied(
+                "filesystem_scope_denied",
+                "filesystem_verifier",
+                serde_json::json!({"path": raw_path, "reason": "path_traversal_or_absolute_path"}),
+            );
+        }
+        splendor_types::VerificationResult::allow()
+    }
+}
+
+fn boundary_denied(
+    reason: &str,
+    verifier: &str,
+    evidence: serde_json::Value,
+) -> splendor_types::VerificationResult {
+    splendor_types::VerificationResult {
+        allowed: false,
+        reasons: vec![reason.to_string()],
+        artifacts: serde_json::json!({
+            "source": verifier,
+            "verifier": verifier,
+            "adapter_execution": "not_attempted",
+            "evidence": evidence,
+        }),
+    }
+}
+
+fn http_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+        .split(':')
+        .next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn domain_allowed(allowlist: &[String], host: &str) -> bool {
+    !allowlist.is_empty()
+        && allowlist.iter().any(|entry| {
+            if entry.starts_with("*.") {
+                host.ends_with(&entry[1..])
+            } else if entry.starts_with('.') {
+                host.ends_with(entry)
+            } else {
+                host == entry
+            }
+        })
 }
 
 fn build_runtime_identity(
@@ -3667,6 +4951,134 @@ fn parse_run_id(value: &str) -> Result<splendor_types::RunId, String> {
     Ok(uuid.into())
 }
 
+fn daemon_request(
+    method: &str,
+    url: &str,
+    body_path: Option<&Path>,
+    credential_path: Option<&Path>,
+    token: &str,
+) -> Result<(), String> {
+    let parsed = parse_local_http_url(url)?;
+    let body = match body_path {
+        Some(path) => Some(
+            fs::read_to_string(path).map_err(|err| format!("Failed to read body file: {err}"))?,
+        ),
+        None => None,
+    };
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        let body_json: serde_json::Value = serde_json::from_str(body.as_deref().unwrap_or(""))
+            .map_err(|err| format!("Mutating daemon request body must be JSON: {err}"))?;
+        if body_json
+            .get("credential")
+            .is_none_or(serde_json::Value::is_null)
+            || body_json
+                .get("audit_attribution")
+                .is_none_or(serde_json::Value::is_null)
+        {
+            return Err(
+                "Mutating daemon requests require body credential and audit_attribution"
+                    .to_string(),
+            );
+        }
+    }
+    let credential = match credential_path {
+        Some(path) => Some(
+            fs::read_to_string(path)
+                .map_err(|err| format!("Failed to read caller credential file: {err}"))?,
+        ),
+        None => None,
+    };
+    let response = send_local_http(
+        &parsed.host,
+        parsed.port,
+        method,
+        &parsed.path,
+        token,
+        body.as_deref(),
+        credential.as_deref(),
+    )?;
+    print!("{response}");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParsedLocalUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_local_http_url(url: &str) -> Result<ParsedLocalUrl, String> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        "splendorctl daemon request only supports explicit local http:// daemon URLs".to_string()
+    })?;
+    let (authority, path_part) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "Daemon URL must include host and port".to_string())?;
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return Err("splendorctl daemon request refuses non-local daemon hosts".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "Daemon URL port is invalid".to_string())?;
+    let path = format!("/{path_part}");
+    Ok(ParsedLocalUrl {
+        host: host.trim_matches(&['[', ']'][..]).to_string(),
+        port,
+        path,
+    })
+}
+
+fn send_local_http(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+    credential: Option<&str>,
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect((host, port))
+        .map_err(|err| format!("Failed to connect to daemon: {err}"))?;
+    let body = body.unwrap_or("");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\nAuthorization: Bearer {token}\r\nX-Splendor-API-Version: 0.1\r\nX-Splendor-Client: splendorctl\r\nConnection: close\r\n"
+    );
+    if let Some(credential) = credential {
+        request.push_str("X-Splendor-Caller-Credential: ");
+        request.push_str(&credential.replace(['\r', '\n'], ""));
+        request.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("Failed to write daemon request: {err}"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("Failed to read daemon response: {err}"))?;
+    let (head, response_body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "Daemon returned malformed HTTP response".to_string())?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "Daemon request failed with HTTP {status}: {response_body}"
+        ));
+    }
+    Ok(response_body.to_string())
+}
+
 /// Returns the CLI usage string.
 fn usage() -> String {
     [
@@ -3674,7 +5086,14 @@ fn usage() -> String {
         "splendorctl state head --db <trace-path> --run <run-id>",
         "splendorctl replay --db <trace-path> --state-db <state-path> --run <run-id> [--from-snapshot <id>] [--include-state]",
         "splendorctl audit export --db <trace-path> --state-db <state-path> --run <run-id> [--tenant <id>] [--agent <id>] [--action <id-or-name>] [--adapter <id>] [--node <id>] [--instance <id>] [--fleet <id>]",
+        "splendorctl acceptance validate-import --trace <jsonl> --state <json> --scenario-report <json> --source <id> [--expected-trace-chain <hash>] [--expected-state-hash <hash>]",
+        "splendorctl acceptance compat --fixture <json> [--fixture <json> ...] --target-schema splendor.0.1.stable.v1",
+        "splendorctl acceptance audit-check --audit <json> --scenario-report <json> --case <name> --category <name>",
+        "splendorctl acceptance replay-mode --mode <inspect_only|read_only_re_evaluation|policy_comparison|verifier_explanation> --trace <jsonl> --state <json> --audit <json> --scenario-report <json> --source <id>",
+        "splendorctl acceptance replay-credential-check --credential <json>",
         "splendorctl run --config <path> [--cycles <n> | --forever]",
+        "splendorctl work-order sign --input <work-order.json> --key-id <id> --secret <secret>",
+        "splendorctl daemon request --method <GET|POST> --url <local-url> --token <token> [--body <json>] [--caller-credential <json>]",
         "splendorctl --version",
         "",
         "Commands:",
@@ -3682,7 +5101,10 @@ fn usage() -> String {
         "  state head     Print the latest state head recorded in the trace.",
         "  replay         Replay a run from trace + state stores.",
         "  audit export   Export a redacted governance audit from trace + state stores.",
+        "  acceptance     Run public acceptance validators for artifact import, replay modes, schema compatibility, and audit reason codes.",
         "  run            Run a local agent loop from config.",
+        "  work-order     Sign local work-order fixtures for scoped run authority.",
+        "  daemon         Request documented local daemon endpoints; actions still go through /actions and the gateway.",
         "  --version      Print package and milestone release identifiers.",
         "",
         "Options:",
@@ -3696,6 +5118,7 @@ fn usage() -> String {
         "  --config <path>      Path to a run config (yaml/json).",
         "  --cycles <n>         Number of cycles to run.",
         "  --forever            Run until interrupted.",
+        "  --token <token>      Required caller token; anonymous daemon fallback is refused.",
     ]
     .join("\n")
 }

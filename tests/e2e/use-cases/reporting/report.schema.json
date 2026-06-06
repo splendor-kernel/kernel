@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://splendor-os.org/schemas/e2e/use-case-acceptance-report.v1.json",
+  "title": "Splendor Use-Case E2E Acceptance Report",
+  "type": "object",
+  "required": [
+    "suite_id",
+    "suite_version",
+    "source_revision",
+    "started_at",
+    "completed_at",
+    "container_topology_hash",
+    "topology_identifier",
+    "commands",
+    "api_contract_versions",
+    "component_versions",
+    "contract_status",
+    "anti_drift_status",
+    "scenarios",
+    "blocking_failures",
+    "non_goal_observations",
+    "human_summary_path"
+  ],
+  "properties": {
+    "suite_id": {"const": "splendor-use-case-e2e-through-0.1"},
+    "suite_version": {"type": "string"},
+    "source_revision": {"type": "string"},
+    "started_at": {"type": "string"},
+    "completed_at": {"type": "string"},
+    "container_topology_hash": {"type": "string", "pattern": "^sha256:"},
+    "topology_identifier": {"type": "string"},
+    "commands": {"type": "array", "items": {"type": "string"}},
+    "api_contract_versions": {"type": "object"},
+    "component_versions": {"type": "object"},
+    "contract_status": {"type": "object", "required": ["status", "blocked_not_yet_covered"]},
+    "anti_drift_status": {"type": "object", "required": ["status"]},
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "fr_coverage",
+          "components",
+          "positive_evidence",
+          "negative_evidence",
+          "replay_evidence",
+          "replay_mode",
+          "replay_side_effect_suppression",
+          "replay_artifacts",
+          "anti_drift_checks",
+          "artifact_paths"
+        ],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"enum": ["passed", "failed", "blocked_not_yet_covered"]},
+          "fr_coverage": {"type": "array", "items": {"type": "string"}},
+          "components": {"type": "array", "items": {"type": "string"}},
+          "positive_evidence": {"type": "array", "items": {"type": "string"}},
+          "negative_evidence": {"type": "array", "items": {"type": "string"}},
+          "replay_evidence": {"type": "array", "items": {"type": "string"}},
+          "replay_mode": {"type": "string"},
+          "replay_side_effect_suppression": {"type": "object", "required": ["required", "evidence_present"]},
+          "replay_artifacts": {"type": "array", "items": {"type": "string"}},
+          "anti_drift_checks": {"type": "array", "items": {"type": "string"}},
+          "run_ids": {"type": "array", "items": {"type": "string"}},
+          "trace_event_ids": {"type": "array", "items": {"type": "string"}},
+          "state_node_ids": {"type": "array", "items": {"type": "string"}},
+          "state_hashes": {"type": "array", "items": {"type": "string"}},
+          "message_ids": {"type": "array", "items": {"type": "string"}},
+          "work_order_ids": {"type": "array", "items": {"type": "string"}},
+          "approval_ids": {"type": "array", "items": {"type": "string"}},
+          "node_ids": {"type": "array", "items": {"type": "string"}},
+          "artifact_paths": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "blocking_failures": {"type": "array", "items": {"type": "string"}},
+    "non_goal_observations": {"type": "array", "items": {"type": "string"}},
+    "human_summary_path": {"type": "string"}
+  }
+}

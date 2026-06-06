@@ -1,16 +1,19 @@
 use axum::body::{to_bytes, Body};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use splendor_daemon::{
-    router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
-    DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest, PolicySyncRequest,
-    PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus,
-    StateHeadResponse, SubmitActionRequest, TickResponse, TracePageResponse,
+    router, ApiErrorBody, AppendPerceptRequest, CircuitBreakerSyncResponse, CreateRunRequest,
+    CreateRunResponse, DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest,
+    PolicySyncRequest, PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse,
+    RunStatus, StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
+    StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
+    TracePageResponse,
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
-    AuditAttribution, ClientPrincipal, CredentialAudience, EndpointScope, Percept,
+    AuditAttribution, CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
+    ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope, Percept,
     PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
     QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
     WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
@@ -196,6 +199,7 @@ fn create_request(
         policy_bundle: None,
         registered_actions,
         approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.test.v1".to_string()],
         allowed_percept_sources: vec!["daemon-client-local".to_string()],
         initial_state: Some(json!({"seed": true})),
@@ -253,6 +257,159 @@ async fn call_empty<T: DeserializeOwned>(
     (status, parsed)
 }
 
+async fn call_empty_with_credential<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    credential: &CallerCredential,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(
+            "x-splendor-caller-credential",
+            serde_json::to_string(credential).expect("credential json"),
+        )
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "json response ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+async fn call_empty_with_credential_header<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    header: HeaderValue,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-splendor-caller-credential", header)
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "json response ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+fn caller_credential(scopes: Vec<EndpointScope>) -> CallerCredential {
+    caller_credential_for_tenant(TenantId::new(), scopes)
+}
+
+fn caller_credential_for_tenant(
+    tenant_id: TenantId,
+    scopes: Vec<EndpointScope>,
+) -> CallerCredential {
+    CallerCredential {
+        credential_id: "cred_test".to_string(),
+        principal: principal(),
+        scopes,
+        binding: CredentialBinding::Tenant { tenant_id },
+        audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        revocation: RevocationStatus::Active,
+    }
+}
+
+fn matching_attribution(credential: &CallerCredential) -> AuditAttribution {
+    AuditAttribution {
+        principal: credential.principal.clone(),
+        credential_id: Some(credential.credential_id.clone()),
+        requested_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn public_caller_credential_header(scopes: Vec<&str>) -> HeaderValue {
+    HeaderValue::from_str(
+        &json!({
+            "credential_id": "cred_public_header",
+            "principal": {
+                "app": {
+                    "app_principal_id": "app_public_header",
+                    "label": "public header app"
+                },
+                "client_principal_id": "client_public_header",
+                "label": "public header client"
+            },
+            "scopes": scopes,
+            "binding": {
+                "tenant": {
+                    "tenant_id": TenantId::new().to_string()
+                }
+            },
+            "audience": {
+                "daemon": {
+                    "daemon_id": "daemon_local"
+                }
+            },
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expires_at"),
+            "revocation": "active"
+        })
+        .to_string(),
+    )
+    .expect("public credential header")
+}
+
+fn public_caller_credential_header_with_revocation(
+    scopes: Vec<&str>,
+    revocation: Value,
+) -> HeaderValue {
+    HeaderValue::from_str(
+        &json!({
+            "credential_id": "cred_public_header",
+            "principal": {
+                "app": {
+                    "app_principal_id": "app_public_header",
+                    "label": "public header app"
+                },
+                "client_principal_id": "client_public_header",
+                "label": "public header client"
+            },
+            "scopes": scopes,
+            "binding": {
+                "tenant": {
+                    "tenant_id": TenantId::new().to_string()
+                }
+            },
+            "audience": {
+                "daemon": {
+                    "daemon_id": "daemon_local"
+                }
+            },
+            "expires_at": (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("expires_at"),
+            "revocation": revocation
+        })
+        .to_string(),
+    )
+    .expect("public credential header")
+}
+
 #[tokio::test]
 async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     let state = DaemonState::local_dev();
@@ -260,6 +417,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: action("allowed_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -429,6 +587,16 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stopped.status, RunStatus::Cancelled);
 
+    let (status, cancelled): (StatusCode, RunInspectResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/cancel", created.run_id),
+        serde_json::to_value(&lifecycle).expect("cancel request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+
     let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
         Method::GET,
@@ -503,16 +671,75 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert!(saw_appended, "append endpoint should be trace-linked");
     assert!(saw_received, "queued daemon percept should reach the tick");
 
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = AuditAttribution {
+        credential_id: Some(trace_credential.credential_id.clone()),
+        ..attribution()
+    };
+    let (status, trace_export): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({"credential": trace_credential, "audit_attribution": trace_audit, "redaction_policy": "none", "start": null, "end": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        trace_export["record_count"].as_u64(),
+        Some(traces.records.len() as u64 + 1)
+    );
+    assert!(trace_export["integrity_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("trace-chain:v1:"));
+
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let before_replay_executions = inspected.adapter_executions;
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential.clone(), "audit_attribution": replay_audit.clone()}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(replay.mode, "inspect_only");
+
+    let (status, explicit_replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit, "mode": "inspect_only", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_replay.mode, "inspect_only");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "inspect_only", "side_effects_allowed": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "replay_side_effects_forbidden");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"mode": "execute", "side_effects_allowed": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "unsupported_replay_mode");
 
     let (status, inspected_after_replay): (StatusCode, RunInspectResponse) = call_empty(
         app.clone(),
@@ -528,11 +755,250 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
 }
 
 #[tokio::test]
+async fn state_snapshot_export_import_uses_authenticated_state_authority() {
+    let state = DaemonState::local_dev();
+    let app = router(state);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let policy_action_id = ActionId::new();
+    let mut planned_action = read_only_action("allowed_action");
+    planned_action.preconditions = vec!["ready".to_string()];
+    let policy_actions = vec![DaemonActionCandidate {
+        action_id: Some(policy_action_id.clone()),
+        action: planned_action,
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: vec!["ready".to_string()],
+    }];
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            policy_actions,
+            vec![RegisteredAction {
+                name: "allowed_action".to_string(),
+                adapter: "daemon.local".to_string(),
+            }],
+        ))
+        .expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("commit state before handoff".to_string()),
+        approval_evidence: None,
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("start request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!tick.state_node_id.is_empty());
+    assert_eq!(
+        tick.action_outcomes
+            .first()
+            .expect("policy action outcome")
+            .action_id,
+        policy_action_id
+    );
+
+    let credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::StateRead]);
+    let audit_attribution = matching_attribution(&credential);
+    let export_request = StateSnapshotExportRequest {
+        run_id: created.run_id.clone(),
+        credential: Some(credential.clone()),
+        audit_attribution: Some(audit_attribution.clone()),
+        work_order_id: "wo_state_handoff_test".to_string(),
+        source_instance_id: Some("instance_source".to_string()),
+        receiver_instance_id: Some("instance_receiver".to_string()),
+    };
+    let (status, exported): (StatusCode, StateSnapshotExportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/export",
+        serde_json::to_value(export_request.clone()).expect("export request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(exported.run_id, created.run_id);
+    assert_eq!(exported.state_node_id, tick.state_node_id);
+    assert_eq!(
+        exported.handoff.source_trace_id.as_ref(),
+        Some(&exported.trace_event_id)
+    );
+    assert_eq!(
+        exported.handoff.previous_state_node_id.as_deref(),
+        Some(tick.state_node_id.as_str())
+    );
+
+    let import_request = StateSnapshotImportRequest {
+        handoff: exported.handoff.clone(),
+        credential: Some(credential.clone()),
+        audit_attribution: Some(audit_attribution.clone()),
+    };
+    let (status, imported): (StatusCode, StateSnapshotImportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(import_request).expect("import request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(imported.run_id, created.run_id);
+    assert!(imported.accepted);
+    assert_eq!(imported.state_node_id, tick.state_node_id);
+
+    let (status, head): (StatusCode, StateHeadResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/state-head", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(head.state_node_id, imported.state_node_id);
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/state-snapshots/export",
+        serde_json::to_value(StateSnapshotExportRequest {
+            credential: None,
+            audit_attribution: Some(audit_attribution.clone()),
+            ..export_request
+        })
+        .expect("missing credential export request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_caller_credential");
+
+    let mut wrong_handoff = exported.handoff;
+    wrong_handoff.authority.tenant_id = TenantId::new();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app,
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: wrong_handoff,
+            credential: Some(credential),
+            audit_attribution: Some(audit_attribution),
+        })
+        .expect("wrong authority import request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "state_handoff_authority_mismatch");
+    assert!(error.details["trace_event_id"].is_string());
+}
+
+#[tokio::test]
+async fn replay_and_trace_export_reject_missing_null_and_mismatched_audit() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let create = create_request(tenant_id.clone(), agent_id, Vec::new(), Vec::new());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = AuditAttribution {
+        credential_id: Some(trace_credential.credential_id.clone()),
+        ..attribution()
+    };
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id, vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
+
+    for (path, credential, audit) in [
+        (
+            format!("/runs/{}/traces/export", created.run_id),
+            serde_json::to_value(&trace_credential).unwrap(),
+            serde_json::to_value(&trace_audit).unwrap(),
+        ),
+        (
+            format!("/runs/{}/replay", created.run_id),
+            serde_json::to_value(&replay_credential).unwrap(),
+            serde_json::to_value(&replay_audit).unwrap(),
+        ),
+    ] {
+        let mut base = if path.ends_with("/replay") {
+            json!({"mode": "inspect_only", "side_effects_allowed": false})
+        } else {
+            json!({"redaction_policy": "none", "start": null, "end": null})
+        };
+
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} missing credential");
+        assert_eq!(error.code, "missing_caller_credential");
+
+        base["credential"] = Value::Null;
+        base["audit_attribution"] = audit.clone();
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} null credential");
+        assert_eq!(error.code, "missing_caller_credential");
+
+        base["credential"] = credential.clone();
+        base.as_object_mut().unwrap().remove("audit_attribution");
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} missing audit");
+        assert_eq!(error.code, "missing_audit_attribution");
+
+        base["audit_attribution"] = Value::Null;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} null audit");
+        assert_eq!(error.code, "missing_audit_attribution");
+
+        let mut mismatched = audit.clone();
+        mismatched["credential_id"] = json!("cred_other");
+        base["audit_attribution"] = mismatched;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} credential mismatch");
+        assert_eq!(error.code, "audit_credential_mismatch");
+
+        let mut principal_mismatch = audit.clone();
+        principal_mismatch["principal"] =
+            serde_json::to_value(ClientPrincipal::new("app_test", "client_other")).unwrap();
+        base["audit_attribution"] = principal_mismatch;
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, &path, base.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} principal mismatch");
+        assert_eq!(error.code, "audit_principal_mismatch");
+    }
+}
+
+#[tokio::test]
 async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
     let app = router(DaemonState::local_dev());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: action("allowed_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -681,11 +1147,17 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
             .unwrap_or(false)
     }));
 
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -709,6 +1181,7 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: read_only_action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -843,6 +1316,191 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
     let serialized = serde_json::to_string(&traces.records).expect("serialized traces");
     assert!(!serialized.contains("raw-secret"));
     assert!(!serialized.contains("token="));
+}
+
+#[tokio::test]
+async fn circuit_breaker_sync_updates_live_gateway_and_preserves_action_id() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let breaker_id = CircuitBreakerId::try_new("breaker_daemon_sync").expect("breaker id");
+    let breaker = CircuitBreaker::tripped(
+        breaker_id.clone(),
+        CircuitBreakerScope::Adapter("daemon.local".to_string()),
+        "unit_breaker_sync",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("breaker");
+    let (status, synced): (StatusCode, CircuitBreakerSyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/governance/circuit-breakers/sync", created.run_id),
+        json!({
+            "credential": null,
+            "audit_attribution": attribution(),
+            "circuit_breakers": [breaker],
+            "reason": "unit_manager_sync"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(synced.accepted);
+    assert_eq!(synced.run_id, created.run_id);
+    assert_eq!(synced.breaker_ids, vec![breaker_id.to_string()]);
+
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces
+        .records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .find(|event| event.trace_event_id == synced.trace_event_id)
+        .map(|event| event.trace_event_id)
+        .expect("breaker sync audit trace");
+
+    let action_id = ActionId::new();
+    let submit = SubmitActionRequest {
+        action_id: Some(action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id: Some(causal_trace_id),
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(submit).expect("submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.action_id, action_id);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "circuit_breaker_tripped"));
+    assert_eq!(
+        outcome
+            .verification
+            .artifacts
+            .get("circuit_breaker")
+            .and_then(|value| value.get("circuit_breaker"))
+            .and_then(|value| value.get("breaker_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Some(breaker_id.to_string())
+    );
+}
+
+#[tokio::test]
+async fn create_run_circuit_breaker_denies_runtime_admission_fail_closed() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let mut create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+    let breaker_id = CircuitBreakerId::try_new("breaker_global_admission").expect("breaker id");
+    create.circuit_breakers = vec![CircuitBreaker::tripped(
+        breaker_id.clone(),
+        CircuitBreakerScope::Global,
+        "unit_global_admission",
+        OffsetDateTime::now_utc(),
+    )
+    .expect("global breaker")];
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("global breaker admission".to_string()),
+        approval_evidence: None,
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("start request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tick.status, RunStatus::Running);
+
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces.records.first().and_then(|record| {
+        serde_json::from_value::<TraceEvent>(record.payload.clone())
+            .ok()
+            .map(|event| event.trace_event_id)
+    });
+    let submit = SubmitActionRequest {
+        action_id: None,
+        run_id: created.run_id,
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id,
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app,
+        Method::POST,
+        "/actions",
+        serde_json::to_value(submit).expect("submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "circuit_breaker_tripped"));
+    assert!(outcome
+        .verification
+        .artifacts
+        .to_string()
+        .contains(&breaker_id.to_string()));
 }
 
 #[tokio::test]
@@ -983,9 +1641,10 @@ async fn revoked_policy_bundle_blocks_existing_side_effects() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
-        tenant_id,
-        agent_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
         credential: None,
         audit_attribution: Some(attribution()),
         causal_trace_id,
@@ -1031,6 +1690,7 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         let tenant_id = TenantId::new();
         let agent_id = AgentId::new();
         let policy_actions = vec![DaemonActionCandidate {
+            action_id: None,
             action: action("allowed_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1141,11 +1801,17 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(inspected.adapter_executions, 0);
 
+        let replay_credential =
+            caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+        let replay_audit = AuditAttribution {
+            credential_id: Some(replay_credential.credential_id.clone()),
+            ..attribution()
+        };
         let (status, replay): (StatusCode, ReplayResponse) = call_json(
             app.clone(),
             Method::POST,
             &format!("/runs/{}/replay", created.run_id),
-            json!({}),
+            json!({"credential": replay_credential, "audit_attribution": replay_audit}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1364,6 +2030,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action("extra_action"),
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1386,6 +2053,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action("allowed_action"),
             adapter: Some("extra.adapter".to_string()),
             quota_usage: None,
@@ -1410,6 +2078,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         tenant_id.clone(),
         agent_id.clone(),
         vec![DaemonActionCandidate {
+            action_id: None,
             action: action_with_permission,
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
@@ -1505,6 +2174,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     denied_action.required_permissions = vec!["not.allowed".to_string()];
 
     let unlinked_submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -1541,12 +2211,13 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
-        tenant_id,
-        agent_id,
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
         credential: None,
         audit_attribution: Some(attribution()),
-        causal_trace_id,
+        causal_trace_id: causal_trace_id.clone(),
         action: denied_action,
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
@@ -1567,6 +2238,34 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         .reasons
         .iter()
         .any(|reason| reason == "permission_denied"));
+    let disallowed_submit = SubmitActionRequest {
+        action_id: None,
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id,
+        action: action("outside_work_order"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: None,
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(disallowed_submit).expect("disallowed submit request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "action_not_allowed"));
     let (status, traces): (StatusCode, TracePageResponse) = call_empty(
         app,
         Method::GET,
@@ -1629,6 +2328,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
     });
 
     let approval_required = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -1672,6 +2372,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         ApprovalDecision::Granted,
     );
     let approval_granted = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
@@ -1725,11 +2426,17 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::ActionNeedsApproval { .. })));
 
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = AuditAttribution {
+        credential_id: Some(replay_credential.credential_id.clone()),
+        ..attribution()
+    };
     let (status, replay): (StatusCode, ReplayResponse) = call_json(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
-        json!({}),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1781,6 +2488,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
             .map(|event| event.trace_event_id)
     });
     let expired_submit = SubmitActionRequest {
+        action_id: None,
         run_id: expired_created.run_id.clone(),
         tenant_id: expired_tenant_id,
         agent_id: expired_agent_id,
@@ -1912,6 +2620,7 @@ async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
     assert_eq!(error.code, "invalid_run_state");
 
     let wrong_scope_submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: TenantId::new(),
         agent_id: agent_id.clone(),
@@ -1975,6 +2684,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     let mut planned = action("allowed_action");
     planned.preconditions = vec!["ready".to_string()];
     let policy_actions = vec![DaemonActionCandidate {
+        action_id: None,
         action: planned,
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage {
@@ -2040,6 +2750,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     });
 
     let submit = SubmitActionRequest {
+        action_id: None,
         run_id: created.run_id,
         tenant_id,
         agent_id,
@@ -2065,6 +2776,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     let mut failing = action("failing_action");
     failing.params = json!({"fail_adapter": true});
     let failed_submit = SubmitActionRequest {
+        action_id: None,
         run_id: submit.run_id,
         tenant_id: submit.tenant_id,
         agent_id: submit.agent_id,
@@ -2187,7 +2899,243 @@ async fn health_and_capabilities_remain_local_dev_only_without_credentials() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
     let (status, error): (StatusCode, ApiErrorBody) =
-        call_empty(locked_app, Method::GET, "/capabilities").await;
+        call_empty(locked_app.clone(), Method::GET, "/capabilities").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(error.code, "anonymous_non_dev_call");
+
+    let health_credential = caller_credential(vec![EndpointScope::HealthRead]);
+    let (status, _health): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        &health_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let capabilities_credential = caller_credential(vec![EndpointScope::CapabilitiesRead]);
+    let (status, _capabilities): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/capabilities",
+        &capabilities_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app, Method::GET, "/capabilities", &health_credential)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_scope");
+}
+
+#[tokio::test]
+async fn health_and_capabilities_accept_canonical_and_public_header_credentials() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let canonical_health = caller_credential(vec![EndpointScope::HealthRead]);
+    let (status, health): (StatusCode, Value) = call_empty_with_credential(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        &canonical_health,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["status"], "ok");
+
+    let public_health = public_caller_credential_header(vec!["splendor.health.read"]);
+    let (status, health): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        public_health,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["runtime_available"], true);
+
+    let public_version = public_caller_credential_header(vec!["splendor.health.read"]);
+    let (status, version): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/version",
+        public_version,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(version["compatibility_line"], "0.1");
+
+    let public_capabilities = public_caller_credential_header(vec!["capabilities_read"]);
+    let (status, capabilities): (StatusCode, Value) = call_empty_with_credential_header(
+        locked_app,
+        Method::GET,
+        "/capabilities",
+        public_capabilities,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities["daemon_api_version"], "0.02-S5");
+}
+
+#[tokio::test]
+async fn credential_header_rejections_fail_closed_for_malformed_and_invalid_authority() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let invalid_utf8 = HeaderValue::from_bytes(&[0xff, 0xfe]).expect("invalid utf8 header bytes");
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app.clone(), Method::GET, "/health", invalid_utf8)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let malformed_json = HeaderValue::from_static("{not-json");
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        malformed_json,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let mut expired = caller_credential(vec![EndpointScope::HealthRead]);
+    expired.expires_at = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &expired).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_expired");
+
+    let mut revoked = caller_credential(vec![EndpointScope::HealthRead]);
+    revoked.revocation = RevocationStatus::Revoked {
+        reason: "operator_revoked".to_string(),
+    };
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &revoked).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_revoked");
+
+    let mut wrong_audience = caller_credential(vec![EndpointScope::HealthRead]);
+    wrong_audience.audience = CredentialAudience::Daemon {
+        daemon_id: "daemon_other".to_string(),
+    };
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app.clone(), Method::GET, "/health", &wrong_audience)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "wrong_audience");
+
+    let missing_scope = caller_credential(vec![EndpointScope::CapabilitiesRead]);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential(locked_app, Method::GET, "/health", &missing_scope).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_scope");
+}
+
+#[tokio::test]
+async fn public_credential_header_rejections_cover_revocation_and_scope_branches() {
+    let locked_app = router(DaemonState::new(DaemonConfig {
+        expected_audience: CredentialAudience::Daemon {
+            daemon_id: "daemon_local".to_string(),
+        },
+        insecure_dev_mode: None,
+        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+        work_order_keyring: splendor_types::WorkOrderKeyring::new(),
+    }));
+
+    let revoked = public_caller_credential_header_with_revocation(
+        vec!["splendor.health.read"],
+        json!({"revoked": {"reason": "operator_revoked"}}),
+    );
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app.clone(), Method::GET, "/health", revoked)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "credential_revoked");
+
+    let malformed_revocation =
+        public_caller_credential_header_with_revocation(vec!["splendor.health.read"], json!(null));
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty_with_credential_header(
+        locked_app.clone(),
+        Method::GET,
+        "/health",
+        malformed_revocation,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+
+    let unsupported_scope = public_caller_credential_header(vec!["splendor.future.scope"]);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_empty_with_credential_header(locked_app, Method::GET, "/health", unsupported_scope)
+            .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "invalid_caller_credential_header");
+}
+
+#[tokio::test]
+async fn resume_without_signed_work_order_fails_before_tick_execution() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let request = create_request(
+        tenant_id,
+        agent_id,
+        vec![DaemonActionCandidate {
+            action_id: None,
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resume_request = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("operator retry".to_string()),
+        approval_evidence: None,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(resume_request).expect("resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "missing_work_order");
+
+    let (status, inspected): (StatusCode, RunInspectResponse) =
+        call_empty(app, Method::GET, &format!("/runs/{}", created.run_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.status, RunStatus::Pending);
+    assert_eq!(inspected.ticks, 0);
+    assert_eq!(inspected.adapter_executions, 0);
 }

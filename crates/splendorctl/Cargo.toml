@@ -7,6 +7,7 @@ edition.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+blake3 = "1.5"
 splendor-adapter-filesystem = { path = "../../adapters/filesystem" }
 splendor-adapter-http = { path = "../../adapters/http" }
 splendor-gateway = { path = "../splendor-gateway" }

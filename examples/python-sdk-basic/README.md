@@ -1,9 +1,11 @@
 # Python SDK Basic
 
-This example demonstrates the 0.01-dev Python SDK ergonomics without bypassing
-the kernel boundary. Policy code proposes actions; adapters are invoked only via
-`KernelRuntime.run_once` after policy, quota, permission, precondition, and
-constraint checks.
+This example demonstrates the stable 0.1 Python local SDK surface without
+bypassing the kernel boundary. Policy code proposes actions; adapters are invoked
+only via `KernelRuntime.run_once` after policy, quota, permission, precondition,
+and constraint checks.
+
+Stable API reference: `docs/sdk/python/stable-0.1.md`.
 
 ## Run
 

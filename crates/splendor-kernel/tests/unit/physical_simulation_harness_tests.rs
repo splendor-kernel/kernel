@@ -410,7 +410,7 @@ fn physical_harness_successful_mission_uses_only_high_level_actions() {
 }
 
 #[test]
-fn physical_harness_safety_denial_never_reaches_adapter() {
+fn physical_harness_safety_intervention_never_reaches_adapter() {
     let mut harness = PhysicalSimulationHarness::new(
         SimulatedSafetySnapshot {
             battery_percent: Some(10.0),
@@ -426,16 +426,16 @@ fn physical_harness_safety_denial_never_reaches_adapter() {
         vec![],
     );
     harness.commit_state(
-        "safety denial",
+        "safety intervention",
         serde_json::json!({"status": denied.status}),
     );
 
-    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(denied.status, ActionStatus::NeedsIntervention);
     assert_eq!(harness.adapter.call_count(), 0);
     assert!(harness
         .replay_trace()
         .iter()
-        .any(|event| matches!(event.kind, TraceEventKind::ActionDenied { .. })));
+        .any(|event| matches!(event.kind, TraceEventKind::ActionNeedsIntervention { .. })));
     assert_replayable_with_state_head(&harness);
 }
 

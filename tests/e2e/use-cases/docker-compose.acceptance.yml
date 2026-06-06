@@ -1,0 +1,164 @@
+# S0-compatible acceptance topology.
+#
+# S0 runs the acceptance runner, local daemon public health/capabilities path,
+# required role placeholders, and deterministic fake boundary services. The
+# runner shares the daemon network namespace so the daemon can remain bound to
+# loopback-only TCP. Daemon ports are not published.
+services:
+  e2e-runner:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: acceptance-runner
+    working_dir: /workspace
+    user: root
+    environment:
+      SPLENDOR_E2E_MODE: acceptance
+      SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
+      SPLENDOR_E2E_NO_COMPOSE: "1"
+      SPLENDOR_E2E_SOURCE_REV: ${SPLENDOR_E2E_SOURCE_REV:-unknown-source-revision}
+      SPLENDOR_DAEMON_URL: http://127.0.0.1:8077
+      SPLENDOR_MANAGER_URL: http://central-manager:8081
+      SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
+      SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
+      SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
+      SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
+      SPLENDOR_E2E_SCENARIO: ${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}
+      SPLENDOR_E2E_MODE_ARG: ${SPLENDOR_E2E_MODE_ARG:-scenario}
+    command:
+      - bash
+      - -lc
+      - |
+        if [[ "$${SPLENDOR_E2E_MODE_ARG:-scenario}" == "all" ]]; then
+          exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --all --reuse-build
+        fi
+        exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --scenario "$${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}" --reuse-build
+    depends_on:
+      - splendor-daemon-local
+      - central-manager
+      - resident-cloud-node
+      - resident-vpc-node
+      - resident-edge-node
+      - fake-http-service
+      - fake-artifact-store
+      - fake-governance-plane
+      - fake-telemetry-sink
+      - device-sim
+      - toxiproxy
+    network_mode: service:splendor-daemon-local
+    volumes:
+      - ../../..:/workspace
+
+  fake-http-service:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8082"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-artifact-store:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-artifacts
+    command: ["python", "-m", "http.server", "8083"]
+    volumes:
+      - e2e-state:/var/lib/splendor-artifacts
+
+  fake-governance-plane:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "-m", "http.server", "8084"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  fake-telemetry-sink:
+    image: python:3.12-slim
+    working_dir: /var/lib/splendor-telemetry
+    command: ["python", "-m", "http.server", "8085"]
+    volumes:
+      - e2e-state:/var/lib/splendor-telemetry
+
+  device-sim:
+    image: python:3.12-slim
+    working_dir: /fixtures
+    command: ["python", "device_sim.py"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  splendor-daemon-local:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  central-manager:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_MANAGER_BIND_ADDR: 0.0.0.0:8081
+      SPLENDOR_MANAGER_ALLOW_NON_LOOPBACK_DEV: "1"
+      SPLENDOR_MANAGER_ID: central-manager
+      SPLENDOR_FLEET_ID: 00000000-0000-4000-8000-000000000104
+    command: ["splendor-manager"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  resident-cloud-node:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8091
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000304
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  resident-vpc-node:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8092
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000302
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  resident-edge-node:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: runtime
+    working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: resident
+      SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8093
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000306
+      SPLENDOR_DEVICE_SIM_URL: http://device-sim:8086
+    command: ["splendor-daemon"]
+    volumes:
+      - ../../..:/workspace
+      - e2e-state:/var/lib/splendor
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+
+volumes:
+  e2e-state:

@@ -10,7 +10,7 @@ use crate::{
     TraceId, VerificationResult, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
     WorkOrderValidationError, ROUTE_PLAN_PROPOSAL_SCHEMA,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -474,7 +474,7 @@ impl TaskResponse {
 }
 
 /// Transport-neutral message sent from one agent runtime context to another.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Message {
     /// Unique message identity, distinct from run, trace, action, or state IDs.
     pub message_id: MessageId,
@@ -489,12 +489,53 @@ pub struct Message {
     /// Typed JSON payload. The envelope validates presence; schema-specific
     /// payload validation belongs to the schema owner.
     pub payload: serde_json::Value,
-    /// Optional trace event that causally produced this message.
+    /// Required-but-nullable trace event that causally produced this message.
+    /// Canonical JSON must include `causal_parent`; use `null` when no parent exists.
     pub causal_parent: Option<TraceEventId>,
     /// Whether the sender expects a response message.
     pub requires_response: bool,
     /// Timestamp when the message was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+struct MessageWire {
+    message_id: MessageId,
+    source_agent_id: AgentId,
+    target_agent_id: AgentId,
+    run_id: RunId,
+    schema: String,
+    payload: serde_json::Value,
+    causal_parent: serde_json::Value,
+    requires_response: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = MessageWire::deserialize(deserializer)?;
+        let causal_parent = if wire.causal_parent.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(wire.causal_parent).map_err(de::Error::custom)?)
+        };
+        Ok(Self {
+            message_id: wire.message_id,
+            source_agent_id: wire.source_agent_id,
+            target_agent_id: wire.target_agent_id,
+            run_id: wire.run_id,
+            schema: wire.schema,
+            payload: wire.payload,
+            causal_parent,
+            requires_response: wire.requires_response,
+            created_at: wire.created_at,
+        })
+    }
 }
 
 impl Message {

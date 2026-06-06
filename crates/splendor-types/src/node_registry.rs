@@ -141,6 +141,7 @@ pub struct NodeHealth {
     /// Coarse node status.
     pub status: HealthStatus,
     /// When the node observed this health state.
+    #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     /// Structured health metadata such as battery, network, or runtime details.
     #[serde(default = "empty_object")]
@@ -161,6 +162,7 @@ pub struct InstanceHealth {
     /// Coarse instance status.
     pub status: HealthStatus,
     /// When the instance observed this health state.
+    #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     /// Structured health metadata such as active contexts or queue pressure.
     #[serde(default = "empty_object")]
@@ -191,6 +193,7 @@ pub struct NodeRegistration {
     /// Initial health reported during registration.
     pub health: NodeHealth,
     /// Registration timestamp supplied by the management boundary.
+    #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
 
@@ -242,6 +245,7 @@ pub struct InstanceRegistration {
     /// Initial health reported during registration.
     pub health: InstanceHealth,
     /// Registration timestamp supplied by the management boundary.
+    #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
 
@@ -296,6 +300,7 @@ pub struct NodeHeartbeat {
     /// New mutable health document.
     pub health: NodeHealth,
     /// Management-observed heartbeat timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: OffsetDateTime,
 }
 
@@ -320,6 +325,7 @@ pub struct InstanceHeartbeat {
     /// New mutable health document.
     pub health: InstanceHealth,
     /// Management-observed heartbeat timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: OffsetDateTime,
 }
 
@@ -341,6 +347,7 @@ impl InstanceHeartbeat {
 #[serde(rename_all = "snake_case")]
 pub struct ManagementAuditEvent {
     /// Event timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
     /// Registry lifecycle payload.
     pub kind: ManagementAuditEventKind,

@@ -82,6 +82,18 @@ pub enum EndpointScope {
     ReplayCreate,
     /// Send a typed message across a remote Splendor instance boundary.
     MessagesSend,
+    /// Read typed message delivery metadata.
+    MessagesRead,
+    /// Submit a signed work order to a manager boundary.
+    WorkOrdersSubmit,
+    /// Revoke a submitted work order.
+    WorkOrdersRevoke,
+    /// Read fleet registry, placement, and telemetry metadata.
+    FleetRead,
+    /// Dispatch an accepted work order to a resident runtime.
+    FleetDispatch,
+    /// Export or import explicit state handoff snapshots.
+    StateHandoff,
     /// Read daemon health.
     HealthRead,
     /// Read daemon capabilities.
@@ -96,6 +108,20 @@ pub enum EndpointScope {
     NodesHeartbeat,
     /// Record an instance heartbeat.
     InstancesHeartbeat,
+    /// Publish a governance/safety policy bundle.
+    PoliciesPublish,
+    /// Revoke a governance/safety policy bundle.
+    PoliciesRevoke,
+    /// Grant, deny, or revoke approvals under scoped authority.
+    ApprovalsManage,
+    /// Create/clear circuit breakers or activate kill switches.
+    GovernanceControl,
+    /// Register physical or edge device profiles.
+    DeviceRegister,
+    /// Read physical or edge device status and policy cache state.
+    DeviceRead,
+    /// Grant or deny local operator intervention requests.
+    OperatorIntervene,
 }
 
 impl EndpointScope {
@@ -114,6 +140,12 @@ impl EndpointScope {
             Self::StateRead => "splendor.state.read",
             Self::ReplayCreate => "splendor.replay.create",
             Self::MessagesSend => "splendor.messages.send",
+            Self::MessagesRead => "splendor.messages.read",
+            Self::WorkOrdersSubmit => "splendor.work_orders.submit",
+            Self::WorkOrdersRevoke => "splendor.work_orders.revoke",
+            Self::FleetRead => "splendor.fleet.read",
+            Self::FleetDispatch => "splendor.fleet.dispatch",
+            Self::StateHandoff => "splendor.state.handoff",
             Self::HealthRead => "splendor.health.read",
             Self::CapabilitiesRead => "splendor.capabilities.read",
             Self::PoliciesSync => "splendor.policies.sync",
@@ -121,6 +153,13 @@ impl EndpointScope {
             Self::InstancesRegister => "splendor.instances.register",
             Self::NodesHeartbeat => "splendor.nodes.heartbeat",
             Self::InstancesHeartbeat => "splendor.instances.heartbeat",
+            Self::PoliciesPublish => "splendor.policies.publish",
+            Self::PoliciesRevoke => "splendor.policies.revoke",
+            Self::ApprovalsManage => "splendor.approvals.manage",
+            Self::GovernanceControl => "splendor.governance.control",
+            Self::DeviceRegister => "splendor.device.register",
+            Self::DeviceRead => "splendor.device.read",
+            Self::OperatorIntervene => "splendor.operator.intervene",
         }
     }
 }
@@ -184,6 +223,7 @@ pub struct CallerCredential {
     /// Audience this credential was issued for.
     pub audience: CredentialAudience,
     /// Expiration time; expired credentials fail closed.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     /// Revocation status from the configured revocation path.
     pub revocation: RevocationStatus,
@@ -226,6 +266,7 @@ pub struct WorkOrderAuthorization {
     /// Validated signature metadata; missing or empty values fail closed.
     pub signature: Option<WorkOrderSignature>,
     /// Expiration time; expired work orders fail closed.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     /// Revocation status from the configured work-order revocation path.
     pub revocation: RevocationStatus,
@@ -240,6 +281,7 @@ pub struct AuditAttribution {
     /// Credential that authenticated the caller.
     pub credential_id: Option<String>,
     /// Request timestamp recorded into trace/audit metadata.
+    #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
 }
 
@@ -369,6 +411,18 @@ pub enum DaemonEndpoint {
         instance_id: InstanceId,
         scope: RegistryScope,
     },
+    /// `POST /devices/profiles`.
+    DeviceProfileRegister {
+        tenant_id: TenantId,
+        node_id: NodeId,
+    },
+    /// `GET /devices/:node_id/status` and policy-cache reads.
+    DeviceRead {
+        tenant_id: TenantId,
+        node_id: NodeId,
+    },
+    /// `POST /operator/interventions*`.
+    OperatorIntervene { tenant_id: TenantId, run_id: RunId },
 }
 
 impl DaemonEndpoint {
@@ -393,6 +447,9 @@ impl DaemonEndpoint {
             Self::InstanceRegister { .. } => EndpointScope::InstancesRegister,
             Self::NodeHeartbeat { .. } => EndpointScope::NodesHeartbeat,
             Self::InstanceHeartbeat { .. } => EndpointScope::InstancesHeartbeat,
+            Self::DeviceProfileRegister { .. } => EndpointScope::DeviceRegister,
+            Self::DeviceRead { .. } => EndpointScope::DeviceRead,
+            Self::OperatorIntervene { .. } => EndpointScope::OperatorIntervene,
         }
     }
 
@@ -409,7 +466,10 @@ impl DaemonEndpoint {
             | Self::StateHeadRead { tenant_id, .. }
             | Self::ReplayCreate { tenant_id, .. }
             | Self::ActionSubmit { tenant_id, .. }
-            | Self::PolicySync { tenant_id, .. } => Some(tenant_id),
+            | Self::PolicySync { tenant_id, .. }
+            | Self::DeviceProfileRegister { tenant_id, .. }
+            | Self::DeviceRead { tenant_id, .. }
+            | Self::OperatorIntervene { tenant_id, .. } => Some(tenant_id),
             Self::Health
             | Self::Capabilities
             | Self::NodeRegister { .. }
@@ -438,7 +498,10 @@ impl DaemonEndpoint {
             | Self::ActionSubmit { .. }
             | Self::PolicySync { .. }
             | Self::Health
-            | Self::Capabilities => None,
+            | Self::Capabilities
+            | Self::DeviceProfileRegister { .. }
+            | Self::DeviceRead { .. }
+            | Self::OperatorIntervene { .. } => None,
         }
     }
 
@@ -457,6 +520,8 @@ impl DaemonEndpoint {
                 | Self::InstanceRegister { .. }
                 | Self::NodeHeartbeat { .. }
                 | Self::InstanceHeartbeat { .. }
+                | Self::DeviceProfileRegister { .. }
+                | Self::OperatorIntervene { .. }
         )
     }
 
@@ -829,7 +894,10 @@ fn validate_endpoint_contract(endpoint: &DaemonEndpoint) -> Result<(), DaemonSec
         | DaemonEndpoint::ReplayCreate { .. }
         | DaemonEndpoint::PolicySync { .. }
         | DaemonEndpoint::Health
-        | DaemonEndpoint::Capabilities => Ok(()),
+        | DaemonEndpoint::Capabilities
+        | DaemonEndpoint::DeviceProfileRegister { .. }
+        | DaemonEndpoint::DeviceRead { .. }
+        | DaemonEndpoint::OperatorIntervene { .. } => Ok(()),
     }
 }
 

@@ -287,6 +287,12 @@ pub struct SimulatedSafetySnapshot {
     pub allowed_zones: Vec<String>,
     pub battery_percent: Option<f64>,
     pub min_battery_percent: Option<f64>,
+    #[serde(default)]
+    pub policy_cache_expired: bool,
+    #[serde(default)]
+    pub high_risk: bool,
+    #[serde(default)]
+    pub cloud_helper_direct_authority: bool,
     pub emergency_stop_engaged: Option<bool>,
     pub collision_risk: Option<SimulatedRiskLevel>,
     pub altitude_m: Option<f64>,
@@ -409,6 +415,35 @@ pub trait InvariantEvaluator: Send + Sync {
         action: &Action,
         satisfied_postconditions: &[String],
     ) -> VerificationResult;
+}
+
+/// Verifies adapter-specific resource boundaries before adapter execution.
+///
+/// This keeps filesystem, network, data-scope, and similar boundary checks in
+/// the verifier pipeline instead of relying on adapter failures after execution
+/// has been attempted.
+pub trait ResourceBoundaryVerifier: Send + Sync {
+    /// Verifies that the action's addressed resource is in scope for the
+    /// effective adapter. A denied result prevents adapter execution.
+    fn verify_resource_boundary(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+    ) -> VerificationResult;
+}
+
+/// Resource verifier that allows all resources.
+#[derive(Clone, Debug, Default)]
+pub struct NoopResourceBoundaryVerifier;
+
+impl ResourceBoundaryVerifier for NoopResourceBoundaryVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        VerificationResult::allow()
+    }
 }
 
 /// Result returned by an approval verifier.
@@ -724,6 +759,7 @@ pub struct VerifiedActionGateway {
     adapters: HashMap<String, AdapterRegistration>,
     tenant_access: Arc<dyn TenantAccess>,
     invariant_evaluator: Arc<dyn InvariantEvaluator>,
+    resource_boundary_verifier: Arc<dyn ResourceBoundaryVerifier>,
     approval_verifier: Arc<dyn ApprovalVerifier>,
     safety_verifier: Option<Arc<dyn SafetyVerifier>>,
     circuit_breaker_evaluator: Arc<dyn CircuitBreakerEvaluator>,
@@ -737,6 +773,7 @@ impl VerifiedActionGateway {
             adapters: HashMap::new(),
             tenant_access,
             invariant_evaluator: Arc::new(SimpleInvariantEvaluator),
+            resource_boundary_verifier: Arc::new(NoopResourceBoundaryVerifier),
             approval_verifier: Arc::new(NoApprovalVerifier),
             safety_verifier: None,
             circuit_breaker_evaluator: Arc::new(NoopCircuitBreakerEvaluator),
@@ -763,6 +800,11 @@ impl VerifiedActionGateway {
     /// Overrides the invariant evaluator used by the gateway.
     pub fn set_invariant_evaluator(&mut self, evaluator: Arc<dyn InvariantEvaluator>) {
         self.invariant_evaluator = evaluator;
+    }
+
+    /// Overrides the resource boundary verifier used before adapter execution.
+    pub fn set_resource_boundary_verifier(&mut self, verifier: Arc<dyn ResourceBoundaryVerifier>) {
+        self.resource_boundary_verifier = verifier;
     }
 
     /// Overrides the approval verifier used by the gateway.
@@ -865,6 +907,15 @@ impl ActionGateway for VerifiedActionGateway {
             combine_verifications([("policy", policy_result), ("invariant", invariant_pre)]);
 
         if !verification.allowed {
+            attach_request_context(&mut verification, &action);
+            return Ok(denied_outcome(action.action_id, verification));
+        }
+
+        let resource_result = self
+            .resource_boundary_verifier
+            .verify_resource_boundary(&action, Some(adapter_id));
+        if !resource_result.allowed {
+            let mut verification = combine_verifications([("resource_boundary", resource_result)]);
             attach_request_context(&mut verification, &action);
             return Ok(denied_outcome(action.action_id, verification));
         }
@@ -1285,6 +1336,26 @@ fn normalize_physical_token(value: &str) -> String {
 
 fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerification {
     let verifier = "simulated_safety_verifier";
+    if snapshot.cloud_helper_direct_authority {
+        return simulated_deny(
+            verifier,
+            "cloud_helper_authority",
+            "cloud_helper_direct_authority_denied",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if snapshot.policy_cache_expired && snapshot.high_risk {
+        return simulated_deny(
+            verifier,
+            "policy_cache",
+            "policy_cache_expired",
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
     if snapshot.emergency_stop_engaged.is_none() {
         return simulated_uncertain(verifier, "emergency_stop", snapshot, Vec::new(), Vec::new());
     }
@@ -1308,7 +1379,7 @@ fn simulated_safety_evidence(snapshot: &SimulatedSafetySnapshot) -> SafetyVerifi
         );
     }
     if snapshot.battery_percent < snapshot.min_battery_percent {
-        return simulated_deny(
+        return simulated_intervention(
             verifier,
             "battery",
             "battery_below_minimum",
@@ -1421,6 +1492,23 @@ fn simulated_deny(
 ) -> SafetyVerification {
     SafetyVerification::Denied(
         SafetyEvidence::new(verifier, check, SafetyCheckStatus::Deny, reason)
+            .with_sensor_refs(snapshot.sensor_refs.clone())
+            .with_zone_refs(zone_refs)
+            .with_thresholds(thresholds)
+            .into_verification(),
+    )
+}
+
+fn simulated_intervention(
+    verifier: &str,
+    check: &str,
+    reason: &str,
+    snapshot: &SimulatedSafetySnapshot,
+    zone_refs: Vec<String>,
+    thresholds: Vec<SafetyThresholdEvidence>,
+) -> SafetyVerification {
+    SafetyVerification::NeedsIntervention(
+        SafetyEvidence::new(verifier, check, SafetyCheckStatus::Uncertain, reason)
             .with_sensor_refs(snapshot.sensor_refs.clone())
             .with_zone_refs(zone_refs)
             .with_thresholds(thresholds)

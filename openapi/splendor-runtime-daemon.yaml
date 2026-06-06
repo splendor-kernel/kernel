@@ -2,7 +2,11 @@ openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
   version: 0.03-dev
-  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage.
+  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
+  x-splendor-compatibility:
+    stable_docs: docs/spec/0.1/api-stability.md
+    compatibility_line: '0.1'
+    version_negotiation: documented-not-enforced
 servers:
   - url: http://127.0.0.1:8077
     description: Explicit local development listener only.
@@ -38,6 +42,7 @@ paths:
       operationId: inspectRun
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Run metadata.
@@ -149,6 +154,31 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+  /runs/{run_id}/cancel:
+    post:
+      summary: Cancel a local run without deleting trace or state evidence.
+      operationId: cancelRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LifecycleRequest'
+      responses:
+        '200':
+          description: Run cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunInspectResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /runs/{run_id}/percepts:
     post:
       summary: Append a percept to the daemon queue for the next tick.
@@ -199,12 +229,36 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+  /runs/{run_id}/governance/circuit-breakers/sync:
+    post:
+      summary: Sync manager-issued circuit breakers into one run gateway evaluator.
+      operationId: syncCircuitBreakers
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CircuitBreakerSyncRequest'
+      responses:
+        '200':
+          description: Circuit breaker sync accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CircuitBreakerSyncResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /runs/{run_id}/state-head:
     get:
       summary: Read the latest committed state node metadata.
       operationId: getStateHead
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: State head metadata.
@@ -222,6 +276,7 @@ paths:
       operationId: getRunTraces
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
         - name: start
           in: query
           schema:
@@ -244,6 +299,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TracePageResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /runs/{run_id}/traces/export:
+    post:
+      summary: Export ordered trace records with explicit redaction policy and integrity metadata.
+      operationId: exportTraces
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TraceExportRequest'
+      responses:
+        '200':
+          description: Trace export package.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceExportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -300,6 +380,8 @@ paths:
     get:
       summary: Read daemon health.
       operationId: getHealth
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Health status.
@@ -309,10 +391,29 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /version:
+    get:
+      summary: Read daemon/runtime/schema compatibility metadata.
+      operationId: getVersion
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200':
+          description: Version and compatibility metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /capabilities:
     get:
       summary: Read local daemon capabilities.
       operationId: getCapabilities
+      parameters:
+        - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200':
           description: Capability list.
@@ -322,10 +423,407 @@ paths:
                 $ref: '#/components/schemas/CapabilitiesResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /state-snapshots/export:
+    post:
+      summary: Export an explicit state handoff snapshot.
+      operationId: exportStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportStateSnapshotRequest'
+      responses:
+        '200':
+          description: State handoff snapshot exported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportStateSnapshotResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /state-snapshots/import:
+    post:
+      summary: Import an explicit state handoff snapshot.
+      operationId: importStateSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportStateSnapshotRequest'
+      responses:
+        '200':
+          description: State handoff snapshot imported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportStateSnapshotResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /fleet/nodes:
+    post:
+      summary: Register a fleet node.
+      operationId: registerNode
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterNodeRequest' } } } }
+      responses:
+        '200': { description: Node registered., content: { application/json: { schema: { $ref: '#/components/schemas/NodeRegistration' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/list:
+    post:
+      summary: List fleet nodes.
+      operationId: listNodes
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Registry projection., content: { application/json: { schema: { $ref: '#/components/schemas/FleetNodeListResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/instances:
+    post:
+      summary: Register a runtime instance.
+      operationId: registerInstance
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterInstanceRequest' } } } }
+      responses:
+        '200': { description: Instance registered., content: { application/json: { schema: { $ref: '#/components/schemas/InstanceRegistration' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/heartbeat:
+    post:
+      summary: Record node heartbeat.
+      operationId: heartbeatNode
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatNodeRequest' } } } }
+      responses:
+        '200': { description: Heartbeat recorded., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedTraceResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/nodes/{node_id}/capabilities:
+    post:
+      summary: Advertise node capabilities.
+      operationId: advertiseCapabilities
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdvertiseCapabilitiesRequest' } } } }
+      responses:
+        '200': { description: Capabilities advertised., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedNodeResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/placement/evaluate:
+    post:
+      summary: Evaluate placement against registered capabilities.
+      operationId: evaluatePlacement
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementEvaluationRequest' } } } }
+      responses:
+        '200': { description: Placement decision., content: { application/json: { schema: { $ref: '#/components/schemas/PlacementDecision' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders:
+    post:
+      summary: Submit a signed work order to the manager.
+      operationId: submitWorkOrder
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Work order accepted., content: { application/json: { schema: { $ref: '#/components/schemas/WorkOrderValidationReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/revoke:
+    post:
+      summary: Revoke a submitted work order.
+      operationId: revokeWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Work order revoked., content: { application/json: { schema: { $ref: '#/components/schemas/RevokedWorkOrderResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /work-orders/{work_order_id}/dispatch:
+    post:
+      summary: Dispatch an accepted work order to a resident daemon.
+      operationId: dispatchWorkOrder
+      parameters:
+        - name: work_order_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchWorkOrderRequest' } } } }
+      responses:
+        '200': { description: Dispatch report., content: { application/json: { schema: { $ref: '#/components/schemas/DispatchReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/telemetry/read:
+    post:
+      summary: Read observational fleet telemetry.
+      operationId: getFleetTelemetry
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Fleet telemetry., content: { application/json: { schema: { $ref: '#/components/schemas/FleetTelemetrySnapshot' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/traces/sync:
+    post:
+      summary: Sync local trace buffer into central trace index.
+      operationId: syncTraceBuffer
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SyncTraceBufferRequest' } } } }
+      responses:
+        '200': { description: Trace sync report., content: { application/json: { schema: { $ref: '#/components/schemas/TraceSyncReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages:
+    post:
+      summary: Send a typed remote message.
+      operationId: sendMessage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SendMessageRequest' } } } }
+      responses:
+        '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages/{message_id}/read:
+    post:
+      summary: Read message delivery status.
+      operationId: getMessage
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /policies:
+    post:
+      summary: Publish and sign a governance policy bundle for acceptance runtimes.
+      operationId: publishPolicyBundle
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PublishPolicyBundleRequest' } } } }
+      responses:
+        '200': { description: Policy bundle published., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /policies/{policy_id}/read:
+    post:
+      summary: Read policy bundle status without granting runtime authority.
+      operationId: getPolicyStatus
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Policy bundle status., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /policies/{policy_id}/revoke:
+    post:
+      summary: Revoke a policy bundle so high-risk side effects fail closed.
+      operationId: revokePolicyBundle
+      parameters:
+        - name: policy_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokePolicyBundleRequest' } } } }
+      responses:
+        '200': { description: Policy bundle revoked., content: { application/json: { schema: { $ref: '#/components/schemas/PolicyBundleStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals:
+    post:
+      summary: Record a trace-linked approval request from runtime evidence.
+      operationId: requestApproval
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalRequestPayload' } } } }
+      responses:
+        '200': { description: Approval requested., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/grant:
+    post:
+      summary: Grant scoped approval evidence for one action.
+      operationId: grantApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval granted., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/deny:
+    post:
+      summary: Deny a pending approval request.
+      operationId: denyApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval denied., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /approvals/{approval_id}/revoke:
+    post:
+      summary: Revoke approval evidence before it authorizes execution.
+      operationId: revokeApproval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
+      responses:
+        '200': { description: Approval revoked., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/circuit-breakers:
+    post:
+      summary: Create a scoped circuit breaker.
+      operationId: createCircuitBreaker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CircuitBreakerRequest' } } } }
+      responses:
+        '200': { description: Circuit breaker tripped., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceCircuitBreakerRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/circuit-breakers/{breaker_id}/clear:
+    post:
+      summary: Clear a scoped circuit breaker with governance authority.
+      operationId: clearCircuitBreaker
+      parameters:
+        - name: breaker_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClearCircuitBreakerRequest' } } } }
+      responses:
+        '200': { description: Circuit breaker cleared., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceCircuitBreakerRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/kill-switches:
+    post:
+      summary: Activate a kill switch and record propagation evidence.
+      operationId: activateKillSwitch
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/KillSwitchRequest' } } } }
+      responses:
+        '200': { description: Kill switch status., content: { application/json: { schema: { $ref: '#/components/schemas/KillSwitchReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /governance/audit/export:
+    post:
+      summary: Export governance audit evidence linking policies, approvals, circuit breakers, kill switches, and runs.
+      operationId: exportGovernanceAudit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceAuditExportRequest' } } } }
+      responses:
+        '200': { description: Governance audit exported., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceAuditExportReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/audit/read:
+    post:
+      summary: Read manager audit events for acceptance replay/audit evidence.
+      operationId: managerAudit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Audit events., content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ManagerAuditEvent' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /devices/profiles:
+    post:
+      summary: Register a resident physical/edge device profile.
+      operationId: registerDeviceProfile
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileRequest' } } } }
+      responses:
+        '200': { description: Device profile registered., content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /devices/{node_id}/status:
+    get:
+      summary: Read device safety and runtime status; never authorizes actions.
+      operationId: getDeviceStatus
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200': { description: Device status., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceRuntimeProfile' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/policy-cache:
+    get:
+      summary: Read local policy cache status; expired high-risk offline actions fail closed.
+      operationId: getPolicyCacheStatus
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - $ref: '#/components/parameters/CallerCredentialHeader'
+      responses:
+        '200': { description: Policy cache status., content: { application/json: { schema: { $ref: '#/components/schemas/DevicePolicyCacheStatus' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/actions:
+    post:
+      summary: Submit a high-level bounded physical action through gateway and safety verification.
+      operationId: submitPhysicalAction
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitPhysicalActionRequest' } } } }
+      responses:
+        '200': { description: Physical action outcome., content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /operator/interventions:
+    post:
+      summary: Request local operator intervention for an ambiguous physical action.
+      operationId: requestOperatorIntervention
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention requested., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /operator/interventions/{intervention_id}/grant:
+    post:
+      summary: Grant scoped expiring local operator intervention.
+      operationId: grantOperatorIntervention
+      parameters:
+        - name: intervention_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention granted., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /operator/interventions/{intervention_id}/deny:
+    post:
+      summary: Deny scoped local operator intervention.
+      operationId: denyOperatorIntervention
+      parameters:
+        - name: intervention_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
+      responses:
+        '200': { description: Operator intervention denied., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /devices/{node_id}/trace-buffer/sync:
+    post:
+      summary: Sync an offline device trace buffer with ordering and tamper checks.
+      operationId: syncDeviceTraceBuffer
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncRequest' } } } }
+      responses:
+        '200': { description: Device trace sync result., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 components:
   parameters:
     RunId:
       name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CallerCredentialHeader:
+      name: X-Splendor-Caller-Credential
+      in: header
+      required: false
+      description: JSON-encoded CallerCredential for non-dev health/capability reads. Explicit local-dev mode may omit it only on loopback or Unix-socket transports.
+      schema:
+        type: string
+    NodeId:
+      name: node_id
       in: path
       required: true
       schema:
@@ -369,6 +867,158 @@ components:
           schema:
             $ref: '#/components/schemas/ApiError'
   schemas:
+    RegisterDeviceProfileRequest:
+      type: object
+      required: [credential, audit_attribution, profile]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        profile: { $ref: '#/components/schemas/DeviceRuntimeProfile' }
+    RegisterDeviceProfileResponse:
+      type: object
+      required: [profile, trace_event_id]
+      properties:
+        profile: { $ref: '#/components/schemas/DeviceRuntimeProfile' }
+        trace_event_id: { type: string, format: uuid }
+    DeviceRuntimeProfile:
+      type: object
+      required: [node_id, tenant_id, device_kind, capabilities, allowed_physical_actions, forbidden_action_classes, safety_constraints, runtime_mode, safety_status, policy_cache, trace_buffer, registered_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        device_kind:
+          type: string
+          enum: [drone_sim]
+        capabilities:
+          type: array
+          items: { type: string }
+        allowed_physical_actions:
+          type: array
+          items:
+            type: string
+            enum: [read_battery, read_sensor_summary, read_map, move_to_waypoint, return_to_base, dock, inspect_zone, capture_image, pause_mission, resume_mission, request_operator_override, notify_operator, upload_trace_summary]
+        forbidden_action_classes:
+          type: array
+          items:
+            type: string
+            enum: [set_motor_pwm, raw_actuator_write, disable_firmware_safety, bypass_collision_avoidance, modify_flight_controller_internals, ignore_emergency_stop, hard_real_time_stabilization]
+        safety_constraints: { type: object, additionalProperties: true }
+        runtime_mode:
+          type: string
+          enum: [resident]
+        safety_status: { type: object, additionalProperties: true }
+        policy_cache: { $ref: '#/components/schemas/DevicePolicyCacheStatus' }
+        trace_buffer: { $ref: '#/components/schemas/DeviceTraceBufferStatus' }
+        registered_at: { type: string, format: date-time }
+    DevicePolicyCacheStatus:
+      type: object
+      required: [policy_id, loaded, ttl_seconds, expires_at, expired]
+      properties:
+        policy_id: { type: string }
+        loaded: { type: boolean }
+        ttl_seconds: { type: integer, minimum: 0 }
+        expires_at: { type: string, format: date-time }
+        expired: { type: boolean }
+    DeviceTraceBufferStatus:
+      type: object
+      required: [enabled, buffered_records, integrity]
+      properties:
+        enabled: { type: boolean }
+        buffered_records: { type: integer, minimum: 0 }
+        integrity: { type: string }
+    SubmitPhysicalActionRequest:
+      allOf:
+        - $ref: '#/components/schemas/SubmitActionRequest'
+        - type: object
+          required: [safety_context]
+          properties:
+            safety_context: { $ref: '#/components/schemas/SafetyContext' }
+            operator_intervention_evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
+    SafetyContext:
+      type: object
+      required: [allowed_zone_refs, privacy_clear, human_proximity_clear, emergency_stop_clear, offline, policy_cache_expired, high_risk, cloud_helper_direct_authority]
+      properties:
+        allowed_zone_refs: { type: array, items: { type: string } }
+        zone_ref: { type: string }
+        altitude_m: { type: number }
+        max_altitude_m: { type: number }
+        battery_percent: { type: number, minimum: 0, maximum: 1 }
+        privacy_clear: { type: boolean }
+        human_proximity_clear: { type: boolean }
+        emergency_stop_clear: { type: boolean }
+        offline: { type: boolean }
+        policy_cache_expired: { type: boolean }
+        high_risk: { type: boolean }
+        cloud_helper_direct_authority: { type: boolean }
+        cloud_helper_proposal_id: { type: string }
+    OperatorInterventionRequest:
+      type: object
+      required: [credential, audit_attribution, intervention_id, tenant_id, agent_id, run_id, node_id, action_name, reason, expires_at]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        action_name: { type: string }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+    OperatorDecisionRequest:
+      type: object
+      required: [credential, audit_attribution, reason]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+    OperatorInterventionEvidence:
+      type: object
+      required: [intervention_id, tenant_id, run_id, action_name, decision, expires_at]
+      properties:
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        action_name: { type: string }
+        decision: { type: string, enum: [granted, denied] }
+        expires_at: { type: string, format: date-time }
+    OperatorInterventionRecord:
+      type: object
+      required: [intervention_id, tenant_id, agent_id, run_id, node_id, action_name, status, reason, expires_at, trace_event_id]
+      properties:
+        intervention_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        action_name: { type: string }
+        status: { type: string, enum: [requested, granted, denied] }
+        reason: { type: string }
+        expires_at: { type: string, format: date-time }
+        trace_event_id: { type: string, format: uuid }
+        evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
+    DeviceTraceBufferSyncRequest:
+      type: object
+      required: [credential, audit_attribution, run_id, records]
+      properties:
+        credential: { $ref: '#/components/schemas/CallerCredential' }
+        audit_attribution: { $ref: '#/components/schemas/AuditAttribution' }
+        run_id: { type: string, format: uuid }
+        records:
+          type: array
+          items: { $ref: '#/components/schemas/TraceRecord' }
+        simulate_tamper: { type: boolean, default: false }
+    DeviceTraceBufferSyncResponse:
+      type: object
+      required: [accepted, accepted_records, trace_event_id]
+      properties:
+        accepted: { type: boolean }
+        accepted_records: { type: integer, minimum: 0 }
+        trace_event_id: { type: string, format: uuid }
+        reason_code:
+          type: string
+          enum: [trace_sync_hash_chain_mismatch, trace_sync_order_mismatch, trace_sync_tamper_simulated, run_not_found, node_not_found]
     ApiError:
       type: object
       required: [code, message, details]
@@ -407,9 +1057,22 @@ components:
         - state_read
         - replay_create
         - messages_send
+        - messages_read
+        - work_orders_submit
+        - work_orders_revoke
+        - fleet_read
+        - fleet_dispatch
+        - state_handoff
         - health_read
         - capabilities_read
         - policies_sync
+        - policies_publish
+        - policies_revoke
+        - approvals_manage
+        - governance_control
+        - device_register
+        - device_read
+        - operator_intervene
         - nodes_register
         - instances_register
         - nodes_heartbeat
@@ -627,6 +1290,760 @@ components:
         requested_at:
           type: string
           format: date-time
+    ManagerSecurityFields:
+      type: object
+      required: [credential, audit_attribution]
+      properties:
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+    ManagerReadRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+    PublishPolicyBundleRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [policy_bundle]
+          properties:
+            policy_bundle:
+              $ref: '#/components/schemas/PolicyBundle'
+    RevokePolicyBundleRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+    PolicyBundleStatusReport:
+      type: object
+      required: [policy_bundle_id, status, envelope, trace_event_id]
+      properties:
+        policy_bundle_id: { type: string }
+        status: { type: string, enum: [published, revoked] }
+        envelope:
+          $ref: '#/components/schemas/PolicyBundleEnvelope'
+        trace_event_id: { type: string, format: uuid }
+    ApprovalRequestPayload:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, expires_at, reason]
+          properties:
+            approval_id: { type: string, format: uuid }
+            tenant_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            action_id: { type: string, format: uuid }
+            action_name: { type: string }
+            adapter: { type: string }
+            policy_id: { type: string }
+            risk_level: { type: string }
+            audience: { type: string }
+            expires_at: { type: string, format: date-time }
+            reason: { type: string }
+    ApprovalDecisionRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+            expires_at: { type: [string, 'null'], format: date-time }
+    GovernanceApprovalRecord:
+      type: object
+      required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, status, reason, issued_by, expires_at, trace_event_id, evidence]
+      properties:
+        approval_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        action_id: { type: string, format: uuid }
+        action_name: { type: string }
+        adapter: { type: string }
+        policy_id: { type: string }
+        risk_level: { type: string }
+        audience: { type: string }
+        status: { type: string, enum: [requested, granted, denied, revoked] }
+        reason: { type: string }
+        issued_by:
+          $ref: '#/components/schemas/AuditAttribution'
+        expires_at: { type: string, format: date-time }
+        trace_event_id: { type: string, format: uuid }
+        evidence:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ApprovalEvidence'
+    CircuitBreakerRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [breaker_id, tenant_id, adapter, action, reason]
+          properties:
+            breaker_id: { type: string }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            adapter: { type: [string, 'null'] }
+            action: { type: [string, 'null'] }
+            reason: { type: string }
+    CircuitBreaker:
+      type: object
+      required: [schema_version, breaker_id, scope, state, reason, created_at, updated_at]
+      properties:
+        schema_version: { type: string }
+        breaker_id: { type: string }
+        scope:
+          type: object
+          description: Tagged CircuitBreakerScope, for example {"scope":"adapter","value":"artifact-store"}.
+        state: { type: string, enum: [tripped, cleared] }
+        reason: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ClearCircuitBreakerRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+    GovernanceCircuitBreakerRecord:
+      type: object
+      required: [breaker_id, status, tenant_id, adapter, action, reason, trace_event_id]
+      properties:
+        breaker_id: { type: string }
+        status: { type: string, enum: [tripped, cleared] }
+        tenant_id: { type: [string, 'null'], format: uuid }
+        adapter: { type: [string, 'null'] }
+        action: { type: [string, 'null'] }
+        reason: { type: string }
+        trace_event_id: { type: string, format: uuid }
+    KillSwitchRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [kill_switch_id, run_id, tenant_id, node_id, instance_id, reason, propagation_ack_required]
+          properties:
+            kill_switch_id: { type: string }
+            run_id: { type: [string, 'null'], format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            node_id: { type: [string, 'null'], format: uuid }
+            instance_id: { type: [string, 'null'], format: uuid }
+            reason: { type: string }
+            propagation_ack_required: { type: boolean }
+    KillSwitchReport:
+      type: object
+      required: [kill_switch_id, status, fail_closed, propagation_acknowledged, cancel_status, target_daemon_url, target_instance_id, target_derived_from_registry, cancel_payload_schema, trace_event_id, reason]
+      properties:
+        kill_switch_id: { type: string }
+        status: { type: string, enum: [activated, fail_closed] }
+        fail_closed: { type: boolean }
+        propagation_acknowledged: { type: boolean }
+        cancel_status: { type: [integer, 'null'] }
+        target_daemon_url: { type: [string, 'null'] }
+        target_instance_id: { type: [string, 'null'], format: uuid }
+        target_derived_from_registry: { type: boolean }
+        cancel_payload_schema: { type: [string, 'null'] }
+        trace_event_id: { type: string, format: uuid }
+        reason: { type: string }
+    GovernanceAuditExportRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [run_id]
+          properties:
+            run_id: { type: [string, 'null'], format: uuid }
+    GovernanceAuditExportReport:
+      type: object
+      required: [exported, trace_event_id, events, policy_bundle_ids, approval_ids, circuit_breaker_ids, kill_switch_ids]
+      properties:
+        exported: { type: boolean }
+        trace_event_id: { type: string, format: uuid }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/ManagerAuditEvent' }
+        policy_bundle_ids:
+          type: array
+          items: { type: string }
+        approval_ids:
+          type: array
+          items: { type: string, format: uuid }
+        circuit_breaker_ids:
+          type: array
+          items: { type: string }
+        kill_switch_ids:
+          type: array
+          items: { type: string }
+    NodeRegistration:
+      type: object
+      required: [node_id, kind, scope, capability_document, runtime_version, health, registered_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        kind: { type: string }
+        scope:
+          type: object
+          required: [fleet_id, tenant_id]
+          properties:
+            fleet_id: { type: string, format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+        capability_document:
+          $ref: '#/components/schemas/CapabilityDocument'
+        runtime_version: { type: string }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        registered_at: { type: string, format: date-time }
+    InstanceRegistration:
+      type: object
+      required: [instance_id, node_id, runtime_mode, hosted_tenants, supported_features, runtime_version, health, registered_at]
+      properties:
+        instance_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        runtime_mode: { type: string }
+        hosted_tenants:
+          type: array
+          items: { type: string, format: uuid }
+        supported_features:
+          type: array
+          items: { type: string }
+        runtime_version: { type: string }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        registered_at: { type: string, format: date-time }
+    NodeHealth:
+      type: object
+      required: [status, observed_at, metadata]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        observed_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+    NodeHeartbeat:
+      type: object
+      required: [node_id, health, recorded_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        recorded_at: { type: string, format: date-time }
+    CapabilityDocument:
+      type: object
+      required: [schema, capabilities, constraints]
+      properties:
+        schema: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        constraints:
+          type: object
+          required: [placement_target, data_locality, resident_daemon_url]
+          properties:
+            placement_target: { type: string }
+            data_locality: { type: string }
+            resident_daemon_url: { type: string, format: uri }
+          additionalProperties: true
+    PlacementRequest:
+      type: object
+      required: [target, required_capabilities, data_locality, dedicated_instance, required_runtime_version, max_runtime_ms, execution_mode]
+      properties:
+        target: { type: string }
+        required_capabilities:
+          type: array
+          items: { type: string }
+        data_locality: { type: [string, 'null'] }
+        dedicated_instance: { type: boolean }
+        required_runtime_version: { type: [string, 'null'] }
+        max_runtime_ms: { type: [integer, 'null'], minimum: 0 }
+        execution_mode: { type: string }
+    TraceSyncBatch:
+      type: object
+      required: [scope, records]
+      properties:
+        scope:
+          type: object
+          required: [fleet_id, node_id, instance_id, tenant_id, agent_id, run_id, work_order_id]
+          properties:
+            fleet_id: { type: [string, 'null'], format: uuid }
+            node_id: { type: [string, 'null'], format: uuid }
+            instance_id: { type: [string, 'null'], format: uuid }
+            tenant_id: { type: [string, 'null'], format: uuid }
+            agent_id: { type: [string, 'null'], format: uuid }
+            run_id: { type: [string, 'null'], format: uuid }
+            work_order_id: { type: [string, 'null'] }
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRecord'
+    MessageEnvelope:
+      type: object
+      required: [message, schema_version, delivery_status, trace_links]
+      properties:
+        message:
+          type: object
+          required: [message_id, source_agent_id, target_agent_id, run_id, schema, payload, causal_parent, requires_response, created_at]
+          properties:
+            message_id: { type: string, format: uuid }
+            source_agent_id: { type: string, format: uuid }
+            target_agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            schema: { type: string }
+            payload: { $ref: '#/components/schemas/JsonValue' }
+            causal_parent: { type: [string, 'null'] }
+            requires_response: { type: boolean }
+            created_at: { type: string, format: date-time }
+        schema_version: { type: string }
+        delivery_status: { type: string }
+        trace_links:
+          type: object
+          additionalProperties: true
+    AcceptedTraceResponse:
+      type: object
+      required: [accepted, trace_event_id]
+      properties:
+        accepted: { type: boolean }
+        trace_event_id: { type: string }
+    AcceptedNodeResponse:
+      type: object
+      required: [accepted, node_id]
+      properties:
+        accepted: { type: boolean }
+        node_id: { type: string, format: uuid }
+    FleetNodeListResponse:
+      type: object
+      required: [fleet_id, audit_event_count]
+      properties:
+        fleet_id: { type: string, format: uuid }
+        audit_event_count: { type: integer, minimum: 0 }
+    FleetTelemetrySnapshot:
+      type: object
+      required: [schema_version, fleet_id, observed_at, authority, nodes, instances, runs, queues, quota_signals, denial_signals, trace_sync, failures]
+      properties:
+        schema_version:
+          type: string
+          const: splendor.fleet_telemetry.v1
+        fleet_id: { type: string, format: uuid }
+        observed_at: { type: string, format: date-time }
+        authority:
+          type: string
+          enum: [observational_only]
+          description: Explicit non-authoritative marker; telemetry never authorizes dispatch, runs, messages, or actions.
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeTelemetry'
+        instances:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstanceTelemetry'
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunTelemetry'
+        queues:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueueTelemetry'
+        quota_signals:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuotaSignal'
+        denial_signals:
+          type: array
+          items:
+            $ref: '#/components/schemas/DenialSignal'
+        trace_sync:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceSyncTelemetry'
+        failures:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailureSignal'
+    NodeTelemetry:
+      type: object
+      required: [fleet_id, node_id, online_state, last_heartbeat_at, observed_at, instance_ids]
+      properties:
+        fleet_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        online_state:
+          type: string
+          enum: [online, stale, offline]
+        last_heartbeat_at: { type: [string, 'null'], format: date-time }
+        observed_at: { type: string, format: date-time }
+        instance_ids:
+          type: array
+          items: { type: string, format: uuid }
+    InstanceTelemetry:
+      type: object
+      required: [node_id, instance_id, runtime_version, runtime_mode, capabilities, current_run_counts, reported_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        runtime_version:
+          type: string
+          description: Runtime image identity or semantic build label reported by the resident instance.
+        runtime_mode:
+          type: string
+          enum: [ephemeral, resident, dedicated, customer_vpc, on_prem, edge_device, physical_robot, desktop_sidecar]
+        runtime_image:
+          type: [string, 'null']
+          description: Optional image identity when the manager can derive it from deployment evidence.
+        build_target:
+          type: [string, 'null']
+          description: Optional compose/build target evidence for same-runtime-image checks.
+        capabilities:
+          type: array
+          items: { type: string }
+        current_run_counts:
+          $ref: '#/components/schemas/RunStatusCounts'
+        reported_at: { type: string, format: date-time }
+    RunStatusCounts:
+      type: object
+      required: [counts]
+      properties:
+        counts:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunStatusCount'
+    RunStatusCount:
+      type: object
+      required: [status, count]
+      properties:
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        count: { type: integer, minimum: 0 }
+    RunTelemetry:
+      type: object
+      required: [tenant_id, agent_id, run_id, node_id, instance_id, status, updated_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        updated_at: { type: string, format: date-time }
+    QueueTelemetry:
+      type: object
+      required: [node_id, instance_id, queued_runs, queued_messages, updated_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        queued_runs: { type: integer, minimum: 0 }
+        queued_messages: { type: integer, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+    FailureCategory:
+      type: string
+      enum: [heartbeat_stale, heartbeat_offline, instance_unavailable, run_failed, quota_denied, verification_denied, trace_sync_lag, trace_sync_failed, state_handoff_failed, work_order_rejected, gateway_failed, other]
+    FailureSignal:
+      type: object
+      required: [category, node_id, instance_id, tenant_id, agent_id, run_id, verifier, message, trace_id, recorded_at]
+      properties:
+        category:
+          $ref: '#/components/schemas/FailureCategory'
+        node_id: { type: [string, 'null'], format: uuid }
+        instance_id: { type: [string, 'null'], format: uuid }
+        tenant_id: { type: [string, 'null'], format: uuid }
+        agent_id: { type: [string, 'null'], format: uuid }
+        run_id: { type: [string, 'null'], format: uuid }
+        verifier: { type: [string, 'null'] }
+        message: { type: string }
+        trace_id: { type: [string, 'null'] }
+        recorded_at: { type: string, format: date-time }
+    QuotaSignal:
+      type: object
+      required: [tenant_id, agent_id, run_id, verifier, allowed, usage, reasons, artifacts, recorded_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        verifier: { type: [string, 'null'] }
+        allowed: { type: boolean }
+        usage:
+          $ref: '#/components/schemas/QuotaUsage'
+        reasons:
+          type: array
+          items: { type: string }
+        artifacts:
+          $ref: '#/components/schemas/JsonValue'
+        recorded_at: { type: string, format: date-time }
+    DenialSignal:
+      type: object
+      required: [tenant_id, agent_id, run_id, verifier, action_name, reasons, artifacts, recorded_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        verifier: { type: [string, 'null'] }
+        action_name: { type: [string, 'null'] }
+        reasons:
+          type: array
+          items: { type: string }
+        artifacts:
+          $ref: '#/components/schemas/JsonValue'
+        recorded_at: { type: string, format: date-time }
+    TraceSyncFailure:
+      type: object
+      required: [category, message, failed_at]
+      properties:
+        category:
+          $ref: '#/components/schemas/FailureCategory'
+        message: { type: string }
+        failed_at: { type: string, format: date-time }
+    TraceSyncTelemetry:
+      type: object
+      required: [node_id, instance_id, last_synced_trace_id, last_synced_sequence, source_high_watermark, lag_events, last_sync_at, last_failure]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        last_synced_trace_id: { type: [string, 'null'] }
+        last_synced_sequence: { type: [integer, 'null'], minimum: 0 }
+        source_high_watermark: { type: [integer, 'null'], minimum: 0 }
+        lag_events: { type: integer, minimum: 0 }
+        last_sync_at: { type: [string, 'null'], format: date-time }
+        last_failure:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/TraceSyncFailure'
+    PlacementDecision:
+      type: object
+      required: [status, candidate_id, reasons]
+      properties:
+        status: { type: string }
+        candidate_id: { type: [string, 'null'] }
+        reasons:
+          type: array
+          items: { type: string }
+    WorkOrderValidationReport:
+      type: object
+      required: [work_order_id, accepted, reasons, trace_event_id]
+      properties:
+        work_order_id: { type: string }
+        accepted: { type: boolean }
+        reasons:
+          type: array
+          items: { type: string }
+        trace_event_id: { type: string }
+    RevokedWorkOrderResponse:
+      type: object
+      required: [revoked, trace_event_id]
+      properties:
+        revoked: { type: boolean }
+        trace_event_id: { type: string }
+    DispatchReport:
+      type: object
+      required: [work_order_id, selected_node_id, selected_instance_id, run_id, create_run_status, start_run_status, trace_event_id, resident_daemon_url]
+      properties:
+        work_order_id: { type: string }
+        selected_node_id: { type: string, format: uuid }
+        selected_instance_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        create_run_status: { type: integer }
+        start_run_status: { type: integer }
+        create_run_body: { type: [string, 'null'] }
+        start_run_body: { type: [string, 'null'] }
+        trace_event_id: { type: string }
+        resident_daemon_url: { type: string, format: uri }
+    TraceSyncReport:
+      type: object
+      required: [accepted_records, duplicate_records, latest_sequence]
+      properties:
+        accepted_records: { type: integer, minimum: 0 }
+        duplicate_records: { type: integer, minimum: 0 }
+        latest_sequence: { type: [integer, 'null'], minimum: 0 }
+    MessageStatusReport:
+      type: object
+      required: [message_id, work_order_id, delivery_status, trace_event_id, duplicate, idempotency_key, source_instance_id, target_instance_id, recipient_validated, receive_side_validated, work_order_authority_validated, route_permission, remote_state_mutated, reason]
+      properties:
+        message_id: { type: string, format: uuid }
+        work_order_id: { type: string }
+        delivery_status: { type: string }
+        trace_event_id: { type: string }
+        duplicate: { type: boolean }
+        idempotency_key: { type: [string, 'null'] }
+        source_instance_id: { type: string, format: uuid }
+        target_instance_id: { type: string, format: uuid }
+        recipient_validated: { type: boolean }
+        receive_side_validated: { type: boolean }
+        work_order_authority_validated: { type: boolean }
+        route_permission: { type: [string, 'null'] }
+        remote_state_mutated: { type: boolean }
+        reason: { type: [string, 'null'] }
+    ManagerAuditEvent:
+      type: object
+      required: [trace_event_id, event_type, details, timestamp]
+      properties:
+        trace_event_id: { type: string }
+        event_type: { type: string }
+        details: { $ref: '#/components/schemas/JsonValue' }
+        timestamp: { type: string, format: date-time }
+    RegisterNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              $ref: '#/components/schemas/NodeRegistration'
+    RegisterInstanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [registration]
+          properties:
+            registration:
+              $ref: '#/components/schemas/InstanceRegistration'
+    HeartbeatNodeRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [heartbeat]
+          properties:
+            heartbeat:
+              $ref: '#/components/schemas/NodeHeartbeat'
+    AdvertiseCapabilitiesRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [capability_document]
+          properties:
+            capability_document:
+              $ref: '#/components/schemas/CapabilityDocument'
+    PlacementEvaluationRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order_id, request]
+          properties:
+            work_order_id:
+              type: [string, 'null']
+            request:
+              $ref: '#/components/schemas/PlacementRequest'
+    SubmitWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order, expected_audience]
+          properties:
+            work_order:
+              $ref: '#/components/schemas/WorkOrderEnvelope'
+            expected_audience:
+              type: string
+    RevokeWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [reason]
+          properties:
+            reason:
+              type: string
+    DispatchWorkOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [target_node_id]
+          properties:
+            target_node_id:
+              type: [string, 'null']
+              format: uuid
+    SyncTraceBufferRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [batch]
+          properties:
+            batch:
+              $ref: '#/components/schemas/TraceSyncBatch'
+    SendMessageRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [work_order_id, message_envelope, source_instance_id, target_instance_id, idempotency_key, simulate_failure]
+          properties:
+            work_order_id:
+              type: string
+            message_envelope:
+              $ref: '#/components/schemas/MessageEnvelope'
+            source_instance_id:
+              type: string
+              format: uuid
+            target_instance_id:
+              type: string
+              format: uuid
+            idempotency_key:
+              type: [string, 'null']
+            simulate_failure:
+              type: [string, 'null']
+    ExportStateSnapshotRequest:
+      type: object
+      required: [run_id, credential, audit_attribution, work_order_id, source_instance_id, receiver_instance_id]
+      properties:
+        run_id: { type: string, format: uuid }
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+        work_order_id: { type: string }
+        source_instance_id: { type: string, format: uuid }
+        receiver_instance_id: { type: string, format: uuid }
+    ImportStateSnapshotRequest:
+      type: object
+      required: [handoff, credential, audit_attribution]
+      properties:
+        handoff:
+          type: object
+          required: [authority, snapshot]
+          properties:
+            authority:
+              type: object
+              required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+            snapshot:
+              type: object
+              required: [state_node_id, state_hash]
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+    ExportStateSnapshotResponse:
+      type: object
+      required: [run_id, state_node_id, trace_event_id, handoff]
+      properties:
+        run_id: { type: string, format: uuid }
+        state_node_id: { type: string }
+        trace_event_id: { type: string }
+        handoff:
+          $ref: '#/components/schemas/StateHandoff'
+    ImportStateSnapshotResponse:
+      type: object
+      required: [run_id, state_node_id, trace_event_id, accepted]
+      properties:
+        run_id: { type: string, format: uuid }
+        state_node_id: { type: string }
+        trace_event_id: { type: string }
+        accepted: { type: boolean }
+    StateHandoff:
+      type: object
+      required: [authority, snapshot]
+      properties:
+        authority:
+          type: object
+          required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+          properties:
+            tenant_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            work_order_id: { type: string }
+            source_instance_id: { type: string, format: uuid }
+            receiver_instance_id: { type: string, format: uuid }
+        snapshot:
+          type: object
+          required: [state_node_id, state_hash]
+          properties:
+            state_node_id: { type: string }
+            state_hash: { type: string }
+          additionalProperties: true
     Percept:
       type: object
       required: [schema, payload, provenance, timestamp]
@@ -844,6 +2261,9 @@ components:
       type: object
       required: [action, adapter, quota_usage, satisfied_preconditions]
       properties:
+        action_id:
+          type: [string, 'null']
+          format: uuid
         action:
           $ref: '#/components/schemas/Action'
         adapter:
@@ -977,13 +2397,9 @@ components:
         work_order:
           $ref: '#/components/schemas/WorkOrderEnvelope'
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         allowed_actions:
           type: array
           items:
@@ -1114,13 +2530,9 @@ components:
       required: [credential, audit_attribution, percept]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         percept:
           oneOf:
             - type: 'null'
@@ -1140,13 +2552,9 @@ components:
       required: [credential, audit_attribution, policy_bundle, sync_error, disconnected]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/AuditAttribution'
+          $ref: '#/components/schemas/AuditAttribution'
         policy_bundle:
           oneOf:
             - type: 'null'
@@ -1186,6 +2594,40 @@ components:
             - $ref: '#/components/schemas/PolicyBundleTraceContext'
         cache_status:
           $ref: '#/components/schemas/PolicyCacheStatusResponse'
+    CircuitBreakerSyncRequest:
+      type: object
+      required: [credential, audit_attribution, circuit_breakers, reason]
+      properties:
+        credential:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AuditAttribution'
+        circuit_breakers:
+          type: array
+          items:
+            $ref: '#/components/schemas/CircuitBreaker'
+        reason:
+          type: [string, 'null']
+    CircuitBreakerSyncResponse:
+      type: object
+      required: [run_id, accepted, breaker_ids, trace_event_id]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        accepted:
+          type: boolean
+        breaker_ids:
+          type: array
+          items:
+            type: string
+        trace_event_id:
+          type: string
+          format: uuid
     StateHeadResponse:
       type: object
       required: [run_id, state_node_id, parent_state_node_ids, data_hash, created_at, label]
@@ -1217,14 +2659,57 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TraceRecord'
-    ReplayRequest:
+    TraceExportRequest:
       type: object
-      required: [credential]
+      required: [credential, audit_attribution, redaction_policy, start, end]
       properties:
         credential:
-          oneOf:
-            - type: 'null'
-            - $ref: '#/components/schemas/CallerCredential'
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+        redaction_policy:
+          type: [string, 'null']
+          description: Required non-empty redaction policy for executable trace exports.
+        start:
+          type: [integer, 'null']
+          minimum: 0
+        end:
+          type: [integer, 'null']
+          minimum: 0
+    TraceExportResponse:
+      type: object
+      required: [run_id, records, record_count, redaction_policy, integrity_hash]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRecord'
+        record_count:
+          type: integer
+          minimum: 0
+        redaction_policy:
+          type: string
+        integrity_hash:
+          type: string
+    ReplayRequest:
+      type: object
+      required: [credential, audit_attribution, mode, side_effects_allowed]
+      properties:
+        credential:
+          $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          $ref: '#/components/schemas/AuditAttribution'
+        mode:
+          type: string
+          enum: [inspect_only]
+          default: inspect_only
+        side_effects_allowed:
+          type: boolean
+          default: false
+          description: Must remain false for default inspect-only replay; side-effectful replay modes are not exposed by the local daemon contract.
     ReplayResponse:
       type: object
       required: [replay_id, run_id, mode, event_count, action_event_count, approval_events]
@@ -1268,6 +2753,9 @@ components:
       type: object
       required: [run_id, tenant_id, agent_id, credential, audit_attribution, causal_trace_id, action, adapter, quota_usage, satisfied_preconditions, approval_evidence]
       properties:
+        action_id:
+          type: [string, 'null']
+          format: uuid
         run_id:
           type: string
           format: uuid
@@ -1314,6 +2802,22 @@ components:
           type: boolean
         runtime_available:
           type: boolean
+    VersionResponse:
+      type: object
+      required: [daemon_api_version, compatibility_line, openapi_version, local_only, schema_versions]
+      properties:
+        daemon_api_version:
+          type: string
+        compatibility_line:
+          type: string
+        openapi_version:
+          type: string
+        local_only:
+          type: boolean
+        schema_versions:
+          type: array
+          items:
+            type: string
     CapabilitiesResponse:
       type: object
       required: [daemon_api_version, local_only, replay_modes, endpoints]
