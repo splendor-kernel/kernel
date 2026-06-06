@@ -66,12 +66,19 @@
           "anti_drift_checks": {"type": "array", "items": {"type": "string"}},
           "run_ids": {"type": "array", "items": {"type": "string"}},
           "trace_event_ids": {"type": "array", "items": {"type": "string"}},
+          "required_event_evidence": {"type": "object"},
           "state_node_ids": {"type": "array", "items": {"type": "string"}},
           "state_hashes": {"type": "array", "items": {"type": "string"}},
           "message_ids": {"type": "array", "items": {"type": "string"}},
           "work_order_ids": {"type": "array", "items": {"type": "string"}},
           "approval_ids": {"type": "array", "items": {"type": "string"}},
           "node_ids": {"type": "array", "items": {"type": "string"}},
+          "instance_ids": {"type": "array", "items": {"type": "string"}},
+          "action_ids": {"type": "array", "items": {"type": "string"}},
+          "policy_ids": {"type": "array", "items": {"type": "string"}},
+          "circuit_breaker_ids": {"type": "array", "items": {"type": "string"}},
+          "kill_switch_ids": {"type": "array", "items": {"type": "string"}},
+          "artifact_ids": {"type": "array", "items": {"type": "string"}},
           "artifact_paths": {"type": "array", "items": {"type": "string"}}
         }
       }
