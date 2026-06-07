@@ -20,8 +20,8 @@ use splendor_types::{
     NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
     PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
     PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus, RunTelemetry,
-    TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring,
-    WorkOrderValidationContext,
+    TaskRequest, TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope,
+    WorkOrderKeyring, WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -1966,7 +1966,7 @@ fn validate_remote_message_authority(
             "target agent is not authorized by the submitted work order route permission",
         ));
     }
-    if message_payload_smuggles_authority(&message.payload, work_order) {
+    if message_payload_smuggles_authority(message, work_order) {
         return Err(ManagerApiError::forbidden(
             "message_payload_scope_smuggling",
             "message payload cannot grant data refs or permissions outside work-order authority",
@@ -1975,38 +1975,88 @@ fn validate_remote_message_authority(
     Ok(())
 }
 
-fn message_payload_smuggles_authority(
-    payload: &serde_json::Value,
-    work_order: &WorkOrderEnvelope,
-) -> bool {
+fn message_payload_smuggles_authority(message: &Message, work_order: &WorkOrderEnvelope) -> bool {
+    let payload = &message.payload;
     let allowed_data_refs = &work_order.work_order.data_refs;
+    let allowed_actions = &work_order.work_order.allowed_actions;
+    let allowed_adapters = &work_order.work_order.allowed_adapters;
     let allowed_permissions = &work_order.work_order.allowed_permissions;
-    let data_refs: Vec<&str> = payload
-        .get("data_refs")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect();
-    if data_refs
-        .iter()
-        .any(|data_ref| !allowed_data_refs.iter().any(|allowed| allowed == *data_ref))
+
+    if payload_fields_exceed_allowlist(payload, &["data_refs"], allowed_data_refs)
+        || payload_fields_exceed_allowlist(
+            payload,
+            &["permissions", "allowed_permissions"],
+            allowed_permissions,
+        )
     {
         return true;
     }
-    let permissions: Vec<&str> = payload
-        .get("permissions")
-        .or_else(|| payload.get("allowed_permissions"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect();
-    permissions.iter().any(|permission| {
-        !allowed_permissions
-            .iter()
-            .any(|allowed| allowed == *permission)
-    })
+
+    if message.schema != TASK_REQUEST_SCHEMA {
+        return false;
+    }
+
+    let task_request = match TaskRequest::from_payload(payload) {
+        Ok(task_request) => task_request,
+        Err(_) => return true,
+    };
+
+    payload_fields_exceed_allowlist(
+        payload,
+        &["data_ref", "data_refs", "input_ref", "input_refs"],
+        allowed_data_refs,
+    ) || payload_fields_exceed_allowlist(payload, &["allowed_actions"], allowed_actions)
+        || payload_fields_exceed_allowlist(payload, &["allowed_adapters"], allowed_adapters)
+        || !values_within_allowlist(
+            &task_request.delegated_authority.allowed_actions,
+            allowed_actions,
+        )
+        || !values_within_allowlist(
+            &task_request.delegated_authority.allowed_adapters,
+            allowed_adapters,
+        )
+        || !values_within_allowlist(
+            &task_request.delegated_authority.allowed_permissions,
+            allowed_permissions,
+        )
+}
+
+fn payload_fields_exceed_allowlist(
+    payload: &serde_json::Value,
+    fields: &[&str],
+    allowlist: &[String],
+) -> bool {
+    fields
+        .iter()
+        .any(|field| payload_field_exceeds_allowlist(payload, field, allowlist))
+}
+
+fn payload_field_exceeds_allowlist(
+    payload: &serde_json::Value,
+    field: &str,
+    allowlist: &[String],
+) -> bool {
+    let Some(value) = payload.get(field) else {
+        return false;
+    };
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(item) => !string_allowed(allowlist, item),
+        serde_json::Value::Array(items) => items.iter().any(|item| match item {
+            serde_json::Value::String(value) => !string_allowed(allowlist, value),
+            serde_json::Value::Null => false,
+            _ => true,
+        }),
+        _ => true,
+    }
+}
+
+fn values_within_allowlist(values: &[String], allowlist: &[String]) -> bool {
+    values.iter().all(|value| string_allowed(allowlist, value))
+}
+
+fn string_allowed(allowlist: &[String], value: &str) -> bool {
+    allowlist.iter().any(|allowed| allowed == value)
 }
 
 fn task_response_child_run_id(message: &Message) -> Option<&str> {
@@ -3615,6 +3665,49 @@ mod tests {
             "simulate_failure": null
         }))
         .expect("send request")
+    }
+
+    fn task_request_send_request(
+        credential: CallerCredential,
+        target_agent: &str,
+        run_id: RunId,
+        message_id: &str,
+        child_run_id: &str,
+        idempotency_key: &str,
+        delegated_authority: serde_json::Value,
+    ) -> SendMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "credential": credential,
+            "audit_attribution": audit_for(&credential),
+            "work_order_id": "wo_test_remote",
+            "message_envelope": {
+                "message": {
+                    "message_id": message_id,
+                    "source_agent_id": "22222222-2222-4222-8222-222222222222",
+                    "target_agent_id": target_agent,
+                    "run_id": run_id,
+                    "schema": TASK_REQUEST_SCHEMA,
+                    "payload": {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_run_id,
+                        "target_agent_id": target_agent,
+                        "objective": "scoped task request",
+                        "delegated_authority": delegated_authority
+                    },
+                    "causal_parent": null,
+                    "requires_response": true,
+                    "created_at": now_rfc3339()
+                },
+                "schema_version": "v1",
+                "delivery_status": "pending",
+                "trace_links": {}
+            },
+            "source_instance_id": "00000000-0000-4000-8000-000000000302",
+            "target_instance_id": "00000000-0000-4000-8000-000000000304",
+            "idempotency_key": idempotency_key,
+            "simulate_failure": null
+        }))
+        .expect("task request send request")
     }
 
     async fn manager_call<T: serde::de::DeserializeOwned>(
@@ -5695,6 +5788,192 @@ mod tests {
                     .get("reason")
                     .and_then(serde_json::Value::as_str)
                     == Some("message_idempotency_scope_mismatch")));
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_nested_task_request_authority_smuggling() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::WorkOrdersSubmit,
+                EndpointScope::MessagesSend,
+            ],
+        );
+        let target_agent = "33333333-3333-4333-8333-333333333333";
+        let work_order = test_work_order(target_agent);
+        let tenant_id = work_order.work_order.tenant_id.clone();
+        let run_id = work_order.work_order.run_id.clone().expect("run id");
+        register_message_route(&state, &security, &tenant_id).await;
+        submit_test_work_order(&state, &security, work_order).await;
+
+        let valid_authority = serde_json::json!({
+            "allowed_actions": ["sql.read_fixture"],
+            "allowed_adapters": ["fixture-sql"],
+            "allowed_permissions": ["fixture.sql.read"]
+        });
+        let extra_permission = serde_json::json!({
+            "allowed_actions": ["sql.read_fixture"],
+            "allowed_adapters": ["fixture-sql"],
+            "allowed_permissions": ["fixture.sql.read", "tenant.admin"]
+        });
+        let permission_smuggle = task_request_send_request(
+            security.credential.clone(),
+            target_agent,
+            run_id.clone(),
+            "55555555-5555-4555-8555-555555555559",
+            "44444444-4444-4444-8444-444444444449",
+            "nested-permission-smuggle",
+            extra_permission,
+        );
+        let permission_message_id = permission_smuggle
+            .message_envelope
+            .message
+            .message_id
+            .clone();
+        let error = send_message(State(state.clone()), Json(permission_smuggle))
+            .await
+            .expect_err("extra nested permission rejected");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "message_payload_scope_smuggling");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&permission_message_id.to_string()));
+        assert!(!state
+            .inner
+            .message_idempotency
+            .lock()
+            .expect("message idempotency lock")
+            .contains_key("nested-permission-smuggle"));
+
+        let retry_valid = task_request_send_request(
+            security.credential.clone(),
+            target_agent,
+            run_id.clone(),
+            "55555555-5555-4555-8555-555555555559",
+            "44444444-4444-4444-8444-444444444449",
+            "nested-permission-smuggle",
+            valid_authority.clone(),
+        );
+        let delivered = send_message(State(state.clone()), Json(retry_valid))
+            .await
+            .expect("valid retry after rejected smuggling is not idempotency-poisoned")
+            .0;
+        assert!(!delivered.duplicate);
+        assert_eq!(
+            delivered.idempotency_key.as_deref(),
+            Some("nested-permission-smuggle")
+        );
+
+        let extra_action = serde_json::json!({
+            "allowed_actions": ["sql.read_fixture", "artifact.publish_external"],
+            "allowed_adapters": ["fixture-sql"],
+            "allowed_permissions": ["fixture.sql.read"]
+        });
+        let action_smuggle = task_request_send_request(
+            security.credential.clone(),
+            target_agent,
+            run_id.clone(),
+            "55555555-5555-4555-8555-55555555555a",
+            "44444444-4444-4444-8444-44444444444a",
+            "nested-action-smuggle",
+            extra_action,
+        );
+        let action_message_id = action_smuggle.message_envelope.message.message_id.clone();
+        let error = send_message(State(state.clone()), Json(action_smuggle))
+            .await
+            .expect_err("extra nested action rejected");
+        assert_eq!(error.body.code, "message_payload_scope_smuggling");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&action_message_id.to_string()));
+        assert!(!state
+            .inner
+            .message_idempotency
+            .lock()
+            .expect("message idempotency lock")
+            .contains_key("nested-action-smuggle"));
+
+        let extra_adapter = serde_json::json!({
+            "allowed_actions": ["sql.read_fixture"],
+            "allowed_adapters": ["fixture-sql", "external-publisher"],
+            "allowed_permissions": ["fixture.sql.read"]
+        });
+        let adapter_smuggle = task_request_send_request(
+            security.credential.clone(),
+            target_agent,
+            run_id.clone(),
+            "55555555-5555-4555-8555-55555555555b",
+            "44444444-4444-4444-8444-44444444444b",
+            "nested-adapter-smuggle",
+            extra_adapter,
+        );
+        let adapter_message_id = adapter_smuggle.message_envelope.message.message_id.clone();
+        let error = send_message(State(state.clone()), Json(adapter_smuggle))
+            .await
+            .expect_err("extra nested adapter rejected");
+        assert_eq!(error.body.code, "message_payload_scope_smuggling");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&adapter_message_id.to_string()));
+        assert!(!state
+            .inner
+            .message_idempotency
+            .lock()
+            .expect("message idempotency lock")
+            .contains_key("nested-adapter-smuggle"));
+
+        let mut input_ref_smuggle = task_request_send_request(
+            security.credential,
+            target_agent,
+            run_id,
+            "55555555-5555-4555-8555-55555555555c",
+            "44444444-4444-4444-8444-44444444444c",
+            "nested-input-ref-smuggle",
+            valid_authority,
+        );
+        input_ref_smuggle
+            .message_envelope
+            .message
+            .payload
+            .as_object_mut()
+            .expect("task request payload object")
+            .insert(
+                "input_ref".to_string(),
+                serde_json::json!("dataset:other-tenant.secret.v1"),
+            );
+        let input_ref_message_id = input_ref_smuggle
+            .message_envelope
+            .message
+            .message_id
+            .clone();
+        let error = send_message(State(state.clone()), Json(input_ref_smuggle))
+            .await
+            .expect_err("out-of-scope explicit input_ref rejected");
+        assert_eq!(error.body.code, "message_payload_scope_smuggling");
+        assert!(!state
+            .inner
+            .messages
+            .lock()
+            .expect("message lock")
+            .contains_key(&input_ref_message_id.to_string()));
+        assert!(!state
+            .inner
+            .message_idempotency
+            .lock()
+            .expect("message idempotency lock")
+            .contains_key("nested-input-ref-smuggle"));
     }
 
     #[tokio::test]

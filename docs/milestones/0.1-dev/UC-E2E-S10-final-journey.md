@@ -74,7 +74,7 @@ The report aggregator rejects missing event IDs, non-UUID event IDs, required ev
 
 ## Controlled Negative Branches
 
-S10 includes independent negative branches for invalid work order, unauthorized data ref, specialist permission escalation, duplicate remote delivery, unsupported/omitted-scope/cross-tenant/unrelated-agent message API access, unauthorized ack/nack attempts, raw physical action, expired approval, circuit-breaker blocked publish, kill-switch cancellation, tampered trace/state import, and unsafe replay mode.
+S10 includes independent negative branches for invalid work order, unauthorized data ref, specialist permission escalation including nested delegated-authority smuggling, duplicate remote delivery, unsupported/omitted-scope/cross-tenant/unrelated-agent message API access, unauthorized ack/nack attempts, raw physical action, expired approval, circuit-breaker blocked publish, kill-switch cancellation, tampered trace/state import, and unsafe replay mode.
 
 ## Replay Behavior
 
