@@ -305,7 +305,7 @@ def cli_action_write() -> dict[str, Any]:
     return {"name": "write_file", "adapter": "filesystem", "params": {"path": "artifacts/failure.txt", "contents": "UC-E2E-S9 failure fixture\n"}, "required_permissions": ["s9.artifact.write"], "usage": {"actions": 1, "filesystem_write_bytes": 28}}
 
 
-def cli_config(root: Path, artifact_dir: Path, envelope: dict[str, Any], run_id: str, port: int, injection: dict[str, Any]) -> dict[str, Any]:
+def cli_config(root: Path, artifact_dir: Path, envelope: dict[str, Any], run_id: str, port: int, injection: dict[str, Any], actions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "trace_db": str(artifact_dir / f"{run_id}.trace.db"),
         "state_db": str(artifact_dir / f"{run_id}.state.db"),
@@ -326,7 +326,7 @@ def cli_config(root: Path, artifact_dir: Path, envelope: dict[str, Any], run_id:
             "initial_state": "{\"scenario\":\"UC-E2E-S9\"}",
             "allowed_permissions": ["s9.http.read", "s9.artifact.write"],
             "percepts": [{"schema": "splendor.percept.s9_failure.v1", "payload": {"url": f"http://127.0.0.1:{port}/allowed/s9-failure-fixture"}, "source": "uc-e2e-s9", "detail": "public CLI failure injection fixture"}],
-            "policy": {"type": "static", "next_state": "{\"failure\":\"injected\"}", "actions": [cli_action_http(port), cli_action_write()]},
+            "policy": {"type": "static", "next_state": "{\"failure\":\"injected\"}", "actions": actions or [cli_action_http(port), cli_action_write()]},
         }],
     }
 
@@ -419,9 +419,9 @@ def load_source(artifacts_root: Path, scenario_id: str) -> dict[str, Any]:
     }
 
 
-def run_cli_failure_case(root: Path, artifact_dir: Path, commands: Path, run_id: str, port: int, case: str, injection: dict[str, Any]) -> dict[str, Any]:
+def run_cli_failure_case(root: Path, artifact_dir: Path, commands: Path, run_id: str, port: int, case: str, injection: dict[str, Any], actions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     envelope = sign_work_order(root, artifact_dir, commands, cli_work_order(run_id))
-    config = cli_config(root, artifact_dir, envelope, run_id, port, injection)
+    config = cli_config(root, artifact_dir, envelope, run_id, port, injection, actions)
     config_path = artifact_dir / f"{case}.config.json"
     write_json(config_path, config)
     before = FixtureHandler.counter
@@ -496,6 +496,16 @@ def main() -> int:
 
     trace_failure_cli = run_cli_failure_case(root, artifact_dir, commands, TRACE_FAIL_RUN_ID, fixture_port, "trace_write_failure", {"trace_fail_on_event": "ActionVerificationStarted"})
     state_failure_cli = run_cli_failure_case(root, artifact_dir, commands, STATE_FAIL_RUN_ID, fixture_port, "state_commit_failure", {"state_commit_fail": True})
+    verifier_unavailable_cli = run_cli_failure_case(
+        root,
+        artifact_dir,
+        commands,
+        VERIFIER_RUN_ID,
+        fixture_port,
+        "verifier_unavailable",
+        {"verifier_unavailable_actions": ["http_get"]},
+        actions=[cli_action_http(fixture_port)],
+    )
 
     envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID))
     call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(manager), "work_order": envelope, "expected_audience": "central-manager"})
@@ -529,11 +539,6 @@ def main() -> int:
     quota_cred = daemon_credential(QUOTA_RUN_ID)
     quota_first = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
     quota_second = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
-
-    verifier_envelope = sign_work_order(root, artifact_dir, commands, work_order(VERIFIER_RUN_ID, actions=["s9.verifier"], permissions=["s9.verifier"]))
-    call("createRun", "POST", args.base_url, "/runs", create_run_payload(VERIFIER_RUN_ID, verifier_envelope, approval_policies=[approval_policy("s9.verifier", "s9.verifier", expires_minutes=-1)]))
-    verifier_cred = daemon_credential(VERIFIER_RUN_ID)
-    verifier_unavailable = call("submitAction", "POST", args.base_url, "/actions", {"run_id": VERIFIER_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": verifier_cred, "audit_attribution": audit(verifier_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559903", "action": action("s9.verifier", {}, ["s9.verifier"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
 
     stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager), "work_order_id": "s9-stale-placement", "request": {"target": "resident_cloud_pool", "required_capabilities": ["s9.stale.only"], "data_locality": "cloud", "dedicated_instance": False, "execution_mode": "live"}})
     failed_message = {**duplicate_message, "message": {**duplicate_message["message"], "message_id": "55555555-5555-4555-8555-555555559904"}}
@@ -572,7 +577,6 @@ def main() -> int:
     traces = call("exportTraces", "POST", args.base_url, f"/runs/{RUN_ID}/traces/export", {"credential": run_cred, "audit_attribution": audit(run_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     adapter_traces = call("exportTraces", "POST", args.base_url, f"/runs/{ADAPTER_FAIL_RUN_ID}/traces/export", {"credential": adapter_cred, "audit_attribution": audit(adapter_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     quota_traces = call("exportTraces", "POST", args.base_url, f"/runs/{QUOTA_RUN_ID}/traces/export", {"credential": quota_cred, "audit_attribution": audit(quota_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
-    verifier_traces = call("exportTraces", "POST", args.base_url, f"/runs/{VERIFIER_RUN_ID}/traces/export", {"credential": verifier_cred, "audit_attribution": audit(verifier_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     retry_traces = call("exportTraces", "POST", args.base_url, f"/runs/{RETRY_RUN_ID}/traces/export", {"credential": retry_cred, "audit_attribution": audit(retry_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     unsafe_traces = call("exportTraces", "POST", args.base_url, f"/runs/{UNSAFE_RETRY_RUN_ID}/traces/export", {"credential": unsafe_cred, "audit_attribution": audit(unsafe_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
     deny_traces = call("exportTraces", "POST", args.base_url, f"/runs/{DENY_RUN_ID}/traces/export", {"credential": deny_cred, "audit_attribution": audit(deny_cred), "redaction_policy": "uc-e2e-s9-redacted", "start": None, "end": None})
@@ -605,7 +609,6 @@ def main() -> int:
         traces["body"].get("records", [])
         + adapter_traces["body"].get("records", [])
         + quota_traces["body"].get("records", [])
-        + verifier_traces["body"].get("records", [])
         + retry_traces["body"].get("records", [])
         + unsafe_traces["body"].get("records", [])
         + deny_traces["body"].get("records", [])
@@ -613,6 +616,7 @@ def main() -> int:
         + kill_traces["body"].get("records", [])
         + trace_failure_cli["records"]
         + state_failure_cli["records"]
+        + verifier_unavailable_cli["records"]
     )
     manager_events: list[dict[str, Any]] = []
     if isinstance(manager_audit.get("body"), list):
@@ -632,8 +636,8 @@ def main() -> int:
         if kind == "action.failed" and run_id == ADAPTER_FAIL_RUN_ID and action_name == "s9.adapter_failure":
             adapter_action_id = action_id or adapter_failure["body"].get("action_id")
             add_event_evidence(event_evidence, "adapter.failed", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=adapter_action_id, details={"action": action_name, "status": adapter_failure["body"].get("status"), "outcome_action_id": adapter_failure["body"].get("action_id"), "api_operation": "submitAction"})
-        if kind in {"action.denied", "action.needs_intervention"} and run_id == VERIFIER_RUN_ID and any(reason in {"approval_policy_expired", "verifier_unavailable"} for reason in reasons):
-            add_event_evidence(event_evidence, "verifier.unavailable", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"reasons": reasons, "status": verifier_unavailable["body"].get("status")})
+        if kind in {"action.denied", "action.needs_intervention"} and run_id == VERIFIER_RUN_ID and "verifier_unavailable" in reasons:
+            add_event_evidence(event_evidence, "verifier.unavailable", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"reasons": reasons, "status": "Denied", "public_path": "splendorctl run --config", "failure_injection": "verifier_unavailable_actions", "http_counter_before": verifier_unavailable_cli["http_counter_before"], "http_counter_after": verifier_unavailable_cli["http_counter_after"]})
         if kind == "action.denied" and run_id == QUOTA_RUN_ID and quota_second["body"].get("status") in {"Denied", "NeedsIntervention"}:
             add_event_evidence(event_evidence, "quota.exceeded", trace_event_id=trace_id(rec), source="runtime_trace_export", original_event_type=kind, artifact="trace-export.jsonl", run_id=run_id, action_id=action_id, details={"reasons": reasons})
         if kind == "trace.write_failed" and run_id == TRACE_FAIL_RUN_ID:
@@ -677,7 +681,7 @@ def main() -> int:
     bounded_retry_counts = {"s9.idempotent_read": retry_executed, "max_attempts": 2, "attempts_submitted": len(retry_attempts), "attempt_statuses": retry_statuses, "third_attempt_status": retry_statuses[2], "enforced_by": "gateway_quota", "quota_consumed_attempts": retry_executed}
     negative_cases = [
         {"case": "adapter_returns_failure_no_fake_success_committed", "passed": adapter_failure["body"].get("status") == "Failed" and before_adapter["body"].get("adapter_executions") == after_adapter["body"].get("adapter_executions"), "reason_codes": ["adapter_failed"]},
-        {"case": "verifier_unavailable_denies_or_intervenes", "passed": verifier_unavailable["body"].get("status") in {"Denied", "NeedsIntervention"} and bool(event_ids.get("verifier.unavailable")), "reason_codes": verifier_unavailable["body"].get("verification", {}).get("reasons", []) or ["verifier_unavailable"]},
+        {"case": "verifier_unavailable_denies_or_intervenes", "passed": verifier_unavailable_cli["trace_export_exit"] == 0 and verifier_unavailable_cli["http_counter_before"] == verifier_unavailable_cli["http_counter_after"] and bool(event_ids.get("verifier.unavailable")), "reason_codes": ["verifier_unavailable"]},
         {"case": "policy_unavailable_or_expired_denies_high_risk", "passed": s5_policy.get("runtime_expired_policy", {}).get("reason_code") == "policy_expired", "reason_codes": ["policy_expired"]},
         {"case": "trace_write_failure_before_side_effect_blocks_execution", "passed": trace_failure_cli["exit"] != 0 and trace_failure_cli["http_counter_before"] == trace_failure_cli["http_counter_after"] and bool(event_ids.get("trace.write_failed")), "reason_codes": ["trace_write_failed"]},
         {"case": "trace_write_failure_after_outcome_audit_visible_no_hidden_continuation", "passed": sync_failed["status"] == 403 and sync_recovered["body"].get("accepted_records", 0) > 0, "reason_codes": ["trace_sync_rejected"]},
@@ -749,7 +753,7 @@ def main() -> int:
         "state_node_ids": [state_head["body"].get("state_node_id", "")] + s5["scenario"].get("state_node_ids", [])[:1],
         "state_hashes": [state_head["body"].get("data_hash", "")] + s5["scenario"].get("state_hashes", [])[:1],
         "message_ids": [duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]],
-        "work_order_ids": [envelope["work_order_id"], retry_envelope["work_order_id"], unsafe_envelope["work_order_id"], adapter_envelope["work_order_id"], quota_envelope["work_order_id"], verifier_envelope["work_order_id"], deny_envelope["work_order_id"], cb_envelope["work_order_id"], kill_envelope["work_order_id"], trace_failure_cli["work_order_id"], state_failure_cli["work_order_id"]] + s5["scenario"].get("work_order_ids", [])[:1],
+        "work_order_ids": [envelope["work_order_id"], retry_envelope["work_order_id"], unsafe_envelope["work_order_id"], adapter_envelope["work_order_id"], quota_envelope["work_order_id"], verifier_unavailable_cli["work_order_id"], deny_envelope["work_order_id"], cb_envelope["work_order_id"], kill_envelope["work_order_id"], trace_failure_cli["work_order_id"], state_failure_cli["work_order_id"]] + s5["scenario"].get("work_order_ids", [])[:1],
         "approval_ids": [approval_context.get("approval_id", "")] + s5["scenario"].get("approval_ids", [])[:1],
         "node_ids": [VPC_NODE_ID, CLOUD_NODE_ID, "00000000-0000-4000-8000-000000009909"],
         "api_operations": sorted({row["operation_id"] for row in api_rows}),
@@ -763,7 +767,8 @@ def main() -> int:
     }
     artifacts = {
         "scenario-report.json": scenario,
-        "fault-injection-report.json": {"positive_checks": positive_checks, "negative_cases": negative_cases, "required_trace_event_ids": event_ids, "required_event_evidence": event_evidence, "source_scenarios": scenario["source_scenarios"], "cli_trace_failure": {k: v for k, v in trace_failure_cli.items() if k != "records"}, "cli_state_failure": {k: v for k, v in state_failure_cli.items() if k != "records"}},
+        "fault-injection-report.json": {"positive_checks": positive_checks, "negative_cases": negative_cases, "required_trace_event_ids": event_ids, "required_event_evidence": event_evidence, "source_scenarios": scenario["source_scenarios"], "cli_trace_failure": {k: v for k, v in trace_failure_cli.items() if k != "records"}, "cli_state_failure": {k: v for k, v in state_failure_cli.items() if k != "records"}, "cli_verifier_unavailable": {k: v for k, v in verifier_unavailable_cli.items() if k != "records"}},
+        "verifier-unavailable-report.json": {"public_path": "splendorctl run --config + splendorctl trace export", "case": {k: v for k, v in verifier_unavailable_cli.items() if k != "records"}, "denied_action": "http_get", "adapter_counter": {"http_counter_before": verifier_unavailable_cli["http_counter_before"], "http_counter_after": verifier_unavailable_cli["http_counter_after"]}, "required_event_evidence": event_evidence.get("verifier.unavailable", [])},
         "quota-retry-report.json": {"quota_first": quota_first["body"], "quota_second": quota_second["body"], "retry_attempts": [attempt["body"] for attempt in retry_attempts], "unsafe_retry": unsafe_retry["body"], "bounded_retry_counts": replay_report["bounded_retry_counts"], "retry_policy": {"mode": "explicit_public_retry_policy", "max_attempts": 2, "retryable_action": "s9.idempotent_read", "idempotency_key": "s9-read-once", "enforced_by": "gateway_quota", "unsafe_retry_rejection": "gateway_permission_denial"}},
         "idempotency-report.json": {"delivered": delivered["body"], "duplicate": duplicate["body"], "markers": replay_report["idempotency_markers"]},
         "failure-matrix.json": {item["case"]: item for item in negative_cases},
