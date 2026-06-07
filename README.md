@@ -1,5 +1,7 @@
 # Splendor Kernel
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/splendor-os/kernel)
+
 **An AI Kernel for Self-Managed Neuro-Symbolic Agents**
 
 ## Intent
