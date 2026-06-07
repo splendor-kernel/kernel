@@ -4559,24 +4559,26 @@ struct LocalResourceBoundaryVerifier {
 
 impl LocalResourceBoundaryVerifier {
     fn from_config(config: Option<&AdaptersConfig>) -> Self {
-        Self::from_config_with_failure_injection(config, None)
+        Self {
+            http_allowed_domains: config
+                .and_then(|adapters| adapters.http.as_ref())
+                .map(|http| http.allowed_domains.clone())
+                .unwrap_or_default(),
+            unavailable_actions: BTreeSet::new(),
+        }
     }
 
     fn from_config_with_failure_injection(
         config: Option<&AdaptersConfig>,
         failure_injection: Option<&FailureInjectionConfig>,
     ) -> Self {
-        Self {
-            http_allowed_domains: config
-                .and_then(|adapters| adapters.http.as_ref())
-                .map(|http| http.allowed_domains.clone())
-                .unwrap_or_default(),
-            unavailable_actions: failure_injection
-                .and_then(|injection| injection.verifier_unavailable_actions.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-        }
+        let mut verifier = Self::from_config(config);
+        verifier.unavailable_actions = failure_injection
+            .and_then(|injection| injection.verifier_unavailable_actions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        verifier
     }
 }
 
