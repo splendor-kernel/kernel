@@ -158,6 +158,10 @@ def sec(credential: dict[str, Any]) -> dict[str, Any]:
     return {"credential": credential, "audit_attribution": audit(credential)}
 
 
+def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant_id: str = TENANT_ID) -> dict[str, Any]:
+    return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
+
+
 def node_registration(node_id: str, kind: str, target: str, locality: str, url: str, capabilities: list[str]) -> dict[str, Any]:
     return {
         "node_id": node_id,
@@ -353,7 +357,7 @@ def main() -> int:
     helper_work_order_submit = call("submitWorkOrder", "POST", "/work-orders", {**sec(manager_cred), "work_order": helper_envelope, "expected_audience": "central-manager"}, base_url=args.manager_url)
     message_envelope = {"message": cloud_message, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
     cloud_message_delivery = call("sendMessage", "POST", "/messages", {**sec(manager_cred), "work_order_id": HELPER_WORK_ORDER_ID, "message_envelope": message_envelope, "source_instance_id": CLOUD_INSTANCE_ID, "target_instance_id": EDGE_INSTANCE_ID, "idempotency_key": "s6-cloud-helper-proposal", "simulate_failure": None}, base_url=args.manager_url)
-    cloud_message_received = call("getMessage", "POST", f"/messages/{CLOUD_MESSAGE_ID}/read", sec(manager_cred), base_url=args.manager_url)
+    cloud_message_received = call("getMessage", "POST", f"/messages/{CLOUD_MESSAGE_ID}/read", message_scope(manager_cred, RUN_ID, AGENT_ID), base_url=args.manager_url)
     manager_audit = call("managerAudit", "POST", "/fleet/audit/read", sec(manager_cred), base_url=args.manager_url)
 
     simulator_evidence: list[dict[str, Any]] = []

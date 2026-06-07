@@ -3647,6 +3647,7 @@ struct RunConfig {
 struct FailureInjectionConfig {
     trace_fail_on_event: Option<String>,
     state_commit_fail: Option<bool>,
+    verifier_unavailable_actions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3782,12 +3783,53 @@ struct FailingTraceStore {
     failed: Mutex<bool>,
 }
 
+fn append_failure_evidence_event(
+    store: &dyn TraceStore,
+    run_id: &str,
+    failure_kind: &str,
+    details: serde_json::Value,
+) -> Result<(), TraceStoreError> {
+    let next_sequence = match store.read(run_id) {
+        Ok(records) => records.len() as u64,
+        Err(TraceStoreError::RunNotFound) => 0,
+        Err(error) => return Err(error),
+    };
+    let parsed_run_id = RunId::parse(run_id).map_err(|_| {
+        TraceStoreError::InvalidTimestamp(format!("invalid_run_id_for_failure_evidence:{run_id}"))
+    })?;
+    let trace_event_id = TraceEventId::from_run_sequence(&parsed_run_id, next_sequence).to_string();
+    store.append(
+        run_id,
+        serde_json::json!({
+            "kind": {
+                failure_kind: details,
+            },
+            "trace_event_id": trace_event_id,
+            "identity": {
+                "run_id": run_id,
+            },
+            "timestamp": OffsetDateTime::now_utc().to_string(),
+        }),
+    )?;
+    Ok(())
+}
+
 impl TraceStore for FailingTraceStore {
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
         if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
             let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
             if !*failed {
                 *failed = true;
+                append_failure_evidence_event(
+                    &self.inner,
+                    run_id,
+                    "TraceWriteFailed",
+                    serde_json::json!({
+                        "failed_event": self.fail_on_event,
+                        "side_effect_executed": false,
+                        "failure_injection": "splendorctl_public_run_config",
+                    }),
+                )?;
                 return Err(TraceStoreError::InvalidTimestamp(format!(
                     "injected_trace_write_failure:{}",
                     self.fail_on_event
@@ -4119,9 +4161,35 @@ fn run_from_config(
     }
 
     let cycles = cycles_override.or(config.cycles).unwrap_or(1);
-    scheduler
-        .run_cycles(cycles)
-        .map_err(|error| format!("Scheduler failed: {error}"))?;
+    if let Err(error) = scheduler.run_cycles(cycles) {
+        if config
+            .failure_injection
+            .as_ref()
+            .and_then(|injection| injection.state_commit_fail)
+            .unwrap_or(false)
+        {
+            for agent_config in &config.agents {
+                let run_id = resolve_run_id(&config, agent_config, work_order.as_ref())?;
+                let run_id_string = run_id.to_string();
+                append_failure_evidence_event(
+                    trace_store.as_ref(),
+                    &run_id_string,
+                    "StateCommitFailed",
+                    serde_json::json!({
+                        "reason": "injected_state_commit_failure",
+                        "next_tick_advanced": false,
+                        "failure_injection": "splendorctl_public_run_config",
+                    }),
+                )
+                .map_err(|trace_error| {
+                    format!(
+                        "Scheduler failed: {error}; failed to record state commit failure evidence: {trace_error}"
+                    )
+                })?;
+            }
+        }
+        return Err(format!("Scheduler failed: {error}"));
+    }
     Ok(())
 }
 
@@ -4463,9 +4531,12 @@ fn build_gateway(
         ));
     }
     gateway.set_circuit_breaker_evaluator(evaluator);
-    gateway.set_resource_boundary_verifier(Arc::new(LocalResourceBoundaryVerifier::from_config(
-        config.adapters.as_ref(),
-    )));
+    gateway.set_resource_boundary_verifier(Arc::new(
+        LocalResourceBoundaryVerifier::from_config_with_failure_injection(
+            config.adapters.as_ref(),
+            config.failure_injection.as_ref(),
+        ),
+    ));
     let actions = collect_action_configs(config)?;
     for action in actions {
         let adapter_id = action
@@ -4483,6 +4554,7 @@ fn build_gateway(
 #[derive(Clone, Debug, Default)]
 struct LocalResourceBoundaryVerifier {
     http_allowed_domains: Vec<String>,
+    unavailable_actions: BTreeSet<String>,
 }
 
 impl LocalResourceBoundaryVerifier {
@@ -4492,7 +4564,21 @@ impl LocalResourceBoundaryVerifier {
                 .and_then(|adapters| adapters.http.as_ref())
                 .map(|http| http.allowed_domains.clone())
                 .unwrap_or_default(),
+            unavailable_actions: BTreeSet::new(),
         }
+    }
+
+    fn from_config_with_failure_injection(
+        config: Option<&AdaptersConfig>,
+        failure_injection: Option<&FailureInjectionConfig>,
+    ) -> Self {
+        let mut verifier = Self::from_config(config);
+        verifier.unavailable_actions = failure_injection
+            .and_then(|injection| injection.verifier_unavailable_actions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        verifier
     }
 }
 
@@ -4502,6 +4588,9 @@ impl ResourceBoundaryVerifier for LocalResourceBoundaryVerifier {
         action: &splendor_gateway::ActionRequest,
         adapter: Option<&str>,
     ) -> splendor_types::VerificationResult {
+        if self.unavailable_actions.contains(&action.action.name) {
+            return verifier_unavailable_denied(&action.action.name, adapter);
+        }
         match adapter {
             Some("http") => self.verify_http(action),
             Some("filesystem") => self.verify_filesystem(action),
@@ -4589,6 +4678,28 @@ fn boundary_denied(
             "verifier": verifier,
             "adapter_execution": "not_attempted",
             "evidence": evidence,
+        }),
+    }
+}
+
+fn verifier_unavailable_denied(
+    action: &str,
+    adapter: Option<&str>,
+) -> splendor_types::VerificationResult {
+    splendor_types::VerificationResult {
+        allowed: false,
+        reasons: vec!["verifier_unavailable".to_string()],
+        artifacts: serde_json::json!({
+            "source": "resource_boundary_verifier",
+            "verifier": "resource_boundary_verifier",
+            "verifier_status": "unavailable",
+            "adapter_execution": "not_attempted",
+            "failure_injection": "splendorctl_public_run_config",
+            "evidence": {
+                "action": action,
+                "adapter": adapter,
+                "reason": "required verifier unavailable; fail closed before adapter execution",
+            },
         }),
     }
 }

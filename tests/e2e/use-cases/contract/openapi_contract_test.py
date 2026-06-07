@@ -100,6 +100,30 @@ S4_MANAGER_RESPONSE_REFS = {
     "importStateSnapshot": "ImportStateSnapshotResponse",
 }
 
+MESSAGE_RESPONSE_REFS = {
+    "sendMessage": "MessageStatusReport",
+    "getMessage": "MessageStatusReport",
+    "ackMessage": "MessageStatusReport",
+    "nackMessage": "MessageStatusReport",
+    "listInbox": "MessageListResponse",
+    "listOutbox": "MessageListResponse",
+    "getMessageCausalGraph": "MessageCausalGraphResponse",
+    "validateMessageSchema": "MessageSchemaValidationReport",
+    "listMessageSchemas": "MessageSchemaListResponse",
+}
+
+MESSAGE_REQUEST_REFS = {
+    "sendMessage": "SendMessageRequest",
+    "getMessage": "MessageReadRequest",
+    "ackMessage": "MessageDeliveryUpdateRequest",
+    "nackMessage": "MessageDeliveryUpdateRequest",
+    "listInbox": "MessageReadRequest",
+    "listOutbox": "MessageReadRequest",
+    "getMessageCausalGraph": "MessageReadRequest",
+    "validateMessageSchema": "MessageSchemaValidationRequest",
+    "listMessageSchemas": "ManagerReadRequest",
+}
+
 S6_PHYSICAL_RESPONSE_REFS = {
     "registerDeviceProfile": "RegisterDeviceProfileResponse",
     "getDeviceStatus": "DeviceRuntimeProfile",
@@ -175,6 +199,36 @@ def require_non_null_authority_fields(text: str, schema_name: str) -> list[str]:
         expected_ref = "CallerCredential" if field == "credential" else "AuditAttribution"
         if f"#/components/schemas/{expected_ref}" not in field_block:
             failures.append(f"{schema_name}.{field}_missing_ref")
+    return failures
+
+
+def require_schema_required_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    matches = re.findall(r"required:\s*\[([^\]]+)\]", block)
+    required_fields = set()
+    for match in matches:
+        required_fields.update(item.strip().strip("'\"") for item in match.split(","))
+    missing = sorted(field for field in fields if field not in required_fields)
+    return [f"{schema_name}.{field}_not_required" for field in missing]
+
+
+def require_non_null_fields(text: str, schema_name: str, fields: set[str]) -> list[str]:
+    block = schema_block(text, schema_name)
+    if not block:
+        return [f"missing schema {schema_name}"]
+    failures: list[str] = []
+    for field in sorted(fields):
+        field_match = re.search(rf"^\s+{re.escape(field)}:\s*(.*)$", block, re.MULTILINE)
+        if not field_match:
+            failures.append(f"{schema_name}.{field}")
+            continue
+        inline = field_match.group(1)
+        next_field = re.search(r"^\s{12}[A-Za-z0-9_]+:\s*", block[field_match.end() :], re.MULTILINE)
+        field_block = inline + "\n" + (block[field_match.end() : field_match.end() + next_field.start()] if next_field else block[field_match.end() :])
+        if "'null'" in field_block or '"null"' in field_block or "type: [" in field_block:
+            failures.append(f"{schema_name}.{field}_allows_null")
     return failures
 
 
@@ -331,6 +385,78 @@ def main() -> int:
         s4_response_failures.append("FleetTelemetrySnapshot.authority_missing_observational_only_marker")
     if s4_response_failures:
         failures.append("Missing required S4 manager response contracts: " + ", ".join(s4_response_failures))
+
+    message_contract_failures: list[str] = []
+    for op_id, schema_name in MESSAGE_RESPONSE_REFS.items():
+        message_contract_failures.extend(require_operation_response_ref(blocks, op_id, schema_name))
+    for op_id, schema_name in MESSAGE_REQUEST_REFS.items():
+        block = blocks.get(op_id, "")
+        if not block:
+            message_contract_failures.append(f"missing operation {op_id}")
+            continue
+        if "requestBody:" not in block:
+            message_contract_failures.append(f"{op_id}.missing_request_body_or_caller_scope")
+        if f"#/components/schemas/{schema_name}" not in block:
+            message_contract_failures.append(f"{op_id}.request_missing_{schema_name}_ref")
+        if "'403':" not in block and "403:" not in block:
+            message_contract_failures.append(f"{op_id}.missing_403_response")
+    schema_failures_for_messages: list[str] = []
+    schema_failures_for_messages.extend(
+        require_schema_fields(
+            text,
+            "MessageStatusReport",
+            {
+                "message_id",
+                "work_order_id",
+                "tenant_id",
+                "run_id",
+                "source_agent_id",
+                "target_agent_id",
+                "schema",
+                "causal_parent",
+                "delivery_status",
+                "trace_event_id",
+                "payload_preserved",
+            },
+        )
+    )
+    for schema_name in ["MessageReadRequest", "MessageDeliveryUpdateRequest", "MessageSchemaValidationRequest"]:
+        block = schema_block(text, schema_name)
+        if "#/components/schemas/ManagerSecurityFields" not in block:
+            schema_failures_for_messages.append(f"{schema_name}.missing_ManagerSecurityFields_ref")
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_required_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageReadRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageDeliveryUpdateRequest", {"reason"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_required_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageDeliveryUpdateRequest", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageListResponse", {"tenant_id", "run_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageListResponse", {"tenant_id", "run_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageCausalGraphResponse", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_non_null_fields(text, "MessageCausalGraphResponse", {"tenant_id", "run_id", "agent_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaValidationRequest", {"message_envelope", "schema", "payload"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaValidationReport", {"valid", "supported", "schema", "delivery_authority_granted", "trace_event_id"}))
+    schema_failures_for_messages.extend(require_schema_fields(text, "MessageSchemaListResponse", {"schemas", "delivery_authority_granted", "trace_event_id"}))
+    if schema_failures_for_messages:
+        message_contract_failures.append("message schema field failures: " + ", ".join(schema_failures_for_messages))
+    required_message_markers = [
+        "message_payload_mutation_forbidden",
+        "cross_tenant_message_read_denied",
+        "splendor.message.task_request.v1",
+        "splendor.message.task_response.v1",
+        "splendor.message.proposal_request.v1",
+        "delivery_authority_granted",
+        "missing_message_tenant_scope",
+        "missing_message_run_scope",
+        "missing_message_agent_scope",
+        "message_ack_agent_not_recipient",
+    ]
+    for marker in required_message_markers:
+        if marker not in text:
+            message_contract_failures.append(f"message_contract_missing_marker:{marker}")
+    if message_contract_failures:
+        failures.append("Missing required message communication contracts: " + ", ".join(message_contract_failures))
 
     s6_contract_failures: list[str] = []
     for op_id, schema_name in S6_PHYSICAL_RESPONSE_REFS.items():
