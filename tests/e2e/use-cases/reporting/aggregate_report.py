@@ -422,6 +422,7 @@ S10_REQUIRED_POSITIVES = {
     "signed_work_order_accepted_and_placed_on_vpc",
     "data_local_analysis_executed",
     "shared_specialist_typed_response_delivered",
+    "message_public_api_surface_exercised",
     "cloud_helper_proposal_only",
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
@@ -435,6 +436,11 @@ S10_REQUIRED_NEGATIVES = {
     "unauthorized_data_ref_denied",
     "specialist_permission_escalation_denied",
     "remote_duplicate_not_double_applied",
+    "unsupported_message_schema_validation_rejected",
+    "omitted_message_read_scope_denied",
+    "cross_tenant_message_read_rejected",
+    "unauthorized_ack_nack_denied",
+    "ack_nack_scope_or_payload_mutation_denied",
     "raw_physical_control_rejected",
     "expired_approval_rejected",
     "circuit_breaker_blocks_matching_publish_attempt",
@@ -479,6 +485,13 @@ S10_REQUIRED_OPERATIONS = {
     "dispatchWorkOrder",
     "sendMessage",
     "getMessage",
+    "listInbox",
+    "listOutbox",
+    "ackMessage",
+    "nackMessage",
+    "getMessageCausalGraph",
+    "validateMessageSchema",
+    "listMessageSchemas",
     "createRun",
     "startRun",
     "pauseRun",
@@ -2878,6 +2891,7 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "registry-report.json",
         "journey-report.json",
         "message-flow.json",
+        "message-api-report.json",
         "artifact-publication-report.json",
         "cloud-helper-report.json",
         "edge-inspection-report.json",
@@ -2956,6 +2970,7 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for name in [
         "journey-report.json",
         "message-flow.json",
+        "message-api-report.json",
         "artifact-publication-report.json",
         "cloud-helper-report.json",
         "edge-inspection-report.json",
@@ -3020,6 +3035,28 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     journey = read_json(artifact_dir / "journey-report.json")
     if journey.get("data_analysis", {}).get("status") != "Executed":
         failures.append("s10_journey_data_analysis_not_executed")
+    message_api = read_json(artifact_dir / "message-api-report.json")
+    required_message_ops = {
+        "listMessageSchemas",
+        "validateMessageSchema",
+        "listInbox",
+        "listOutbox",
+        "getMessageCausalGraph",
+        "ackMessage",
+        "nackMessage",
+    }
+    if set(message_api.get("operations", [])) < required_message_ops:
+        failures.append("s10_message_api_operations_missing")
+    if message_api.get("schema_validation", {}).get("valid") is not True:
+        failures.append("s10_message_schema_validation_not_positive")
+    if message_api.get("unsupported_schema_validation", {}).get("valid") is not False:
+        failures.append("s10_message_unsupported_schema_not_rejected")
+    if message_api.get("cross_tenant_read", {}).get("status") != 403:
+        failures.append("s10_cross_tenant_message_read_not_rejected")
+    if message_api.get("ack_scope_failure", {}).get("status") != 403 or message_api.get("nack_payload_mutation_denial", {}).get("status") != 400:
+        failures.append("s10_ack_nack_negative_scope_or_payload_missing")
+    if message_api.get("causal_graph", {}).get("node_count", 0) < 2:
+        failures.append("s10_message_causal_graph_missing_nodes")
     artifact = read_json(artifact_dir / "artifact-publication-report.json")
     if artifact.get("publish_needs_approval", {}).get("status") != "NeedsApproval":
         failures.append("s10_publish_did_not_pause_for_approval")
@@ -3108,6 +3145,15 @@ def main() -> int:
     blocking = []
     if contract.get("status") != "passed":
         blocking.append("contract_status_failed")
+    if args.mode == "all" or args.scenario == "UC-E2E-S10":
+        blocked_contract_groups = [
+            group
+            for group in contract.get("blocked_not_yet_covered", [])
+            if group.get("status") == "blocked_not_yet_covered"
+        ]
+        for group in blocked_contract_groups:
+            missing = ",".join(group.get("missing_operation_ids", []) or group.get("missing_fields", []))
+            blocking.append(f"contract_required_group_blocked:{group.get('group')}:{missing}")
     if anti.get("status") != "passed":
         blocking.append("anti_drift_status_failed")
     if public_boundary.get("status") != "passed":

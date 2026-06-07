@@ -117,6 +117,10 @@ def sec(credential: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"credential": credential, "audit_attribution": audit(credential)}
 
 
+def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant_id: str = TENANT_ID) -> dict[str, Any]:
+    return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
+
+
 def credential_header(credential: dict[str, Any]) -> dict[str, str]:
     return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
 
@@ -268,7 +272,7 @@ def main() -> int:
     remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
     duplicate_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555556"}}
     duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
-    received = call("getMessage", "POST", args.manager_url, f"/messages/{message['message']['message_id']}/read", sec(cred))
+    received = call("getMessage", "POST", args.manager_url, f"/messages/{message['message']['message_id']}/read", message_scope(cred, run_id, HELPER_AGENT_ID))
     failed_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555555"}}
     failed_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-fail", "simulate_failure": "toxiproxy_transport_failure"})
     unsupported_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555557", "schema": "splendor.message.unsupported.v1"}}
