@@ -5165,6 +5165,78 @@ fn run_from_config_state_failure_injection_records_evidence_and_prevents_next_ti
 }
 
 #[test]
+fn run_from_config_verifier_unavailable_failure_injection_fails_closed_before_adapter() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let fs_base = dir.path().join("fs");
+    let tenant_uuid = Uuid::new_v4();
+    let agent_uuid = Uuid::new_v4();
+    let run_uuid = Uuid::new_v4();
+    let tenant_id: TenantId = tenant_uuid.into();
+    let agent_id: AgentId = agent_uuid.into();
+    let run_id: RunId = run_uuid.into();
+    let work_order = signed_work_order_block(
+        tenant_id,
+        agent_id,
+        run_id.clone(),
+        vec!["write_file".to_string()],
+    );
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nfailure_injection:\n  verifier_unavailable_actions: [\"write_file\"]\ntenants:\n  - id: {}\n    allowed_actions: [\"write_file\"]\n    allowed_adapters: [\"filesystem\"]\n    allowed_permissions: [\"fs.write\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    allowed_permissions: [\"fs.write\"]\n    policy:\n      type: static\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          required_permissions: [\"fs.write\"]\n          params:\n            path: \"blocked.txt\"\n            contents: \"blocked\"\nadapters:\n  filesystem:\n    base_dir: {}\n{}",
+        trace_path.display(),
+        state_path.display(),
+        run_uuid,
+        tenant_uuid,
+        agent_uuid,
+        tenant_uuid,
+        run_uuid,
+        fs_base.display(),
+        work_order,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    run_from_config(&config_path, Some(1), false).expect("verifier denial completes safely");
+    assert!(!fs_base
+        .join(tenant_uuid.to_string())
+        .join("blocked.txt")
+        .exists());
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let events = decode_and_validate_trace_records(
+        &TraceStore::read(&store, &run_id.to_string()).expect("records"),
+        &run_id.to_string(),
+    )
+    .expect("trace validation");
+    let denied = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceEventKind::ActionDenied { action, result } if action.name == "write_file" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("verifier unavailable denial");
+    assert!(denied
+        .reasons
+        .iter()
+        .any(|reason| reason == "verifier_unavailable"));
+    assert_eq!(
+        denied.artifacts["resource_boundary"]["verifier_status"],
+        serde_json::json!("unavailable")
+    );
+    assert_eq!(
+        denied.artifacts["resource_boundary"]["adapter_execution"],
+        serde_json::json!("not_attempted")
+    );
+    assert!(events.iter().all(|event| !matches!(
+        &event.kind,
+        TraceEventKind::ActionExecuted { action, .. } if action.name == "write_file"
+    )));
+}
+
+#[test]
 fn run_from_config_bad_work_order_signature_records_audit_without_starting_run() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");

@@ -586,9 +586,95 @@ paths:
           in: path
           required: true
           schema: { type: string, format: uuid }
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
       responses:
         '200': { description: Message status., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /messages/{message_id}/ack:
+    post:
+      summary: Acknowledge message delivery/consumption metadata without mutating payload or granting authority.
+      operationId: ackMessage
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageDeliveryUpdateRequest' } } } }
+      responses:
+        '200': { description: Message acknowledgement recorded., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '400': { description: message_payload_mutation_forbidden; ack cannot mutate payload., content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /messages/{message_id}/nack:
+    post:
+      summary: Record message delivery failure metadata without mutating payload or granting authority.
+      operationId: nackMessage
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageDeliveryUpdateRequest' } } } }
+      responses:
+        '200': { description: Message negative acknowledgement recorded., content: { application/json: { schema: { $ref: '#/components/schemas/MessageStatusReport' } } } }
+        '400': { description: message_payload_mutation_forbidden; nack cannot mutate payload., content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /agents/{agent_id}/inbox:
+    get:
+      summary: List messages delivered to an agent inbox under caller tenant/agent scope.
+      operationId: listInbox
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
+      responses:
+        '200': { description: Agent inbox messages., content: { application/json: { schema: { $ref: '#/components/schemas/MessageListResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /agents/{agent_id}/outbox:
+    get:
+      summary: List messages sent by an agent outbox under caller tenant/agent scope.
+      operationId: listOutbox
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
+      responses:
+        '200': { description: Agent outbox messages., content: { application/json: { schema: { $ref: '#/components/schemas/MessageListResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /runs/{run_id}/messages/causal-graph:
+    get:
+      summary: Read the non-authoritative message causal graph for a run.
+      operationId: getMessageCausalGraph
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageReadRequest' } } } }
+      responses:
+        '200': { description: Message causal graph., content: { application/json: { schema: { $ref: '#/components/schemas/MessageCausalGraphResponse' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /message-schemas/validate:
+    post:
+      summary: Validate a message schema/payload without delivering it or granting authority.
+      operationId: validateMessageSchema
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MessageSchemaValidationRequest' } } } }
+      responses:
+        '200': { description: Message schema validation result., content: { application/json: { schema: { $ref: '#/components/schemas/MessageSchemaValidationReport' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /message-schemas:
+    get:
+      summary: List stable supported message schemas; the list is non-authoritative for delivery.
+      operationId: listMessageSchemas
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagerReadRequest' } } } }
+      responses:
+        '200': { description: Supported message schemas., content: { application/json: { schema: { $ref: '#/components/schemas/MessageSchemaListResponse' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
   /policies:
     post:
@@ -1301,6 +1387,24 @@ components:
     ManagerReadRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          properties:
+            tenant_id:
+              type: [string, 'null']
+              format: uuid
+            agent_id:
+              type: [string, 'null']
+              format: uuid
+    MessageReadRequest:
+      description: Message read/list/causal graph scope. Normal callers must provide tenant_id, run_id, and agent_id; missing_message_tenant_scope, missing_message_run_scope, missing_message_agent_scope, cross_tenant_message_read_denied, message_run_scope_denied, or message_agent_scope_denied fail closed.
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [tenant_id, run_id, agent_id]
+          properties:
+            tenant_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
     PublishPolicyBundleRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -1587,7 +1691,12 @@ components:
             source_agent_id: { type: string, format: uuid }
             target_agent_id: { type: string, format: uuid }
             run_id: { type: string, format: uuid }
-            schema: { type: string }
+            schema:
+              type: string
+              enum:
+                - splendor.message.task_request.v1
+                - splendor.message.task_response.v1
+                - splendor.message.proposal_request.v1
             payload: { $ref: '#/components/schemas/JsonValue' }
             causal_parent: { type: [string, 'null'] }
             requires_response: { type: boolean }
@@ -1855,10 +1964,16 @@ components:
         latest_sequence: { type: [integer, 'null'], minimum: 0 }
     MessageStatusReport:
       type: object
-      required: [message_id, work_order_id, delivery_status, trace_event_id, duplicate, idempotency_key, source_instance_id, target_instance_id, recipient_validated, receive_side_validated, work_order_authority_validated, route_permission, remote_state_mutated, reason]
+      required: [message_id, work_order_id, tenant_id, run_id, source_agent_id, target_agent_id, schema, causal_parent, delivery_status, trace_event_id, duplicate, idempotency_key, source_instance_id, target_instance_id, recipient_validated, receive_side_validated, work_order_authority_validated, route_permission, remote_state_mutated, reason, payload_preserved]
       properties:
         message_id: { type: string, format: uuid }
         work_order_id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        source_agent_id: { type: string, format: uuid }
+        target_agent_id: { type: string, format: uuid }
+        schema: { type: string }
+        causal_parent: { type: [string, 'null'] }
         delivery_status: { type: string }
         trace_event_id: { type: string }
         duplicate: { type: boolean }
@@ -1871,6 +1986,125 @@ components:
         route_permission: { type: [string, 'null'] }
         remote_state_mutated: { type: boolean }
         reason: { type: [string, 'null'] }
+        read_trace_event_id: { type: [string, 'null'] }
+        ack_trace_event_id: { type: [string, 'null'] }
+        nack_trace_event_id: { type: [string, 'null'] }
+        payload_preserved:
+          type: boolean
+          description: Ack/nack/read operations preserve message payload and grant no action authority.
+    MessageDeliveryUpdateRequest:
+      description: Ack/nack scope. Normal callers must provide tenant_id, run_id, and the target recipient agent_id; missing_message_tenant_scope, missing_message_run_scope, missing_message_agent_scope, cross_tenant_message_read_denied, message_run_scope_denied, message_agent_scope_denied, or message_ack_agent_not_recipient fail closed.
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [tenant_id, run_id, agent_id, reason]
+          properties:
+            tenant_id: { type: string, format: uuid }
+            run_id: { type: string, format: uuid }
+            agent_id: { type: string, format: uuid }
+            reason: { type: [string, 'null'] }
+            payload:
+              $ref: '#/components/schemas/JsonValue'
+              description: Must be absent; present values are rejected because ack/nack cannot mutate payload.
+            payload_patch:
+              $ref: '#/components/schemas/JsonValue'
+              description: Must be absent; present values are rejected because ack/nack cannot mutate payload.
+    MessageListResponse:
+      type: object
+      required: [agent_id, direction, tenant_id, run_id, messages, trace_event_id]
+      properties:
+        agent_id: { type: string, format: uuid }
+        direction: { type: string, enum: [inbox, outbox] }
+        tenant_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/MessageStatusReport'
+        trace_event_id: { type: string }
+    MessageCausalGraphNode:
+      type: object
+      required: [message_id, work_order_id, source_agent_id, target_agent_id, schema, delivery_status, trace_event_id, causal_parent]
+      properties:
+        message_id: { type: string, format: uuid }
+        work_order_id: { type: string }
+        source_agent_id: { type: string, format: uuid }
+        target_agent_id: { type: string, format: uuid }
+        schema: { type: string }
+        delivery_status: { type: string }
+        trace_event_id: { type: string }
+        causal_parent: { type: [string, 'null'] }
+    MessageCausalGraphEdge:
+      type: object
+      required: [from_trace_event_id, to_message_id, to_trace_event_id, from_message_id]
+      properties:
+        from_trace_event_id: { type: string }
+        to_message_id: { type: string, format: uuid }
+        to_trace_event_id: { type: string }
+        from_message_id: { type: [string, 'null'], format: uuid }
+    MessageCausalGraphResponse:
+      type: object
+      required: [run_id, tenant_id, agent_id, nodes, edges, trace_event_id]
+      properties:
+        run_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/MessageCausalGraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/MessageCausalGraphEdge'
+        trace_event_id: { type: string }
+    MessageSchemaValidationRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          properties:
+            message_envelope:
+              $ref: '#/components/schemas/MessageEnvelope'
+            schema: { type: [string, 'null'] }
+            payload:
+              $ref: '#/components/schemas/JsonValue'
+    MessageSchemaValidationReport:
+      type: object
+      required: [valid, supported, schema, schema_version, reason, delivery_authority_granted, trace_event_id]
+      properties:
+        valid: { type: boolean }
+        supported: { type: boolean }
+        schema: { type: string }
+        schema_version: { type: [string, 'null'] }
+        reason: { type: [string, 'null'] }
+        delivery_authority_granted:
+          type: boolean
+          const: false
+          description: Schema validation never authorizes delivery or actions.
+        trace_event_id: { type: string }
+    SupportedMessageSchema:
+      type: object
+      required: [schema, version, description, delivery_authority_granted]
+      properties:
+        schema: { type: string }
+        version: { type: string }
+        description: { type: string }
+        delivery_authority_granted:
+          type: boolean
+          const: false
+    MessageSchemaListResponse:
+      type: object
+      required: [schemas, delivery_authority_granted, trace_event_id]
+      properties:
+        schemas:
+          type: array
+          items:
+            $ref: '#/components/schemas/SupportedMessageSchema'
+        delivery_authority_granted:
+          type: boolean
+          const: false
+          description: Listing schemas is non-authoritative for delivery/actions.
+        trace_event_id: { type: string }
     ManagerAuditEvent:
       type: object
       required: [trace_event_id, event_type, details, timestamp]

@@ -117,12 +117,12 @@ Scopes should be stable string values so clients and generated tests can reason 
 | Operation ID | Path shape | Method | Required scope | Semantics acceptance tests must prove |
 | --- | --- | --- | --- | --- |
 | `sendMessage` | `/messages` | `POST` | `splendor.messages.send` | Sends typed message with source/target/run/schema/payload/causal parent/timestamp through router/transport. |
-| `getMessage` | `/messages/{message_id}` | `GET` | `splendor.messages.read` | Returns message metadata and delivery status with tenant/source/target authorization. |
-| `listInbox` | `/agents/{agent_id}/inbox` | `GET` | `splendor.messages.read` | Reads delivered messages scoped to caller/tenant/agent. |
-| `listOutbox` | `/agents/{agent_id}/outbox` | `GET` | `splendor.messages.read` | Reads sent messages and delivery states. |
-| `ackMessage` | `/messages/{message_id}/ack` | `POST` | `splendor.messages.send` | Records acknowledgement; cannot mutate payload or grant authority. |
-| `nackMessage` | `/messages/{message_id}/nack` | `POST` | `splendor.messages.send` | Records failure reason and trace event. |
-| `getMessageCausalGraph` | `/runs/{run_id}/messages/causal-graph` | `GET` | `splendor.messages.read` | Reconstructs causal parent graph from trace/message IDs. |
+| `getMessage` | `/messages/{message_id}` | `GET` | `splendor.messages.read` | Returns message metadata and delivery status only with explicit tenant_id, run_id, and participating source/target agent_id scope. |
+| `listInbox` | `/agents/{agent_id}/inbox` | `GET` | `splendor.messages.read` | Reads delivered messages scoped to caller/tenant/run/path agent; omitted tenant/run/agent scope fails closed. |
+| `listOutbox` | `/agents/{agent_id}/outbox` | `GET` | `splendor.messages.read` | Reads sent messages and delivery states scoped to caller/tenant/run/path agent. |
+| `ackMessage` | `/messages/{message_id}/ack` | `POST` | `splendor.messages.send` | Records acknowledgement only when tenant_id, run_id, and recipient target agent_id match; cannot mutate payload or grant authority. |
+| `nackMessage` | `/messages/{message_id}/nack` | `POST` | `splendor.messages.send` | Records failure reason only when tenant_id, run_id, and recipient target agent_id match; cannot mutate payload, route, work-order authority, source/target, run, tenant, permissions, or data refs. |
+| `getMessageCausalGraph` | `/runs/{run_id}/messages/causal-graph` | `GET` | `splendor.messages.read` | Reconstructs causal parent graph from trace/message IDs under explicit tenant/run/agent scope. |
 | `validateMessageSchema` | `/message-schemas/validate` | `POST` | `splendor.messages.read` | Validates schema version/payload without delivery. |
 | `listMessageSchemas` | `/message-schemas` | `GET` | `splendor.messages.read` | Lists stable supported schema IDs/versions. |
 

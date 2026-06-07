@@ -422,6 +422,7 @@ S10_REQUIRED_POSITIVES = {
     "signed_work_order_accepted_and_placed_on_vpc",
     "data_local_analysis_executed",
     "shared_specialist_typed_response_delivered",
+    "message_public_api_surface_exercised",
     "cloud_helper_proposal_only",
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
@@ -435,6 +436,11 @@ S10_REQUIRED_NEGATIVES = {
     "unauthorized_data_ref_denied",
     "specialist_permission_escalation_denied",
     "remote_duplicate_not_double_applied",
+    "unsupported_message_schema_validation_rejected",
+    "omitted_message_read_scope_denied",
+    "cross_tenant_message_read_rejected",
+    "unauthorized_ack_nack_denied",
+    "ack_nack_scope_or_payload_mutation_denied",
     "raw_physical_control_rejected",
     "expired_approval_rejected",
     "circuit_breaker_blocks_matching_publish_attempt",
@@ -479,6 +485,13 @@ S10_REQUIRED_OPERATIONS = {
     "dispatchWorkOrder",
     "sendMessage",
     "getMessage",
+    "listInbox",
+    "listOutbox",
+    "ackMessage",
+    "nackMessage",
+    "getMessageCausalGraph",
+    "validateMessageSchema",
+    "listMessageSchemas",
     "createRun",
     "startRun",
     "pauseRun",
@@ -726,6 +739,28 @@ def trace_record_action_name(record: dict) -> str:
     return str(action.get("name") or "")
 
 
+def trace_record_reasons(record: dict) -> list[str]:
+    payload = trace_record_kind_payload(record)
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    reasons = result.get("reasons")
+    if not isinstance(reasons, list):
+        outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
+        action_outcome = outcome.get("action_outcome") if isinstance(outcome.get("action_outcome"), dict) else {}
+        verification = action_outcome.get("verification") if isinstance(action_outcome.get("verification"), dict) else {}
+        reasons = verification.get("reasons")
+    return [str(reason) for reason in reasons] if isinstance(reasons, list) else []
+
+
+def value_contains_key_value(value: object, key: str, expected: object) -> bool:
+    if isinstance(value, dict):
+        if value.get(key) == expected:
+            return True
+        return any(value_contains_key_value(child, key, expected) for child in value.values())
+    if isinstance(value, list):
+        return any(value_contains_key_value(child, key, expected) for child in value)
+    return False
+
+
 def trace_record_message_id(record: dict) -> str:
     identity = record.get("payload", {}).get("identity", {})
     return str(identity.get("message_id") or "")
@@ -880,6 +915,22 @@ def validate_s9_required_event_evidence(
                         failures.append(f"s9_runtime_event_action_correlation_missing:{event_name}")
                     elif details.get("action") and trace_record_action_name(observed["record"]) != details.get("action"):
                         failures.append(f"s9_runtime_event_action_name_mismatch:{event_name}")
+                if event_name == "verifier.unavailable":
+                    observed_payload = trace_record_kind_payload(observed["record"])
+                    observed_reasons = trace_record_reasons(observed["record"])
+                    observed_text = json.dumps(observed_payload, sort_keys=True)
+                    if "verifier_unavailable" not in observed_reasons:
+                        failures.append("s9_verifier_unavailable_missing_runtime_reason")
+                    if any(forbidden in observed_text for forbidden in ["policy_expired", "approval_policy_expired"]):
+                        failures.append("s9_verifier_unavailable_confused_with_policy_or_approval_expiry")
+                    if not value_contains_key_value(observed_payload, "verifier_status", "unavailable"):
+                        failures.append("s9_verifier_unavailable_missing_verifier_status")
+                    if not value_contains_key_value(observed_payload, "adapter_execution", "not_attempted"):
+                        failures.append("s9_verifier_unavailable_adapter_not_blocked")
+                    if details.get("failure_injection") != "verifier_unavailable_actions" or details.get("public_path") != "splendorctl run --config":
+                        failures.append("s9_verifier_unavailable_public_cli_path_missing")
+                    if details.get("http_counter_before") != details.get("http_counter_after"):
+                        failures.append("s9_verifier_unavailable_adapter_counter_changed")
                 if event_name in {"trace.write_failed", "state.commit_failed", "run.paused", "run.cancelled"} and not row.get("run_id"):
                     failures.append(f"s9_runtime_event_run_correlation_missing:{event_name}")
                 if event_name == "trace.write_failed" and details.get("http_counter_before") != details.get("http_counter_after"):
@@ -2648,6 +2699,7 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "api-traffic.ndjson",
         "trace-export.jsonl",
         "fault-injection-report.json",
+        "verifier-unavailable-report.json",
         "quota-retry-report.json",
         "idempotency-report.json",
         "failure-matrix.json",
@@ -2714,6 +2766,19 @@ def load_s9_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     fault = read_json(artifact_dir / "fault-injection-report.json")
     if set(fault.get("source_scenarios", [])) != S9_REQUIRED_SOURCE_SCENARIOS:
         failures.append("s9_fault_report_missing_source_scenarios")
+    verifier_report = read_json(artifact_dir / "verifier-unavailable-report.json")
+    verifier_counter = verifier_report.get("adapter_counter", {})
+    if verifier_report.get("public_path") != "splendorctl run --config + splendorctl trace export" or verifier_report.get("denied_action") != "http_get":
+        failures.append("s9_verifier_unavailable_report_missing_public_cli_path")
+    if verifier_counter.get("http_counter_before") != verifier_counter.get("http_counter_after"):
+        failures.append("s9_verifier_unavailable_report_counter_changed")
+    verifier_evidence_ids = [
+        row.get("trace_event_id")
+        for row in verifier_report.get("required_event_evidence", [])
+        if isinstance(row, dict)
+    ]
+    if sorted(verifier_evidence_ids) != sorted(event_ids.get("verifier.unavailable", [])):
+        failures.append("s9_verifier_unavailable_report_evidence_mismatch")
     audit = read_json(artifact_dir / "audit-report.json")
     manager_export = read_json(artifact_dir / "manager-audit-export.json")
     manager_events = []
@@ -2826,6 +2891,7 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         "registry-report.json",
         "journey-report.json",
         "message-flow.json",
+        "message-api-report.json",
         "artifact-publication-report.json",
         "cloud-helper-report.json",
         "edge-inspection-report.json",
@@ -2904,6 +2970,7 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     for name in [
         "journey-report.json",
         "message-flow.json",
+        "message-api-report.json",
         "artifact-publication-report.json",
         "cloud-helper-report.json",
         "edge-inspection-report.json",
@@ -2968,6 +3035,28 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     journey = read_json(artifact_dir / "journey-report.json")
     if journey.get("data_analysis", {}).get("status") != "Executed":
         failures.append("s10_journey_data_analysis_not_executed")
+    message_api = read_json(artifact_dir / "message-api-report.json")
+    required_message_ops = {
+        "listMessageSchemas",
+        "validateMessageSchema",
+        "listInbox",
+        "listOutbox",
+        "getMessageCausalGraph",
+        "ackMessage",
+        "nackMessage",
+    }
+    if set(message_api.get("operations", [])) < required_message_ops:
+        failures.append("s10_message_api_operations_missing")
+    if message_api.get("schema_validation", {}).get("valid") is not True:
+        failures.append("s10_message_schema_validation_not_positive")
+    if message_api.get("unsupported_schema_validation", {}).get("valid") is not False:
+        failures.append("s10_message_unsupported_schema_not_rejected")
+    if message_api.get("cross_tenant_read", {}).get("status") != 403:
+        failures.append("s10_cross_tenant_message_read_not_rejected")
+    if message_api.get("ack_scope_failure", {}).get("status") != 403 or message_api.get("nack_payload_mutation_denial", {}).get("status") != 400:
+        failures.append("s10_ack_nack_negative_scope_or_payload_missing")
+    if message_api.get("causal_graph", {}).get("node_count", 0) < 2:
+        failures.append("s10_message_causal_graph_missing_nodes")
     artifact = read_json(artifact_dir / "artifact-publication-report.json")
     if artifact.get("publish_needs_approval", {}).get("status") != "NeedsApproval":
         failures.append("s10_publish_did_not_pause_for_approval")
@@ -3056,6 +3145,15 @@ def main() -> int:
     blocking = []
     if contract.get("status") != "passed":
         blocking.append("contract_status_failed")
+    if args.mode == "all" or args.scenario == "UC-E2E-S10":
+        blocked_contract_groups = [
+            group
+            for group in contract.get("blocked_not_yet_covered", [])
+            if group.get("status") == "blocked_not_yet_covered"
+        ]
+        for group in blocked_contract_groups:
+            missing = ",".join(group.get("missing_operation_ids", []) or group.get("missing_fields", []))
+            blocking.append(f"contract_required_group_blocked:{group.get('group')}:{missing}")
     if anti.get("status") != "passed":
         blocking.append("anti_drift_status_failed")
     if public_boundary.get("status") != "passed":
