@@ -19,7 +19,10 @@ Produce concise, credible validation evidence for PRs and handoff.
 
 ```yaml
   RUN_ID: "<value>"
+  TASK_IDS: "<value>"
   PR_ID: "<value>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
   VALIDATION_LOG: "<value>"
   USER_QA_LOG: "<value>"
   KNOWN_RISKS: "<value>"
@@ -38,6 +41,7 @@ Produce concise, credible validation evidence for PRs and handoff.
 - CI results
 - User-flow QA
 - Issue criteria
+- Task-scoped validation log
 
 ## Procedure
 
@@ -48,13 +52,16 @@ Produce concise, credible validation evidence for PRs and handoff.
 - For known failures accepted as non-blocking, include why and linked issue.
 - Keep evidence factual and concise.
 - Do not bury critical failures under long summaries.
-- Reuse this report in PR body, issue close comments, and handoff.
+- Reuse this report in PR body, issue close comments, and `<STATE_ROOT>/handoff.md`.
+- Store detailed report files under `<STATE_FILES_ROOT>/reports/qa/`; do not create repo-tracked QA reports unless explicitly required as durable project evidence.
 
 ## Outputs
 
 - QA evidence section
 - Issue close evidence
-- Handoff validation block
+- `<STATE_ROOT>/validation-log.md` update
+- `<STATE_ROOT>/handoff.md` validation block
+- Optional `<STATE_FILES_ROOT>/reports/qa/...`
 
 ## Quality Bar
 
@@ -68,6 +75,7 @@ Produce concise, credible validation evidence for PRs and handoff.
 - Do not say “validated” without evidence
 - Do not hide not-run checks
 - Do not overquote logs
+- Do not leave QA evidence only in chat memory
 
 ## Anti-Patterns
 
@@ -81,3 +89,4 @@ Produce concise, credible validation evidence for PRs and handoff.
 - Readers can trust what was and was not validated
 - Risk is visible
 - No validation is overstated
+- Evidence is persisted in the task-scoped state root

@@ -3,6 +3,9 @@
 ## Current State
 
 Project:
+Task IDs:
+State root:
+State files root:
 Run ID:
 Base branch:
 Loop branch:
@@ -10,11 +13,26 @@ Final PR:
 Merged:
 Head SHA:
 
-## Rules Reminder
+## Resume Protocol
 
-Read `<STATE_ROOT>/rules-lock.md` before acting.
-Do not rely on chat memory.
-Do not close issues or merge without evidence.
+Before acting or after compaction, read this task-scoped state root first:
+
+```text
+<STATE_ROOT>/rules-lock.md
+<STATE_ROOT>/run-context.md
+<STATE_ROOT>/current-loop.md
+<STATE_ROOT>/issue-map.json
+<STATE_ROOT>/assignment-board.md
+<STATE_ROOT>/qa-plan.md
+<STATE_ROOT>/validation-log.md
+<STATE_ROOT>/decisions.md
+<STATE_ROOT>/handoff.md
+<STATE_ROOT>/compaction-checkpoint.md
+<STATE_FILES_ROOT>/subagents/*/handoff.md
+<STATE_FILES_ROOT>/subagents/*/validation.md
+```
+
+Do not rely on chat memory. Do not use a broad project-level state root. Do not close issues or merge without evidence.
 
 ## What Was Fixed
 
@@ -57,6 +75,13 @@ Created:
 Updated:
 Closed:
 Still active:
+
+## Sub-Agent Handoffs
+
+- Assignment:
+  Path:
+  Status:
+  Next action:
 
 ## Next Recommended Actions
 

@@ -13,14 +13,16 @@ metadata:
 
 ## Purpose
 
-Start a new loop or resume an existing related loop from the latest repository state without duplicating branches or work.
+Start a new loop or resume an existing related loop from the latest repository state without duplicating branches, work, or task-scoped state roots.
 
 ## Params
 
 ```yaml
   BASE_BRANCH: "<value>"
   DEV_BRANCH: "<value>"
-  STATE_ROOT: "<value>"
+  TASK_IDS: "<issue IDs, sprint IDs, or tightly related task range>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
   WORKTREE_ROOT: "<value>"
   RUN_BRANCH_PREFIX: "<value>"
   RESUME_QUERY: "<value>"
@@ -36,25 +38,27 @@ Start a new loop or resume an existing related loop from the latest repository s
 
 - Git repo
 - GitHub CLI access when available
-- State capsule
-- Repo trackers
+- Task-scoped state capsule
+- Issue/PR context
 
 ## Procedure
 
+- Derive `<TASK_IDS>` from the explicit issue IDs, sprint IDs, task IDs, or bounded task range before creating or reading state.
+- Refuse to use a broad state root such as `~/.agent-state/<repo-slug>`; use `~/.agent-state/<repo-slug>/<task_ids>` and `<STATE_ROOT>/files`.
 - Run `git fetch origin --prune` and record the result.
 - Run `git status --short` and refuse to mix unrelated uncommitted changes into the loop.
 - List open PRs targeting `<DEV_BRANCH>` and search for related loop branches.
 - List open issues matching the current workstream labels/query.
-- Read state capsule and repo trackers before deciding whether to resume.
-- Resume an active loop when objective, branch, and issue set match and the branch is not stale/merged/abandoned.
+- Read task-scoped state files and sub-agent handoffs before deciding whether to resume.
+- Resume an active loop only when objective, task IDs, branch, issue set, and state root match and the branch is not stale/merged/abandoned.
 - Start a new loop only when no relevant active loop exists or the existing loop is explicitly stale.
 - Create the loop worktree outside the main checkout with a UUID-based branch.
-- Record base SHA, branch, worktree path, resume decision, and reason in state.
+- Record base SHA, branch, worktree path, state-root path, resume decision, and reason in `<STATE_ROOT>/current-loop.md` and `<STATE_ROOT>/decisions.md`.
 
 ## Outputs
 
 - Loop branch/worktree
-- Updated state capsule
+- Task-scoped state capsule
 - Resume/new-run decision
 
 ## Quality Bar
@@ -69,6 +73,7 @@ Start a new loop or resume an existing related loop from the latest repository s
 - Do not branch from stale local dev
 - Do not start duplicate loops for the same work
 - Do not use dirty worktrees
+- Do not mix unrelated tasks in one state root
 
 ## Anti-Patterns
 
@@ -79,6 +84,6 @@ Start a new loop or resume an existing related loop from the latest repository s
 
 ## Done When
 
-- There is exactly one active loop for the objective
-- Base SHA is recorded
+- There is exactly one active loop for the objective and task IDs
+- Base SHA and state-root path are recorded
 - The branch decision is explained

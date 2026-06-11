@@ -13,7 +13,7 @@ metadata:
 
 ## Purpose
 
-Keep delegated work aligned, integrated, and honest while it is in progress.
+Keep delegated work aligned, integrated, and honest while it is in progress, with checkpoints persisted in the task-scoped state root.
 
 ## Params
 
@@ -21,7 +21,8 @@ Keep delegated work aligned, integrated, and honest while it is in progress.
   ASSIGNMENT_ID: "<value>"
   CHECKPOINT_INTERVAL: "<value>"
   BLOCKER_POLICY: "<value>"
-  STATE_ROOT: "<value>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
 ```
 
 ## Use When
@@ -36,6 +37,7 @@ Keep delegated work aligned, integrated, and honest while it is in progress.
 - Branch diffs
 - Issue acceptance criteria
 - Validation log
+- `<STATE_FILES_ROOT>/subagents/<assignment-id>/...`
 
 ## Procedure
 
@@ -44,13 +46,15 @@ Keep delegated work aligned, integrated, and honest while it is in progress.
 - Inspect intermediate diffs when the task touches architecture, services, config, data, or UI.
 - Challenge shortcuts early: mocks, TODOs, placeholder files, isolated components, untracked follow-up.
 - When blockers appear, decide whether to unblock, re-scope, split, or escalate.
-- Update the assignment board and state capsule after each meaningful checkpoint.
+- Update `<STATE_ROOT>/assignment-board.md` after each meaningful checkpoint.
+- Require sub-agents to update `<STATE_FILES_ROOT>/subagents/<assignment-id>/handoff.md`, `validation.md`, and `diff-notes.md` after meaningful work and before compaction.
 - Do not wait until final PR review to identify direction drift.
 - When a sub-agent finishes, require evidence before marking ready for review.
 
 ## Outputs
 
 - Updated assignment board
+- Updated sub-agent handoff/validation files
 - Risk/blocker notes
 - Sub-agent correction requests
 
@@ -66,6 +70,7 @@ Keep delegated work aligned, integrated, and honest while it is in progress.
 - Do not micromanage low-risk implementation details
 - Do not accept vague “done” updates
 - Do not lose assumptions
+- Do not let a sub-agent work outside the shared task state root
 
 ## Anti-Patterns
 
@@ -78,4 +83,5 @@ Keep delegated work aligned, integrated, and honest while it is in progress.
 
 - Work remains aligned with objective
 - Blockers are visible
+- State files are current
 - No shallow completion reaches final review

@@ -13,7 +13,7 @@ metadata:
 
 ## Purpose
 
-Safely deliver integrated loop work to the dev branch when gates pass.
+Safely deliver integrated loop work to the dev branch when gates pass and task-scoped state is complete.
 
 ## Params
 
@@ -22,7 +22,9 @@ Safely deliver integrated loop work to the dev branch when gates pass.
   DEV_BRANCH: "<value>"
   ALLOW_DEV_MERGE: "<value>"
   REQUIRED_CHECKS: "<value>"
-  STATE_ROOT: "<value>"
+  TASK_IDS: "<value>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
 ```
 
 ## Use When
@@ -36,26 +38,30 @@ Safely deliver integrated loop work to the dev branch when gates pass.
 - Loop branch
 - QA evidence
 - Issue map
-- State capsule
-- Repo trackers
+- Task-scoped state capsule
+- Sub-agent handoffs
+- Repo trackers when explicitly relevant
 
 ## Procedure
 
 - Update loop branch from `<DEV_BRANCH>` and resolve conflicts.
-- Run required validation gates and record exact results.
+- Run required validation gates and record exact results in `<STATE_ROOT>/validation-log.md`.
 - Open final PR from loop branch to `<DEV_BRANCH>`.
-- Include run ID, base/head SHA, issues completed, issues created/updated, major changes, validation, user QA, risks, remaining work, and handoff.
+- Include run ID, task IDs, state-root path, base/head SHA, issues completed, issues created/updated, major changes, validation, user QA, risks, remaining work, and handoff summary.
 - Verify no P0 introduced by the loop remains.
 - Verify no production service is replaced by fake/mock behavior.
+- Verify `<STATE_ROOT>/handoff.md`, `validation-log.md`, `decisions.md`, `assignment-board.md`, and `compaction-checkpoint.md` are current.
 - Merge only when `ALLOW_DEV_MERGE=true`, branch protection allows it, and required checks pass or are documented.
-- After merge, confirm merge SHA, update/close issues, update state capsule and trackers, and clean local worktrees only after remote state is confirmed.
+- After merge, confirm merge SHA, update/close issues, update task-scoped state files, and clean local worktrees only after remote state is confirmed.
+- Do not commit transient reports or sub-agent handoffs into the repo; keep them under `<STATE_FILES_ROOT>`.
 
 ## Outputs
 
 - Final PR
 - Merge result or blocked-ready status
 - Updated issues
-- Updated handoff
+- Updated `<STATE_ROOT>/handoff.md`
+- Updated validation and decision logs
 
 ## Quality Bar
 
@@ -69,6 +75,7 @@ Safely deliver integrated loop work to the dev branch when gates pass.
 - Never force-push dev
 - Never bypass branch protection
 - Never hide failed validation
+- Never lose final state by leaving it only in chat memory
 
 ## Anti-Patterns
 
@@ -81,3 +88,4 @@ Safely deliver integrated loop work to the dev branch when gates pass.
 
 - Dev contains validated work or blocked reason is explicit
 - Issue/project state matches reality
+- Task-scoped state files are sufficient to resume or audit the loop

@@ -3,6 +3,9 @@
 ## Summary
 
 Run ID:
+Task IDs:
+State root:
+State files root:
 Base SHA:
 Head SHA:
 Workstream:
@@ -51,6 +54,14 @@ Failed:
 Not run:
 - `command` — reason, risk, alternative validation
 
+## State Files Updated
+
+- `<STATE_ROOT>/handoff.md`
+- `<STATE_ROOT>/validation-log.md`
+- `<STATE_ROOT>/decisions.md`
+- `<STATE_ROOT>/compaction-checkpoint.md`
+- `<STATE_FILES_ROOT>/reports/...`
+
 ## Known Risks
 
 - ...
@@ -65,5 +76,5 @@ Not run:
 - [ ] No hidden TODOs/placeholders.
 - [ ] No untracked follow-up.
 - [ ] No known architecture drift introduced.
-- [ ] Service inventory/state capsule updated.
+- [ ] Task-scoped state capsule updated.
 - [ ] Issue state matches reality.
