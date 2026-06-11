@@ -21,7 +21,8 @@ Run the strongest available local checks and report exactly what passed, failed,
   REQUIRED_COMMANDS: "<value>"
   OPTIONAL_COMMANDS: "<value>"
   ENVIRONMENT_NOTES: "<value>"
-  STATE_ROOT: "<value>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
 ```
 
 ## Use When
@@ -46,14 +47,16 @@ Run the strongest available local checks and report exactly what passed, failed,
 - If a command cannot run, record reason, risk, and alternative validation.
 - Do not claim full validation when tooling/dependencies/environment are missing.
 - Rerun affected checks after fixes or conflict resolution.
-- Store results in validation log and PR body.
+- Store results in `<STATE_ROOT>/validation-log.md` and summarize them in the PR body.
+- Store longer excerpts or attachments under `<STATE_FILES_ROOT>/reports/validation/` instead of repo-tracked reports unless explicitly required.
 - Keep local validation separate from CI validation; both matter.
 
 ## Outputs
 
-- Validation log
+- `<STATE_ROOT>/validation-log.md`
 - PR validation section
 - Blocker list
+- Optional `<STATE_FILES_ROOT>/reports/validation/...`
 
 ## Quality Bar
 
@@ -67,6 +70,7 @@ Run the strongest available local checks and report exactly what passed, failed,
 - Do not ignore failing checks
 - Do not say “all tests pass” unless they did
 - Do not hide environment limitations
+- Do not leave validation only in chat memory
 
 ## Anti-Patterns
 
@@ -80,3 +84,4 @@ Run the strongest available local checks and report exactly what passed, failed,
 - Every relevant check has a truthful status
 - Failures are fixed or block merge
 - Unavailable checks have risk notes
+- Validation is persisted in the task-scoped state root

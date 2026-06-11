@@ -13,13 +13,15 @@ metadata:
 
 ## Purpose
 
-Leave exact current information for the next agent or human.
+Leave exact current information for the next agent or human in the task-scoped state root.
 
 ## Params
 
 ```yaml
-  STATE_ROOT: "<value>"
+  STATE_ROOT: "~/.agent-state/<repo-slug>/<task_ids>"
+  STATE_FILES_ROOT: "<STATE_ROOT>/files"
   REPO_HANDOFF_PATH: "<value>"
+  TASK_IDS: "<value>"
   RUN_ID: "<value>"
   FINAL_PR: "<value>"
   HEAD_SHA: "<value>"
@@ -39,23 +41,26 @@ Leave exact current information for the next agent or human.
 - PR list
 - Service inventory
 - Known risks
+- Sub-agent handoffs and validation files
 
 ## Procedure
 
-- Write `Start Here Next Run` at the top of the handoff.
+- Write `Start Here Next Run` at the top of `<STATE_ROOT>/handoff.md`.
+- Include `STATE_ROOT`, `STATE_FILES_ROOT`, task IDs, run ID, branch, PR links, issue IDs, commit SHAs, and commands run.
 - Separate verified facts from guesses and likely-but-unproven leads.
 - List fixed work, still-present issues, blockers, services needing action, validation results, and next recommended steps.
-- Include exact branch names, PR links, issue IDs, commit SHAs, and commands run.
+- Summarize active sub-agent outputs from `<STATE_FILES_ROOT>/subagents/*/handoff.md` and validation files.
 - Record what was intentionally deferred and why.
-- Update both off-worktree state and repo-facing tracker when appropriate.
+- Update off-worktree task state by default; update repo-facing trackers only when they represent durable project truth and are explicitly appropriate.
 - Comment on relevant issues/PRs when their state changed.
 - Keep the handoff concise enough to read first, but complete enough to resume without chat memory.
 
 ## Outputs
 
-- `handoff.md`
-- Repo handoff section
+- `<STATE_ROOT>/handoff.md`
+- `<STATE_ROOT>/compaction-checkpoint.md` when relevant
 - Final report content
+- Repo handoff section only when explicitly required as durable project truth
 
 ## Quality Bar
 
@@ -69,6 +74,7 @@ Leave exact current information for the next agent or human.
 - Do not hide uncertainty
 - Do not bury blockers
 - Do not leave follow-up only in PR prose
+- Do not write transient handoffs into repo-tracked files by default
 
 ## Anti-Patterns
 
@@ -79,6 +85,6 @@ Leave exact current information for the next agent or human.
 
 ## Done When
 
-- Next agent can resume without guessing
+- Next agent can resume the task range without guessing
 - Current project state is truthful
-- Original rules remain referenced
+- Original rules and task-scoped state root remain referenced

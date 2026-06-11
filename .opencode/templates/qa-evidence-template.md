@@ -3,6 +3,9 @@
 ## Scope
 
 Changed area:
+Task IDs:
+State root:
+State files root:
 Risk level:
 Entry points:
 
@@ -42,6 +45,12 @@ Failure tested:
 Expected:
 Observed:
 Result:
+
+## State Files Updated
+
+- `<STATE_ROOT>/validation-log.md`
+- `<STATE_ROOT>/handoff.md`
+- `<STATE_FILES_ROOT>/reports/qa/...`
 
 ## Merge Recommendation
 
