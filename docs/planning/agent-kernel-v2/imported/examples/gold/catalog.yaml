@@ -1,0 +1,2379 @@
+schema_version: splendor.gold.catalog.v1
+source: 09_gold_examples_catalog.md
+result_schema: schemas/gold-result.schema.json
+status_semantics:
+  specified_not_implemented: The contract and acceptance criteria exist; no passing executable gold directory is
+    claimed.
+  implemented_not_exercised: Executable assets exist but the case did not run in the current evidence set.
+  passed: The exact catalog revision ran and all required assertions passed.
+  failed: The case ran and at least one required assertion failed.
+  not_exercised: Requirements were unavailable or the case was intentionally not selected; this is never pass.
+graduation_tiers:
+  A: 'Local contract: deterministic positive and negative paths on one machine.'
+  B: 'Fault: crash, timeout, cancellation, partial output, store failure, and recovery.'
+  C: 'Distributed: identity, leases, partitions, retries, aggregation, and fencing.'
+  D: 'Adversarial: authority, injection, data, secret, reward, eval, and rollback abuse.'
+  E: 'Sustained: drift, pressure, rotation, upgrade, and long-running recovery.'
+resource_classes:
+  local_cpu: Runs on one ordinary CPU host.
+  local_gpu_optional: Runs locally; a GPU accelerates but is not semantically required.
+  local_container: Requires an OCI-compatible local container executor.
+  local_kubernetes: Requires a disposable Kubernetes test namespace or provider emulator.
+  human_in_the_loop: Requires authenticated human input or adjudication fixtures.
+  multi_node_simulated: Requires a deterministic simulated multi-node topology.
+  multi_node_gpu: Requires two or more compatible accelerator workers or a faithful emulator.
+  heterogeneous_fleet: Requires heterogeneous node capabilities, leases, and placement.
+  edge_simulated: Requires a simulated edge/device runtime and local safety boundary.
+  physical_hardware_optional: Simulation is mandatory; representative hardware is an optional higher tier.
+  sustained_fleet: Requires a long-running fleet or faithful pressure/drift simulation.
+duration_classes:
+  smoke: Expected target under five minutes.
+  short: Expected target under thirty minutes.
+  medium: Expected target under four hours.
+  sustained: Extended soak, pressure, drift, or recovery run.
+assertion_definitions:
+  case.result.explicit: The result is exactly pass, fail, or not_exercised; skip is never pass.
+  events.causal_chain.complete: Required events have identities, ordering, and causal links sufficient for independent
+    reconstruction.
+  state.transition.valid: Every durable state-head transition follows the declared state machine and compare-and-swap
+    rules.
+  artifacts.lineage.complete: Every governed output identifies immutable code, data, environment, configuration,
+    and producer inputs.
+  authority.fail_closed: Missing, expired, revoked, mismatched, or widened authority prevents the governed operation.
+  effects.gateway_mediated: All governed side effects pass proposal, verification, invocation, and outcome boundaries.
+  effects.forbidden.none: No forbidden driver, adapter, actuator, network, or external side effect occurred.
+  resources.bounds.enforced: Quota, deadline, reservation, locality, and interference policies are enforced and
+    evidenced.
+  cleanup.complete: Ephemeral processes, sandboxes, leases, mounts, secrets, and temporary artifacts are released
+    or explicitly quarantined.
+  recovery.evidenced: Failure, retry, resume, cancellation, or rollback creates a distinct evidenced attempt without
+    overwriting history.
+  driver.contract.conformant: Driver manifest, schemas, lifecycle, cancellation, health, timeout, and idempotency
+    behavior pass conformance.
+  secrets.non_disclosure: Secret material is brokered by scope and is absent from public traces, logs, artifacts,
+    and prompts where forbidden.
+  data.provenance.complete: Records retain source, collection purpose, timestamps, transforms, consent/license,
+    and immutable lineage.
+  data.quality_gate.enforced: Quality, quarantine, split, contamination, and use-policy decisions are explicit and
+    cannot be interpreted as pass when incomplete.
+  data.protected_eval.isolated: Training and candidate-controlled code cannot read protected evaluation cases, labels,
+    or hidden answers.
+  feedback.target.exact: Feedback identifies the exact subject revision, causal context, source trust, confidence,
+    and permitted use.
+  reward.derivation.versioned: Raw feedback remains immutable and any reward/learning signal records a versioned
+    derivation.
+  eval.report.complete: Candidate, baseline, suite, data, environment, slices, uncertainty, failures, and limitations
+    are present in the report.
+  eval.independence.declared: Evaluator relationship and trust class are declared; related/self evaluation cannot
+    satisfy an independent gate alone.
+  training.candidate_only: Training may publish checkpoints and a candidate bundle but has no operation that activates
+    deployment.
+  deployment.gated: Activation requires a ChangeSet, policy-selected evidence, gate decision, bounded rollout plan,
+    and authority.
+  deployment.rollback.proven: Stop conditions halt new exposure and eligible cohorts return to a known-good version
+    with incident evidence.
+  fleet.lease.fenced: Only a current fenced execution lease may commit attempts, checkpoints, state, or outputs.
+  fleet.inference_reservation.preserved: Background work yields before online inference or physical-control reservations
+    and SLOs are violated.
+  agent.route.trace.complete: Typed route steps preserve neural proposals, symbolic decisions, state reads/writes,
+    model calls, and action proposals.
+  world.assertion.provenance: Facts, beliefs, hypotheses, predictions, confidence, evidence, and conflicts remain
+    distinct and versioned.
+  physical.local_veto.enforced: Remote or cloud decisions cannot override device-local safety veto, emergency stop,
+    or mission reservation.
+  self_change.non_self_granting: An improving component cannot widen authority, lower its risk class, select protected
+    judges, or activate itself.
+  security.attack.denied_or_limited: The attack is denied with evidence, or a precise tested limitation is recorded
+    without claiming protection.
+examples:
+- id: G00
+  name: Schema round-trip
+  category: Foundation examples
+  owner: schema-and-compatibility
+  status: specified_not_implemented
+  proves: Stable IDs/spec/run/artifact/event serialization
+  acceptance: Rust/Python/TypeScript round-trip; unknown authorizing fields fail
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+- id: G01
+  name: Authority deny-first
+  category: Foundation examples
+  owner: authority-service
+  status: specified_not_implemented
+  proves: Capability/data/work-order scoping
+  acceptance: Missing/expired/revoked/wrong-audience grants fail closed
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - security.attack.denied_or_limited
+- id: G02
+  name: State and trace transaction
+  category: Foundation examples
+  owner: state-and-event-services
+  status: specified_not_implemented
+  proves: Commit ordering and integrity
+  acceptance: State cannot advance after required trace/store failure
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+- id: G03
+  name: Replay inspect-only
+  category: Foundation examples
+  owner: evidence-and-replay
+  status: specified_not_implemented
+  proves: Replay remains side-effect free
+  acceptance: Adapter invocation count stays zero; causal reconstruction matches
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - effects.forbidden.none
+- id: G04
+  name: Workload lifecycle
+  category: Foundation examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Submit/place/lease/run/checkpoint/cancel
+  acceptance: Every transition and attempt is evidenced; retry does not overwrite
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+- id: G05
+  name: Artifact lineage
+  category: Foundation examples
+  owner: artifact-service
+  status: specified_not_implemented
+  proves: Content-addressed inputs/outputs
+  acceptance: Complete producer/input graph; reference does not grant read
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+- id: G06
+  name: Managed/observed/unmanaged modes
+  category: Foundation examples
+  owner: control-plane
+  status: specified_not_implemented
+  proves: Guarantee boundary
+  acceptance: UI/API labels and evidence differ; policy can reject non-managed mode
+  required_feature_flags:
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - security.attack.denied_or_limited
+- id: G07
+  name: Driver conformance harness
+  category: Foundation examples
+  owner: driver-registry
+  status: specified_not_implemented
+  proves: Common manifest/lifecycle
+  acceptance: Health, timeout, cancel, idempotency, schema, denial tests pass
+  required_feature_flags:
+  - drivers
+  - foundation
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+- id: G08
+  name: Secret lease
+  category: Foundation examples
+  owner: secret-broker
+  status: specified_not_implemented
+  proves: Brokered secret use
+  acceptance: Secret absent from trace/artifacts; expiry closes handle
+  required_feature_flags:
+  - drivers
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - cleanup.complete
+  - recovery.evidenced
+  - secrets.non_disclosure
+  - security.attack.denied_or_limited
+- id: G09
+  name: Resource quota
+  category: Foundation examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: CPU/RAM/network/action limits
+  acceptance: Workload throttles/denies with deterministic reason and evidence
+  required_feature_flags:
+  - drivers
+  - foundation
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - resources.bounds.enforced
+- id: G10
+  name: Restricted argv command
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Safe shell primitive
+  acceptance: No ambient shell; mount/network limits; outputs captured and cleaned
+  required_feature_flags:
+  - drivers
+  - managed-environments
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+- id: G11
+  name: Explicit sh -c high-risk mode
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Separate shell-string authority
+  acceptance: Dedicated capability and approval required; injection tests included
+  required_feature_flags:
+  - drivers
+  - managed-environments
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - security.attack.denied_or_limited
+- id: G12
+  name: Locked Python environment
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Reproducible Python execution
+  acceptance: Lockfile/image digest pinned; deterministic input/output artifact
+  required_feature_flags:
+  - drivers
+  - managed-environments
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+- id: G13
+  name: OCI coding sandbox
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Container isolation
+  acceptance: Read-only base, scoped workspace, network deny, cleanup and attestation
+  required_feature_flags:
+  - drivers
+  - managed-environments
+  - sandbox-executors
+  resource_class: local_container
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+- id: G14
+  name: Kubernetes Job driver
+  category: Environment and actuator examples
+  owner: executor-providers
+  status: specified_not_implemented
+  proves: External scheduler mapping
+  acceptance: Splendor identity/lease/lineage maps to concrete K8s UIDs and outputs
+  required_feature_flags:
+  - drivers
+  - fleet
+  - managed-environments
+  - sandbox-executors
+  resource_class: local_kubernetes
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - fleet.lease.fenced
+- id: G15
+  name: HTTP actuator
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Idempotency and compensation
+  acceptance: Allowlist/rate limit; duplicate key safe; compensation evidence
+  required_feature_flags:
+  - drivers
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+- id: G16
+  name: Database actuator
+  category: Environment and actuator examples
+  owner: driver-gateway
+  status: specified_not_implemented
+  proves: Data scope and transaction
+  acceptance: Row/field scope enforced; rollback/commit paths traced
+  required_feature_flags:
+  - drivers
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+- id: G17
+  name: Artifact publication
+  category: Environment and actuator examples
+  owner: artifact-service
+  status: specified_not_implemented
+  proves: Publishing is a side effect
+  acceptance: Signature, destination scope, immutable digest, revocation path
+  required_feature_flags:
+  - drivers
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - cleanup.complete
+  - secrets.non_disclosure
+- id: G18
+  name: Sub-agent as actuator
+  category: Environment and actuator examples
+  owner: agent-service
+  status: specified_not_implemented
+  proves: Typed specialist operation
+  acceptance: No permission inheritance; bounded input/output and expiry
+  required_feature_flags:
+  - agent-runtime
+  - drivers
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - cleanup.complete
+  - agent.route.trace.complete
+- id: G19
+  name: Trigger agent
+  category: Environment and actuator examples
+  owner: agent-service
+  status: specified_not_implemented
+  proves: Event-to-work-order path
+  acceptance: Trigger conditions, dedup, quota, and no arbitrary run start
+  required_feature_flags:
+  - agent-runtime
+  - drivers
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+  - agent.route.trace.complete
+- id: G20
+  name: Polling perceptor
+  category: Perception and world-model examples
+  owner: perception-service
+  status: specified_not_implemented
+  proves: Freshness/provenance
+  acceptance: Expired observation rejected; source health recorded
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - agent.route.trace.complete
+- id: G21
+  name: Streaming perceptor
+  category: Perception and world-model examples
+  owner: perception-service
+  status: specified_not_implemented
+  proves: Backpressure and ordering
+  acceptance: Bounded queue, loss/drop policy, cursor checkpoint, resume
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - data.provenance.complete
+  - agent.route.trace.complete
+- id: G22
+  name: Human input perceptor
+  category: Perception and world-model examples
+  owner: perception-service
+  status: specified_not_implemented
+  proves: Authenticated human source
+  acceptance: Source identity/trust class and privacy scope preserved
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - agent.route.trace.complete
+- id: G23
+  name: Gridworld symbolic world
+  category: Perception and world-model examples
+  owner: world-state-service
+  status: specified_not_implemented
+  proves: World state vs observation
+  acceptance: Invalid state update denied; deterministic state lineage
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G24
+  name: Probabilistic belief state
+  category: Perception and world-model examples
+  owner: world-state-service
+  status: specified_not_implemented
+  proves: Belief vs asserted truth
+  acceptance: Hypotheses/confidence preserved; corroboration changes belief version
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G25
+  name: Learned world model
+  category: Perception and world-model examples
+  owner: world-model-service
+  status: specified_not_implemented
+  proves: Prediction/outcome linkage
+  acceptance: Versioned prediction, rollout artifact, calibration eval
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G26
+  name: Memory partitions
+  category: Perception and world-model examples
+  owner: state-service
+  status: specified_not_implemented
+  proves: Episodic/semantic/active-config separation
+  acceptance: Active bundle cannot change via memory write; retention enforced
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G27
+  name: Neuro-symbolic router
+  category: Perception and world-model examples
+  owner: agent-router
+  status: specified_not_implemented
+  proves: Typed neural + rule flow
+  acceptance: Model output is proposal; rule denial prevents action; fallback traced
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G28
+  name: Multi-modal route
+  category: Perception and world-model examples
+  owner: agent-router
+  status: specified_not_implemented
+  proves: Images/audio/text/custom tensors
+  acceptance: Schema adapters and model bindings explicit; data scopes preserved
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G29
+  name: Long-lived event agent
+  category: Perception and world-model examples
+  owner: agent-supervisor
+  status: specified_not_implemented
+  proves: 24/7 lifecycle
+  acceptance: Restart/resume, stale-source handling, timers, bounded inbox, drain
+  required_feature_flags:
+  - agent-runtime
+  - perception-world
+  resource_class: sustained_fleet
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - data.provenance.complete
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G30
+  name: Percept-to-record opt-in
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Runtime data is not automatic training data
+  acceptance: Only declared sink persists; purpose/data lease required
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G31
+  name: Source collection
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: CollectionSpec/Run
+  acceptance: Sampling, rate, retention, provenance, failure and resume
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G32
+  name: Schema and missingness quality
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: QualitySpec/Report/Gate
+  acceptance: Hard failure quarantines; report links exact records/shards
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G33
+  name: Exact/near dedup
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Driver-pluggable quality work
+  acceptance: Algorithm version and thresholds recorded; deterministic fixtures
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G34
+  name: License/consent/purpose gate
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Data-policy control
+  acceptance: Incompatible records denied even when readable
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - security.attack.denied_or_limited
+- id: G35
+  name: PII/secret redaction
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Transform lineage and security
+  acceptance: Original/restricted and redacted artifacts separated; access tested
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - cleanup.complete
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - security.attack.denied_or_limited
+- id: G36
+  name: Train/eval contamination scan
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Protected-set isolation
+  acceptance: Exact/near leaks detected without exposing hidden answers to trainer
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - security.attack.denied_or_limited
+- id: G37
+  name: Temporal/source split
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Leakage-resistant SplitManifest
+  acceptance: Record assignments deterministic and independently verifiable
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G38
+  name: Annotation/adjudication
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Human/model labeling workflow
+  acceptance: Redundancy, disagreement, confidence, adjudication provenance
+  required_feature_flags:
+  - data-control
+  resource_class: human_in_the_loop
+  duration_class: medium
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G39
+  name: Dataset rebuild
+  category: Data and quality examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Reproducible immutable versions
+  acceptance: Same pinned inputs/config reproduce digest or explain nondeterminism
+  required_feature_flags:
+  - data-control
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+- id: G40
+  name: Raw feedback ingestion
+  category: Evaluation and feedback examples
+  owner: feedback-service
+  status: specified_not_implemented
+  proves: FeedbackEvent semantics
+  acceptance: Subject/source/trust/causal refs required; no direct model mutation
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - feedback.target.exact
+- id: G41
+  name: Reward derivation
+  category: Evaluation and feedback examples
+  owner: reward-service
+  status: specified_not_implemented
+  proves: Reward provenance
+  acceptance: Raw feedback preserved; derivation version pinned; tampering detected
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - feedback.target.exact
+  - reward.derivation.versioned
+- id: G42
+  name: Deterministic eval
+  category: Evaluation and feedback examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: EvalSpec/Run/Report
+  acceptance: Exact cases, environment, candidate, baseline, metric artifacts
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - eval.report.complete
+- id: G43
+  name: Human pairwise eval
+  category: Evaluation and feedback examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: Preference and adjudication
+  acceptance: Blinding/randomization, annotator scope, disagreement and confidence
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: human_in_the_loop
+  duration_class: medium
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - eval.report.complete
+  - eval.independence.declared
+- id: G44
+  name: Model-judge eval
+  category: Evaluation and feedback examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: Evaluator trust classes
+  acceptance: Related/self evaluator flagged; cannot satisfy independent gate alone
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - security.attack.denied_or_limited
+- id: G45
+  name: Replay comparison
+  category: Evaluation and feedback examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: Counterfactual evaluation
+  acceptance: Candidate/baseline run on same recorded inputs with no effects
+  required_feature_flags:
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - effects.forbidden.none
+  - data.provenance.complete
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - agent.route.trace.complete
+- id: G46
+  name: Shadow deployment
+  category: Evaluation and feedback examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: Live inputs without effects
+  acceptance: Candidate outputs isolated; latency/cost/quality compared
+  required_feature_flags:
+  - evaluation-feedback
+  - fleet
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - fleet.lease.fenced
+  - agent.route.trace.complete
+- id: G47
+  name: Canary deployment
+  category: Evaluation and feedback examples
+  owner: deployment-controller
+  status: specified_not_implemented
+  proves: Bounded live effects
+  acceptance: Cohort/blast radius/abort triggers; automatic rollback
+  required_feature_flags:
+  - change-control
+  - evaluation-feedback
+  - fleet
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - deployment.gated
+  - deployment.rollback.proven
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+- id: G48
+  name: Drift monitor
+  category: Evaluation and feedback examples
+  owner: monitoring-and-evaluation
+  status: specified_not_implemented
+  proves: Post-deployment online eval
+  acceptance: Data/model/performance drift creates incident/change proposal
+  required_feature_flags:
+  - change-control
+  - evaluation-feedback
+  - fleet
+  resource_class: sustained_fleet
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - feedback.target.exact
+  - eval.report.complete
+  - deployment.gated
+  - deployment.rollback.proven
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G49
+  name: Reward-hacking test
+  category: Evaluation and feedback examples
+  owner: evaluation-and-change-control
+  status: specified_not_implemented
+  proves: Signal independence
+  acceptance: Candidate manipulation attempt detected; promotion denied
+  required_feature_flags:
+  - change-control
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - effects.forbidden.none
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G50
+  name: Linear regression lifecycle
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: Minimal train/eval/promote
+  acceptance: Dataset version -> run -> checkpoint -> candidate -> gate -> rollout
+  required_feature_flags:
+  - training
+  resource_class: local_cpu
+  duration_class: smoke
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - eval.report.complete
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+- id: G51
+  name: MNIST/CIFAR classifier
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: GPU/CPU model driver
+  acceptance: Reproducibility, batching, model artifact, baseline regression
+  required_feature_flags:
+  - training
+  resource_class: local_gpu_optional
+  duration_class: short
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - eval.report.complete
+  - training.candidate_only
+- id: G52
+  name: Tiny transformer from scratch
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: Tokenization/shards/checkpoint
+  acceptance: Resume exactness class documented; eval/overfit checks
+  required_feature_flags:
+  - training
+  resource_class: local_gpu_optional
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - eval.report.complete
+  - training.candidate_only
+- id: G53
+  name: Released GPT-2 inference
+  category: Learning examples
+  owner: model-driver
+  status: specified_not_implemented
+  proves: Transformers/model import
+  acceptance: Tokenizer/model digests, session isolation, latency/resource evidence
+  required_feature_flags:
+  - drivers
+  - training
+  resource_class: local_gpu_optional
+  duration_class: short
+  required_tiers:
+  - A
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - effects.gateway_mediated
+  - driver.contract.conformant
+  - eval.report.complete
+  - training.candidate_only
+- id: G54
+  name: GPT-2 full lifecycle
+  category: Learning examples
+  owner: gold-lifecycle-program
+  status: specified_not_implemented
+  proves: Data-to-self-adjustment integration
+  acceptance: Defined in 10_gold_gpt2.md
+  required_feature_flags:
+  - change-control
+  - data-control
+  - evaluation-feedback
+  - training
+  resource_class: multi_node_gpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - agent.route.trace.complete
+  - world.assertion.provenance
+  - self_change.non_self_granting
+- id: G55
+  name: LoRA/fine-tune candidate
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: Parameter-efficient change
+  acceptance: Base/adapter lineage; bundle compatibility; rollback
+  required_feature_flags:
+  - change-control
+  - training
+  resource_class: local_gpu_optional
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+- id: G56
+  name: Contextual bandit RL
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: Online/offline reward
+  acceptance: Episode linkage, exploration policy, safety constraints, off-policy eval
+  required_feature_flags:
+  - evaluation-feedback
+  - training
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - agent.route.trace.complete
+- id: G57
+  name: Gridworld PPO
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: RL actor/evaluator separation
+  acceptance: Environment version, seeds, rollouts, checkpoints, policy gate
+  required_feature_flags:
+  - evaluation-feedback
+  - training
+  resource_class: local_gpu_optional
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - cleanup.complete
+  - recovery.evidenced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G58
+  name: Preference optimization
+  category: Learning examples
+  owner: training-service
+  status: specified_not_implemented
+  proves: Feedback-to-dataset-to-candidate
+  acceptance: Raw preferences, curation, reward/eval separation
+  required_feature_flags:
+  - data-control
+  - evaluation-feedback
+  - training
+  resource_class: local_gpu_optional
+  duration_class: medium
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+- id: G59
+  name: World-model learning
+  category: Learning examples
+  owner: world-model-and-training
+  status: specified_not_implemented
+  proves: Prediction model lifecycle
+  acceptance: Data quality, calibration, rollout eval, active bundle promotion
+  required_feature_flags:
+  - data-control
+  - evaluation-feedback
+  - training
+  resource_class: local_gpu_optional
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G60
+  name: Two-node task lease
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Remote identity/lease
+  acceptance: Signed work, expiry, output lineage, node rejection path
+  required_feature_flags:
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+- id: G61
+  name: Heterogeneous eval fan-out
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Arbitrary capable devices
+  acceptance: Capability-aware case placement and deterministic aggregation
+  required_feature_flags:
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: short
+  required_tiers:
+  - A
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - eval.report.complete
+  - fleet.lease.fenced
+- id: G62
+  name: Data locality scheduler
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Data-work placement
+  acceptance: Minimizes transfer subject to residency/trust; lineage complete
+  required_feature_flags:
+  - data-control
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: short
+  required_tiers:
+  - A
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - resources.bounds.enforced
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - fleet.lease.fenced
+- id: G63
+  name: PyTorch script workload
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Compatibility mode
+  acceptance: Existing script isolated and captured; no false elastic claim
+  required_feature_flags:
+  - drivers
+  - fleet
+  - sandbox-executors
+  resource_class: local_container
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - fleet.lease.fenced
+- id: G64
+  name: Structured PyTorch DDP-style
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: TorchTrainProgram + strategy
+  acceptance: 1/2/8-worker equivalence tolerance, checkpoint/resume, node failure
+  required_feature_flags:
+  - drivers
+  - fleet
+  - training
+  resource_class: multi_node_gpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - eval.report.complete
+  - training.candidate_only
+  - fleet.lease.fenced
+- id: G65
+  name: Elastic membership
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Worker epochs
+  acceptance: Membership change legal only by strategy; optimizer/data cursor restored
+  required_feature_flags:
+  - fleet
+  - training
+  resource_class: multi_node_gpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - training.candidate_only
+  - fleet.lease.fenced
+- id: G66
+  name: Inference-protected training
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Interference policy
+  acceptance: Background work preempts before configured p99/SLO breach
+  required_feature_flags:
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - resources.bounds.enforced
+  - eval.report.complete
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+- id: G67
+  name: Federated edge training
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Intermittent heterogeneous devices
+  acceptance: Local data leases, update provenance, aggregation, dropout tolerance
+  required_feature_flags:
+  - data-control
+  - fleet
+  - training
+  resource_class: heterogeneous_fleet
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - training.candidate_only
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+- id: G68
+  name: Mixed 1,000-node simulation
+  category: Distributed and fleet examples
+  owner: execution-fabric
+  status: specified_not_implemented
+  proves: Fleet-wide scheduling
+  acceptance: Concurrent inference/training/eval/data, partitions, drain, fairness
+  required_feature_flags:
+  - fleet
+  resource_class: heterogeneous_fleet
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+- id: G69
+  name: Artifact replication/recovery
+  category: Distributed and fleet examples
+  owner: artifact-service
+  status: specified_not_implemented
+  proves: Fleet artifact availability
+  acceptance: Digest verification, partial transfer resume, corrupt replica quarantine
+  required_feature_flags:
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - fleet.lease.fenced
+- id: G70
+  name: Scoped orchestrator/specialists
+  category: Multi-agent, physical, and self-evolution examples
+  owner: agent-service
+  status: specified_not_implemented
+  proves: Multi-agent delegation
+  acceptance: Work-order narrowing, budget/expiry, causal result aggregation
+  required_feature_flags:
+  - agent-runtime
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - fleet.lease.fenced
+  - agent.route.trace.complete
+  - security.attack.denied_or_limited
+- id: G71
+  name: Critic sub-agent
+  category: Multi-agent, physical, and self-evolution examples
+  owner: evaluation-and-agent-service
+  status: specified_not_implemented
+  proves: Independent judgment
+  acceptance: No action authority; related lineage marked; disagreement preserved
+  required_feature_flags:
+  - agent-runtime
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - eval.report.complete
+  - eval.independence.declared
+  - agent.route.trace.complete
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G72
+  name: Agent migration
+  category: Multi-agent, physical, and self-evolution examples
+  owner: agent-and-fleet-services
+  status: specified_not_implemented
+  proves: State-head handoff
+  acceptance: Single writer, checkpoint, lease transfer, no duplicate effects
+  required_feature_flags:
+  - agent-runtime
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+  - agent.route.trace.complete
+  - world.assertion.provenance
+- id: G73
+  name: Simulated drone mission
+  category: Multi-agent, physical, and self-evolution examples
+  owner: device-service
+  status: specified_not_implemented
+  proves: Physical action boundary
+  acceptance: High-level commands, local denial, offline fallback, trace sync
+  required_feature_flags:
+  - fleet
+  - perception-world
+  - physical-edge
+  resource_class: edge_simulated
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - agent.route.trace.complete
+  - world.assertion.provenance
+  - physical.local_veto.enforced
+  - security.attack.denied_or_limited
+- id: G74
+  name: Robot environment launch
+  category: Multi-agent, physical, and self-evolution examples
+  owner: device-and-executor-services
+  status: specified_not_implemented
+  proves: Device runs signed image
+  acceptance: Resource/safety reservations, device access, cleanup, local preemption
+  required_feature_flags:
+  - drivers
+  - fleet
+  - managed-environments
+  - perception-world
+  - physical-edge
+  - sandbox-executors
+  resource_class: local_container
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - driver.contract.conformant
+  - secrets.non_disclosure
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - physical.local_veto.enforced
+- id: G75
+  name: Physical irreversible action
+  category: Multi-agent, physical, and self-evolution examples
+  owner: device-and-change-control
+  status: specified_not_implemented
+  proves: Risk and evidence
+  acceptance: Strong approval, no fake rollback, containment/incident path
+  required_feature_flags:
+  - physical-edge
+  resource_class: physical_hardware_optional
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - deployment.rollback.proven
+  - physical.local_veto.enforced
+  - security.attack.denied_or_limited
+- id: G76
+  name: Prompt/rule self-adjustment
+  category: Multi-agent, physical, and self-evolution examples
+  owner: improvement-and-change-control
+  status: specified_not_implemented
+  proves: Low/medium-risk change
+  acceptance: Candidate, hidden eval, shadow, canary, rollback
+  required_feature_flags:
+  - agent-runtime
+  - change-control
+  - evaluation-feedback
+  - training
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - recovery.evidenced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+  - agent.route.trace.complete
+  - world.assertion.provenance
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G77
+  name: Coding feedback adjustment
+  category: Multi-agent, physical, and self-evolution examples
+  owner: improvement-and-change-control
+  status: specified_not_implemented
+  proves: Live improvement loop
+  acceptance: Sandbox, protected tests, patch artifact, change gate, rollback
+  required_feature_flags:
+  - agent-runtime
+  - change-control
+  - evaluation-feedback
+  - sandbox-executors
+  - training
+  resource_class: local_container
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - secrets.non_disclosure
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+  - agent.route.trace.complete
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G78
+  name: Model self-training proposal
+  category: Multi-agent, physical, and self-evolution examples
+  owner: improvement-and-change-control
+  status: specified_not_implemented
+  proves: Data/training/eval independence
+  acceptance: Active model cannot select hidden tests or self-promote
+  required_feature_flags:
+  - agent-runtime
+  - change-control
+  - data-control
+  - evaluation-feedback
+  - training
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - recovery.evidenced
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - training.candidate_only
+  - deployment.gated
+  - deployment.rollback.proven
+  - agent.route.trace.complete
+  - world.assertion.provenance
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G79
+  name: Value-change attempt
+  category: Multi-agent, physical, and self-evolution examples
+  owner: improvement-and-change-control
+  status: specified_not_implemented
+  proves: Critical separation
+  acceptance: Ordinary self-change authority denied; special multi-party flow required
+  required_feature_flags:
+  - change-control
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - deployment.gated
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G80
+  name: Prompt/data injection through perceptor
+  category: Security and adversarial examples
+  owner: agent-router-and-authority
+  status: specified_not_implemented
+  proves: Taint and capability separation
+  acceptance: Payload cannot grant authority or bypass route/gateway controls
+  required_feature_flags:
+  - adversarial
+  - agent-runtime
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - agent.route.trace.complete
+  - world.assertion.provenance
+  - security.attack.denied_or_limited
+- id: G81
+  name: Malicious dataset poisoning
+  category: Security and adversarial examples
+  owner: data-service
+  status: specified_not_implemented
+  proves: Quality/quarantine
+  acceptance: Poison fixture detected or produces explicit known limitation; no silent admit
+  required_feature_flags:
+  - adversarial
+  - data-control
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - security.attack.denied_or_limited
+- id: G82
+  name: Secret exfiltration attempt
+  category: Security and adversarial examples
+  owner: authority-and-secret-services
+  status: specified_not_implemented
+  proves: Data/secret/network scopes
+  acceptance: Denied with evidence; secret absent from artifacts and model prompts where forbidden
+  required_feature_flags:
+  - adversarial
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - secrets.non_disclosure
+  - security.attack.denied_or_limited
+- id: G83
+  name: Compromised worker
+  category: Security and adversarial examples
+  owner: fleet-attestation
+  status: specified_not_implemented
+  proves: Trust and artifact integrity
+  acceptance: Invalid signature/checkpoint rejected; worker quarantined
+  required_feature_flags:
+  - adversarial
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+  - security.attack.denied_or_limited
+- id: G84
+  name: Eval leakage attempt
+  category: Security and adversarial examples
+  owner: evaluation-service
+  status: specified_not_implemented
+  proves: Hidden evaluator isolation
+  acceptance: Trainer/candidate cannot read protected cases/answers
+  required_feature_flags:
+  - adversarial
+  - data-control
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - data.provenance.complete
+  - data.quality_gate.enforced
+  - data.protected_eval.isolated
+  - eval.report.complete
+  - eval.independence.declared
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G85
+  name: Reward-channel tampering
+  category: Security and adversarial examples
+  owner: feedback-and-evidence
+  status: specified_not_implemented
+  proves: Anti-tamper signals
+  acceptance: Signature/lineage mismatch invalidates signal; gate denies
+  required_feature_flags:
+  - adversarial
+  - evaluation-feedback
+  resource_class: local_cpu
+  duration_class: medium
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.forbidden.none
+  - data.provenance.complete
+  - feedback.target.exact
+  - reward.derivation.versioned
+  - eval.report.complete
+  - eval.independence.declared
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited
+- id: G86
+  name: Driver schema confusion
+  category: Security and adversarial examples
+  owner: driver-registry
+  status: specified_not_implemented
+  proves: Typed ABI
+  acceptance: Mismatched schema/version fails before execution
+  required_feature_flags:
+  - adversarial
+  - drivers
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - effects.forbidden.none
+  - driver.contract.conformant
+  - security.attack.denied_or_limited
+- id: G87
+  name: Duplicate irreversible action
+  category: Security and adversarial examples
+  owner: action-gateway
+  status: specified_not_implemented
+  proves: Idempotency/replay safety
+  acceptance: Retry cannot repeat effect without explicit new authorization
+  required_feature_flags:
+  - adversarial
+  - drivers
+  resource_class: local_cpu
+  duration_class: short
+  required_tiers:
+  - A
+  - B
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - cleanup.complete
+  - recovery.evidenced
+  - security.attack.denied_or_limited
+- id: G88
+  name: Expired offline policy
+  category: Security and adversarial examples
+  owner: device-service
+  status: specified_not_implemented
+  proves: Edge fail-safe
+  acceptance: Device degrades or stops according to pinned safe policy
+  required_feature_flags:
+  - adversarial
+  - fleet
+  - perception-world
+  - physical-edge
+  resource_class: edge_simulated
+  duration_class: sustained
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  - E
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - physical.local_veto.enforced
+  - security.attack.denied_or_limited
+- id: G89
+  name: Rollout blast-radius breach
+  category: Security and adversarial examples
+  owner: deployment-controller
+  status: specified_not_implemented
+  proves: Change controller safety
+  acceptance: New leases denied, rollout aborted, active version restored
+  required_feature_flags:
+  - adversarial
+  - change-control
+  - evaluation-feedback
+  - fleet
+  resource_class: multi_node_simulated
+  duration_class: medium
+  required_tiers:
+  - A
+  - B
+  - C
+  - D
+  evidence_assertions:
+  - case.result.explicit
+  - events.causal_chain.complete
+  - state.transition.valid
+  - artifacts.lineage.complete
+  - authority.fail_closed
+  - effects.gateway_mediated
+  - effects.forbidden.none
+  - resources.bounds.enforced
+  - cleanup.complete
+  - recovery.evidenced
+  - eval.report.complete
+  - eval.independence.declared
+  - deployment.gated
+  - deployment.rollback.proven
+  - fleet.lease.fenced
+  - fleet.inference_reservation.preserved
+  - self_change.non_self_granting
+  - security.attack.denied_or_limited

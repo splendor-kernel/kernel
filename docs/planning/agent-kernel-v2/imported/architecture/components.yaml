@@ -1,0 +1,352 @@
+schema_version: splendor.architecture.components.v1
+source: component_responsibility_matrix.md
+components:
+- id: splendor.identity-registry
+  name: Identity Registry
+  plane: identity_authority
+  kind: registry
+  status: proposed_vnext_contract
+  owns_exactly: Stable identities for tenants, humans, services, agents, nodes, devices, and governance authorities
+  receives: Registration/rotation requests and proof material
+  emits: Principal, identity status, revocation facts
+  must_never_do: Grant operational capability merely because an identity exists
+- id: splendor.authority-service
+  name: Authority Service
+  plane: identity_authority
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Capability issuance, narrowing, expiry, delegation, revocation, and authorization decisions
+  receives: Principal, requested operation, scope, policy refs, evidence
+  emits: CapabilityGrant, allow/deny reason, authority audit event
+  must_never_do: Infer authority from prompts, metadata, messages, or ownership alone
+- id: splendor.secret-broker
+  name: Secret Broker
+  plane: identity_authority
+  kind: broker
+  status: proposed_vnext_contract
+  owns_exactly: Short-lived secret leases and delivery to an isolated execution boundary
+  receives: Authorized secret reference and workload/driver identity
+  emits: SecretLease, lease audit events
+  must_never_do: Put secret bytes in state, traces, artifacts, prompts, action parameters, or datasets
+- id: splendor.artifact-registry
+  name: Artifact Registry
+  plane: artifact_lineage
+  kind: registry
+  status: proposed_vnext_contract
+  owns_exactly: Immutable identity, integrity, metadata, storage reference, retention class, and lifecycle of artifacts
+  receives: Artifact bytes/reference and manifest
+  emits: ArtifactRef, ArtifactManifest, verification status
+  must_never_do: Decide whether an artifact is good enough for deployment
+- id: splendor.lineage-service
+  name: Lineage Service
+  plane: artifact_lineage
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Derivation graph among data, code, environment, model, checkpoint, eval, world, and deployment artifacts
+  receives: Parent refs, transform identity, parameters, run/evidence refs
+  emits: LineageEdge, closure queries, reproducibility graph
+  must_never_do: Treat a mutable URI or tag as immutable identity
+- id: splendor.data-use-controller
+  name: Data-Use Controller
+  plane: identity_authority
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Legal/policy purpose, allowed operations, locality, retention, and audience for data
+  receives: Data subject/classification, requested use, principal/workload
+  emits: DataUseGrant, denial, expiry/revocation event
+  must_never_do: Allow training access because inference access exists, or vice versa
+- id: splendor.event-log
+  name: Event Log
+  plane: event_state_evidence
+  kind: event_log
+  status: proposed_vnext_contract
+  owns_exactly: Append-only ordered facts with identity, causality, schema, integrity, and payload references
+  receives: EventEnvelope append requests
+  emits: Durable event IDs, subscriptions, causal queries
+  must_never_do: Be used as mutable state or silently drop required privileged events
+- id: splendor.state-service
+  name: State Service
+  plane: event_state_evidence
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Versioned mutable heads over immutable commits, partition ownership, compare-and-swap, snapshot
+    and merge policy
+  receives: State transition proposal, expected head, evidence refs
+  emits: StateCommit, new StateHead, conflict result
+  must_never_do: Accept unversioned mutation or let replay alter a live head by default
+- id: splendor.evidence-service
+  name: Evidence Service
+  plane: event_state_evidence
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Bundles the exact facts needed to explain, reproduce, approve, or reject an operation/change
+  receives: Event, artifact, eval, approval, incident, and environment refs
+  emits: EvidenceBundle, completeness result
+  must_never_do: Claim certainty that its referenced evidence does not support
+- id: splendor.replay-simulation-service
+  name: Replay/Simulation Service
+  plane: event_state_evidence
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Reconstruct, re-evaluate, or simulate recorded execution under explicit non-live drivers
+  receives: Evidence range, state/artifact versions, simulation policy
+  emits: Replay report, divergence report, counterfactual artifacts
+  must_never_do: Execute live side effects or become the architecture's central abstraction
+- id: splendor.node-agent
+  name: Node Agent
+  plane: execution_fabric
+  kind: node_agent
+  status: proposed_vnext_contract
+  owns_exactly: Local resource inventory, execution leases, isolation enforcement, health, checkpoint transfer,
+    and local device safety hooks
+  receives: Signed placement/lease and workload package
+  emits: Resource offers, workload events, metrics, result/checkpoint refs
+  must_never_do: Broaden a work order, leak one tenant's data, or cede physical emergency veto
+- id: splendor.fleet-scheduler
+  name: Fleet Scheduler
+  plane: execution_fabric
+  kind: scheduler
+  status: proposed_vnext_contract
+  owns_exactly: Admission, placement, preemption, gang/rendezvous formation, fairness, locality, and interference
+    control
+  receives: WorkloadSpec, ResourceOffer, policy/SLO state
+  emits: PlacementDecision, ExecutionLease, preemption/queue events
+  must_never_do: Execute user code, edit training logic, or consume protected holdouts itself
+- id: splendor.workload-controller
+  name: Workload Controller
+  plane: execution_fabric
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Lifecycle of one logical computation across retries, workers, checkpoints, and outputs
+  receives: WorkloadSpec, leases, worker events
+  emits: Workload status, output artifact refs, failure decision
+  must_never_do: Activate a candidate merely because the workload succeeded
+- id: splendor.driver-registry
+  name: Driver Registry
+  plane: driver_boundary
+  kind: registry
+  status: proposed_vnext_contract
+  owns_exactly: Driver manifests, compatibility, maturity, certification, and operation lookup
+  receives: DriverManifest, conformance evidence
+  emits: Resolved driver/version, compatibility result
+  must_never_do: Let a driver self-certify or silently change operation semantics
+- id: splendor.driver-gateway
+  name: Driver Gateway
+  plane: driver_boundary
+  kind: gateway
+  status: proposed_vnext_contract
+  owns_exactly: Typed invocation lifecycle, authority/gate enforcement, idempotency, cancellation, timeout, postconditions,
+    compensation linkage
+  receives: Invocation, capability, gate policy, resolved driver
+  emits: InvocationResult, usage, postcondition and evidence events
+  must_never_do: Route around a verifier, execute unknown-schema operations, or promise rollback for irreversible
+    effects
+- id: splendor.perceptor-driver
+  name: Perceptor Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Acquire and normalize observations from a declared source
+  receives: Collection request, source/data grant, schema
+  emits: PerceptEvent, quality/freshness/provenance metadata
+  must_never_do: Grant action authority or write arbitrary world truth directly
+- id: splendor.actuator-driver
+  name: Actuator Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Translate approved high-level actions to tools/services/devices and report outcomes
+  receives: Approved invocation and bounded credentials/lease
+  emits: Outcome, resource usage, postconditions, compensation ref
+  must_never_do: Decide its own permission or bypass local physical safety
+- id: splendor.model-driver
+  name: Model Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Execute inference/scoring/embedding/generation against an immutable model bundle
+  receives: Model ref, typed request, inference workload lease
+  emits: Typed model result, usage, model/version evidence
+  must_never_do: Mutate live weights or select deployment versions outside routing policy
+- id: splendor.trainer-driver
+  name: Trainer Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Run a declared learning algorithm and produce checkpoints/candidates
+  receives: Training plan, code/env/data refs, worker context
+  emits: Checkpoint refs, metrics, CandidateBundle
+  must_never_do: Read protected eval data, activate candidates, or rewrite lineage
+- id: splendor.evaluator-driver
+  name: Evaluator Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Apply a versioned eval protocol and produce signed/traceable measurements
+  receives: Candidate/baseline refs, eval suite, protected data grant
+  emits: EvalReport, slice results, uncertainty, evidence
+  must_never_do: Train on its protected inputs or translate "inconclusive" into "pass"
+- id: splendor.data-operator-driver
+  name: Data Operator Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Collect, parse, redact, normalize, label, deduplicate, split, quality-check, or quarantine data
+  receives: Collection/data-workload spec and grants
+  emits: Data shards, dataset snapshot/report artifacts
+  must_never_do: Mutate an immutable snapshot or remove provenance to improve a metric
+- id: splendor.sandbox-executor-driver
+  name: Sandbox/Executor Driver
+  plane: driver_boundary
+  kind: driver
+  status: proposed_vnext_contract
+  owns_exactly: Run shell, Python, OCI, VM, Kubernetes, or custom jobs in a declared isolation profile
+  receives: Workload package, env/artifact refs, scoped mounts/network/secrets
+  emits: Exit/result artifacts, resource usage, execution evidence
+  must_never_do: Be an unrestricted host shell or make its environment implicit
+- id: splendor.agent-registry
+  name: Agent Registry
+  plane: agent_runtime_routing
+  kind: registry
+  status: proposed_vnext_contract
+  owns_exactly: Versioned AgentSpec and component/deployment references
+  receives: Agent definitions and validated updates
+  emits: Agent revision, compatibility result
+  must_never_do: Contain private chain-of-thought or implement the agent's intelligence
+- id: splendor.agent-instance-controller
+  name: Agent Instance Controller
+  plane: agent_runtime_routing
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: 24/7 lifecycle, inbox, route execution budget, state-head binding, health, pause/resume/drain
+  receives: Agent revision, percept/message triggers, leases
+  emits: Route steps, proposals, state commits, instance status
+  must_never_do: Treat internal model output as an authorized external action
+- id: splendor.route-runtime
+  name: Route Runtime
+  plane: agent_runtime_routing
+  kind: runtime
+  status: proposed_vnext_contract
+  owns_exactly: Typed crossings among neural, symbolic, state, human, sub-agent, and driver steps
+  receives: User-space route code/spec and current context
+  emits: RouteStepEvent, typed results/proposals
+  must_never_do: Require one graph framework or inspect/standardize hidden reasoning text
+- id: splendor.world-state-service
+  name: World-State Service
+  plane: agent_runtime_routing
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Governed shared beliefs/facts/hypotheses with provenance, confidence, time, ownership, and conflict
+    policy
+  receives: Percept-derived or computed state proposals
+  emits: World-state commits, conflict/uncertainty events
+  must_never_do: Equate a neural latent with verified external truth
+- id: splendor.message-delegation-service
+  name: Message/Delegation Service
+  plane: agent_runtime_routing
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Typed delivery and explicit narrower authority transfer to agents/sub-agents
+  receives: Message/delegation proposal and parent scope
+  emits: Message lifecycle, DelegationGrant, causal link
+  must_never_do: Make a message itself a permission token or implicitly inherit parent power
+- id: splendor.collection-controller
+  name: Collection Controller
+  plane: data_feedback_eval_learning
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Convert permitted sources/events into bounded collection and curation workloads
+  receives: CollectionPlan, data-use rules, triggers
+  emits: Snapshot/report refs, collection status
+  must_never_do: Continuously collect unspecified data "for future use"
+- id: splendor.feedback-service
+  name: Feedback Service
+  plane: data_feedback_eval_learning
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Attach human, environment, automated, or downstream feedback to an exact target/version
+  receives: FeedbackRecord with source/provenance/use policy
+  emits: Durable feedback event, conflict/trust views
+  must_never_do: Collapse heterogeneous feedback into one unqualified scalar
+- id: splendor.reward-derivation-service
+  name: Reward Derivation Service
+  plane: data_feedback_eval_learning
+  kind: service
+  status: proposed_vnext_contract
+  owns_exactly: Produce versioned teaching/reward signals from exact feedback/outcomes
+  receives: Feedback/event refs and derivation artifact
+  emits: RewardSignal, RewardDerivation lineage
+  must_never_do: Hide normative choices inside an unlabeled reward number
+- id: splendor.eval-controller
+  name: Eval Controller
+  plane: data_feedback_eval_learning
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Eval-run lifecycle, protected access, baseline/candidate comparison, aggregation, and report publication
+  receives: EvalSuite, candidate/baseline, leases
+  emits: EvalRun, EvalReport, gate-ready evidence
+  must_never_do: Let candidate code select or alter its judge without an explicit change
+- id: splendor.training-controller
+  name: Training Controller
+  plane: data_feedback_eval_learning
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Training-plan validation, data/code/env binding, workload creation, checkpoint/candidate collection
+  receives: TrainingPlan
+  emits: Workload refs, training run, CandidateBundle
+  must_never_do: Merge training and deployment into one operation
+- id: splendor.improvement-controller
+  name: Improvement Controller
+  plane: change_governance
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Diagnose triggers and propose bounded data/eval/train/search/change work
+  receives: Monitoring/feedback/incident/eval evidence
+  emits: ImprovementProposal, authorized child workloads
+  must_never_do: Grant itself new authority or suppress unfavorable evidence
+- id: splendor.change-controller
+  name: Change Controller
+  plane: change_governance
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Immutable diff, risk classification, required evidence, dependency ordering
+  receives: Candidate artifacts and proposed target revision
+  emits: ChangeSet, validation status
+  must_never_do: Edit values, code, model, route, data, or driver in place
+- id: splendor.gate-engine
+  name: Gate Engine
+  plane: change_governance
+  kind: engine
+  status: proposed_vnext_contract
+  owns_exactly: Deterministic/declared promotion conditions, obligations, approvals, exceptions, and fail-closed
+    decisions
+  receives: Change/proposal, policy, evidence, runtime facts
+  emits: GateDecision
+  must_never_do: Generate the candidate it is judging or let missing evidence count as success
+- id: splendor.deployment-controller
+  name: Deployment Controller
+  plane: change_governance
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Shadow, canary, progressive rollout, activation pointers, stop conditions, quarantine, and rollback
+  receives: Approved ChangeSet and DeploymentPlan
+  emits: Deployment revision/status, cohort assignment, rollback events
+  must_never_do: Overwrite last-known-good artifacts or call irreversible effects "rolled back"
+- id: splendor.incident-controller
+  name: Incident Controller
+  plane: change_governance
+  kind: controller
+  status: proposed_vnext_contract
+  owns_exactly: Detect, classify, contain, investigate, and close safety/quality/availability incidents
+  receives: Monitor/eval/gate/driver/fleet events
+  emits: Incident, containment actions, evidence and lessons
+  must_never_do: Silently train on incident data outside its declared use policy
+- id: splendor.observability-exporter
+  name: Observability Exporter
+  plane: event_state_evidence
+  kind: exporter
+  status: proposed_vnext_contract
+  owns_exactly: Export selected metrics/traces/evidence without changing kernel truth
+  receives: Subscriptions and redaction/export policy
+  emits: External telemetry
+  must_never_do: Become the source of authority or expose secrets/protected payloads
