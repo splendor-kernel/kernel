@@ -1,0 +1,260 @@
+{
+  "schema_version": "splendor.architecture.dependency_policy.v1",
+  "repository": "splendor-kernel/kernel",
+  "purpose": "Machine-enforceable package dependency and change-impact policy for the Splendor agent kernel.",
+  "default_mode": "migration",
+  "internal_package_prefixes": ["splendor-", "@splendor/"],
+  "packages": {
+    "splendor-types": {
+      "tier": 0,
+      "role": "canonical_contracts",
+      "paths": ["crates/splendor-types"],
+      "required": true,
+      "allowed_internal_dependencies": [],
+      "allowed_internal_dev_dependencies": [],
+      "impact_facets": ["public_api", "wire_schema", "generated_surface"],
+      "forbidden_external_dependencies": [
+        "axum", "tokio", "rusqlite", "ureq", "reqwest", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"
+      ]
+    },
+    "splendor-store": {
+      "tier": 1,
+      "role": "persistence_only",
+      "paths": ["crates/splendor-store"],
+      "required": true,
+      "allowed_internal_dependencies": ["splendor-types"],
+      "allowed_internal_dev_dependencies": ["splendor-types"],
+      "impact_facets": ["persistence", "event_semantics"],
+      "forbidden_external_dependencies": ["axum", "ureq", "reqwest", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-authority": {
+      "tier": 2,
+      "role": "identity_authority_data_use_secrets",
+      "paths": ["crates/splendor-authority"],
+      "required": false,
+      "allowed_internal_dependencies": ["splendor-types", "splendor-store"],
+      "allowed_internal_dev_dependencies": ["splendor-types", "splendor-store"],
+      "impact_facets": ["authority", "data_feedback", "event_semantics"],
+      "forbidden_external_dependencies": ["axum", "ureq", "reqwest", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-artifacts": {
+      "tier": 3,
+      "role": "artifact_registry_and_lineage",
+      "paths": ["crates/splendor-artifacts"],
+      "required": false,
+      "allowed_internal_dependencies": ["splendor-types", "splendor-store", "splendor-authority"],
+      "allowed_internal_dev_dependencies": ["splendor-types", "splendor-store", "splendor-authority"],
+      "impact_facets": ["wire_schema", "persistence", "data_feedback", "change_deployment"],
+      "forbidden_external_dependencies": ["axum", "ureq", "reqwest", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-evidence": {
+      "tier": 3,
+      "role": "events_state_evidence_replay_export",
+      "paths": ["crates/splendor-evidence"],
+      "required": false,
+      "allowed_internal_dependencies": ["splendor-types", "splendor-store", "splendor-authority"],
+      "allowed_internal_dev_dependencies": ["splendor-types", "splendor-store", "splendor-authority"],
+      "impact_facets": ["persistence", "event_semantics", "generated_surface"],
+      "forbidden_external_dependencies": ["axum", "ureq", "reqwest", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-gateway": {
+      "tier": 4,
+      "role": "driver_registry_and_verified_invocation",
+      "paths": ["crates/splendor-gateway"],
+      "required": true,
+      "allowed_internal_dependencies": ["splendor-types", "splendor-authority", "splendor-artifacts", "splendor-evidence"],
+      "allowed_internal_dev_dependencies": ["splendor-types", "splendor-authority", "splendor-artifacts", "splendor-evidence"],
+      "impact_facets": ["authority", "side_effect", "event_semantics", "physical_safety"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-fabric": {
+      "tier": 5,
+      "role": "workloads_nodes_placement_leases_fencing",
+      "paths": ["crates/splendor-fabric"],
+      "required": false,
+      "allowed_internal_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway"
+      ],
+      "allowed_internal_dev_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway"
+      ],
+      "impact_facets": ["fabric", "event_semantics", "side_effect"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-agent": {
+      "tier": 6,
+      "role": "agent_instances_routes_world_state_messages_delegation",
+      "paths": ["crates/splendor-agent"],
+      "required": false,
+      "allowed_internal_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric"
+      ],
+      "allowed_internal_dev_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric"
+      ],
+      "impact_facets": ["agent_runtime", "event_semantics", "side_effect", "change_deployment"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-learning": {
+      "tier": 6,
+      "role": "collection_feedback_reward_eval_training_improvement_control",
+      "paths": ["crates/splendor-learning"],
+      "required": false,
+      "allowed_internal_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric"
+      ],
+      "allowed_internal_dev_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric"
+      ],
+      "impact_facets": ["data_feedback", "evaluation", "training", "research_claim"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-change": {
+      "tier": 7,
+      "role": "change_gates_deployment_rollback_incidents",
+      "paths": ["crates/splendor-change"],
+      "required": false,
+      "allowed_internal_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning"
+      ],
+      "allowed_internal_dev_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning"
+      ],
+      "impact_facets": ["change_deployment", "authority", "evaluation", "research_claim"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-kernel": {
+      "tier": 8,
+      "role": "composition_root_and_compatibility_facade",
+      "paths": ["crates/splendor-kernel"],
+      "required": true,
+      "allowed_internal_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change"
+      ],
+      "allowed_internal_dev_dependencies": [
+        "splendor-types", "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change",
+        "splendor-adapter-filesystem", "splendor-adapter-http", "splendor-adapter-robotics"
+      ],
+      "impact_facets": ["agent_runtime", "public_api", "event_semantics"],
+      "forbidden_external_dependencies": ["axum", "pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-daemon": {
+      "tier": 9,
+      "role": "authenticated_transport_and_process_composition",
+      "paths": ["crates/splendor-daemon"],
+      "required": true,
+      "allowed_internal_dependencies": ["splendor-kernel", "splendor-types"],
+      "allowed_internal_dev_dependencies": ["splendor-kernel", "splendor-types"],
+      "impact_facets": ["public_api", "generated_surface", "authority"],
+      "forbidden_external_dependencies": ["pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendorctl": {
+      "tier": 9,
+      "role": "operator_cli",
+      "paths": ["crates/splendorctl"],
+      "required": true,
+      "allowed_internal_dependencies": ["splendor-kernel", "splendor-types"],
+      "allowed_internal_dev_dependencies": ["splendor-kernel", "splendor-types"],
+      "impact_facets": ["public_api", "generated_surface"],
+      "forbidden_external_dependencies": ["pyo3", "kube", "bollard", "tch", "candle-core", "ort"]
+    },
+    "splendor-bindings": {
+      "tier": 9,
+      "role": "python_native_binding",
+      "paths": ["python/bindings"],
+      "required": true,
+      "allowed_internal_dependencies": ["splendor-kernel", "splendor-types"],
+      "allowed_internal_dev_dependencies": ["splendor-kernel", "splendor-types"],
+      "impact_facets": ["public_api", "generated_surface"],
+      "forbidden_external_dependencies": []
+    }
+  },
+  "package_patterns": [
+    {
+      "pattern": "splendor-adapter-*",
+      "role": "provider_driver",
+      "tier": 10,
+      "allowed_internal_dependencies": ["splendor-types", "splendor-gateway"],
+      "allowed_internal_dev_dependencies": ["splendor-types", "splendor-gateway", "splendor-store"],
+      "impact_facets": ["side_effect"],
+      "forbidden_internal_dependencies": [
+        "splendor-kernel", "splendor-daemon", "splendor-agent", "splendor-learning", "splendor-change"
+      ]
+    }
+  ],
+  "migration_exceptions": [
+    {
+      "source": "splendor-daemon",
+      "targets": ["splendor-gateway", "splendor-store"],
+      "scope": "Existing 0.1 daemon composition and handlers while application command/query facades are extracted.",
+      "reason": "Current daemon directly composes gateway and stores.",
+      "removal_condition": "Every endpoint calls a splendor-kernel application command/query and direct store/gateway imports disappear from handler modules.",
+      "expires_by": "vNext application-service extraction",
+      "allow_in_mode": ["migration"]
+    },
+    {
+      "source": "splendorctl",
+      "targets": ["splendor-gateway", "splendor-store", "splendor-adapter-filesystem", "splendor-adapter-http"],
+      "scope": "Existing embedded-local CLI composition only.",
+      "reason": "The current CLI constructs local adapters and stores for 0.1 workflows.",
+      "removal_condition": "Local composition is isolated behind an embedded-local module and all ordinary commands use public application APIs.",
+      "expires_by": "vNext CLI/application facade",
+      "allow_in_mode": ["migration"]
+    }
+  ],
+  "path_owners": [
+    {"pattern": "crates/splendor-types/**", "owner": "splendor-types"},
+    {"pattern": "crates/splendor-store/**", "owner": "splendor-store"},
+    {"pattern": "crates/splendor-authority/**", "owner": "splendor-authority"},
+    {"pattern": "crates/splendor-artifacts/**", "owner": "splendor-artifacts"},
+    {"pattern": "crates/splendor-evidence/**", "owner": "splendor-evidence"},
+    {"pattern": "crates/splendor-gateway/**", "owner": "splendor-gateway"},
+    {"pattern": "crates/splendor-fabric/**", "owner": "splendor-fabric"},
+    {"pattern": "crates/splendor-agent/**", "owner": "splendor-agent"},
+    {"pattern": "crates/splendor-learning/**", "owner": "splendor-learning"},
+    {"pattern": "crates/splendor-change/**", "owner": "splendor-change"},
+    {"pattern": "crates/splendor-kernel/**", "owner": "splendor-kernel"},
+    {"pattern": "crates/splendor-daemon/**", "owner": "splendor-daemon"},
+    {"pattern": "crates/splendorctl/**", "owner": "splendorctl"},
+    {"pattern": "adapters/**", "owner": "adapter"},
+    {"pattern": "python/bindings/**", "owner": "splendor-bindings"},
+    {"pattern": "python/splendor/**", "owner": "python-sdk"},
+    {"pattern": "typescript/packages/types/**", "owner": "typescript-types"},
+    {"pattern": "typescript/packages/client/**", "owner": "typescript-client"},
+    {"pattern": "openapi/**", "owner": "splendor-daemon"},
+    {"pattern": "conformance/**", "owner": "conformance"},
+    {"pattern": "docs/spec/**", "owner": "architecture-api"},
+    {"pattern": "examples/**", "owner": "examples"}
+  ],
+  "semantic_reverse_edges": {
+    "splendor-types": [
+      "splendor-store", "splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl", "splendor-bindings", "adapter", "python-sdk", "typescript-types", "typescript-client"
+    ],
+    "splendor-store": ["splendor-authority", "splendor-artifacts", "splendor-evidence", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl"],
+    "splendor-authority": ["splendor-artifacts", "splendor-evidence", "splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-daemon", "splendor-node"],
+    "splendor-artifacts": ["splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-node"],
+    "splendor-evidence": ["splendor-gateway", "splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl"],
+    "splendor-gateway": ["splendor-fabric", "splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl", "splendor-node", "adapter"],
+    "splendor-fabric": ["splendor-agent", "splendor-learning", "splendor-change", "splendor-kernel", "splendor-node"],
+    "splendor-agent": ["splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl"],
+    "splendor-learning": ["splendor-change", "splendor-kernel", "splendor-daemon", "splendorctl"],
+    "splendor-change": ["splendor-kernel", "splendor-daemon", "splendorctl"]
+  },
+  "facet_validation": {
+    "public_api": ["public-api-diff", "sdk-contract", "docs-examples"],
+    "wire_schema": ["cross-language-golden", "schema-generation", "compatibility-migration"],
+    "persistence": ["migration", "crash-recovery", "replay-state-roundtrip", "rollback"],
+    "event_semantics": ["event-order", "subscriber-contract", "replay", "observability"],
+    "authority": ["deny-uncertain", "revocation", "cache-degraded", "effect-path-negative"],
+    "side_effect": ["gateway-path", "driver-conformance", "cancel-timeout-retry", "replay-no-effect"],
+    "fabric": ["placement", "lease-fencing", "worker-loss", "checkpoint-restart", "inference-protection"],
+    "agent_runtime": ["instance-lifecycle", "route-typing", "world-state", "delegation", "upgrade-rollback"],
+    "data_feedback": ["data-use", "lineage", "feedback-provenance", "reward-derivation", "retention"],
+    "evaluation": ["protected-holdout", "contamination", "eval-reproducibility", "gate-integration"],
+    "training": ["candidate-only", "distributed-training", "global-progress", "checkpoint-lineage"],
+    "change_deployment": ["impact-requirements", "principal-separation", "shadow-canary", "rollback", "incident"],
+    "physical_safety": ["local-veto", "uncertainty-denial", "simulation", "disconnect", "hil-when-claimed"],
+    "generated_surface": ["regenerate-clean-tree", "python-typecheck", "typescript-typecheck", "openapi-contract"],
+    "research_claim": ["baseline", "ablation", "multiple-seeds", "independent-eval", "claim-limit-review"]
+  }
+}
