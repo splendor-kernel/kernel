@@ -47,7 +47,7 @@ LABEL org.opencontainers.image.title="Splendor Kernel" \
       org.opencontainers.image.version="${SPLENDOR_IMAGE_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
-      org.opencontainers.image.source="https://github.com/splendor-os/kernel" \
+      org.opencontainers.image.source="https://github.com/splendor-kernel/kernel" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 RUN apt-get update \

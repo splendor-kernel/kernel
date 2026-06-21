@@ -920,6 +920,6 @@ This protects the Splendor thesis: verified side effects, explicit state, ordere
 Use these as orientation references. The repository code and versioned specs remain the implementation source of truth.
 
 - Splendor website: https://splendor-os.org/
-- Kernel repository: https://github.com/splendor-os/kernel
-- Kernel DeepWiki: https://deepwiki.com/splendor-os/kernel
+- Kernel repository: https://github.com/splendor-kernel/kernel
+- Kernel DeepWiki: https://deepwiki.com/splendor-kernel/kernel
 - Splendor docs: https://docs.splendor-os.org/

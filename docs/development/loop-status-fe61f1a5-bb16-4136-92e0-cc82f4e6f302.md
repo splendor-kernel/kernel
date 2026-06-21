@@ -6,7 +6,7 @@
 - Master loop branch: `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`
 - Master loop worktree: `/Users/db/dev/Splendor Kernel-loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`
 - Base branch: latest `origin/dev` at loop creation (`e7d7ed3`)
-- Final integration PR: [#105](https://github.com/splendor-os/kernel/pull/105), source `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`, base `dev`
+- Final integration PR: [#105](https://github.com/splendor-kernel/kernel/pull/105), source `agent/loop-fe61f1a5-bb16-4136-92e0-cc82f4e6f302`, base `dev`
 
 ## Sprint scope
 
@@ -61,13 +61,13 @@
 
 | Issue | Sprint | Branch | Worktree | Status | PR | Validation | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| #28 | 0.05-S1 | `agent/28-0.05-S1` | `/Users/db/dev/Splendor Kernel-28-0.05-S1` | merged | [#99](https://github.com/splendor-os/kernel/pull/99) merged | `cargo test -p splendor-types`; code-review approve after fixes | Device profiles/capabilities foundation; physical capability validation integrated with node registration. |
-| #29 | 0.05-S2 | `agent/29-0.05-S2` | `/Users/db/dev/Splendor Kernel-29-0.05-S2` | merged | [#101](https://github.com/splendor-os/kernel/pull/101) merged | `cargo test -p splendor-kernel policy_cache`; `cargo test -p splendor-types policy_distribution`; daemon policy tests; code-review approve after fixes | Offline policy cache/degraded mode; expired policy fails closed and connectivity transitions trace. |
-| #30 | 0.05-S3 | `agent/30-0.05-S3` | `/Users/db/dev/Splendor Kernel-30-0.05-S3` | merged | [#100](https://github.com/splendor-os/kernel/pull/100) merged | `cargo test -p splendor-store trace_sync`; `cargo test -p splendor-kernel trace_durability`; `cargo test -p splendor-store`; code-review approve after fixes | Local trace buffer/reconnect sync; canonical trace events, durability monitor, replay-visible offline boundaries. |
-| #31 | 0.05-S4 | `agent/31-0.05-S4` | `/Users/db/dev/Splendor Kernel-31-0.05-S4` | merged | [#102](https://github.com/splendor-os/kernel/pull/102) merged | `cargo test -p splendor-adapter-robotics`; `cargo test -p splendor-gateway`; code-review approve | Robotics adapter interface and simulated adapter behind gateway/safety verifier. |
-| #32 | 0.05-S5 | `agent/32-0.05-S5` | `/Users/db/dev/Splendor Kernel-32-0.05-S5` | merged | [#98](https://github.com/splendor-os/kernel/pull/98) merged | `cargo test -p splendor-gateway`; code-review approve | Safety verifier API integrated into existing gateway chain. |
-| #33 | 0.05-S6 | `agent/33-0.05-S6` | `/Users/db/dev/Splendor Kernel-33-0.05-S6` | merged | [#103](https://github.com/splendor-os/kernel/pull/103) merged | `cargo test -p splendor-types cloud_helper`; `cargo test -p splendor-types work_order`; `cargo test -p splendor-kernel cloud_helper`; code-review approve after fixes | Cloud helper advisory pattern; canonical work-order path rejects helper actuator authority. |
-| #34 | 0.05-S7 | `agent/34-0.05-S7` | `/Users/db/dev/Splendor Kernel-34-0.05-S7` | merged | [#104](https://github.com/splendor-os/kernel/pull/104) merged | `cargo test -p splendor-kernel physical_harness --no-default-features`; `cargo test -p splendor-kernel --no-default-features`; code-review approve after fixes | Final physical simulation harness across 0.05 primitives. |
+| #28 | 0.05-S1 | `agent/28-0.05-S1` | `/Users/db/dev/Splendor Kernel-28-0.05-S1` | merged | [#99](https://github.com/splendor-kernel/kernel/pull/99) merged | `cargo test -p splendor-types`; code-review approve after fixes | Device profiles/capabilities foundation; physical capability validation integrated with node registration. |
+| #29 | 0.05-S2 | `agent/29-0.05-S2` | `/Users/db/dev/Splendor Kernel-29-0.05-S2` | merged | [#101](https://github.com/splendor-kernel/kernel/pull/101) merged | `cargo test -p splendor-kernel policy_cache`; `cargo test -p splendor-types policy_distribution`; daemon policy tests; code-review approve after fixes | Offline policy cache/degraded mode; expired policy fails closed and connectivity transitions trace. |
+| #30 | 0.05-S3 | `agent/30-0.05-S3` | `/Users/db/dev/Splendor Kernel-30-0.05-S3` | merged | [#100](https://github.com/splendor-kernel/kernel/pull/100) merged | `cargo test -p splendor-store trace_sync`; `cargo test -p splendor-kernel trace_durability`; `cargo test -p splendor-store`; code-review approve after fixes | Local trace buffer/reconnect sync; canonical trace events, durability monitor, replay-visible offline boundaries. |
+| #31 | 0.05-S4 | `agent/31-0.05-S4` | `/Users/db/dev/Splendor Kernel-31-0.05-S4` | merged | [#102](https://github.com/splendor-kernel/kernel/pull/102) merged | `cargo test -p splendor-adapter-robotics`; `cargo test -p splendor-gateway`; code-review approve | Robotics adapter interface and simulated adapter behind gateway/safety verifier. |
+| #32 | 0.05-S5 | `agent/32-0.05-S5` | `/Users/db/dev/Splendor Kernel-32-0.05-S5` | merged | [#98](https://github.com/splendor-kernel/kernel/pull/98) merged | `cargo test -p splendor-gateway`; code-review approve | Safety verifier API integrated into existing gateway chain. |
+| #33 | 0.05-S6 | `agent/33-0.05-S6` | `/Users/db/dev/Splendor Kernel-33-0.05-S6` | merged | [#103](https://github.com/splendor-kernel/kernel/pull/103) merged | `cargo test -p splendor-types cloud_helper`; `cargo test -p splendor-types work_order`; `cargo test -p splendor-kernel cloud_helper`; code-review approve after fixes | Cloud helper advisory pattern; canonical work-order path rejects helper actuator authority. |
+| #34 | 0.05-S7 | `agent/34-0.05-S7` | `/Users/db/dev/Splendor Kernel-34-0.05-S7` | merged | [#104](https://github.com/splendor-kernel/kernel/pull/104) merged | `cargo test -p splendor-kernel physical_harness --no-default-features`; `cargo test -p splendor-kernel --no-default-features`; code-review approve after fixes | Final physical simulation harness across 0.05 primitives. |
 
 ## QA findings
 
@@ -102,4 +102,4 @@
 
 ## Final PR readiness
 
-- Final integration PR opened: [#105](https://github.com/splendor-os/kernel/pull/105).
+- Final integration PR opened: [#105](https://github.com/splendor-kernel/kernel/pull/105).
