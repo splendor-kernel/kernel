@@ -117,7 +117,7 @@ Issue links use GitHub's current canonical repository URL for this repository.
 - [#137](https://github.com/splendor-kernel/kernel/issues/137) — Plan machine-enforced architecture ownership and dependency policy.
 - [#138](https://github.com/splendor-kernel/kernel/issues/138) — Triage v2 gold examples into 0.1 conformance and post-0.1 suites.
 - [#139](https://github.com/splendor-kernel/kernel/issues/139) — Plan idempotent service/API semantics for vNext without daemon drift.
-- [#140](https://github.com/splendor-kernel/kernel/issues/140) — Epic: vNext identity, authority, data-use, and secrets plane.
+- [#140](https://github.com/splendor-kernel/kernel/issues/140) — Epic: vNext identity, authority, data-use, and secrets plane; see draft [`RFC 0008`](../../rfc/0008-vnext-identity-authority-data-use-secrets-plane.md).
 - [#141](https://github.com/splendor-kernel/kernel/issues/141) — Epic: vNext event, state, evidence, replay, and observability plane.
 - [#142](https://github.com/splendor-kernel/kernel/issues/142) — Epic: vNext workload fabric, node, fleet, lease, and scheduler plane.
 - [#143](https://github.com/splendor-kernel/kernel/issues/143) — Epic: vNext driver registry, gateway, and driver profiles.

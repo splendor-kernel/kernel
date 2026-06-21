@@ -84,3 +84,6 @@
   evidence service, learning-control plane, and self-management lifecycle remain
   future planning surfaces. They are not current production capabilities or
   conformance evidence.
+- `docs/rfc/0008-vnext-identity-authority-data-use-secrets-plane.md` is a draft
+  post-0.1 planning RFC for issue #140. It does not implement principal registry,
+  authority decision, secret broker, or data-use controller behavior.
