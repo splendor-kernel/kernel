@@ -71,3 +71,16 @@
 - The current daemon can carry API version metadata, but it does not actively
   negotiate API versions or reject unsupported version headers. Treat this as a
   documented limitation, not a production protocol guarantee.
+
+## Agent-kernel v2 planning import
+
+- `docs/planning/agent-kernel-v2/` contains imported vNext planning material for
+  a broader post-0.1 agent-kernel direction.
+- That planning material is non-normative until specific RFCs are accepted and
+  implemented. It does not replace the stable 0.1 primitive specs, current
+  `docs/rules/*` roadmap, Action Gateway contract, state/trace/replay
+  invariants, or physical/edge safety boundaries.
+- Proposed concepts such as a universal driver gateway, workload fabric,
+  evidence service, learning-control plane, and self-management lifecycle remain
+  future planning surfaces. They are not current production capabilities or
+  conformance evidence.

@@ -108,6 +108,11 @@ Planned beyond 0.1-dev:
 1. Production remote auth rollout, fleet scheduling, adapter certification
    workflow, and physical hardware claims only when future milestones implement
    and validate those surfaces explicitly.
+2. Post-0.1 vNext planning is captured in
+   [`docs/planning/agent-kernel-v2/`](docs/planning/agent-kernel-v2/) and
+   [`docs/rfc/0006-agent-kernel-v2-lifecycle.md`](docs/rfc/0006-agent-kernel-v2-lifecycle.md).
+   These documents are planning references only; they do not upgrade current
+   implementation or stable 0.1 capability claims.
 
 ## Why
 
