@@ -34,20 +34,20 @@ After the GitHub Container Registry package is public, install the released imag
 with Docker. Published release images support `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull ghcr.io/splendor-os/kernel:0.05-dev
+docker pull ghcr.io/splendor-kernel/kernel:0.05-dev
 ```
 
 Branch images are also published for integration smoke tests:
 
 ```bash
-docker pull ghcr.io/splendor-os/kernel:dev
-docker pull ghcr.io/splendor-os/kernel:main
+docker pull ghcr.io/splendor-kernel/kernel:dev
+docker pull ghcr.io/splendor-kernel/kernel:main
 ```
 
 ## Verify the installation
 
 ```bash
-docker run --rm ghcr.io/splendor-os/kernel:0.05-dev
+docker run --rm ghcr.io/splendor-kernel/kernel:0.05-dev
 ```
 
 Expected shape:
@@ -60,7 +60,7 @@ The default command is `splendorctl --version`. You can pass any `splendorctl`
 command after the image name:
 
 ```bash
-docker run --rm ghcr.io/splendor-os/kernel:0.05-dev \
+docker run --rm ghcr.io/splendor-kernel/kernel:0.05-dev \
   splendorctl run --config ./examples/local-basic-loop/config.yaml --cycles 1
 ```
 
@@ -71,7 +71,7 @@ against your own config:
 docker run --rm \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/splendor-os/kernel:0.05-dev \
+  ghcr.io/splendor-kernel/kernel:0.05-dev \
   splendorctl run --config ./splendor-run.yaml --cycles 1
 ```
 
@@ -105,9 +105,9 @@ bash scripts/container-tests.sh
 
 The Docker publish workflow emits:
 
-- `ghcr.io/splendor-os/kernel:dev` from the `dev` branch;
-- `ghcr.io/splendor-os/kernel:main` from the `main` branch;
-- `ghcr.io/splendor-os/kernel:0.05-dev` and the Git tag name when a `v0.05*`
+- `ghcr.io/splendor-kernel/kernel:dev` from the `dev` branch;
+- `ghcr.io/splendor-kernel/kernel:main` from the `main` branch;
+- `ghcr.io/splendor-kernel/kernel:0.05-dev` and the Git tag name when a `v0.05*`
   release tag is pushed;
 - `sha-<commit>` for immutable commit-addressed pulls.
 
@@ -129,7 +129,7 @@ The publish workflow builds and pushes with GitHub's default `GITHUB_TOKEN`, but
 package visibility changes require package-admin authority that the default token
 does not have. For first-time public installs, a release administrator must either:
 
-- set `ghcr.io/splendor-os/kernel` to public in GitHub's package settings; or
+- set `ghcr.io/splendor-kernel/kernel` to public in GitHub's package settings; or
 - configure a `GHCR_VISIBILITY_TOKEN` repository/organization secret from a
   package admin with package read/write authority so the workflow can make the
   package public after publishing.

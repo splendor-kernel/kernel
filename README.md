@@ -1,6 +1,6 @@
 # Splendor Kernel
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/splendor-os/kernel)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/splendor-kernel/kernel)
 
 **An AI Kernel for Self-Managed Neuro-Symbolic Agents**
 
@@ -78,8 +78,8 @@ Once the GitHub Container Registry package is public, install and verify the
 `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull ghcr.io/splendor-os/kernel:0.05-dev
-docker run --rm ghcr.io/splendor-os/kernel:0.05-dev
+docker pull ghcr.io/splendor-kernel/kernel:0.05-dev
+docker run --rm ghcr.io/splendor-kernel/kernel:0.05-dev
 ```
 
 Expected shape:
