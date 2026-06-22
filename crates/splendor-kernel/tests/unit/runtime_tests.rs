@@ -1,5 +1,5 @@
 use super::*;
-use splendor_store::{InMemoryTraceStore, TraceStore};
+use splendor_store::{InMemoryTraceStore, TraceStore, TraceStoreError};
 use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
     StateReferenceMode, TenantId,
@@ -17,6 +17,45 @@ impl TraceSink for CapturingSink {
         self.events.lock().expect("events lock").push(event.clone());
         Ok(())
     }
+}
+
+#[derive(Clone, Default)]
+struct ControlledSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+    fail_next: Arc<Mutex<bool>>,
+}
+
+impl ControlledSink {
+    fn fail_next_record(&self) {
+        *self.fail_next.lock().expect("fail_next lock") = true;
+    }
+
+    fn recorded_events(&self) -> Vec<TraceEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+}
+
+impl TraceSink for ControlledSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), TraceError> {
+        let mut fail_next = self.fail_next.lock().expect("fail_next lock");
+        if *fail_next {
+            *fail_next = false;
+            return Err(TraceError::Store(TraceStoreError::Poisoned));
+        }
+        drop(fail_next);
+
+        self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
+fn runtime_prev_event_hash(runtime: &KernelRuntime) -> Option<ContentHash> {
+    runtime
+        .trace_cursor
+        .lock()
+        .expect("trace cursor lock")
+        .prev_event_hash
+        .clone()
 }
 
 #[test]
@@ -98,6 +137,106 @@ fn runtime_rejects_mismatched_trace_identity_before_persistence() {
     assert_eq!(runtime.run_id(), &run_id);
     assert_eq!(runtime.next_sequence(), 0);
     assert!(events.lock().expect("events lock").is_empty());
+}
+
+#[test]
+fn trace_sink_failure_does_not_advance_cursor_or_skip_sequence() {
+    let sink = ControlledSink::default();
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+
+    sink.fail_next_record();
+    let error = runtime
+        .record_event(TraceEventKind::PolicyInvoked {
+            policy: "transient".to_string(),
+        })
+        .expect_err("forced persistence failure");
+
+    assert!(matches!(
+        error,
+        TraceError::Store(TraceStoreError::Poisoned)
+    ));
+    assert_eq!(runtime.next_sequence(), 0);
+    assert!(runtime_prev_event_hash(&runtime).is_none());
+    assert!(sink.recorded_events().is_empty());
+
+    let recovered = runtime
+        .record_event(TraceEventKind::PolicyInvoked {
+            policy: "recovered".to_string(),
+        })
+        .expect("record after failure");
+
+    assert_eq!(recovered.sequence, 0);
+    assert_eq!(runtime.next_sequence(), 1);
+    let recorded = sink.recorded_events();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].sequence, 0);
+}
+
+#[test]
+fn trace_sink_failure_preserves_integrity_cursor_for_recovered_completion() {
+    let sink = ControlledSink::default();
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+
+    let first = runtime
+        .record_event(TraceEventKind::PolicyInvoked {
+            policy: "first".to_string(),
+        })
+        .expect("first persisted event");
+    assert_eq!(first.sequence, 0);
+    let first_hash = runtime_prev_event_hash(&runtime).expect("first event hash");
+
+    sink.fail_next_record();
+    let error = runtime
+        .record_event(TraceEventKind::PolicyCompleted {
+            policy: "failed".to_string(),
+        })
+        .expect_err("forced persistence failure");
+    assert!(matches!(
+        error,
+        TraceError::Store(TraceStoreError::Poisoned)
+    ));
+    assert_eq!(runtime.next_sequence(), 1);
+    assert_eq!(runtime_prev_event_hash(&runtime), Some(first_hash.clone()));
+    assert_eq!(sink.recorded_events().len(), 1);
+
+    let completed = runtime
+        .record_event(TraceEventKind::LoopTickCompleted {
+            tick_id: 7,
+            integrity: None,
+        })
+        .expect("completion after failure");
+    assert_eq!(completed.sequence, 1);
+    let expected_completed_hash =
+        compute_event_hash(Some(&first_hash), &completed).expect("completion hash");
+    if let TraceEventKind::LoopTickCompleted {
+        integrity: Some(integrity),
+        ..
+    } = &completed.kind
+    {
+        assert_eq!(integrity.prev_event_hash.as_ref(), Some(&first_hash));
+        assert_eq!(integrity.event_hash, expected_completed_hash);
+    } else {
+        panic!("missing completion integrity");
+    }
+    assert_eq!(
+        runtime_prev_event_hash(&runtime),
+        Some(expected_completed_hash)
+    );
+
+    let recorded = sink.recorded_events();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].sequence, 0);
+    assert_eq!(recorded[1].sequence, 1);
+    assert!(matches!(
+        recorded[1].kind,
+        TraceEventKind::LoopTickCompleted { .. }
+    ));
 }
 
 #[test]
