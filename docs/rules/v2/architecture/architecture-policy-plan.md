@@ -131,6 +131,28 @@ the policy file location, schema, exception owners, and rollout mode.
 | Does not classify every docs-only rule-pack change as production impact | Docs-only changes remain non-runtime unless they change accepted rules/specs |
 | Does not replace RFC, security review, or release compatibility review | Policy checks are a lower bound, not the whole review process |
 
+## Current FND-002 Baseline Guard
+
+The repository currently wires a bounded smoke guard at
+`scripts/architecture/check-dependency-policy.py` and CI runs it in the Rust job.
+This implemented guard is narrower than the proposed future architecture-policy
+check above:
+
+- it reads Cargo metadata, checks direct non-dev Rust workspace dependency
+  allowlists for the current 0.1 crates/adapters only, and checks all direct
+  internal Rust workspace dependency edges for cycles;
+- it rejects internal dependency cycles and obvious wrong-direction/provider
+  non-dev edges, such as an adapter depending on `splendor-kernel` or
+  `splendor-types` depending on `splendor-store`;
+- it preserves documented migration seams for `splendor-daemon`, `splendorctl`,
+  and `splendor-bindings`;
+- it does not enforce `dependency_policy.proposed.json`, does not require
+  proposed v2 plane crates to exist, and does not prove full FND-002 completion.
+
+Treat failures from this script as current-baseline architecture regressions.
+Treat passing output as only lower-bound evidence that the existing Rust package
+graph has not drifted in the checked direction.
+
 ## Duplicate Mutation-Owner Prohibition
 
 One privileged mutation must have exactly one owner. This rule applies to current
