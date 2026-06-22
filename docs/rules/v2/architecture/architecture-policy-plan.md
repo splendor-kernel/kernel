@@ -1,9 +1,9 @@
 # Architecture Policy Plan for Issue #137
 
-> **Status:** Non-normative planning proposal for issue #137. This document does
-> not change the stable Splendor 0.1 implementation contract, does not make
-> `imported/architecture/dependency_policy.proposed.json` active policy, and does
-> not claim that v2 package ownership is implemented.
+> **Status:** Active 0.2/v2 architecture-policy planning rule for issue #137.
+> This document does not change the stable Splendor 0.1 baseline, does not make
+> `catalog/architecture/dependency_policy.proposed.json` active CI policy, and
+> does not claim that v2 package ownership is implemented.
 
 ## Issue And Fit
 
@@ -11,17 +11,17 @@
 | --- | --- |
 | Issue | [#137 Plan machine-enforced architecture ownership and dependency policy](https://github.com/splendor-kernel/kernel/issues/137) |
 | Parent | [#135 Epic: Align v2 agent-kernel catalog with current Splendor roadmap](https://github.com/splendor-kernel/kernel/issues/135) |
-| Milestone | `Splendor0.1-dev` planning and post-0.1 RFC preparation |
+| Milestone | `Splendor0.2-dev` / v2 active execution with 0.1 baseline compatibility |
 | Primary sprint fit | `0.1-S2 - Compatibility test suite` |
 | Primary FR fit | `FR-0.1-05`, `FR-0.1-08` |
 | Related downstream fit | `FR-0.1-03` for runtime compatibility, `FR-0.1-06` for migration policy |
 | Primitives strengthened | docs/tests planning for gateway, verifier, state graph, trace store, replay, messages, work orders, SDK/API compatibility |
 | Boundary | docs only |
 
-This plan proposes how to turn the imported vNext architecture material into a
-bounded future architecture policy. It preserves the current authoritative order:
-`AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, release notes, accepted RFCs,
-then planning documents.
+This plan turns the v2 architecture material into bounded 0.2 architecture
+policy work. It preserves the current authoritative order: `AGENTS.md`, core
+`docs/rules/*` safety documents, 0.1 stable specs, release notes, accepted RFCs,
+then this v2 rule pack for active decomposition.
 
 ## Source Inputs
 
@@ -32,10 +32,10 @@ then planning documents.
 | `docs/rules/sprints_frs_milestones.md` | 0.1 milestone and FR fit, no cross-milestone leakage |
 | `docs/rules/verifiable_criteria/sprints/0.1-S2-compatibility-test-suite.md` | Conformance-suite scope and non-goals |
 | `docs/spec/0.1/conformance.md` | Stable 0.1 conformance categories and fixture boundary |
-| `docs/planning/agent-kernel-v2/README.md` | Planning-only status for imported vNext material |
-| `docs/planning/agent-kernel-v2/imported/16_clean_architecture_rules.md` | Proposed vNext ownership, dependency order, mutation-owner rules, enforcement ideas |
-| `docs/planning/agent-kernel-v2/imported/architecture/components.yaml` | Proposed vNext component owners and must-never-do clauses |
-| `docs/planning/agent-kernel-v2/imported/architecture/dependency_policy.proposed.json` | Proposed machine-readable policy shape, migration exceptions, path owners, facets |
+| `docs/rules/v2/README.md` | Active 0.2/v2 rule-pack entrypoint and evidence boundary |
+| `docs/rules/v2/architecture/clean-architecture-rules.md` | v2 ownership, dependency order, mutation-owner rules, enforcement ideas |
+| `docs/rules/v2/catalog/architecture/components.yaml` | v2 component owners and must-never-do clauses |
+| `docs/rules/v2/catalog/architecture/dependency_policy.proposed.json` | Proposed machine-readable policy shape, migration exceptions, path owners, facets |
 | Root `Cargo.toml`, `package.json`, and `python/pyproject.toml` | Current package/workspace evidence |
 
 ## Non-Goals
@@ -43,9 +43,9 @@ then planning documents.
 - No Rust, Python, TypeScript, OpenAPI, conformance, or CI behavior changes.
 - No crate moves, package splits, generated-contract changes, or broad refactor.
 - No enforcement of `dependency_policy.proposed.json` as CI or accepted policy.
-- No normative changes under `docs/rules/*` or `docs/spec/0.1/*`.
+- No runtime behavior change, schema change, or CI enforcement from this docs-only move.
 - No replacement of the current Action Gateway, verifier chain, state graph, trace store, replay, work-order, or identity invariants.
-- No claim that proposed vNext packages such as `splendor-authority`, `splendor-evidence`, `splendor-fabric`, `splendor-agent`, `splendor-learning`, or `splendor-change` exist today.
+- No claim that proposed 0.2/v2 packages such as `splendor-authority`, `splendor-evidence`, `splendor-fabric`, `splendor-agent`, `splendor-learning`, or `splendor-change` exist today.
 - No certification, marketplace, product UI, full fleet scheduler, full workflow engine, or physical production safety claim.
 
 ## Current Package Ownership Vs Proposed V2 Ownership
@@ -63,12 +63,12 @@ and is RFC-required before implementation.
 | `crates/splendor-daemon` | Runtime daemon API and process composition boundary | `AGENTS.md` daemon/API guidance; current daemon depends on kernel, gateway, store, types | Authenticated transport translation, API versioning, process composition | Direct store/gateway dependency is migration debt only; new handlers must call one public application command/query and must not own mutations |
 | `crates/splendorctl` | CLI workflows for run execution, trace export, replay, and local embedded ergonomics | `AGENTS.md`; current CLI depends on kernel, gateway, store, types, filesystem adapter, HTTP adapter | Operator/developer client over public command/query routes; embedded-local composition isolated explicitly | Direct store/gateway/adapter construction is an exception only for existing embedded-local mode; ordinary operator paths must not become backdoors |
 | `adapters/filesystem`, `adapters/http`, `adapters/robotics` | Gated adapter implementations that execute only after gateway verification | `AGENTS.md`; adapter crates depend inward on `splendor-gateway` and `splendor-types` | Concrete provider or driver implementations under the driver boundary | Adapter changes that add operation classes, effect semantics, secrets, physical actions, or maturity claims require RFC or accepted adapter contract changes |
-| `python/bindings` | Rust/Python boundary | `AGENTS.md`; current Cargo member `splendor-bindings` depends on `splendor-kernel` | Thin native boundary over canonical Rust contracts | Any Python binding that exposes new vNext authority, workload, gateway, state, or replay semantics requires SDK/API RFC and parity tests |
+| `python/bindings` | Rust/Python boundary | `AGENTS.md`; current Cargo member `splendor-bindings` depends on `splendor-kernel` | Thin native boundary over canonical Rust contracts | Any Python binding that exposes new 0.2/v2 authority, workload, gateway, state, or replay semantics requires SDK/API RFC and parity tests |
 | `python/splendor` | Python SDK callbacks and local ergonomics; Python proposes but Rust enforces | `AGENTS.md`; `python/pyproject.toml` package `splendor` | Generated or schema-aligned authoring and client ergonomics | SDK must not implement independent kernel semantics, privileged side effects, or direct adapter execution; migration waits for generated contract plan |
 | `typescript/packages/types` | Schema-aligned TypeScript contracts | `AGENTS.md`; `@splendor/types` package manifest | Generated TypeScript contracts from canonical schemas | Generation and compatibility must be accepted before making this an architecture check; no runtime behavior belongs here |
 | `typescript/packages/client` | Thin daemon/control client | `AGENTS.md`; `@splendor/client` depends on `@splendor/types` | Thin daemon/control client over authenticated APIs | Client must not implement verifier, gateway, store, replay, or state-machine behavior; daemon API breaking changes require RFC |
 | `conformance/0.1` and `docs/spec/0.1/conformance.md` | Stable primitive fixture evidence for 0.1 compatibility | `0.1-S2` criteria and conformance spec | Architecture check evidence can feed conformance reports later | Static architecture checks are not a substitute for positive, denial, failure, trace, state, replay, and fail-closed conformance cases |
-| `docs/planning/agent-kernel-v2/imported/*` | Non-normative vNext planning source material | Planning README says imported policy is not active CI policy or implementation evidence | Candidate source for future RFCs | Imported files remain planning-only until accepted and implemented by RFC |
+| `docs/rules/v2/*` | Active 0.2/v2 rule pack | `docs/rules/v2/README.md` says v2 rules guide decomposition but are not implementation evidence | Source for 0.2 assignments and RFCs | Runtime behavior still requires accepted RFCs where needed, code, tests, docs, and validation evidence |
 
 ## Proposed Package Splits And RFC Boundary
 
@@ -122,13 +122,13 @@ the policy file location, schema, exception owners, and rollout mode.
 
 | Non-check | Reason |
 | --- | --- |
-| Does not enforce `dependency_policy.proposed.json` as current CI policy | The imported file is planning-only until RFC acceptance |
+| Does not enforce `dependency_policy.proposed.json` as current CI policy | The proposed policy file is not active CI until RFC acceptance |
 | Does not require proposed v2 crates to exist | Missing proposed crates are not failures before package-split RFCs |
 | Does not prove runtime correctness | Static checks cannot replace conformance tests for gateway, trace, state, replay, messages, work orders, governance, and adapters |
 | Does not certify adapters or physical systems | Adapter maturity and physical safety need separate conformance and safety evidence |
 | Does not infer semantic ownership from folder names alone | Ownership must come from accepted path and mutation-owner registries |
 | Does not ban existing scoped migration debt | Temporary exceptions are allowed only when named, owned, scoped, and exit-bound |
-| Does not classify every docs-only planning change as production impact | Planning docs remain non-normative unless they change accepted rules/specs |
+| Does not classify every docs-only rule-pack change as production impact | Docs-only changes remain non-runtime unless they change accepted rules/specs |
 | Does not replace RFC, security review, or release compatibility review | Policy checks are a lower bound, not the whole review process |
 
 ## Duplicate Mutation-Owner Prohibition

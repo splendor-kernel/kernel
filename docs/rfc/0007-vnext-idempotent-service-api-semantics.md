@@ -11,7 +11,7 @@ behavior, trace formats, state formats, or replay semantics.
 
 Milestone and sprint alignment:
 
-- Milestone: `Splendor0.1-dev` / post-0.1 API RFC preparation.
+- Milestone: `Splendor0.2-dev` / v2 API RFC preparation with 0.1 baseline compatibility.
 - Sprint: `0.1-S4 - SDK and API stabilization`.
 - FRs: `FR-0.1-03`, `FR-0.1-04`, `FR-0.1-08`; related `FR-0.02-S0-01` through `FR-0.02-S0-11`.
 - vNext planning refs: `FND-004`, `FND-010`, `AR-020`, `AR-080`, `AR-082`.

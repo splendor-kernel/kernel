@@ -1,10 +1,10 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 task index. This file indexes the 0.2/v2 catalog of record after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
 # Splendor Agent Kernel — Implementation Task Index
 
 **381 tasks:** 12 foundations, 350 component tasks, and 19 integration/research/operations programs.
 
-The complete requirements, anti-drift boundaries, integrations, and validation criteria are in `14_complete_implementation_task_catalog.md`.
+The complete requirements, anti-drift boundaries, integrations, and validation criteria are in `complete_implementation_task_catalog.md`.
 
 ## Cross-cutting foundations
 
@@ -663,4 +663,5 @@ The complete requirements, anti-drift boundaries, integrations, and validation c
 | 18 | `OPS-001` | Harden the complete system for production security, reliability, and supply chain | `FND-011`, `INT-003`, `INT-010`, `INC-009` |
 | 19 | `OPS-002` | Replace conceptual documentation with versioned implementer specifications and gold paths | `INT-009`, `INT-010`, `NOV-006`, `FND-006` |
 
-Catalog validator: **PASS**.
+Source-pack catalog validator: **PASS** at import time only. This is not active
+repository CI evidence and does not prove that any 0.2/v2 task is implemented.

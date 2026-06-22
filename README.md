@@ -103,16 +103,15 @@ notes.
 
 ## Next steps
 
-Planned beyond 0.1-dev:
+Current baseline and active work:
 
-1. Production remote auth rollout, fleet scheduling, adapter certification
-   workflow, and physical hardware claims only when future milestones implement
-   and validate those surfaces explicitly.
-2. Post-0.1 vNext planning is captured in
-   [`docs/planning/agent-kernel-v2/`](docs/planning/agent-kernel-v2/) and
-   [`docs/rfc/0006-agent-kernel-v2-lifecycle.md`](docs/rfc/0006-agent-kernel-v2-lifecycle.md).
-   These documents are planning references only; they do not upgrade current
-   implementation or stable 0.1 capability claims.
+1. 0.1 is the implemented/stable primitive baseline.
+2. 0.2/v2 active execution rules are captured in
+   [`docs/rules/v2/`](docs/rules/v2/) and linked from
+   [`docs/rules/sprints_frs_milestones.md`](docs/rules/sprints_frs_milestones.md).
+3. Production remote auth rollout, fleet scheduling, adapter certification
+   workflow, and physical hardware claims require sprint evidence before they can
+   be claimed as implemented capabilities.
 
 ## Why
 

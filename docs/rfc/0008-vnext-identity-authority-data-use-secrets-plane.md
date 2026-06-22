@@ -4,7 +4,7 @@
 
 Status: Draft.
 
-Scope: post-0.1 planning proposal for GitHub issue #140. This RFC is
+Scope: 0.2/v2 draft proposal for GitHub issue #140. This RFC is
 non-normative until accepted and implemented. It does not change current daemon
 behavior, stable 0.1 specs, OpenAPI schemas, SDKs, generated artifacts, Action
 Gateway behavior, verifier behavior, trace formats, state formats, replay
@@ -18,7 +18,7 @@ Milestone and sprint tie-ins:
 
 | Area | Tie-in |
 | --- | --- |
-| Milestone fit | Post-0.1 RFC and planning work before implementation. |
+| Milestone fit | 0.2/v2 RFC-bound work before implementation. |
 | Related sprint | `0.02-S0 - Daemon Security Boundary`. |
 | Related sprint | `0.03-S1 - Distributed identity model`. |
 | Related sprint | `0.03-S3 - Signed work orders`. |
@@ -35,12 +35,12 @@ Source material:
 - `docs/rules/verifiable_criteria/sprints/0.03-S1-distributed-identity-model.md`
 - `docs/rules/verifiable_criteria/sprints/0.03-S3-signed-work-orders.md`
 - `docs/rules/verifiable_criteria/sprints/0.04-S5-central-policy-distribution.md`
-- `docs/planning/agent-kernel-v2/README.md`
-- `docs/planning/agent-kernel-v2/0.1-vnext-schema-identity-map.md`
-- `docs/planning/agent-kernel-v2/imported/00_architecture.md`
-- `docs/planning/agent-kernel-v2/imported/14_complete_implementation_task_catalog.md`
-- `docs/planning/agent-kernel-v2/imported/15_implementation_task_index.md`
-- `docs/planning/agent-kernel-v2/imported/16_clean_architecture_rules.md`
+- `docs/rules/v2/README.md`
+- `docs/rules/v2/architecture/schema-identity-map.md`
+- `docs/rules/v2/architecture/architecture.md`
+- `docs/rules/v2/catalog/complete_implementation_task_catalog.md`
+- `docs/rules/v2/catalog/implementation_task_index.md`
+- `docs/rules/v2/architecture/clean-architecture-rules.md`
 - `docs/rfc/0006-agent-kernel-v2-lifecycle.md`
 - `docs/rfc/0007-vnext-idempotent-service-api-semantics.md`
 - `docs/releases/known-limitations.md`
@@ -269,7 +269,7 @@ Proposed title: `RFC: vNext principal registry without identity-authority collap
 
 Issue link: `[#152](https://github.com/splendor-kernel/kernel/issues/152)`.
 
-Milestone fit: post-0.1 RFC first; implementation only after accepted RFC. Related
+Milestone fit: 0.2/v2 RFC first; implementation only after accepted RFC. Related
 criteria: `0.02-S0`, `0.03-S1`, `0.03-S3`.
 
 FR/tie-ins:
@@ -336,7 +336,7 @@ Proposed title: `RFC: vNext authority decisions, work-order compatibility, and d
 
 Issue link: `[#153](https://github.com/splendor-kernel/kernel/issues/153)`.
 
-Milestone fit: post-0.1 RFC first; implementation only after accepted RFC. Related
+Milestone fit: 0.2/v2 RFC first; implementation only after accepted RFC. Related
 criteria: `0.02-S0`, `0.03-S3`, `0.04-S5`.
 
 FR/tie-ins:
@@ -406,7 +406,7 @@ Proposed title: `RFC: vNext secret broker with refs, leases, scoped delivery, an
 
 Issue link: `[#154](https://github.com/splendor-kernel/kernel/issues/154)`.
 
-Milestone fit: post-0.1 RFC first; implementation only after accepted RFC.
+Milestone fit: 0.2/v2 RFC first; implementation only after accepted RFC.
 Related criteria: `0.02-S0`, `0.03-S3`, `0.04-S5`.
 
 FR/tie-ins:
@@ -475,7 +475,7 @@ Proposed title: `RFC: vNext data-use controller for purpose-scoped inference, tr
 
 Issue link: `[#155](https://github.com/splendor-kernel/kernel/issues/155)`.
 
-Milestone fit: post-0.1 RFC first; implementation only after accepted RFC.
+Milestone fit: 0.2/v2 RFC first; implementation only after accepted RFC.
 Related criteria: `0.03-S3`, `0.04-S5`, later data/learning-control RFCs.
 
 FR/tie-ins:

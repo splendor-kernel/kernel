@@ -1,8 +1,8 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 responsibility matrix. This file defines v2 component ownership for active 0.2 decomposition after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
 # Component Responsibility Matrix
 
-This is the shortest authoritative answer to “which component owns this?” The detailed contracts are in the numbered documents. A component may call another component, but it must not absorb the other component's authority or lifecycle. The schema-validated machine view is [`architecture/components.yaml`](architecture/components.yaml); it is generated from this table so ownership cannot silently drift.
+This is the shortest authoritative answer to “which component owns this?” The detailed contracts are in the numbered documents. A component may call another component, but it must not absorb the other component's authority or lifecycle. The imported source pack also includes the machine-readable view [`architecture/components.yaml`](architecture/components.yaml). In this repository, that file is active catalog source material, not proof that a current generator or CI drift check exists.
 
 | Component | Owns exactly | Receives | Emits | Must never do |
 |---|---|---|---|---|

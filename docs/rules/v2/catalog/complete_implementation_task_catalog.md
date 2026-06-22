@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 catalog of record for component, task, dependency, and gold-evidence decomposition. This file is authoritative for 0.2/v2 sprint planning only after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
 # Splendor Agent Kernel — Complete Implementation Task Catalog
 
@@ -10,9 +10,9 @@ This file is the dependency-aware engineering contract for evolving Splendor fro
 
 The central novelty target is narrow and falsifiable: **make learning/evolution, symbolic control, verified action, feedback/evaluation, and deployment governance interoperable as one kernel-routed process while preserving user-space freedom.** The catalog does not claim that this target is already achieved, that GPT-2 or any learning algorithm is novel, or that value alignment is solved.
 
-## Reviewed implementation baseline
+## Reviewed 0.1 compatibility anchors
 
-The task decomposition preserves and extends the repository’s existing state graph and snapshots, append-only trace/replay, local scheduler/loop engine, action gateway and verifiers, filesystem/HTTP/robotics adapters, daemon/SDK/client, typed messages and local delegation, node/instance and placement foundations, signed work orders, trace aggregation/state handoff/fleet telemetry, governance workflows, and physical/edge simulation contracts.
+The task decomposition preserves and extends the repository surfaces identified during baseline review: state graph and snapshots, append-only trace/replay, local scheduler/loop engine, action gateway and verifiers, filesystem/HTTP/robotics adapters, daemon/SDK/client, typed messages and local delegation, node/instance and placement foundations, signed work orders, trace aggregation/state handoff/fleet telemetry, governance workflows, and physical/edge simulation contracts.
 
 The following are treated as compatibility anchors rather than reimplemented from zero: existing identity types; `Percept`, `Action`, `Constraint`, `Feedback`, and `Reward`; `LoopEngine`; `Scheduler`; state/trace stores; `VerifiedActionGateway`; work orders and policy bundles; local messages/delegation; node/instance registration and placement v0; governance/approval/circuit-breaker/escalation objects; device profiles and simulated safety.
 
@@ -69,6 +69,13 @@ Synchronous collective groups are compatibility-homogeneous unless an explicit T
 ## How to read a task
 
 A task is complete only when every required implementation item exists, every anti-drift boundary is respected, every integration is exercised, and every validation condition passes with retained evidence. A type definition or happy-path unit test alone is never completion. Task-level `Required contracts / collaborating tasks` are interface dependencies and may be mutually recursive; contract-first stubs and conformance fixtures break those implementation cycles. The eight dependency gates later in this file define the architectural partial order.
+
+Component sections titled `Implemented baseline to preserve` are compatibility-anchor notes, not standalone acceptance evidence. Treat them as preservation targets that still require current code, test, and validation evidence before making implementation-complete or production-readiness claims.
+
+Component completion gates and validation bullets describe the required future
+done state for 0.2/v2 work. Present-tense phrases such as “is implemented,”
+“are implemented,” or “pass” in those sections are not current repository
+capability claims unless backed by separate current implementation evidence.
 
 **Catalog totals:** 12 cross-cutting foundations; 38 component owners; 350 component tasks; 19 integration/research/operations tasks; **381 total tasks**; 90 gold cases.
 
@@ -8452,7 +8459,7 @@ Prove the abstraction supports software, language/task, physical, multi-agent, a
 
 **Implemented baseline to preserve**
 
-Typed local messages, inbox/outbox lifecycle, recipient/schema isolation, local delegation, parent/child runs, remote message envelopes/transport reference path, causal replay, and task request/response types are implemented. Missing are durable fleet-grade delivery, ordering/dedup/backpressure, capability token attenuation/revocation across transports, trigger subscriptions, long-running request workflows, group/broadcast patterns, protected payload refs, and adversarial hardening.
+Baseline review identified typed local messages, inbox/outbox lifecycle, recipient/schema isolation, local delegation, parent/child runs, remote message envelopes/transport reference path, causal replay, and task request/response types as compatibility anchors to preserve. Missing are durable fleet-grade delivery, ordering/dedup/backpressure, capability token attenuation/revocation across transports, trigger subscriptions, long-running request workflows, group/broadcast patterns, protected payload refs, and adversarial hardening.
 
 **Exact kernel responsibility**
 
@@ -12220,7 +12227,7 @@ Close the evolution loop with exact proof of what reached which agents/devices a
 ### Component completion gate
 
 - Only an exact, approved, non-expired ChangeSet/ActivationSet can deploy, and deployment authority is fenced.
-- Shadow, canary, progressive rollout, SLO/value/safety stop, mixed-version handling, physical/offline policy, and honest rollback are implemented.
+- Required done state includes shadow, canary, progressive rollout, SLO/value/safety stop, mixed-version handling, physical/offline policy, and honest rollback.
 - Actual exposure and outcomes—not desired state—produce durable deployment evidence and feed controlled improvement.
 
 ---
@@ -13539,10 +13546,15 @@ The project described here is implementation-complete only when:
 - G00–G89 are executable with explicit capability requirements and negative assertions; unavailable cases are blocked, never passed.
 - NOV-001–NOV-006 produce reproducible evidence and appropriately bounded claims. Null or negative results remain valid outcomes.
 
-## Catalog validation
+## Source-pack catalog validation
 
-- Overall catalog validation: **PASS**
-- Components: 38 (exact match with `architecture/components.yaml`: True)
+The imported source pack reported the following internal consistency results at
+import time. These are not active repository CI results, not proof that v2
+runtime behavior is implemented, and not evidence that a current in-repo
+validator or detailed validator report exists.
+
+- Source-pack catalog validation: **PASS**
+- Components: 38 (source-pack match with `architecture/components.yaml`: True)
 - Total tasks: 381
 - Duplicate task IDs: 0
 - Unresolved dependencies: 0
@@ -13551,7 +13563,9 @@ The project described here is implementation-complete only when:
 - Weak component completion gates: 0
 - Gold cases covered: 90/90 with 2502 task-to-gold references
 
-The machine-readable task registry and detailed validator report are generated beside this document.
+Any future repository validator or detailed validator report must be implemented
+separately, wired into explicit validation, and recorded as current evidence
+before it can support completion claims.
 
 ## Source and research notes
 
