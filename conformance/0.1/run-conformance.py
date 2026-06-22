@@ -55,6 +55,35 @@ SECRET_KEYS = {
     "secret",
     "token",
 }
+AUTHORIZING_EXTENSION_KEY_FRAGMENTS = {
+    "accesstoken",
+    "adapter",
+    "apikey",
+    "approval",
+    "authheader",
+    "authority",
+    "authorization",
+    "bearer",
+    "capability",
+    "credential",
+    "datause",
+    "driver",
+    "gateway",
+    "identity",
+    "jwt",
+    "oauth",
+    "password",
+    "permission",
+    "policy",
+    "privatekey",
+    "quota",
+    "secret",
+    "signature",
+    "token",
+    "traceid",
+    "verifier",
+    "workorder",
+}
 
 
 @dataclass
@@ -92,6 +121,33 @@ def event_kind_matches(actual: str, expected: str) -> bool:
 
 def normalize_key(key: str) -> str:
     return "".join(character for character in key.lower() if character.isalnum())
+
+
+def is_authorizing_extension_key(key: str, reserved_keys: list[str]) -> bool:
+    normalized = normalize_key(key)
+    normalized_reserved = {normalize_key(reserved_key) for reserved_key in reserved_keys}
+    return (
+        normalized in normalized_reserved
+        or normalized in SECRET_KEYS
+        or any(fragment in normalized for fragment in AUTHORIZING_EXTENSION_KEY_FRAGMENTS)
+    )
+
+
+def collect_authorizing_extension_paths(value: Any, reserved_keys: list[str], path: str) -> list[str]:
+    illegal: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if not isinstance(key, str) or not key.strip() or key.strip() != key:
+                illegal.append(child_path)
+                continue
+            if is_authorizing_extension_key(key, reserved_keys):
+                illegal.append(child_path)
+            illegal.extend(collect_authorizing_extension_paths(nested, reserved_keys, child_path))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            illegal.extend(collect_authorizing_extension_paths(nested, reserved_keys, f"{path}[{index}]"))
+    return illegal
 
 
 def validate_trace(trace: dict[str, Any]) -> None:
@@ -275,7 +331,7 @@ def validate_adapter_manifests(config: dict[str, Any]) -> None:
             assert_true("gateway" in text, f"{manifest.relative_to(ROOT)} must document gateway mediation")
 
 
-def validate_stable_examples(config: dict[str, Any]) -> None:
+def load_stable_examples_manifest(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     path = ROOT / config.get("path", STABLE_EXAMPLES_PATH.relative_to(ROOT))
     data = load_json(path)
     assert_true(data.get("schema_version") == "splendor.stable_primitives_manifest.v1", "stable examples schema_version mismatch")
@@ -288,13 +344,13 @@ def validate_stable_examples(config: dict[str, Any]) -> None:
 
     primitives = data.get("primitives")
     assert_true(isinstance(primitives, list) and primitives, "stable examples primitives must be non-empty")
-    required_primitives = set(config.get("required_primitives", []))
-    seen_primitives: set[str] = set()
+    by_name: dict[str, dict[str, Any]] = {}
     for primitive in primitives:
         assert_true(isinstance(primitive, dict), "stable primitive entry must be an object")
         name = primitive.get("name")
         assert_true(isinstance(name, str) and name, "stable primitive name is required")
-        seen_primitives.add(name)
+        assert_true(name not in by_name, f"duplicate stable primitive {name}")
+        by_name[name] = primitive
         required_fields = primitive.get("required_fields")
         example = primitive.get("example")
         assert_true(isinstance(required_fields, list), f"{name} required_fields must be an array")
@@ -303,11 +359,129 @@ def validate_stable_examples(config: dict[str, Any]) -> None:
         assert_true(not missing, f"{name} example missing required fields: {', '.join(missing)}")
         extensions = example.get("extensions")
         if isinstance(extensions, dict):
-            illegal = sorted(key for key in extensions if key in reserved_keys or normalize_key(key) in SECRET_KEYS)
+            illegal = sorted(collect_authorizing_extension_paths(extensions, reserved_keys, "extensions"))
             assert_true(not illegal, f"{name} extensions contain reserved authority keys: {', '.join(illegal)}")
+    return data, by_name
 
-    missing_primitives = sorted(required_primitives - seen_primitives)
+
+def validate_required_stable_primitives(primitives: dict[str, dict[str, Any]], required_primitives: set[str]) -> None:
+    missing_primitives = sorted(required_primitives - set(primitives))
     assert_true(not missing_primitives, f"stable examples missing primitives: {', '.join(missing_primitives)}")
+
+
+def validate_stable_examples(config: dict[str, Any]) -> None:
+    _, primitives = load_stable_examples_manifest(config)
+    validate_required_stable_primitives(primitives, set(config.get("required_primitives", [])))
+
+
+def validate_compatibility_non_claims(config: dict[str, Any]) -> None:
+    assert_true(config.get("evidence_scope") == "partial_fnd_006_fixture_matrix_v0", "compatibility evidence_scope must be partial_fnd_006_fixture_matrix_v0")
+    non_claims = set(config.get("non_claims", []))
+    required_non_claims = {"no_fnd_006_completion", "no_g00_pass", "no_g72_pass"}
+    missing = sorted(required_non_claims - non_claims)
+    assert_true(not missing, f"compatibility non_claims missing: {', '.join(missing)}")
+
+
+def validate_compatibility_stable_examples(config: dict[str, Any]) -> None:
+    stable_config = config.get("stable_examples", {})
+    assert_true(isinstance(stable_config, dict), "compatibility stable_examples must be an object")
+    _, primitives = load_stable_examples_manifest(stable_config)
+    validate_required_stable_primitives(primitives, set(stable_config.get("required_primitives", [])))
+    expected_count = stable_config.get("expected_count")
+    if expected_count is not None:
+        assert_true(len(primitives) == expected_count, f"expected {expected_count} stable primitives, found {len(primitives)}")
+
+
+def validate_non_authorizing_extension_variants(config: dict[str, Any]) -> None:
+    stable_config = config.get("stable_examples", {})
+    assert_true(isinstance(stable_config, dict), "compatibility stable_examples must be an object")
+    data, primitives = load_stable_examples_manifest(stable_config)
+    reserved_keys = data["extension_policy"]["reserved_keys"]
+    variants = config.get("variants")
+    assert_true(isinstance(variants, list) and variants, "compatibility variants must be a non-empty array")
+    for variant in variants:
+        assert_true(isinstance(variant, dict), "compatibility variant must be an object")
+        primitive_name = variant.get("primitive")
+        primitive = primitives.get(primitive_name)
+        assert_true(primitive is not None, f"compatibility variant references unknown primitive {primitive_name!r}")
+        assert_true(primitive.get("extensions") == "non_authorizing", f"{primitive_name} does not allow non-authorizing extensions")
+        assert_true("extensions" in primitive.get("optional_fields", []), f"{primitive_name} optional_fields must include extensions")
+        assert_true(variant.get("expected") == "accepted", f"{primitive_name} non-authorizing extension variant must expect accepted")
+        assert_true(variant.get("authority_effect") == "none", f"{primitive_name} extension variant must declare no authority effect")
+        extensions = variant.get("extensions")
+        assert_true(isinstance(extensions, dict) and extensions, f"{primitive_name} compatibility extensions must be a non-empty object")
+        illegal = sorted(collect_authorizing_extension_paths(extensions, reserved_keys, "extensions"))
+        assert_true(not illegal, f"{primitive_name} accepted compatibility extensions contain authorizing keys: {', '.join(illegal)}")
+
+
+def validate_authorizing_extension_rejections(config: dict[str, Any]) -> None:
+    stable_config = config.get("stable_examples", {})
+    assert_true(isinstance(stable_config, dict), "compatibility stable_examples must be an object")
+    data, primitives = load_stable_examples_manifest(stable_config)
+    reserved_keys = data["extension_policy"]["reserved_keys"]
+    variants = config.get("variants")
+    assert_true(isinstance(variants, list) and variants, "compatibility variants must be a non-empty array")
+    for variant in variants:
+        assert_true(isinstance(variant, dict), "compatibility variant must be an object")
+        primitive_name = variant.get("primitive")
+        primitive = primitives.get(primitive_name)
+        assert_true(primitive is not None, f"compatibility variant references unknown primitive {primitive_name!r}")
+        assert_true(primitive.get("extensions") == "non_authorizing", f"{primitive_name} rejection variant must target an extension-capable primitive")
+        assert_true(variant.get("expected") == "rejected", f"{primitive_name} authorizing extension variant must expect rejected")
+        assert_true(variant.get("failure_mode") == "fail_closed", f"{primitive_name} authorizing extension variant must fail closed")
+        extensions = variant.get("extensions")
+        assert_true(isinstance(extensions, dict) and extensions, f"{primitive_name} rejected extensions must be a non-empty object")
+        illegal = sorted(collect_authorizing_extension_paths(extensions, reserved_keys, "extensions"))
+        assert_true(illegal, f"{primitive_name} rejected compatibility fixture must include authorizing extension keys")
+        fail_closed = variant.get("fail_closed")
+        assert_true(isinstance(fail_closed, dict) and fail_closed, f"{primitive_name} fail_closed evidence must be present")
+        for field, value in fail_closed.items():
+            assert_true(value is False, f"{primitive_name} fail_closed.{field} must be false")
+
+
+def validate_trace_alias_variants(config: dict[str, Any]) -> None:
+    stable_config = config.get("stable_examples", {})
+    assert_true(isinstance(stable_config, dict), "compatibility stable_examples must be an object")
+    data, primitives = load_stable_examples_manifest(stable_config)
+    assert_true("TraceEvent" in primitives, "TraceEvent stable example is required for alias compatibility")
+    aliases = data.get("deprecated_aliases")
+    assert_true(isinstance(aliases, list), "stable examples deprecated_aliases must be an array")
+    replacements = {alias.get("alias"): alias.get("replacement") for alias in aliases if isinstance(alias, dict)}
+    variants = config.get("variants")
+    assert_true(isinstance(variants, list) and variants, "trace alias variants must be a non-empty array")
+    for variant in variants:
+        assert_true(isinstance(variant, dict), "trace alias variant must be an object")
+        assert_true(variant.get("primitive") == "TraceEvent", "trace alias compatibility only applies to TraceEvent")
+        alias = variant.get("alias")
+        replacement = variant.get("replacement")
+        assert_true(replacements.get(alias) == replacement, f"deprecated alias {alias!r} must map to {replacement!r}")
+        input_event = variant.get("input")
+        emitted_event = variant.get("emitted")
+        assert_true(isinstance(input_event, dict), "trace alias input must be an object")
+        assert_true(isinstance(emitted_event, dict), "trace alias emitted fixture must be an object")
+        assert_true(alias in input_event, f"trace alias input must include {alias}")
+        assert_true(replacement not in input_event, f"trace alias input fixture should exercise alias-only {alias}")
+        assert_true(replacement in emitted_event, f"trace alias emitted fixture must include {replacement}")
+        assert_true(alias not in emitted_event, f"trace alias emitted fixture must not include deprecated {alias}")
+        assert_true(input_event[alias] == emitted_event[replacement], "trace alias value must canonicalize to trace_event_id")
+        for field in ("run_id", "sequence", "timestamp", "identity", "kind"):
+            assert_true(input_event.get(field) == emitted_event.get(field), f"trace alias canonicalization changed {field}")
+        assert_true(variant.get("authority_effect") == "none", "trace alias compatibility must not grant authority")
+
+
+def validate_compatibility(config: dict[str, Any]) -> None:
+    validate_compatibility_non_claims(config)
+    matrix = config.get("matrix")
+    if matrix == "stable_examples_accepted":
+        validate_compatibility_stable_examples(config)
+    elif matrix == "non_authorizing_extensions_accepted":
+        validate_non_authorizing_extension_variants(config)
+    elif matrix == "authorizing_extensions_rejected":
+        validate_authorizing_extension_rejections(config)
+    elif matrix == "trace_id_alias_canonical_output":
+        validate_trace_alias_variants(config)
+    else:
+        raise ConformanceError(f"unknown compatibility matrix {matrix!r}")
 
 
 def validate_case(case: dict[str, Any]) -> None:
@@ -332,6 +506,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_adapter_manifests(case["adapter_manifests"])
     elif primitive == "stable_primitives":
         validate_stable_examples(case["stable_examples"])
+    elif primitive == "compatibility":
+        validate_compatibility(case["compatibility"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 
@@ -361,7 +537,10 @@ def run_suite(fixture_path: Path) -> list[Result]:
             if path == "negative_fixture":
                 results.append(Result(case_id, primitive, requirement, path, "fail", "negative fixture unexpectedly passed"))
             else:
-                results.append(Result(case_id, primitive, requirement, path, "pass", "ok"))
+                report_message = case.get("report_message")
+                if not isinstance(report_message, str) or not report_message:
+                    report_message = "ok"
+                results.append(Result(case_id, primitive, requirement, path, "pass", report_message))
     return results
 
 

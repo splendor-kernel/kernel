@@ -334,6 +334,86 @@
       "path": "positive",
       "description": "S1 stable primitive examples load with required fields, non-authorizing extensions, and expected primitive coverage.",
       "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json", "required_primitives": ["Tenant", "Agent", "Run", "Tick", "Action", "Percept", "Message", "StateNode", "TraceEvent", "WorkOrder", "Approval", "Policy", "Constraint", "Verifier", "Adapter", "Feedback", "Reward"] }
+    },
+    {
+      "case_id": "compatibility-stable-examples-current-accepted",
+      "primitive": "compatibility",
+      "requirement": "CONF-0.1-COMPAT-STABLE-EXAMPLES",
+      "path": "positive",
+      "description": "Partial FND-006 matrix evidence that current stable primitive examples remain accepted through the 0.1 conformance path.",
+      "report_message": "partial FND-006 compatibility matrix v0: current stable examples accepted; no FND-006 completion or G00/G72 pass claimed",
+      "compatibility": {
+        "matrix": "stable_examples_accepted",
+        "evidence_scope": "partial_fnd_006_fixture_matrix_v0",
+        "non_claims": ["no_fnd_006_completion", "no_g00_pass", "no_g72_pass"],
+        "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json", "expected_count": 17, "required_primitives": ["Tenant", "Agent", "Run", "Tick", "Action", "Percept", "Message", "StateNode", "TraceEvent", "WorkOrder", "Approval", "Policy", "Constraint", "Verifier", "Adapter", "Feedback", "Reward"] }
+      }
+    },
+    {
+      "case_id": "compatibility-non-authorizing-extensions-accepted",
+      "primitive": "compatibility",
+      "requirement": "CONF-0.1-COMPAT-ADDITIVE-NON-AUTHORIZING",
+      "path": "positive",
+      "description": "Partial FND-006 matrix evidence that additive non-authorizing extension metadata is accepted only on primitives that allow extensions.",
+      "report_message": "partial FND-006 compatibility matrix v0: non-authorizing extension metadata accepted where allowed; no FND-006 completion or G00/G72 pass claimed",
+      "compatibility": {
+        "matrix": "non_authorizing_extensions_accepted",
+        "evidence_scope": "partial_fnd_006_fixture_matrix_v0",
+        "non_claims": ["no_fnd_006_completion", "no_g00_pass", "no_g72_pass"],
+        "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json" },
+        "variants": [
+          { "primitive": "Tenant", "expected": "accepted", "authority_effect": "none", "extensions": { "display_hint": "Finance tenant", "correlation_id": "corr-compat-tenant" } },
+          { "primitive": "StateNode", "expected": "accepted", "authority_effect": "none", "extensions": { "external_reference": "snapshot-index-42", "diagnostics": { "writer": "fixture", "duration_ms": 3 } } },
+          { "primitive": "WorkOrder", "expected": "accepted", "authority_effect": "none", "extensions": { "display_hint": "weekly dashboard", "correlation_id": "corr-compat-work-order" } },
+          { "primitive": "Feedback", "expected": "accepted", "authority_effect": "none", "extensions": { "display_hint": "operator note", "diagnostics": { "source_channel": "fixture" } } }
+        ]
+      }
+    },
+    {
+      "case_id": "compatibility-authorizing-extensions-rejected",
+      "primitive": "compatibility",
+      "requirement": "CONF-0.1-COMPAT-AUTHORIZING-EXTENSIONS-FAIL-CLOSED",
+      "path": "fail_closed",
+      "description": "Partial FND-006 matrix evidence that authorizing or security-critical extension fields are rejected fail-closed and cannot grant authority.",
+      "report_message": "partial FND-006 compatibility matrix v0: authorizing/security-critical extension fields rejected fail-closed; no FND-006 completion or G00/G72 pass claimed",
+      "compatibility": {
+        "matrix": "authorizing_extensions_rejected",
+        "evidence_scope": "partial_fnd_006_fixture_matrix_v0",
+        "non_claims": ["no_fnd_006_completion", "no_g00_pass", "no_g72_pass"],
+        "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json" },
+        "variants": [
+          { "primitive": "Tenant", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "allowed_permissions": ["fleet.admin"] }, "fail_closed": { "accepted": false, "authority_granted": false, "side_effect_authorized": false } },
+          { "primitive": "WorkOrder", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "signature": "forged-fixture-signature" }, "fail_closed": { "accepted": false, "run_started": false, "authority_granted": false } },
+          { "primitive": "Policy", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "quota_override": { "max_actions_per_tick": 999 } }, "fail_closed": { "accepted": false, "authority_granted": false, "side_effect_authorized": false } },
+          { "primitive": "Adapter", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "credential_ref": "secret:prod" }, "fail_closed": { "accepted": false, "adapter_executed": false, "authority_granted": false } },
+          { "primitive": "Verifier", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "verifier_result": { "allowed": true } }, "fail_closed": { "accepted": false, "authority_granted": false, "side_effect_authorized": false } }
+        ]
+      }
+    },
+    {
+      "case_id": "compatibility-trace-id-alias-canonical-output",
+      "primitive": "compatibility",
+      "requirement": "CONF-0.1-COMPAT-TRACE-ID-ALIAS",
+      "path": "positive",
+      "description": "Partial FND-006 matrix evidence that the implemented trace_id input alias canonicalizes to stable trace_event_id output and does not create a second identity.",
+      "report_message": "partial FND-006 compatibility matrix v0: trace_id input alias canonicalizes to trace_event_id output; no FND-006 completion or G00/G72 pass claimed",
+      "compatibility": {
+        "matrix": "trace_id_alias_canonical_output",
+        "evidence_scope": "partial_fnd_006_fixture_matrix_v0",
+        "non_claims": ["no_fnd_006_completion", "no_g00_pass", "no_g72_pass"],
+        "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json" },
+        "variants": [
+          {
+            "primitive": "TraceEvent",
+            "alias": "trace_id",
+            "replacement": "trace_event_id",
+            "implemented_by": "serde alias on splendor_types::TraceEvent",
+            "authority_effect": "none",
+            "input": { "trace_id": "77777777-7777-5777-8777-777777777777", "run_id": "33333333-3333-3333-3333-333333333333", "sequence": 12, "timestamp": "2026-05-25T00:00:01Z", "identity": { "run_id": "33333333-3333-3333-3333-333333333333", "tenant_id": "11111111-1111-1111-1111-111111111111", "agent_id": "22222222-2222-2222-2222-222222222222", "tick_id": 1, "state_node_id": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, "kind": { "StateCommitted": { "state_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "snapshot_id": null } } },
+            "emitted": { "trace_event_id": "77777777-7777-5777-8777-777777777777", "run_id": "33333333-3333-3333-3333-333333333333", "sequence": 12, "timestamp": "2026-05-25T00:00:01Z", "identity": { "run_id": "33333333-3333-3333-3333-333333333333", "tenant_id": "11111111-1111-1111-1111-111111111111", "agent_id": "22222222-2222-2222-2222-222222222222", "tick_id": 1, "state_node_id": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, "kind": { "StateCommitted": { "state_hash": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "snapshot_id": null } } }
+          }
+        ]
+      }
     }
   ]
 }

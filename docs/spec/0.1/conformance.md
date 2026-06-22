@@ -23,6 +23,7 @@ for these primitive categories:
 - work orders
 - governance
 - adapters
+- compatibility fixture matrix v0
 
 The suite must be runnable without production secrets, external services,
 production networks, SaaS systems, hardware, or vendor-specific runners.
@@ -58,6 +59,11 @@ The suite validates:
   and no secret-shaped fixture fields.
 - S1 stable primitive examples with required fields and non-authorizing
   extensions.
+- Partial FND-006 compatibility fixture matrix v0 evidence: current stable
+  examples are accepted, additive non-authorizing extensions are accepted where
+  allowed, authorizing/security-critical extension fields are rejected
+  fail-closed, and the documented `trace_id` input alias canonicalizes to stable
+  `trace_event_id` output.
 
 ## Report Format
 
@@ -79,7 +85,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 24,
+  "case_count": 28,
   "failed_count": 0,
   "results": [
     {
@@ -100,8 +106,12 @@ Every failure identifies the exact `primitive`, `requirement`, and `case_id`.
 
 The suite does not change stable primitive schemas. It adds conformance fixture
 IDs and report schema `splendor.conformance_report.v1` for compatibility testing.
-Implementers may use the report shape for CI checks, but passing this fixture
-suite alone must not be represented as complete use-case E2E acceptance.
+The FND-006 compatibility matrix v0 cases are partial fixture evidence only; they
+do not implement version negotiation, storage migrations, rolling upgrades,
+training-worker compatibility, or agent migration, and they must not be reported
+as `G00`, `G72`, or full FND-006 completion. Implementers may use the report
+shape for CI checks, but passing this fixture suite alone must not be represented
+as complete use-case E2E acceptance.
 
 ## Non-Goals
 
