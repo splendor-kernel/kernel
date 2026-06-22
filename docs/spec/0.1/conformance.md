@@ -24,6 +24,7 @@ for these primitive categories:
 - governance
 - adapters
 - compatibility fixture matrix v0
+- performance budget fixture contract v0
 
 The suite must be runnable without production secrets, external services,
 production networks, SaaS systems, hardware, or vendor-specific runners.
@@ -64,6 +65,11 @@ The suite validates:
   allowed, authorizing/security-critical extension fields are rejected
   fail-closed, and the documented `trace_id` input alias canonicalizes to stable
   `trace_event_id` output.
+- Partial FND-012 performance budget fixture contract v0 evidence: mandatory
+  latency/throughput budgets, environment-capture shape, regression thresholds,
+  retention/backpressure actions, provider/model-time separation, and
+  G29/G66/G68/G74 SLO/resource mappings are present while gold status remains
+  `not_exercised`.
 
 ## Report Format
 
@@ -85,7 +91,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 28,
+  "case_count": 31,
   "failed_count": 0,
   "results": [
     {
@@ -112,6 +118,13 @@ training-worker compatibility, or agent migration, and they must not be reported
 as `G00`, `G72`, or full FND-006 completion. Implementers may use the report
 shape for CI checks, but passing this fixture suite alone must not be represented
 as complete use-case E2E acceptance.
+
+The FND-012 performance budget cases are also partial fixture evidence only.
+They validate a budget/report contract plus negative environment-capture and
+provider/model-time-mixing cases; they do not execute 24/7 soak tests,
+1,000-node simulation, GPU/training,
+robotics, live fleet, or physical hardware benchmarks, and they must not be
+reported as `G29`, `G66`, `G68`, `G74`, issue #231, or issue #180 completion.
 
 ## Non-Goals
 

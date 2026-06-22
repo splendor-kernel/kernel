@@ -1,0 +1,343 @@
+{
+  "schema_version": "splendor.performance_budgets.v1",
+  "task_id": "FND-012",
+  "evidence_scope": "partial_fnd_012_budget_contract_v0",
+  "non_claims": [
+    "no_fnd_012_completion",
+    "no_issue_180_completion",
+    "no_g29_pass",
+    "no_g66_pass",
+    "no_g68_pass",
+    "no_g74_pass",
+    "no_benchmark_execution"
+  ],
+  "benchmark_environment": {
+    "environment_id": "reference-contract-template-not-a-measured-run",
+    "captured_at": "2026-06-22T12:00:00Z",
+    "host_class": "future-benchmark-runner-must-capture",
+    "os": "future-benchmark-runner-must-capture",
+    "cpu_model": "future-benchmark-runner-must-capture",
+    "cpu_cores": 1,
+    "memory_gib": 1,
+    "storage_backend": "future-benchmark-runner-must-capture",
+    "rustc_version": "future-benchmark-runner-must-capture",
+    "splendor_commit": "future-benchmark-runner-must-capture",
+    "clock_source": "monotonic-clock-required",
+    "network_topology": "future-benchmark-runner-must-capture",
+    "accelerator": "none-required-for-reference-contract"
+  },
+  "report_summary": {
+    "report_id": "fnd-012-reference-performance-budget-v0",
+    "status": "budget_contract_only",
+    "benchmark_suite": "fnd-012-reference-scale-budget-contract",
+    "measured": false,
+    "summary": "Executable budget contract only. No 24/7 soak, 1,000-node simulation, GPU/training, robotics, or live fleet benchmark was executed by this fixture.",
+    "benchmark_run_ref": null
+  },
+  "latency_budgets": [
+    {
+      "metric_id": "local_event_append",
+      "description": "Append one local event/evidence envelope with required integrity and identity checks.",
+      "max_p50_ms": 1.0,
+      "max_p95_ms": 3.0,
+      "max_p99_ms": 5.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Storage engine write latency is captured as Splendor control-plane overhead; provider/model time is excluded."
+      }
+    },
+    {
+      "metric_id": "state_commit",
+      "description": "Commit one validated state node and state-head update with trace linkage.",
+      "max_p50_ms": 4.0,
+      "max_p95_ms": 12.0,
+      "max_p99_ms": 20.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "State integrity and trace linkage checks are included."
+      }
+    },
+    {
+      "metric_id": "authority_decision",
+      "description": "Evaluate a cached but unexpired authority/capability decision with denial evidence available.",
+      "max_p50_ms": 1.0,
+      "max_p95_ms": 4.0,
+      "max_p99_ms": 8.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "The decision includes expiry/revocation/cache-freshness checks, not external IdP latency."
+      }
+    },
+    {
+      "metric_id": "gateway_preflight",
+      "description": "Run required pre-execution gateway/verifier checks before adapter invocation.",
+      "max_p50_ms": 2.0,
+      "max_p95_ms": 8.0,
+      "max_p99_ms": 15.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "All required verifiers remain enabled; adapter execution/provider time is excluded."
+      }
+    },
+    {
+      "metric_id": "model_invocation_overhead",
+      "description": "Kernel scheduling/invocation bookkeeping overhead around a model call, excluding model/provider compute and network time.",
+      "max_p50_ms": 2.0,
+      "max_p95_ms": 10.0,
+      "max_p99_ms": 20.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Provider/model/training latency must be reported in separate user-space/provider metrics."
+      }
+    },
+    {
+      "metric_id": "percept_routing",
+      "description": "Route one authenticated percept into a bounded inbox with provenance/evidence retained.",
+      "max_p50_ms": 1.0,
+      "max_p95_ms": 4.0,
+      "max_p99_ms": 8.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Perceptor/source work is excluded; Splendor provenance and queue admission checks are included."
+      }
+    },
+    {
+      "metric_id": "tick_admission",
+      "description": "Admit one agent tick after identity, quota, state-head, and policy freshness checks.",
+      "max_p50_ms": 2.0,
+      "max_p95_ms": 6.0,
+      "max_p99_ms": 12.0,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Policy/model execution is excluded; admission checks remain enabled."
+      }
+    }
+  ],
+  "throughput_budgets": [
+    {
+      "metric_id": "event_ingestion",
+      "description": "Sustained event/evidence ingestion into local control-plane storage.",
+      "min_rate_per_second": 5000.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Metric includes integrity and append-order checks."
+      }
+    },
+    {
+      "metric_id": "artifact_transfer",
+      "description": "Control-plane artifact transfer coordination and receipt processing, not provider blob-store bandwidth.",
+      "min_rate_per_second": 50.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Payload bytes and storage-provider throughput are separate provider metrics."
+      }
+    },
+    {
+      "metric_id": "scheduler_offers",
+      "description": "Scheduler offer evaluations that preserve authority, quota, and resource checks.",
+      "min_rate_per_second": 1000.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Does not include cloud/Kubernetes provider scheduling latency."
+      }
+    },
+    {
+      "metric_id": "workload_transitions",
+      "description": "Workload lifecycle state transitions with mutation receipt/evidence retained.",
+      "min_rate_per_second": 500.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Transition evidence and fencing checks are included."
+      }
+    },
+    {
+      "metric_id": "feedback_ingestion",
+      "description": "Feedback event ingestion with provenance, non-reward separation, and bounded summaries.",
+      "min_rate_per_second": 1000.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Reward derivation and evaluator work are separate budgets."
+      }
+    },
+    {
+      "metric_id": "eval_fan_out",
+      "description": "Evaluation fan-out control-plane dispatch and result receipt accounting, not evaluator/model runtime.",
+      "min_rate_per_second": 200.0,
+      "window_seconds": 60,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "Evaluator execution and model inference are excluded."
+      }
+    },
+    {
+      "metric_id": "one_thousand_node_simulation",
+      "description": "Reference-scale simulated fleet control-plane heartbeats/offers/transitions for 1,000 nodes.",
+      "min_rate_per_second": 1000.0,
+      "window_seconds": 300,
+      "measurement_boundary": {
+        "kernel_control_plane_only": true,
+        "provider_model_training_time_included": false,
+        "evidence_checks_included": true,
+        "authority_checks_included": true,
+        "safety_checks_included": true,
+        "notes": "This budget requires future simulation harness evidence; this fixture does not execute the simulation."
+      },
+      "scale_target": {
+        "nodes": 1000,
+        "workloads": 5000,
+        "sustained_seconds": 300
+      }
+    }
+  ],
+  "regression_thresholds": [
+    { "metric_id": "local_event_append", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "state_commit", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "authority_decision", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "gateway_preflight", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "model_invocation_overhead", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "percept_routing", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "tick_admission", "max_regression_percent": 10.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "event_ingestion", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "artifact_transfer", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "scheduler_offers", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "workload_transitions", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "feedback_ingestion", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "eval_fan_out", "max_regression_percent": 15.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block kernel release gate and require benchmark triage" },
+    { "metric_id": "one_thousand_node_simulation", "max_regression_percent": 20.0, "baseline_ref": "artifact:perf-baseline.reference-v0", "action_on_regression": "block reference-scale claim and require simulation triage" }
+  ],
+  "retention_backpressure_actions": [
+    {
+      "action_id": "retain_event_log_by_budget",
+      "kind": "retention",
+      "trigger_metric_id": "event_ingestion",
+      "trigger": "event partitions approach configured storage growth budget",
+      "action": "compact or archive eligible event partitions while preserving required evidence, hash links, and replay references",
+      "required_event": "performance.retention_action_required",
+      "fail_closed": true
+    },
+    {
+      "action_id": "cap_trace_payload_growth",
+      "kind": "retention",
+      "trigger_metric_id": "local_event_append",
+      "trigger": "event payload summaries approach bounded trace payload budget",
+      "action": "reject unbounded payloads and require artifact reference/offload remediation",
+      "required_event": "performance.payload_offload_required",
+      "fail_closed": true
+    },
+    {
+      "action_id": "apply_percept_inbox_backpressure",
+      "kind": "backpressure",
+      "trigger_metric_id": "percept_routing",
+      "trigger": "bounded percept inbox approaches high-water mark",
+      "action": "throttle or defer source admission with trace-visible drop/defer evidence instead of unbounded memory growth",
+      "required_event": "performance.backpressure_applied",
+      "fail_closed": true
+    },
+    {
+      "action_id": "protect_inference_capacity",
+      "kind": "backpressure",
+      "trigger_metric_id": "scheduler_offers",
+      "trigger": "scheduler usage predicts live inference SLO breach",
+      "action": "deny, pause, or preempt lower-priority background workloads before protected inference capacity is breached",
+      "required_event": "performance.inference_capacity_protected",
+      "fail_closed": true
+    }
+  ],
+  "gold_slo_resource_budgets": [
+    {
+      "gold_id": "G29",
+      "evidence_status": "not_exercised",
+      "slo_metric_ids": ["local_event_append", "percept_routing", "tick_admission", "event_ingestion"],
+      "resource_budgets": [
+        { "resource_id": "g29_long_lived_agent_control_plane", "kind": "control_plane", "cpu_cores": 1.0, "memory_mib": 512, "storage_mib": 1024, "network_mbps": 10.0, "notes": "Reference SLO/resource contract for restart/resume, bounded inbox, and drain; no 24/7 run executed." }
+      ],
+      "notes": ["G29 remains not_exercised until a sustained lifecycle harness runs and validates restart/resume, stale source handling, timers, bounded inbox, and drain."]
+    },
+    {
+      "gold_id": "G66",
+      "evidence_status": "not_exercised",
+      "slo_metric_ids": ["model_invocation_overhead", "scheduler_offers", "workload_transitions"],
+      "resource_budgets": [
+        { "resource_id": "g66_inference_reservation", "kind": "inference_reservation", "cpu_cores": 2.0, "memory_mib": 2048, "network_mbps": 25.0, "notes": "Protected inference reservation contract; no training workload or preemption benchmark executed." },
+        { "resource_id": "g66_background_training_worker_cap", "kind": "worker", "cpu_cores": 4.0, "memory_mib": 4096, "storage_mib": 2048, "notes": "Background training budget must be preemptible before live inference SLO breach." }
+      ],
+      "notes": ["G66 remains not_exercised until a harness proves background work preempts before configured p99/SLO breach."]
+    },
+    {
+      "gold_id": "G68",
+      "evidence_status": "not_exercised",
+      "slo_metric_ids": ["event_ingestion", "scheduler_offers", "workload_transitions", "one_thousand_node_simulation"],
+      "resource_budgets": [
+        { "resource_id": "g68_simulated_fleet_control_plane", "kind": "simulation", "cpu_cores": 16.0, "memory_mib": 32768, "storage_mib": 65536, "network_mbps": 1000.0, "max_nodes": 1000, "notes": "Reference 1,000-node simulation budget; no large fleet simulation executed." }
+      ],
+      "notes": ["G68 remains not_exercised until concurrent inference/training/eval/data, partitions, drain, and fairness run under the stated budgets."]
+    },
+    {
+      "gold_id": "G74",
+      "evidence_status": "not_exercised",
+      "slo_metric_ids": ["authority_decision", "gateway_preflight", "tick_admission"],
+      "resource_budgets": [
+        { "resource_id": "g74_device_environment_control_plane", "kind": "control_plane", "cpu_cores": 2.0, "memory_mib": 2048, "storage_mib": 4096, "network_mbps": 50.0, "notes": "Signed environment-launch control-plane reservation; no robot/container launch executed." },
+        { "resource_id": "g74_local_safety_reservation", "kind": "physical_safety", "cpu_cores": 1.0, "memory_mib": 512, "notes": "Local safety reservation must remain available for veto/preemption; no hardware or safety certification claim." }
+      ],
+      "notes": ["G74 remains not_exercised until signed image launch, device access, cleanup, and local preemption are exercised in the appropriate harness."]
+    }
+  ]
+}

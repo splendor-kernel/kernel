@@ -418,6 +418,33 @@
           }
         ]
       }
+    },
+    {
+      "case_id": "performance-budgets-reference-contract",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-PERFORMANCE-BUDGETS",
+      "path": "positive",
+      "description": "Partial FND-012 fixture validates mandatory budget metrics, environment capture, regression thresholds, retention/backpressure actions, and G29/G66/G68/G74 SLO/resource mappings without benchmark or gold pass claims.",
+      "report_message": "partial FND-012 performance budget contract v0: mandatory budget/report fields validate; no benchmark execution, FND-012 completion, or G29/G66/G68/G74 pass claimed",
+      "performance_budgets": { "path": "docs/spec/0.2/performance-budgets.json" }
+    },
+    {
+      "case_id": "performance-budgets-missing-environment-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-ENVIRONMENT-CAPTURE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves performance budget reports without benchmark environment capture are rejected.",
+      "expected_failure": "benchmark_environment is required",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-missing-environment.json" }
+    },
+    {
+      "case_id": "performance-budgets-provider-time-mixed-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-CONTROL-PLANE-SEPARATION",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves provider/model/training time cannot be mixed into kernel control-plane overhead budgets.",
+      "expected_failure": "provider/model time must not be mixed into kernel control-plane overhead",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-provider-time-mixed.json" }
     }
   ]
 }

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "conformance" / "0.1" / "fixtures" / "conformance-cases.json"
 ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
 STABLE_EXAMPLES_PATH = ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
+PERFORMANCE_BUDGETS_PATH = ROOT / "docs" / "spec" / "0.2" / "performance-budgets.json"
 ACTION_OUTCOMES = {
     "action.executed",
     "action.denied",
@@ -93,6 +94,36 @@ AUTHORIZING_EXTENSION_KEY_FRAGMENTS = {
     "verifier",
     "workorder",
 }
+PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
+PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
+REQUIRED_PERFORMANCE_NON_CLAIMS = {
+    "no_fnd_012_completion",
+    "no_issue_180_completion",
+    "no_g29_pass",
+    "no_g66_pass",
+    "no_g68_pass",
+    "no_g74_pass",
+    "no_benchmark_execution",
+}
+REQUIRED_LATENCY_BUDGET_METRICS = {
+    "local_event_append",
+    "state_commit",
+    "authority_decision",
+    "gateway_preflight",
+    "model_invocation_overhead",
+    "percept_routing",
+    "tick_admission",
+}
+REQUIRED_THROUGHPUT_BUDGET_METRICS = {
+    "event_ingestion",
+    "artifact_transfer",
+    "scheduler_offers",
+    "workload_transitions",
+    "feedback_ingestion",
+    "eval_fan_out",
+    "one_thousand_node_simulation",
+}
+REQUIRED_PERFORMANCE_GOLD_IDS = {"G29", "G66", "G68", "G74"}
 
 
 @dataclass
@@ -493,6 +524,176 @@ def validate_compatibility(config: dict[str, Any]) -> None:
         raise ConformanceError(f"unknown compatibility matrix {matrix!r}")
 
 
+def require_non_empty_string(value: Any, label: str) -> None:
+    assert_true(isinstance(value, str) and value.strip(), f"{label} is required")
+
+
+def require_positive_number(value: Any, label: str) -> None:
+    assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0, f"{label} must be positive")
+
+
+def validate_performance_environment(environment: Any) -> None:
+    assert_true(isinstance(environment, dict), "benchmark_environment is required")
+    for field in (
+        "environment_id",
+        "captured_at",
+        "host_class",
+        "os",
+        "cpu_model",
+        "storage_backend",
+        "rustc_version",
+        "splendor_commit",
+        "clock_source",
+        "network_topology",
+    ):
+        require_non_empty_string(environment.get(field), f"benchmark_environment.{field}")
+    require_positive_number(environment.get("cpu_cores"), "benchmark_environment.cpu_cores")
+    require_positive_number(environment.get("memory_gib"), "benchmark_environment.memory_gib")
+
+
+def validate_performance_report_summary(summary: Any) -> None:
+    assert_true(isinstance(summary, dict), "performance report_summary is required")
+    for field in ("report_id", "status", "benchmark_suite", "summary"):
+        require_non_empty_string(summary.get(field), f"report_summary.{field}")
+    assert_true(summary.get("measured") is False, "partial FND-012 fixture must not claim measured benchmark results")
+    assert_true(summary.get("status") == "budget_contract_only", "partial FND-012 fixture status must be budget_contract_only")
+
+
+def validate_measurement_boundary(metric_id: str, boundary: Any) -> None:
+    assert_true(isinstance(boundary, dict), f"{metric_id} measurement_boundary is required")
+    if boundary.get("kernel_control_plane_only") is not True or boundary.get("provider_model_training_time_included") is not False:
+        raise ConformanceError("provider/model time must not be mixed into kernel control-plane overhead")
+    assert_true(boundary.get("evidence_checks_included") is True, f"{metric_id} must include evidence checks")
+    assert_true(boundary.get("authority_checks_included") is True, f"{metric_id} must include authority checks")
+    assert_true(boundary.get("safety_checks_included") is True, f"{metric_id} must include safety checks")
+
+
+def validate_latency_budget_records(records: Any) -> set[str]:
+    assert_true(isinstance(records, list) and records, "latency_budgets must be a non-empty array")
+    metrics: set[str] = set()
+    for record in records:
+        assert_true(isinstance(record, dict), "latency budget record must be an object")
+        metric_id = record.get("metric_id")
+        require_non_empty_string(metric_id, "latency_budgets.metric_id")
+        assert_true(metric_id not in metrics, f"duplicate performance metric {metric_id}")
+        metrics.add(metric_id)
+        require_non_empty_string(record.get("description"), f"{metric_id}.description")
+        for field in ("max_p50_ms", "max_p95_ms", "max_p99_ms"):
+            require_positive_number(record.get(field), f"{metric_id}.{field}")
+        assert_true(record["max_p50_ms"] <= record["max_p95_ms"] <= record["max_p99_ms"], f"{metric_id} latency percentiles must be ordered")
+        validate_measurement_boundary(metric_id, record.get("measurement_boundary"))
+    missing = sorted(REQUIRED_LATENCY_BUDGET_METRICS - metrics)
+    assert_true(not missing, f"performance budgets missing mandatory latency metrics: {', '.join(missing)}")
+    return metrics
+
+
+def validate_throughput_budget_records(records: Any) -> set[str]:
+    assert_true(isinstance(records, list) and records, "throughput_budgets must be a non-empty array")
+    metrics: set[str] = set()
+    for record in records:
+        assert_true(isinstance(record, dict), "throughput budget record must be an object")
+        metric_id = record.get("metric_id")
+        require_non_empty_string(metric_id, "throughput_budgets.metric_id")
+        assert_true(metric_id not in metrics, f"duplicate performance metric {metric_id}")
+        metrics.add(metric_id)
+        require_non_empty_string(record.get("description"), f"{metric_id}.description")
+        require_positive_number(record.get("min_rate_per_second"), f"{metric_id}.min_rate_per_second")
+        require_positive_number(record.get("window_seconds"), f"{metric_id}.window_seconds")
+        validate_measurement_boundary(metric_id, record.get("measurement_boundary"))
+    missing = sorted(REQUIRED_THROUGHPUT_BUDGET_METRICS - metrics)
+    assert_true(not missing, f"performance budgets missing mandatory throughput metrics: {', '.join(missing)}")
+    return metrics
+
+
+def validate_regression_thresholds(thresholds: Any, required_metrics: set[str]) -> None:
+    assert_true(isinstance(thresholds, list) and thresholds, "regression_thresholds must be a non-empty array")
+    metrics: set[str] = set()
+    for threshold in thresholds:
+        assert_true(isinstance(threshold, dict), "regression threshold must be an object")
+        metric_id = threshold.get("metric_id")
+        require_non_empty_string(metric_id, "regression_thresholds.metric_id")
+        metrics.add(metric_id)
+        require_positive_number(threshold.get("max_regression_percent"), f"{metric_id}.max_regression_percent")
+        require_non_empty_string(threshold.get("baseline_ref"), f"{metric_id}.baseline_ref")
+        require_non_empty_string(threshold.get("action_on_regression"), f"{metric_id}.action_on_regression")
+    missing = sorted(required_metrics - metrics)
+    assert_true(not missing, f"performance budgets missing regression thresholds: {', '.join(missing)}")
+
+
+def validate_retention_backpressure_actions(actions: Any, known_metrics: set[str]) -> None:
+    assert_true(isinstance(actions, list) and actions, "retention_backpressure_actions must be a non-empty array")
+    kinds: set[str] = set()
+    for action in actions:
+        assert_true(isinstance(action, dict), "retention/backpressure action must be an object")
+        action_id = action.get("action_id")
+        require_non_empty_string(action_id, "retention_backpressure_actions.action_id")
+        kind = action.get("kind")
+        assert_true(kind in {"retention", "backpressure"}, f"{action_id} kind must be retention or backpressure")
+        kinds.add(kind)
+        trigger_metric_id = action.get("trigger_metric_id")
+        require_non_empty_string(trigger_metric_id, f"{action_id}.trigger_metric_id")
+        assert_true(trigger_metric_id in known_metrics, f"{action_id} trigger_metric_id references unknown metric")
+        require_non_empty_string(action.get("trigger"), f"{action_id}.trigger")
+        require_non_empty_string(action.get("action"), f"{action_id}.action")
+        require_non_empty_string(action.get("required_event"), f"{action_id}.required_event")
+        assert_true(action.get("fail_closed") is True, f"{action_id} must fail closed")
+    missing = sorted({"retention", "backpressure"} - kinds)
+    assert_true(not missing, f"performance budgets missing retention/backpressure actions: {', '.join(missing)}")
+
+
+def validate_gold_resource_budget(gold_id: str, budget: Any) -> None:
+    assert_true(isinstance(budget, dict), f"{gold_id} resource budget must be an object")
+    require_non_empty_string(budget.get("resource_id"), f"{gold_id}.resource_id")
+    assert_true(budget.get("kind") in {"control_plane", "inference_reservation", "worker", "physical_safety", "simulation"}, f"{gold_id} resource budget kind is invalid")
+    numeric_fields = ("cpu_cores", "memory_mib", "storage_mib", "network_mbps", "max_nodes")
+    assert_true(any(isinstance(budget.get(field), (int, float)) and not isinstance(budget.get(field), bool) and budget[field] > 0 for field in numeric_fields), f"{gold_id} resource budget must include a positive numeric limit")
+    require_non_empty_string(budget.get("notes"), f"{gold_id}.resource_budget.notes")
+
+
+def validate_gold_slo_resource_budgets(budgets: Any, known_metrics: set[str]) -> None:
+    assert_true(isinstance(budgets, list) and budgets, "gold_slo_resource_budgets must be a non-empty array")
+    gold_ids: set[str] = set()
+    for budget in budgets:
+        assert_true(isinstance(budget, dict), "gold SLO/resource budget must be an object")
+        gold_id = budget.get("gold_id")
+        require_non_empty_string(gold_id, "gold_slo_resource_budgets.gold_id")
+        assert_true(gold_id not in gold_ids, f"duplicate gold budget {gold_id}")
+        gold_ids.add(gold_id)
+        assert_true(budget.get("evidence_status") == "not_exercised", f"{gold_id} must remain not_exercised in this partial fixture")
+        slo_metric_ids = budget.get("slo_metric_ids")
+        assert_true(isinstance(slo_metric_ids, list) and slo_metric_ids, f"{gold_id} slo_metric_ids must be non-empty")
+        for metric_id in slo_metric_ids:
+            assert_true(metric_id in known_metrics, f"{gold_id} references unknown SLO metric {metric_id}")
+        resources = budget.get("resource_budgets")
+        assert_true(isinstance(resources, list) and resources, f"{gold_id} resource_budgets must be non-empty")
+        for resource_budget in resources:
+            validate_gold_resource_budget(gold_id, resource_budget)
+        notes = budget.get("notes")
+        assert_true(isinstance(notes, list) and notes, f"{gold_id} notes must be non-empty")
+    missing = sorted(REQUIRED_PERFORMANCE_GOLD_IDS - gold_ids)
+    assert_true(not missing, f"performance budgets missing gold SLO/resource mappings: {', '.join(missing)}")
+
+
+def validate_performance_budgets(config: dict[str, Any]) -> None:
+    path = ROOT / config.get("path", PERFORMANCE_BUDGETS_PATH.relative_to(ROOT))
+    data = load_json(path)
+    assert_true(data.get("schema_version") == PERFORMANCE_BUDGET_SCHEMA_VERSION, "performance budget schema_version mismatch")
+    assert_true(data.get("task_id") == "FND-012", "performance budget task_id must be FND-012")
+    assert_true(data.get("evidence_scope") == PERFORMANCE_BUDGET_EVIDENCE_SCOPE, "performance budget evidence_scope mismatch")
+    non_claims = set(data.get("non_claims", []))
+    missing_non_claims = sorted(REQUIRED_PERFORMANCE_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"performance budgets missing non_claims: {', '.join(missing_non_claims)}")
+    validate_performance_environment(data.get("benchmark_environment"))
+    validate_performance_report_summary(data.get("report_summary"))
+    latency_metrics = validate_latency_budget_records(data.get("latency_budgets"))
+    throughput_metrics = validate_throughput_budget_records(data.get("throughput_budgets"))
+    known_metrics = latency_metrics | throughput_metrics
+    required_metrics = REQUIRED_LATENCY_BUDGET_METRICS | REQUIRED_THROUGHPUT_BUDGET_METRICS
+    validate_regression_thresholds(data.get("regression_thresholds"), required_metrics)
+    validate_retention_backpressure_actions(data.get("retention_backpressure_actions"), known_metrics)
+    validate_gold_slo_resource_budgets(data.get("gold_slo_resource_budgets"), known_metrics)
+
+
 def validate_case(case: dict[str, Any]) -> None:
     primitive = case.get("primitive")
     if primitive == "runtime_loop":
@@ -517,6 +718,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_stable_examples(case["stable_examples"])
     elif primitive == "compatibility":
         validate_compatibility(case["compatibility"])
+    elif primitive == "performance_budgets":
+        validate_performance_budgets(case["performance_budgets"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 

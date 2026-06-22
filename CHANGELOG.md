@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — 0.2/v2 foundation partial evidence
+
+### Added
+
+- Added a partial FND-012 performance budget contract in `splendor-types`, a
+  machine-readable 0.2 fixture, and conformance validation for mandatory
+  latency/throughput metrics, benchmark environment capture, regression
+  thresholds, retention/backpressure actions, and G29/G66/G68/G74 budget
+  mappings.
+
+### Explicitly not included
+
+- No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7
+  soak, 1,000-node, GPU/training, robotics, live fleet, or physical hardware
+  benchmark was executed by this slice.
+
 ## 0.1-dev — Stable primitive compatibility line
 
 ### Release and migration artifacts
