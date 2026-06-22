@@ -39,6 +39,8 @@ or containment links. It also rejects prompt-only/security-by-prompt wording suc
 as `system prompt`, `prompt instruction`, or `LLM instruction` in trust-boundary
 or enforcement controls even when `prompt_only` is set to false. `case_status:
 exercised` requires explicit executable gold evidence metadata, and the partial
-G80-G89 fixture remains `mapped_not_exercised`. Unsafe crypto-agility labels such
-as `none`, `md5`, `rsa_md5`, `plain`, and empty labels are rejected as validation
-failures only; this does not implement cryptography.
+G80-G89 fixture remains `mapped_not_exercised`. Crypto-agility labels use an
+explicit allow-list (`ed25519`, `ecdsa_p256_sha256`) so weak or underspecified
+labels such as `none`, `md5`, `rsa_md5`, `rsa_sha1`, `sha1`, `dsa_sha1`, `plain`,
+and empty labels are rejected as validation failures only; this does not
+implement cryptography or claim crypto enforcement.

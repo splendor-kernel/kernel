@@ -447,8 +447,8 @@
       "primitive": "security_invariants",
       "requirement": "CONF-0.2-FND-011-CRYPTO-AGILITY-SAFE-LABELS",
       "path": "negative_fixture",
-      "description": "Negative fixture proves unsafe crypto-agility labels are rejected without claiming crypto implementation.",
-      "expected_failure": "security_invariants unsafe crypto algorithm label 'rsa_md5'",
+      "description": "Negative fixture proves unsupported or unsafe crypto-agility labels are rejected by allow-list without claiming crypto implementation.",
+      "expected_failure": "security_invariants unsafe crypto algorithm label 'rsa_sha1'",
       "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-unsafe-crypto-negative.json" }
     },
     {

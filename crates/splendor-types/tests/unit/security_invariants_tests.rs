@@ -117,13 +117,35 @@ fn exercised_case_requires_executable_gold_evidence() {
 }
 
 #[test]
-fn unsafe_crypto_algorithm_labels_fail_validation() {
-    for algorithm in ["none", "md5", "rsa_md5", "plain", " "] {
+fn explicit_allowed_crypto_algorithm_labels_pass_validation() {
+    let mut catalog = fixture_catalog();
+    catalog.crypto_agility.allowed_signature_algorithms =
+        vec!["ed25519".to_string(), "ecdsa-p256-sha256".to_string()];
+
+    validate_security_invariant_catalog(&catalog)
+        .expect("only explicit allowed signature algorithms pass");
+}
+
+#[test]
+fn unsupported_or_unsafe_crypto_algorithm_labels_fail_validation() {
+    for algorithm in [
+        "none",
+        "md5",
+        "rsa_md5",
+        "plain",
+        "rsa_sha1",
+        "sha1",
+        "dsa_sha1",
+        "ecdsa_p192_sha256",
+        "rsa_pkcs1_sha1",
+        "rsa_pss_sha256",
+        " ",
+    ] {
         let mut catalog = fixture_catalog();
         catalog.crypto_agility.allowed_signature_algorithms = vec![algorithm.to_string()];
 
         let error = validate_security_invariant_catalog(&catalog)
-            .expect_err("unsafe crypto algorithm fails");
+            .expect_err("unsafe or unsupported crypto algorithm fails");
 
         if algorithm.trim().is_empty() {
             assert_eq!(

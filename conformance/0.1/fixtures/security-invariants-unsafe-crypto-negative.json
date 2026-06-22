@@ -3,7 +3,7 @@
   "evidence_scope": "partial_fnd_011_security_invariants_v0",
   "non_claims": ["no_fnd_011_completion", "no_g80_g89_pass", "no_gold_harness_pass"],
   "crypto_agility": {
-    "allowed_signature_algorithms": ["rsa_md5"],
+    "allowed_signature_algorithms": ["rsa_sha1"],
     "key_rotation": {
       "rotation_required": true,
       "revocation_path_required": true,

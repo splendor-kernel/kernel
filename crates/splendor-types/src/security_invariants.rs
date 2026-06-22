@@ -299,7 +299,12 @@ pub struct KeyRotationPolicy {
 /// Cryptographic agility posture for FND-011.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CryptoAgility {
-    /// Allowed signature algorithm labels for future signed controls.
+    /// Explicitly allowed signature algorithm labels for future signed controls.
+    ///
+    /// This bounded fixture contract intentionally uses a narrow allow-list rather
+    /// than a deny-list so weak or underspecified labels cannot become accidental
+    /// conformance evidence. Additional labels require a follow-up RFC or fixture
+    /// contract update.
     pub allowed_signature_algorithms: Vec<String>,
     /// Key rotation and revocation posture.
     pub key_rotation: KeyRotationPolicy,
@@ -421,7 +426,7 @@ pub enum SecurityInvariantValidationError {
         /// Missing field.
         field: &'static str,
     },
-    /// An unsafe or non-cryptographic algorithm label was present in crypto agility metadata.
+    /// An unsafe or unsupported algorithm label was present in crypto agility metadata.
     #[error("security invariant catalog uses unsafe crypto algorithm label {algorithm:?}")]
     UnsafeCryptoAlgorithm {
         /// Rejected algorithm label.
@@ -788,7 +793,7 @@ const PROMPT_ONLY_CONTROL_PHRASES: &[&str] = &[
     "instruction prompt",
 ];
 
-const UNSAFE_CRYPTO_ALGORITHM_LABELS: &[&str] = &["none", "plain", "plaintext", "md5"];
+const ALLOWED_SIGNATURE_ALGORITHM_LABELS: &[&str] = &["ed25519", "ecdsa_p256_sha256"];
 
 fn is_prompt_only_control_text(value: &str) -> bool {
     let normalized = normalize_free_text(value);
@@ -802,7 +807,7 @@ fn is_unsafe_crypto_algorithm_label(value: &str) -> bool {
     if normalized.is_empty() {
         return true;
     }
-    UNSAFE_CRYPTO_ALGORITHM_LABELS.contains(&normalized.as_str()) || normalized.contains("md5")
+    !ALLOWED_SIGNATURE_ALGORITHM_LABELS.contains(&normalized.as_str())
 }
 
 fn normalize_free_text(value: &str) -> String {

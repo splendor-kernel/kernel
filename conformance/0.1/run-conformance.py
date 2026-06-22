@@ -117,7 +117,7 @@ PROMPT_ONLY_SECURITY_PHRASES = {
     "developer instruction",
     "instruction prompt",
 }
-UNSAFE_CRYPTO_ALGORITHM_LABELS = {"none", "plain", "plaintext", "md5"}
+ALLOWED_SECURITY_SIGNATURE_ALGORITHMS = {"ed25519", "ecdsa_p256_sha256"}
 PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
 PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
 REQUIRED_PERFORMANCE_NON_CLAIMS = {
@@ -571,7 +571,7 @@ def validate_security_crypto_agility(data: dict[str, Any]) -> None:
     for algorithm in algorithms:
         label = require_non_empty_string(algorithm, "crypto_agility.allowed_signature_algorithms")
         normalized = normalize_security_label(label)
-        if normalized in UNSAFE_CRYPTO_ALGORITHM_LABELS or "md5" in normalized:
+        if normalized not in ALLOWED_SECURITY_SIGNATURE_ALGORITHMS:
             raise ConformanceError(f"security_invariants unsafe crypto algorithm label {label!r}")
     key_rotation = crypto.get("key_rotation")
     assert_true(isinstance(key_rotation, dict), "security_invariants key_rotation is required")
