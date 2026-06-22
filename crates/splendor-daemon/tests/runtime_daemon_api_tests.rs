@@ -8,7 +8,7 @@ use splendor_daemon::{
     PolicySyncRequest, PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse,
     RunStatus, StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
     StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
-    TracePageResponse,
+    TraceExportResponse, TracePageResponse,
 };
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
@@ -16,7 +16,7 @@ use splendor_types::{
     ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope, Percept,
     PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
     QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent, TraceEventKind,
-    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
     APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use time::OffsetDateTime;
@@ -339,6 +339,256 @@ fn matching_attribution(credential: &CallerCredential) -> AuditAttribution {
         credential_id: Some(credential.credential_id.clone()),
         requested_at: OffsetDateTime::now_utc(),
     }
+}
+
+const FND009_CANARIES: &[&str] = &[
+    "FND009_SECRET_VALUE_NEVER_RETURN",
+    "FND009_TOKEN_VALUE_NEVER_RETURN",
+    "FND009_AUTHORIZATION_VALUE_NEVER_RETURN",
+    "FND009_CREDENTIAL_VALUE_NEVER_RETURN",
+    "FND009_SIGNATURE_VALUE_NEVER_RETURN",
+    "FND009_PRIVATE_KEY_VALUE_NEVER_RETURN",
+    "FND009_STATE_BYTES_VALUE_NEVER_RETURN",
+    "FND009_SNAPSHOT_BYTES_VALUE_NEVER_RETURN",
+    "FND009_RESTRICTED_VALUE_NEVER_RETURN",
+    "FND009_LEGAL_HOLD_VALUE_NEVER_RETURN",
+    "FND009_REASON_VALUE_NEVER_RETURN",
+    "FND009_STATUS_VALUE_NEVER_RETURN",
+    "FND009_REASONS_VALUE_NEVER_RETURN",
+    "FND009_SOURCE_VALUE_NEVER_RETURN",
+    "FND009_SCHEMA_VALUE_NEVER_RETURN",
+    "FND009_AUTH_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_JWT_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_COOKIE_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SET_COOKIE_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SESSION_ID_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_CLIENT_SECRET_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_REFRESH_TOKEN_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SECRET_REF_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_REASON_PASSWORD_VALUE_NEVER_RETURN",
+    "FND009_STATUS_SECRET_VALUE_NEVER_RETURN",
+    "FND009_REASONS_CREDENTIAL_VALUE_NEVER_RETURN",
+    "FND009_SOURCE_SIGNATURE_VALUE_NEVER_RETURN",
+    "FND009_SCHEMA_TOKEN_VALUE_NEVER_RETURN",
+    "FND009_NAME_AUTH_VALUE_NEVER_RETURN",
+    "FND009_ADAPTER_AUTHZ_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_CAMEL_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_SNAKE_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_KEBAB_VALUE_NEVER_RETURN",
+    "FND009_AUTHZ_KEY_VALUE_NEVER_RETURN",
+];
+
+fn fnd009_sensitive_params() -> Value {
+    json!({
+        "secret": FND009_CANARIES[0],
+        "apiToken": FND009_CANARIES[1],
+        "authorization": format!("Bearer {}", FND009_CANARIES[2]),
+        "credential": FND009_CANARIES[3],
+        "signature": FND009_CANARIES[4],
+        "privateKey": format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", FND009_CANARIES[5]),
+        "state_bytes": FND009_CANARIES[6],
+        "snapshotBytes": FND009_CANARIES[7],
+        "nested": {
+            "restricted": FND009_CANARIES[8],
+            "legal_hold": FND009_CANARIES[9],
+        },
+        "visibility": "protected-eval",
+        "safetyLabel": "safety-local",
+        "reason": format!("token={} password {}", FND009_CANARIES[10], FND009_CANARIES[23]),
+        "status": format!("authorization={} secret {}", FND009_CANARIES[11], FND009_CANARIES[24]),
+        "reasons": [format!("credential={}", FND009_CANARIES[12]), format!("credential {}", FND009_CANARIES[25]), "safe_context_reason"],
+        "source": format!("secret={} signature {}", FND009_CANARIES[13], FND009_CANARIES[26]),
+        "schema": format!("jwt={} token {}", FND009_CANARIES[14], FND009_CANARIES[27]),
+        "name": format!("auth {}", FND009_CANARIES[28]),
+        "adapter": format!("authz {}", FND009_CANARIES[29]),
+        "auth": FND009_CANARIES[15],
+        "jwt": FND009_CANARIES[16],
+        "cookie": FND009_CANARIES[17],
+        "setCookie": FND009_CANARIES[18],
+        "sessionId": FND009_CANARIES[19],
+        "clientSecret": FND009_CANARIES[20],
+        "refreshToken": FND009_CANARIES[21],
+        "secretRef": FND009_CANARIES[22],
+        "authKey": FND009_CANARIES[30],
+        "nested_aliases": {
+            "auth_key": FND009_CANARIES[31],
+            "auth-key": FND009_CANARIES[32],
+            "authz": FND009_CANARIES[33],
+        },
+        "plain_context": "kept for causal shape",
+    })
+}
+
+fn fnd009_action(name: &str) -> Action {
+    let mut action = action(name);
+    action.params = fnd009_sensitive_params();
+    action
+}
+
+fn assert_canaries_absent<T: serde::Serialize>(label: &str, value: &T) {
+    let serialized = serde_json::to_string(value).expect("serialized redacted trace view");
+    for canary in FND009_CANARIES {
+        assert!(
+            !serialized.contains(canary),
+            "{label} leaked sensitive canary {canary}: {serialized}"
+        );
+    }
+}
+
+fn assert_trace_records_preserve_identity_and_reasons(
+    run_id: &RunId,
+    records: &[splendor_store::TraceRecord],
+) {
+    assert!(!records.is_empty(), "trace view should include records");
+    let run_id_string = run_id.to_string();
+    for (expected, record) in records.iter().enumerate() {
+        assert_eq!(record.run_id, run_id_string);
+        assert_eq!(record.sequence, expected as u64);
+        assert_eq!(
+            record.payload.get("run_id").and_then(Value::as_str),
+            Some(run_id_string.as_str())
+        );
+        assert_eq!(
+            record.payload.get("sequence").and_then(Value::as_u64),
+            Some(record.sequence)
+        );
+        assert!(
+            record
+                .payload
+                .get("trace_event_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty()),
+            "trace_event_id should remain visible at sequence {}",
+            record.sequence
+        );
+        assert!(
+            !record.event_hash.to_string().is_empty(),
+            "event_hash should remain visible at sequence {}",
+            record.sequence
+        );
+        if record.sequence == 0 {
+            assert!(record.prev_event_hash.is_none());
+        } else {
+            assert!(
+                record.prev_event_hash.is_some(),
+                "prev_event_hash should remain visible after the first event"
+            );
+        }
+    }
+
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/ActionDenied/result/reasons")
+                .and_then(Value::as_array)
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason == "action_not_allowed"))
+        }),
+        "denial reason should remain visible"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/OutcomeRecorded/outcome/action_outcome/status")
+                .and_then(Value::as_str)
+                == Some("Executed")
+        }),
+        "action status should remain visible"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/ActionVerificationStarted/action/params/visibility")
+                .and_then(Value::as_str)
+                == Some("[REDACTED:protected-eval]")
+        }),
+        "protected-eval existence should remain visible as a redacted marker"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/ActionVerificationStarted/action/params/reason")
+                .and_then(Value::as_str)
+                == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/status")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/0")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/1")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/2")
+                    .and_then(Value::as_str)
+                    == Some("safe_context_reason")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/source")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/schema")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/name")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/adapter")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/authKey")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth_key")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth-key")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/authz")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+        }),
+        "sensitive allow-listed text and auth aliases should redact while safe reason text remains visible"
+    );
+}
+
+fn assert_trace_export_audit_event_visible(records: &[splendor_store::TraceRecord]) {
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/DaemonAudit/endpoint")
+                .and_then(Value::as_str)
+                == Some("splendor.traces.export.redacted")
+        }),
+        "trace export audit event should remain visible"
+    );
 }
 
 fn public_caller_credential_header(scopes: Vec<&str>) -> HeaderValue {
@@ -752,6 +1002,172 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         inspected_after_replay.adapter_executions, before_replay_executions,
         "replay must not call adapters again"
     );
+}
+
+#[tokio::test]
+async fn trace_read_and_export_redact_sensitive_payload_views() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, initial_traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=redacted", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = initial_traces
+        .records
+        .first()
+        .and_then(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .map(|event| event.trace_event_id)
+        .unwrap_or_else(|| TraceId::from_run_sequence(&created.run_id, 0));
+
+    let action_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ActionsSubmit]);
+    let action_audit = matching_attribution(&action_credential);
+    let allowed_action_id = ActionId::new();
+    let allowed_submit = SubmitActionRequest {
+        action_id: Some(allowed_action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        credential: Some(action_credential.clone()),
+        audit_attribution: Some(action_audit.clone()),
+        causal_trace_id: Some(causal_trace_id.clone()),
+        action: fnd009_action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, allowed_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(allowed_submit).expect("allowed submit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(allowed_outcome.action_id, allowed_action_id);
+    assert_eq!(
+        allowed_outcome.status,
+        splendor_gateway::ActionStatus::Executed
+    );
+
+    let denied_action_id = ActionId::new();
+    let denied_submit = SubmitActionRequest {
+        action_id: Some(denied_action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id,
+        credential: Some(action_credential),
+        audit_attribution: Some(action_audit),
+        causal_trace_id: Some(causal_trace_id),
+        action: fnd009_action("blocked_sensitive_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(denied_submit).expect("denied submit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied_outcome.action_id, denied_action_id);
+    assert_eq!(
+        denied_outcome.status,
+        splendor_gateway::ActionStatus::Denied
+    );
+    assert!(denied_outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "action_not_allowed"));
+
+    let (status, redacted_read): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=redacted", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_canaries_absent("redacted trace read", &redacted_read);
+    assert_trace_records_preserve_identity_and_reasons(&created.run_id, &redacted_read.records);
+
+    let (status, none_read): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_canaries_absent("none trace read mandatory redaction", &none_read);
+    assert_trace_records_preserve_identity_and_reasons(&created.run_id, &none_read.records);
+
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = matching_attribution(&trace_credential);
+    let (status, redacted_export): (StatusCode, TraceExportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({
+            "credential": trace_credential.clone(),
+            "audit_attribution": trace_audit.clone(),
+            "redaction_policy": "redacted",
+            "start": null,
+            "end": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(redacted_export.redaction_policy, "redacted");
+    assert_eq!(redacted_export.record_count, redacted_export.records.len());
+    assert!(redacted_export
+        .integrity_hash
+        .starts_with("trace-chain:v1:"));
+    assert_canaries_absent("redacted trace export", &redacted_export);
+    assert_trace_records_preserve_identity_and_reasons(&created.run_id, &redacted_export.records);
+    assert_trace_export_audit_event_visible(&redacted_export.records);
+
+    let (status, none_export): (StatusCode, TraceExportResponse) = call_json(
+        app,
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({
+            "credential": trace_credential,
+            "audit_attribution": trace_audit,
+            "redaction_policy": "none",
+            "start": null,
+            "end": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(none_export.redaction_policy, "none");
+    assert_canaries_absent("none trace export mandatory redaction", &none_export);
+    assert_trace_records_preserve_identity_and_reasons(&created.run_id, &none_export.records);
+    assert_trace_export_audit_event_visible(&none_export.records);
 }
 
 #[tokio::test]
