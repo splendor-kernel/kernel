@@ -106,7 +106,7 @@ Scopes should be stable string values so clients and generated tests can reason 
 | `evaluatePlacement` | `/fleet/placement/evaluate` | `POST` | `splendor.fleet.read` | Explains valid target or rejection based on explicit capability/work-order rules. |
 | `submitWorkOrder` | `/work-orders` | `POST` | `splendor.work_orders.submit` | Validates signature, tenant, expiry, revocation, allowed actions/adapters/permissions/data refs/quotas/audience. |
 | `revokeWorkOrder` | `/work-orders/{work_order_id}/revoke` | `POST` | `splendor.work_orders.revoke` | Prevents create/resume/authorize for revoked work order. |
-| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. |
+| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. Resident daemon create-run payloads carry deterministic request and idempotency keys derived from dispatch scope. |
 | `getFleetTelemetry` | `/fleet/telemetry` | `GET` | `splendor.fleet.read` | Reports health/run/quota/trace-sync status; non-authoritative. |
 | `syncTraceBuffer` | `/fleet/traces/sync` | `POST` | `splendor.traces.read` or node sync credential | Aggregates trace buffers with ordering/integrity validation. |
 

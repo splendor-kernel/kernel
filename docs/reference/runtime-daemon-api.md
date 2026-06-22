@@ -113,6 +113,14 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 The OpenAPI description is maintained in
 [`openapi/splendor-runtime-daemon.yaml`](../../openapi/splendor-runtime-daemon.yaml).
 
+`GET /capabilities` returns `service_profiles` with truthful maturity labels for
+the current daemon surface. The local run API is reported as implemented for the
+0.1 compatibility line, bounded create-run idempotency v0 is reported as
+experimental for `POST /runs` only, physical/device endpoints are reported as
+simulated, and v2 watch streams plus G00/G06 evidence remain unavailable/not
+exercised until an executable fixture proves them. Capability labels are
+discovery metadata, not action or work-order authority.
+
 ## Local transport and security
 
 The reference daemon binary binds to `127.0.0.1:8077` and emits a visible warning
@@ -144,6 +152,17 @@ incompatible bundles before policy invocation or adapter execution can occur.
 - a scheduler containing one loop engine;
 - a `VerifiedActionGateway` with explicitly registered local adapters;
 - optional `approval_policies` evaluated by the gateway approval verifier.
+
+`CreateRunRequest` also requires non-blank `request_id` and `idempotency_key`.
+The request ID is correlation only and remains distinct from `run_id` and
+`work_order_id`. The daemon owns a bounded in-memory create-run idempotency ledger
+scoped by caller/principal, tenant, agent, work order, resolved run ID, and the
+creation request fingerprint. The first accepted request returns an
+`idempotency_receipt_id`; an exact retry with the same key and scope returns the
+same run and receipt with `duplicate: true` and does not create another run slot.
+Reusing an idempotency key for a different scope fails closed with
+`create_run_idempotency_scope_mismatch`; public error details intentionally omit
+raw attempted/existing scope fields and caller identifiers.
 
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`

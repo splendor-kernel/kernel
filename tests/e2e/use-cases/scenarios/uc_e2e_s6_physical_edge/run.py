@@ -235,7 +235,10 @@ def quota() -> dict[str, int]:
 
 def create_run_payload(envelope: dict[str, Any]) -> dict[str, Any]:
     cred = edge_credential()
+    work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", WORK_ORDER_ID)
     return {
+        "request_id": f"req-uc-e2e-s6-{work_order_id}-{RUN_ID}",
+        "idempotency_key": f"idem-uc-e2e-s6-{work_order_id}-{RUN_ID}",
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "work_order": envelope,

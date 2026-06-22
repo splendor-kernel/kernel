@@ -1180,6 +1180,8 @@ export interface AuditAttribution {
 }
 
 export interface CreateRunRequest {
+  request_id: string;
+  idempotency_key: string;
   tenant_id: TenantId;
   agent_id: AgentId;
   work_order: WorkOrderEnvelope;
@@ -1201,6 +1203,10 @@ export interface CreateRunRequest {
 }
 
 export interface CreateRunResponse {
+  request_id: string;
+  idempotency_key: string;
+  idempotency_receipt_id: string;
+  duplicate: boolean;
   run_id: RunId;
   status: RunStatus;
 }
@@ -1347,6 +1353,17 @@ export interface CapabilitiesResponse {
   local_only: boolean;
   replay_modes: string[];
   endpoints: string[];
+  service_profiles: ServiceCapabilityProfile[];
+}
+
+export type ServiceCapabilityStatus = "implemented" | "experimental" | "simulated" | "unavailable";
+
+export interface ServiceCapabilityProfile {
+  name: string;
+  status: ServiceCapabilityStatus;
+  maturity: string;
+  endpoints: string[];
+  notes: string[];
 }
 
 export const CANONICAL_SCHEMA_FIELDS = {
@@ -1437,6 +1454,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
   trace_event: ["trace_event_id", "run_id", "sequence", "timestamp", "identity", "kind"],
   state_head: ["run_id", "state_node_id", "parent_state_node_ids", "data_hash", "created_at", "label"],
   create_run_request: [
+    "request_id",
+    "idempotency_key",
     "tenant_id",
     "agent_id",
     "work_order",
@@ -1500,7 +1519,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
   ],
   health_response: ["status", "local_only", "runtime_available"],
   version_response: ["daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"],
-  capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints"]
+  capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints", "service_profiles"]
 } as const satisfies {
   message: readonly (keyof Message)[];
   run_config: readonly (keyof RunConfig)[];

@@ -1367,6 +1367,8 @@ fn resident_create_run_payload(
         );
     }
     let mut create = serde_json::json!({
+        "request_id": format!("req-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
+        "idempotency_key": format!("idem-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
         "tenant_id": work_order.work_order.tenant_id,
         "agent_id": work_order.work_order.agent_id,
         "work_order": work_order,
@@ -4723,6 +4725,39 @@ mod tests {
             payload["allowed_permissions"],
             serde_json::json!(work_order.work_order.allowed_permissions)
         );
+        assert_eq!(
+            payload["request_id"],
+            serde_json::json!(format!(
+                "req-manager-dispatch-{}-{run_id}",
+                work_order.work_order.work_order_id
+            ))
+        );
+        assert_eq!(
+            payload["idempotency_key"],
+            serde_json::json!(format!(
+                "idem-manager-dispatch-{}-{run_id}",
+                work_order.work_order.work_order_id
+            ))
+        );
+        let repeated = resident_create_run_payload(
+            &work_order,
+            &run_id,
+            serde_json::json!({"credential_id":"resident-test"}),
+            serde_json::json!({"credential_id":"resident-test"}),
+        )
+        .expect("repeated payload derives deterministically");
+        assert_eq!(repeated["request_id"], payload["request_id"]);
+        assert_eq!(repeated["idempotency_key"], payload["idempotency_key"]);
+        let distinct_run = RunId::new();
+        let distinct = resident_create_run_payload(
+            &work_order,
+            &distinct_run,
+            serde_json::json!({"credential_id":"resident-test"}),
+            serde_json::json!({"credential_id":"resident-test"}),
+        )
+        .expect("distinct run payload derives from distinct run id");
+        assert_ne!(distinct["request_id"], payload["request_id"]);
+        assert_ne!(distinct["idempotency_key"], payload["idempotency_key"]);
         assert!(payload["registered_actions"]
             .as_array()
             .expect("registered actions")
