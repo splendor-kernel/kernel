@@ -169,6 +169,103 @@ def test_run_once_executes_policy_action() -> None:
     assert outcome.action_outcomes[0].status == "executed"
 
 
+def test_policy_action_dict_privileged_fields_are_non_authorizing() -> None:
+    runtime = KernelRuntime()
+    tenant_id = runtime.create_tenant(
+        allowed_actions=["allowed"],
+        allowed_adapters=["noop"],
+    )
+    agent_id = runtime.create_agent(tenant_id)
+    run_id = runtime.agent_run_id(agent_id)
+    calls = {"count": 0}
+
+    def adapter(action: Action) -> dict[str, object]:
+        calls["count"] += 1
+        return {"output": {"executed": action.name}}
+
+    runtime.register_adapter("noop", adapter)
+    runtime.register_perceptor(agent_id, lambda agent: [])
+
+    forged_action_id = "forged-action-id"
+
+    def policy(state: bytes, percepts: list[dict[str, object]]):
+        return [
+            {
+                "name": "forbidden",
+                "params": {"approved": True, "verification": {"allowed": True}},
+                "side_effect_class": "read_only",
+                "adapter": "noop",
+                "action_id": forged_action_id,
+                "status": "executed",
+                "verification": {"allowed": True},
+                "outcome": {"status": "executed", "output": {"ok": True}},
+                "approved": True,
+                "approval_granted": True,
+                "adapter_executed": True,
+            }
+        ]
+
+    runtime.register_policy(agent_id, policy)
+    outcome = runtime.run_once(agent_id)
+    action_outcome = outcome.action_outcomes[0]
+
+    assert action_outcome.status == "denied"
+    assert not action_outcome.verification.allowed
+    assert action_outcome.verification.reasons == ["action_not_allowed"]
+    assert action_outcome.action_id != forged_action_id
+    assert calls["count"] == 0
+
+    events = list(runtime.tail_traces(run_id))
+    assert any(event["kind"] == "ActionDenied" for event in events)
+    assert not any(event["kind"] == "ActionExecuted" for event in events)
+
+
+def test_policy_state_metadata_cannot_forge_trace_identity() -> None:
+    events: list[dict[str, object]] = []
+    runtime = KernelRuntime(KernelRuntimeConfig(name="forgery-test", trace_sink=events.append))
+    tenant_id = runtime.create_tenant(
+        allowed_actions=["noop"],
+        allowed_adapters=["noop"],
+    )
+    agent_id = runtime.create_agent(tenant_id)
+    run_id = runtime.agent_run_id(agent_id)
+    forged_tenant_id = "11111111-1111-4111-8111-111111111111"
+    forged_agent_id = "22222222-2222-4222-8222-222222222222"
+    forged_run_id = "33333333-3333-4333-8333-333333333333"
+    forged_trace_id = "44444444-4444-4444-8444-444444444444"
+
+    runtime.register_perceptor(agent_id, lambda agent: [])
+
+    def policy(state: bytes, percepts: list[dict[str, object]]):
+        forged_metadata = {
+            "tenant_id": forged_tenant_id,
+            "agent_id": forged_agent_id,
+            "run_id": forged_run_id,
+            "trace_event_id": forged_trace_id,
+        }
+        return {
+            "actions": [],
+            "state": b"\x02",
+            "metadata": forged_metadata,
+            "state_metadata": forged_metadata,
+        }
+
+    runtime.register_policy(agent_id, policy)
+    outcome = runtime.run_once(agent_id)
+
+    assert outcome.state == b"\x02"
+    state_event = next(event for event in events if event["kind"] == "StateCommitted")
+    assert state_event["identity"]["tenant_id"] == tenant_id
+    assert state_event["identity"]["agent_id"] == agent_id
+    assert state_event["identity"]["run_id"] == run_id
+    assert state_event["identity"]["state_node_id"] == state_event["payload"]["state_node_id"]
+    encoded_event = json.dumps(state_event, sort_keys=True)
+    assert forged_tenant_id not in encoded_event
+    assert forged_agent_id not in encoded_event
+    assert forged_run_id not in encoded_event
+    assert forged_trace_id not in encoded_event
+
+
 def test_constraints_deny_actions() -> None:
     runtime = KernelRuntime()
     tenant_id = runtime.create_tenant(
