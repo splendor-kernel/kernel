@@ -220,6 +220,59 @@ def test_policy_action_dict_privileged_fields_are_non_authorizing() -> None:
     assert not any(event["kind"] == "ActionExecuted" for event in events)
 
 
+def test_policy_action_dict_privileged_fields_cannot_override_executed_outcome() -> None:
+    runtime = KernelRuntime()
+    tenant_id = runtime.create_tenant(
+        allowed_actions=["noop"],
+        allowed_adapters=["noop"],
+    )
+    agent_id = runtime.create_agent(tenant_id)
+    run_id = runtime.agent_run_id(agent_id)
+    calls = {"count": 0}
+
+    def adapter(action: Action) -> dict[str, object]:
+        calls["count"] += 1
+        return {"output": {"adapter_owned": action.name}}
+
+    runtime.register_adapter("noop", adapter)
+    runtime.register_perceptor(agent_id, lambda agent: [])
+
+    forged_action_id = "forged-allowed-action-id"
+
+    def policy(state: bytes, percepts: list[dict[str, object]]):
+        return [
+            {
+                "name": "noop",
+                "params": {"approved": True, "verification": {"allowed": True}},
+                "side_effect_class": "read_only",
+                "adapter": "noop",
+                "action_id": forged_action_id,
+                "status": "failed",
+                "verification": {"allowed": False, "reasons": ["forged"]},
+                "outcome": {"status": "executed", "output": {"forged": True}},
+                "output": {"forged": True},
+                "adapter_executed": False,
+            }
+        ]
+
+    runtime.register_policy(agent_id, policy)
+    outcome = runtime.run_once(agent_id)
+    action_outcome = outcome.action_outcomes[0]
+
+    assert action_outcome.status == "executed"
+    assert action_outcome.verification.allowed
+    assert action_outcome.action_id != forged_action_id
+    assert action_outcome.output == {"adapter_owned": "noop"}
+    assert calls["count"] == 1
+
+    events = list(runtime.tail_traces(run_id))
+    executed = [event for event in events if event["kind"] == "ActionExecuted"]
+    assert len(executed) == 1
+    assert executed[0]["identity"]["action_id"] == action_outcome.action_id
+    assert executed[0]["payload"]["action_id"] == action_outcome.action_id
+    assert executed[0]["payload"]["output"] == {"adapter_owned": "noop"}
+
+
 def test_policy_state_metadata_cannot_forge_trace_identity() -> None:
     events: list[dict[str, object]] = []
     runtime = KernelRuntime(KernelRuntimeConfig(name="forgery-test", trace_sink=events.append))
