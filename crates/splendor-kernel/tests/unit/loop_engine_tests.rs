@@ -311,6 +311,42 @@ impl Policy for MultiActionPolicy {
     }
 }
 
+struct ForgedStateMetadataPolicy {
+    tenant_id: splendor_types::TenantId,
+    agent_id: splendor_types::AgentId,
+    run_id: RunId,
+    trace_event_id: splendor_types::TraceEventId,
+}
+
+impl Policy for ForgedStateMetadataPolicy {
+    fn name(&self) -> &str {
+        "forged-state-metadata-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        let mut metadata = StateMetadata::new(
+            OffsetDateTime::now_utc(),
+            Some("policy-supplied-label".to_string()),
+        );
+        metadata.tenant_id = Some(self.tenant_id.clone());
+        metadata.agent_id = Some(self.agent_id.clone());
+        metadata.run_id = Some(self.run_id.clone());
+        metadata.trace_event_id = Some(self.trace_event_id.clone());
+        Ok(PolicyDecision {
+            actions: Vec::new(),
+            next_state: StateData {
+                bytes: vec![9],
+                content_type: None,
+            },
+            metadata,
+        })
+    }
+}
+
 fn work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrder {
     let now = OffsetDateTime::now_utc();
     WorkOrder {
@@ -537,6 +573,94 @@ fn loop_engine_emits_ordered_trace_events() {
             Some(&outcome.action_outcomes[0].action_id)
         );
     }
+}
+
+#[test]
+fn loop_engine_overwrites_policy_state_metadata_identity() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = CapturingTraceSink {
+        events: Arc::clone(&events),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink),
+        ..KernelRuntimeConfig::default()
+    });
+    let runtime_run_id = runtime.run_id().clone();
+
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store.clone(), SnapshotPolicy::default());
+    let initial_state = StateData {
+        bytes: vec![1],
+        content_type: None,
+    };
+    let agent_id = splendor_types::AgentId::new();
+    let tenant_id = splendor_types::TenantId::new();
+    let agent = AgentContext::new(
+        agent_id.clone(),
+        tenant_id.clone(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let forged_tenant_id = splendor_types::TenantId::new();
+    let forged_agent_id = splendor_types::AgentId::new();
+    let forged_run_id = RunId::new();
+    let forged_trace_event_id = splendor_types::TraceEventId::new();
+
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        graph,
+        initial_state,
+        Box::new(ForgedStateMetadataPolicy {
+            tenant_id: forged_tenant_id.clone(),
+            agent_id: forged_agent_id.clone(),
+            run_id: forged_run_id.clone(),
+            trace_event_id: forged_trace_event_id.clone(),
+        }),
+        Arc::new(StubGateway),
+        runtime,
+    );
+
+    let outcome = engine.tick(1).expect("tick");
+
+    let recorded = events.lock().expect("events lock");
+    let state_event = recorded
+        .iter()
+        .find(|event| matches!(event.kind, TraceEventKind::StateCommitted { .. }))
+        .expect("state committed");
+    assert_eq!(outcome.state_commit.tenant_id.as_ref(), Some(&tenant_id));
+    assert_eq!(outcome.state_commit.agent_id.as_ref(), Some(&agent_id));
+    assert_eq!(outcome.state_commit.run_id.as_ref(), Some(&runtime_run_id));
+    assert_eq!(
+        outcome.state_commit.trace_event_id.as_ref(),
+        Some(&state_event.trace_event_id)
+    );
+    assert_ne!(
+        outcome.state_commit.tenant_id.as_ref(),
+        Some(&forged_tenant_id)
+    );
+    assert_ne!(
+        outcome.state_commit.agent_id.as_ref(),
+        Some(&forged_agent_id)
+    );
+    assert_ne!(outcome.state_commit.run_id.as_ref(), Some(&forged_run_id));
+    assert_ne!(
+        outcome.state_commit.trace_event_id.as_ref(),
+        Some(&forged_trace_event_id)
+    );
+
+    let node = store
+        .get_node(&outcome.state_commit.node_id)
+        .expect("stored state node");
+    assert_eq!(node.metadata.tenant_id.as_ref(), Some(&tenant_id));
+    assert_eq!(node.metadata.agent_id.as_ref(), Some(&agent_id));
+    assert_eq!(node.metadata.run_id.as_ref(), Some(&runtime_run_id));
+    assert_eq!(
+        node.metadata.trace_event_id.as_ref(),
+        Some(&state_event.trace_event_id)
+    );
+    assert_eq!(
+        node.metadata.label.as_deref(),
+        Some("policy-supplied-label")
+    );
 }
 
 #[test]
