@@ -371,3 +371,220 @@ fn rejects_missing_gold_budget_mapping() {
         Err(PerformanceBudgetValidationError::MissingGoldBudget { gold_id: "G68" })
     ));
 }
+
+#[test]
+fn rejects_header_and_report_shape_failures() {
+    let mut missing_schema = valid_catalog();
+    missing_schema.schema_version.clear();
+    assert!(matches!(
+        missing_schema.validate(),
+        Err(PerformanceBudgetValidationError::MissingSchema)
+    ));
+
+    let mut unsupported_schema = valid_catalog();
+    unsupported_schema.schema_version = "splendor.performance_budgets.v2".to_string();
+    assert!(matches!(
+        unsupported_schema.validate(),
+        Err(PerformanceBudgetValidationError::UnsupportedSchema { schema })
+            if schema == "splendor.performance_budgets.v2"
+    ));
+
+    let mut wrong_task = valid_catalog();
+    wrong_task.task_id = "FND-999".to_string();
+    assert!(matches!(
+        wrong_task.validate(),
+        Err(PerformanceBudgetValidationError::WrongTaskId)
+    ));
+
+    let mut wrong_scope = valid_catalog();
+    wrong_scope.evidence_scope = "benchmark_execution".to_string();
+    assert!(matches!(
+        wrong_scope.validate(),
+        Err(PerformanceBudgetValidationError::WrongEvidenceScope)
+    ));
+
+    let mut missing_claim = valid_catalog();
+    missing_claim
+        .non_claims
+        .retain(|claim| claim != "no_g74_pass");
+    assert!(matches!(
+        missing_claim.validate(),
+        Err(PerformanceBudgetValidationError::MissingNonClaim {
+            claim: "no_g74_pass"
+        })
+    ));
+
+    let mut missing_report_id = valid_catalog();
+    missing_report_id.report_summary.report_id.clear();
+    assert!(matches!(
+        missing_report_id.validate(),
+        Err(PerformanceBudgetValidationError::MissingReportSummaryField { field: "report_id" })
+    ));
+
+    let mut missing_suite = valid_catalog();
+    missing_suite.report_summary.benchmark_suite.clear();
+    assert!(matches!(
+        missing_suite.validate(),
+        Err(
+            PerformanceBudgetValidationError::MissingReportSummaryField {
+                field: "benchmark_suite"
+            }
+        )
+    ));
+
+    let mut missing_summary = valid_catalog();
+    missing_summary.report_summary.summary.clear();
+    assert!(matches!(
+        missing_summary.validate(),
+        Err(PerformanceBudgetValidationError::MissingReportSummaryField { field: "summary" })
+    ));
+}
+
+#[test]
+fn rejects_metric_and_boundary_failures() {
+    let mut duplicate_latency = valid_catalog();
+    duplicate_latency.latency_budgets[1].metric_id = "local_event_append".to_string();
+    assert!(matches!(
+        duplicate_latency.validate(),
+        Err(PerformanceBudgetValidationError::DuplicateMetric { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut bad_latency_order = valid_catalog();
+    bad_latency_order.latency_budgets[0].max_p95_ms = 1.0;
+    bad_latency_order.latency_budgets[0].max_p50_ms = 2.0;
+    assert!(matches!(
+        bad_latency_order.validate(),
+        Err(PerformanceBudgetValidationError::InvalidLatencyBudget { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut missing_throughput = valid_catalog();
+    missing_throughput
+        .throughput_budgets
+        .retain(|budget| budget.metric_id != "artifact_transfer");
+    assert!(matches!(
+        missing_throughput.validate(),
+        Err(PerformanceBudgetValidationError::MissingThroughputMetric {
+            metric_id: "artifact_transfer"
+        })
+    ));
+
+    let mut duplicate_throughput = valid_catalog();
+    duplicate_throughput.throughput_budgets[1].metric_id = "event_ingestion".to_string();
+    assert!(matches!(
+        duplicate_throughput.validate(),
+        Err(PerformanceBudgetValidationError::DuplicateMetric { metric_id })
+            if metric_id == "event_ingestion"
+    ));
+
+    let mut zero_window = valid_catalog();
+    zero_window.throughput_budgets[0].window_seconds = 0;
+    assert!(matches!(
+        zero_window.validate(),
+        Err(PerformanceBudgetValidationError::InvalidThroughputBudget { metric_id })
+            if metric_id == "event_ingestion"
+    ));
+
+    let mut evidence_skipped = valid_catalog();
+    evidence_skipped.latency_budgets[0]
+        .measurement_boundary
+        .evidence_checks_included = false;
+    assert!(matches!(
+        evidence_skipped.validate(),
+        Err(PerformanceBudgetValidationError::EvidenceChecksSkipped { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut authority_skipped = valid_catalog();
+    authority_skipped.latency_budgets[0]
+        .measurement_boundary
+        .authority_checks_included = false;
+    assert!(matches!(
+        authority_skipped.validate(),
+        Err(PerformanceBudgetValidationError::AuthorityChecksSkipped { metric_id })
+            if metric_id == "local_event_append"
+    ));
+}
+
+#[test]
+fn rejects_retention_and_gold_budget_failures() {
+    let mut invalid_threshold = valid_catalog();
+    invalid_threshold.regression_thresholds[0]
+        .baseline_ref
+        .clear();
+    assert!(matches!(
+        invalid_threshold.validate(),
+        Err(PerformanceBudgetValidationError::InvalidRegressionThreshold { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut invalid_action = valid_catalog();
+    invalid_action.retention_backpressure_actions[0].fail_closed = false;
+    assert!(matches!(
+        invalid_action.validate(),
+        Err(PerformanceBudgetValidationError::InvalidRetentionBackpressureAction { action_id })
+            if action_id == "retain_event_log_by_budget"
+    ));
+
+    let mut missing_backpressure = valid_catalog();
+    missing_backpressure
+        .retention_backpressure_actions
+        .retain(|action| action.kind != RetentionBackpressureKind::Backpressure);
+    assert!(matches!(
+        missing_backpressure.validate(),
+        Err(
+            PerformanceBudgetValidationError::MissingRetentionBackpressureKind {
+                kind: "backpressure"
+            }
+        )
+    ));
+
+    let mut duplicate_gold = valid_catalog();
+    duplicate_gold.gold_slo_resource_budgets[1].gold_id = "G29".to_string();
+    assert!(matches!(
+        duplicate_gold.validate(),
+        Err(PerformanceBudgetValidationError::InvalidGoldBudget { gold_id }) if gold_id == "G29"
+    ));
+
+    let mut implemented_gold = valid_catalog();
+    implemented_gold.gold_slo_resource_budgets[0].evidence_status =
+        GoldBudgetEvidenceStatus::SpecifiedNotImplemented;
+    assert!(matches!(
+        implemented_gold.validate(),
+        Err(PerformanceBudgetValidationError::InvalidGoldBudget { gold_id }) if gold_id == "G29"
+    ));
+
+    let mut unknown_metric = valid_catalog();
+    unknown_metric.gold_slo_resource_budgets[0]
+        .slo_metric_ids
+        .push("unknown_metric".to_string());
+    assert!(matches!(
+        unknown_metric.validate(),
+        Err(PerformanceBudgetValidationError::UnknownGoldMetricReference { gold_id, metric_id })
+            if gold_id == "G29" && metric_id == "unknown_metric"
+    ));
+
+    let mut zero_nodes = valid_catalog();
+    zero_nodes.gold_slo_resource_budgets[2].resource_budgets[0].max_nodes = Some(0);
+    assert!(matches!(
+        zero_nodes.validate(),
+        Err(PerformanceBudgetValidationError::InvalidGoldBudget { gold_id }) if gold_id == "G68"
+    ));
+
+    let mut empty_resource = valid_catalog();
+    empty_resource.gold_slo_resource_budgets[0].resource_budgets[0] = ResourceBudget {
+        resource_id: " ".to_string(),
+        kind: ResourceBudgetKind::Worker,
+        cpu_cores: None,
+        memory_mib: None,
+        storage_mib: None,
+        network_mbps: None,
+        max_nodes: None,
+        notes: " ".to_string(),
+    };
+    assert!(matches!(
+        empty_resource.validate(),
+        Err(PerformanceBudgetValidationError::InvalidGoldBudget { gold_id }) if gold_id == "G29"
+    ));
+}
