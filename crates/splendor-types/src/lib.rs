@@ -48,6 +48,7 @@ mod node_registry;
 mod placement;
 mod policy_distribution;
 mod primitives;
+mod schema_extensions;
 mod state_handoff;
 mod trace;
 mod work_order;
@@ -149,6 +150,12 @@ pub use policy_distribution::{
 pub use primitives::{
     Action, Constraint, ConstraintKind, ConstraintScope, CostEstimate, Feedback, Percept,
     PerceptProvenance, QuotaUsage, Reward, SideEffectClass, VerificationResult,
+};
+pub use schema_extensions::{
+    is_reserved_extension_key, normalize_extension_key, validate_extension_map,
+    validate_extension_map_with_reserved_keys, validate_extension_value,
+    validate_extension_value_with_reserved_keys, ExtensionValidationError,
+    ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
 };
 pub use state_handoff::{
     StateHandoff, StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext,

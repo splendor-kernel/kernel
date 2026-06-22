@@ -7,6 +7,7 @@
 //! approval queues, circuit-breaker blocking, and kill-switch propagation are
 //! later isolated sprints.
 
+use crate::{schema_extensions, ExtensionValidationError};
 use crate::{
     ActionId, AgentId, ApprovalId, CircuitBreakerId, EscalationId, FleetId, InstanceId,
     InterventionId, KillSwitchId, NodeId, RunId, SideEffectClass, TenantId, TraceEventId,
@@ -19,6 +20,19 @@ use uuid::Uuid;
 
 /// Canonical governance state schema version introduced in 0.04-S1.
 pub const GOVERNANCE_STATE_SCHEMA_VERSION: &str = "splendor.governance_state.v1";
+
+const GOVERNANCE_EXTENSION_RESERVED_KEYS: &[&str] = &[
+    "issuer",
+    "issuer_id",
+    "source",
+    "reason",
+    "created_at",
+    "expires_at",
+    "revocation",
+    "revoked_at",
+    "status",
+    "state",
+];
 
 /// Forward-compatible, non-authoritative governance extension fields.
 pub type GovernanceExtensions = BTreeMap<String, serde_json::Value>;
@@ -1664,87 +1678,18 @@ fn validate_non_blank(field: &'static str, value: &str) -> Result<(), Governance
 }
 
 fn validate_extensions(extensions: &GovernanceExtensions) -> Result<(), GovernanceValidationError> {
-    for (key, value) in extensions {
-        let normalized = normalize_extension_key(key);
-        if key.trim().is_empty() || key.trim() != key {
-            return Err(GovernanceValidationError::InvalidExtensions {
-                reason: "blank_extension_key".to_string(),
-            });
-        }
-        if is_reserved_extension_key(&normalized) {
-            return Err(GovernanceValidationError::InvalidExtensions {
-                reason: format!("reserved_extension_key:{key}"),
-            });
-        }
-        reject_reserved_extension_value(value)?;
-    }
-    Ok(())
-}
-
-fn reject_reserved_extension_value(
-    value: &serde_json::Value,
-) -> Result<(), GovernanceValidationError> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object {
-                let normalized = normalize_extension_key(key);
-                if is_reserved_extension_key(&normalized) {
-                    return Err(GovernanceValidationError::InvalidExtensions {
-                        reason: format!("reserved_extension_key:{key}"),
-                    });
-                }
-                reject_reserved_extension_value(child)?;
-            }
-            Ok(())
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                reject_reserved_extension_value(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn normalize_extension_key(key: &str) -> String {
-    key.trim().to_ascii_lowercase().replace('-', "_")
-}
-
-fn is_reserved_extension_key(key: &str) -> bool {
-    matches!(
-        key,
-        "scope"
-            | "scope_type"
-            | "tenant_id"
-            | "agent_id"
-            | "run_id"
-            | "action_id"
-            | "adapter"
-            | "fleet_id"
-            | "node_id"
-            | "instance_id"
-            | "issuer"
-            | "issuer_id"
-            | "source"
-            | "reason"
-            | "created_at"
-            | "expires_at"
-            | "revocation"
-            | "revoked_at"
-            | "status"
-            | "state"
-            | "allowed_actions"
-            | "allowed_adapters"
-            | "allowed_permissions"
-            | "permissions"
-            | "authority"
-            | "credential"
-            | "credentials"
-            | "work_order"
-            | "signature"
-            | "approval_token"
+    schema_extensions::validate_extension_map_with_reserved_keys(
+        extensions,
+        "extensions",
+        GOVERNANCE_EXTENSION_RESERVED_KEYS,
     )
+    .map_err(invalid_extensions)
+}
+
+fn invalid_extensions(error: ExtensionValidationError) -> GovernanceValidationError {
+    GovernanceValidationError::InvalidExtensions {
+        reason: error.to_string(),
+    }
 }
 
 trait GovernanceUuid {
