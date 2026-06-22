@@ -399,9 +399,7 @@ impl AdapterError {
     /// Converts this adapter failure with a caller-supplied adapter/provider label.
     pub fn taxonomy_for_adapter(&self, adapter: impl AsRef<str>) -> ErrorTaxonomy {
         match self {
-            Self::Failed(detail) => {
-                ErrorTaxonomy::unknown_adapter_failure(adapter, Some(detail.as_str()))
-            }
+            Self::Failed(_) => ErrorTaxonomy::unknown_adapter_failure(adapter, None),
         }
     }
 }
@@ -1128,8 +1126,8 @@ impl GatewayError {
                 RetryClass::RetryWithNewAuthorization,
                 EffectCertainty::None,
             ),
-            Self::AdapterFailed(detail) => {
-                ErrorTaxonomy::unknown_adapter_failure("gateway_adapter", Some(detail.as_str()))
+            Self::AdapterFailed(_) => {
+                ErrorTaxonomy::unknown_adapter_failure("gateway_adapter", None)
             }
         }
     }

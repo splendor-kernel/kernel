@@ -96,37 +96,47 @@ fn gateway_errors_map_to_exact_taxonomy_semantics() {
     );
     assert_eq!(verification.effect_certainty, EffectCertainty::None);
 
-    let adapter = GatewayError::AdapterFailed("provider timeout".to_string()).taxonomy();
+    let adapter = GatewayError::AdapterFailed("X-Api-Key: sk-test-secret".to_string()).taxonomy();
     assert_eq!(adapter.category, ErrorCategory::DriverFailure);
     assert_eq!(adapter.reason_code.as_str(), UNKNOWN_ADAPTER_FAILURE_REASON);
     assert_eq!(adapter.retry_class, RetryClass::NotRetryable);
     assert_eq!(adapter.effect_certainty, EffectCertainty::Uncertain);
-    assert_eq!(
-        adapter
-            .provider_detail
-            .as_ref()
-            .map(splendor_types::ProviderDetail::provider),
-        Some("gateway_adapter")
-    );
+    let detail = adapter.provider_detail.as_ref().expect("provider detail");
+    assert_eq!(detail.provider(), "gateway_adapter");
+    assert_eq!(detail.safe_summary(), None);
+    let encoded = serde_json::to_string(&adapter).expect("taxonomy serializes");
+    assert!(!encoded.contains("sk-test-secret"));
+    assert!(!encoded.contains("X-Api-Key"));
 }
 
 #[test]
 fn adapter_error_unknown_failures_are_uncertain_and_non_retryable() {
-    let taxonomy = AdapterError::Failed(
-        "provider returned HTTP 500 with Authorization: Bearer secret".to_string(),
-    )
-    .taxonomy_for_adapter("custom/provider");
+    for raw_detail in [
+        "provider returned HTTP 500 with X-Api-Key: sk-test-secret",
+        "api-key=sk-test-secret",
+        "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+    ] {
+        let taxonomy =
+            AdapterError::Failed(raw_detail.to_string()).taxonomy_for_adapter("custom/provider");
 
-    assert_eq!(taxonomy.category, ErrorCategory::DriverFailure);
-    assert_eq!(
-        taxonomy.reason_code.as_str(),
-        UNKNOWN_ADAPTER_FAILURE_REASON
-    );
-    assert_eq!(taxonomy.retry_class, RetryClass::NotRetryable);
-    assert_eq!(taxonomy.effect_certainty, EffectCertainty::Uncertain);
-    let detail = taxonomy.provider_detail.as_ref().expect("provider detail");
-    assert_eq!(detail.provider(), "custom_provider");
-    assert_eq!(detail.safe_summary(), Some("[redacted]"));
+        assert_eq!(taxonomy.category, ErrorCategory::DriverFailure);
+        assert_eq!(
+            taxonomy.reason_code.as_str(),
+            UNKNOWN_ADAPTER_FAILURE_REASON
+        );
+        assert_eq!(taxonomy.retry_class, RetryClass::NotRetryable);
+        assert_eq!(taxonomy.effect_certainty, EffectCertainty::Uncertain);
+        let detail = taxonomy.provider_detail.as_ref().expect("provider detail");
+        assert_eq!(detail.provider(), "custom_provider");
+        assert_eq!(detail.safe_summary(), None);
+
+        let encoded = serde_json::to_string(&taxonomy).expect("taxonomy serializes");
+        assert!(!encoded.contains("sk-test-secret"));
+        assert!(!encoded.contains("X-Api-Key"));
+        assert!(!encoded.contains("api-key"));
+        assert!(!encoded.contains("PRIVATE KEY"));
+        assert!(!encoded.contains("abc123"));
+    }
 }
 
 #[derive(Clone)]
