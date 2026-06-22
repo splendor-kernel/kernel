@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "conformance" / "0.1" / "fixtures" / "conformance-cases.json"
 ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
 STABLE_EXAMPLES_PATH = ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
+SECURITY_INVARIANTS_PATH = ROOT / "docs" / "rules" / "v2" / "security" / "security-invariants.json"
 ACTION_OUTCOMES = {
     "action.executed",
     "action.denied",
@@ -93,6 +94,28 @@ AUTHORIZING_EXTENSION_KEY_FRAGMENTS = {
     "verifier",
     "workorder",
 }
+REQUIRED_SECURITY_GOLD_IDS = {"G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"}
+REQUIRED_SECURITY_PLANES = {
+    "identity_authority",
+    "artifact_lineage",
+    "event_state_evidence",
+    "execution_fabric",
+    "driver_boundary",
+    "agent_runtime_routing",
+    "data_feedback_eval_learning_control",
+    "change_governance",
+}
+REQUIRED_SECURITY_NON_CLAIMS = {"no_fnd_011_completion", "no_g80_g89_pass", "no_gold_harness_pass"}
+PROMPT_ONLY_SECURITY_PHRASES = {
+    "prompt instruction",
+    "system prompt",
+    "llm instruction",
+    "model instruction",
+    "assistant instruction",
+    "developer instruction",
+    "instruction prompt",
+}
+UNSAFE_CRYPTO_ALGORITHM_LABELS = {"none", "plain", "plaintext", "md5"}
 
 
 @dataclass
@@ -493,6 +516,171 @@ def validate_compatibility(config: dict[str, Any]) -> None:
         raise ConformanceError(f"unknown compatibility matrix {matrix!r}")
 
 
+def require_non_empty_string(value: Any, field: str, gold_id: str | None = None) -> str:
+    assert_true(isinstance(value, str) and value.strip(), f"{gold_id + ' ' if gold_id else ''}{field} must be a non-empty string")
+    return value
+
+
+def require_non_empty_array(value: Any, field: str, gold_id: str | None = None) -> list[Any]:
+    assert_true(isinstance(value, list) and value, f"{gold_id + ' ' if gold_id else ''}{field} must be a non-empty array")
+    return value
+
+
+def load_security_invariants(config: dict[str, Any]) -> dict[str, Any]:
+    path = ROOT / config.get("path", SECURITY_INVARIANTS_PATH.relative_to(ROOT))
+    return load_json(path)
+
+
+def validate_security_crypto_agility(data: dict[str, Any]) -> None:
+    crypto = data.get("crypto_agility")
+    assert_true(isinstance(crypto, dict), "security_invariants crypto_agility is required")
+    algorithms = require_non_empty_array(crypto.get("allowed_signature_algorithms"), "crypto_agility.allowed_signature_algorithms")
+    for algorithm in algorithms:
+        label = require_non_empty_string(algorithm, "crypto_agility.allowed_signature_algorithms")
+        normalized = normalize_security_label(label)
+        if normalized in UNSAFE_CRYPTO_ALGORITHM_LABELS or "md5" in normalized:
+            raise ConformanceError(f"security_invariants unsafe crypto algorithm label {label!r}")
+    key_rotation = crypto.get("key_rotation")
+    assert_true(isinstance(key_rotation, dict), "security_invariants key_rotation is required")
+    assert_true(key_rotation.get("rotation_required") is True, "security_invariants key rotation must be required")
+    assert_true(key_rotation.get("revocation_path_required") is True, "security_invariants revocation path must be required")
+    require_non_empty_string(key_rotation.get("compromise_response"), "crypto_agility.key_rotation.compromise_response")
+    require_non_empty_array(crypto.get("node_attestation_extension_points"), "crypto_agility.node_attestation_extension_points")
+    require_non_empty_array(crypto.get("non_cryptographic_safety_assumptions"), "crypto_agility.non_cryptographic_safety_assumptions")
+
+
+def validate_security_review_checklist(data: dict[str, Any]) -> None:
+    checklist = require_non_empty_array(data.get("security_review_checklist"), "security_review_checklist")
+    for item in checklist:
+        assert_true(isinstance(item, dict), "security_review_checklist items must be objects")
+        require_non_empty_string(item.get("id"), "security_review_checklist.id")
+        require_non_empty_string(item.get("question"), "security_review_checklist.question")
+        require_non_empty_string(item.get("required_evidence"), "security_review_checklist.required_evidence")
+
+
+def validate_security_enforcement(invariant: dict[str, Any], gold_id: str) -> None:
+    enforcement = invariant.get("enforcement")
+    assert_true(isinstance(enforcement, dict), f"{gold_id} enforcement mapping is required")
+    enforcing_component = require_non_empty_string(enforcement.get("enforcing_component"), "enforcement.enforcing_component", gold_id)
+    if is_prompt_only_control_text(enforcing_component):
+        raise ConformanceError(f"security invariant {gold_id} uses a prompt-only trust boundary")
+    require_non_empty_array(enforcement.get("required_events"), "enforcement.required_events", gold_id)
+    require_non_empty_array(enforcement.get("evidence_links"), "enforcement.evidence_links", gold_id)
+    require_non_empty_array(enforcement.get("containment_actions"), "enforcement.containment_actions", gold_id)
+
+
+def validate_security_invariant_record(invariant: dict[str, Any]) -> tuple[str, set[str], str]:
+    assert_true(isinstance(invariant, dict), "security invariant record must be an object")
+    gold_id = require_non_empty_string(invariant.get("gold_id"), "gold_id")
+    require_non_empty_string(invariant.get("threat_id"), "threat_id", gold_id)
+    require_non_empty_string(invariant.get("name"), "name", gold_id)
+    require_non_empty_array(invariant.get("assets"), "assets", gold_id)
+    require_non_empty_string(invariant.get("principal"), "principal", gold_id)
+    require_non_empty_string(invariant.get("attacker_capability"), "attacker_capability", gold_id)
+    require_non_empty_string(invariant.get("incident_classification"), "incident_classification", gold_id)
+    require_non_empty_string(invariant.get("change_risk_classification"), "change_risk_classification", gold_id)
+
+    maturity_gate = invariant.get("maturity_gate")
+    assert_true(isinstance(maturity_gate, dict), f"{gold_id} maturity_gate is required")
+    case_status = maturity_gate.get("case_status")
+    if maturity_gate.get("conformant_required") is True and case_status == "skipped":
+        raise ConformanceError(f"mandatory conformant security case {gold_id} is skipped")
+    assert_true(
+        case_status in {"mapped_not_exercised", "exercised", "skipped"},
+        f"{gold_id} maturity_gate.case_status is invalid",
+    )
+    require_non_empty_string(maturity_gate.get("non_claim"), "maturity_gate.non_claim", gold_id)
+    if case_status == "exercised":
+        executable = maturity_gate.get("executable_gold_evidence")
+        assert_true(isinstance(executable, dict), f"security invariant {gold_id} is exercised without executable gold evidence")
+        require_non_empty_string(executable.get("harness_id"), "executable_gold_evidence.harness_id", gold_id)
+        require_non_empty_string(executable.get("report_ref"), "executable_gold_evidence.report_ref", gold_id)
+        require_non_empty_string(executable.get("executed_at"), "executable_gold_evidence.executed_at", gold_id)
+        require_non_empty_array(executable.get("evidence_assertions"), "executable_gold_evidence.evidence_assertions", gold_id)
+
+    boundary = invariant.get("trust_boundary")
+    assert_true(isinstance(boundary, dict), f"{gold_id} trust_boundary is required")
+    boundary_name = require_non_empty_string(boundary.get("name"), "trust_boundary.name", gold_id)
+    enforced_by = require_non_empty_array(boundary.get("enforced_by"), "trust_boundary.enforced_by", gold_id)
+    prompt_only_enforcers = any(isinstance(item, str) and is_prompt_only_control_text(item) for item in enforced_by)
+    if boundary.get("prompt_only") is True or prompt_only_enforcers or is_prompt_only_control_text(boundary_name):
+        raise ConformanceError(f"security invariant {gold_id} uses a prompt-only trust boundary")
+
+    validate_security_enforcement(invariant, gold_id)
+
+    primary_plane = require_non_empty_string(invariant.get("primary_plane"), "primary_plane", gold_id)
+    related_planes = invariant.get("related_planes", [])
+    assert_true(isinstance(related_planes, list), f"{gold_id} related_planes must be an array")
+    planes = {primary_plane, *[plane for plane in related_planes if isinstance(plane, str)]}
+    unknown_planes = sorted(planes - REQUIRED_SECURITY_PLANES)
+    assert_true(not unknown_planes, f"{gold_id} unknown security planes: {', '.join(unknown_planes)}")
+    return gold_id, planes, str(case_status)
+
+
+def validate_security_invariants(config: dict[str, Any]) -> None:
+    data = load_security_invariants(config)
+    assert_true(data.get("schema_version") == "splendor.security_invariants.v1", "security_invariants schema_version mismatch")
+    assert_true(
+        data.get("evidence_scope") == "partial_fnd_011_security_invariants_v0",
+        "security_invariants evidence_scope must be partial_fnd_011_security_invariants_v0",
+    )
+    non_claims = set(data.get("non_claims", []))
+    missing_non_claims = sorted(REQUIRED_SECURITY_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"security_invariants non_claims missing: {', '.join(missing_non_claims)}")
+    validate_security_crypto_agility(data)
+    validate_security_review_checklist(data)
+
+    invariants = require_non_empty_array(data.get("invariants"), "invariants")
+    seen_gold_ids: set[str] = set()
+    covered_planes: set[str] = set()
+    required_case_status = config.get("required_case_status")
+    for invariant in invariants:
+        gold_id, planes, case_status = validate_security_invariant_record(invariant)
+        assert_true(gold_id not in seen_gold_ids, f"duplicate security invariant mapping for {gold_id}")
+        if required_case_status is not None:
+            assert_true(case_status == required_case_status, f"{gold_id} case_status must be {required_case_status}")
+        seen_gold_ids.add(gold_id)
+        covered_planes.update(planes)
+
+    required_gold_ids = set(config.get("required_gold_ids", sorted(REQUIRED_SECURITY_GOLD_IDS)))
+    missing_gold_ids = sorted(required_gold_ids - seen_gold_ids)
+    assert_true(not missing_gold_ids, f"missing security invariant mappings: {', '.join(missing_gold_ids)}")
+    required_planes = set(config.get("required_planes", sorted(REQUIRED_SECURITY_PLANES)))
+    missing_planes = sorted(required_planes - covered_planes)
+    assert_true(not missing_planes, f"security_invariants missing security planes: {', '.join(missing_planes)}")
+
+
+def normalize_security_text(value: str) -> str:
+    normalized = []
+    previous_was_space = True
+    for character in value:
+        if character.isalnum():
+            normalized.append(character.lower())
+            previous_was_space = False
+        elif not previous_was_space:
+            normalized.append(" ")
+            previous_was_space = True
+    return "".join(normalized).strip()
+
+
+def normalize_security_label(value: str) -> str:
+    normalized = []
+    previous_was_separator = True
+    for character in value.strip():
+        if character.isalnum():
+            normalized.append(character.lower())
+            previous_was_separator = False
+        elif not previous_was_separator:
+            normalized.append("_")
+            previous_was_separator = True
+    return "".join(normalized).strip("_")
+
+
+def is_prompt_only_control_text(value: str) -> bool:
+    normalized = normalize_security_text(value)
+    return any(phrase in normalized for phrase in PROMPT_ONLY_SECURITY_PHRASES)
+
+
 def validate_case(case: dict[str, Any]) -> None:
     primitive = case.get("primitive")
     if primitive == "runtime_loop":
@@ -517,6 +705,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_stable_examples(case["stable_examples"])
     elif primitive == "compatibility":
         validate_compatibility(case["compatibility"])
+    elif primitive == "security_invariants":
+        validate_security_invariants(case["security_invariants"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 
