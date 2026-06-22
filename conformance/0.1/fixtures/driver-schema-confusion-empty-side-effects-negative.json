@@ -1,0 +1,46 @@
+{
+  "schema_version": "splendor.driver_schema_confusion_fixture.v1",
+  "task_id": "FND-011",
+  "gold_id": "G86",
+  "evidence_scope": "partial_fnd_011_g86_driver_schema_confusion_v0",
+  "description": "Negative guard: empty side_effects evidence is not enough because mandatory zero counters must be exactly present.",
+  "non_claims": ["no_g86_gold_pass", "no_g80_g89_pass", "no_full_driver_conformance", "no_driver_registry_implementation", "no_live_adapter_execution"],
+  "run_id": "run_g86_empty_side_effects_bad",
+  "action_id": "action_g86_empty_side_effects_bad",
+  "driver_id": "driver.filesystem.fixture",
+  "operation": "filesystem.write_file",
+  "schema_mismatch": {
+    "reason": "driver_schema_version_mismatch",
+    "expected": { "schema": "splendor.driver.filesystem.write_file", "version": "v1" },
+    "requested": { "schema": "splendor.driver.filesystem.write_file", "version": "v2" },
+    "detected_before_execution": true
+  },
+  "verification": {
+    "allowed": false,
+    "reasons": ["driver_schema_version_mismatch"],
+    "verifier_results": [
+      {
+        "verifier": "driver_schema",
+        "allowed": false,
+        "reason": "driver_schema_version_mismatch",
+        "evidence": {
+          "driver_manifest_ref": "docs/spec/0.1/fixtures/adapter-manifests/filesystem.json",
+          "operation": "filesystem.write_file",
+          "requested_schema": "splendor.driver.filesystem.write_file@v2",
+          "expected_schema": "splendor.driver.filesystem.write_file@v1"
+        }
+      }
+    ]
+  },
+  "gateway": { "status": "denied", "adapter_executed": false, "adapter_invocation_count": 0, "driver_invocation_count": 0, "effect_certainty": "none" },
+  "outcome": { "status": "denied", "reason": "driver_schema_version_mismatch", "side_effect_occurred": false },
+  "side_effects": {},
+  "events": [
+    { "trace_event_id": "trace_g86_empty_effects_schema_checked", "kind": "driver.schema.checked", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-schema-check" },
+    { "trace_event_id": "trace_g86_empty_effects_verification_started", "kind": "verification.started", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-verification-started" },
+    { "trace_event_id": "trace_g86_empty_effects_schema_rejected", "kind": "driver.schema.rejected", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-schema-rejection" },
+    { "trace_event_id": "trace_g86_empty_effects_verification_completed", "kind": "verification.completed", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-verification-denied" },
+    { "trace_event_id": "trace_g86_empty_effects_action_denied", "kind": "action.denied", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-action-denied" },
+    { "trace_event_id": "trace_g86_empty_effects_outcome_recorded", "kind": "outcome.recorded", "identity": { "run_id": "run_g86_empty_side_effects_bad", "action_id": "action_g86_empty_side_effects_bad", "driver_id": "driver.filesystem.fixture" }, "evidence_ref": "evidence:g86-empty-effects-outcome-denied" }
+  ]
+}

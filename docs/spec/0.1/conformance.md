@@ -25,6 +25,7 @@ for these primitive categories:
 - adapters
 - compatibility fixture matrix v0
 - FND-011 security invariant mapping fixture v0
+- FND-011 G86 driver schema-confusion denial fixture v0
 - performance budget fixture contract v0
 
 The suite must be runnable without production secrets, external services,
@@ -74,6 +75,15 @@ The suite validates:
   prompt-only enforcement wording even when `prompt_only` is false, unsafe
   crypto-agility labels, `exercised` status without executable gold evidence,
   missing G80-G89 mappings, and missing event/evidence/containment links.
+- Partial FND-011 G86 driver schema-confusion denial fixture v0 evidence: a
+  driver schema/version mismatch carries a stable mismatch reason, fails
+  verification, records schema rejection/denial/outcome events, keeps
+  adapter/driver invocation counts at zero, and records no side effects. A
+  negative fixture family proves the runner rejects a mismatched-schema case that
+  still reports execution, unknown execution/receipt fields, side-effect events,
+  missing side-effect counters, duplicate trace IDs, out-of-order events,
+  mismatched verifier evidence, and malformed non-claim guards. This is bounded
+  denial evidence only, not a G86 gold pass.
 - Partial FND-012 performance budget fixture contract v0 evidence: mandatory
   latency/throughput budgets, environment-capture shape, regression thresholds,
   retention/backpressure actions, provider/model-time separation, and
@@ -101,7 +111,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 36,
+  "case_count": 47,
   "failed_count": 0,
   "results": [
     {
@@ -138,6 +148,12 @@ passing G80-G89 gold evidence.
 The fixture runner also rejects `case_status: exercised` unless explicit
 executable gold evidence metadata is present. The checked G80-G89 fixture remains
 `mapped_not_exercised`; this is not pass status.
+
+The G86 driver schema-confusion denial fixture is partial evidence only. It does
+not implement a driver registry, driver certification process, runtime ABI
+negotiation service, or live adapter execution path. It must not be reported as a
+full G86 gold pass, full FND-011 completion, issue #230 completion, or full
+G80-G89 pass status.
 
 The FND-012 performance budget cases are also partial fixture evidence only.
 They validate a budget/report contract plus negative environment-capture,

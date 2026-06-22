@@ -461,6 +461,105 @@
       "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-skipped-negative.json" }
     },
     {
+      "case_id": "driver-schema-confusion-g86-denial",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-SCHEMA-MISMATCH-DENIAL",
+      "path": "denial",
+      "description": "Partial G86 evidence: driver schema/version mismatch is denied before adapter or driver execution, with verification, denial, outcome, and no-side-effect evidence.",
+      "report_message": "partial FND-011 G86 driver schema-confusion denial v0: schema/version mismatch denied before execution; no G86 gold pass or full G80-G89 pass claimed",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-g86-denial.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-executed-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-NO-EXECUTION-AFTER-SCHEMA-MISMATCH",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves a schema/version mismatch case is rejected if it still reports adapter or driver execution.",
+      "expected_failure": "schema mismatch denial must not report adapter execution",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-executed-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-unknown-gateway-execution-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-CLOSED-FIXTURE-SCHEMA",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves unknown gateway.driver_executed execution evidence is rejected instead of treated as denial-only evidence.",
+      "expected_failure": "gateway unknown keys: driver_executed",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-unknown-gateway-execution-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-side-effect-receipt-executed-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-DENIAL-ONLY-SIDE-EFFECT-EVIDENCE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves executed side-effect receipt fields are unknown and rejected for schema-mismatch denial evidence.",
+      "expected_failure": "outcome unknown keys: side_effect_receipt_status",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-side-effect-receipt-executed-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-side-effect-event-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-EVENT-ALLOWLIST",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves side-effect event namespaces such as filesystem.write are rejected in denial evidence.",
+      "expected_failure": "driver schema side-effect event namespace filesystem.write is forbidden",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-side-effect-event-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-empty-side-effects-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-SIDE-EFFECT-COUNTERS-REQUIRED",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves empty side_effects evidence is rejected because mandatory zero counters must be exactly present.",
+      "expected_failure": "side_effects missing keys",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-empty-side-effects-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-duplicate-trace-id-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-UNIQUE-TRACE-EVENTS",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves duplicate trace_event_id values are rejected for G86 denial evidence.",
+      "expected_failure": "duplicate trace_event_id",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-duplicate-trace-id-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-out-of-order-events-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-ORDERED-DENIAL-EVENTS",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves G86 denial events must follow the required schema-check, verification, rejection, completion, denial, outcome order.",
+      "expected_failure": "driver schema event sequence mismatch",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-out-of-order-events-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-mismatched-verifier-evidence-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-CONSISTENT-VERIFIER-EVIDENCE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves driver_schema verifier evidence must match schema_mismatch expected/requested values and operation exactly.",
+      "expected_failure": "driver_schema verifier evidence requested_schema must match schema_mismatch.requested",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-mismatched-verifier-evidence-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-non-claims-object-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-NON-CLAIMS-SHAPE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves non_claims must be an array rather than an object whose keys resemble non-claim labels.",
+      "expected_failure": "driver schema fixture non_claims must be an array",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-non-claims-object-negative.json" }
+    },
+    {
+      "case_id": "driver-schema-confusion-non-claims-empty-negative-fixture",
+      "primitive": "driver_schema_confusion",
+      "requirement": "CONF-0.2-FND-011-G86-NON-CLAIMS-ENTRIES",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves non_claim entries must be non-empty strings so overclaim guards cannot be malformed.",
+      "expected_failure": "driver schema fixture non_claim must be a non-empty string",
+      "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-non-claims-empty-negative.json" }
+    },
+    {
       "case_id": "performance-budgets-reference-contract",
       "primitive": "performance_budgets",
       "requirement": "CONF-0.2-FND-012-PERFORMANCE-BUDGETS",

@@ -24,6 +24,14 @@ control, protected eval isolation, or physical safety certification. Gold cases
 remain not exercised unless an exact executable gold harness runs and records
 passing evidence.
 
+The conformance suite also contains a bounded G86 driver schema-confusion denial
+fixture that proves a schema/version mismatch is denied before adapter/driver
+execution. Its negative guards reject contradictory execution fields, side-effect
+events/evidence, duplicate trace IDs, out-of-order events, and mismatched verifier
+evidence. That fixture family is partial denial evidence only; it does not
+implement a driver registry, certification process, ABI negotiation service, or
+runtime driver execution system, and it does not mark G86 or G80-G89 as passed.
+
 ## Validation
 
 The fixture is validated by:

@@ -253,7 +253,7 @@
       "fail_closed_decision": "deny",
       "enforcement": {
         "enforcing_component": "driver registry and gateway schema verifier",
-        "required_events": ["driver.schema.checked", "driver.schema.rejected", "verification.completed", "action.denied"],
+        "required_events": ["driver.schema.checked", "verification.started", "driver.schema.rejected", "verification.completed", "action.denied", "outcome.recorded"],
         "evidence_links": ["driver_manifest_ref", "operation_schema_ref", "schema_rejection_event", "gateway_denial_event"],
         "containment_actions": ["deny_request", "record_incident"]
       },
@@ -262,7 +262,7 @@
       "maturity_gate": {
         "conformant_required": true,
         "case_status": "mapped_not_exercised",
-        "non_claim": "mapping only; G86 remains not exercised until schema/version mismatch fixture proves pre-execution denial"
+        "non_claim": "partial conformance denial fixture exists for schema/version mismatch; G86 remains mapped_not_exercised until a full executable gold harness covers driver registry, ABI negotiation, and runtime integration"
       }
     },
     {
