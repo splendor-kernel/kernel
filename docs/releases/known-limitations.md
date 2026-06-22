@@ -72,18 +72,20 @@
   negotiate API versions or reject unsupported version headers. Treat this as a
   documented limitation, not a production protocol guarantee.
 
-## Agent-kernel v2 planning import
+## Agent-kernel 0.2/v2 active rules
 
-- `docs/planning/agent-kernel-v2/` contains imported vNext planning material for
-  a broader post-0.1 agent-kernel direction.
-- That planning material is non-normative until specific RFCs are accepted and
-  implemented. It does not replace the stable 0.1 primitive specs, current
-  `docs/rules/*` roadmap, Action Gateway contract, state/trace/replay
-  invariants, or physical/edge safety boundaries.
-- Proposed concepts such as a universal driver gateway, workload fabric,
-  evidence service, learning-control plane, and self-management lifecycle remain
-  future planning surfaces. They are not current production capabilities or
-  conformance evidence.
+- `docs/rules/v2/` contains the active 0.2/v2 execution rule pack for the broader
+  agent-kernel direction.
+- 0.1 remains the implemented/stable baseline. 0.2/v2 rules are authoritative for
+  decomposition, sprint sequencing, catalog coverage, architecture ownership, and
+  gold/conformance planning when v2 work is in scope.
+- Moving v2 material into `docs/rules/v2/` does not implement proposed runtime
+  behavior. V2 concepts such as a universal driver gateway, workload fabric,
+  evidence service, learning-control plane, secret broker, data-use controller,
+  and self-management lifecycle are not current production capabilities or
+  conformance evidence until their sprint evidence passes.
+- `docs/planning/agent-kernel-v2/` is retained for provenance and archival import
+  notes, not as the primary v2 entrypoint.
 - `docs/rfc/0008-vnext-identity-authority-data-use-secrets-plane.md` is a draft
-  post-0.1 planning RFC for issue #140. It does not implement principal registry,
+  planning RFC for issue #140. It does not implement principal registry,
   authority decision, secret broker, or data-use controller behavior.

@@ -1,8 +1,8 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 architecture rule source. This file guides 0.2/v2 decomposition after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
 # Core Abstractions and State Machines
 
-This document is the normative conceptual model for vNext. Domain subsystems should reuse these objects instead of inventing parallel identity, scheduling, artifact, or lifecycle mechanisms.
+This document is the normative conceptual model for 0.2/v2. Domain subsystems should reuse these objects instead of inventing parallel identity, scheduling, artifact, or lifecycle mechanisms.
 
 ## 1. Design rules
 

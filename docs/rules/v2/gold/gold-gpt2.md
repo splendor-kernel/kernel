@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold program source. This file defines a future gold path after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold Program: GPT-2 Small Across the Full Splendor Lifecycle
 
@@ -168,7 +168,9 @@ A report has thresholds, sample counts, method/version, false-positive/false-neg
 
 ## 6. Training plan
 
-`examples/gpt2/training_plan.yaml` illustrates the contract. The complete plan binds:
+Future executable fixtures should add a file such as
+`examples/gpt2/training_plan.yaml` to illustrate this contract. That file is not
+present or active in this docs-only integration. The complete plan binds:
 
 ```text
 model architecture artifact
@@ -192,7 +194,7 @@ declared candidate outputs
 
 ### 6.1 Distributed execution
 
-The trainer driver supports three modes described in `11_gold_distributed_pytorch.md`. For the reference run:
+The trainer driver supports three modes described in [`gold-distributed-pytorch.md`](gold-distributed-pytorch.md). For the reference run:
 
 - the fleet scheduler forms a compatible worker gang or elastic group;
 - each worker receives a short-lived execution lease, exact artifact refs, and only the required data shards;
@@ -453,9 +455,10 @@ The GPT-2 program is complete only when a clean machine/fleet simulation can:
 11. export a causal evidence graph from source data through deployment and post-deployment feedback;
 12. repeat the run with only declared nondeterminism and explain material divergence.
 
-## 16. Example artifacts
+## 16. Planned example artifacts
 
-The pack includes proposed manifests under `examples/gpt2/`:
+Future implementation/gold-example issues should add executable fixtures and
+proposed manifests under `examples/gpt2/`, including:
 
 - `agent.yaml`
 - `collection_plan.yaml`
@@ -463,4 +466,7 @@ The pack includes proposed manifests under `examples/gpt2/`:
 - `eval_suite.yaml`
 - `deployment_plan.yaml`
 
-They are illustrative vNext contracts, not claims of implementation in the current kernel.
+Those files are not present or active in this docs-only integration. They remain
+planned illustrative 0.2/v2 contracts until future implementation/gold-example
+issues add executable fixtures and retained evidence before any pass or
+implementation claim.

@@ -1,5 +1,5 @@
 schema_version: splendor.gold.catalog.v1
-source: 09_gold_examples_catalog.md
+source: gold-examples-catalog.md
 result_schema: schemas/gold-result.schema.json
 status_semantics:
   specified_not_implemented: The contract and acceptance criteria exist; no passing executable gold directory is

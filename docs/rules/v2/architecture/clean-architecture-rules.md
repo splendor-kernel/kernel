@@ -1,8 +1,8 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 architecture rule source. This file guides 0.2/v2 decomposition after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
 # Splendor Clean Architecture Constitution
 
-**Status:** normative architecture rule set for the Splendor agent kernel vNext work.
+**Status:** normative architecture rule set for the Splendor 0.2/v2 agent-kernel work.
 **Applies to:** Rust workspace, Python SDK/bindings, TypeScript clients, daemon APIs, node binaries, adapters, examples, schemas, persistence, fleet protocols, and generated artifacts.
 **Purpose:** prevent architectural drift while Splendor grows from the implemented 0.1 runtime into a complete kernel substrate for persistent neuro-symbolic agents, governed data and feedback, evaluation, distributed learning control, physical AI, and controlled self-evolution.
 
@@ -224,7 +224,13 @@ The present repository predates the vNext plane crates. Existing code is preserv
 | `splendorctl` direct adapter construction | explicit embedded-local composition only | Remote/operator paths must call public APIs; no hidden bypass |
 | hand-written Python runtime semantics | generated schemas/bindings and thin ergonomics | Preserve 0.1 compatibility; do not manually add vNext authority, workload, change, or data-use semantics in Python |
 
-A migration exception requires an entry in `architecture/dependency_policy.json` containing owner, reason, exact edge, affected modules, removal condition, and expiration milestone. “Temporary” without a removal condition is not an exception.
+A future migration exception registry should require owner, reason, exact edge,
+affected modules, removal condition, and expiration milestone. The proposed
+shape currently lives at
+`docs/rules/v2/catalog/architecture/dependency_policy.proposed.json` and is not
+an active CI policy until accepted by RFC where RFC-required, or by a documented
+non-public architecture-policy approval when no RFC trigger applies.
+“Temporary” without a removal condition is not an exception.
 
 ---
 
@@ -415,17 +421,25 @@ A core service may calculate a plan or proposal for an effect. Only an allowed e
 
 ## 10. Enforcing the architecture
 
-Documentation alone is not enforcement. The following controls are mandatory.
+Documentation alone is not enforcement. The following controls are proposed
+architecture-policy controls for 0.2/v2 work. They are not active CI checks until
+the referenced policy locations, schemas, owners, and rollout mode are accepted
+and implemented.
 
 ### 10.1 Machine-readable dependency policy
 
-`architecture/dependency_policy.json` is the source for package tiers, allowed edges, path owners, migration exceptions, and impact facets. CI runs:
+The proposed dependency-policy shape is
+`docs/rules/v2/catalog/architecture/dependency_policy.proposed.json`. A future
+accepted policy file, such as `architecture/dependency_policy.json`, should be
+the source for package tiers, allowed edges, path owners, migration exceptions,
+and impact facets. A future checker may run a command similar to:
 
 ```bash
 python tools/check_architecture_policy.py --policy architecture/dependency_policy.json
 ```
 
-The checker must fail on:
+That checker does not exist in this branch and must not be described as active
+CI. Once implemented and accepted, it should fail on:
 
 - unapproved workspace dependency edge;
 - internal dependency cycle;
@@ -436,11 +450,13 @@ The checker must fail on:
 - target package that adds a reverse edge;
 - production use of a dev-only adapter dependency.
 
-`cargo metadata` is the graph source. Hand-maintained diagrams are explanatory, not authoritative.
+`cargo metadata` should be the Rust graph source for that future checker.
+Hand-maintained diagrams remain explanatory, not authoritative.
 
 ### 10.2 Source import/effect fences
 
-A static scan rejects direct effect APIs outside allowed locations. The scan covers at least:
+A future static scan should reject direct effect APIs outside allowed locations.
+The scan should cover at least:
 
 - `std::fs`, `std::net`, `std::process::Command`;
 - `tokio::process`, outbound HTTP clients, database clients;
@@ -448,11 +464,15 @@ A static scan rejects direct effect APIs outside allowed locations. The scan cov
 - direct adapter construction from domain packages;
 - direct store-engine construction from daemon handlers.
 
-False positives are resolved by narrowing the detector or adding a precise reviewed exception. Broad path exclusions are forbidden.
+False positives should be resolved by narrowing the detector or adding a precise
+reviewed exception. Broad path exclusions remain forbidden.
 
 ### 10.3 Mutation ownership registry
 
-Maintain a machine-readable registry mapping each command, mutable state head, transition family, and canonical event to exactly one component. CI rejects duplicate ownership. Examples:
+A future machine-readable registry should map each command, mutable state head,
+transition family, and canonical event to exactly one component. Future CI may
+reject duplicate ownership after that registry is accepted and implemented.
+Examples:
 
 - `SubmitInvocation` → Driver Gateway;
 - `CommitState` → State Service;
@@ -467,9 +487,12 @@ A transport endpoint and a store method are not owners.
 
 ### 10.4 Generated contract checks
 
-CI regenerates JSON Schema, OpenAPI models, Python models, TypeScript types, and golden fixtures. The working tree must remain clean after generation.
+Future contract checks should regenerate JSON Schema, OpenAPI models, Python
+models, TypeScript types, and golden fixtures from accepted contract sources.
+The working tree should remain clean after generation. This document does not
+claim that the generator commands below exist or are active CI in this branch.
 
-Required checks:
+Candidate checks include:
 
 ```bash
 cargo test -p splendor-types
@@ -813,6 +836,8 @@ For model/data/code/eval/driver changes, query or enumerate:
 
 ### Step 6 — Generate the recursive impact report
 
+When implemented, a future impact tool may run a command similar to:
+
 ```bash
 python tools/compute_change_impact.py \
   --policy architecture/dependency_policy.json \
@@ -821,6 +846,9 @@ python tools/compute_change_impact.py \
   --format markdown \
   --out target/architecture/impact.md
 ```
+
+`tools/compute_change_impact.py` and `architecture/dependency_policy.json` are
+future paths in this branch, not active tooling.
 
 The static report is a lower bound. Runtime lineage/deployment data supplements it for release and incident work.
 

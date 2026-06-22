@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold program source. This file defines a future gold path after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold Program: Agent and World Modeling with Neural and Symbolic Components
 
@@ -268,4 +268,7 @@ The program passes when it can demonstrate:
 - progressive rollout and rollback with honest physical-effect semantics;
 - complete causal lineage from percept through assertion, plan, action, outcome, feedback, training, and deployment.
 
-See `examples/world_model/agent.yaml` for an illustrative `AgentSpec`.
+Future implementation/gold-example issues should add an illustrative `AgentSpec`
+fixture such as `examples/world_model/agent.yaml`. That file is not present or
+active in this docs-only integration and cannot support a pass or implementation
+claim until executable fixtures and retained evidence exist.

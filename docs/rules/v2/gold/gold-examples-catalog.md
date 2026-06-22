@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold rule source. This file defines gold-case contracts for 0.2/v2 work after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold Validation and Example Catalog
 
@@ -119,7 +119,7 @@ Gold status requires CI execution, not documentation alone.
 | G51 | MNIST/CIFAR classifier | GPU/CPU model driver | Reproducibility, batching, model artifact, baseline regression |
 | G52 | Tiny transformer from scratch | Tokenization/shards/checkpoint | Resume exactness class documented; eval/overfit checks |
 | G53 | Released GPT-2 inference | Transformers/model import | Tokenizer/model digests, session isolation, latency/resource evidence |
-| G54 | GPT-2 full lifecycle | Data-to-self-adjustment integration | Defined in `10_gold_gpt2.md` |
+| G54 | GPT-2 full lifecycle | Data-to-self-adjustment integration | Defined in [`gold-gpt2.md`](gold-gpt2.md) |
 | G55 | LoRA/fine-tune candidate | Parameter-efficient change | Base/adapter lineage; bundle compatibility; rollback |
 | G56 | Contextual bandit RL | Online/offline reward | Episode linkage, exploration policy, safety constraints, off-policy eval |
 | G57 | Gridworld PPO | RL actor/evaluator separation | Environment version, seeds, rollouts, checkpoints, policy gate |
@@ -222,6 +222,6 @@ Gold examples should produce semantic assertions rather than byte-identical time
 | Fleet execution | G60–G69 simulation Tier C | fault-injected Tier C | real heterogeneous Tier C/E |
 | Self-management and physical AI | G70–G89 Tier A/D | Tier B/C/D | Tier C/D/E with rollback drills |
 
-## 15. CI contract
+## 15. Proposed CI contract
 
-This pack exposes the schema-validated machine-readable index [`examples/gold/catalog.yaml`](examples/gold/catalog.yaml). It contains each ID, owner, required feature flags, resource class, expected duration class, graduation tiers, and emitted evidence assertions. `tools/generate_gold_catalog.py` keeps the index synchronized with this document, while `tools/validate_gold_catalog.py` enforces contiguous G00–G89 identity, schema validity, assertion references, and status honesty. CI selects examples by capability rather than silently skipping them. A skipped gold case is reported as **not exercised**, never as passed.
+This pack includes the machine-readable index [`examples/catalog.yaml`](examples/catalog.yaml). It contains each ID, owner, required feature flags, resource class, expected duration class, graduation tiers, and emitted evidence assertions. Future tooling may add generator and validator scripts, such as `tools/generate_gold_catalog.py` and `tools/validate_gold_catalog.py`, to keep the index synchronized and enforce contiguous G00–G89 identity, schema validity, assertion references, and status honesty. Those scripts and CI selection behavior are not active in this branch unless implemented separately. Once implemented, CI must select examples by capability rather than silently skipping them. A skipped gold case is reported as **not exercised**, never as passed.

@@ -1,6 +1,6 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 architecture rule source. This file guides 0.2/v2 decomposition after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements the described behavior.
 
-# Splendor vNext — Canonical Agent Kernel Architecture
+# Splendor 0.2/v2 — Canonical Agent Kernel Architecture
 
 ## 1. Definition
 
@@ -282,7 +282,7 @@ Crate boundaries may differ, but responsibilities should not be recombined into 
 12. GPT-2 full lifecycle gold example
 13. 1,000-device mixed-workload fleet
 14. Shell, Python, OCI, and Kubernetes isolation
-15. Current implementation to vNext gap map
+15. Current implementation to 0.2/v2 gap map
 
 ## 17. Acceptance definition for the architecture
 

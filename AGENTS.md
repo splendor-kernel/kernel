@@ -82,6 +82,29 @@ Required for adapter, verifier, gateway, state, trace, replay, or distributed wo
 /examples/
 ```
 
+Required for 0.2/v2 agent-kernel work, including implementation, QA,
+integration, and gold-example work for issues #141-#155:
+
+```text
+/docs/rules/v2/README.md
+/docs/rules/v2/0.2-execution-sprints.md
+/docs/rules/v2/catalog/complete_implementation_task_catalog.md
+/docs/rules/v2/catalog/implementation_task_index.md
+/docs/rules/v2/gold/gold-conformance-triage.md
+/docs/rules/v2/architecture/schema-identity-map.md
+```
+
+For 0.2/v2 work, `complete_implementation_task_catalog.md` is the catalog of
+record for component/task/gold decomposition and `0.2-execution-sprints.md` is
+the grouped assignment map. They are active execution rules for decomposition,
+sprint planning, QA coverage, integration coverage, and gold-example planning.
+They do not prove that the repository implements the described behavior, and
+they do not override the gateway, verifier, state, trace, replay, identity,
+secure daemon, permission, or physical-safety invariants in this file and the
+core `docs/rules/*` safety documents. They also do not override accepted RFCs,
+stable specs, public schemas, public API contracts, release limitations,
+gateway/verifier contracts, or RFC requirements.
+
 If a required document conflicts with another document, follow this priority order:
 
 ```text
@@ -89,9 +112,11 @@ If a required document conflicts with another document, follow this priority ord
 2. /docs/rules/splendor_dev_model.md
 3. /docs/rules/verifiable_criteria/main.md and the applicable sprint criteria or acceptance rule pack
 4. /docs/rules/sprints_frs_milestones.md
-5. /docs/reference/*
-6. /docs/guides/*
-7. examples and comments
+5. accepted RFCs, stable specs, release limitation docs, and public API/schema contracts
+6. /docs/rules/v2/* for active 0.2/v2 decomposition, sprint sequencing, and catalog coverage when 0.2/v2 work is in scope
+7. /docs/reference/*
+8. /docs/guides/*
+9. examples and comments
 ```
 
 Open a docs issue or RFC if the conflict affects a primitive, schema, runtime invariant, or public API.
@@ -355,16 +380,24 @@ Do not build these before the primitive layer is stable:
 
 Implementation must follow the active sprint and milestone documents.
 
-Current milestone shape:
+Current baseline and active work shape:
 
 ```text
-0.01-dev: local kernel baseline
-0.02-dev: local multi-agent runtime + daemon control
-0.03-dev: resident nodes + fleet execution foundation
-0.04-dev: governance workflows
-0.05-dev: physical/edge orchestration
-0.1-dev: stable primitive spec + compatibility line
+0.01-dev through 0.05-dev: historical milestones that fed the 0.1 baseline
+0.1-dev: implemented/stable primitive baseline + compatibility line
+0.2/v2: active implementation, QA, integration, and gold-example execution from docs/rules/v2
 ```
+
+Treat 0.1 as the implemented/stable baseline unless current code and test
+evidence prove otherwise. Full 0.01-0.1 roadmap detail is preserved under
+`docs/rules/legacy/0.1-sprints_frs_milestones.md`; keep it for acceptance
+history and compatibility work. Treat 0.2/v2 as the active execution line for
+new implementation, QA, integration, and gold-example work. Moving v2 material
+into `docs/rules/v2/` makes it authoritative for decomposition, sequencing, and
+sprint scope; it does not make proposed v2 runtime behavior implemented. The v2
+rule pack cannot override accepted RFCs, stable specs, public schemas, public
+API contracts, release limitations, AGENTS safety invariants, gateway/verifier
+contracts, or RFC requirements.
 
 Do not pull later-milestone features into earlier sprints unless they are required to complete the sprint acceptance criteria.
 

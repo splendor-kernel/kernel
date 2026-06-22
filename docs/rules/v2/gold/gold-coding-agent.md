@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold program source. This file defines a future gold path after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold Program: Coding Agent with Live Feedback and Controlled Adjustment
 
@@ -256,4 +256,8 @@ The program passes when it demonstrates:
 - canary stop, rollback, and incident evidence;
 - no host escape, secret leakage, direct production mutation, or authority inheritance.
 
-See `examples/coding_agent/agent.yaml` and `examples/coding_agent/improvement_plan.yaml`.
+Future implementation/gold-example issues should add fixtures such as
+`examples/coding_agent/agent.yaml` and
+`examples/coding_agent/improvement_plan.yaml`. Those files are not present or
+active in this docs-only integration and cannot support a pass or implementation
+claim until executable fixtures and retained evidence exist.

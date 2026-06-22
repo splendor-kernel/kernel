@@ -1,8 +1,8 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold catalog source. This file defines the gold result protocol after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold conformance catalog and result protocol
 
-`catalog.yaml` is the machine-readable registry for G00–G89. The human acceptance descriptions live in [`../../09_gold_examples_catalog.md`](../../09_gold_examples_catalog.md); `tools/generate_gold_catalog.py` keeps both views synchronized.
+`catalog.yaml` is the machine-readable registry for G00-G89. The human acceptance descriptions live in [`../gold-examples-catalog.md`](../gold-examples-catalog.md); imported generator tooling was not made active in this repository.
 
 ## Status is evidence-scoped
 
@@ -24,10 +24,10 @@ A conforming runner:
 3. executes only under the case's declared resource and authority profile;
 4. records assertion-level outcomes and immutable evidence references;
 5. computes the case outcome: any failure means `failed`; otherwise any required non-exercised assertion means `not_exercised`; only complete success means `passed`;
-6. emits a document conforming to [`../../schemas/gold-result.schema.json`](../../schemas/gold-result.schema.json);
+6. emits a document conforming to the planned `schemas/gold-result.schema.json` contract once that schema is added;
 7. preserves failed and not-exercised results rather than overwriting them with retries.
 
-`result.fixture.yaml` demonstrates the result envelope without claiming an implemented case. It is intentionally `not_exercised`.
+A future `result.fixture.yaml` may demonstrate the result envelope without claiming an implemented case. Until that fixture exists and is wired into a runner, the example result remains planned and any corresponding case stays `not_exercised`.
 
 ## Executable case directory
 

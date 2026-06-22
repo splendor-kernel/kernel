@@ -1,4 +1,4 @@
-> **Status:** Imported vNext planning reference. This file is not part of the stable 0.1 implementation contract and is not evidence that the repository implements the described behavior. Existing `AGENTS.md`, `docs/rules/*`, `docs/spec/0.1/*`, and release limitation documents remain authoritative until an RFC is accepted and implemented. If the source text below says `normative`, that status applies only to the imported vNext source pack, not to current repository rules.
+> **Status:** Active 0.2/v2 gold program source. This file defines a future gold path after the higher-priority safety, accepted-RFC, stable-spec, public-contract, and release-limitation hierarchy. It is not evidence that the repository implements or passes the described behavior.
 
 # Gold Program: Convert PyTorch Training into Flexible Distributed Splendor Work
 
@@ -369,11 +369,15 @@ The distributed PyTorch gold program must pass:
 14. denial of direct deployment from trainer scope;
 15. local, OCI, Kubernetes, and synthetic-fleet executions producing equivalent logical evidence.
 
-## 15. Example material
+## 15. Planned example material
 
 - `examples/distributed_pytorch/training_plan.yaml`
 - `code_examples/train_tiny_transformer.py`
 - `proposed_api/python/splendor_vnext/pytorch_adapter.py`
 - `proposed_api/python/tests/test_pytorch_adapter.py`
 
-The included adapter code is a contract/reference planner; it does not replace PyTorch's distributed runtime.
+These files are planned example/reference artifacts and are not present or active
+in this docs-only integration. Future implementation/gold-example issues must
+add executable fixtures and retained evidence before any pass or implementation
+claim. Any future adapter code is a contract/reference planner; it does not
+replace PyTorch's distributed runtime.

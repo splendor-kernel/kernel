@@ -1,17 +1,17 @@
-# 0.1 to vNext Schema and Identity Map
+# 0.1 to 0.2/v2 Schema and Identity Map
 
-> **Status:** Non-normative planning and RFC preparation for issue
+> **Status:** Active 0.2/v2 architecture rule source for issue
 > [#136](https://github.com/splendor-kernel/kernel/issues/136). This document
-> does not implement vNext schemas, does not change the stable Splendor 0.1
-> primitive contract, does not break any public API, does not migrate trace or
-> state stores, and does not make universal v2 objects stable contracts before
-> RFC approval.
+> does not implement v2 schemas, does not change the stable Splendor 0.1
+> baseline, does not break any public API, does not migrate trace or state
+> stores, and does not make universal v2 objects stable contracts before RFC
+> approval and implementation evidence.
 
 ## Scope
 
 Issue: #136, "Plan vNext schema and identity grammar without breaking 0.1 primitives".
 
-Milestone and sprint fit: Splendor0.1-dev planning, primarily 0.1-S1 stable schema freeze and 0.1-S6 migration and release.
+Milestone and sprint fit: Splendor0.2-dev / v2 active execution, with 0.1 stable baseline compatibility checks.
 
 Functional requirements touched: FR-0.1-01 stable primitive specs, FR-0.1-02 schema versioning and compatibility rules, FR-0.1-03 runtime compatibility, FR-0.1-05 conformance fixture planning, FR-0.1-06 migration policy, and FR-0.1-08 side-effect, verifier, trace, state, replay, and identity guarantees.
 
@@ -21,16 +21,16 @@ Boundary: docs only.
 
 ## Source Baseline
 
-This map follows the current authority order from `AGENTS.md`, `docs/rules/*`, and `docs/spec/0.1/*`. The imported vNext planning pack is source material, not a contract.
+This map follows the current authority order from `AGENTS.md`, `docs/rules/*`, accepted RFCs, stable specs, release limitations, and public contracts. The 0.2/v2 rule pack is the active decomposition contract only after those higher-priority sources; it is not implementation evidence.
 
 Source documents used:
 
 - `docs/spec/0.1/primitives.md`
 - `docs/spec/0.1/schema-versioning.md`
-- `docs/planning/agent-kernel-v2/README.md`
-- `docs/planning/agent-kernel-v2/imported/00_architecture.md`
-- `docs/planning/agent-kernel-v2/imported/01_core_abstractions.md`
-- `docs/planning/agent-kernel-v2/imported/16_clean_architecture_rules.md`
+- `docs/rules/v2/README.md`
+- `docs/rules/v2/architecture/architecture.md`
+- `docs/rules/v2/architecture/core-abstractions.md`
+- `docs/rules/v2/architecture/clean-architecture-rules.md`
 - `docs/rules/verifiable_criteria/sprints/0.1-S1-stable-schema-freeze.md`
 - `docs/rules/verifiable_criteria/sprints/0.1-S6-migration-and-release.md`
 
@@ -52,7 +52,7 @@ This document uses three planning classifications.
 | --- | --- | --- |
 | Extension | vNext can be layered onto 0.1 as optional, typed, non-authorizing metadata, wrapper, or separate profile. | Allowed only if 0.1 required fields, identity scope, authority semantics, gateway mediation, trace linkage, state ownership, and replay defaults are unchanged. |
 | Replacement candidate | vNext proposes a semantic successor or renamed object. | Not compatible inside the 0.1 stable line if it removes, renames, or changes meaning of stable fields. Requires RFC, major schema version or explicit migration boundary, fixtures, and compatibility notes before implementation. |
-| Deferred vNext-only concept | vNext concept has no stable 0.1 primitive counterpart or would pull in later milestone behavior. | Stays planning-only until a future RFC binds it to milestone scope, schemas, fixtures, and enforcement. |
+| Deferred 0.2/v2-only concept | v2 concept has no stable 0.1 primitive counterpart or would pull in later milestone behavior. | Stays RFC-bound until a future RFC binds it to milestone scope, schemas, fixtures, and enforcement. |
 
 ## Primitive Mapping
 
@@ -186,7 +186,18 @@ Replay rules for future RFCs:
 
 ## RFC Readiness Checklist
 
-Any future implementation that uses this map must first provide an RFC or equivalent contract change note covering:
+Any future implementation that uses this map must follow `AGENTS.md` RFC rules.
+An accepted RFC is required where `AGENTS.md` requires one, including new or
+renamed primitives, public schema changes, trace event semantic changes, state
+graph format changes, gateway contract changes, verifier pipeline changes,
+daemon API breaking changes, SDK breaking changes, distributed identity changes,
+governance semantic changes, and physical/device action model changes. Contract
+change notes are allowed only for non-public, non-primitive,
+non-security-affecting additive changes that do not alter accepted RFCs, stable
+specs, public schemas, public API contracts, release limitations, gateway or
+verifier contracts, or replay/state/trace semantics.
+
+The RFC or allowed contract note must cover:
 
 - Affected primitive, schema/profile version, and public surface.
 - Whether the change is additive, replacement candidate, or deferred vNext-only work.
@@ -207,4 +218,4 @@ Any future implementation that uses this map must first provide an RFC or equiva
 | Specify additive vs breaking schema changes | `Additive and Breaking Change Rules` |
 | Define migration fixtures for identity, action request, trace event, state node, work order, and message records | `Migration Fixture Plan` |
 | Confirm Action Gateway and replay invariants remain intact | `Gateway and Replay Invariants` |
-| Confirm planning-only status and no public break or migration | Status banner, `Scope`, and `Non-Goals` |
+| Confirm active-rule status and no public break or migration | Status banner, `Scope`, and `Non-Goals` |
