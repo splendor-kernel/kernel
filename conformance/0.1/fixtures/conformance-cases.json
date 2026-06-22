@@ -383,6 +383,10 @@
         "stable_examples": { "path": "docs/spec/0.1/stable-primitive-examples.json" },
         "variants": [
           { "primitive": "Tenant", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "allowed_permissions": ["fleet.admin"] }, "fail_closed": { "accepted": false, "authority_granted": false, "side_effect_authorized": false } },
+          { "primitive": "Agent", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "principal_id": "principal_root" }, "fail_closed": { "accepted": false, "identity_changed": false, "authority_granted": false } },
+          { "primitive": "Tenant", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "capabilities": ["fleet.admin"] }, "fail_closed": { "accepted": false, "capability_granted": false, "authority_granted": false } },
+          { "primitive": "Run", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "run_started": true }, "fail_closed": { "accepted": false, "run_started": false, "authority_granted": false } },
+          { "primitive": "Policy", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "side_effect_authorized": true }, "fail_closed": { "accepted": false, "side_effect_authorized": false, "authority_granted": false } },
           { "primitive": "WorkOrder", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "signature": "forged-fixture-signature" }, "fail_closed": { "accepted": false, "run_started": false, "authority_granted": false } },
           { "primitive": "Policy", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "quota_override": { "max_actions_per_tick": 999 } }, "fail_closed": { "accepted": false, "authority_granted": false, "side_effect_authorized": false } },
           { "primitive": "Adapter", "expected": "rejected", "failure_mode": "fail_closed", "extensions": { "credential_ref": "secret:prod" }, "fail_closed": { "accepted": false, "adapter_executed": false, "authority_granted": false } },
