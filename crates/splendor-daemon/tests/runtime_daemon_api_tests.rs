@@ -352,6 +352,19 @@ const FND009_CANARIES: &[&str] = &[
     "FND009_SNAPSHOT_BYTES_VALUE_NEVER_RETURN",
     "FND009_RESTRICTED_VALUE_NEVER_RETURN",
     "FND009_LEGAL_HOLD_VALUE_NEVER_RETURN",
+    "FND009_REASON_VALUE_NEVER_RETURN",
+    "FND009_STATUS_VALUE_NEVER_RETURN",
+    "FND009_REASONS_VALUE_NEVER_RETURN",
+    "FND009_SOURCE_VALUE_NEVER_RETURN",
+    "FND009_SCHEMA_VALUE_NEVER_RETURN",
+    "FND009_AUTH_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_JWT_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_COOKIE_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SET_COOKIE_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SESSION_ID_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_CLIENT_SECRET_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_REFRESH_TOKEN_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_SECRET_REF_ALIAS_VALUE_NEVER_RETURN",
 ];
 
 fn fnd009_sensitive_params() -> Value {
@@ -370,6 +383,19 @@ fn fnd009_sensitive_params() -> Value {
         },
         "visibility": "protected-eval",
         "safetyLabel": "safety-local",
+        "reason": format!("token={}", FND009_CANARIES[10]),
+        "status": format!("authorization={}", FND009_CANARIES[11]),
+        "reasons": [format!("credential={}", FND009_CANARIES[12]), "safe_context_reason"],
+        "source": format!("secret={}", FND009_CANARIES[13]),
+        "schema": format!("jwt={}", FND009_CANARIES[14]),
+        "auth": FND009_CANARIES[15],
+        "jwt": FND009_CANARIES[16],
+        "cookie": FND009_CANARIES[17],
+        "setCookie": FND009_CANARIES[18],
+        "sessionId": FND009_CANARIES[19],
+        "clientSecret": FND009_CANARIES[20],
+        "refreshToken": FND009_CANARIES[21],
+        "secretRef": FND009_CANARIES[22],
         "plain_context": "kept for causal shape",
     })
 }
@@ -460,6 +486,31 @@ fn assert_trace_records_preserve_identity_and_reasons(
                 == Some("[REDACTED:protected-eval]")
         }),
         "protected-eval existence should remain visible as a redacted marker"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record
+                .payload
+                .pointer("/kind/ActionVerificationStarted/action/params/reason")
+                .and_then(Value::as_str)
+                == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/status")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/0")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/1")
+                    .and_then(Value::as_str)
+                    == Some("safe_context_reason")
+        }),
+        "sensitive reason/status text should redact while safe reason text remains visible"
     );
 }
 

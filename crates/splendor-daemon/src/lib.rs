@@ -3946,39 +3946,28 @@ fn redact_trace_records(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
 }
 
 fn redact_trace_value(value: serde_json::Value) -> serde_json::Value {
-    redact_trace_value_with_key(value, None)
+    redact_trace_value_inner(value)
 }
 
-fn redact_trace_value_with_key(
-    value: serde_json::Value,
-    key_context: Option<&str>,
-) -> serde_json::Value {
+fn redact_trace_value_inner(value: serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact_trace_value_with_key(item, key_context))
-                .collect(),
-        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_trace_value_inner).collect())
+        }
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
             for (key, value) in map {
                 let redacted_value = if is_trace_sensitive_key(&key) {
                     redact_sensitive_trace_field_value(value)
                 } else {
-                    redact_trace_value_with_key(value, Some(&key))
+                    redact_trace_value_inner(value)
                 };
                 redacted.insert(key, redacted_value);
             }
             serde_json::Value::Object(redacted)
         }
         serde_json::Value::String(value) => {
-            if key_context
-                .map(is_trace_identity_reason_or_status_key)
-                .unwrap_or(false)
-            {
-                serde_json::Value::String(value)
-            } else if let Some(label) = protected_visibility_label(&value) {
+            if let Some(label) = protected_visibility_label(&value) {
                 serde_json::Value::String(format!("[REDACTED:{label}]"))
             } else if is_trace_sensitive_text(&value) {
                 serde_json::Value::String("[REDACTED]".to_string())
@@ -4026,6 +4015,15 @@ fn is_trace_sensitive_key(key: &str) -> bool {
         "authorization",
         "auth_header",
         "bearer",
+        "jwt",
+        "cookie",
+        "set-cookie",
+        "set_cookie",
+        "session",
+        "session_id",
+        "client_secret",
+        "refresh_token",
+        "secret_ref",
         "signature",
         "private_key",
         "api_key",
@@ -4043,6 +4041,7 @@ fn is_trace_sensitive_key(key: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+        || matches!(normalized.as_str(), "auth")
         || [
             "secret",
             "token",
@@ -4051,6 +4050,14 @@ fn is_trace_sensitive_key(key: &str) -> bool {
             "authorization",
             "authheader",
             "bearer",
+            "jwt",
+            "cookie",
+            "setcookie",
+            "session",
+            "sessionid",
+            "clientsecret",
+            "refreshtoken",
+            "secretref",
             "signature",
             "privatekey",
             "apikey",
@@ -4113,6 +4120,24 @@ fn is_trace_sensitive_text(value: &str) -> bool {
         "auth:",
         "auth=",
         "bearer ",
+        "jwt:",
+        "jwt=",
+        "cookie:",
+        "cookie=",
+        "set-cookie:",
+        "set-cookie=",
+        "set_cookie:",
+        "set_cookie=",
+        "session:",
+        "session=",
+        "session_id:",
+        "session_id=",
+        "client_secret:",
+        "client_secret=",
+        "refresh_token:",
+        "refresh_token=",
+        "secret_ref:",
+        "secret_ref=",
         "token:",
         "token=",
         "secret:",
@@ -4154,10 +4179,16 @@ fn is_trace_sensitive_text(value: &str) -> bool {
             "authorization",
             "authheader",
             "bearertoken",
+            "jwt",
+            "cookie",
+            "setcookie",
+            "sessionid",
             "accesstoken",
             "refreshtoken",
+            "refreshjwt",
             "sessiontoken",
             "clientsecret",
+            "secretref",
             "apikey",
             "privatekey",
             "statebytes",
@@ -4930,6 +4961,63 @@ mod tests {
         let error = validate_trace_order(&records, &wrong_run).expect_err("wrong run denied");
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.body.code, "trace_order_invalid");
+    }
+
+    #[test]
+    fn trace_read_and_export_view_redaction_does_not_mutate_persisted_records() {
+        let run_id = RunId::new();
+        let store = InMemoryTraceStore::default();
+        let reason_canary = "FND009_PERSISTED_REASON_VALUE_NEVER_RETURN";
+        let status_canary = "FND009_PERSISTED_STATUS_VALUE_NEVER_RETURN";
+        store
+            .append(
+                &run_id.to_string(),
+                serde_json::json!({
+                    "trace_event_id": TraceId::from_run_sequence(&run_id, 0),
+                    "run_id": run_id.clone(),
+                    "sequence": 0,
+                    "kind": "unit.redaction_probe",
+                    "reason": format!("token={reason_canary}"),
+                    "status": format!("authorization={status_canary}"),
+                    "source": "safe_source",
+                }),
+            )
+            .expect("append raw trace");
+
+        let persisted_before = store.read(&run_id.to_string()).expect("read raw trace");
+        let persisted_json = serde_json::to_string(&persisted_before).expect("raw trace json");
+        assert!(persisted_json.contains(reason_canary));
+        assert!(persisted_json.contains(status_canary));
+
+        let redacted = redact_trace_records(persisted_before.clone());
+        let redacted_json = serde_json::to_string(&redacted).expect("redacted trace json");
+        assert!(!redacted_json.contains(reason_canary));
+        assert!(!redacted_json.contains(status_canary));
+        assert_eq!(
+            redacted[0]
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            redacted[0]
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(redacted[0].event_hash, persisted_before[0].event_hash);
+        assert_eq!(
+            redacted[0].prev_event_hash,
+            persisted_before[0].prev_event_hash
+        );
+
+        let persisted_after = store.read(&run_id.to_string()).expect("reread raw trace");
+        assert_eq!(persisted_after, persisted_before);
+        let persisted_after_json = serde_json::to_string(&persisted_after).expect("raw trace json");
+        assert!(persisted_after_json.contains(reason_canary));
+        assert!(persisted_after_json.contains(status_canary));
     }
 
     #[test]
