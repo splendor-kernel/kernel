@@ -38,6 +38,7 @@ mod determinism;
 mod device_profile;
 mod escalation;
 mod external_governance;
+mod failure_taxonomy;
 mod fleet_telemetry;
 mod governance;
 mod hash;
@@ -93,6 +94,10 @@ pub use external_governance::{
     ExternalGovernanceAdapterFailure, ExternalGovernanceEndpoints, ExternalGovernanceReference,
     ExternalGovernanceWorkOrderBridge, ExternalTraceRange, GovernedArtifactRef,
     EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION, GOVERNED_ARTIFACT_REF_SCHEMA_VERSION,
+};
+pub use failure_taxonomy::{
+    EffectCertainty, ErrorCategory, ErrorTaxonomy, ProviderDetail, ReasonCode, ReasonCodeError,
+    RetryClass, UNKNOWN_ADAPTER_FAILURE_REASON, UNKNOWN_PROVIDER_FAILURE_REASON,
 };
 pub use fleet_telemetry::{
     DenialSignal, FailureCategory, FailureSignal, FleetTelemetrySnapshot, InstanceTelemetry,
