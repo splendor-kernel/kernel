@@ -365,6 +365,17 @@ const FND009_CANARIES: &[&str] = &[
     "FND009_CLIENT_SECRET_ALIAS_VALUE_NEVER_RETURN",
     "FND009_REFRESH_TOKEN_ALIAS_VALUE_NEVER_RETURN",
     "FND009_SECRET_REF_ALIAS_VALUE_NEVER_RETURN",
+    "FND009_REASON_PASSWORD_VALUE_NEVER_RETURN",
+    "FND009_STATUS_SECRET_VALUE_NEVER_RETURN",
+    "FND009_REASONS_CREDENTIAL_VALUE_NEVER_RETURN",
+    "FND009_SOURCE_SIGNATURE_VALUE_NEVER_RETURN",
+    "FND009_SCHEMA_TOKEN_VALUE_NEVER_RETURN",
+    "FND009_NAME_AUTH_VALUE_NEVER_RETURN",
+    "FND009_ADAPTER_AUTHZ_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_CAMEL_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_SNAKE_VALUE_NEVER_RETURN",
+    "FND009_AUTHKEY_KEBAB_VALUE_NEVER_RETURN",
+    "FND009_AUTHZ_KEY_VALUE_NEVER_RETURN",
 ];
 
 fn fnd009_sensitive_params() -> Value {
@@ -383,11 +394,13 @@ fn fnd009_sensitive_params() -> Value {
         },
         "visibility": "protected-eval",
         "safetyLabel": "safety-local",
-        "reason": format!("token={}", FND009_CANARIES[10]),
-        "status": format!("authorization={}", FND009_CANARIES[11]),
-        "reasons": [format!("credential={}", FND009_CANARIES[12]), "safe_context_reason"],
-        "source": format!("secret={}", FND009_CANARIES[13]),
-        "schema": format!("jwt={}", FND009_CANARIES[14]),
+        "reason": format!("token={} password {}", FND009_CANARIES[10], FND009_CANARIES[23]),
+        "status": format!("authorization={} secret {}", FND009_CANARIES[11], FND009_CANARIES[24]),
+        "reasons": [format!("credential={}", FND009_CANARIES[12]), format!("credential {}", FND009_CANARIES[25]), "safe_context_reason"],
+        "source": format!("secret={} signature {}", FND009_CANARIES[13], FND009_CANARIES[26]),
+        "schema": format!("jwt={} token {}", FND009_CANARIES[14], FND009_CANARIES[27]),
+        "name": format!("auth {}", FND009_CANARIES[28]),
+        "adapter": format!("authz {}", FND009_CANARIES[29]),
         "auth": FND009_CANARIES[15],
         "jwt": FND009_CANARIES[16],
         "cookie": FND009_CANARIES[17],
@@ -396,6 +409,12 @@ fn fnd009_sensitive_params() -> Value {
         "clientSecret": FND009_CANARIES[20],
         "refreshToken": FND009_CANARIES[21],
         "secretRef": FND009_CANARIES[22],
+        "authKey": FND009_CANARIES[30],
+        "nested_aliases": {
+            "auth_key": FND009_CANARIES[31],
+            "auth-key": FND009_CANARIES[32],
+            "authz": FND009_CANARIES[33],
+        },
         "plain_context": "kept for causal shape",
     })
 }
@@ -508,9 +527,54 @@ fn assert_trace_records_preserve_identity_and_reasons(
                     .payload
                     .pointer("/kind/ActionVerificationStarted/action/params/reasons/1")
                     .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/reasons/2")
+                    .and_then(Value::as_str)
                     == Some("safe_context_reason")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/source")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/schema")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/name")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/adapter")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/authKey")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth_key")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth-key")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
+                && record
+                    .payload
+                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/authz")
+                    .and_then(Value::as_str)
+                    == Some("[REDACTED]")
         }),
-        "sensitive reason/status text should redact while safe reason text remains visible"
+        "sensitive allow-listed text and auth aliases should redact while safe reason text remains visible"
     );
 }
 

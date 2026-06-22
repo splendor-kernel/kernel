@@ -4014,6 +4014,9 @@ fn is_trace_sensitive_key(key: &str) -> bool {
         "credential",
         "authorization",
         "auth_header",
+        "auth_key",
+        "auth-key",
+        "authz",
         "bearer",
         "jwt",
         "cookie",
@@ -4049,6 +4052,8 @@ fn is_trace_sensitive_key(key: &str) -> bool {
             "credential",
             "authorization",
             "authheader",
+            "authkey",
+            "authz",
             "bearer",
             "jwt",
             "cookie",
@@ -4119,6 +4124,8 @@ fn is_trace_sensitive_text(value: &str) -> bool {
         "authorization=",
         "auth:",
         "auth=",
+        "authz:",
+        "authz=",
         "bearer ",
         "jwt:",
         "jwt=",
@@ -4178,6 +4185,8 @@ fn is_trace_sensitive_text(value: &str) -> bool {
         || [
             "authorization",
             "authheader",
+            "authkey",
+            "authz",
             "bearertoken",
             "jwt",
             "cookie",
@@ -4199,7 +4208,50 @@ fn is_trace_sensitive_text(value: &str) -> bool {
         ]
         .iter()
         .any(|needle| compact.contains(needle))
+        || has_sensitive_plaintext_marker(value)
         || looks_like_trace_jwt(value)
+}
+
+fn has_sensitive_plaintext_marker(value: &str) -> bool {
+    let words = value
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "authorization"
+                | "auth"
+                | "authz"
+                | "bearer"
+                | "token"
+                | "secret"
+                | "password"
+                | "credential"
+                | "signature"
+                | "jwt"
+                | "cookie"
+                | "session"
+        )
+    }) || words.windows(2).any(|window| {
+        matches!(
+            (window[0].as_str(), window[1].as_str()),
+            ("private", "key")
+                | ("client", "secret")
+                | ("refresh", "token")
+                | ("secret", "ref")
+                | ("set", "cookie")
+                | ("state", "bytes")
+                | ("snapshot", "bytes")
+                | ("protected", "eval")
+                | ("safety", "local")
+                | ("legal", "hold")
+        )
+    })
 }
 
 fn protected_visibility_label(value: &str) -> Option<&'static str> {
