@@ -25,6 +25,7 @@ for these primitive categories:
 - adapters
 - compatibility fixture matrix v0
 - FND-011 security invariant mapping fixture v0
+- performance budget fixture contract v0
 
 The suite must be runnable without production secrets, external services,
 production networks, SaaS systems, hardware, or vendor-specific runners.
@@ -73,6 +74,12 @@ The suite validates:
   prompt-only enforcement wording even when `prompt_only` is false, unsafe
   crypto-agility labels, `exercised` status without executable gold evidence,
   missing G80-G89 mappings, and missing event/evidence/containment links.
+- Partial FND-012 performance budget fixture contract v0 evidence: mandatory
+  latency/throughput budgets, environment-capture shape, regression thresholds,
+  retention/backpressure actions, provider/model-time separation, and
+  G29/G66/G68/G74 SLO/resource mappings are present while gold status remains
+  `not_exercised`; negative fixtures reject missing environment capture,
+  provider/model-time mixing, and skipped safety checks.
 
 ## Report Format
 
@@ -94,7 +101,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 32,
+  "case_count": 36,
   "failed_count": 0,
   "results": [
     {
@@ -131,6 +138,13 @@ passing G80-G89 gold evidence.
 The fixture runner also rejects `case_status: exercised` unless explicit
 executable gold evidence metadata is present. The checked G80-G89 fixture remains
 `mapped_not_exercised`; this is not pass status.
+
+The FND-012 performance budget cases are also partial fixture evidence only.
+They validate a budget/report contract plus negative environment-capture,
+provider/model-time-mixing, and skipped-safety-check cases; they do not execute
+24/7 soak tests, 1,000-node simulation, GPU/training,
+robotics, live fleet, or physical hardware benchmarks, and they must not be
+reported as `G29`, `G66`, `G68`, `G74`, issue #231, or issue #180 completion.
 
 ## Non-Goals
 

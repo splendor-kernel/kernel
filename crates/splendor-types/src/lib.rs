@@ -45,6 +45,7 @@ mod hash;
 mod ids;
 mod message;
 mod node_registry;
+mod performance_budgets;
 mod placement;
 mod policy_distribution;
 mod primitives;
@@ -135,6 +136,16 @@ pub use node_registry::{
     HealthStatus, InstanceHealth, InstanceHeartbeat, InstanceRegistration, ManagementAuditEvent,
     ManagementAuditEventKind, NodeHealth, NodeHeartbeat, NodeKind, NodeRegistration,
     NodeRegistryValidationError, RegistryScope, RuntimeMode,
+};
+pub use performance_budgets::{
+    validate_performance_budget_catalog, BenchmarkEnvironment, GoldBudgetEvidenceStatus,
+    GoldSloResourceBudget, LatencyBudget, MeasurementBoundary, PerformanceBudgetCatalog,
+    PerformanceBudgetValidationError, PerformanceReportStatus, PerformanceReportSummary,
+    RegressionThreshold, ResourceBudget, ResourceBudgetKind, RetentionBackpressureAction,
+    RetentionBackpressureKind, ScaleTarget, ThroughputBudget, PERFORMANCE_BUDGET_EVIDENCE_SCOPE,
+    PERFORMANCE_BUDGET_SCHEMA_VERSION, REQUIRED_LATENCY_BUDGET_METRICS,
+    REQUIRED_PERFORMANCE_GOLD_IDS, REQUIRED_PERFORMANCE_NON_CLAIMS,
+    REQUIRED_THROUGHPUT_BUDGET_METRICS,
 };
 pub use placement::{
     select_placement, DataLocality, PlacementCandidate, PlacementCandidateEvaluation,

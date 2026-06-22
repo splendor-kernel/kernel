@@ -1,0 +1,28 @@
+{
+  "schema_version": "splendor.performance_budgets.v1",
+  "task_id": "FND-012",
+  "evidence_scope": "partial_fnd_012_budget_contract_v0",
+  "non_claims": [
+    "no_fnd_012_completion",
+    "no_issue_231_completion",
+    "no_issue_180_completion",
+    "no_g29_pass",
+    "no_g66_pass",
+    "no_g68_pass",
+    "no_g74_pass",
+    "no_benchmark_execution"
+  ],
+  "report_summary": {
+    "report_id": "fnd-012-negative-missing-environment",
+    "status": "budget_contract_only",
+    "benchmark_suite": "fnd-012-reference-scale-budget-contract",
+    "measured": false,
+    "summary": "Negative fixture intentionally omits benchmark_environment to prove conformance rejects missing environment capture.",
+    "benchmark_run_ref": null
+  },
+  "latency_budgets": [],
+  "throughput_budgets": [],
+  "regression_thresholds": [],
+  "retention_backpressure_actions": [],
+  "gold_slo_resource_budgets": []
+}
