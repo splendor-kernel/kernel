@@ -70,6 +70,8 @@ The suite validates:
   capability, fail-closed decision, enforcing component, required event,
   evidence link, containment action, incident class, and change-risk class. The
   runner rejects prompt-only boundaries, skipped mandatory conformant cases,
+  prompt-only enforcement wording even when `prompt_only` is false, unsafe
+  crypto-agility labels, `exercised` status without executable gold evidence,
   missing G80-G89 mappings, and missing event/evidence/containment links.
 
 ## Report Format
@@ -92,7 +94,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 30,
+  "case_count": 32,
   "failed_count": 0,
   "results": [
     {
@@ -125,6 +127,10 @@ does not implement a secret broker, data-use controller, attestation system,
 rollout controller, protected eval isolation, red-team harness, or physical
 safety certification. It must not be reported as full FND-011 completion or as
 passing G80-G89 gold evidence.
+
+The fixture runner also rejects `case_status: exercised` unless explicit
+executable gold evidence metadata is present. The checked G80-G89 fixture remains
+`mapped_not_exercised`; this is not pass status.
 
 ## Non-Goals
 

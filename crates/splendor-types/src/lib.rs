@@ -159,12 +159,13 @@ pub use schema_extensions::{
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
 };
 pub use security_invariants::{
-    validate_security_invariant_catalog, ContainmentAction, CryptoAgility, FailClosedDecision,
-    KeyRotationPolicy, SecurityCaseStatus, SecurityEnforcementMapping, SecurityInvariantCatalog,
-    SecurityInvariantRecord, SecurityInvariantValidationError, SecurityMaturityGate, SecurityPlane,
-    SecurityReviewChecklistItem, SecurityThreatId, SecurityThreatIdError, TrustBoundary,
-    ALL_SECURITY_PLANES, REQUIRED_SECURITY_GOLD_IDS, SECURITY_INVARIANT_PARTIAL_EVIDENCE_SCOPE,
-    SECURITY_INVARIANT_REQUIRED_NON_CLAIMS, SECURITY_INVARIANT_SCHEMA_VERSION,
+    validate_security_invariant_catalog, ContainmentAction, CryptoAgility, ExecutableGoldEvidence,
+    FailClosedDecision, KeyRotationPolicy, SecurityCaseStatus, SecurityEnforcementMapping,
+    SecurityInvariantCatalog, SecurityInvariantRecord, SecurityInvariantValidationError,
+    SecurityMaturityGate, SecurityPlane, SecurityReviewChecklistItem, SecurityThreatId,
+    SecurityThreatIdError, TrustBoundary, ALL_SECURITY_PLANES, REQUIRED_SECURITY_GOLD_IDS,
+    SECURITY_INVARIANT_PARTIAL_EVIDENCE_SCOPE, SECURITY_INVARIANT_REQUIRED_NON_CLAIMS,
+    SECURITY_INVARIANT_SCHEMA_VERSION,
 };
 pub use state_handoff::{
     StateHandoff, StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext,

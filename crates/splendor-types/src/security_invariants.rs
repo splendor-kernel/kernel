@@ -231,6 +231,24 @@ pub struct SecurityMaturityGate {
     pub case_status: SecurityCaseStatus,
     /// Non-claim text that keeps mapping evidence distinct from gold pass evidence.
     pub non_claim: String,
+    /// Required when `case_status` is `exercised`. This is executable evidence
+    /// metadata only; it is not authority and does not by itself mark a gold
+    /// case passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_gold_evidence: Option<ExecutableGoldEvidence>,
+}
+
+/// Executable gold evidence metadata for an exercised case.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableGoldEvidence {
+    /// Stable harness ID that executed the case.
+    pub harness_id: String,
+    /// Report or artifact reference containing the retained run output.
+    pub report_ref: String,
+    /// Execution timestamp or externally retained run reference.
+    pub executed_at: String,
+    /// Evidence assertions covered by the harness report.
+    pub evidence_assertions: Vec<String>,
 }
 
 /// One threat/invariant mapping record.
@@ -377,6 +395,12 @@ pub enum SecurityInvariantValidationError {
         /// Gold case ID.
         gold_id: String,
     },
+    /// A case claimed to be exercised without explicit executable evidence metadata.
+    #[error("security invariant {gold_id} is exercised without executable gold evidence")]
+    MissingExecutableGoldEvidence {
+        /// Gold case ID.
+        gold_id: String,
+    },
     /// A mandatory conformant case was skipped.
     #[error("mandatory conformant security case {gold_id} is skipped")]
     SkippedMandatoryCase {
@@ -396,6 +420,12 @@ pub enum SecurityInvariantValidationError {
     MissingCryptoAgility {
         /// Missing field.
         field: &'static str,
+    },
+    /// An unsafe or non-cryptographic algorithm label was present in crypto agility metadata.
+    #[error("security invariant catalog uses unsafe crypto algorithm label {algorithm:?}")]
+    UnsafeCryptoAlgorithm {
+        /// Rejected algorithm label.
+        algorithm: String,
     },
     /// The security review checklist is missing or incomplete.
     #[error("security invariant catalog security review checklist is incomplete")]
@@ -512,6 +542,16 @@ fn validate_security_invariant_record(
         &invariant.gold_id,
         "trust_boundary.enforced_by",
     )?;
+    reject_prompt_only_control_text(
+        &invariant.gold_id,
+        "trust_boundary.name",
+        std::slice::from_ref(&invariant.trust_boundary.name),
+    )?;
+    reject_prompt_only_control_text(
+        &invariant.gold_id,
+        "trust_boundary.enforced_by",
+        &invariant.trust_boundary.enforced_by,
+    )?;
 
     if invariant.maturity_gate.conformant_required
         && invariant.maturity_gate.case_status == SecurityCaseStatus::Skipped
@@ -525,6 +565,7 @@ fn validate_security_invariant_record(
         &invariant.gold_id,
         "maturity_gate.non_claim",
     )?;
+    validate_executable_gold_evidence(&invariant.gold_id, &invariant.maturity_gate)?;
 
     validate_enforcement(&invariant.gold_id, &invariant.enforcement)
 }
@@ -541,6 +582,11 @@ fn validate_enforcement(
             },
         );
     }
+    reject_prompt_only_control_text(
+        gold_id,
+        "enforcement.enforcing_component",
+        std::slice::from_ref(&enforcement.enforcing_component),
+    )?;
     if enforcement.required_events.is_empty()
         || enforcement
             .required_events
@@ -589,6 +635,13 @@ fn validate_crypto_agility(crypto: &CryptoAgility) -> Result<(), SecurityInvaria
             field: "allowed_signature_algorithms",
         });
     }
+    for algorithm in &crypto.allowed_signature_algorithms {
+        if is_unsafe_crypto_algorithm_label(algorithm) {
+            return Err(SecurityInvariantValidationError::UnsafeCryptoAlgorithm {
+                algorithm: algorithm.clone(),
+            });
+        }
+    }
     if !crypto.key_rotation.rotation_required {
         return Err(SecurityInvariantValidationError::MissingCryptoAgility {
             field: "key_rotation.rotation_required",
@@ -622,6 +675,61 @@ fn validate_crypto_agility(crypto: &CryptoAgility) -> Result<(), SecurityInvaria
     {
         return Err(SecurityInvariantValidationError::MissingCryptoAgility {
             field: "non_cryptographic_safety_assumptions",
+        });
+    }
+    Ok(())
+}
+
+fn validate_executable_gold_evidence(
+    gold_id: &str,
+    maturity_gate: &SecurityMaturityGate,
+) -> Result<(), SecurityInvariantValidationError> {
+    if maturity_gate.case_status != SecurityCaseStatus::Exercised {
+        return Ok(());
+    }
+
+    let Some(evidence) = &maturity_gate.executable_gold_evidence else {
+        return Err(
+            SecurityInvariantValidationError::MissingExecutableGoldEvidence {
+                gold_id: gold_id.to_string(),
+            },
+        );
+    };
+
+    ensure_non_empty_string(
+        &evidence.harness_id,
+        gold_id,
+        "executable_gold_evidence.harness_id",
+    )?;
+    ensure_non_empty_string(
+        &evidence.report_ref,
+        gold_id,
+        "executable_gold_evidence.report_ref",
+    )?;
+    ensure_non_empty_string(
+        &evidence.executed_at,
+        gold_id,
+        "executable_gold_evidence.executed_at",
+    )?;
+    ensure_non_empty_strings(
+        &evidence.evidence_assertions,
+        gold_id,
+        "executable_gold_evidence.evidence_assertions",
+    )?;
+    Ok(())
+}
+
+fn reject_prompt_only_control_text(
+    gold_id: &str,
+    _field: &'static str,
+    values: &[String],
+) -> Result<(), SecurityInvariantValidationError> {
+    if values
+        .iter()
+        .any(|value| is_prompt_only_control_text(value))
+    {
+        return Err(SecurityInvariantValidationError::PromptOnlyBoundary {
+            gold_id: gold_id.to_string(),
         });
     }
     Ok(())
@@ -668,6 +776,63 @@ fn ensure_non_empty_strings(
         });
     }
     Ok(())
+}
+
+const PROMPT_ONLY_CONTROL_PHRASES: &[&str] = &[
+    "prompt instruction",
+    "system prompt",
+    "llm instruction",
+    "model instruction",
+    "assistant instruction",
+    "developer instruction",
+    "instruction prompt",
+];
+
+const UNSAFE_CRYPTO_ALGORITHM_LABELS: &[&str] = &["none", "plain", "plaintext", "md5"];
+
+fn is_prompt_only_control_text(value: &str) -> bool {
+    let normalized = normalize_free_text(value);
+    PROMPT_ONLY_CONTROL_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+}
+
+fn is_unsafe_crypto_algorithm_label(value: &str) -> bool {
+    let normalized = normalize_label(value);
+    if normalized.is_empty() {
+        return true;
+    }
+    UNSAFE_CRYPTO_ALGORITHM_LABELS.contains(&normalized.as_str()) || normalized.contains("md5")
+}
+
+fn normalize_free_text(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = true;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn normalize_label(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_separator = true;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            normalized.push('_');
+            previous_was_separator = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
 }
 
 const MAX_SECURITY_THREAT_ID_BYTES: usize = 96;

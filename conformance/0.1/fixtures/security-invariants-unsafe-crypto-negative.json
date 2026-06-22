@@ -1,0 +1,23 @@
+{
+  "schema_version": "splendor.security_invariants.v1",
+  "evidence_scope": "partial_fnd_011_security_invariants_v0",
+  "non_claims": ["no_fnd_011_completion", "no_g80_g89_pass", "no_gold_harness_pass"],
+  "crypto_agility": {
+    "allowed_signature_algorithms": ["rsa_md5"],
+    "key_rotation": {
+      "rotation_required": true,
+      "revocation_path_required": true,
+      "compromise_response": "fixture compromise response"
+    },
+    "node_attestation_extension_points": ["node_identity_attestation_ref"],
+    "non_cryptographic_safety_assumptions": ["cryptography does not prove physical safety"]
+  },
+  "security_review_checklist": [
+    {
+      "id": "SEC-REVIEW-CRYPTO-NEGATIVE",
+      "question": "negative fixture question",
+      "required_evidence": "negative fixture evidence"
+    }
+  ],
+  "invariants": []
+}

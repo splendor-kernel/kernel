@@ -35,4 +35,10 @@ cargo test -p splendor-types security_invariants
 
 The validation is intentionally strict about prompt-only boundaries, skipped
 mandatory conformant cases, missing G80-G89 mappings, and missing event/evidence
-or containment links.
+or containment links. It also rejects prompt-only/security-by-prompt wording such
+as `system prompt`, `prompt instruction`, or `LLM instruction` in trust-boundary
+or enforcement controls even when `prompt_only` is set to false. `case_status:
+exercised` requires explicit executable gold evidence metadata, and the partial
+G80-G89 fixture remains `mapped_not_exercised`. Unsafe crypto-agility labels such
+as `none`, `md5`, `rsa_md5`, `plain`, and empty labels are rejected as validation
+failures only; this does not implement cryptography.

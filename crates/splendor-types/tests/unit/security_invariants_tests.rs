@@ -50,6 +50,31 @@ fn prompt_only_boundary_fails_validation() {
 }
 
 #[test]
+fn prompt_only_false_with_prompt_wording_still_fails_validation() {
+    let mut catalog = fixture_catalog();
+    let g80 = catalog
+        .invariants
+        .iter_mut()
+        .find(|record| record.gold_id == "G80")
+        .expect("G80 fixture exists");
+    g80.trust_boundary.prompt_only = false;
+    g80.trust_boundary.enforced_by = vec![
+        "prompt instruction".to_string(),
+        "system prompt".to_string(),
+        "LLM instruction".to_string(),
+    ];
+
+    let error = validate_security_invariant_catalog(&catalog).expect_err("prompt wording fails");
+
+    assert_eq!(
+        error,
+        SecurityInvariantValidationError::PromptOnlyBoundary {
+            gold_id: "G80".to_string()
+        }
+    );
+}
+
+#[test]
 fn skipped_mandatory_case_fails_validation() {
     let mut catalog = fixture_catalog();
     let g87 = catalog
@@ -67,6 +92,55 @@ fn skipped_mandatory_case_fails_validation() {
             gold_id: "G87".to_string()
         }
     );
+}
+
+#[test]
+fn exercised_case_requires_executable_gold_evidence() {
+    let mut catalog = fixture_catalog();
+    let g86 = catalog
+        .invariants
+        .iter_mut()
+        .find(|record| record.gold_id == "G86")
+        .expect("G86 fixture exists");
+    g86.maturity_gate.case_status = SecurityCaseStatus::Exercised;
+    g86.maturity_gate.executable_gold_evidence = None;
+
+    let error = validate_security_invariant_catalog(&catalog)
+        .expect_err("exercised without evidence fails");
+
+    assert_eq!(
+        error,
+        SecurityInvariantValidationError::MissingExecutableGoldEvidence {
+            gold_id: "G86".to_string()
+        }
+    );
+}
+
+#[test]
+fn unsafe_crypto_algorithm_labels_fail_validation() {
+    for algorithm in ["none", "md5", "rsa_md5", "plain", " "] {
+        let mut catalog = fixture_catalog();
+        catalog.crypto_agility.allowed_signature_algorithms = vec![algorithm.to_string()];
+
+        let error = validate_security_invariant_catalog(&catalog)
+            .expect_err("unsafe crypto algorithm fails");
+
+        if algorithm.trim().is_empty() {
+            assert_eq!(
+                error,
+                SecurityInvariantValidationError::MissingCryptoAgility {
+                    field: "allowed_signature_algorithms"
+                }
+            );
+        } else {
+            assert_eq!(
+                error,
+                SecurityInvariantValidationError::UnsafeCryptoAlgorithm {
+                    algorithm: algorithm.to_string()
+                }
+            );
+        }
+    }
 }
 
 #[test]
