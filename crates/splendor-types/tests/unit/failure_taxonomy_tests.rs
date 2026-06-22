@@ -132,6 +132,108 @@ fn provider_detail_deserialization_is_sanitized_before_reserialization() {
 }
 
 #[test]
+fn provider_detail_builders_cover_fallback_empty_and_truncation_paths() {
+    let fallback = ProviderDetail::new(" !!! ")
+        .with_provider_code("***")
+        .with_safe_summary(" \n\t ");
+    assert_eq!(fallback.provider(), "unknown_provider");
+    assert_eq!(fallback.provider_code(), Some("unknown_code"));
+    assert_eq!(fallback.safe_summary(), None);
+
+    let decoded: ProviderDetail = serde_json::from_value(serde_json::json!({
+        "provider": "***",
+        "provider_code": null,
+        "safe_summary": null
+    }))
+    .expect("provider detail decodes");
+    assert_eq!(decoded.provider(), "unknown_provider");
+    assert_eq!(decoded.provider_code(), None);
+    assert_eq!(decoded.safe_summary(), None);
+
+    let long_label = format!("provider_{}", "x".repeat(100));
+    let long_summary = format!("ok {}", "x".repeat(300));
+    let truncated = ProviderDetail::new(long_label).with_safe_summary(&long_summary);
+    assert_eq!(truncated.provider().len(), 64);
+    assert_eq!(
+        truncated.safe_summary().expect("summary").chars().count(),
+        256
+    );
+}
+
+#[test]
+fn safe_summary_collapses_whitespace_without_treating_it_as_authority() {
+    let detail = ProviderDetail::new("provider").with_safe_summary(" first\n\tsecond\r\nthird ");
+
+    assert_eq!(detail.safe_summary(), Some("first second third"));
+}
+
+#[test]
+fn taxonomy_constructors_cover_invalid_unavailable_and_unknown_provider_paths() {
+    let taxonomy = ErrorTaxonomy::try_new(
+        ErrorCategory::Timeout,
+        "provider_timeout",
+        RetryClass::RetryWithSameIdempotencyKey,
+        EffectCertainty::None,
+    )
+    .expect("valid taxonomy");
+    assert_eq!(taxonomy.category, ErrorCategory::Timeout);
+    assert_eq!(taxonomy.reason_code.as_str(), "provider_timeout");
+
+    assert!(matches!(
+        ErrorTaxonomy::try_new(
+            ErrorCategory::InvalidInput,
+            "bad-code",
+            RetryClass::NotRetryable,
+            EffectCertainty::None,
+        ),
+        Err(ReasonCodeError::InvalidCharacter { character: '-' })
+    ));
+    assert!(matches!(
+        ErrorTaxonomy::try_new(
+            ErrorCategory::InvalidInput,
+            "x".repeat(129),
+            RetryClass::NotRetryable,
+            EffectCertainty::None,
+        ),
+        Err(ReasonCodeError::TooLong { max: 128 })
+    ));
+
+    let unavailable = ErrorTaxonomy::unavailable_before_execution("provider_unavailable");
+    assert_eq!(unavailable.category, ErrorCategory::Unavailable);
+    assert_eq!(unavailable.reason_code.as_str(), "provider_unavailable");
+    assert_eq!(
+        unavailable.retry_class,
+        RetryClass::RetryWithSameIdempotencyKey
+    );
+    assert_eq!(unavailable.effect_certainty, EffectCertainty::None);
+    assert!(unavailable.provider_detail.is_none());
+
+    let unknown = ErrorTaxonomy::unknown_provider_failure("Opaque Provider", None);
+    assert_eq!(unknown.category, ErrorCategory::DriverFailure);
+    assert_eq!(
+        unknown.reason_code.as_str(),
+        UNKNOWN_PROVIDER_FAILURE_REASON
+    );
+    assert_eq!(unknown.retry_class, RetryClass::NotRetryable);
+    assert_eq!(unknown.effect_certainty, EffectCertainty::Uncertain);
+    let detail = unknown.provider_detail.as_ref().expect("provider detail");
+    assert_eq!(detail.provider(), "opaque_provider");
+    assert_eq!(detail.safe_summary(), None);
+}
+
+#[test]
+fn taxonomy_deserialization_rejects_invalid_reason_code() {
+    let decoded = serde_json::from_value::<ErrorTaxonomy>(serde_json::json!({
+        "category": "driver_failure",
+        "reason_code": "InvalidCode",
+        "retry_class": "not_retryable",
+        "effect_certainty": "uncertain"
+    }));
+
+    assert!(decoded.is_err());
+}
+
+#[test]
 fn unknown_adapter_failure_defaults_to_uncertain_non_retryable() {
     let taxonomy = ErrorTaxonomy::unknown_adapter_failure(
         "Robot Driver / v2",
