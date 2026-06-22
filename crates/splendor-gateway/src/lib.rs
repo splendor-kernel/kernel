@@ -38,9 +38,10 @@ use serde::{Deserialize, Serialize};
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
     ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, CircuitBreaker,
-    CircuitBreakerScope, IdentityValidationError, QuotaUsage, RunId, RuntimeIdentityContext,
-    SideEffectClass, TenantId, VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION,
-    APPROVAL_POLICY_SCHEMA_VERSION, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    CircuitBreakerScope, EffectCertainty, ErrorCategory, ErrorTaxonomy, IdentityValidationError,
+    QuotaUsage, ReasonCode, RetryClass, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
+    VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::HashMap;
 use std::future::{ready, Future, Ready};
@@ -383,6 +384,26 @@ pub enum AdapterError {
     /// Adapter execution failed.
     #[error("adapter failed: {0}")]
     Failed(String),
+}
+
+impl AdapterError {
+    /// Converts an unclassified adapter failure into the canonical taxonomy.
+    ///
+    /// Generic adapter errors do not prove whether the provider produced a side
+    /// effect. Until a driver-specific receipt mapping exists, they remain
+    /// non-retryable with uncertain effect.
+    pub fn taxonomy(&self) -> ErrorTaxonomy {
+        self.taxonomy_for_adapter("action_adapter")
+    }
+
+    /// Converts this adapter failure with a caller-supplied adapter/provider label.
+    pub fn taxonomy_for_adapter(&self, adapter: impl AsRef<str>) -> ErrorTaxonomy {
+        match self {
+            Self::Failed(detail) => {
+                ErrorTaxonomy::unknown_adapter_failure(adapter, Some(detail.as_str()))
+            }
+        }
+    }
 }
 
 /// Accessor trait for tenant policy and quota checks.
@@ -1089,6 +1110,29 @@ pub enum GatewayError {
     /// Adapter failed to execute the action.
     #[error("adapter execution failed: {0}")]
     AdapterFailed(String),
+}
+
+impl GatewayError {
+    /// Converts gateway-level failures into the canonical taxonomy bridge.
+    pub fn taxonomy(&self) -> ErrorTaxonomy {
+        match self {
+            Self::Unimplemented => ErrorTaxonomy::new(
+                ErrorCategory::Unavailable,
+                ReasonCode::from_static("gateway_unimplemented"),
+                RetryClass::NotRetryable,
+                EffectCertainty::None,
+            ),
+            Self::VerificationFailed(_) => ErrorTaxonomy::new(
+                ErrorCategory::Unauthorized,
+                ReasonCode::from_static("gateway_verification_failed"),
+                RetryClass::RetryWithNewAuthorization,
+                EffectCertainty::None,
+            ),
+            Self::AdapterFailed(detail) => {
+                ErrorTaxonomy::unknown_adapter_failure("gateway_adapter", Some(detail.as_str()))
+            }
+        }
+    }
 }
 
 fn check_conditions(reason: &str, expected: &[String], satisfied: &[String]) -> VerificationResult {
