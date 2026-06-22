@@ -186,6 +186,8 @@ fn create_request(
     registered_actions: Vec<RegisteredAction>,
 ) -> CreateRunRequest {
     CreateRunRequest {
+        request_id: format!("req_{}", TraceId::new()),
+        idempotency_key: format!("idem_{}", TraceId::new()),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
         work_order: signed_work_order(tenant_id, agent_id, None, vec![EndpointScope::RunsCreate]),
@@ -231,6 +233,16 @@ async fn call_json<T: DeserializeOwned>(
         )
     });
     (status, parsed)
+}
+
+async fn call_status(app: axum::Router, method: Method, uri: &str, body: Value) -> StatusCode {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).expect("body")))
+        .expect("request");
+    app.oneshot(request).await.expect("response").status()
 }
 
 async fn call_empty<T: DeserializeOwned>(
@@ -2295,15 +2307,240 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created.run_id, duplicate_run_id);
 
+    let mut duplicate_different_key = duplicate;
+    duplicate_different_key.request_id = format!("req_{}", TraceId::new());
+    duplicate_different_key.idempotency_key = format!("idem_{}", TraceId::new());
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app,
         Method::POST,
         "/runs",
-        serde_json::to_value(duplicate).expect("second duplicate request"),
+        serde_json::to_value(duplicate_different_key).expect("second duplicate request"),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error.code, "run_already_exists");
+}
+
+#[tokio::test]
+async fn create_run_idempotency_replays_same_scope_receipt_without_duplicate_work() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let mut request = create_request(tenant_id, agent_id, Vec::new(), Vec::new());
+    request.request_id = "req_create_run_idempotent".to_string();
+    request.idempotency_key = "idem_create_run_idempotent".to_string();
+    request.work_order = signed_work_order_with_id(
+        "wo_create_run_idempotent",
+        request.tenant_id.clone(),
+        request.agent_id.clone(),
+        Some(run_id.clone()),
+    );
+
+    let (status, first): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request.clone()).expect("first idempotent create"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first.run_id, run_id);
+    assert!(!first.duplicate);
+
+    let (status, duplicate): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("duplicate idempotent create"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(duplicate.run_id, first.run_id);
+    assert_eq!(duplicate.status, first.status);
+    assert_eq!(duplicate.request_id, first.request_id);
+    assert_eq!(duplicate.idempotency_key, first.idempotency_key);
+    assert_eq!(
+        duplicate.idempotency_receipt_id,
+        first.idempotency_receipt_id
+    );
+    assert!(duplicate.duplicate);
+
+    let (status, trace_page): (StatusCode, TracePageResponse) = call_empty(
+        app,
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", first.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let audit_endpoints: Vec<_> = trace_page
+        .records
+        .iter()
+        .filter_map(|record| {
+            record
+                .payload
+                .pointer("/kind/DaemonAudit/endpoint")
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert!(audit_endpoints.contains(&"splendor.runs.create"));
+    assert!(audit_endpoints.contains(&"splendor.runs.create.idempotent_duplicate"));
+    assert_eq!(
+        audit_endpoints
+            .iter()
+            .filter(|endpoint| **endpoint == "splendor.runs.create")
+            .count(),
+        1,
+        "duplicate idempotency retry must not record a second create mutation"
+    );
+}
+
+#[tokio::test]
+async fn create_run_idempotency_scope_mismatch_and_missing_fields_fail_closed() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let first_run_id = RunId::new();
+    let mut first = create_request(tenant_id, agent_id, Vec::new(), Vec::new());
+    first.request_id = "req_first_scope".to_string();
+    first.idempotency_key = "idem_scope_collision".to_string();
+    first.work_order = signed_work_order_with_id(
+        "wo_scope_a",
+        first.tenant_id.clone(),
+        first.agent_id.clone(),
+        Some(first_run_id.clone()),
+    );
+    let mut caller_mismatch = first.clone();
+    caller_mismatch.request_id = "req_second_caller_scope".to_string();
+    caller_mismatch.audit_attribution = Some(AuditAttribution {
+        principal: ClientPrincipal::new("app_other", "client_other"),
+        credential_id: Some("cred_other".to_string()),
+        requested_at: OffsetDateTime::now_utc(),
+    });
+    let first_tenant_id = first.tenant_id.to_string();
+    let first_agent_id = first.agent_id.to_string();
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(first).expect("first scoped create"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(caller_mismatch).expect("caller scope mismatch create"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "create_run_idempotency_scope_mismatch");
+    assert_eq!(
+        error.details,
+        json!({"scope_mismatch": true, "category": "create_run_idempotency"})
+    );
+    let details_text = error.details.to_string();
+    for forbidden in [
+        "attempted_scope".to_string(),
+        "existing_scope".to_string(),
+        "tenant_id".to_string(),
+        "agent_id".to_string(),
+        "work_order_id".to_string(),
+        "resolved_run_id".to_string(),
+        "caller".to_string(),
+        "request_fingerprint".to_string(),
+        "app_other".to_string(),
+        "client_other".to_string(),
+        "cred_other".to_string(),
+        first_tenant_id,
+        first_agent_id,
+        "wo_scope_a".to_string(),
+        first_run_id.to_string(),
+        created.run_id.to_string(),
+    ] {
+        assert!(
+            !details_text.contains(&forbidden),
+            "scope mismatch details leaked sensitive scope field/value: {forbidden}"
+        );
+    }
+
+    let second_run_id = RunId::new();
+    let mut second = create_request(TenantId::new(), AgentId::new(), Vec::new(), Vec::new());
+    second.request_id = "req_second_scope".to_string();
+    second.idempotency_key = "idem_scope_collision".to_string();
+    second.work_order = signed_work_order_with_id(
+        "wo_scope_b",
+        second.tenant_id.clone(),
+        second.agent_id.clone(),
+        Some(second_run_id.clone()),
+    );
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(second).expect("scope mismatch create"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "create_run_idempotency_scope_mismatch");
+    assert_eq!(
+        error.details,
+        json!({"scope_mismatch": true, "category": "create_run_idempotency"})
+    );
+    let (status, missing_second): (StatusCode, ApiErrorBody) =
+        call_empty(app.clone(), Method::GET, &format!("/runs/{second_run_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_second.code, "invalid_run");
+
+    let mut blank = create_request(TenantId::new(), AgentId::new(), Vec::new(), Vec::new());
+    let blank_run_id = RunId::new();
+    blank.work_order = signed_work_order_with_id(
+        "wo_blank_idempotency",
+        blank.tenant_id.clone(),
+        blank.agent_id.clone(),
+        Some(blank_run_id.clone()),
+    );
+    blank.idempotency_key = " ".to_string();
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(blank).expect("blank idempotency request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "missing_idempotency_key");
+    let (status, missing_blank): (StatusCode, ApiErrorBody) =
+        call_empty(app.clone(), Method::GET, &format!("/runs/{blank_run_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_blank.code, "invalid_run");
+
+    let mut missing = serde_json::to_value(create_request(
+        TenantId::new(),
+        AgentId::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+    .expect("missing request body");
+    missing
+        .as_object_mut()
+        .expect("object")
+        .remove("request_id");
+    let (status, original): (StatusCode, RunInspectResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(original.status, RunStatus::Pending);
+    let missing_status = call_status(app, Method::POST, "/runs", missing).await;
+    assert!(
+        missing_status.is_client_error(),
+        "missing request_id should fail during extraction/validation"
+    );
 }
 
 #[tokio::test]
@@ -3400,6 +3637,44 @@ async fn health_and_capabilities_accept_canonical_and_public_header_credentials(
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(capabilities["daemon_api_version"], "0.02-S5");
+    let profiles = capabilities["service_profiles"]
+        .as_array()
+        .expect("service profiles array");
+    let runtime = profiles
+        .iter()
+        .find(|profile| profile["name"] == "runtime_daemon_local")
+        .expect("runtime daemon profile");
+    assert_eq!(runtime["status"], "implemented");
+    assert_eq!(runtime["maturity"], "local_0_1_compat");
+    assert!(runtime["endpoints"]
+        .as_array()
+        .expect("runtime endpoints")
+        .iter()
+        .any(|endpoint| endpoint == "POST /runs"));
+    let simulated = profiles
+        .iter()
+        .find(|profile| profile["name"] == "physical_device_simulation")
+        .expect("simulated physical profile");
+    assert_eq!(simulated["status"], "simulated");
+    let idempotency = profiles
+        .iter()
+        .find(|profile| profile["name"] == "create_run_idempotency_v0")
+        .expect("idempotency profile");
+    assert_eq!(idempotency["status"], "experimental");
+    assert_eq!(idempotency["maturity"], "bounded_current_endpoint");
+    let watch = profiles
+        .iter()
+        .find(|profile| profile["name"] == "v2_watch_streams")
+        .expect("watch stream profile");
+    assert_eq!(watch["status"], "unavailable");
+    let gold = profiles
+        .iter()
+        .find(|profile| profile["name"] == "gold_g00_g06")
+        .expect("gold profile");
+    assert_eq!(gold["maturity"], "not_exercised");
+    assert!(!profiles.iter().any(|profile| {
+        profile["name"] == "v2_watch_streams" && profile["status"] == "implemented"
+    }));
 }
 
 #[tokio::test]

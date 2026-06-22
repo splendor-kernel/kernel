@@ -212,7 +212,10 @@ def policy_bundle(expires: int = 60, policy_id: str = POLICY_ID, expires_at: str
 
 def create_run_payload(run_id: str, envelope: dict[str, Any], signed_policy: dict[str, Any] | None, *, policies: list[dict[str, Any]] | None = None, circuit_breakers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     cred = daemon_credential(run_id)
+    work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", "unknown")
     return {
+        "request_id": f"req-uc-e2e-s5-{work_order_id}-{run_id}",
+        "idempotency_key": f"idem-uc-e2e-s5-{work_order_id}-{run_id}",
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "work_order": envelope,

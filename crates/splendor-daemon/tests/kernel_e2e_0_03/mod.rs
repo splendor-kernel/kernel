@@ -770,6 +770,8 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     let tenant_id = TenantId::parse("00000000-0000-0000-0000-000000000201")?;
     let agent_id = AgentId::parse("00000000-0000-0000-0000-000000000202")?;
     let create = CreateRunRequest {
+        request_id: "req_kernel_e2e_daemon".to_string(),
+        idempotency_key: "idem_kernel_e2e_daemon".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
         work_order: daemon_work_order(
@@ -998,6 +1000,8 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     let locked_tenant = TenantId::parse("00000000-0000-0000-0000-000000000211")?;
     let locked_agent = AgentId::parse("00000000-0000-0000-0000-000000000212")?;
     let locked_create = CreateRunRequest {
+        request_id: "req_kernel_e2e_locked".to_string(),
+        idempotency_key: "idem_kernel_e2e_locked".to_string(),
         tenant_id: locked_tenant.clone(),
         agent_id: locked_agent.clone(),
         work_order: daemon_work_order(
@@ -2869,6 +2873,8 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     let state = DaemonState::local_dev();
     let app = router(state);
     let create = CreateRunRequest {
+        request_id: "req_final_cross_primitive_journey".to_string(),
+        idempotency_key: "idem_final_cross_primitive_journey".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: orchestrator.clone(),
         work_order: daemon_work_order(
@@ -3483,6 +3489,8 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         schemas,
         "CreateRunRequest",
         &[
+            "request_id",
+            "idempotency_key",
             "tenant_id",
             "agent_id",
             "work_order",
@@ -3550,6 +3558,8 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
     let agent_id = AgentId::parse("00000000-0000-0000-0000-000000001502")?;
     let run_id = RunId::parse("00000000-0000-0000-0000-000000001503")?;
     let create_run_shape = serde_json::to_value(CreateRunRequest {
+        request_id: "req_openapi_shape".to_string(),
+        idempotency_key: "idem_openapi_shape".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
         work_order: daemon_work_order(
@@ -3587,9 +3597,23 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         snapshot_interval: Some(1),
     })?;
     assert_json_has_keys(&create_run_shape, &create_run_required, "CreateRunRequest");
-    let create_response_required =
-        assert_required_fields(schemas, "CreateRunResponse", &["run_id", "status"])?;
+    let create_response_required = assert_required_fields(
+        schemas,
+        "CreateRunResponse",
+        &[
+            "request_id",
+            "idempotency_key",
+            "idempotency_receipt_id",
+            "duplicate",
+            "run_id",
+            "status",
+        ],
+    )?;
     let create_response_shape = serde_json::to_value(CreateRunResponse {
+        request_id: "req_openapi_shape".to_string(),
+        idempotency_key: "idem_openapi_shape".to_string(),
+        idempotency_receipt_id: "create_run:fnv64:0000000000000000".to_string(),
+        duplicate: false,
         run_id: run_id.clone(),
         status: DaemonRunStatus::Pending,
     })?;

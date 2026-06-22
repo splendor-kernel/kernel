@@ -47,6 +47,8 @@ Sends `POST /runs` with:
 
 ```ts
 {
+  request_id: string,
+  idempotency_key: string,
   tenant_id: TenantId,
   agent_id: AgentId,
   work_order: WorkOrderEnvelope,
@@ -60,6 +62,7 @@ Sends `POST /runs` with:
   policy_bundle: PolicyBundleEnvelope | null,
   registered_actions: RegisteredAction[],
   approval_policies: ApprovalPolicy[],
+  circuit_breakers: CircuitBreaker[],
   allowed_percept_schemas: string[],
   allowed_percept_sources: string[],
   initial_state: JsonValue | null,
@@ -67,10 +70,16 @@ Sends `POST /runs` with:
 }
 ```
 
-The method requires a signed, scoped work-order object and `audit_attribution`.
+The method requires non-blank `request_id` and `idempotency_key` fields, a signed,
+scoped work-order object, and `audit_attribution`.
 Those requirements mirror the daemon security boundary: caller authentication does
 not authorize a run by itself. The client uses the Rust daemon's flattened
 `CreateRunRequest` schema, not a `{ run_config, work_order, audit }` wrapper.
+
+`request_id` is caller correlation only. `idempotency_key` suppresses duplicate
+`POST /runs` work within the daemon's create-run idempotency scope. A retry with
+the same key and scope receives the same run/receipt with `duplicate: true`; key
+reuse for a different scope fails closed.
 
 The client performs only structural fail-closed checks before sending the
 request: signature metadata must be present, `schema_version`, `work_order_id`,
