@@ -1,9 +1,10 @@
 use super::*;
 use splendor_types::{
     AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, CircuitBreaker,
-    CircuitBreakerId, CircuitBreakerScope, FleetId, InstanceId, NodeId, QuotaUsage, RunId,
-    RuntimeIdentityContext, SideEffectClass, TenantId, APPROVAL_EVIDENCE_SCHEMA_VERSION,
-    APPROVAL_POLICY_SCHEMA_VERSION,
+    CircuitBreakerId, CircuitBreakerScope, EffectCertainty, ErrorCategory, FleetId, InstanceId,
+    NodeId, QuotaUsage, RetryClass, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    UNKNOWN_ADAPTER_FAILURE_REASON,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -73,6 +74,69 @@ fn gateway_error_strings_include_details() {
     let adapter = GatewayError::AdapterFailed("timeout".to_string());
     assert!(verification.to_string().contains("quota"));
     assert!(adapter.to_string().contains("timeout"));
+}
+
+#[test]
+fn gateway_errors_map_to_exact_taxonomy_semantics() {
+    let unimplemented = GatewayError::Unimplemented.taxonomy();
+    assert_eq!(unimplemented.category, ErrorCategory::Unavailable);
+    assert_eq!(unimplemented.reason_code.as_str(), "gateway_unimplemented");
+    assert_eq!(unimplemented.retry_class, RetryClass::NotRetryable);
+    assert_eq!(unimplemented.effect_certainty, EffectCertainty::None);
+
+    let verification = GatewayError::VerificationFailed("quota".to_string()).taxonomy();
+    assert_eq!(verification.category, ErrorCategory::Unauthorized);
+    assert_eq!(
+        verification.reason_code.as_str(),
+        "gateway_verification_failed"
+    );
+    assert_eq!(
+        verification.retry_class,
+        RetryClass::RetryWithNewAuthorization
+    );
+    assert_eq!(verification.effect_certainty, EffectCertainty::None);
+
+    let adapter = GatewayError::AdapterFailed("X-Api-Key: sk-test-secret".to_string()).taxonomy();
+    assert_eq!(adapter.category, ErrorCategory::DriverFailure);
+    assert_eq!(adapter.reason_code.as_str(), UNKNOWN_ADAPTER_FAILURE_REASON);
+    assert_eq!(adapter.retry_class, RetryClass::NotRetryable);
+    assert_eq!(adapter.effect_certainty, EffectCertainty::Uncertain);
+    let detail = adapter.provider_detail.as_ref().expect("provider detail");
+    assert_eq!(detail.provider(), "gateway_adapter");
+    assert_eq!(detail.safe_summary(), None);
+    let encoded = serde_json::to_string(&adapter).expect("taxonomy serializes");
+    assert!(!encoded.contains("sk-test-secret"));
+    assert!(!encoded.contains("X-Api-Key"));
+}
+
+#[test]
+fn adapter_error_unknown_failures_are_uncertain_and_non_retryable() {
+    for raw_detail in [
+        "provider returned HTTP 500 with X-Api-Key: sk-test-secret",
+        "api-key=sk-test-secret",
+        "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+    ] {
+        let taxonomy =
+            AdapterError::Failed(raw_detail.to_string()).taxonomy_for_adapter("custom/provider");
+
+        assert_eq!(taxonomy.category, ErrorCategory::DriverFailure);
+        assert_eq!(
+            taxonomy.reason_code.as_str(),
+            UNKNOWN_ADAPTER_FAILURE_REASON
+        );
+        assert_eq!(taxonomy.retry_class, RetryClass::NotRetryable);
+        assert_eq!(taxonomy.effect_certainty, EffectCertainty::Uncertain);
+        let detail = taxonomy.provider_detail.as_ref().expect("provider detail");
+        assert_eq!(detail.provider(), "custom_provider");
+        assert_eq!(detail.safe_summary(), None);
+
+        let encoded = serde_json::to_string(&taxonomy).expect("taxonomy serializes");
+        assert!(!encoded.contains("sk-test-secret"));
+        assert!(!encoded.contains("X-Api-Key"));
+        assert!(!encoded.contains("api-key"));
+        assert!(!encoded.contains("PRIVATE KEY"));
+        assert!(!encoded.contains("abc123"));
+    }
 }
 
 #[derive(Clone)]
