@@ -418,6 +418,28 @@
           }
         ]
       }
+    },
+    {
+      "case_id": "security-invariants-g80-g89-mapping",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-G80-G89-MAPPING",
+      "path": "positive",
+      "description": "Partial FND-011 fixture evidence maps every G80-G89 security/adversarial case to an invariant, plane, component, event, evidence link, and containment action.",
+      "report_message": "partial FND-011 security invariant mapping v0: G80-G89 mapped with events/evidence/containment; no FND-011 completion or G80-G89 pass claimed",
+      "security_invariants": {
+        "path": "docs/rules/v2/security/security-invariants.json",
+        "required_gold_ids": ["G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"],
+        "required_planes": ["identity_authority", "artifact_lineage", "event_state_evidence", "execution_fabric", "driver_boundary", "agent_runtime_routing", "data_feedback_eval_learning_control", "change_governance"]
+      }
+    },
+    {
+      "case_id": "security-invariants-skipped-mandatory-negative-fixture",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-NO-MANDATORY-SKIPS",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves mandatory conformant security cases cannot be reported as skipped.",
+      "expected_failure": "mandatory conformant security case G80 is skipped",
+      "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-skipped-negative.json" }
     }
   ]
 }

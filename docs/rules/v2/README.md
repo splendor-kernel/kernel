@@ -70,6 +70,7 @@ docs/examples, migration notes when needed, and validation output.
 - `catalog/architecture/` - machine-readable component/task/dependency-policy source files.
 - `architecture/` - active v2 architecture rules, schema/identity map, and ownership policy plan.
 - `gold/` - gold conformance triage, gold program documents, and machine-readable gold catalog.
+- `security/` - bounded FND-011 security threat/invariant mapping fixtures; partial evidence only, not G80-G89 pass status.
 
 ## Safety Guardrails
 
