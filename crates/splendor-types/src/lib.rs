@@ -34,6 +34,7 @@ mod approval;
 mod capabilities;
 mod cloud_helper;
 mod daemon_security;
+mod determinism;
 mod device_profile;
 mod escalation;
 mod external_governance;
@@ -73,6 +74,7 @@ pub use daemon_security::{
     InsecureDevMode, LocalTransportBinding, RevocationStatus, WorkOrderAuthorization,
     WorkOrderSignature,
 };
+pub use determinism::{DeterminismError, DeterministicIdFactory, FixedClock, StepClock};
 pub use device_profile::{
     is_allowed_physical_action, physical_action_capability, validate_physical_capability_document,
     DeviceCapability, DeviceCapabilityCategory, DeviceLocalPolicyIndicators, DeviceNodeKind,
