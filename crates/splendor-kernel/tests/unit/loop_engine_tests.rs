@@ -2,7 +2,7 @@ use super::*;
 use crate::SnapshotPolicy;
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
-    StateNodeId, StateSnapshot, StateStore, StateStoreError,
+    StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceStoreError,
 };
 use splendor_types::{
     ActionId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalTraceContext, ConstraintKind,
@@ -21,6 +21,31 @@ struct CapturingTraceSink {
 
 impl crate::TraceSink for CapturingTraceSink {
     fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct FailingActionVerificationTraceSink {
+    events: Arc<Mutex<Vec<TraceEvent>>>,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl crate::TraceSink for FailingActionVerificationTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        let mut failed = self.failed.lock().expect("failed lock");
+        if !*failed
+            && matches!(
+                &event.kind,
+                TraceEventKind::ActionVerificationStarted { .. }
+            )
+        {
+            *failed = true;
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
+        drop(failed);
+
         self.events.lock().expect("events lock").push(event.clone());
         Ok(())
     }
@@ -512,6 +537,71 @@ fn loop_engine_emits_ordered_trace_events() {
             Some(&outcome.action_outcomes[0].action_id)
         );
     }
+}
+
+#[test]
+fn loop_engine_trace_failure_before_action_dispatch_stops_gateway_and_state_advance() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = FailingActionVerificationTraceSink {
+        events: Arc::clone(&events),
+        failed: Arc::new(Mutex::new(false)),
+    };
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink),
+        ..KernelRuntimeConfig::default()
+    });
+
+    let store = Arc::new(InMemoryStateStore::default());
+    let graph = StateGraph::new(store, SnapshotPolicy::default());
+    let initial_bytes = vec![1];
+    let initial_state = StateData {
+        bytes: initial_bytes.clone(),
+        content_type: None,
+    };
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = Arc::new(CountingGateway {
+        calls: Arc::clone(&calls),
+    });
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        graph,
+        initial_state,
+        Box::new(StaticPolicy),
+        gateway,
+        runtime,
+    );
+    engine.set_constraint_engine(StaticConstraintEngine);
+
+    let error = engine.tick(1).expect_err("trace failure before dispatch");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+    assert_eq!(engine.state.bytes, initial_bytes);
+    assert_eq!(engine.state_graph.tick(), 0);
+    assert!(engine.state_graph.head().is_none());
+    assert!(engine.agent.state_head.is_none());
+
+    let recorded = events.lock().expect("events lock");
+    assert_eq!(engine.runtime.next_sequence(), recorded.len() as u64);
+    assert!(recorded
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ConstraintsEvaluated { .. })));
+    assert!(!recorded.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::ActionVerificationStarted { .. }
+            | TraceEventKind::ActionVerificationCompleted { .. }
+            | TraceEventKind::ActionExecuted { .. }
+            | TraceEventKind::StateCommitted { .. }
+            | TraceEventKind::LoopTickCompleted { .. }
+    )));
 }
 
 #[test]

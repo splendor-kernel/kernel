@@ -1,8 +1,8 @@
 //! # Kernel Runtime
 //!
 //! `KernelRuntime` is the minimal execution context used to emit ordered trace
-//! events. It owns a run identifier, runtime identity context, sequence counter,
-//! and a configurable trace sink.
+//! events. It owns a run identifier, runtime identity context, trace cursor, and
+//! a configurable trace sink.
 //!
 //! ## Example
 //! ```rust,no_run
@@ -21,7 +21,6 @@ use splendor_types::{
     ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
     StateReference, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -59,25 +58,32 @@ pub struct KernelRuntime {
     run_id: RunId,
     /// Base identity context embedded into each trace event.
     identity: TraceIdentityContext,
-    /// Monotonic sequence counter for trace events.
-    sequence: AtomicU64,
+    /// Monotonic sequence and integrity state for successfully persisted events.
+    trace_cursor: Mutex<TraceCursor>,
     /// Trace sink used to emit serialized events.
     trace_sink: Arc<dyn TraceSink>,
-    /// Latest event hash in the integrity chain.
-    prev_event_hash: Mutex<Option<ContentHash>>,
+}
+
+/// Runtime trace cursor updated only after durable trace persistence succeeds.
+#[derive(Clone, Debug)]
+struct TraceCursor {
+    next_sequence: u64,
+    prev_event_hash: Option<ContentHash>,
 }
 
 impl KernelRuntime {
-    /// Creates a runtime with a new run identifier and sequence counter.
+    /// Creates a runtime with a new run identifier and trace cursor.
     pub fn new(config: KernelRuntimeConfig) -> Self {
         let run_id = config.run_id.unwrap_or_default();
         let identity = TraceIdentityContext::from_runtime(run_id.clone(), &config.identity);
         Self {
             run_id,
             identity,
-            sequence: AtomicU64::new(config.initial_sequence),
+            trace_cursor: Mutex::new(TraceCursor {
+                next_sequence: config.initial_sequence,
+                prev_event_hash: config.initial_prev_hash,
+            }),
             trace_sink: config.trace_sink,
-            prev_event_hash: Mutex::new(config.initial_prev_hash),
         }
     }
 
@@ -123,7 +129,10 @@ impl KernelRuntime {
 
     /// Returns the next trace sequence that will be assigned.
     pub fn next_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::SeqCst)
+        self.trace_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next_sequence
     }
 
     /// Records a `TraceEventKind` and returns the emitted `TraceEvent`.
@@ -132,31 +141,39 @@ impl KernelRuntime {
     }
 
     /// Records a `TraceEventKind` with explicit identity context.
+    ///
+    /// The runtime serializes trace cursor state across the durable sink append.
+    /// `TraceSink` implementations used here must not synchronously call back into
+    /// the same runtime while recording, or they can deadlock on the cursor lock.
     pub fn record_event_with_identity(
         &self,
         identity: TraceIdentityContext,
         kind: TraceEventKind,
     ) -> Result<TraceEvent, TraceError> {
         identity.ensure_run(&self.run_id)?;
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let mut event =
-            TraceEvent::try_new_with_identity(identity, sequence, OffsetDateTime::now_utc(), kind)?;
-        let mut prev_hash = self
-            .prev_event_hash
+        let mut cursor = self
+            .trace_cursor
             .lock()
             .map_err(|_| TraceError::IntegrityLock)?;
-        let event_hash = compute_event_hash(prev_hash.as_ref(), &event)?;
+        let sequence = cursor.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(TraceError::SequenceOverflow(sequence))?;
+        let mut event =
+            TraceEvent::try_new_with_identity(identity, sequence, OffsetDateTime::now_utc(), kind)?;
+        let event_hash = compute_event_hash(cursor.prev_event_hash.as_ref(), &event)?;
         if let TraceEventKind::LoopTickCompleted { tick_id, .. } = event.kind {
             event.kind = TraceEventKind::LoopTickCompleted {
                 tick_id,
                 integrity: Some(TraceIntegrity {
-                    prev_event_hash: prev_hash.clone(),
+                    prev_event_hash: cursor.prev_event_hash.clone(),
                     event_hash: event_hash.clone(),
                 }),
             };
         }
-        *prev_hash = Some(event_hash);
         self.trace_sink.record(&event)?;
+        cursor.next_sequence = next_sequence;
+        cursor.prev_event_hash = Some(event_hash);
         Ok(event)
     }
 
