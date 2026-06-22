@@ -1,0 +1,53 @@
+{
+  "schema_version": "splendor.security_invariants.v1",
+  "evidence_scope": "partial_fnd_011_security_invariants_v0",
+  "non_claims": ["no_fnd_011_completion", "no_g80_g89_pass", "no_gold_harness_pass"],
+  "crypto_agility": {
+    "allowed_signature_algorithms": ["ed25519"],
+    "key_rotation": {
+      "rotation_required": true,
+      "revocation_path_required": true,
+      "compromise_response": "fixture compromise response"
+    },
+    "node_attestation_extension_points": ["node_identity_attestation_ref"],
+    "non_cryptographic_safety_assumptions": ["cryptography does not prove physical safety"]
+  },
+  "security_review_checklist": [
+    {
+      "id": "SEC-REVIEW-NEGATIVE",
+      "question": "negative fixture question",
+      "required_evidence": "negative fixture evidence"
+    }
+  ],
+  "invariants": [
+    {
+      "threat_id": "threat.g80.skipped_negative_fixture",
+      "gold_id": "G80",
+      "name": "Skipped mandatory negative fixture",
+      "primary_plane": "agent_runtime_routing",
+      "related_planes": ["identity_authority"],
+      "assets": ["fixture asset"],
+      "trust_boundary": {
+        "name": "negative fixture boundary",
+        "prompt_only": false,
+        "enforced_by": ["fixture verifier"]
+      },
+      "principal": "fixture principal",
+      "attacker_capability": "fixture attacker capability",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "fixture enforcing component",
+        "required_events": ["fixture.denied"],
+        "evidence_links": ["fixture_evidence_ref"],
+        "containment_actions": ["deny_request"]
+      },
+      "incident_classification": "fixture_incident",
+      "change_risk_classification": "fixture_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "skipped",
+        "non_claim": "negative fixture deliberately skips a mandatory case"
+      }
+    }
+  ]
+}

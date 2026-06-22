@@ -1,0 +1,356 @@
+{
+  "schema_version": "splendor.security_invariants.v1",
+  "evidence_scope": "partial_fnd_011_security_invariants_v0",
+  "milestone": "Splendor0.2-dev / 0.2/v2 active execution",
+  "sprint": "V2-FND-0",
+  "catalog_task_id": "FND-011",
+  "frs": ["FR-0.2-01", "FR-0.2-08"],
+  "non_claims": [
+    "no_fnd_011_completion",
+    "no_g80_g89_pass",
+    "no_gold_harness_pass",
+    "no_runtime_enforcement_change",
+    "no_secret_broker_implementation",
+    "no_node_attestation_implementation",
+    "no_physical_safety_certification"
+  ],
+  "crypto_agility": {
+    "allowed_signature_algorithms": ["ed25519", "ecdsa_p256_sha256"],
+    "key_rotation": {
+      "rotation_required": true,
+      "revocation_path_required": true,
+      "compromise_response": "rotate signing keys, revoke affected work orders/capability grants, quarantine derived evidence until revalidated"
+    },
+    "node_attestation_extension_points": [
+      "node_identity_attestation_ref",
+      "worker_image_digest_ref",
+      "driver_manifest_signature_ref",
+      "checkpoint_integrity_ref"
+    ],
+    "non_cryptographic_safety_assumptions": [
+      "cryptographic signatures do not prove model alignment or data quality",
+      "physical safety still requires local safety veto and device firmware/controller guarantees",
+      "prompt text, metadata, extensions, and model outputs are not authority",
+      "operator and governance workflows require independent authorization evidence"
+    ]
+  },
+  "security_review_checklist": [
+    {
+      "id": "SEC-REVIEW-AUTH-FIELDS",
+      "question": "Does the schema add, move, or reinterpret identity, authority, approval, credential, data-use, quota, policy, gateway, verifier, or driver fields?",
+      "required_evidence": "documented authorizing fields, non-authorizing extension treatment, fail-closed unknown-field behavior, and compatibility impact"
+    },
+    {
+      "id": "SEC-REVIEW-GATEWAY",
+      "question": "Can the operation cause filesystem, network, database, shell, cloud, artifact, credential, device, or other external effects?",
+      "required_evidence": "gateway/driver mediation, verifier chain, idempotency or explicit non-idempotency handling, and no replay live-effect path"
+    },
+    {
+      "id": "SEC-REVIEW-EVIDENCE",
+      "question": "Which event, evidence, state, artifact, and replay records prove allow, denial, containment, or uncertainty?",
+      "required_evidence": "required event kinds, evidence links, redaction path, and replay/simulation no-live-effect behavior"
+    },
+    {
+      "id": "SEC-REVIEW-SECRET-DATA",
+      "question": "Could protected data, eval cases, rewards, secrets, credentials, or private artifacts leak through payloads, prompts, logs, traces, artifacts, or provider diagnostics?",
+      "required_evidence": "data-use and secret-scope checks, redaction expectations, forbidden payload tests, and trace-safe diagnostic policy"
+    },
+    {
+      "id": "SEC-REVIEW-CONTAINMENT",
+      "question": "What fail-closed containment action happens when verifier, policy, identity, revocation, attestation, or safety status is unavailable or suspicious?",
+      "required_evidence": "deny/pause/quarantine/fence/revoke/degrade/rollback/safe-stop mapping with owning service and incident classification"
+    }
+  ],
+  "invariants": [
+    {
+      "threat_id": "threat.g80.prompt_data_injection",
+      "gold_id": "G80",
+      "name": "Prompt/data injection through perceptor",
+      "primary_plane": "agent_runtime_routing",
+      "related_planes": ["identity_authority", "driver_boundary", "event_state_evidence"],
+      "assets": ["route authority", "action proposals", "percept provenance", "gateway verifier inputs"],
+      "trust_boundary": {
+        "name": "perceptor payload to route-policy boundary",
+        "prompt_only": false,
+        "enforced_by": ["percept provenance validation", "capability-gated route crossing", "gateway verification"]
+      },
+      "principal": "agent principal bound by tenant/work-order scope",
+      "attacker_capability": "malicious percept payload attempts to smuggle instructions, capability grants, or gateway bypass text",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "agent route runtime with authority and gateway verifiers",
+        "required_events": ["percepts.received", "route.input.tainted", "authorization.denied", "action.denied"],
+        "evidence_links": ["percept_provenance_ref", "capability_decision_ref", "gateway_denial_event"],
+        "containment_actions": ["deny_request", "record_incident"]
+      },
+      "incident_classification": "unauthorized_action_attempt",
+      "change_risk_classification": "security_adversarial_route_boundary",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G80 remains not exercised until an adversarial route/gateway harness passes"
+      }
+    },
+    {
+      "threat_id": "threat.g81.malicious_dataset_poisoning",
+      "gold_id": "G81",
+      "name": "Malicious dataset poisoning",
+      "primary_plane": "data_feedback_eval_learning_control",
+      "related_planes": ["artifact_lineage", "event_state_evidence", "change_governance"],
+      "assets": ["dataset snapshot", "data quality report", "candidate training input", "gate evidence"],
+      "trust_boundary": {
+        "name": "external or collected data to governed dataset snapshot boundary",
+        "prompt_only": false,
+        "enforced_by": ["dataset provenance checks", "quality gate quarantine", "lineage-linked evidence bundle"]
+      },
+      "principal": "data collection or training workload principal",
+      "attacker_capability": "malicious data source injects poisoned records or mislabeled examples into a candidate input",
+      "fail_closed_decision": "quarantine",
+      "enforcement": {
+        "enforcing_component": "data quality gate and artifact lineage service",
+        "required_events": ["data.snapshot.created", "data.quality.checked", "data.quality.quarantined", "gate.denied"],
+        "evidence_links": ["dataset_snapshot_ref", "quality_report_ref", "quarantine_event", "lineage_edge_ref"],
+        "containment_actions": ["quarantine_artifact", "pause_run", "record_incident"]
+      },
+      "incident_classification": "data_poisoning_or_contamination",
+      "change_risk_classification": "candidate_input_integrity_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G81 remains not exercised until poisoning fixture and quarantine harness pass"
+      }
+    },
+    {
+      "threat_id": "threat.g82.secret_exfiltration",
+      "gold_id": "G82",
+      "name": "Secret exfiltration attempt",
+      "primary_plane": "identity_authority",
+      "related_planes": ["driver_boundary", "event_state_evidence", "data_feedback_eval_learning_control"],
+      "assets": ["secret reference", "credential lease", "network egress scope", "trace-safe diagnostics"],
+      "trust_boundary": {
+        "name": "secret reference lease to driver/network boundary",
+        "prompt_only": false,
+        "enforced_by": ["secret lease verifier", "network egress verifier", "audit redaction policy"]
+      },
+      "principal": "workload or adapter principal with narrowed secret-reference scope",
+      "attacker_capability": "user code or model output attempts to copy a secret into prompts, artifacts, logs, traces, or outbound network calls",
+      "fail_closed_decision": "revoke",
+      "enforcement": {
+        "enforcing_component": "authority secret-reference checks plus gateway egress verifier",
+        "required_events": ["secret.lease.checked", "network.egress.denied", "authorization.denied", "evidence.redacted"],
+        "evidence_links": ["secret_lease_ref", "egress_policy_ref", "redaction_evidence_ref", "gateway_denial_event"],
+        "containment_actions": ["deny_request", "block_network_egress", "revoke_credential", "record_incident"]
+      },
+      "incident_classification": "credential_or_secret_breach_attempt",
+      "change_risk_classification": "secret_scope_or_network_exfiltration_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G82 remains not exercised until secret/non-disclosure and egress-denial harness pass"
+      }
+    },
+    {
+      "threat_id": "threat.g83.compromised_worker",
+      "gold_id": "G83",
+      "name": "Compromised worker",
+      "primary_plane": "execution_fabric",
+      "related_planes": ["artifact_lineage", "event_state_evidence", "identity_authority", "driver_boundary"],
+      "assets": ["worker identity", "execution lease", "checkpoint artifact", "driver receipt", "node trust status"],
+      "trust_boundary": {
+        "name": "worker/node output to authoritative artifact and lease boundary",
+        "prompt_only": false,
+        "enforced_by": ["worker proof binding", "checkpoint signature validation", "lease fencing", "node quarantine"]
+      },
+      "principal": "worker or node principal holding a scoped execution lease",
+      "attacker_capability": "compromised worker forges receipts, checkpoints, or outputs after losing trust or lease authority",
+      "fail_closed_decision": "fence",
+      "enforcement": {
+        "enforcing_component": "fabric lease controller with artifact integrity validation",
+        "required_events": ["worker.proof.checked", "artifact.signature.rejected", "lease.fenced", "worker.quarantined"],
+        "evidence_links": ["worker_identity_ref", "lease_ref", "artifact_digest_ref", "quarantine_event"],
+        "containment_actions": ["fence_lease", "quarantine_worker", "quarantine_artifact", "record_incident"]
+      },
+      "incident_classification": "worker_or_supply_chain_compromise",
+      "change_risk_classification": "node_trust_and_artifact_integrity_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G83 remains not exercised until worker compromise, signature rejection, and quarantine harness pass"
+      }
+    },
+    {
+      "threat_id": "threat.g84.eval_leakage",
+      "gold_id": "G84",
+      "name": "Eval leakage attempt",
+      "primary_plane": "data_feedback_eval_learning_control",
+      "related_planes": ["identity_authority", "artifact_lineage", "event_state_evidence", "change_governance"],
+      "assets": ["protected eval cases", "hidden answers", "candidate artifact", "eval report", "gate decision"],
+      "trust_boundary": {
+        "name": "trainer/candidate process to protected evaluator boundary",
+        "prompt_only": false,
+        "enforced_by": ["protected-eval data-use scope", "evaluator isolation", "gate independence check"]
+      },
+      "principal": "trainer, candidate, or improvement workload principal",
+      "attacker_capability": "candidate/trainer attempts to read hidden eval cases or answer keys before gate evaluation",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "evaluation service with authority and data-use checks",
+        "required_events": ["eval.case_access.denied", "data_use.denied", "eval.independence.checked", "gate.denied"],
+        "evidence_links": ["protected_eval_ref", "data_use_decision_ref", "eval_report_ref", "gate_decision_ref"],
+        "containment_actions": ["deny_request", "pause_run", "record_incident"]
+      },
+      "incident_classification": "protected_eval_leakage_attempt",
+      "change_risk_classification": "eval_independence_and_gate_integrity_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G84 remains not exercised until protected eval isolation harness passes"
+      }
+    },
+    {
+      "threat_id": "threat.g85.reward_channel_tampering",
+      "gold_id": "G85",
+      "name": "Reward-channel tampering",
+      "primary_plane": "event_state_evidence",
+      "related_planes": ["data_feedback_eval_learning_control", "artifact_lineage", "change_governance", "identity_authority"],
+      "assets": ["feedback record", "reward derivation", "evidence chain", "gate input", "candidate decision"],
+      "trust_boundary": {
+        "name": "feedback/reward signal to promotion gate boundary",
+        "prompt_only": false,
+        "enforced_by": ["feedback source authentication", "reward derivation lineage", "evidence integrity check", "gate denial on mismatch"]
+      },
+      "principal": "feedback source, reward derivation workload, or candidate gate principal",
+      "attacker_capability": "malicious actor changes reward values, lineage, or source evidence to make a candidate appear safe",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "feedback/reward evidence service plus change gate",
+        "required_events": ["feedback.ingested", "reward.lineage.checked", "evidence.integrity_failed", "gate.denied"],
+        "evidence_links": ["feedback_event_ref", "reward_derivation_ref", "evidence_chain_ref", "gate_decision_ref"],
+        "containment_actions": ["deny_request", "quarantine_artifact", "record_incident"]
+      },
+      "incident_classification": "reward_or_feedback_tampering",
+      "change_risk_classification": "reward_gate_integrity_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G85 remains not exercised until reward anti-tamper and gate-denial harness pass"
+      }
+    },
+    {
+      "threat_id": "threat.g86.driver_schema_confusion",
+      "gold_id": "G86",
+      "name": "Driver schema confusion",
+      "primary_plane": "driver_boundary",
+      "related_planes": ["identity_authority", "event_state_evidence"],
+      "assets": ["driver manifest", "operation schema", "invocation parameters", "gateway verifier result"],
+      "trust_boundary": {
+        "name": "typed invocation request to driver operation ABI boundary",
+        "prompt_only": false,
+        "enforced_by": ["driver manifest schema validation", "operation version negotiation", "gateway preflight denial"]
+      },
+      "principal": "driver invocation principal scoped by work order and capability",
+      "attacker_capability": "caller supplies mismatched schema, version, or operation payload to trigger unintended driver behavior",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "driver registry and gateway schema verifier",
+        "required_events": ["driver.schema.checked", "driver.schema.rejected", "verification.completed", "action.denied"],
+        "evidence_links": ["driver_manifest_ref", "operation_schema_ref", "schema_rejection_event", "gateway_denial_event"],
+        "containment_actions": ["deny_request", "record_incident"]
+      },
+      "incident_classification": "driver_schema_confusion_attempt",
+      "change_risk_classification": "driver_abi_compatibility_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G86 remains not exercised until schema/version mismatch fixture proves pre-execution denial"
+      }
+    },
+    {
+      "threat_id": "threat.g87.duplicate_irreversible_action",
+      "gold_id": "G87",
+      "name": "Duplicate irreversible action",
+      "primary_plane": "driver_boundary",
+      "related_planes": ["event_state_evidence", "change_governance", "identity_authority"],
+      "assets": ["irreversible effect", "idempotency key", "action receipt", "replay plan", "authorization evidence"],
+      "trust_boundary": {
+        "name": "retry/replay request to irreversible driver effect boundary",
+        "prompt_only": false,
+        "enforced_by": ["idempotency verifier", "receipt store check", "replay inspect-only default", "fresh authorization requirement"]
+      },
+      "principal": "action gateway or replay principal requesting an irreversible effect",
+      "attacker_capability": "retry storm or replay attempt tries to repeat an irreversible side effect without a distinct explicit authorization",
+      "fail_closed_decision": "deny",
+      "enforcement": {
+        "enforcing_component": "action gateway idempotency and replay-safety verifier",
+        "required_events": ["idempotency.checked", "duplicate_effect.denied", "replay.inspect_only", "action.denied"],
+        "evidence_links": ["idempotency_key_ref", "action_receipt_ref", "replay_plan_ref", "gateway_denial_event"],
+        "containment_actions": ["deny_request", "record_incident"]
+      },
+      "incident_classification": "duplicate_irreversible_effect_attempt",
+      "change_risk_classification": "idempotency_and_replay_safety_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G87 remains not exercised until duplicate/replay irreversible-effect fixture passes"
+      }
+    },
+    {
+      "threat_id": "threat.g88.expired_offline_policy",
+      "gold_id": "G88",
+      "name": "Expired offline policy",
+      "primary_plane": "execution_fabric",
+      "related_planes": ["identity_authority", "driver_boundary", "agent_runtime_routing", "change_governance", "event_state_evidence"],
+      "assets": ["offline policy bundle", "device-local safety status", "physical action lease", "trace buffer", "safe mode state"],
+      "trust_boundary": {
+        "name": "offline cached policy to physical/device action boundary",
+        "prompt_only": false,
+        "enforced_by": ["policy TTL verifier", "device-local safety verifier", "safe degraded-mode policy", "trace buffer evidence"]
+      },
+      "principal": "resident device or edge node principal operating while disconnected",
+      "attacker_capability": "network partition or stale cache causes a node to use expired policy for high-risk or physical actions",
+      "fail_closed_decision": "safe_stop",
+      "enforcement": {
+        "enforcing_component": "node/device policy cache with local safety verifier",
+        "required_events": ["policy.ttl.expired", "offline.degraded", "physical.local_veto", "device.safe_stop"],
+        "evidence_links": ["policy_bundle_ref", "ttl_check_event", "local_safety_evidence_ref", "trace_buffer_ref"],
+        "containment_actions": ["degrade_to_safe_mode", "safe_stop_device", "require_human_intervention", "record_incident"]
+      },
+      "incident_classification": "expired_policy_or_offline_safety_risk",
+      "change_risk_classification": "edge_policy_ttl_and_physical_safety_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G88 remains not exercised until offline policy and device-safe degraded-mode harness pass"
+      }
+    },
+    {
+      "threat_id": "threat.g89.rollout_blast_radius_breach",
+      "gold_id": "G89",
+      "name": "Rollout blast-radius breach",
+      "primary_plane": "change_governance",
+      "related_planes": ["execution_fabric", "artifact_lineage", "event_state_evidence", "identity_authority", "data_feedback_eval_learning_control"],
+      "assets": ["deployment plan", "canary cohort", "active version", "rollback target", "lease admission", "gate evidence"],
+      "trust_boundary": {
+        "name": "candidate deployment plan to active fleet version boundary",
+        "prompt_only": false,
+        "enforced_by": ["blast-radius policy", "deployment gate", "lease admission controller", "rollback controller"]
+      },
+      "principal": "change or deployment principal attempting to activate a candidate",
+      "attacker_capability": "malicious or faulty rollout exceeds canary scope, asks for new leases, or suppresses abort/rollback signals",
+      "fail_closed_decision": "rollback",
+      "enforcement": {
+        "enforcing_component": "change/deployment controller with fleet lease admission",
+        "required_events": ["deployment.blast_radius.checked", "lease.admission.denied", "rollout.aborted", "deployment.rollback.completed"],
+        "evidence_links": ["deployment_plan_ref", "gate_decision_ref", "lease_denial_event", "rollback_evidence_ref"],
+        "containment_actions": ["rollback_deployment", "fence_lease", "pause_run", "record_incident"]
+      },
+      "incident_classification": "deployment_blast_radius_breach",
+      "change_risk_classification": "rollout_and_self_change_containment_risk",
+      "maturity_gate": {
+        "conformant_required": true,
+        "case_status": "mapped_not_exercised",
+        "non_claim": "mapping only; G89 remains not exercised until rollout blast-radius and rollback harness pass"
+      }
+    }
+  ]
+}

@@ -418,6 +418,83 @@
           }
         ]
       }
+    },
+    {
+      "case_id": "security-invariants-g80-g89-mapping",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-G80-G89-MAPPING",
+      "path": "positive",
+      "description": "Partial FND-011 fixture evidence maps every G80-G89 security/adversarial case to an invariant, plane, component, event, evidence link, and containment action.",
+      "report_message": "partial FND-011 security invariant mapping v0: G80-G89 mapped with events/evidence/containment; no FND-011 completion or G80-G89 pass claimed",
+      "security_invariants": {
+        "path": "docs/rules/v2/security/security-invariants.json",
+        "required_gold_ids": ["G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"],
+        "required_planes": ["identity_authority", "artifact_lineage", "event_state_evidence", "execution_fabric", "driver_boundary", "agent_runtime_routing", "data_feedback_eval_learning_control", "change_governance"],
+        "required_case_status": "mapped_not_exercised"
+      }
+    },
+    {
+      "case_id": "security-invariants-prompt-only-negative-fixture",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-NO-PROMPT-BOUNDARY",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves prompt-only enforcement wording is rejected even when prompt_only is false.",
+      "expected_failure": "security invariant G80 uses a prompt-only trust boundary",
+      "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-prompt-only-negative.json" }
+    },
+    {
+      "case_id": "security-invariants-unsafe-crypto-negative-fixture",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-CRYPTO-AGILITY-SAFE-LABELS",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves unsupported or unsafe crypto-agility labels are rejected by allow-list without claiming crypto implementation.",
+      "expected_failure": "security_invariants unsafe crypto algorithm label 'rsa_sha1'",
+      "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-unsafe-crypto-negative.json" }
+    },
+    {
+      "case_id": "security-invariants-skipped-mandatory-negative-fixture",
+      "primitive": "security_invariants",
+      "requirement": "CONF-0.2-FND-011-NO-MANDATORY-SKIPS",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves mandatory conformant security cases cannot be reported as skipped.",
+      "expected_failure": "mandatory conformant security case G80 is skipped",
+      "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-skipped-negative.json" }
+    },
+    {
+      "case_id": "performance-budgets-reference-contract",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-PERFORMANCE-BUDGETS",
+      "path": "positive",
+      "description": "Partial FND-012 fixture validates mandatory budget metrics, environment capture, regression thresholds, retention/backpressure actions, and G29/G66/G68/G74 SLO/resource mappings without benchmark or gold pass claims.",
+      "report_message": "partial FND-012 performance budget contract v0: mandatory budget/report fields validate; no benchmark execution, #231/#180 completion, or G29/G66/G68/G74 pass claimed",
+      "performance_budgets": { "path": "docs/spec/0.2/performance-budgets.json" }
+    },
+    {
+      "case_id": "performance-budgets-missing-environment-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-ENVIRONMENT-CAPTURE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves performance budget reports without benchmark environment capture are rejected.",
+      "expected_failure": "benchmark_environment is required",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-missing-environment.json" }
+    },
+    {
+      "case_id": "performance-budgets-provider-time-mixed-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-CONTROL-PLANE-SEPARATION",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves provider/model/training time cannot be mixed into kernel control-plane overhead budgets.",
+      "expected_failure": "provider/model time must not be mixed into kernel control-plane overhead",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-provider-time-mixed.json" }
+    },
+    {
+      "case_id": "performance-budgets-skipped-safety-check-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-NO-SAFETY-SKIP-FOR-SPEED",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves budgets cannot skip required safety checks to meet performance targets.",
+      "expected_failure": "gateway_preflight must include safety checks",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-skipped-safety-check.json" }
     }
   ]
 }

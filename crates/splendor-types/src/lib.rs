@@ -45,10 +45,12 @@ mod hash;
 mod ids;
 mod message;
 mod node_registry;
+mod performance_budgets;
 mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod security_invariants;
 mod state_handoff;
 mod trace;
 mod work_order;
@@ -135,6 +137,16 @@ pub use node_registry::{
     ManagementAuditEventKind, NodeHealth, NodeHeartbeat, NodeKind, NodeRegistration,
     NodeRegistryValidationError, RegistryScope, RuntimeMode,
 };
+pub use performance_budgets::{
+    validate_performance_budget_catalog, BenchmarkEnvironment, GoldBudgetEvidenceStatus,
+    GoldSloResourceBudget, LatencyBudget, MeasurementBoundary, PerformanceBudgetCatalog,
+    PerformanceBudgetValidationError, PerformanceReportStatus, PerformanceReportSummary,
+    RegressionThreshold, ResourceBudget, ResourceBudgetKind, RetentionBackpressureAction,
+    RetentionBackpressureKind, ScaleTarget, ThroughputBudget, PERFORMANCE_BUDGET_EVIDENCE_SCOPE,
+    PERFORMANCE_BUDGET_SCHEMA_VERSION, REQUIRED_LATENCY_BUDGET_METRICS,
+    REQUIRED_PERFORMANCE_GOLD_IDS, REQUIRED_PERFORMANCE_NON_CLAIMS,
+    REQUIRED_THROUGHPUT_BUDGET_METRICS,
+};
 pub use placement::{
     select_placement, DataLocality, PlacementCandidate, PlacementCandidateEvaluation,
     PlacementDecision, PlacementDecisionStatus, PlacementExecutionMode, PlacementExplain,
@@ -156,6 +168,15 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use security_invariants::{
+    validate_security_invariant_catalog, ContainmentAction, CryptoAgility, ExecutableGoldEvidence,
+    FailClosedDecision, KeyRotationPolicy, SecurityCaseStatus, SecurityEnforcementMapping,
+    SecurityInvariantCatalog, SecurityInvariantRecord, SecurityInvariantValidationError,
+    SecurityMaturityGate, SecurityPlane, SecurityReviewChecklistItem, SecurityThreatId,
+    SecurityThreatIdError, TrustBoundary, ALL_SECURITY_PLANES, REQUIRED_SECURITY_GOLD_IDS,
+    SECURITY_INVARIANT_PARTIAL_EVIDENCE_SCOPE, SECURITY_INVARIANT_REQUIRED_NON_CLAIMS,
+    SECURITY_INVARIANT_SCHEMA_VERSION,
 };
 pub use state_handoff::{
     StateHandoff, StateHandoffAuthority, StateHandoffSnapshot, StateHandoffTraceContext,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "conformance" / "0.1" / "fixtures" / "conformance-cases.json"
 ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
 STABLE_EXAMPLES_PATH = ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
+SECURITY_INVARIANTS_PATH = ROOT / "docs" / "rules" / "v2" / "security" / "security-invariants.json"
+PERFORMANCE_BUDGETS_PATH = ROOT / "docs" / "spec" / "0.2" / "performance-budgets.json"
 ACTION_OUTCOMES = {
     "action.executed",
     "action.denied",
@@ -93,6 +96,59 @@ AUTHORIZING_EXTENSION_KEY_FRAGMENTS = {
     "verifier",
     "workorder",
 }
+REQUIRED_SECURITY_GOLD_IDS = {"G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"}
+REQUIRED_SECURITY_PLANES = {
+    "identity_authority",
+    "artifact_lineage",
+    "event_state_evidence",
+    "execution_fabric",
+    "driver_boundary",
+    "agent_runtime_routing",
+    "data_feedback_eval_learning_control",
+    "change_governance",
+}
+REQUIRED_SECURITY_NON_CLAIMS = {"no_fnd_011_completion", "no_g80_g89_pass", "no_gold_harness_pass"}
+PROMPT_ONLY_SECURITY_PHRASES = {
+    "prompt instruction",
+    "system prompt",
+    "llm instruction",
+    "model instruction",
+    "assistant instruction",
+    "developer instruction",
+    "instruction prompt",
+}
+ALLOWED_SECURITY_SIGNATURE_ALGORITHMS = {"ed25519", "ecdsa_p256_sha256"}
+PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
+PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
+REQUIRED_PERFORMANCE_NON_CLAIMS = {
+    "no_fnd_012_completion",
+    "no_issue_231_completion",
+    "no_issue_180_completion",
+    "no_g29_pass",
+    "no_g66_pass",
+    "no_g68_pass",
+    "no_g74_pass",
+    "no_benchmark_execution",
+}
+REQUIRED_LATENCY_BUDGET_METRICS = {
+    "local_event_append",
+    "state_commit",
+    "authority_decision",
+    "gateway_preflight",
+    "model_invocation_overhead",
+    "percept_routing",
+    "tick_admission",
+}
+REQUIRED_THROUGHPUT_BUDGET_METRICS = {
+    "event_ingestion",
+    "artifact_transfer",
+    "scheduler_offers",
+    "workload_transitions",
+    "feedback_ingestion",
+    "eval_fan_out",
+    "one_thousand_node_simulation",
+}
+REQUIRED_PERFORMANCE_GOLD_IDS = {"G29", "G66", "G68", "G74"}
 
 
 @dataclass
@@ -493,6 +549,340 @@ def validate_compatibility(config: dict[str, Any]) -> None:
         raise ConformanceError(f"unknown compatibility matrix {matrix!r}")
 
 
+def require_non_empty_string(value: Any, field: str, gold_id: str | None = None) -> str:
+    assert_true(isinstance(value, str) and value.strip(), f"{gold_id + ' ' if gold_id else ''}{field} must be a non-empty string")
+    return value
+
+
+def require_non_empty_array(value: Any, field: str, gold_id: str | None = None) -> list[Any]:
+    assert_true(isinstance(value, list) and value, f"{gold_id + ' ' if gold_id else ''}{field} must be a non-empty array")
+    return value
+
+
+def load_security_invariants(config: dict[str, Any]) -> dict[str, Any]:
+    path = ROOT / config.get("path", SECURITY_INVARIANTS_PATH.relative_to(ROOT))
+    return load_json(path)
+
+
+def validate_security_crypto_agility(data: dict[str, Any]) -> None:
+    crypto = data.get("crypto_agility")
+    assert_true(isinstance(crypto, dict), "security_invariants crypto_agility is required")
+    algorithms = require_non_empty_array(crypto.get("allowed_signature_algorithms"), "crypto_agility.allowed_signature_algorithms")
+    for algorithm in algorithms:
+        label = require_non_empty_string(algorithm, "crypto_agility.allowed_signature_algorithms")
+        normalized = normalize_security_label(label)
+        if normalized not in ALLOWED_SECURITY_SIGNATURE_ALGORITHMS:
+            raise ConformanceError(f"security_invariants unsafe crypto algorithm label {label!r}")
+    key_rotation = crypto.get("key_rotation")
+    assert_true(isinstance(key_rotation, dict), "security_invariants key_rotation is required")
+    assert_true(key_rotation.get("rotation_required") is True, "security_invariants key rotation must be required")
+    assert_true(key_rotation.get("revocation_path_required") is True, "security_invariants revocation path must be required")
+    require_non_empty_string(key_rotation.get("compromise_response"), "crypto_agility.key_rotation.compromise_response")
+    require_non_empty_array(crypto.get("node_attestation_extension_points"), "crypto_agility.node_attestation_extension_points")
+    require_non_empty_array(crypto.get("non_cryptographic_safety_assumptions"), "crypto_agility.non_cryptographic_safety_assumptions")
+
+
+def validate_security_review_checklist(data: dict[str, Any]) -> None:
+    checklist = require_non_empty_array(data.get("security_review_checklist"), "security_review_checklist")
+    for item in checklist:
+        assert_true(isinstance(item, dict), "security_review_checklist items must be objects")
+        require_non_empty_string(item.get("id"), "security_review_checklist.id")
+        require_non_empty_string(item.get("question"), "security_review_checklist.question")
+        require_non_empty_string(item.get("required_evidence"), "security_review_checklist.required_evidence")
+
+
+def validate_security_enforcement(invariant: dict[str, Any], gold_id: str) -> None:
+    enforcement = invariant.get("enforcement")
+    assert_true(isinstance(enforcement, dict), f"{gold_id} enforcement mapping is required")
+    enforcing_component = require_non_empty_string(enforcement.get("enforcing_component"), "enforcement.enforcing_component", gold_id)
+    if is_prompt_only_control_text(enforcing_component):
+        raise ConformanceError(f"security invariant {gold_id} uses a prompt-only trust boundary")
+    require_non_empty_array(enforcement.get("required_events"), "enforcement.required_events", gold_id)
+    require_non_empty_array(enforcement.get("evidence_links"), "enforcement.evidence_links", gold_id)
+    require_non_empty_array(enforcement.get("containment_actions"), "enforcement.containment_actions", gold_id)
+
+
+def validate_security_invariant_record(invariant: dict[str, Any]) -> tuple[str, set[str], str]:
+    assert_true(isinstance(invariant, dict), "security invariant record must be an object")
+    gold_id = require_non_empty_string(invariant.get("gold_id"), "gold_id")
+    require_non_empty_string(invariant.get("threat_id"), "threat_id", gold_id)
+    require_non_empty_string(invariant.get("name"), "name", gold_id)
+    require_non_empty_array(invariant.get("assets"), "assets", gold_id)
+    require_non_empty_string(invariant.get("principal"), "principal", gold_id)
+    require_non_empty_string(invariant.get("attacker_capability"), "attacker_capability", gold_id)
+    require_non_empty_string(invariant.get("incident_classification"), "incident_classification", gold_id)
+    require_non_empty_string(invariant.get("change_risk_classification"), "change_risk_classification", gold_id)
+
+    maturity_gate = invariant.get("maturity_gate")
+    assert_true(isinstance(maturity_gate, dict), f"{gold_id} maturity_gate is required")
+    case_status = maturity_gate.get("case_status")
+    if maturity_gate.get("conformant_required") is True and case_status == "skipped":
+        raise ConformanceError(f"mandatory conformant security case {gold_id} is skipped")
+    assert_true(
+        case_status in {"mapped_not_exercised", "exercised", "skipped"},
+        f"{gold_id} maturity_gate.case_status is invalid",
+    )
+    require_non_empty_string(maturity_gate.get("non_claim"), "maturity_gate.non_claim", gold_id)
+    if case_status == "exercised":
+        executable = maturity_gate.get("executable_gold_evidence")
+        assert_true(isinstance(executable, dict), f"security invariant {gold_id} is exercised without executable gold evidence")
+        require_non_empty_string(executable.get("harness_id"), "executable_gold_evidence.harness_id", gold_id)
+        require_non_empty_string(executable.get("report_ref"), "executable_gold_evidence.report_ref", gold_id)
+        require_non_empty_string(executable.get("executed_at"), "executable_gold_evidence.executed_at", gold_id)
+        require_non_empty_array(executable.get("evidence_assertions"), "executable_gold_evidence.evidence_assertions", gold_id)
+
+    boundary = invariant.get("trust_boundary")
+    assert_true(isinstance(boundary, dict), f"{gold_id} trust_boundary is required")
+    boundary_name = require_non_empty_string(boundary.get("name"), "trust_boundary.name", gold_id)
+    enforced_by = require_non_empty_array(boundary.get("enforced_by"), "trust_boundary.enforced_by", gold_id)
+    prompt_only_enforcers = any(isinstance(item, str) and is_prompt_only_control_text(item) for item in enforced_by)
+    if boundary.get("prompt_only") is True or prompt_only_enforcers or is_prompt_only_control_text(boundary_name):
+        raise ConformanceError(f"security invariant {gold_id} uses a prompt-only trust boundary")
+
+    validate_security_enforcement(invariant, gold_id)
+
+    primary_plane = require_non_empty_string(invariant.get("primary_plane"), "primary_plane", gold_id)
+    related_planes = invariant.get("related_planes", [])
+    assert_true(isinstance(related_planes, list), f"{gold_id} related_planes must be an array")
+    planes = {primary_plane, *[plane for plane in related_planes if isinstance(plane, str)]}
+    unknown_planes = sorted(planes - REQUIRED_SECURITY_PLANES)
+    assert_true(not unknown_planes, f"{gold_id} unknown security planes: {', '.join(unknown_planes)}")
+    return gold_id, planes, str(case_status)
+
+
+def validate_security_invariants(config: dict[str, Any]) -> None:
+    data = load_security_invariants(config)
+    assert_true(data.get("schema_version") == "splendor.security_invariants.v1", "security_invariants schema_version mismatch")
+    assert_true(
+        data.get("evidence_scope") == "partial_fnd_011_security_invariants_v0",
+        "security_invariants evidence_scope must be partial_fnd_011_security_invariants_v0",
+    )
+    non_claims = set(data.get("non_claims", []))
+    missing_non_claims = sorted(REQUIRED_SECURITY_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"security_invariants non_claims missing: {', '.join(missing_non_claims)}")
+    validate_security_crypto_agility(data)
+    validate_security_review_checklist(data)
+
+    invariants = require_non_empty_array(data.get("invariants"), "invariants")
+    seen_gold_ids: set[str] = set()
+    covered_planes: set[str] = set()
+    required_case_status = config.get("required_case_status")
+    for invariant in invariants:
+        gold_id, planes, case_status = validate_security_invariant_record(invariant)
+        assert_true(gold_id not in seen_gold_ids, f"duplicate security invariant mapping for {gold_id}")
+        if required_case_status is not None:
+            assert_true(case_status == required_case_status, f"{gold_id} case_status must be {required_case_status}")
+        seen_gold_ids.add(gold_id)
+        covered_planes.update(planes)
+
+    required_gold_ids = set(config.get("required_gold_ids", sorted(REQUIRED_SECURITY_GOLD_IDS)))
+    missing_gold_ids = sorted(required_gold_ids - seen_gold_ids)
+    assert_true(not missing_gold_ids, f"missing security invariant mappings: {', '.join(missing_gold_ids)}")
+    required_planes = set(config.get("required_planes", sorted(REQUIRED_SECURITY_PLANES)))
+    missing_planes = sorted(required_planes - covered_planes)
+    assert_true(not missing_planes, f"security_invariants missing security planes: {', '.join(missing_planes)}")
+
+
+def normalize_security_text(value: str) -> str:
+    normalized = []
+    previous_was_space = True
+    for character in value:
+        if character.isalnum():
+            normalized.append(character.lower())
+            previous_was_space = False
+        elif not previous_was_space:
+            normalized.append(" ")
+            previous_was_space = True
+    return "".join(normalized).strip()
+
+
+def normalize_security_label(value: str) -> str:
+    normalized = []
+    previous_was_separator = True
+    for character in value.strip():
+        if character.isalnum():
+            normalized.append(character.lower())
+            previous_was_separator = False
+        elif not previous_was_separator:
+            normalized.append("_")
+            previous_was_separator = True
+    return "".join(normalized).strip("_")
+
+
+def is_prompt_only_control_text(value: str) -> bool:
+    normalized = normalize_security_text(value)
+    return any(phrase in normalized for phrase in PROMPT_ONLY_SECURITY_PHRASES)
+
+def require_positive_number(value: Any, label: str) -> None:
+    assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{label} must be positive")
+
+
+def validate_performance_environment(environment: Any) -> None:
+    assert_true(isinstance(environment, dict), "benchmark_environment is required")
+    for field in (
+        "environment_id",
+        "captured_at",
+        "host_class",
+        "os",
+        "cpu_model",
+        "storage_backend",
+        "rustc_version",
+        "splendor_commit",
+        "clock_source",
+        "network_topology",
+    ):
+        require_non_empty_string(environment.get(field), f"benchmark_environment.{field}")
+    require_positive_number(environment.get("cpu_cores"), "benchmark_environment.cpu_cores")
+    require_positive_number(environment.get("memory_gib"), "benchmark_environment.memory_gib")
+
+
+def validate_performance_report_summary(summary: Any) -> None:
+    assert_true(isinstance(summary, dict), "performance report_summary is required")
+    for field in ("report_id", "status", "benchmark_suite", "summary"):
+        require_non_empty_string(summary.get(field), f"report_summary.{field}")
+    assert_true(summary.get("measured") is False, "partial FND-012 fixture must not claim measured benchmark results")
+    assert_true(summary.get("status") == "budget_contract_only", "partial FND-012 fixture status must be budget_contract_only")
+
+
+def validate_measurement_boundary(metric_id: str, boundary: Any) -> None:
+    assert_true(isinstance(boundary, dict), f"{metric_id} measurement_boundary is required")
+    if boundary.get("kernel_control_plane_only") is not True or boundary.get("provider_model_training_time_included") is not False:
+        raise ConformanceError("provider/model time must not be mixed into kernel control-plane overhead")
+    assert_true(boundary.get("evidence_checks_included") is True, f"{metric_id} must include evidence checks")
+    assert_true(boundary.get("authority_checks_included") is True, f"{metric_id} must include authority checks")
+    assert_true(boundary.get("safety_checks_included") is True, f"{metric_id} must include safety checks")
+
+
+def validate_latency_budget_records(records: Any) -> set[str]:
+    assert_true(isinstance(records, list) and records, "latency_budgets must be a non-empty array")
+    metrics: set[str] = set()
+    for record in records:
+        assert_true(isinstance(record, dict), "latency budget record must be an object")
+        metric_id = record.get("metric_id")
+        require_non_empty_string(metric_id, "latency_budgets.metric_id")
+        assert_true(metric_id not in metrics, f"duplicate performance metric {metric_id}")
+        metrics.add(metric_id)
+        require_non_empty_string(record.get("description"), f"{metric_id}.description")
+        for field in ("max_p50_ms", "max_p95_ms", "max_p99_ms"):
+            require_positive_number(record.get(field), f"{metric_id}.{field}")
+        assert_true(record["max_p50_ms"] <= record["max_p95_ms"] <= record["max_p99_ms"], f"{metric_id} latency percentiles must be ordered")
+        validate_measurement_boundary(metric_id, record.get("measurement_boundary"))
+    missing = sorted(REQUIRED_LATENCY_BUDGET_METRICS - metrics)
+    assert_true(not missing, f"performance budgets missing mandatory latency metrics: {', '.join(missing)}")
+    return metrics
+
+
+def validate_throughput_budget_records(records: Any) -> set[str]:
+    assert_true(isinstance(records, list) and records, "throughput_budgets must be a non-empty array")
+    metrics: set[str] = set()
+    for record in records:
+        assert_true(isinstance(record, dict), "throughput budget record must be an object")
+        metric_id = record.get("metric_id")
+        require_non_empty_string(metric_id, "throughput_budgets.metric_id")
+        assert_true(metric_id not in metrics, f"duplicate performance metric {metric_id}")
+        metrics.add(metric_id)
+        require_non_empty_string(record.get("description"), f"{metric_id}.description")
+        require_positive_number(record.get("min_rate_per_second"), f"{metric_id}.min_rate_per_second")
+        require_positive_number(record.get("window_seconds"), f"{metric_id}.window_seconds")
+        validate_measurement_boundary(metric_id, record.get("measurement_boundary"))
+    missing = sorted(REQUIRED_THROUGHPUT_BUDGET_METRICS - metrics)
+    assert_true(not missing, f"performance budgets missing mandatory throughput metrics: {', '.join(missing)}")
+    return metrics
+
+
+def validate_regression_thresholds(thresholds: Any, required_metrics: set[str]) -> None:
+    assert_true(isinstance(thresholds, list) and thresholds, "regression_thresholds must be a non-empty array")
+    metrics: set[str] = set()
+    for threshold in thresholds:
+        assert_true(isinstance(threshold, dict), "regression threshold must be an object")
+        metric_id = threshold.get("metric_id")
+        require_non_empty_string(metric_id, "regression_thresholds.metric_id")
+        metrics.add(metric_id)
+        require_positive_number(threshold.get("max_regression_percent"), f"{metric_id}.max_regression_percent")
+        require_non_empty_string(threshold.get("baseline_ref"), f"{metric_id}.baseline_ref")
+        require_non_empty_string(threshold.get("action_on_regression"), f"{metric_id}.action_on_regression")
+    missing = sorted(required_metrics - metrics)
+    assert_true(not missing, f"performance budgets missing regression thresholds: {', '.join(missing)}")
+
+
+def validate_retention_backpressure_actions(actions: Any, known_metrics: set[str]) -> None:
+    assert_true(isinstance(actions, list) and actions, "retention_backpressure_actions must be a non-empty array")
+    kinds: set[str] = set()
+    for action in actions:
+        assert_true(isinstance(action, dict), "retention/backpressure action must be an object")
+        action_id = action.get("action_id")
+        require_non_empty_string(action_id, "retention_backpressure_actions.action_id")
+        kind = action.get("kind")
+        assert_true(kind in {"retention", "backpressure"}, f"{action_id} kind must be retention or backpressure")
+        kinds.add(kind)
+        trigger_metric_id = action.get("trigger_metric_id")
+        require_non_empty_string(trigger_metric_id, f"{action_id}.trigger_metric_id")
+        assert_true(trigger_metric_id in known_metrics, f"{action_id} trigger_metric_id references unknown metric")
+        require_non_empty_string(action.get("trigger"), f"{action_id}.trigger")
+        require_non_empty_string(action.get("action"), f"{action_id}.action")
+        require_non_empty_string(action.get("required_event"), f"{action_id}.required_event")
+        assert_true(action.get("fail_closed") is True, f"{action_id} must fail closed")
+    missing = sorted({"retention", "backpressure"} - kinds)
+    assert_true(not missing, f"performance budgets missing retention/backpressure actions: {', '.join(missing)}")
+
+
+def validate_gold_resource_budget(gold_id: str, budget: Any) -> None:
+    assert_true(isinstance(budget, dict), f"{gold_id} resource budget must be an object")
+    require_non_empty_string(budget.get("resource_id"), f"{gold_id}.resource_id")
+    assert_true(budget.get("kind") in {"control_plane", "inference_reservation", "worker", "physical_safety", "simulation"}, f"{gold_id} resource budget kind is invalid")
+    numeric_fields = ("cpu_cores", "memory_mib", "storage_mib", "network_mbps", "max_nodes")
+    for field in numeric_fields:
+        value = budget.get(field)
+        if value is not None:
+            assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{gold_id}.{field} must be positive and finite")
+    assert_true(any(budget.get(field) is not None for field in numeric_fields), f"{gold_id} resource budget must include a positive numeric limit")
+    require_non_empty_string(budget.get("notes"), f"{gold_id}.resource_budget.notes")
+
+
+def validate_gold_slo_resource_budgets(budgets: Any, known_metrics: set[str]) -> None:
+    assert_true(isinstance(budgets, list) and budgets, "gold_slo_resource_budgets must be a non-empty array")
+    gold_ids: set[str] = set()
+    for budget in budgets:
+        assert_true(isinstance(budget, dict), "gold SLO/resource budget must be an object")
+        gold_id = budget.get("gold_id")
+        require_non_empty_string(gold_id, "gold_slo_resource_budgets.gold_id")
+        assert_true(gold_id not in gold_ids, f"duplicate gold budget {gold_id}")
+        gold_ids.add(gold_id)
+        assert_true(budget.get("evidence_status") == "not_exercised", f"{gold_id} must remain not_exercised in this partial fixture")
+        slo_metric_ids = budget.get("slo_metric_ids")
+        assert_true(isinstance(slo_metric_ids, list) and slo_metric_ids, f"{gold_id} slo_metric_ids must be non-empty")
+        for metric_id in slo_metric_ids:
+            assert_true(metric_id in known_metrics, f"{gold_id} references unknown SLO metric {metric_id}")
+        resources = budget.get("resource_budgets")
+        assert_true(isinstance(resources, list) and resources, f"{gold_id} resource_budgets must be non-empty")
+        for resource_budget in resources:
+            validate_gold_resource_budget(gold_id, resource_budget)
+        notes = budget.get("notes")
+        assert_true(isinstance(notes, list) and notes, f"{gold_id} notes must be non-empty")
+    missing = sorted(REQUIRED_PERFORMANCE_GOLD_IDS - gold_ids)
+    assert_true(not missing, f"performance budgets missing gold SLO/resource mappings: {', '.join(missing)}")
+
+
+def validate_performance_budgets(config: dict[str, Any]) -> None:
+    path = ROOT / config.get("path", PERFORMANCE_BUDGETS_PATH.relative_to(ROOT))
+    data = load_json(path)
+    assert_true(data.get("schema_version") == PERFORMANCE_BUDGET_SCHEMA_VERSION, "performance budget schema_version mismatch")
+    assert_true(data.get("task_id") == "FND-012", "performance budget task_id must be FND-012")
+    assert_true(data.get("evidence_scope") == PERFORMANCE_BUDGET_EVIDENCE_SCOPE, "performance budget evidence_scope mismatch")
+    non_claims = set(data.get("non_claims", []))
+    missing_non_claims = sorted(REQUIRED_PERFORMANCE_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"performance budgets missing non_claims: {', '.join(missing_non_claims)}")
+    validate_performance_environment(data.get("benchmark_environment"))
+    validate_performance_report_summary(data.get("report_summary"))
+    latency_metrics = validate_latency_budget_records(data.get("latency_budgets"))
+    throughput_metrics = validate_throughput_budget_records(data.get("throughput_budgets"))
+    known_metrics = latency_metrics | throughput_metrics
+    required_metrics = REQUIRED_LATENCY_BUDGET_METRICS | REQUIRED_THROUGHPUT_BUDGET_METRICS
+    validate_regression_thresholds(data.get("regression_thresholds"), required_metrics)
+    validate_retention_backpressure_actions(data.get("retention_backpressure_actions"), known_metrics)
+    validate_gold_slo_resource_budgets(data.get("gold_slo_resource_budgets"), known_metrics)
+
+
 def validate_case(case: dict[str, Any]) -> None:
     primitive = case.get("primitive")
     if primitive == "runtime_loop":
@@ -517,6 +907,10 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_stable_examples(case["stable_examples"])
     elif primitive == "compatibility":
         validate_compatibility(case["compatibility"])
+    elif primitive == "security_invariants":
+        validate_security_invariants(case["security_invariants"])
+    elif primitive == "performance_budgets":
+        validate_performance_budgets(case["performance_budgets"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 
