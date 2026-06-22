@@ -34,6 +34,8 @@ fn extension_key_normalization_is_canonical_across_common_variants() {
     );
     assert!(is_reserved_extension_key("api-key"));
     assert!(is_reserved_extension_key("apikey"));
+    assert!(is_reserved_extension_key("accessToken"));
+    assert!(is_reserved_extension_key("access_token"));
     assert!(is_reserved_extension_key("workOrder"));
     assert!(is_reserved_extension_key("gateway"));
 }
@@ -62,9 +64,15 @@ fn reserved_authority_key_variants_are_rejected_with_path_and_reason() {
     let cases = [
         ("approval_token", "approval_token"),
         ("approvalToken", "approval_token"),
+        ("accessToken", "access_token"),
+        ("access_token", "access_token"),
         ("api-key", "api_key"),
         ("apikey", "apikey"),
         ("workOrder", "work_order"),
+        ("workorder", "workorder"),
+        ("datause", "datause"),
+        ("authheader", "authheader"),
+        ("privatekey", "privatekey"),
         ("driver", "driver"),
         ("gateway", "gateway"),
         ("secret", "secret"),
@@ -77,6 +85,46 @@ fn reserved_authority_key_variants_are_rejected_with_path_and_reason() {
 
         assert_eq!(error.path, format!("extensions.{key}"));
         assert_eq!(error.key, key);
+        assert_eq!(error.normalized_key, normalized);
+        assert_eq!(
+            error.reason,
+            ExtensionValidationReason::ReservedAuthorityKey
+        );
+    }
+}
+
+#[test]
+fn v2_identity_fields_are_reserved_from_extension_metadata() {
+    let reserved_ids = [
+        ("workload_id", "workload_id"),
+        ("attempt_id", "attempt_id"),
+        ("worker_id", "worker_id"),
+        ("lease_id", "lease_id"),
+        ("artifact_id", "artifact_id"),
+        ("dataset_id", "dataset_id"),
+        ("model_id", "model_id"),
+        ("checkpoint_id", "checkpoint_id"),
+        ("eval_id", "eval_id"),
+        ("change_id", "change_id"),
+        ("deployment_id", "deployment_id"),
+        ("incident_id", "incident_id"),
+        ("event_id", "event_id"),
+        ("evidence_id", "evidence_id"),
+        ("feedback_id", "feedback_id"),
+        ("reward_id", "reward_id"),
+        ("gate_id", "gate_id"),
+        ("invocation_id", "invocation_id"),
+        ("device_id", "device_id"),
+        ("deviceId", "device_id"),
+    ];
+
+    for (key, normalized) in reserved_ids {
+        assert!(is_reserved_extension_key(key), "{key} must be reserved");
+        let values = extension_map([(key, json!("must not carry identity"))]);
+        let error =
+            validate_extension_map(&values, "extensions").expect_err("identity keys fail closed");
+
+        assert_eq!(error.path, format!("extensions.{key}"));
         assert_eq!(error.normalized_key, normalized);
         assert_eq!(
             error.reason,
