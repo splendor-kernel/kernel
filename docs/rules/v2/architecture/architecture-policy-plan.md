@@ -38,9 +38,10 @@ then this v2 rule pack for active decomposition.
 | `docs/rules/v2/catalog/architecture/dependency_policy.proposed.json` | Proposed machine-readable policy shape, migration exceptions, path owners, facets |
 | Root `Cargo.toml`, `package.json`, and `python/pyproject.toml` | Current package/workspace evidence |
 
-## Non-Goals
+## Original Plan Non-Goals
 
-- No Rust, Python, TypeScript, OpenAPI, conformance, or CI behavior changes.
+- For the original issue #137 planning artifact, no Rust, Python, TypeScript,
+  OpenAPI, conformance, or CI behavior changes were introduced.
 - No crate moves, package splits, generated-contract changes, or broad refactor.
 - No enforcement of `dependency_policy.proposed.json` as CI or accepted policy.
 - No runtime behavior change, schema change, or CI enforcement from this docs-only move.

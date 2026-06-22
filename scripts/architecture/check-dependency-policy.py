@@ -366,6 +366,18 @@ def run_self_test() -> int:
             ),
             "Dependency cycle detected",
         ),
+        (
+            "dev_cycle_between_kernel_and_adapter",
+            metadata_fixture(
+                {
+                    "splendor-types": [],
+                    "splendor-gateway": ["splendor-types"],
+                    "splendor-kernel": [("splendor-adapter-http", "dev")],
+                    "splendor-adapter-http": ["splendor-gateway", "splendor-kernel"],
+                }
+            ),
+            "Dependency cycle detected",
+        ),
     ]
 
     failures = 0
@@ -385,7 +397,7 @@ def run_self_test() -> int:
     return 0
 
 
-def metadata_fixture(edges: dict[str, list[str]]) -> dict[str, Any]:
+def metadata_fixture(edges: dict[str, list[str | tuple[str, str | None]]]) -> dict[str, Any]:
     packages = []
     workspace_members = []
     for name, deps in edges.items():
@@ -397,16 +409,18 @@ def metadata_fixture(edges: dict[str, list[str]]) -> dict[str, Any]:
                 "id": package_id,
                 "name": name,
                 "manifest_path": f"/{manifest_parent}/Cargo.toml",
-                "dependencies": [
-                    {
-                        "name": dep,
-                        "kind": None,
-                    }
-                    for dep in deps
-                ],
+                "dependencies": [dependency_fixture(dep) for dep in deps],
             }
         )
     return {"packages": packages, "workspace_members": workspace_members}
+
+
+def dependency_fixture(dep: str | tuple[str, str | None]) -> dict[str, str | None]:
+    if isinstance(dep, tuple):
+        name, kind = dep
+    else:
+        name, kind = dep, None
+    return {"name": name, "kind": kind}
 
 
 if __name__ == "__main__":
