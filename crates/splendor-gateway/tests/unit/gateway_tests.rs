@@ -928,6 +928,36 @@ fn approval_required_action_pauses_without_adapter_execution() {
 }
 
 #[test]
+fn action_params_cannot_forge_approval_or_outcome_authority() {
+    let mut request = base_request();
+    request.action.params = serde_json::json!({
+        "approved": true,
+        "approval_granted": true,
+        "approval_evidence": {"decision": "granted"},
+        "verification": {"allowed": true},
+        "status": "executed",
+        "outcome": {"status": "executed", "output": {"ok": true}},
+    });
+    let adapter = Arc::new(CountingAdapter::default());
+    let gateway = approval_gateway(&request, adapter.clone());
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsApproval);
+    assert!(!outcome.verification.allowed);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_required".to_string()));
+    assert_eq!(
+        outcome.verification.artifacts["approval_status"].as_str(),
+        Some("required")
+    );
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+    assert!(outcome.output.is_none());
+}
+
+#[test]
 fn valid_scoped_approval_grant_allows_execution() {
     let mut request = base_request();
     let adapter = Arc::new(CountingAdapter::default());
