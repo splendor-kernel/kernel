@@ -438,20 +438,19 @@ fn validate_report_summary(
                 },
             );
         }
-        PerformanceReportStatus::Measured => {
+        PerformanceReportStatus::Measured
             if summary
                 .benchmark_run_ref
                 .as_deref()
                 .map(str::trim)
                 .unwrap_or_default()
-                .is_empty()
-            {
-                return Err(
-                    PerformanceBudgetValidationError::MissingReportSummaryField {
-                        field: "benchmark_run_ref",
-                    },
-                );
-            }
+                .is_empty() =>
+        {
+            return Err(
+                PerformanceBudgetValidationError::MissingReportSummaryField {
+                    field: "benchmark_run_ref",
+                },
+            );
         }
         _ => {}
     }
