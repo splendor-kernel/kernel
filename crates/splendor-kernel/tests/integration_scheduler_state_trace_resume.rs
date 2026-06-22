@@ -174,16 +174,28 @@ fn build_gateway(registry: &TenantRegistry, actions: &[&str]) -> Arc<dyn ActionG
     Arc::new(gateway)
 }
 
-fn build_engine(
+struct EngineFixture {
     agent_id: splendor_kernel::AgentId,
     tenant_id: TenantId,
     run_id: RunId,
-    action_name: &str,
+    action_name: &'static str,
     state_store: Arc<InMemoryStateStore>,
     trace_store: Arc<InMemoryTraceStore>,
     snapshot_policy: SnapshotPolicy,
     gateway: Arc<dyn ActionGateway>,
-) -> LoopEngine {
+}
+
+fn build_engine(fixture: EngineFixture) -> LoopEngine {
+    let EngineFixture {
+        agent_id,
+        tenant_id,
+        run_id,
+        action_name,
+        state_store,
+        trace_store,
+        snapshot_policy,
+        gateway,
+    } = fixture;
     let graph = StateGraph::new(state_store, snapshot_policy);
     let initial_state = StateData {
         bytes: vec![0],
@@ -263,30 +275,30 @@ fn scheduler_runs_cycles_and_persists_state_and_traces() {
     let state_store_one = Arc::new(InMemoryStateStore::default());
     let trace_store_one = Arc::new(InMemoryTraceStore::default());
     let run_id_one = ids.run_id("alpha-run").expect("run");
-    let engine_one = build_engine(
-        ids.agent_id("alpha-agent").expect("agent"),
-        tenant_id.clone(),
-        run_id_one.clone(),
-        "alpha",
-        state_store_one.clone(),
-        trace_store_one.clone(),
-        snapshot_policy.clone(),
-        gateway.clone(),
-    );
+    let engine_one = build_engine(EngineFixture {
+        agent_id: ids.agent_id("alpha-agent").expect("agent"),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id_one.clone(),
+        action_name: "alpha",
+        state_store: state_store_one.clone(),
+        trace_store: trace_store_one.clone(),
+        snapshot_policy: snapshot_policy.clone(),
+        gateway: gateway.clone(),
+    });
 
     let state_store_two = Arc::new(InMemoryStateStore::default());
     let trace_store_two = Arc::new(InMemoryTraceStore::default());
     let run_id_two = ids.run_id("beta-run").expect("run");
-    let engine_two = build_engine(
-        ids.agent_id("beta-agent").expect("agent"),
-        tenant_id.clone(),
-        run_id_two.clone(),
-        "beta",
-        state_store_two.clone(),
-        trace_store_two.clone(),
-        snapshot_policy.clone(),
+    let engine_two = build_engine(EngineFixture {
+        agent_id: ids.agent_id("beta-agent").expect("agent"),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id_two.clone(),
+        action_name: "beta",
+        state_store: state_store_two.clone(),
+        trace_store: trace_store_two.clone(),
+        snapshot_policy: snapshot_policy.clone(),
         gateway,
-    );
+    });
 
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine_one);
@@ -353,16 +365,16 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
     let state_store = Arc::new(InMemoryStateStore::default());
     let trace_store = Arc::new(InMemoryTraceStore::default());
     let run_id = ids.run_id("resume-run").expect("run");
-    let engine = build_engine(
-        agent_id.clone(),
-        tenant_id.clone(),
-        run_id.clone(),
-        "resume",
-        state_store.clone(),
-        trace_store.clone(),
-        snapshot_policy.clone(),
+    let engine = build_engine(EngineFixture {
+        agent_id: agent_id.clone(),
+        tenant_id: tenant_id.clone(),
+        run_id: run_id.clone(),
+        action_name: "resume",
+        state_store: state_store.clone(),
+        trace_store: trace_store.clone(),
+        snapshot_policy: snapshot_policy.clone(),
         gateway,
-    );
+    });
 
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine);
