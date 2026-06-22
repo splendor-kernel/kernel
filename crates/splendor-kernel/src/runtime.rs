@@ -141,6 +141,10 @@ impl KernelRuntime {
     }
 
     /// Records a `TraceEventKind` with explicit identity context.
+    ///
+    /// The runtime serializes trace cursor state across the durable sink append.
+    /// `TraceSink` implementations used here must not synchronously call back into
+    /// the same runtime while recording, or they can deadlock on the cursor lock.
     pub fn record_event_with_identity(
         &self,
         identity: TraceIdentityContext,

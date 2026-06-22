@@ -4,7 +4,8 @@ use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
     StateReferenceMode, TenantId,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 use time::OffsetDateTime;
 
 #[derive(Default)]
@@ -237,6 +238,70 @@ fn trace_sink_failure_preserves_integrity_cursor_for_recovered_completion() {
         recorded[1].kind,
         TraceEventKind::LoopTickCompleted { .. }
     ));
+}
+
+#[test]
+fn concurrent_record_event_calls_keep_contiguous_sequence_and_integrity_cursor() {
+    const THREAD_COUNT: usize = 8;
+
+    let sink = ControlledSink::default();
+    let runtime = Arc::new(KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(sink.clone()),
+        ..KernelRuntimeConfig::default()
+    }));
+    let start = Arc::new(Barrier::new(THREAD_COUNT + 1));
+
+    let handles = (0..THREAD_COUNT)
+        .map(|tick_id| {
+            let runtime = Arc::clone(&runtime);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                runtime.record_event(TraceEventKind::LoopTickCompleted {
+                    tick_id: tick_id as u64,
+                    integrity: None,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    start.wait();
+    let returned = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("record thread panicked")
+                .expect("record event")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(returned.len(), THREAD_COUNT);
+
+    let recorded = sink.recorded_events();
+    assert_eq!(recorded.len(), THREAD_COUNT);
+    assert_eq!(runtime.next_sequence(), THREAD_COUNT as u64);
+
+    let mut prev_hash = None;
+    for (sequence, event) in recorded.iter().enumerate() {
+        assert_eq!(event.sequence, sequence as u64);
+        assert_eq!(
+            event.trace_event_id,
+            splendor_types::TraceEventId::from_run_sequence(&event.run_id, event.sequence)
+        );
+        let event_hash = compute_event_hash(prev_hash.as_ref(), event).expect("event hash");
+        if let TraceEventKind::LoopTickCompleted {
+            integrity: Some(integrity),
+            ..
+        } = &event.kind
+        {
+            assert_eq!(integrity.prev_event_hash.as_ref(), prev_hash.as_ref());
+            assert_eq!(integrity.event_hash, event_hash);
+        } else {
+            panic!("missing completion integrity");
+        }
+        prev_hash = Some(event_hash);
+    }
+    assert_eq!(runtime_prev_event_hash(runtime.as_ref()), prev_hash);
 }
 
 #[test]
