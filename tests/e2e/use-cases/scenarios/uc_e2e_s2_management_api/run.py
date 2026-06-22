@@ -162,6 +162,8 @@ def action(name: str = ACTION_NAME) -> dict[str, Any]:
 
 def create_run_request(envelope: dict[str, Any], credential: dict[str, Any], run_id: str) -> dict[str, Any]:
     return {
+        "request_id": f"req-uc-e2e-s2-{run_id}",
+        "idempotency_key": f"idem-uc-e2e-s2-{run_id}",
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "work_order": envelope,
@@ -175,6 +177,7 @@ def create_run_request(envelope: dict[str, Any], credential: dict[str, Any], run
         "policy_bundle": None,
         "registered_actions": [{"name": ACTION_NAME, "adapter": ADAPTER}],
         "approval_policies": [],
+        "circuit_breakers": [],
         "allowed_percept_schemas": ["splendor.percept.management_api.v1"],
         "allowed_percept_sources": ["uc-e2e-s2-management-client"],
         "initial_state": {"scenario": "UC-E2E-S2", "run_id": run_id},

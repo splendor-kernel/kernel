@@ -559,6 +559,7 @@ def create_run_payload(
 ) -> dict[str, Any]:
     allowed_actions = envelope.get("allowed_actions", [])
     allowed_adapters = envelope.get("allowed_adapters", [])
+    work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", "unknown")
     registered_actions = [{"name": name, "adapter": allowed_adapters[0] if allowed_adapters else "daemon.recording"} for name in allowed_actions]
     for entry in registered_actions:
         if entry["name"].startswith("artifact."):
@@ -568,6 +569,8 @@ def create_run_payload(
         if entry["name"] in ALLOWED_PHYSICAL_ACTIONS:
             entry["adapter"] = "device-sim"
     return {
+        "request_id": f"req-uc-e2e-s10-{work_order_id}-{run_id}",
+        "idempotency_key": f"idem-uc-e2e-s10-{work_order_id}-{run_id}",
         "tenant_id": TENANT_ID,
         "agent_id": agent_id,
         "work_order": envelope,

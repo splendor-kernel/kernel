@@ -2604,6 +2604,8 @@ components:
     CreateRunRequest:
       type: object
       required:
+        - request_id
+        - idempotency_key
         - tenant_id
         - agent_id
         - work_order
@@ -2617,11 +2619,20 @@ components:
         - policy_bundle
         - registered_actions
         - approval_policies
+        - circuit_breakers
         - allowed_percept_schemas
         - allowed_percept_sources
         - initial_state
         - snapshot_interval
       properties:
+        request_id:
+          type: string
+          minLength: 1
+          description: Correlation identifier supplied by the caller; distinct from run identity.
+        idempotency_key:
+          type: string
+          minLength: 1
+          description: Duplicate-suppression key scoped by caller, work order, tenant, agent, and resolved run.
         tenant_id:
           type: string
           format: uuid
@@ -2664,6 +2675,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ApprovalPolicy'
+        circuit_breakers:
+          type: array
+          items:
+            $ref: '#/components/schemas/CircuitBreaker'
         allowed_percept_schemas:
           type: array
           items:
@@ -2679,8 +2694,16 @@ components:
           minimum: 1
     CreateRunResponse:
       type: object
-      required: [run_id, status]
+      required: [request_id, idempotency_key, idempotency_receipt_id, duplicate, run_id, status]
       properties:
+        request_id:
+          type: string
+        idempotency_key:
+          type: string
+        idempotency_receipt_id:
+          type: string
+        duplicate:
+          type: boolean
         run_id:
           type: string
           format: uuid
@@ -3054,7 +3077,7 @@ components:
             type: string
     CapabilitiesResponse:
       type: object
-      required: [daemon_api_version, local_only, replay_modes, endpoints]
+      required: [daemon_api_version, local_only, replay_modes, endpoints, service_profiles]
       properties:
         daemon_api_version:
           type: string
@@ -3065,6 +3088,29 @@ components:
           items:
             type: string
         endpoints:
+          type: array
+          items:
+            type: string
+        service_profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceCapabilityProfile'
+    ServiceCapabilityProfile:
+      type: object
+      required: [name, status, maturity, endpoints, notes]
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [implemented, experimental, simulated, unavailable]
+        maturity:
+          type: string
+        endpoints:
+          type: array
+          items:
+            type: string
+        notes:
           type: array
           items:
             type: string

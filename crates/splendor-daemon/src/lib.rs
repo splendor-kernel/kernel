@@ -58,6 +58,7 @@ pub struct DaemonState {
 
 struct DaemonInner {
     runs: Mutex<HashMap<RunId, RunSlot>>,
+    create_run_idempotency: Mutex<HashMap<String, CreateRunIdempotencyEntry>>,
     expected_audience: CredentialAudience,
     insecure_dev_mode: Option<InsecureDevMode>,
     policy_bundle_keyring: PolicyBundleKeyring,
@@ -66,6 +67,23 @@ struct DaemonInner {
     device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
     operator_interventions: Mutex<HashMap<String, OperatorInterventionRecord>>,
     device_audit: Mutex<Vec<DeviceAuditEvent>>,
+}
+
+#[derive(Clone, Debug)]
+struct CreateRunIdempotencyEntry {
+    scope: CreateRunIdempotencyScope,
+    response: CreateRunResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct CreateRunIdempotencyScope {
+    tenant_id: TenantId,
+    agent_id: splendor_types::AgentId,
+    work_order_id: splendor_types::WorkOrderId,
+    resolved_run_id: RunId,
+    caller: serde_json::Value,
+    request_fingerprint: String,
 }
 
 impl DaemonState {
@@ -84,6 +102,7 @@ impl DaemonState {
         Self {
             inner: Arc::new(DaemonInner {
                 runs: Mutex::new(HashMap::new()),
+                create_run_idempotency: Mutex::new(HashMap::new()),
                 expected_audience: config.expected_audience,
                 insecure_dev_mode: config.insecure_dev_mode,
                 policy_bundle_keyring: config.policy_bundle_keyring,
@@ -703,6 +722,8 @@ pub struct SecurityFields {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateRunRequest {
+    pub request_id: String,
+    pub idempotency_key: String,
     pub tenant_id: TenantId,
     pub agent_id: splendor_types::AgentId,
     pub work_order: WorkOrderEnvelope,
@@ -794,6 +815,10 @@ pub struct RegisteredAction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateRunResponse {
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub idempotency_receipt_id: String,
+    pub duplicate: bool,
     pub run_id: RunId,
     pub status: RunStatus,
 }
@@ -1209,6 +1234,17 @@ pub struct CapabilitiesResponse {
     pub local_only: bool,
     pub replay_modes: Vec<String>,
     pub endpoints: Vec<String>,
+    pub service_profiles: Vec<ServiceCapabilityProfile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServiceCapabilityProfile {
+    pub name: String,
+    pub status: String,
+    pub maturity: String,
+    pub endpoints: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1409,11 +1445,105 @@ fn work_order_error(error: WorkOrderValidationError) -> ApiError {
     )
 }
 
+fn require_create_run_token(value: &str, field: &'static str) -> Result<String, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("missing_{field}"),
+            format!("create_run requires non-blank {field}"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn create_run_caller_scope(
+    credential: Option<&CallerCredential>,
+    security: &DaemonSecurityDecision,
+) -> serde_json::Value {
+    let principal = security.principal.as_ref().or_else(|| {
+        security
+            .audit_attribution
+            .as_ref()
+            .map(|audit| &audit.principal)
+    });
+    serde_json::json!({
+        "principal": principal.map(|principal| serde_json::json!({
+            "app_principal_id": &principal.app.app_principal_id,
+            "client_principal_id": &principal.client_principal_id,
+        })),
+        "credential_id": credential
+            .map(|credential| credential.credential_id.clone())
+            .or_else(|| security.audit_attribution.as_ref().and_then(|audit| audit.credential_id.clone())),
+        "insecure_dev_mode": security.insecure_dev_mode,
+    })
+}
+
+fn create_run_request_fingerprint(request: &CreateRunRequest, work_order: &WorkOrder) -> String {
+    stable_json_hash(&serde_json::json!({
+        "validated_work_order": work_order,
+        "allowed_actions": &request.allowed_actions,
+        "allowed_adapters": &request.allowed_adapters,
+        "allowed_permissions": &request.allowed_permissions,
+        "policy_actions": &request.policy_actions,
+        "policy_bundle_required": request.policy_bundle_required,
+        "policy_bundle": &request.policy_bundle,
+        "registered_actions": &request.registered_actions,
+        "approval_policies": &request.approval_policies,
+        "circuit_breakers": &request.circuit_breakers,
+        "allowed_percept_schemas": &request.allowed_percept_schemas,
+        "allowed_percept_sources": &request.allowed_percept_sources,
+        "initial_state": &request.initial_state,
+        "snapshot_interval": request.snapshot_interval,
+    }))
+}
+
+fn create_run_idempotency_scope(
+    request: &CreateRunRequest,
+    work_order: &WorkOrder,
+    security: &DaemonSecurityDecision,
+    run_id: RunId,
+) -> CreateRunIdempotencyScope {
+    CreateRunIdempotencyScope {
+        tenant_id: request.tenant_id.clone(),
+        agent_id: request.agent_id.clone(),
+        work_order_id: work_order.work_order_id.clone(),
+        resolved_run_id: run_id,
+        caller: create_run_caller_scope(request.credential.as_ref(), security),
+        request_fingerprint: create_run_request_fingerprint(request, work_order),
+    }
+}
+
+fn create_run_receipt_id(idempotency_key: &str, scope: &CreateRunIdempotencyScope) -> String {
+    let hash = stable_json_hash(&serde_json::json!({
+        "idempotency_key": idempotency_key,
+        "scope": scope,
+    }));
+    format!("create_run:{hash}")
+}
+
+fn create_run_scope_mismatch_error(
+    _attempted: &CreateRunIdempotencyScope,
+    _existing: &CreateRunIdempotencyScope,
+) -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "create_run_idempotency_scope_mismatch",
+        "idempotency key was already used for a different create-run scope",
+    )
+    .details(serde_json::json!({
+        "scope_mismatch": true,
+        "category": "create_run_idempotency",
+    }))
+}
+
 async fn create_run(
     State(state): State<DaemonState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, ApiError> {
     state.ensure_runtime_available()?;
+    let request_id = require_create_run_token(&request.request_id, "request_id")?;
+    let idempotency_key = require_create_run_token(&request.idempotency_key, "idempotency_key")?;
     let validated_work_order = validate_daemon_work_order(
         &state,
         &request.work_order,
@@ -1436,10 +1566,56 @@ async fn create_run(
         request.audit_attribution.clone(),
     )?;
 
+    let existing_run_id_for_scope = {
+        let idempotency = state
+            .inner
+            .create_run_idempotency
+            .lock()
+            .map_err(|_| lock_error())?;
+        idempotency
+            .get(&idempotency_key)
+            .map(|entry| entry.scope.resolved_run_id.clone())
+    };
     let run_id = validated_work_order
         .run_id
         .clone()
+        .or(existing_run_id_for_scope)
         .unwrap_or_else(RunId::new);
+    let idempotency_scope =
+        create_run_idempotency_scope(&request, &validated_work_order, &security, run_id.clone());
+
+    {
+        let idempotency = state
+            .inner
+            .create_run_idempotency
+            .lock()
+            .map_err(|_| lock_error())?;
+        if let Some(existing) = idempotency.get(&idempotency_key) {
+            if existing.scope != idempotency_scope {
+                return Err(create_run_scope_mismatch_error(
+                    &idempotency_scope,
+                    &existing.scope,
+                ));
+            }
+            let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+            let slot = runs.get(&existing.response.run_id).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "create_run_idempotency_receipt_missing",
+                    "idempotency receipt references a missing local run",
+                )
+            })?;
+            record_daemon_audit(
+                slot,
+                "splendor.runs.create.idempotent_duplicate",
+                security.audit_attribution,
+            )?;
+            let mut response = existing.response.clone();
+            response.duplicate = true;
+            return Ok(Json(response));
+        }
+    }
+
     let trace_store: Arc<dyn TraceStore> = Arc::new(InMemoryTraceStore::default());
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
     let tenant_registry = TenantRegistry::new();
@@ -1598,6 +1774,35 @@ async fn create_run(
         updated_at: OffsetDateTime::now_utc(),
     };
 
+    let mut idempotency = state
+        .inner
+        .create_run_idempotency
+        .lock()
+        .map_err(|_| lock_error())?;
+    if let Some(existing) = idempotency.get(&idempotency_key) {
+        if existing.scope != idempotency_scope {
+            return Err(create_run_scope_mismatch_error(
+                &idempotency_scope,
+                &existing.scope,
+            ));
+        }
+        let runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+        let slot = runs.get(&existing.response.run_id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "create_run_idempotency_receipt_missing",
+                "idempotency receipt references a missing local run",
+            )
+        })?;
+        record_daemon_audit(
+            slot,
+            "splendor.runs.create.idempotent_duplicate",
+            security.audit_attribution,
+        )?;
+        let mut response = existing.response.clone();
+        response.duplicate = true;
+        return Ok(Json(response));
+    }
     let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
     if runs.contains_key(&run_id) {
         return Err(ApiError::new(
@@ -1607,11 +1812,23 @@ async fn create_run(
         ));
     }
     record_daemon_audit(&slot, "splendor.runs.create", security.audit_attribution)?;
-    runs.insert(run_id.clone(), slot);
-    Ok(Json(CreateRunResponse {
-        run_id,
+    let response = CreateRunResponse {
+        request_id,
+        idempotency_key: idempotency_key.clone(),
+        idempotency_receipt_id: create_run_receipt_id(&idempotency_key, &idempotency_scope),
+        duplicate: false,
+        run_id: run_id.clone(),
         status: RunStatus::Pending,
-    }))
+    };
+    runs.insert(run_id.clone(), slot);
+    idempotency.insert(
+        idempotency_key,
+        CreateRunIdempotencyEntry {
+            scope: idempotency_scope,
+            response: response.clone(),
+        },
+    );
+    Ok(Json(response))
 }
 
 async fn sync_circuit_breakers(
@@ -3498,36 +3715,101 @@ async fn capabilities(
 ) -> Result<Json<CapabilitiesResponse>, ApiError> {
     let credential = caller_credential_from_headers(&headers)?;
     state.validate_security(DaemonEndpoint::Capabilities, credential, None, None)?;
+    let run_endpoints = vec![
+        "POST /runs".to_string(),
+        "GET /runs/{run_id}".to_string(),
+        "POST /runs/{run_id}/start".to_string(),
+        "POST /runs/{run_id}/pause".to_string(),
+        "POST /runs/{run_id}/resume".to_string(),
+        "POST /runs/{run_id}/stop".to_string(),
+        "POST /runs/{run_id}/cancel".to_string(),
+        "POST /runs/{run_id}/percepts".to_string(),
+        "POST /runs/{run_id}/policies/sync".to_string(),
+        "GET /runs/{run_id}/state-head".to_string(),
+        "GET /runs/{run_id}/traces".to_string(),
+        "POST /runs/{run_id}/traces/export".to_string(),
+        "POST /runs/{run_id}/replay".to_string(),
+        "POST /actions".to_string(),
+    ];
+    let device_endpoints = vec![
+        "POST /devices/profiles".to_string(),
+        "GET /devices/{node_id}/status".to_string(),
+        "GET /devices/{node_id}/policy-cache".to_string(),
+        "POST /devices/{node_id}/actions".to_string(),
+        "POST /operator/interventions".to_string(),
+        "POST /operator/interventions/{intervention_id}/grant".to_string(),
+        "POST /operator/interventions/{intervention_id}/deny".to_string(),
+        "POST /devices/{node_id}/trace-buffer/sync".to_string(),
+    ];
+    let metadata_endpoints = [
+        "GET /health".to_string(),
+        "GET /version".to_string(),
+        "GET /capabilities".to_string(),
+    ];
+    let endpoints = run_endpoints
+        .iter()
+        .chain(device_endpoints.iter())
+        .chain(metadata_endpoints.iter())
+        .cloned()
+        .collect();
     Ok(Json(CapabilitiesResponse {
         daemon_api_version: "0.02-S5".to_string(),
         local_only: true,
         replay_modes: vec!["inspect_only".to_string()],
-        endpoints: vec![
-            "POST /runs".to_string(),
-            "GET /runs/{run_id}".to_string(),
-            "POST /runs/{run_id}/start".to_string(),
-            "POST /runs/{run_id}/pause".to_string(),
-            "POST /runs/{run_id}/resume".to_string(),
-            "POST /runs/{run_id}/stop".to_string(),
-            "POST /runs/{run_id}/cancel".to_string(),
-            "POST /runs/{run_id}/percepts".to_string(),
-            "POST /runs/{run_id}/policies/sync".to_string(),
-            "GET /runs/{run_id}/state-head".to_string(),
-            "GET /runs/{run_id}/traces".to_string(),
-            "POST /runs/{run_id}/traces/export".to_string(),
-            "POST /runs/{run_id}/replay".to_string(),
-            "POST /actions".to_string(),
-            "POST /devices/profiles".to_string(),
-            "GET /devices/{node_id}/status".to_string(),
-            "GET /devices/{node_id}/policy-cache".to_string(),
-            "POST /devices/{node_id}/actions".to_string(),
-            "POST /operator/interventions".to_string(),
-            "POST /operator/interventions/{intervention_id}/grant".to_string(),
-            "POST /operator/interventions/{intervention_id}/deny".to_string(),
-            "POST /devices/{node_id}/trace-buffer/sync".to_string(),
-            "GET /health".to_string(),
-            "GET /version".to_string(),
-            "GET /capabilities".to_string(),
+        endpoints,
+        service_profiles: vec![
+            ServiceCapabilityProfile {
+                name: "runtime_daemon_local".to_string(),
+                status: "implemented".to_string(),
+                maturity: "local_0_1_compat".to_string(),
+                endpoints: run_endpoints,
+                notes: vec![
+                    "current local daemon run/percept/state/trace/replay/action compatibility surface"
+                        .to_string(),
+                    "POST /runs requires request_id and idempotency_key with bounded create-run idempotency v0"
+                        .to_string(),
+                ],
+            },
+            ServiceCapabilityProfile {
+                name: "physical_device_simulation".to_string(),
+                status: "simulated".to_string(),
+                maturity: "local_simulation_only".to_string(),
+                endpoints: device_endpoints,
+                notes: vec![
+                    "high-level physical action simulation and trace-buffer surfaces only".to_string(),
+                    "not a production robotics safety certification or low-level controller".to_string(),
+                ],
+            },
+            ServiceCapabilityProfile {
+                name: "create_run_idempotency_v0".to_string(),
+                status: "experimental".to_string(),
+                maturity: "bounded_current_endpoint".to_string(),
+                endpoints: vec!["POST /runs".to_string()],
+                notes: vec![
+                    "partial FND-010 evidence for create-run only; no all-mutating-endpoint rollout"
+                        .to_string(),
+                ],
+            },
+            ServiceCapabilityProfile {
+                name: "v2_watch_streams".to_string(),
+                status: "unavailable".to_string(),
+                maturity: "not_implemented".to_string(),
+                endpoints: Vec::new(),
+                notes: vec![
+                    "event/workload/feedback/eval/training/change/deployment watch streams are not implemented in this daemon"
+                        .to_string(),
+                ],
+            },
+            ServiceCapabilityProfile {
+                name: "gold_g00_g06".to_string(),
+                status: "unavailable".to_string(),
+                maturity: "not_exercised".to_string(),
+                endpoints: Vec::new(),
+                notes: vec![
+                    "capability reporting is partial evidence only and does not claim G00 or G06 pass"
+                        .to_string(),
+                ],
+            },
         ],
     }))
 }
@@ -4576,6 +4858,8 @@ mod tests {
             revocation: splendor_types::RevocationStatus::Active,
         };
         let request = CreateRunRequest {
+            request_id: format!("req_{}", TraceId::new()),
+            idempotency_key: format!("idem_{}", TraceId::new()),
             tenant_id,
             agent_id,
             work_order: WorkOrderEnvelope::signed_with_shared_secret(
@@ -4603,6 +4887,61 @@ mod tests {
         let _ = create_run(State(state.clone()), Json(request))
             .await
             .expect("create run");
+    }
+
+    fn unit_create_run_request(
+        tenant_id: TenantId,
+        agent_id: splendor_types::AgentId,
+        run_id: Option<RunId>,
+        work_order_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> CreateRunRequest {
+        let work_order = WorkOrder {
+            schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+            work_order_id: splendor_types::WorkOrderId::try_new(work_order_id)
+                .expect("work order id"),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id,
+            objective: "unit idempotent run".to_string(),
+            allowed_actions: vec!["daemon.record".to_string()],
+            allowed_adapters: vec!["daemon.local".to_string()],
+            allowed_permissions: Vec::new(),
+            data_refs: Vec::new(),
+            quotas: splendor_types::WorkOrderQuotaPolicy::default(),
+            placement: splendor_types::WorkOrderPlacement::default(),
+            issued_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+            revocation: splendor_types::RevocationStatus::Active,
+        };
+        CreateRunRequest {
+            request_id: request_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            tenant_id,
+            agent_id,
+            work_order: WorkOrderEnvelope::signed_with_shared_secret(
+                work_order,
+                "work-order-local-key",
+                b"splendor-local-work-order-secret",
+            )
+            .expect("signed work order"),
+            credential: None,
+            audit_attribution: Some(unit_audit()),
+            allowed_actions: Vec::new(),
+            allowed_adapters: Vec::new(),
+            allowed_permissions: Vec::new(),
+            policy_actions: Vec::new(),
+            policy_bundle_required: false,
+            policy_bundle: None,
+            registered_actions: Vec::new(),
+            approval_policies: Vec::new(),
+            circuit_breakers: Vec::new(),
+            allowed_percept_schemas: Vec::new(),
+            allowed_percept_sources: Vec::new(),
+            initial_state: None,
+            snapshot_interval: None,
+        }
     }
 
     fn physical_request(
@@ -4645,6 +4984,141 @@ mod tests {
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
         }
+    }
+
+    #[tokio::test]
+    async fn create_run_idempotency_returns_same_receipt_without_duplicate_state() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let request = unit_create_run_request(
+            tenant_id,
+            agent_id,
+            Some(run_id.clone()),
+            "wo_unit_idem",
+            "req_unit_idem",
+            "idem_unit_create",
+        );
+
+        let first = create_run(State(state.clone()), Json(request.clone()))
+            .await
+            .expect("first create")
+            .0;
+        assert_eq!(first.run_id, run_id);
+        assert!(!first.duplicate);
+        assert_eq!(first.request_id, "req_unit_idem");
+        assert_eq!(first.idempotency_key, "idem_unit_create");
+        assert_eq!(
+            state.inner.runs.lock().expect("runs").len(),
+            1,
+            "first create inserts one run"
+        );
+
+        let duplicate = create_run(State(state.clone()), Json(request))
+            .await
+            .expect("duplicate create")
+            .0;
+        assert_eq!(duplicate.run_id, first.run_id);
+        assert_eq!(duplicate.status, first.status);
+        assert_eq!(
+            duplicate.idempotency_receipt_id,
+            first.idempotency_receipt_id
+        );
+        assert!(duplicate.duplicate);
+        assert_eq!(
+            state.inner.runs.lock().expect("runs").len(),
+            1,
+            "duplicate idempotency request must not insert a second run"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_run_idempotency_scope_mismatch_fails_without_second_run() {
+        let state = DaemonState::local_dev();
+        let first = unit_create_run_request(
+            TenantId::new(),
+            splendor_types::AgentId::new(),
+            Some(RunId::new()),
+            "wo_unit_idem_a",
+            "req_unit_idem_a",
+            "idem_unit_collision",
+        );
+        let _ = create_run(State(state.clone()), Json(first))
+            .await
+            .expect("first create");
+
+        let different_scope = unit_create_run_request(
+            TenantId::new(),
+            splendor_types::AgentId::new(),
+            Some(RunId::new()),
+            "wo_unit_idem_b",
+            "req_unit_idem_b",
+            "idem_unit_collision",
+        );
+        let error = create_run(State(state.clone()), Json(different_scope))
+            .await
+            .expect_err("scope mismatch denied");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "create_run_idempotency_scope_mismatch");
+        assert_eq!(
+            error.body.details,
+            serde_json::json!({
+                "scope_mismatch": true,
+                "category": "create_run_idempotency",
+            }),
+            "scope mismatch details must not leak attempted/existing scopes"
+        );
+        assert_eq!(
+            state.inner.runs.lock().expect("runs").len(),
+            1,
+            "scope mismatch must not create a second run"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_run_rejects_blank_idempotency_fields_before_mutation() {
+        let state = DaemonState::local_dev();
+        let blank_request_id = unit_create_run_request(
+            TenantId::new(),
+            splendor_types::AgentId::new(),
+            Some(RunId::new()),
+            "wo_unit_blank_request",
+            "   ",
+            "idem_blank_request",
+        );
+        let error = create_run(State(state.clone()), Json(blank_request_id))
+            .await
+            .expect_err("blank request id rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.body.code, "missing_request_id");
+
+        let blank_idempotency_key = unit_create_run_request(
+            TenantId::new(),
+            splendor_types::AgentId::new(),
+            Some(RunId::new()),
+            "wo_unit_blank_idem",
+            "req_blank_idem",
+            "\t",
+        );
+        let error = create_run(State(state.clone()), Json(blank_idempotency_key))
+            .await
+            .expect_err("blank idempotency key rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.body.code, "missing_idempotency_key");
+        assert!(
+            state.inner.runs.lock().expect("runs").is_empty(),
+            "blank idempotency validation must not mutate runs"
+        );
+        assert!(
+            state
+                .inner
+                .create_run_idempotency
+                .lock()
+                .expect("idempotency ledger")
+                .is_empty(),
+            "blank idempotency validation must not poison the ledger"
+        );
     }
 
     fn unit_daemon_action_request(
@@ -5167,6 +5641,8 @@ mod tests {
         )
         .expect("signed work order");
         let request = CreateRunRequest {
+            request_id: format!("req_{}", TraceId::new()),
+            idempotency_key: format!("idem_{}", TraceId::new()),
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
             work_order: work_order_envelope,

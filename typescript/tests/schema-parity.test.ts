@@ -365,6 +365,7 @@ test("OpenAPI documents S5 daemon request and response schemas", () => {
     "SubmitActionRequest",
     "HealthResponse",
     "CapabilitiesResponse",
+    "ServiceCapabilityProfile",
     "ApiError"
   ]) {
     assert.match(openapi, new RegExp(`\\n    ${schema}:\\n`), `OpenAPI must define ${schema}`);
@@ -409,8 +410,20 @@ test("OpenAPI work-order envelope and run status contracts stay canonical", () =
   ]);
 
   const createRun = extractOpenApiSchemaBlock(openapi, "CreateRunRequest");
+  assert.match(createRun, /- request_id/);
+  assert.match(createRun, /- idempotency_key/);
+  assert.match(createRun, /request_id:[\s\S]*minLength: 1/);
+  assert.match(createRun, /idempotency_key:[\s\S]*minLength: 1/);
   assert.match(createRun, /work_order:[\s\S]*\$ref: '#\/components\/schemas\/WorkOrderEnvelope'/);
   assert.doesNotMatch(createRun, /WorkOrderAuthorization/);
+
+  const createRunResponse = extractOpenApiSchemaBlock(openapi, "CreateRunResponse");
+  for (const field of ["request_id", "idempotency_key", "idempotency_receipt_id", "duplicate", "run_id", "status"]) {
+    assert.match(createRunResponse, new RegExp(`required: \\[.*${field}`), `CreateRunResponse must require ${field}`);
+  }
+
+  const capabilities = extractOpenApiSchemaBlock(openapi, "CapabilitiesResponse");
+  assert.match(capabilities, /service_profiles:[\s\S]*\$ref: '#\/components\/schemas\/ServiceCapabilityProfile'/);
 
   const lifecycle = extractOpenApiSchemaBlock(openapi, "LifecycleRequest");
   assert.match(lifecycle, /work_order:[\s\S]*\$ref: '#\/components\/schemas\/WorkOrderEnvelope'/);

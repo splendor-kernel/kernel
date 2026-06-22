@@ -122,6 +122,7 @@ export class SplendorClient {
   }
 
   async createRun(request: CreateRunRequest): Promise<CreateRunResponse> {
+    this.requireCreateRunIdempotency(request);
     if (!request?.work_order) {
       throw new TypeError("createRun requires a signed, scoped work order envelope");
     }
@@ -130,6 +131,15 @@ export class SplendorClient {
     return this.request<CreateRunResponse>("POST", "runs", {
       body: request
     });
+  }
+
+  private requireCreateRunIdempotency(request: CreateRunRequest): void {
+    if (typeof request?.request_id !== "string" || !request.request_id.trim()) {
+      throw new TypeError("createRun requires a non-blank request_id");
+    }
+    if (typeof request?.idempotency_key !== "string" || !request.idempotency_key.trim()) {
+      throw new TypeError("createRun requires a non-blank idempotency_key");
+    }
   }
 
   async inspectRun(runId: RunId): Promise<RunInspectResponse> {

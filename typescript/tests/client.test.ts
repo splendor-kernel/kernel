@@ -86,6 +86,8 @@ const workOrder: WorkOrderEnvelope = {
 };
 
 const createRunRequest: CreateRunRequest = {
+  request_id: "req_test_create_run",
+  idempotency_key: "idem_test_create_run",
   tenant_id: tenantId,
   agent_id: agentId,
   work_order: workOrder,
@@ -175,12 +177,20 @@ test("client reports unavailable fetch implementation", () => {
 });
 
 test("createRun posts run config with work-order envelope and audit attribution", async () => {
-  const { fetcher, calls } = makeFetch({ run_id: runId, status: "pending" });
+  const { fetcher, calls } = makeFetch({
+    request_id: "req_test_create_run",
+    idempotency_key: "idem_test_create_run",
+    idempotency_receipt_id: "create_run:fnv64:test",
+    duplicate: false,
+    run_id: runId,
+    status: "pending"
+  });
   const client = new SplendorClient({ baseUrl: "https://daemon.example/v1", token: "token", fetch: fetcher });
 
   const response = await client.createRun(createRunRequest);
 
   assert.equal(response.run_id, runId);
+  assert.equal(response.duplicate, false);
   assert.equal(calls.length, 1);
   assert.equal(new URL(calls[0].url).pathname, "/v1/runs");
   assert.equal(calls[0].init.method, "POST");
@@ -197,6 +207,25 @@ test("createRun fails closed when work order or audit attribution is absent", as
   await assert.rejects(() => client.createRun({ ...createRunRequest, audit_attribution: null }), /audit attribution/);
   await assert.rejects(() => client.createRun({ ...createRunRequest, credential: null }), /caller credential/);
   await assert.rejects(() => client.createRun({ ...createRunRequest, work_order: null as never }), /work order/);
+});
+
+test("createRun rejects missing or blank idempotency fields before fetch", async () => {
+  const { fetcher, calls } = makeFetch({ run_id: runId });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+
+  await assert.rejects(
+    () => client.createRun({ ...createRunRequest, request_id: " " }),
+    /request_id/
+  );
+  await assert.rejects(
+    () => client.createRun({ ...createRunRequest, idempotency_key: "\t" }),
+    /idempotency_key/
+  );
+  await assert.rejects(
+    () => client.createRun({ ...createRunRequest, request_id: undefined as never }),
+    /request_id/
+  );
+  assert.equal(calls.length, 0);
 });
 
 test("lifecycle and inspection helpers use daemon endpoint shapes", async () => {
