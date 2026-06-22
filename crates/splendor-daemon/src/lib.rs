@@ -2207,6 +2207,7 @@ async fn traces(
         _ => slot.trace_store.read(&run_id.to_string()),
     }
     .map_err(trace_error)?;
+    let records = redact_trace_records(records);
     Ok(Json(TracePageResponse { run_id, records }))
 }
 
@@ -2244,6 +2245,7 @@ async fn export_traces(
     }
     .map_err(trace_error)?;
     let integrity_hash = trace_export_integrity_hash(&records);
+    let records = redact_trace_records(records);
     Ok(Json(TraceExportResponse {
         run_id,
         record_count: records.len(),
@@ -3931,6 +3933,284 @@ fn trace_export_integrity_hash(records: &[TraceRecord]) -> String {
         .map(|record| record.event_hash.to_string())
         .unwrap_or_else(|| "empty".to_string());
     format!("trace-chain:v1:{}:{last_event_hash}", records.len())
+}
+
+fn redact_trace_records(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
+    records
+        .into_iter()
+        .map(|mut record| {
+            record.payload = redact_trace_value(record.payload);
+            record
+        })
+        .collect()
+}
+
+fn redact_trace_value(value: serde_json::Value) -> serde_json::Value {
+    redact_trace_value_with_key(value, None)
+}
+
+fn redact_trace_value_with_key(
+    value: serde_json::Value,
+    key_context: Option<&str>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_trace_value_with_key(item, key_context))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                let redacted_value = if is_trace_sensitive_key(&key) {
+                    redact_sensitive_trace_field_value(value)
+                } else {
+                    redact_trace_value_with_key(value, Some(&key))
+                };
+                redacted.insert(key, redacted_value);
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::String(value) => {
+            if key_context
+                .map(is_trace_identity_reason_or_status_key)
+                .unwrap_or(false)
+            {
+                serde_json::Value::String(value)
+            } else if let Some(label) = protected_visibility_label(&value) {
+                serde_json::Value::String(format!("[REDACTED:{label}]"))
+            } else if is_trace_sensitive_text(&value) {
+                serde_json::Value::String("[REDACTED]".to_string())
+            } else {
+                serde_json::Value::String(value)
+            }
+        }
+        other => other,
+    }
+}
+
+fn redact_sensitive_trace_field_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                redacted.insert(key, redact_sensitive_trace_field_value(value));
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(_) => serde_json::Value::String("[REDACTED]".to_string()),
+        serde_json::Value::String(value) => {
+            if let Some(label) = protected_visibility_label(&value) {
+                serde_json::Value::String(format!("[REDACTED:{label}]"))
+            } else {
+                serde_json::Value::String("[REDACTED]".to_string())
+            }
+        }
+        serde_json::Value::Null => serde_json::Value::Null,
+        _ => serde_json::Value::String("[REDACTED]".to_string()),
+    }
+}
+
+fn is_trace_sensitive_key(key: &str) -> bool {
+    if is_trace_identity_reason_or_status_key(key) {
+        return false;
+    }
+    let normalized = key.to_ascii_lowercase();
+    let compact = compact_trace_match_text(&normalized);
+    [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "authorization",
+        "auth_header",
+        "bearer",
+        "signature",
+        "private_key",
+        "api_key",
+        "access_key",
+        "session_key",
+        "state_bytes",
+        "snapshot_bytes",
+        "restricted",
+        "protected_eval",
+        "protected-eval",
+        "safety_local",
+        "safety-local",
+        "legal_hold",
+        "legal-hold",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "authorization",
+            "authheader",
+            "bearer",
+            "signature",
+            "privatekey",
+            "apikey",
+            "accesskey",
+            "sessionkey",
+            "statebytes",
+            "snapshotbytes",
+            "restricted",
+            "protectedeval",
+            "safetylocal",
+            "legalhold",
+        ]
+        .iter()
+        .any(|needle| compact.contains(needle))
+}
+
+fn is_trace_identity_reason_or_status_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "trace_event_id"
+            | "trace_id"
+            | "event_id"
+            | "run_id"
+            | "tenant_id"
+            | "agent_id"
+            | "runtime_context_id"
+            | "tick_id"
+            | "action_id"
+            | "state_node_id"
+            | "message_id"
+            | "work_order_id"
+            | "approval_id"
+            | "artifact_id"
+            | "sequence"
+            | "kind"
+            | "type"
+            | "endpoint"
+            | "schema"
+            | "name"
+            | "adapter"
+            | "source"
+            | "status"
+            | "reason"
+            | "reasons"
+            | "reason_code"
+            | "code"
+            | "allowed"
+            | "event_hash"
+            | "prev_event_hash"
+    )
+}
+
+fn is_trace_sensitive_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let compact = compact_trace_match_text(&normalized);
+    [
+        "authorization:",
+        "authorization=",
+        "auth:",
+        "auth=",
+        "bearer ",
+        "token:",
+        "token=",
+        "secret:",
+        "secret=",
+        "password:",
+        "password=",
+        "credential:",
+        "credential=",
+        "api_key:",
+        "api_key=",
+        "api-key:",
+        "api-key=",
+        "apikey:",
+        "apikey=",
+        "signature:",
+        "signature=",
+        "private_key:",
+        "private_key=",
+        "private-key:",
+        "private-key=",
+        "private key",
+        "state_bytes:",
+        "state_bytes=",
+        "snapshot_bytes:",
+        "snapshot_bytes=",
+        "restricted:",
+        "restricted=",
+        "protected-eval:",
+        "protected-eval=",
+        "safety-local:",
+        "safety-local=",
+        "legal-hold:",
+        "legal-hold=",
+        "-----begin",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || [
+            "authorization",
+            "authheader",
+            "bearertoken",
+            "accesstoken",
+            "refreshtoken",
+            "sessiontoken",
+            "clientsecret",
+            "apikey",
+            "privatekey",
+            "statebytes",
+            "snapshotbytes",
+            "protectedeval",
+            "safetylocal",
+            "legalhold",
+        ]
+        .iter()
+        .any(|needle| compact.contains(needle))
+        || looks_like_trace_jwt(value)
+}
+
+fn protected_visibility_label(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "restricted" => Some("restricted"),
+        "secret" => Some("secret"),
+        "protected-eval" => Some("protected-eval"),
+        "safety-local" => Some("safety-local"),
+        "legal-hold" => Some("legal-hold"),
+        _ => None,
+    }
+}
+
+fn looks_like_trace_jwt(value: &str) -> bool {
+    let token = value.trim();
+    let mut parts = token.split('.');
+    let Some(header) = parts.next() else {
+        return false;
+    };
+    let Some(payload) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    [header, payload, signature].iter().all(|part| {
+        part.len() >= 8
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+fn compact_trace_match_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect()
 }
 
 fn stable_json_hash(value: &serde_json::Value) -> String {
