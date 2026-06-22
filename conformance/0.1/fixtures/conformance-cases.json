@@ -425,7 +425,7 @@
       "requirement": "CONF-0.2-FND-012-PERFORMANCE-BUDGETS",
       "path": "positive",
       "description": "Partial FND-012 fixture validates mandatory budget metrics, environment capture, regression thresholds, retention/backpressure actions, and G29/G66/G68/G74 SLO/resource mappings without benchmark or gold pass claims.",
-      "report_message": "partial FND-012 performance budget contract v0: mandatory budget/report fields validate; no benchmark execution, FND-012 completion, or G29/G66/G68/G74 pass claimed",
+      "report_message": "partial FND-012 performance budget contract v0: mandatory budget/report fields validate; no benchmark execution, #231/#180 completion, or G29/G66/G68/G74 pass claimed",
       "performance_budgets": { "path": "docs/spec/0.2/performance-budgets.json" }
     },
     {
@@ -445,6 +445,15 @@
       "description": "Negative fixture proves provider/model/training time cannot be mixed into kernel control-plane overhead budgets.",
       "expected_failure": "provider/model time must not be mixed into kernel control-plane overhead",
       "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-provider-time-mixed.json" }
+    },
+    {
+      "case_id": "performance-budgets-skipped-safety-check-negative-fixture",
+      "primitive": "performance_budgets",
+      "requirement": "CONF-0.2-FND-012-NO-SAFETY-SKIP-FOR-SPEED",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves budgets cannot skip required safety checks to meet performance targets.",
+      "expected_failure": "gateway_preflight must include safety checks",
+      "performance_budgets": { "path": "docs/spec/0.2/fixtures/performance-budgets-skipped-safety-check.json" }
     }
   ]
 }

@@ -25,11 +25,16 @@ retention/backpressure requirements that future benchmark reports must satisfy.
   - eval fan-out;
   - 1,000-node simulation.
 - Kernel control-plane overhead is separated from provider/model/training time.
+- `BudgetContractOnly` reports must keep `measured: false`; measured reports
+  must carry `measured: true` and a non-empty `benchmark_run_ref` before they can
+  be treated as benchmark evidence.
 - Regression thresholds are required for every mandatory metric.
 - Benchmark environment capture is required before a report can validate.
 - Retention and backpressure actions are required for long-run storage, payload,
   inbox, and inference-capacity pressure.
 - G29, G66, G68, and G74 each map to SLO/resource budget records.
+- Machine-enforced fixture non-claims include `no_issue_231_completion` and
+  `no_issue_180_completion` alongside the FND/gold/benchmark non-claims.
 
 ## Non-claims
 
@@ -48,7 +53,8 @@ This is not a benchmark result and not a task-completion claim.
 The `performance_budgets` conformance primitive validates this fixture from
 `conformance/0.1/run-conformance.py`. It rejects missing mandatory metrics,
 missing environment capture, provider/model time mixed into kernel overhead,
-missing regression thresholds, and missing retention/backpressure actions.
+missing regression thresholds, skipped evidence/authority/safety checks, missing
+gold SLO/resource mappings, and missing retention/backpressure actions.
 
 The Rust `splendor-types` module exposes behavior-light types and validation for
 the same contract. These types do not execute benchmarks and do not authorize

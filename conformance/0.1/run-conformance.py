@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,7 @@ PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
 PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
 REQUIRED_PERFORMANCE_NON_CLAIMS = {
     "no_fnd_012_completion",
+    "no_issue_231_completion",
     "no_issue_180_completion",
     "no_g29_pass",
     "no_g66_pass",
@@ -529,7 +531,7 @@ def require_non_empty_string(value: Any, label: str) -> None:
 
 
 def require_positive_number(value: Any, label: str) -> None:
-    assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0, f"{label} must be positive")
+    assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{label} must be positive")
 
 
 def validate_performance_environment(environment: Any) -> None:
@@ -646,7 +648,11 @@ def validate_gold_resource_budget(gold_id: str, budget: Any) -> None:
     require_non_empty_string(budget.get("resource_id"), f"{gold_id}.resource_id")
     assert_true(budget.get("kind") in {"control_plane", "inference_reservation", "worker", "physical_safety", "simulation"}, f"{gold_id} resource budget kind is invalid")
     numeric_fields = ("cpu_cores", "memory_mib", "storage_mib", "network_mbps", "max_nodes")
-    assert_true(any(isinstance(budget.get(field), (int, float)) and not isinstance(budget.get(field), bool) and budget[field] > 0 for field in numeric_fields), f"{gold_id} resource budget must include a positive numeric limit")
+    for field in numeric_fields:
+        value = budget.get(field)
+        if value is not None:
+            assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{gold_id}.{field} must be positive and finite")
+    assert_true(any(budget.get(field) is not None for field in numeric_fields), f"{gold_id} resource budget must include a positive numeric limit")
     require_non_empty_string(budget.get("notes"), f"{gold_id}.resource_budget.notes")
 
 

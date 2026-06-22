@@ -236,6 +236,90 @@ fn rejects_provider_time_mixed_into_kernel_overhead() {
 }
 
 #[test]
+fn report_summary_status_must_match_measured_evidence() {
+    let mut contract_only = valid_catalog();
+    contract_only.report_summary.measured = true;
+    assert!(matches!(
+        contract_only.validate(),
+        Err(
+            PerformanceBudgetValidationError::InconsistentReportSummary {
+                field: "budget_contract_only_requires_measured_false"
+            }
+        )
+    ));
+
+    let mut measured_false = valid_catalog();
+    measured_false.report_summary.status = PerformanceReportStatus::Measured;
+    measured_false.report_summary.measured = false;
+    measured_false.report_summary.benchmark_run_ref = Some("artifact:benchmark-run".to_string());
+    assert!(matches!(
+        measured_false.validate(),
+        Err(
+            PerformanceBudgetValidationError::InconsistentReportSummary {
+                field: "measured_status_requires_measured_true"
+            }
+        )
+    ));
+
+    let mut missing_ref = valid_catalog();
+    missing_ref.report_summary.status = PerformanceReportStatus::Measured;
+    missing_ref.report_summary.measured = true;
+    missing_ref.report_summary.benchmark_run_ref = None;
+    assert!(matches!(
+        missing_ref.validate(),
+        Err(
+            PerformanceBudgetValidationError::MissingReportSummaryField {
+                field: "benchmark_run_ref"
+            }
+        )
+    ));
+
+    let mut measured = valid_catalog();
+    measured.report_summary.status = PerformanceReportStatus::Measured;
+    measured.report_summary.measured = true;
+    measured.report_summary.benchmark_run_ref = Some("artifact:benchmark-run".to_string());
+    measured
+        .validate()
+        .expect("measured report summary is valid with run ref");
+}
+
+#[test]
+fn rejects_non_finite_and_non_positive_f64_budget_values() {
+    let mut nan_latency = valid_catalog();
+    nan_latency.latency_budgets[0].max_p50_ms = f64::NAN;
+    assert!(matches!(
+        nan_latency.validate(),
+        Err(PerformanceBudgetValidationError::InvalidLatencyBudget { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut infinite_throughput = valid_catalog();
+    infinite_throughput.throughput_budgets[0].min_rate_per_second = f64::INFINITY;
+    assert!(matches!(
+        infinite_throughput.validate(),
+        Err(PerformanceBudgetValidationError::InvalidThroughputBudget { metric_id })
+            if metric_id == "event_ingestion"
+    ));
+
+    let mut nan_threshold = valid_catalog();
+    nan_threshold.regression_thresholds[0].max_regression_percent = f64::NAN;
+    assert!(matches!(
+        nan_threshold.validate(),
+        Err(PerformanceBudgetValidationError::InvalidRegressionThreshold { metric_id })
+            if metric_id == "local_event_append"
+    ));
+
+    let mut infinite_resource = valid_catalog();
+    infinite_resource.gold_slo_resource_budgets[0].resource_budgets[0].cpu_cores =
+        Some(f64::NEG_INFINITY);
+    assert!(matches!(
+        infinite_resource.validate(),
+        Err(PerformanceBudgetValidationError::InvalidGoldBudget { gold_id })
+            if gold_id == "G29"
+    ));
+}
+
+#[test]
 fn rejects_missing_environment_capture() {
     let mut catalog = valid_catalog();
     catalog.benchmark_environment.rustc_version.clear();

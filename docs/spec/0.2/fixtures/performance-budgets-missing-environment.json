@@ -4,6 +4,7 @@
   "evidence_scope": "partial_fnd_012_budget_contract_v0",
   "non_claims": [
     "no_fnd_012_completion",
+    "no_issue_231_completion",
     "no_issue_180_completion",
     "no_g29_pass",
     "no_g66_pass",

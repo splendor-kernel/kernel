@@ -9,6 +9,10 @@
   latency/throughput metrics, benchmark environment capture, regression
   thresholds, retention/backpressure actions, and G29/G66/G68/G74 budget
   mappings.
+- Hardened the partial FND-012 contract so issue #231 non-claims are
+  machine-enforced, measured report summaries require a benchmark run reference,
+  non-finite budget values are rejected, and skipped safety checks fail
+  conformance.
 
 ### Explicitly not included
 

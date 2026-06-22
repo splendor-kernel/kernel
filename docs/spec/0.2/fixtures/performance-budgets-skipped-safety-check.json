@@ -13,7 +13,7 @@
     "no_benchmark_execution"
   ],
   "benchmark_environment": {
-    "environment_id": "negative-provider-time-mixed",
+    "environment_id": "negative-skipped-safety-check",
     "captured_at": "2026-06-22T12:00:00Z",
     "host_class": "negative-fixture",
     "os": "negative-fixture",
@@ -28,26 +28,26 @@
     "accelerator": "none"
   },
   "report_summary": {
-    "report_id": "fnd-012-negative-provider-time-mixed",
+    "report_id": "fnd-012-negative-skipped-safety-check",
     "status": "budget_contract_only",
     "benchmark_suite": "fnd-012-reference-scale-budget-contract",
     "measured": false,
-    "summary": "Negative fixture intentionally mixes provider/model time into kernel overhead.",
+    "summary": "Negative fixture intentionally skips safety checks to prove performance budgets cannot trade safety for speed.",
     "benchmark_run_ref": null
   },
   "latency_budgets": [
     {
-      "metric_id": "model_invocation_overhead",
-      "description": "Invalid metric record that includes provider/model/training time.",
+      "metric_id": "gateway_preflight",
+      "description": "Invalid metric record with safety checks skipped.",
       "max_p50_ms": 1.0,
       "max_p95_ms": 2.0,
       "max_p99_ms": 3.0,
       "measurement_boundary": {
         "kernel_control_plane_only": true,
-        "provider_model_training_time_included": true,
+        "provider_model_training_time_included": false,
         "evidence_checks_included": true,
         "authority_checks_included": true,
-        "safety_checks_included": true,
+        "safety_checks_included": false,
         "notes": "This field is intentionally invalid."
       }
     }

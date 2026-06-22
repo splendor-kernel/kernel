@@ -18,6 +18,7 @@ pub const PERFORMANCE_BUDGET_EVIDENCE_SCOPE: &str = "partial_fnd_012_budget_cont
 /// Non-claim markers required on the partial FND-012 budget fixture.
 pub const REQUIRED_PERFORMANCE_NON_CLAIMS: &[&str] = &[
     "no_fnd_012_completion",
+    "no_issue_231_completion",
     "no_issue_180_completion",
     "no_g29_pass",
     "no_g66_pass",
@@ -291,6 +292,8 @@ pub enum PerformanceBudgetValidationError {
     MissingEnvironmentField { field: &'static str },
     #[error("performance report summary field {field} is required")]
     MissingReportSummaryField { field: &'static str },
+    #[error("performance report summary status and measured fields are inconsistent: {field}")]
+    InconsistentReportSummary { field: &'static str },
     #[error("latency budget missing mandatory metric: {metric_id}")]
     MissingLatencyMetric { metric_id: &'static str },
     #[error("throughput budget missing mandatory metric: {metric_id}")]
@@ -420,12 +423,37 @@ fn validate_report_summary(
             PerformanceBudgetValidationError::MissingReportSummaryField { field: "summary" },
         );
     }
-    if matches!(summary.status, PerformanceReportStatus::BudgetContractOnly) && summary.measured {
-        return Err(
-            PerformanceBudgetValidationError::MissingReportSummaryField {
-                field: "measured_false_for_contract_only",
-            },
-        );
+    match summary.status {
+        PerformanceReportStatus::BudgetContractOnly if summary.measured => {
+            return Err(
+                PerformanceBudgetValidationError::InconsistentReportSummary {
+                    field: "budget_contract_only_requires_measured_false",
+                },
+            );
+        }
+        PerformanceReportStatus::Measured if !summary.measured => {
+            return Err(
+                PerformanceBudgetValidationError::InconsistentReportSummary {
+                    field: "measured_status_requires_measured_true",
+                },
+            );
+        }
+        PerformanceReportStatus::Measured => {
+            if summary
+                .benchmark_run_ref
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(
+                    PerformanceBudgetValidationError::MissingReportSummaryField {
+                        field: "benchmark_run_ref",
+                    },
+                );
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -442,7 +470,9 @@ fn validate_latency_budgets(
             });
         }
         if budget.description.trim().is_empty()
-            || budget.max_p50_ms <= 0.0
+            || !is_finite_positive(budget.max_p50_ms)
+            || !is_finite_positive(budget.max_p95_ms)
+            || !is_finite_positive(budget.max_p99_ms)
             || budget.max_p95_ms < budget.max_p50_ms
             || budget.max_p99_ms < budget.max_p95_ms
         {
@@ -474,7 +504,7 @@ fn validate_throughput_budgets(
             });
         }
         if budget.description.trim().is_empty()
-            || budget.min_rate_per_second <= 0.0
+            || !is_finite_positive(budget.min_rate_per_second)
             || budget.window_seconds == 0
         {
             return Err(PerformanceBudgetValidationError::InvalidThroughputBudget {
@@ -527,7 +557,7 @@ fn validate_regression_thresholds(
     let mut threshold_metrics = BTreeSet::new();
     for threshold in thresholds {
         if threshold.metric_id.trim().is_empty()
-            || threshold.max_regression_percent <= 0.0
+            || !is_finite_positive(threshold.max_regression_percent)
             || threshold.baseline_ref.trim().is_empty()
             || threshold.action_on_regression.trim().is_empty()
         {
@@ -642,17 +672,50 @@ fn validate_resource_budget(
     gold_id: &str,
     budget: &ResourceBudget,
 ) -> Result<(), PerformanceBudgetValidationError> {
-    let has_positive = budget.cpu_cores.unwrap_or_default() > 0.0
-        || budget.memory_mib.unwrap_or_default() > 0
-        || budget.storage_mib.unwrap_or_default() > 0
-        || budget.network_mbps.unwrap_or_default() > 0.0
-        || budget.max_nodes.unwrap_or_default() > 0;
+    if let Some(value) = budget.cpu_cores {
+        if !is_finite_positive(value) {
+            return Err(PerformanceBudgetValidationError::InvalidGoldBudget {
+                gold_id: gold_id.to_string(),
+            });
+        }
+    }
+    if let Some(value) = budget.network_mbps {
+        if !is_finite_positive(value) {
+            return Err(PerformanceBudgetValidationError::InvalidGoldBudget {
+                gold_id: gold_id.to_string(),
+            });
+        }
+    }
+    for value in [budget.memory_mib, budget.storage_mib]
+        .into_iter()
+        .flatten()
+    {
+        if value == 0 {
+            return Err(PerformanceBudgetValidationError::InvalidGoldBudget {
+                gold_id: gold_id.to_string(),
+            });
+        }
+    }
+    if matches!(budget.max_nodes, Some(0)) {
+        return Err(PerformanceBudgetValidationError::InvalidGoldBudget {
+            gold_id: gold_id.to_string(),
+        });
+    }
+    let has_positive = budget.cpu_cores.is_some()
+        || budget.memory_mib.is_some()
+        || budget.storage_mib.is_some()
+        || budget.network_mbps.is_some()
+        || budget.max_nodes.is_some();
     if budget.resource_id.trim().is_empty() || budget.notes.trim().is_empty() || !has_positive {
         return Err(PerformanceBudgetValidationError::InvalidGoldBudget {
             gold_id: gold_id.to_string(),
         });
     }
     Ok(())
+}
+
+fn is_finite_positive(value: f64) -> bool {
+    value.is_finite() && value > 0.0
 }
 
 fn require_non_empty(

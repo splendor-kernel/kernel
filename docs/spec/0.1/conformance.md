@@ -69,7 +69,8 @@ The suite validates:
   latency/throughput budgets, environment-capture shape, regression thresholds,
   retention/backpressure actions, provider/model-time separation, and
   G29/G66/G68/G74 SLO/resource mappings are present while gold status remains
-  `not_exercised`.
+  `not_exercised`; negative fixtures reject missing environment capture,
+  provider/model-time mixing, and skipped safety checks.
 
 ## Report Format
 
@@ -91,7 +92,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 31,
+  "case_count": 32,
   "failed_count": 0,
   "results": [
     {
@@ -120,9 +121,9 @@ shape for CI checks, but passing this fixture suite alone must not be represente
 as complete use-case E2E acceptance.
 
 The FND-012 performance budget cases are also partial fixture evidence only.
-They validate a budget/report contract plus negative environment-capture and
-provider/model-time-mixing cases; they do not execute 24/7 soak tests,
-1,000-node simulation, GPU/training,
+They validate a budget/report contract plus negative environment-capture,
+provider/model-time-mixing, and skipped-safety-check cases; they do not execute
+24/7 soak tests, 1,000-node simulation, GPU/training,
 robotics, live fleet, or physical hardware benchmarks, and they must not be
 reported as `G29`, `G66`, `G68`, `G74`, issue #231, or issue #180 completion.
 
