@@ -118,6 +118,84 @@ PROMPT_ONLY_SECURITY_PHRASES = {
     "instruction prompt",
 }
 ALLOWED_SECURITY_SIGNATURE_ALGORITHMS = {"ed25519", "ecdsa_p256_sha256"}
+DRIVER_SCHEMA_CONFUSION_SCHEMA_VERSION = "splendor.driver_schema_confusion_fixture.v1"
+DRIVER_SCHEMA_CONFUSION_EVIDENCE_SCOPE = "partial_fnd_011_g86_driver_schema_confusion_v0"
+DRIVER_SCHEMA_CONFUSION_NON_CLAIMS = {
+    "no_g86_gold_pass",
+    "no_g80_g89_pass",
+    "no_full_driver_conformance",
+    "no_driver_registry_implementation",
+    "no_live_adapter_execution",
+}
+DRIVER_SCHEMA_MISMATCH_REASONS = {
+    "driver_schema_mismatch",
+    "driver_schema_version_mismatch",
+    "driver_operation_schema_mismatch",
+}
+DRIVER_SCHEMA_EVENT_ORDER = [
+    "driver.schema.checked",
+    "verification.started",
+    "driver.schema.rejected",
+    "verification.completed",
+    "action.denied",
+    "outcome.recorded",
+]
+DRIVER_SCHEMA_REQUIRED_EVENTS = set(DRIVER_SCHEMA_EVENT_ORDER)
+DRIVER_SCHEMA_FORBIDDEN_EVENTS = {
+    "action.executed",
+    "adapter.executed",
+    "adapter.invoked",
+    "driver.executed",
+    "driver.invoked",
+}
+DRIVER_SCHEMA_FORBIDDEN_EVENT_PREFIXES = (
+    "artifact.",
+    "db.",
+    "email.",
+    "filesystem.",
+    "network.",
+    "shell.",
+    "webhook.",
+)
+DRIVER_SCHEMA_TOP_LEVEL_KEYS = {
+    "action_id",
+    "description",
+    "driver_id",
+    "events",
+    "evidence_scope",
+    "gateway",
+    "gold_id",
+    "non_claims",
+    "operation",
+    "outcome",
+    "run_id",
+    "schema_mismatch",
+    "schema_version",
+    "side_effects",
+    "task_id",
+    "verification",
+}
+DRIVER_SCHEMA_MISMATCH_KEYS = {"detected_before_execution", "expected", "reason", "requested"}
+DRIVER_SCHEMA_ENDPOINT_KEYS = {"schema", "version"}
+DRIVER_SCHEMA_VERIFICATION_KEYS = {"allowed", "reasons", "verifier_results"}
+DRIVER_SCHEMA_VERIFIER_RESULT_KEYS = {"allowed", "evidence", "reason", "verifier"}
+DRIVER_SCHEMA_VERIFIER_EVIDENCE_KEYS = {"driver_manifest_ref", "expected_schema", "operation", "requested_schema"}
+DRIVER_SCHEMA_GATEWAY_KEYS = {
+    "adapter_executed",
+    "adapter_invocation_count",
+    "driver_invocation_count",
+    "effect_certainty",
+    "status",
+}
+DRIVER_SCHEMA_OUTCOME_KEYS = {"reason", "side_effect_occurred", "status"}
+DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS = {
+    "artifacts_published",
+    "external_mutations",
+    "filesystem_writes",
+    "network_calls",
+}
+DRIVER_SCHEMA_EVENT_KEYS = {"evidence_ref", "identity", "kind", "trace_event_id"}
+DRIVER_SCHEMA_EVENT_IDENTITY_KEYS = {"action_id", "driver_id", "run_id"}
 PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
 PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
 REQUIRED_PERFORMANCE_NON_CLAIMS = {
@@ -176,6 +254,14 @@ def load_json(path: Path) -> dict[str, Any]:
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise ConformanceError(message)
+
+
+def require_exact_keys(value: dict[str, Any], expected_keys: set[str], label: str) -> None:
+    actual_keys = set(value)
+    missing = sorted(expected_keys - actual_keys)
+    extras = sorted(actual_keys - expected_keys)
+    assert_true(not missing, f"{label} missing keys: {', '.join(missing)}")
+    assert_true(not extras, f"{label} unknown keys: {', '.join(extras)}")
 
 
 def event_kind_matches(actual: str, expected: str) -> bool:
@@ -657,7 +743,9 @@ def validate_security_invariants(config: dict[str, Any]) -> None:
         data.get("evidence_scope") == "partial_fnd_011_security_invariants_v0",
         "security_invariants evidence_scope must be partial_fnd_011_security_invariants_v0",
     )
-    non_claims = set(data.get("non_claims", []))
+    non_claim_values = data.get("non_claims")
+    assert_true(isinstance(non_claim_values, list), "security_invariants non_claims must be an array")
+    non_claims = {require_non_empty_string(non_claim, "security_invariants non_claim") for non_claim in non_claim_values}
     missing_non_claims = sorted(REQUIRED_SECURITY_NON_CLAIMS - non_claims)
     assert_true(not missing_non_claims, f"security_invariants non_claims missing: {', '.join(missing_non_claims)}")
     validate_security_crypto_agility(data)
@@ -712,6 +800,187 @@ def normalize_security_label(value: str) -> str:
 def is_prompt_only_control_text(value: str) -> bool:
     normalized = normalize_security_text(value)
     return any(phrase in normalized for phrase in PROMPT_ONLY_SECURITY_PHRASES)
+
+
+def load_driver_schema_confusion_fixture(config: dict[str, Any]) -> dict[str, Any]:
+    path_value = config.get("path")
+    assert_true(isinstance(path_value, str) and path_value, "driver_schema_confusion.path is required")
+    return load_json(ROOT / path_value)
+
+
+def validate_schema_endpoint(endpoint: Any, label: str) -> tuple[str, str]:
+    assert_true(isinstance(endpoint, dict), f"{label} schema endpoint is required")
+    require_exact_keys(endpoint, DRIVER_SCHEMA_ENDPOINT_KEYS, label)
+    schema = require_non_empty_string(endpoint.get("schema"), f"{label}.schema")
+    version = require_non_empty_string(endpoint.get("version"), f"{label}.version")
+    return schema, version
+
+
+def driver_schema_ref(schema: str, version: str) -> str:
+    return f"{schema}@{version}"
+
+
+def validate_driver_schema_verification(
+    data: dict[str, Any],
+    reason: str,
+    operation: str,
+    expected_ref: str,
+    requested_ref: str,
+) -> None:
+    verification = data.get("verification")
+    assert_true(isinstance(verification, dict), "driver schema verification evidence is required")
+    require_exact_keys(verification, DRIVER_SCHEMA_VERIFICATION_KEYS, "verification")
+    assert_true(verification.get("allowed") is False, "driver schema mismatch verification must fail closed")
+    reasons = verification.get("reasons")
+    assert_true(reasons == [reason], "driver schema verification reasons must contain only the mismatch reason")
+    verifier_results = require_non_empty_array(verification.get("verifier_results"), "verification.verifier_results")
+    assert_true(len(verifier_results) == 1, "verification.verifier_results must contain only driver_schema denial evidence")
+    for result in verifier_results:
+        assert_true(isinstance(result, dict), "verification.verifier_results entries must be objects")
+        require_exact_keys(result, DRIVER_SCHEMA_VERIFIER_RESULT_KEYS, "verification.verifier_results entry")
+        assert_true(result.get("verifier") == "driver_schema", "driver_schema verifier denial is required")
+        assert_true(result.get("allowed") is False, "driver_schema verifier must deny mismatch")
+        assert_true(result.get("reason") == reason, "driver_schema verifier reason must match mismatch reason")
+        evidence = result.get("evidence")
+        assert_true(isinstance(evidence, dict), "driver_schema verifier evidence is required")
+        require_exact_keys(evidence, DRIVER_SCHEMA_VERIFIER_EVIDENCE_KEYS, "driver_schema verifier evidence")
+        require_non_empty_string(evidence.get("driver_manifest_ref"), "driver_schema verifier evidence.driver_manifest_ref")
+        assert_true(
+            evidence.get("operation") == operation,
+            "driver_schema verifier evidence operation must match fixture operation",
+        )
+        assert_true(
+            evidence.get("requested_schema") == requested_ref,
+            "driver_schema verifier evidence requested_schema must match schema_mismatch.requested",
+        )
+        assert_true(
+            evidence.get("expected_schema") == expected_ref,
+            "driver_schema verifier evidence expected_schema must match schema_mismatch.expected",
+        )
+
+
+def validate_driver_schema_gateway(data: dict[str, Any]) -> None:
+    gateway = data.get("gateway")
+    assert_true(isinstance(gateway, dict), "driver schema gateway containment evidence is required")
+    require_exact_keys(gateway, DRIVER_SCHEMA_GATEWAY_KEYS, "gateway")
+    assert_true(gateway.get("status") == "denied", "schema mismatch must be denied")
+    assert_true(gateway.get("adapter_executed") is False, "schema mismatch denial must not report adapter execution")
+    adapter_count = gateway.get("adapter_invocation_count")
+    assert_true(
+        isinstance(adapter_count, int) and not isinstance(adapter_count, bool) and adapter_count == 0,
+        "schema mismatch denial must keep adapter invocation count at zero",
+    )
+    driver_count = gateway.get("driver_invocation_count")
+    assert_true(
+        isinstance(driver_count, int) and not isinstance(driver_count, bool) and driver_count == 0,
+        "schema mismatch denial must keep driver invocation count at zero",
+    )
+    assert_true(gateway.get("effect_certainty") == "none", "schema mismatch denial must record effect_certainty none")
+
+
+def validate_driver_schema_outcome(data: dict[str, Any], reason: str) -> None:
+    outcome = data.get("outcome")
+    assert_true(isinstance(outcome, dict), "driver schema denial outcome evidence is required")
+    require_exact_keys(outcome, DRIVER_SCHEMA_OUTCOME_KEYS, "outcome")
+    assert_true(outcome.get("status") == "denied", "driver schema outcome status must be denied")
+    assert_true(outcome.get("reason") == reason, "driver schema outcome reason must match mismatch reason")
+    assert_true(outcome.get("side_effect_occurred") is False, "driver schema mismatch outcome must not report side effects")
+    side_effects = data.get("side_effects")
+    assert_true(isinstance(side_effects, dict), "driver schema side_effects evidence is required")
+    require_exact_keys(side_effects, DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS, "side_effects")
+    for field in sorted(DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS):
+        value = side_effects.get(field)
+        assert_true(
+            isinstance(value, int) and not isinstance(value, bool) and value == 0,
+            f"driver schema side_effects.{field} must be zero",
+        )
+
+
+def forbidden_driver_schema_event_reason(kind: str) -> str | None:
+    if any(kind.startswith(prefix) for prefix in DRIVER_SCHEMA_FORBIDDEN_EVENT_PREFIXES):
+        return f"driver schema side-effect event namespace {kind} is forbidden"
+    if kind in DRIVER_SCHEMA_FORBIDDEN_EVENTS or "executed" in kind or "execution" in kind or kind.endswith(".invoked"):
+        return f"driver schema execution event {kind} is forbidden"
+    return None
+
+
+def validate_driver_schema_events(data: dict[str, Any]) -> None:
+    events = require_non_empty_array(data.get("events"), "driver schema events")
+    run_id = require_non_empty_string(data.get("run_id"), "run_id")
+    action_id = require_non_empty_string(data.get("action_id"), "action_id")
+    driver_id = require_non_empty_string(data.get("driver_id"), "driver_id")
+    assert_true(len(events) == len(DRIVER_SCHEMA_EVENT_ORDER), "driver schema event sequence must have exactly six denial events")
+    event_kinds: list[str] = []
+    trace_event_ids: set[str] = set()
+    for event in events:
+        assert_true(isinstance(event, dict), "driver schema events entries must be objects")
+        require_exact_keys(event, DRIVER_SCHEMA_EVENT_KEYS, "driver schema event")
+        trace_event_id = require_non_empty_string(event.get("trace_event_id"), "driver schema event.trace_event_id")
+        assert_true(trace_event_id not in trace_event_ids, f"duplicate trace_event_id {trace_event_id}")
+        trace_event_ids.add(trace_event_id)
+        kind = require_non_empty_string(event.get("kind"), "driver schema event.kind")
+        forbidden_reason = forbidden_driver_schema_event_reason(kind)
+        assert_true(forbidden_reason is None, str(forbidden_reason))
+        assert_true(kind in DRIVER_SCHEMA_REQUIRED_EVENTS, f"driver schema event kind {kind} is not allowed")
+        event_kinds.append(kind)
+        identity = event.get("identity")
+        assert_true(isinstance(identity, dict), "driver schema event identity is required")
+        require_exact_keys(identity, DRIVER_SCHEMA_EVENT_IDENTITY_KEYS, "driver schema event identity")
+        assert_true(identity.get("run_id") == run_id, "driver schema event run_id mismatch")
+        assert_true(identity.get("action_id") == action_id, "driver schema event action_id mismatch")
+        assert_true(identity.get("driver_id") == driver_id, "driver schema event driver_id mismatch")
+        require_non_empty_string(event.get("evidence_ref"), "driver schema event.evidence_ref")
+    assert_true(
+        event_kinds == DRIVER_SCHEMA_EVENT_ORDER,
+        f"driver schema event sequence mismatch: expected {', '.join(DRIVER_SCHEMA_EVENT_ORDER)}",
+    )
+
+
+def validate_driver_schema_confusion(config: dict[str, Any]) -> None:
+    data = load_driver_schema_confusion_fixture(config)
+    require_exact_keys(data, DRIVER_SCHEMA_TOP_LEVEL_KEYS, "driver schema fixture")
+    assert_true(data.get("schema_version") == DRIVER_SCHEMA_CONFUSION_SCHEMA_VERSION, "driver schema fixture schema_version mismatch")
+    assert_true(data.get("task_id") == "FND-011", "driver schema fixture task_id must be FND-011")
+    assert_true(data.get("gold_id") == "G86", "driver schema fixture gold_id must be G86")
+    require_non_empty_string(data.get("description"), "description")
+    operation = require_non_empty_string(data.get("operation"), "operation")
+    require_non_empty_string(data.get("run_id"), "run_id")
+    require_non_empty_string(data.get("action_id"), "action_id")
+    require_non_empty_string(data.get("driver_id"), "driver_id")
+    assert_true(
+        data.get("evidence_scope") == DRIVER_SCHEMA_CONFUSION_EVIDENCE_SCOPE,
+        "driver schema fixture evidence_scope mismatch",
+    )
+    non_claim_values = data.get("non_claims")
+    assert_true(isinstance(non_claim_values, list), "driver schema fixture non_claims must be an array")
+    non_claims = {require_non_empty_string(non_claim, "driver schema fixture non_claim") for non_claim in non_claim_values}
+    missing_non_claims = sorted(DRIVER_SCHEMA_CONFUSION_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"driver schema fixture non_claims missing: {', '.join(missing_non_claims)}")
+
+    mismatch = data.get("schema_mismatch")
+    assert_true(isinstance(mismatch, dict), "driver schema mismatch evidence is required")
+    require_exact_keys(mismatch, DRIVER_SCHEMA_MISMATCH_KEYS, "schema_mismatch")
+    reason = require_non_empty_string(mismatch.get("reason"), "schema_mismatch.reason")
+    assert_true(reason in DRIVER_SCHEMA_MISMATCH_REASONS, f"unsupported driver schema mismatch reason {reason!r}")
+    expected_schema, expected_version = validate_schema_endpoint(mismatch.get("expected"), "schema_mismatch.expected")
+    requested_schema, requested_version = validate_schema_endpoint(mismatch.get("requested"), "schema_mismatch.requested")
+    assert_true(
+        expected_schema != requested_schema or expected_version != requested_version,
+        "driver schema mismatch fixture must actually differ by schema or version",
+    )
+    assert_true(mismatch.get("detected_before_execution") is True, "driver schema mismatch must be detected before execution")
+
+    validate_driver_schema_verification(
+        data,
+        reason,
+        operation,
+        driver_schema_ref(expected_schema, expected_version),
+        driver_schema_ref(requested_schema, requested_version),
+    )
+    validate_driver_schema_gateway(data)
+    validate_driver_schema_outcome(data, reason)
+    validate_driver_schema_events(data)
+
 
 def require_positive_number(value: Any, label: str) -> None:
     assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{label} must be positive")
@@ -909,6 +1178,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_compatibility(case["compatibility"])
     elif primitive == "security_invariants":
         validate_security_invariants(case["security_invariants"])
+    elif primitive == "driver_schema_confusion":
+        validate_driver_schema_confusion(case["driver_schema_confusion"])
     elif primitive == "performance_budgets":
         validate_performance_budgets(case["performance_budgets"])
     else:

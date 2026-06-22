@@ -1,0 +1,127 @@
+{
+  "schema_version": "splendor.driver_schema_confusion_fixture.v1",
+  "task_id": "FND-011",
+  "gold_id": "G86",
+  "evidence_scope": "partial_fnd_011_g86_driver_schema_confusion_v0",
+  "description": "Negative guard: non_claims must be an array, not an object with overclaim-shaped keys.",
+  "non_claims": {
+    "no_g86_gold_pass": false,
+    "no_g80_g89_pass": false,
+    "no_full_driver_conformance": false,
+    "no_driver_registry_implementation": false,
+    "no_live_adapter_execution": false
+  },
+  "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+  "action_id": "action_g86_bad_non_claims_object",
+  "driver_id": "driver.filesystem.fixture",
+  "operation": "filesystem.write_file",
+  "schema_mismatch": {
+    "reason": "driver_schema_version_mismatch",
+    "expected": {
+      "schema": "splendor.driver.filesystem.write_file",
+      "version": "v1"
+    },
+    "requested": {
+      "schema": "splendor.driver.filesystem.write_file",
+      "version": "v2"
+    },
+    "detected_before_execution": true
+  },
+  "verification": {
+    "allowed": false,
+    "reasons": ["driver_schema_version_mismatch"],
+    "verifier_results": [
+      {
+        "verifier": "driver_schema",
+        "allowed": false,
+        "reason": "driver_schema_version_mismatch",
+        "evidence": {
+          "driver_manifest_ref": "docs/spec/0.1/fixtures/adapter-manifests/filesystem.json",
+          "operation": "filesystem.write_file",
+          "requested_schema": "splendor.driver.filesystem.write_file@v2",
+          "expected_schema": "splendor.driver.filesystem.write_file@v1"
+        }
+      }
+    ]
+  },
+  "gateway": {
+    "status": "denied",
+    "adapter_executed": false,
+    "adapter_invocation_count": 0,
+    "driver_invocation_count": 0,
+    "effect_certainty": "none"
+  },
+  "outcome": {
+    "status": "denied",
+    "reason": "driver_schema_version_mismatch",
+    "side_effect_occurred": false
+  },
+  "side_effects": {
+    "filesystem_writes": 0,
+    "network_calls": 0,
+    "external_mutations": 0,
+    "artifacts_published": 0
+  },
+  "events": [
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_schema_checked",
+      "kind": "driver.schema.checked",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-schema-check"
+    },
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_verification_started",
+      "kind": "verification.started",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-verification-started"
+    },
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_schema_rejected",
+      "kind": "driver.schema.rejected",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-schema-rejection"
+    },
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_verification_completed",
+      "kind": "verification.completed",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-verification-denied"
+    },
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_action_denied",
+      "kind": "action.denied",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-action-denied"
+    },
+    {
+      "trace_event_id": "trace_g86_bad_non_claims_object_outcome_recorded",
+      "kind": "outcome.recorded",
+      "identity": {
+        "run_id": "run_g86_schema_confusion_bad_non_claims_object",
+        "action_id": "action_g86_bad_non_claims_object",
+        "driver_id": "driver.filesystem.fixture"
+      },
+      "evidence_ref": "evidence:g86-bad-non-claims-object-outcome-denied"
+    }
+  ]
+}
