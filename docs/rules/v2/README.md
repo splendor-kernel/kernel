@@ -71,6 +71,7 @@ docs/examples, migration notes when needed, and validation output.
 - `architecture/` - active v2 architecture rules, schema/identity map, and ownership policy plan.
 - `gold/` - gold conformance triage, gold program documents, and machine-readable gold catalog.
 - `security/` - bounded FND-011 security threat/invariant mapping fixtures; partial evidence only, not G80-G89 pass status.
+- `foundation-readiness.md` / `foundation-readiness.json` - V2-FND-0 foundation readiness checkpoint for starting C01 contract/RFC work; partial evidence only, not full FND validation, gold pass status, or C01 implementation.
 
 ## Safety Guardrails
 

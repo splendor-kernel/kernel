@@ -32,6 +32,17 @@ evidence. That fixture family is partial denial evidence only; it does not
 implement a driver registry, certification process, ABI negotiation service, or
 runtime driver execution system, and it does not mark G86 or G80-G89 as passed.
 
+The suite now also contains bounded G80 prompt/data-injection denial evidence.
+The Python runtime test exercises the current local runtime path: a malicious
+perceptor payload smuggles `allowed_actions`, `allowed_adapters`,
+`allowed_permissions`, approval, verification, and gateway-bypass hints; a naive
+policy proposes the requested unauthorized filesystem action; tenant/gateway
+verification denies it; the adapter call count remains zero; and trace contains a
+denial with no execution event. The conformance fixture mirrors that denial shape
+and rejects contradictory execution, side-effect event, missing side-effect
+counter, and malformed non-claim evidence. This remains partial evidence only:
+G80, G80-G89, FND-011, #230, and #180 are not complete or passed.
+
 ## Validation
 
 The fixture is validated by:
@@ -39,6 +50,7 @@ The fixture is validated by:
 ```bash
 python3 conformance/0.1/run-conformance.py --format json
 cargo test -p splendor-types security_invariants
+python3 -m pytest python/tests/test_runtime.py
 ```
 
 The validation is intentionally strict about prompt-only boundaries, skipped
@@ -52,3 +64,7 @@ explicit allow-list (`ed25519`, `ecdsa_p256_sha256`) so weak or underspecified
 labels such as `none`, `md5`, `rsa_md5`, `rsa_sha1`, `sha1`, `dsa_sha1`, `plain`,
 and empty labels are rejected as validation failures only; this does not
 implement cryptography or claim crypto enforcement.
+
+The G80 denial fixture uses inert local canary strings only. It does not add a
+route taint engine, protected-eval/data-use controller, secret broker, production
+adapter registry, live side-effect path, or gold harness pass status.

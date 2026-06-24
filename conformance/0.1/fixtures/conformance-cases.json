@@ -461,6 +461,60 @@
       "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-skipped-negative.json" }
     },
     {
+      "case_id": "prompt-data-injection-g80-denial",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-PROMPT-DATA-INJECTION-DENIAL",
+      "path": "denial",
+      "description": "Partial G80 evidence: malicious perceptor payload authority fields remain data, a naive policy proposes the requested unauthorized side-effect action, and tenant/gateway verification denies before adapter execution.",
+      "report_message": "partial FND-011 G80 prompt/data-injection denial v0: payload authority fields remain non-authorizing and denial occurs before execution; no G80 gold pass or full G80-G89 pass claimed",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-g80-denial.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-executed-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-NO-EXECUTION-AFTER-INJECTION-DENIAL",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves prompt/data-injection denial evidence is rejected if it still reports adapter execution.",
+      "expected_failure": "prompt injection denial must not report adapter execution",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-executed-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-side-effect-event-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-EVENT-ALLOWLIST",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves side-effect event namespaces such as filesystem.write are rejected in prompt/data-injection denial evidence.",
+      "expected_failure": "prompt injection side-effect event namespace filesystem.write is forbidden",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-side-effect-event-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-empty-side-effects-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-SIDE-EFFECT-COUNTERS-REQUIRED",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves prompt/data-injection denial evidence must include exact zero side-effect counters.",
+      "expected_failure": "prompt injection side_effects missing keys",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-empty-side-effects-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-non-claims-object-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-NON-CLAIMS-SHAPE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves G80 non_claims must be an array rather than an object whose keys resemble non-claim labels.",
+      "expected_failure": "prompt injection fixture non_claims must be an array",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-non-claims-object-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-payload-grant-mismatch-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-MALICIOUS-PAYLOAD-GRANT-SHAPE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves G80 evidence must show the malicious payload actually tried to grant the requested action authority.",
+      "expected_failure": "malicious percept payload must attempt to grant the requested action",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-payload-grant-mismatch-negative.json" }
+    },
+    {
       "case_id": "driver-schema-confusion-g86-denial",
       "primitive": "driver_schema_confusion",
       "requirement": "CONF-0.2-FND-011-G86-SCHEMA-MISMATCH-DENIAL",
@@ -558,6 +612,24 @@
       "description": "Negative fixture proves non_claim entries must be non-empty strings so overclaim guards cannot be malformed.",
       "expected_failure": "driver schema fixture non_claim must be a non-empty string",
       "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-non-claims-empty-negative.json" }
+    },
+    {
+      "case_id": "v2-fnd-foundation-readiness-for-c01",
+      "primitive": "foundation_readiness",
+      "requirement": "CONF-0.2-FND-FOUNDATION-READY-FOR-C01",
+      "path": "positive",
+      "description": "Foundation readiness checkpoint proves FND-001 through FND-012 have foundation-level evidence paths and explicit remaining validation before C01 contract work starts.",
+      "report_message": "V2-FND-0 foundation readiness checkpoint validates FND-001..FND-012 evidence paths and C01 readiness non-claims; no full FND validation, gold pass, or C01 implementation claimed",
+      "foundation_readiness": { "path": "docs/rules/v2/foundation-readiness.json" }
+    },
+    {
+      "case_id": "v2-fnd-foundation-readiness-overclaim-negative-fixture",
+      "primitive": "foundation_readiness",
+      "requirement": "CONF-0.2-FND-FOUNDATION-READY-NO-OVERCLAIM",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves a foundation readiness checkpoint cannot mark an individual FND task complete instead of foundation-ready.",
+      "expected_failure": "foundation FND-001 status must be foundation_ready",
+      "foundation_readiness": { "path": "conformance/0.1/fixtures/fnd-foundation-readiness-overclaim-negative.json" }
     },
     {
       "case_id": "performance-budgets-reference-contract",
