@@ -1,0 +1,323 @@
+{
+  "schema_version": "splendor.v2_foundation_readiness.v1",
+  "checkpoint_id": "v2-fnd-0-c01-readiness-2026-06-24",
+  "sprint": "V2-FND-0",
+  "aggregate_issue": 180,
+  "status": "foundation_ready_for_c01",
+  "non_claims": [
+    "no_fnd_full_validation",
+    "no_fnd_001_012_completion_claim",
+    "no_gold_pass_claim",
+    "no_c01_implementation",
+    "no_principal_registry_service"
+  ],
+  "exit_gate_coverage": {
+    "schema_compatibility": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "docs/spec/0.1/schema-versioning.md",
+        "docs/spec/0.1/stable-primitive-examples.json",
+        "conformance/0.1/fixtures/conformance-cases.json"
+      ]
+    },
+    "non_authorizing_extensions": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-types/src/schema_extensions.rs",
+        "crates/splendor-types/tests/unit/schema_extensions_tests.rs",
+        "conformance/0.1/run-conformance.py"
+      ]
+    },
+    "failure_taxonomy": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-types/src/failure_taxonomy.rs",
+        "crates/splendor-types/tests/unit/failure_taxonomy_tests.rs"
+      ]
+    },
+    "conformance_harness_scope": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "conformance/0.1/run-conformance.py",
+        "docs/spec/0.1/conformance.md",
+        "crates/splendor-kernel/tests/integration_adapters_filesystem_http_gateway.rs"
+      ]
+    },
+    "migration_fixture_family": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "docs/spec/0.1/schema-versioning.md",
+        "conformance/0.1/fixtures/conformance-cases.json",
+        "docs/rules/v2/architecture/schema-identity-map.md"
+      ]
+    },
+    "security_invariants": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "docs/rules/v2/security/security-invariants.json",
+        "crates/splendor-types/src/security_invariants.rs",
+        "python/tests/test_runtime.py"
+      ]
+    },
+    "performance_budgets": {
+      "status": "foundation_ready",
+      "evidence_paths": [
+        "docs/spec/0.2/performance-budgets.json",
+        "crates/splendor-types/src/performance_budgets.rs",
+        "crates/splendor-types/tests/unit/performance_budgets_tests.rs"
+      ]
+    }
+  },
+  "c01_readiness": {
+    "component_label": "C01",
+    "component_id": "splendor.identity-registry",
+    "readiness_scope": "may_start_contract_rfc_and_foundation_dependent_work",
+    "allowed_next_work": [
+      "IDR-001",
+      "IDR-002",
+      "IDR-003",
+      "IDR-004",
+      "IDR-005",
+      "IDR-006"
+    ],
+    "required_fnd_dependencies": [
+      "FND-001",
+      "FND-003",
+      "FND-006",
+      "FND-011"
+    ],
+    "required_rfc_refs": [
+      "docs/rfc/0008-vnext-identity-authority-data-use-secrets-plane.md",
+      "issue:#152"
+    ],
+    "full_implementation_blocked_until_rfc_accepted": true,
+    "non_claims": [
+      "no_c01_implementation",
+      "no_principal_registry_service",
+      "no_identity_authorization_collapse",
+      "no_accepted_principal_registry_rfc_claim"
+    ]
+  },
+  "foundations": [
+    {
+      "task_id": "FND-001",
+      "issue": 220,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-types/src/schema_extensions.rs",
+        "crates/splendor-types/tests/unit/schema_extensions_tests.rs",
+        "docs/spec/0.1/primitives.md",
+        "docs/spec/0.1/stable-primitive-examples.json"
+      ],
+      "remaining_validation": [
+        "full vNext object grammar",
+        "generated Rust/Python/TypeScript schemas",
+        "G00 round-trip gold evidence"
+      ],
+      "gold_ids": ["G00"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-002",
+      "issue": 221,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/rules/v2/architecture/architecture-policy-plan.md",
+        "docs/rules/v2/catalog/architecture/dependency_policy.proposed.json",
+        "scripts/architecture/check-dependency-policy.py"
+      ],
+      "remaining_validation": [
+        "full v2 plane crate split",
+        "mechanical duplicate-owner detection across all services",
+        "G00 package compatibility evidence"
+      ],
+      "gold_ids": ["G00"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-003",
+      "issue": 222,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-kernel/tests/unit/loop_engine_tests.rs",
+        "crates/splendor-kernel/tests/integration_loop_engine_state_trace_persistence.rs",
+        "conformance/0.1/fixtures/conformance-cases.json"
+      ],
+      "remaining_validation": [
+        "generic CommandEnvelope/DecisionRecord/MutationReceipt contracts",
+        "outbox recovery protocol",
+        "G02/G04/G15/G47/G75/G87 gold evidence"
+      ],
+      "gold_ids": ["G02", "G04", "G15", "G47", "G75", "G87"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-004",
+      "issue": 223,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-types/src/failure_taxonomy.rs",
+        "crates/splendor-types/tests/unit/failure_taxonomy_tests.rs",
+        "conformance/0.1/fixtures/conformance-cases.json"
+      ],
+      "remaining_validation": [
+        "generated SDK exception mappings",
+        "complete HTTP/gRPC status mapping",
+        "G04/G07/G87 gold evidence"
+      ],
+      "gold_ids": ["G04", "G07", "G87"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-005",
+      "issue": 224,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "conformance/0.1/run-conformance.py",
+        "docs/spec/0.1/conformance.md",
+        "crates/splendor-kernel/tests/integration_adapters_filesystem_http_gateway.rs"
+      ],
+      "remaining_validation": [
+        "subprocess/resident/remote driver harness",
+        "signed ConformanceReport artifact",
+        "G07 filesystem and HTTP adapter gold evidence"
+      ],
+      "gold_ids": ["G07"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-006",
+      "issue": 225,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/spec/0.1/schema-versioning.md",
+        "conformance/0.1/fixtures/conformance-cases.json",
+        "docs/rules/v2/architecture/schema-identity-map.md"
+      ],
+      "remaining_validation": [
+        "version negotiation across daemon/node/driver/message/work-order protocols",
+        "online storage migrations",
+        "G00/G72 mixed-version gold evidence"
+      ],
+      "gold_ids": ["G00", "G72"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-007",
+      "issue": 226,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-gateway/tests/unit/gateway_tests.rs",
+        "crates/splendor-kernel/tests/unit/loop_engine_tests.rs",
+        "python/tests/test_runtime.py"
+      ],
+      "remaining_validation": [
+        "sealed privileged-commit interfaces",
+        "future eval/training/change/deployment privilege coverage",
+        "G01/G27/G40/G78/G79/G80 gold evidence"
+      ],
+      "gold_ids": ["G01", "G27", "G40", "G78", "G79", "G80"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-008",
+      "issue": 227,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "crates/splendor-types/src/determinism.rs",
+        "crates/splendor-types/tests/unit/determinism_tests.rs",
+        "docs/spec/0.2/performance-budgets.json"
+      ],
+      "remaining_validation": [
+        "artifact payload-reference utilities for all large payloads",
+        "environment fingerprint integration",
+        "G03/G39/G42/G52/G64 gold evidence"
+      ],
+      "gold_ids": ["G03", "G39", "G42", "G52", "G64"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-009",
+      "issue": 228,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/reference/audit-export.md",
+        "crates/splendor-daemon/src/lib.rs",
+        "crates/splendor-daemon/tests/runtime_daemon_api_tests.rs"
+      ],
+      "remaining_validation": [
+        "secret broker and data-use policy integration",
+        "protected eval isolation",
+        "G08/G35/G82/G84 gold evidence"
+      ],
+      "gold_ids": ["G08", "G35", "G82", "G84"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-010",
+      "issue": 229,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/reference/runtime-daemon-api.md",
+        "crates/splendor-daemon/src/lib.rs",
+        "crates/splendor-daemon/tests/runtime_daemon_api_tests.rs"
+      ],
+      "remaining_validation": [
+        "durable idempotency ledger for all mutating endpoints",
+        "generated client contract tests",
+        "G00/G06 gold evidence"
+      ],
+      "gold_ids": ["G00", "G06"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-011",
+      "issue": 230,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/rules/v2/security/security-invariants.json",
+        "crates/splendor-types/src/security_invariants.rs",
+        "conformance/0.1/fixtures/prompt-data-injection-g80-denial.json",
+        "conformance/0.1/fixtures/driver-schema-confusion-g86-denial.json",
+        "python/tests/test_runtime.py"
+      ],
+      "remaining_validation": [
+        "full red-team harness for G80-G89",
+        "secret broker, attestation, protected eval, rollout-control integrations",
+        "G80-G89 gold evidence"
+      ],
+      "gold_ids": ["G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    },
+    {
+      "task_id": "FND-012",
+      "issue": 231,
+      "foundation_status": "foundation_ready",
+      "evidence_paths": [
+        "docs/spec/0.2/performance-budgets.json",
+        "docs/spec/0.2/performance-budgets.md",
+        "crates/splendor-types/src/performance_budgets.rs",
+        "crates/splendor-types/tests/unit/performance_budgets_tests.rs"
+      ],
+      "remaining_validation": [
+        "benchmark execution and 24/7 soak tests",
+        "1,000-node simulation and preemption proof",
+        "G29/G66/G68/G74 gold evidence"
+      ],
+      "gold_ids": ["G29", "G66", "G68", "G74"],
+      "gold_status": "not_exercised",
+      "non_claims": ["no_full_task_completion", "no_gold_pass"]
+    }
+  ]
+}

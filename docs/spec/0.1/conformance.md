@@ -83,8 +83,9 @@ The suite validates:
   invocation count remains zero, required denial events and exact identity
   linkage are present, and side-effect counters remain zero. Negative fixtures
   reject contradictory adapter execution, side-effect event namespaces, missing
-  side-effect counters, and malformed non-claim guards. This is bounded denial
-  evidence only, not a G80 gold pass.
+  side-effect counters, malformed non-claim guards, and fixtures that do not
+  prove the malicious payload tried to grant the requested action authority. This
+  is bounded denial evidence only, not a G80 gold pass.
 - Partial FND-011 G86 driver schema-confusion denial fixture v0 evidence: a
   driver schema/version mismatch carries a stable mismatch reason, fails
   verification, records schema rejection/denial/outcome events, keeps
@@ -94,6 +95,12 @@ The suite validates:
   missing side-effect counters, duplicate trace IDs, out-of-order events,
   mismatched verifier evidence, and malformed non-claim guards. This is bounded
   denial evidence only, not a G86 gold pass.
+- V2-FND-0 foundation readiness checkpoint evidence: every `FND-001` through
+  `FND-012` entry has foundation-level evidence paths, explicit remaining
+  validation gaps, `not_exercised` gold status, and non-claims. The C01 readiness
+  section allows starting Identity Registry contract/RFC work only; it does not
+  claim C01 implementation. A negative fixture rejects an overclaiming foundation
+  status.
 - Partial FND-012 performance budget fixture contract v0 evidence: mandatory
   latency/throughput budgets, environment-capture shape, regression thresholds,
   retention/backpressure actions, provider/model-time separation, and
@@ -121,7 +128,7 @@ The JSON report is stable for CI ingestion:
   "milestone": "Splendor0.1-dev",
   "sprint": "0.1-S2",
   "status": "pass",
-  "case_count": 52,
+  "case_count": 55,
   "failed_count": 0,
   "results": [
     {
@@ -172,6 +179,12 @@ engine, full capability separation grammar, protected eval/data-use controls,
 secret brokering, a production adapter registry, or a full adversarial gold
 harness. They must not be reported as a G80 gold pass, full FND-011 completion,
 issue #230 completion, issue #180 completion, or full G80-G89 pass status.
+
+The V2-FND-0 foundation readiness checkpoint is a foundation gate only. It marks
+all FND tasks as ready for C01 contract/RFC work by evidence path, but it does
+not mark FND-001 through FND-012 complete, does not close #180/#220-#231 by
+itself, does not pass any gold case, and does not implement C01 or a Principal
+Registry service.
 
 The FND-012 performance budget cases are also partial fixture evidence only.
 They validate a budget/report contract plus negative environment-capture,

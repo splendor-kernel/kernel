@@ -23,6 +23,7 @@ ADAPTER_VALIDATOR = ROOT / "scripts" / "validate-adapter-manifests.py"
 STABLE_EXAMPLES_PATH = ROOT / "docs" / "spec" / "0.1" / "stable-primitive-examples.json"
 SECURITY_INVARIANTS_PATH = ROOT / "docs" / "rules" / "v2" / "security" / "security-invariants.json"
 PERFORMANCE_BUDGETS_PATH = ROOT / "docs" / "spec" / "0.2" / "performance-budgets.json"
+FOUNDATION_READINESS_PATH = ROOT / "docs" / "rules" / "v2" / "foundation-readiness.json"
 ACTION_OUTCOMES = {
     "action.executed",
     "action.denied",
@@ -342,6 +343,59 @@ REQUIRED_THROUGHPUT_BUDGET_METRICS = {
     "one_thousand_node_simulation",
 }
 REQUIRED_PERFORMANCE_GOLD_IDS = {"G29", "G66", "G68", "G74"}
+FOUNDATION_READINESS_SCHEMA_VERSION = "splendor.v2_foundation_readiness.v1"
+FOUNDATION_READINESS_STATUS = "foundation_ready_for_c01"
+REQUIRED_FOUNDATION_TASKS = {f"FND-{index:03d}" for index in range(1, 13)}
+REQUIRED_FOUNDATION_NON_CLAIMS = {
+    "no_fnd_full_validation",
+    "no_fnd_001_012_completion_claim",
+    "no_gold_pass_claim",
+    "no_c01_implementation",
+    "no_principal_registry_service",
+}
+FOUNDATION_READINESS_TOP_LEVEL_KEYS = {
+    "aggregate_issue",
+    "c01_readiness",
+    "checkpoint_id",
+    "exit_gate_coverage",
+    "foundations",
+    "non_claims",
+    "schema_version",
+    "status",
+    "sprint",
+}
+FOUNDATION_RECORD_KEYS = {
+    "evidence_paths",
+    "foundation_status",
+    "gold_ids",
+    "gold_status",
+    "issue",
+    "non_claims",
+    "remaining_validation",
+    "task_id",
+}
+FOUNDATION_REQUIRED_EXIT_GATES = {
+    "schema_compatibility",
+    "non_authorizing_extensions",
+    "failure_taxonomy",
+    "conformance_harness_scope",
+    "migration_fixture_family",
+    "security_invariants",
+    "performance_budgets",
+}
+FOUNDATION_EXIT_GATE_KEYS = {"evidence_paths", "status"}
+FOUNDATION_C01_KEYS = {
+    "allowed_next_work",
+    "component_id",
+    "component_label",
+    "full_implementation_blocked_until_rfc_accepted",
+    "non_claims",
+    "readiness_scope",
+    "required_fnd_dependencies",
+    "required_rfc_refs",
+}
+REQUIRED_C01_TASKS = {f"IDR-{index:03d}" for index in range(1, 7)}
+REQUIRED_C01_FND_DEPENDENCIES = {"FND-001", "FND-003", "FND-006", "FND-011"}
 
 
 @dataclass
@@ -1144,6 +1198,49 @@ def validate_prompt_malicious_percept(data: dict[str, Any]) -> tuple[str, str, l
         payload.get("requested_action"),
         "malicious_percept.payload.requested_action",
     )
+    payload_allowed_actions = payload.get("allowed_actions")
+    assert_true(isinstance(payload_allowed_actions, list), "malicious_percept.payload.allowed_actions must be an array")
+    for allowed_action in payload_allowed_actions:
+        require_non_empty_string(allowed_action, "malicious_percept.payload.allowed_actions")
+    assert_true(
+        requested_name in payload_allowed_actions,
+        "malicious percept payload must attempt to grant the requested action",
+    )
+    payload_allowed_adapters = payload.get("allowed_adapters")
+    assert_true(isinstance(payload_allowed_adapters, list), "malicious_percept.payload.allowed_adapters must be an array")
+    for allowed_adapter in payload_allowed_adapters:
+        require_non_empty_string(allowed_adapter, "malicious_percept.payload.allowed_adapters")
+    assert_true(
+        requested_adapter in payload_allowed_adapters,
+        "malicious percept payload must attempt to grant the requested adapter",
+    )
+    payload_allowed_permissions = payload.get("allowed_permissions")
+    assert_true(
+        isinstance(payload_allowed_permissions, list),
+        "malicious_percept.payload.allowed_permissions must be an array",
+    )
+    for allowed_permission in payload_allowed_permissions:
+        require_non_empty_string(allowed_permission, "malicious_percept.payload.allowed_permissions")
+    assert_true(
+        all(permission in payload_allowed_permissions for permission in requested_permissions),
+        "malicious percept payload must attempt to grant the requested permissions",
+    )
+    approval = payload.get("approval")
+    assert_true(isinstance(approval, dict), "malicious_percept.payload.approval must be an object")
+    assert_true(
+        approval.get("granted") is True,
+        "malicious percept payload must attempt to forge an approval grant",
+    )
+    verification = payload.get("verification")
+    assert_true(isinstance(verification, dict), "malicious_percept.payload.verification must be an object")
+    assert_true(
+        verification.get("allowed") is True,
+        "malicious percept payload must attempt to forge verification allow",
+    )
+    assert_true(
+        payload.get("gateway_bypass") is True,
+        "malicious percept payload must attempt gateway bypass",
+    )
     return requested_name, requested_adapter, requested_permissions
 
 
@@ -1333,6 +1430,108 @@ def validate_prompt_data_injection(config: dict[str, Any]) -> None:
     validate_prompt_gateway(data)
     validate_prompt_outcome_and_side_effects(data, reason)
     validate_prompt_events(data)
+
+
+def require_existing_relative_path(value: Any, label: str) -> Path:
+    path_value = require_non_empty_string(value, label)
+    path = Path(path_value)
+    assert_true(not path.is_absolute(), f"{label} must be repository-relative")
+    assert_true(".." not in path.parts, f"{label} must not traverse outside the repository")
+    full_path = ROOT / path
+    assert_true(full_path.exists(), f"{label} path does not exist: {path_value}")
+    return full_path
+
+
+def validate_foundation_readiness_record(record: Any) -> str:
+    assert_true(isinstance(record, dict), "foundation readiness entries must be objects")
+    require_exact_keys(record, FOUNDATION_RECORD_KEYS, "foundation readiness entry")
+    task_id = require_non_empty_string(record.get("task_id"), "foundation.task_id")
+    assert_true(task_id in REQUIRED_FOUNDATION_TASKS, f"unknown foundation task {task_id}")
+    issue = record.get("issue")
+    assert_true(isinstance(issue, int) and not isinstance(issue, bool) and 220 <= issue <= 231, f"foundation {task_id} issue must be a FND issue number")
+    assert_true(record.get("foundation_status") == "foundation_ready", f"foundation {task_id} status must be foundation_ready")
+    assert_true(record.get("gold_status") == "not_exercised", f"foundation {task_id} gold_status must remain not_exercised")
+    evidence_paths = require_non_empty_array(record.get("evidence_paths"), f"foundation {task_id} evidence_paths")
+    for evidence_path in evidence_paths:
+        require_existing_relative_path(evidence_path, f"foundation {task_id} evidence_paths")
+    remaining_validation = require_non_empty_array(record.get("remaining_validation"), f"foundation {task_id} remaining_validation")
+    for item in remaining_validation:
+        require_non_empty_string(item, f"foundation {task_id} remaining_validation")
+    gold_ids = require_non_empty_array(record.get("gold_ids"), f"foundation {task_id} gold_ids")
+    for gold_id in gold_ids:
+        require_non_empty_string(gold_id, f"foundation {task_id} gold_ids")
+    non_claims = set(require_non_empty_array(record.get("non_claims"), f"foundation {task_id} non_claims"))
+    for non_claim in non_claims:
+        require_non_empty_string(non_claim, f"foundation {task_id} non_claims")
+    assert_true("no_full_task_completion" in non_claims, f"foundation {task_id} must not claim full task completion")
+    assert_true("no_gold_pass" in non_claims, f"foundation {task_id} must not claim gold pass")
+    return task_id
+
+
+def validate_foundation_exit_gate_coverage(coverage: Any) -> None:
+    assert_true(isinstance(coverage, dict), "foundation exit_gate_coverage must be an object")
+    require_exact_keys(coverage, FOUNDATION_REQUIRED_EXIT_GATES, "foundation exit_gate_coverage")
+    for gate_id, gate in coverage.items():
+        assert_true(isinstance(gate, dict), f"foundation exit gate {gate_id} must be an object")
+        require_exact_keys(gate, FOUNDATION_EXIT_GATE_KEYS, f"foundation exit gate {gate_id}")
+        assert_true(gate.get("status") == "foundation_ready", f"foundation exit gate {gate_id} must be foundation_ready")
+        evidence_paths = require_non_empty_array(gate.get("evidence_paths"), f"foundation exit gate {gate_id} evidence_paths")
+        for evidence_path in evidence_paths:
+            require_existing_relative_path(evidence_path, f"foundation exit gate {gate_id} evidence_paths")
+
+
+def validate_c01_readiness(readiness: Any) -> None:
+    assert_true(isinstance(readiness, dict), "c01_readiness must be an object")
+    require_exact_keys(readiness, FOUNDATION_C01_KEYS, "c01_readiness")
+    assert_true(readiness.get("component_label") == "C01", "c01_readiness.component_label must be C01")
+    assert_true(readiness.get("component_id") == "splendor.identity-registry", "c01_readiness.component_id mismatch")
+    assert_true(
+        readiness.get("readiness_scope") == "may_start_contract_rfc_and_foundation_dependent_work",
+        "c01_readiness.readiness_scope mismatch",
+    )
+    assert_true(
+        readiness.get("full_implementation_blocked_until_rfc_accepted") is True,
+        "C01 full implementation must remain blocked until the Principal Registry RFC is accepted",
+    )
+    allowed_next_work = {require_non_empty_string(item, "c01_readiness.allowed_next_work") for item in require_non_empty_array(readiness.get("allowed_next_work"), "c01_readiness.allowed_next_work")}
+    missing_tasks = sorted(REQUIRED_C01_TASKS - allowed_next_work)
+    assert_true(not missing_tasks, f"c01_readiness missing IDR tasks: {', '.join(missing_tasks)}")
+    dependencies = {require_non_empty_string(item, "c01_readiness.required_fnd_dependencies") for item in require_non_empty_array(readiness.get("required_fnd_dependencies"), "c01_readiness.required_fnd_dependencies")}
+    missing_deps = sorted(REQUIRED_C01_FND_DEPENDENCIES - dependencies)
+    assert_true(not missing_deps, f"c01_readiness missing FND dependencies: {', '.join(missing_deps)}")
+    rfc_refs = require_non_empty_array(readiness.get("required_rfc_refs"), "c01_readiness.required_rfc_refs")
+    for rfc_ref in rfc_refs:
+        if isinstance(rfc_ref, str) and rfc_ref.startswith("docs/"):
+            require_existing_relative_path(rfc_ref, "c01_readiness.required_rfc_refs")
+        else:
+            require_non_empty_string(rfc_ref, "c01_readiness.required_rfc_refs")
+    non_claims = {require_non_empty_string(item, "c01_readiness.non_claims") for item in require_non_empty_array(readiness.get("non_claims"), "c01_readiness.non_claims")}
+    assert_true("no_c01_implementation" in non_claims, "c01_readiness must not claim C01 implementation")
+    assert_true("no_principal_registry_service" in non_claims, "c01_readiness must not claim a Principal Registry service")
+
+
+def validate_foundation_readiness(config: dict[str, Any]) -> None:
+    path = ROOT / config.get("path", FOUNDATION_READINESS_PATH.relative_to(ROOT))
+    data = load_json(path)
+    require_exact_keys(data, FOUNDATION_READINESS_TOP_LEVEL_KEYS, "foundation readiness fixture")
+    assert_true(data.get("schema_version") == FOUNDATION_READINESS_SCHEMA_VERSION, "foundation readiness schema_version mismatch")
+    assert_true(data.get("sprint") == "V2-FND-0", "foundation readiness sprint must be V2-FND-0")
+    assert_true(data.get("aggregate_issue") == 180, "foundation readiness aggregate_issue must be 180")
+    assert_true(data.get("status") == FOUNDATION_READINESS_STATUS, f"foundation readiness status must be {FOUNDATION_READINESS_STATUS}")
+    require_non_empty_string(data.get("checkpoint_id"), "foundation readiness checkpoint_id")
+    non_claims = {require_non_empty_string(item, "foundation readiness non_claims") for item in require_non_empty_array(data.get("non_claims"), "foundation readiness non_claims")}
+    missing_non_claims = sorted(REQUIRED_FOUNDATION_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"foundation readiness missing non_claims: {', '.join(missing_non_claims)}")
+    foundations = require_non_empty_array(data.get("foundations"), "foundation readiness foundations")
+    task_ids: set[str] = set()
+    for record in foundations:
+        task_id = validate_foundation_readiness_record(record)
+        assert_true(task_id not in task_ids, f"duplicate foundation task {task_id}")
+        task_ids.add(task_id)
+    missing_tasks = sorted(REQUIRED_FOUNDATION_TASKS - task_ids)
+    assert_true(not missing_tasks, f"foundation readiness missing tasks: {', '.join(missing_tasks)}")
+    validate_foundation_exit_gate_coverage(data.get("exit_gate_coverage"))
+    validate_c01_readiness(data.get("c01_readiness"))
 
 
 def require_positive_number(value: Any, label: str) -> None:
@@ -1537,6 +1736,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_prompt_data_injection(case["prompt_data_injection"])
     elif primitive == "performance_budgets":
         validate_performance_budgets(case["performance_budgets"])
+    elif primitive == "foundation_readiness":
+        validate_foundation_readiness(case["foundation_readiness"])
     else:
         raise ConformanceError(f"unknown primitive {primitive!r}")
 

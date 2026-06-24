@@ -1,0 +1,41 @@
+{
+  "schema_version": "splendor.v2_foundation_readiness.v1",
+  "checkpoint_id": "v2-fnd-0-overclaim-negative",
+  "sprint": "V2-FND-0",
+  "aggregate_issue": 180,
+  "status": "foundation_ready_for_c01",
+  "non_claims": ["no_fnd_full_validation", "no_fnd_001_012_completion_claim", "no_gold_pass_claim", "no_c01_implementation", "no_principal_registry_service"],
+  "exit_gate_coverage": {
+    "schema_compatibility": { "status": "foundation_ready", "evidence_paths": ["docs/spec/0.1/schema-versioning.md"] },
+    "non_authorizing_extensions": { "status": "foundation_ready", "evidence_paths": ["crates/splendor-types/src/schema_extensions.rs"] },
+    "failure_taxonomy": { "status": "foundation_ready", "evidence_paths": ["crates/splendor-types/src/failure_taxonomy.rs"] },
+    "conformance_harness_scope": { "status": "foundation_ready", "evidence_paths": ["conformance/0.1/run-conformance.py"] },
+    "migration_fixture_family": { "status": "foundation_ready", "evidence_paths": ["docs/spec/0.1/schema-versioning.md"] },
+    "security_invariants": { "status": "foundation_ready", "evidence_paths": ["docs/rules/v2/security/security-invariants.json"] },
+    "performance_budgets": { "status": "foundation_ready", "evidence_paths": ["docs/spec/0.2/performance-budgets.json"] }
+  },
+  "c01_readiness": {
+    "component_label": "C01",
+    "component_id": "splendor.identity-registry",
+    "readiness_scope": "may_start_contract_rfc_and_foundation_dependent_work",
+    "allowed_next_work": ["IDR-001", "IDR-002", "IDR-003", "IDR-004", "IDR-005", "IDR-006"],
+    "required_fnd_dependencies": ["FND-001", "FND-003", "FND-006", "FND-011"],
+    "required_rfc_refs": ["docs/rfc/0008-vnext-identity-authority-data-use-secrets-plane.md", "issue:#152"],
+    "full_implementation_blocked_until_rfc_accepted": true,
+    "non_claims": ["no_c01_implementation", "no_principal_registry_service"]
+  },
+  "foundations": [
+    { "task_id": "FND-001", "issue": 220, "foundation_status": "complete", "evidence_paths": ["crates/splendor-types/src/schema_extensions.rs"], "remaining_validation": ["G00"], "gold_ids": ["G00"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-002", "issue": 221, "foundation_status": "foundation_ready", "evidence_paths": ["scripts/architecture/check-dependency-policy.py"], "remaining_validation": ["G00"], "gold_ids": ["G00"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-003", "issue": 222, "foundation_status": "foundation_ready", "evidence_paths": ["crates/splendor-kernel/tests/unit/loop_engine_tests.rs"], "remaining_validation": ["G02"], "gold_ids": ["G02"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-004", "issue": 223, "foundation_status": "foundation_ready", "evidence_paths": ["crates/splendor-types/src/failure_taxonomy.rs"], "remaining_validation": ["G04"], "gold_ids": ["G04"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-005", "issue": 224, "foundation_status": "foundation_ready", "evidence_paths": ["conformance/0.1/run-conformance.py"], "remaining_validation": ["G07"], "gold_ids": ["G07"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-006", "issue": 225, "foundation_status": "foundation_ready", "evidence_paths": ["docs/spec/0.1/schema-versioning.md"], "remaining_validation": ["G72"], "gold_ids": ["G72"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-007", "issue": 226, "foundation_status": "foundation_ready", "evidence_paths": ["python/tests/test_runtime.py"], "remaining_validation": ["G80"], "gold_ids": ["G80"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-008", "issue": 227, "foundation_status": "foundation_ready", "evidence_paths": ["crates/splendor-types/src/determinism.rs"], "remaining_validation": ["G03"], "gold_ids": ["G03"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-009", "issue": 228, "foundation_status": "foundation_ready", "evidence_paths": ["docs/reference/audit-export.md"], "remaining_validation": ["G82"], "gold_ids": ["G82"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-010", "issue": 229, "foundation_status": "foundation_ready", "evidence_paths": ["docs/reference/runtime-daemon-api.md"], "remaining_validation": ["G06"], "gold_ids": ["G06"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-011", "issue": 230, "foundation_status": "foundation_ready", "evidence_paths": ["docs/rules/v2/security/security-invariants.json"], "remaining_validation": ["G80-G89"], "gold_ids": ["G80"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] },
+    { "task_id": "FND-012", "issue": 231, "foundation_status": "foundation_ready", "evidence_paths": ["docs/spec/0.2/performance-budgets.json"], "remaining_validation": ["G29"], "gold_ids": ["G29"], "gold_status": "not_exercised", "non_claims": ["no_full_task_completion", "no_gold_pass"] }
+  ]
+}

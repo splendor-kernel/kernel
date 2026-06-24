@@ -506,6 +506,15 @@
       "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-non-claims-object-negative.json" }
     },
     {
+      "case_id": "prompt-data-injection-payload-grant-mismatch-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-MALICIOUS-PAYLOAD-GRANT-SHAPE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves G80 evidence must show the malicious payload actually tried to grant the requested action authority.",
+      "expected_failure": "malicious percept payload must attempt to grant the requested action",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-payload-grant-mismatch-negative.json" }
+    },
+    {
       "case_id": "driver-schema-confusion-g86-denial",
       "primitive": "driver_schema_confusion",
       "requirement": "CONF-0.2-FND-011-G86-SCHEMA-MISMATCH-DENIAL",
@@ -603,6 +612,24 @@
       "description": "Negative fixture proves non_claim entries must be non-empty strings so overclaim guards cannot be malformed.",
       "expected_failure": "driver schema fixture non_claim must be a non-empty string",
       "driver_schema_confusion": { "path": "conformance/0.1/fixtures/driver-schema-confusion-non-claims-empty-negative.json" }
+    },
+    {
+      "case_id": "v2-fnd-foundation-readiness-for-c01",
+      "primitive": "foundation_readiness",
+      "requirement": "CONF-0.2-FND-FOUNDATION-READY-FOR-C01",
+      "path": "positive",
+      "description": "Foundation readiness checkpoint proves FND-001 through FND-012 have foundation-level evidence paths and explicit remaining validation before C01 contract work starts.",
+      "report_message": "V2-FND-0 foundation readiness checkpoint validates FND-001..FND-012 evidence paths and C01 readiness non-claims; no full FND validation, gold pass, or C01 implementation claimed",
+      "foundation_readiness": { "path": "docs/rules/v2/foundation-readiness.json" }
+    },
+    {
+      "case_id": "v2-fnd-foundation-readiness-overclaim-negative-fixture",
+      "primitive": "foundation_readiness",
+      "requirement": "CONF-0.2-FND-FOUNDATION-READY-NO-OVERCLAIM",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves a foundation readiness checkpoint cannot mark an individual FND task complete instead of foundation-ready.",
+      "expected_failure": "foundation FND-001 status must be foundation_ready",
+      "foundation_readiness": { "path": "conformance/0.1/fixtures/fnd-foundation-readiness-overclaim-negative.json" }
     },
     {
       "case_id": "performance-budgets-reference-contract",
