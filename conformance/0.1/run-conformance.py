@@ -196,6 +196,121 @@ DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS = {
 }
 DRIVER_SCHEMA_EVENT_KEYS = {"evidence_ref", "identity", "kind", "trace_event_id"}
 DRIVER_SCHEMA_EVENT_IDENTITY_KEYS = {"action_id", "driver_id", "run_id"}
+PROMPT_DATA_INJECTION_SCHEMA_VERSION = "splendor.prompt_data_injection_fixture.v1"
+PROMPT_DATA_INJECTION_EVIDENCE_SCOPE = "partial_fnd_011_g80_prompt_data_injection_denial_v0"
+PROMPT_DATA_INJECTION_NON_CLAIMS = {
+    "no_g80_gold_pass",
+    "no_g80_g89_pass",
+    "no_fnd_011_completion",
+    "no_route_taint_runtime",
+    "no_live_adapter_execution",
+}
+PROMPT_DATA_INJECTION_AUTHORITY_FIELDS = {
+    "allowed_actions",
+    "allowed_adapters",
+    "allowed_permissions",
+    "approval",
+    "verification",
+    "gateway_bypass",
+}
+PROMPT_DATA_INJECTION_DENIAL_REASONS = {
+    "action_not_allowed",
+    "adapter_not_allowed",
+    "permission_missing",
+    "prompt_data_not_authority",
+}
+PROMPT_DATA_INJECTION_EVENT_ORDER = [
+    "percepts.received",
+    "route.input.tainted",
+    "actions.proposed",
+    "verification.started",
+    "authorization.denied",
+    "verification.completed",
+    "action.denied",
+    "outcome.recorded",
+]
+PROMPT_DATA_INJECTION_REQUIRED_EVENTS = set(PROMPT_DATA_INJECTION_EVENT_ORDER)
+PROMPT_DATA_INJECTION_FORBIDDEN_EVENTS = {
+    "action.executed",
+    "adapter.executed",
+    "adapter.invoked",
+    "driver.executed",
+    "driver.invoked",
+    "gateway.executed",
+}
+PROMPT_DATA_INJECTION_FORBIDDEN_EVENT_PREFIXES = (
+    "artifact.",
+    "db.",
+    "email.",
+    "filesystem.",
+    "network.",
+    "shell.",
+    "webhook.",
+)
+PROMPT_DATA_INJECTION_TOP_LEVEL_KEYS = {
+    "action_id",
+    "adapter_id",
+    "agent_id",
+    "description",
+    "events",
+    "evidence_scope",
+    "gateway",
+    "gold_id",
+    "malicious_percept",
+    "non_claims",
+    "outcome",
+    "policy_proposal",
+    "run_id",
+    "schema_version",
+    "side_effects",
+    "task_id",
+    "tenant_id",
+    "tick_id",
+    "verification",
+}
+PROMPT_DATA_INJECTION_PERCEPT_KEYS = {"payload", "provenance", "schema", "tainted_fields"}
+PROMPT_DATA_INJECTION_PROVENANCE_KEYS = {"source", "trust_boundary"}
+PROMPT_DATA_INJECTION_REQUESTED_ACTION_KEYS = {
+    "adapter",
+    "name",
+    "params",
+    "required_permissions",
+    "side_effect_class",
+}
+PROMPT_DATA_INJECTION_POLICY_KEYS = {
+    "naive_policy",
+    "proposed_action",
+    "used_payload_requested_action",
+}
+PROMPT_DATA_INJECTION_VERIFICATION_KEYS = {"allowed", "reasons", "verifier_results"}
+PROMPT_DATA_INJECTION_VERIFIER_RESULT_KEYS = {"allowed", "evidence", "reason", "verifier"}
+PROMPT_DATA_INJECTION_VERIFIER_EVIDENCE_KEYS = {
+    "allowed_actions",
+    "allowed_adapters",
+    "allowed_permissions",
+    "requested_action",
+    "requested_adapter",
+    "requested_permissions",
+}
+PROMPT_DATA_INJECTION_GATEWAY_KEYS = {
+    "adapter_executed",
+    "adapter_invocation_count",
+    "effect_certainty",
+    "execution_attempted",
+    "gateway_bypassed",
+    "status",
+    "verification_ran",
+}
+PROMPT_DATA_INJECTION_OUTCOME_KEYS = {"reason", "side_effect_occurred", "status"}
+PROMPT_DATA_INJECTION_EVENT_KEYS = {"evidence_ref", "identity", "kind", "trace_event_id"}
+PROMPT_DATA_INJECTION_EVENT_IDENTITY_KEYS = {
+    "action_id",
+    "agent_id",
+    "percept_ref",
+    "run_id",
+    "tenant_id",
+    "tick_id",
+}
 PERFORMANCE_BUDGET_SCHEMA_VERSION = "splendor.performance_budgets.v1"
 PERFORMANCE_BUDGET_EVIDENCE_SCOPE = "partial_fnd_012_budget_contract_v0"
 REQUIRED_PERFORMANCE_NON_CLAIMS = {
@@ -982,6 +1097,244 @@ def validate_driver_schema_confusion(config: dict[str, Any]) -> None:
     validate_driver_schema_events(data)
 
 
+def load_prompt_data_injection_fixture(config: dict[str, Any]) -> dict[str, Any]:
+    path_value = config.get("path")
+    assert_true(isinstance(path_value, str) and path_value, "prompt_data_injection.path is required")
+    return load_json(ROOT / path_value)
+
+
+def validate_prompt_requested_action(action: Any, label: str) -> tuple[str, str, list[str]]:
+    assert_true(isinstance(action, dict), f"{label} is required")
+    require_exact_keys(action, PROMPT_DATA_INJECTION_REQUESTED_ACTION_KEYS, label)
+    name = require_non_empty_string(action.get("name"), f"{label}.name")
+    adapter = require_non_empty_string(action.get("adapter"), f"{label}.adapter")
+    side_effect_class = require_non_empty_string(action.get("side_effect_class"), f"{label}.side_effect_class")
+    assert_true(side_effect_class != "read_only", f"{label}.side_effect_class must be side-effectful")
+    params = action.get("params")
+    assert_true(isinstance(params, dict), f"{label}.params must be an object")
+    permissions = action.get("required_permissions")
+    assert_true(isinstance(permissions, list), f"{label}.required_permissions must be an array")
+    for permission in permissions:
+        require_non_empty_string(permission, f"{label}.required_permissions")
+    return name, adapter, list(permissions)
+
+
+def validate_prompt_malicious_percept(data: dict[str, Any]) -> tuple[str, str, list[str]]:
+    percept = data.get("malicious_percept")
+    assert_true(isinstance(percept, dict), "malicious_percept evidence is required")
+    require_exact_keys(percept, PROMPT_DATA_INJECTION_PERCEPT_KEYS, "malicious_percept")
+    require_non_empty_string(percept.get("schema"), "malicious_percept.schema")
+    provenance = percept.get("provenance")
+    assert_true(isinstance(provenance, dict), "malicious_percept.provenance is required")
+    require_exact_keys(provenance, PROMPT_DATA_INJECTION_PROVENANCE_KEYS, "malicious_percept.provenance")
+    require_non_empty_string(provenance.get("source"), "malicious_percept.provenance.source")
+    require_non_empty_string(provenance.get("trust_boundary"), "malicious_percept.provenance.trust_boundary")
+
+    payload = percept.get("payload")
+    assert_true(isinstance(payload, dict), "malicious_percept.payload must be an object")
+    tainted_fields = require_non_empty_array(percept.get("tainted_fields"), "malicious_percept.tainted_fields")
+    for field in tainted_fields:
+        require_non_empty_string(field, "malicious_percept.tainted_fields")
+    tainted_set = set(tainted_fields)
+    missing_taint = sorted(PROMPT_DATA_INJECTION_AUTHORITY_FIELDS - tainted_set)
+    assert_true(not missing_taint, f"malicious percept missing tainted authority fields: {', '.join(missing_taint)}")
+    missing_payload_fields = sorted(field for field in PROMPT_DATA_INJECTION_AUTHORITY_FIELDS if field not in payload)
+    assert_true(not missing_payload_fields, f"malicious percept payload missing authority fields: {', '.join(missing_payload_fields)}")
+    requested_name, requested_adapter, requested_permissions = validate_prompt_requested_action(
+        payload.get("requested_action"),
+        "malicious_percept.payload.requested_action",
+    )
+    return requested_name, requested_adapter, requested_permissions
+
+
+def validate_prompt_policy_proposal(
+    data: dict[str, Any],
+    requested_name: str,
+    requested_adapter: str,
+    requested_permissions: list[str],
+) -> None:
+    proposal = data.get("policy_proposal")
+    assert_true(isinstance(proposal, dict), "policy_proposal evidence is required")
+    require_exact_keys(proposal, PROMPT_DATA_INJECTION_POLICY_KEYS, "policy_proposal")
+    assert_true(proposal.get("naive_policy") is True, "policy_proposal.naive_policy must be true")
+    assert_true(
+        proposal.get("used_payload_requested_action") is True,
+        "policy_proposal must show the payload requested action was proposed",
+    )
+    proposed_name, proposed_adapter, proposed_permissions = validate_prompt_requested_action(
+        proposal.get("proposed_action"),
+        "policy_proposal.proposed_action",
+    )
+    assert_true(proposed_name == requested_name, "policy proposal action must match malicious requested action")
+    assert_true(proposed_adapter == requested_adapter, "policy proposal adapter must match malicious requested adapter")
+    assert_true(
+        proposed_permissions == requested_permissions,
+        "policy proposal permissions must match malicious requested permissions",
+    )
+
+
+def validate_prompt_verification(
+    data: dict[str, Any],
+    requested_name: str,
+    requested_adapter: str,
+    requested_permissions: list[str],
+) -> str:
+    verification = data.get("verification")
+    assert_true(isinstance(verification, dict), "prompt injection verification evidence is required")
+    require_exact_keys(verification, PROMPT_DATA_INJECTION_VERIFICATION_KEYS, "verification")
+    assert_true(verification.get("allowed") is False, "prompt injection verification must fail closed")
+    reasons = verification.get("reasons")
+    assert_true(isinstance(reasons, list) and len(reasons) == 1, "prompt injection verification must have exactly one denial reason")
+    reason = require_non_empty_string(reasons[0], "verification.reasons")
+    assert_true(reason in PROMPT_DATA_INJECTION_DENIAL_REASONS, f"unsupported prompt injection denial reason {reason!r}")
+    verifier_results = require_non_empty_array(verification.get("verifier_results"), "verification.verifier_results")
+    tenant_denial_seen = False
+    for result in verifier_results:
+        assert_true(isinstance(result, dict), "verification.verifier_results entries must be objects")
+        require_exact_keys(result, PROMPT_DATA_INJECTION_VERIFIER_RESULT_KEYS, "verification.verifier_results entry")
+        verifier = require_non_empty_string(result.get("verifier"), "verification.verifier_results.verifier")
+        assert_true(result.get("allowed") is False, "prompt injection verifier result must deny")
+        assert_true(result.get("reason") == reason, "prompt injection verifier reason must match denial reason")
+        evidence = result.get("evidence")
+        assert_true(isinstance(evidence, dict), "prompt injection verifier evidence is required")
+        require_exact_keys(evidence, PROMPT_DATA_INJECTION_VERIFIER_EVIDENCE_KEYS, "prompt injection verifier evidence")
+        assert_true(evidence.get("requested_action") == requested_name, "verifier evidence requested_action must match proposal")
+        assert_true(evidence.get("requested_adapter") == requested_adapter, "verifier evidence requested_adapter must match proposal")
+        assert_true(
+            evidence.get("requested_permissions") == requested_permissions,
+            "verifier evidence requested_permissions must match proposal",
+        )
+        allowed_actions = evidence.get("allowed_actions")
+        allowed_adapters = evidence.get("allowed_adapters")
+        allowed_permissions = evidence.get("allowed_permissions")
+        assert_true(isinstance(allowed_actions, list), "verifier evidence allowed_actions must be an array")
+        assert_true(isinstance(allowed_adapters, list), "verifier evidence allowed_adapters must be an array")
+        assert_true(isinstance(allowed_permissions, list), "verifier evidence allowed_permissions must be an array")
+        assert_true(
+            requested_name not in allowed_actions
+            or requested_adapter not in allowed_adapters
+            or any(permission not in allowed_permissions for permission in requested_permissions),
+            "prompt injection fixture must prove tenant scope did not grant the requested authority",
+        )
+        tenant_denial_seen = tenant_denial_seen or verifier in {"tenant", "tenant_policy", "agent_permission"}
+    assert_true(tenant_denial_seen, "prompt injection denial must include tenant or permission verifier evidence")
+    return reason
+
+
+def validate_prompt_gateway(data: dict[str, Any]) -> None:
+    gateway = data.get("gateway")
+    assert_true(isinstance(gateway, dict), "prompt injection gateway containment evidence is required")
+    require_exact_keys(gateway, PROMPT_DATA_INJECTION_GATEWAY_KEYS, "gateway")
+    assert_true(gateway.get("status") == "denied", "prompt injection gateway status must be denied")
+    assert_true(gateway.get("verification_ran") is True, "prompt injection verification must run")
+    assert_true(gateway.get("execution_attempted") is False, "prompt injection denial must not attempt gateway execution")
+    assert_true(gateway.get("gateway_bypassed") is False, "prompt injection payload must not bypass the gateway")
+    assert_true(gateway.get("adapter_executed") is False, "prompt injection denial must not report adapter execution")
+    adapter_count = gateway.get("adapter_invocation_count")
+    assert_true(
+        isinstance(adapter_count, int) and not isinstance(adapter_count, bool) and adapter_count == 0,
+        "prompt injection denial must keep adapter invocation count at zero",
+    )
+    assert_true(gateway.get("effect_certainty") == "none", "prompt injection denial must record effect_certainty none")
+
+
+def validate_prompt_outcome_and_side_effects(data: dict[str, Any], reason: str) -> None:
+    outcome = data.get("outcome")
+    assert_true(isinstance(outcome, dict), "prompt injection denial outcome evidence is required")
+    require_exact_keys(outcome, PROMPT_DATA_INJECTION_OUTCOME_KEYS, "outcome")
+    assert_true(outcome.get("status") == "denied", "prompt injection outcome status must be denied")
+    assert_true(outcome.get("reason") == reason, "prompt injection outcome reason must match verification reason")
+    assert_true(outcome.get("side_effect_occurred") is False, "prompt injection outcome must not report side effects")
+    side_effects = data.get("side_effects")
+    assert_true(isinstance(side_effects, dict), "prompt injection side_effects evidence is required")
+    require_exact_keys(side_effects, DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS, "prompt injection side_effects")
+    for field in sorted(DRIVER_SCHEMA_SIDE_EFFECT_COUNTERS):
+        value = side_effects.get(field)
+        assert_true(
+            isinstance(value, int) and not isinstance(value, bool) and value == 0,
+            f"prompt injection side_effects.{field} must be zero",
+        )
+
+
+def forbidden_prompt_data_injection_event_reason(kind: str) -> str | None:
+    if any(kind.startswith(prefix) for prefix in PROMPT_DATA_INJECTION_FORBIDDEN_EVENT_PREFIXES):
+        return f"prompt injection side-effect event namespace {kind} is forbidden"
+    if kind in PROMPT_DATA_INJECTION_FORBIDDEN_EVENTS or kind.endswith(".invoked"):
+        return f"prompt injection execution event {kind} is forbidden"
+    return None
+
+
+def validate_prompt_events(data: dict[str, Any]) -> None:
+    events = require_non_empty_array(data.get("events"), "prompt injection events")
+    run_id = require_non_empty_string(data.get("run_id"), "run_id")
+    tenant_id = require_non_empty_string(data.get("tenant_id"), "tenant_id")
+    agent_id = require_non_empty_string(data.get("agent_id"), "agent_id")
+    action_id = require_non_empty_string(data.get("action_id"), "action_id")
+    tick_id = data.get("tick_id")
+    assert_true(isinstance(tick_id, int) and not isinstance(tick_id, bool) and tick_id > 0, "tick_id must be a positive integer")
+    percept_ref = require_non_empty_string(data.get("malicious_percept", {}).get("provenance", {}).get("source"), "malicious_percept.provenance.source")
+    assert_true(len(events) == len(PROMPT_DATA_INJECTION_EVENT_ORDER), "prompt injection event sequence must have exactly eight denial events")
+    event_kinds: list[str] = []
+    trace_event_ids: set[str] = set()
+    for event in events:
+        assert_true(isinstance(event, dict), "prompt injection events entries must be objects")
+        require_exact_keys(event, PROMPT_DATA_INJECTION_EVENT_KEYS, "prompt injection event")
+        trace_event_id = require_non_empty_string(event.get("trace_event_id"), "prompt injection event.trace_event_id")
+        assert_true(trace_event_id not in trace_event_ids, f"duplicate trace_event_id {trace_event_id}")
+        trace_event_ids.add(trace_event_id)
+        kind = require_non_empty_string(event.get("kind"), "prompt injection event.kind")
+        forbidden_reason = forbidden_prompt_data_injection_event_reason(kind)
+        assert_true(forbidden_reason is None, str(forbidden_reason))
+        assert_true(kind in PROMPT_DATA_INJECTION_REQUIRED_EVENTS, f"prompt injection event kind {kind} is not allowed")
+        event_kinds.append(kind)
+        identity = event.get("identity")
+        assert_true(isinstance(identity, dict), "prompt injection event identity is required")
+        require_exact_keys(identity, PROMPT_DATA_INJECTION_EVENT_IDENTITY_KEYS, "prompt injection event identity")
+        assert_true(identity.get("run_id") == run_id, "prompt injection event run_id mismatch")
+        assert_true(identity.get("tenant_id") == tenant_id, "prompt injection event tenant_id mismatch")
+        assert_true(identity.get("agent_id") == agent_id, "prompt injection event agent_id mismatch")
+        assert_true(identity.get("action_id") == action_id, "prompt injection event action_id mismatch")
+        assert_true(identity.get("tick_id") == tick_id, "prompt injection event tick_id mismatch")
+        assert_true(identity.get("percept_ref") == percept_ref, "prompt injection event percept_ref mismatch")
+        require_non_empty_string(event.get("evidence_ref"), "prompt injection event.evidence_ref")
+    assert_true(
+        event_kinds == PROMPT_DATA_INJECTION_EVENT_ORDER,
+        f"prompt injection event sequence mismatch: expected {', '.join(PROMPT_DATA_INJECTION_EVENT_ORDER)}",
+    )
+
+
+def validate_prompt_data_injection(config: dict[str, Any]) -> None:
+    data = load_prompt_data_injection_fixture(config)
+    require_exact_keys(data, PROMPT_DATA_INJECTION_TOP_LEVEL_KEYS, "prompt injection fixture")
+    assert_true(data.get("schema_version") == PROMPT_DATA_INJECTION_SCHEMA_VERSION, "prompt injection fixture schema_version mismatch")
+    assert_true(data.get("task_id") == "FND-011", "prompt injection fixture task_id must be FND-011")
+    assert_true(data.get("gold_id") == "G80", "prompt injection fixture gold_id must be G80")
+    assert_true(
+        data.get("evidence_scope") == PROMPT_DATA_INJECTION_EVIDENCE_SCOPE,
+        "prompt injection fixture evidence_scope mismatch",
+    )
+    require_non_empty_string(data.get("description"), "description")
+    require_non_empty_string(data.get("tenant_id"), "tenant_id")
+    require_non_empty_string(data.get("agent_id"), "agent_id")
+    require_non_empty_string(data.get("run_id"), "run_id")
+    require_non_empty_string(data.get("action_id"), "action_id")
+    require_non_empty_string(data.get("adapter_id"), "adapter_id")
+    assert_true(isinstance(data.get("tick_id"), int) and not isinstance(data.get("tick_id"), bool), "tick_id must be an integer")
+    non_claim_values = data.get("non_claims")
+    assert_true(isinstance(non_claim_values, list), "prompt injection fixture non_claims must be an array")
+    non_claims = {require_non_empty_string(non_claim, "prompt injection fixture non_claim") for non_claim in non_claim_values}
+    missing_non_claims = sorted(PROMPT_DATA_INJECTION_NON_CLAIMS - non_claims)
+    assert_true(not missing_non_claims, f"prompt injection fixture non_claims missing: {', '.join(missing_non_claims)}")
+
+    requested_name, requested_adapter, requested_permissions = validate_prompt_malicious_percept(data)
+    assert_true(data.get("adapter_id") == requested_adapter, "adapter_id must match malicious requested adapter")
+    validate_prompt_policy_proposal(data, requested_name, requested_adapter, requested_permissions)
+    reason = validate_prompt_verification(data, requested_name, requested_adapter, requested_permissions)
+    validate_prompt_gateway(data)
+    validate_prompt_outcome_and_side_effects(data, reason)
+    validate_prompt_events(data)
+
+
 def require_positive_number(value: Any, label: str) -> None:
     assert_true(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0, f"{label} must be positive")
 
@@ -1180,6 +1533,8 @@ def validate_case(case: dict[str, Any]) -> None:
         validate_security_invariants(case["security_invariants"])
     elif primitive == "driver_schema_confusion":
         validate_driver_schema_confusion(case["driver_schema_confusion"])
+    elif primitive == "prompt_data_injection":
+        validate_prompt_data_injection(case["prompt_data_injection"])
     elif primitive == "performance_budgets":
         validate_performance_budgets(case["performance_budgets"])
     else:

@@ -461,6 +461,51 @@
       "security_invariants": { "path": "conformance/0.1/fixtures/security-invariants-skipped-negative.json" }
     },
     {
+      "case_id": "prompt-data-injection-g80-denial",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-PROMPT-DATA-INJECTION-DENIAL",
+      "path": "denial",
+      "description": "Partial G80 evidence: malicious perceptor payload authority fields remain data, a naive policy proposes the requested unauthorized side-effect action, and tenant/gateway verification denies before adapter execution.",
+      "report_message": "partial FND-011 G80 prompt/data-injection denial v0: payload authority fields remain non-authorizing and denial occurs before execution; no G80 gold pass or full G80-G89 pass claimed",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-g80-denial.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-executed-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-NO-EXECUTION-AFTER-INJECTION-DENIAL",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves prompt/data-injection denial evidence is rejected if it still reports adapter execution.",
+      "expected_failure": "prompt injection denial must not report adapter execution",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-executed-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-side-effect-event-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-EVENT-ALLOWLIST",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves side-effect event namespaces such as filesystem.write are rejected in prompt/data-injection denial evidence.",
+      "expected_failure": "prompt injection side-effect event namespace filesystem.write is forbidden",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-side-effect-event-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-empty-side-effects-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-SIDE-EFFECT-COUNTERS-REQUIRED",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves prompt/data-injection denial evidence must include exact zero side-effect counters.",
+      "expected_failure": "prompt injection side_effects missing keys",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-empty-side-effects-negative.json" }
+    },
+    {
+      "case_id": "prompt-data-injection-non-claims-object-negative-fixture",
+      "primitive": "prompt_data_injection",
+      "requirement": "CONF-0.2-FND-011-G80-NON-CLAIMS-SHAPE",
+      "path": "negative_fixture",
+      "description": "Negative fixture proves G80 non_claims must be an array rather than an object whose keys resemble non-claim labels.",
+      "expected_failure": "prompt injection fixture non_claims must be an array",
+      "prompt_data_injection": { "path": "conformance/0.1/fixtures/prompt-data-injection-non-claims-object-negative.json" }
+    },
+    {
       "case_id": "driver-schema-confusion-g86-denial",
       "primitive": "driver_schema_confusion",
       "requirement": "CONF-0.2-FND-011-G86-SCHEMA-MISMATCH-DENIAL",

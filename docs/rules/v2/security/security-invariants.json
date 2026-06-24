@@ -79,7 +79,7 @@
       "fail_closed_decision": "deny",
       "enforcement": {
         "enforcing_component": "agent route runtime with authority and gateway verifiers",
-        "required_events": ["percepts.received", "route.input.tainted", "authorization.denied", "action.denied"],
+        "required_events": ["percepts.received", "route.input.tainted", "actions.proposed", "verification.started", "authorization.denied", "verification.completed", "action.denied", "outcome.recorded"],
         "evidence_links": ["percept_provenance_ref", "capability_decision_ref", "gateway_denial_event"],
         "containment_actions": ["deny_request", "record_incident"]
       },
@@ -88,7 +88,7 @@
       "maturity_gate": {
         "conformant_required": true,
         "case_status": "mapped_not_exercised",
-        "non_claim": "mapping only; G80 remains not exercised until an adversarial route/gateway harness passes"
+        "non_claim": "partial Python runtime and conformance denial evidence exists for payload-smuggled authority fields; G80 remains mapped_not_exercised until a full adversarial route/gateway harness covers taint/capability separation and runtime integration"
       }
     },
     {
