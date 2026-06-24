@@ -4,7 +4,7 @@
   "sprint": "V2-FND-0",
   "aggregate_issue": 180,
   "status": "foundation_ready_for_c01",
-  "non_claims": ["no_fnd_full_validation", "no_fnd_001_012_completion_claim", "no_gold_pass_claim", "no_c01_implementation", "no_principal_registry_service"],
+  "non_claims": ["no_fnd_full_validation", "no_fnd_001_012_completion_claim", "no_gold_pass_claim", "no_c01_implementation", "no_principal_registry_service", "no_accepted_principal_registry_rfc_claim"],
   "exit_gate_coverage": {
     "schema_compatibility": { "status": "foundation_ready", "evidence_paths": ["docs/spec/0.1/schema-versioning.md"] },
     "non_authorizing_extensions": { "status": "foundation_ready", "evidence_paths": ["crates/splendor-types/src/schema_extensions.rs"] },

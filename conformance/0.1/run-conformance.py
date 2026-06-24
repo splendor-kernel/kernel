@@ -346,12 +346,28 @@ REQUIRED_PERFORMANCE_GOLD_IDS = {"G29", "G66", "G68", "G74"}
 FOUNDATION_READINESS_SCHEMA_VERSION = "splendor.v2_foundation_readiness.v1"
 FOUNDATION_READINESS_STATUS = "foundation_ready_for_c01"
 REQUIRED_FOUNDATION_TASKS = {f"FND-{index:03d}" for index in range(1, 13)}
+FOUNDATION_TASK_ISSUES = {f"FND-{index:03d}": 219 + index for index in range(1, 13)}
+FOUNDATION_TASK_GOLD_IDS = {
+    "FND-001": {"G00"},
+    "FND-002": {"G00"},
+    "FND-003": {"G02", "G04", "G15", "G47", "G75", "G87"},
+    "FND-004": {"G04", "G07", "G87"},
+    "FND-005": {"G07"},
+    "FND-006": {"G00", "G72"},
+    "FND-007": {"G01", "G27", "G40", "G78", "G79", "G80"},
+    "FND-008": {"G03", "G39", "G42", "G52", "G64"},
+    "FND-009": {"G08", "G35", "G82", "G84"},
+    "FND-010": {"G00", "G06"},
+    "FND-011": {"G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"},
+    "FND-012": {"G29", "G66", "G68", "G74"},
+}
 REQUIRED_FOUNDATION_NON_CLAIMS = {
     "no_fnd_full_validation",
     "no_fnd_001_012_completion_claim",
     "no_gold_pass_claim",
     "no_c01_implementation",
     "no_principal_registry_service",
+    "no_accepted_principal_registry_rfc_claim",
 }
 FOUNDATION_READINESS_TOP_LEVEL_KEYS = {
     "aggregate_issue",
@@ -1448,7 +1464,10 @@ def validate_foundation_readiness_record(record: Any) -> str:
     task_id = require_non_empty_string(record.get("task_id"), "foundation.task_id")
     assert_true(task_id in REQUIRED_FOUNDATION_TASKS, f"unknown foundation task {task_id}")
     issue = record.get("issue")
-    assert_true(isinstance(issue, int) and not isinstance(issue, bool) and 220 <= issue <= 231, f"foundation {task_id} issue must be a FND issue number")
+    assert_true(
+        isinstance(issue, int) and not isinstance(issue, bool) and issue == FOUNDATION_TASK_ISSUES[task_id],
+        f"foundation {task_id} issue must be {FOUNDATION_TASK_ISSUES[task_id]}",
+    )
     assert_true(record.get("foundation_status") == "foundation_ready", f"foundation {task_id} status must be foundation_ready")
     assert_true(record.get("gold_status") == "not_exercised", f"foundation {task_id} gold_status must remain not_exercised")
     evidence_paths = require_non_empty_array(record.get("evidence_paths"), f"foundation {task_id} evidence_paths")
@@ -1457,9 +1476,11 @@ def validate_foundation_readiness_record(record: Any) -> str:
     remaining_validation = require_non_empty_array(record.get("remaining_validation"), f"foundation {task_id} remaining_validation")
     for item in remaining_validation:
         require_non_empty_string(item, f"foundation {task_id} remaining_validation")
-    gold_ids = require_non_empty_array(record.get("gold_ids"), f"foundation {task_id} gold_ids")
-    for gold_id in gold_ids:
-        require_non_empty_string(gold_id, f"foundation {task_id} gold_ids")
+    gold_ids = {require_non_empty_string(gold_id, f"foundation {task_id} gold_ids") for gold_id in require_non_empty_array(record.get("gold_ids"), f"foundation {task_id} gold_ids")}
+    assert_true(
+        gold_ids == FOUNDATION_TASK_GOLD_IDS[task_id],
+        f"foundation {task_id} gold_ids must be {', '.join(sorted(FOUNDATION_TASK_GOLD_IDS[task_id]))}",
+    )
     non_claims = set(require_non_empty_array(record.get("non_claims"), f"foundation {task_id} non_claims"))
     for non_claim in non_claims:
         require_non_empty_string(non_claim, f"foundation {task_id} non_claims")
@@ -1494,8 +1515,10 @@ def validate_c01_readiness(readiness: Any) -> None:
         "C01 full implementation must remain blocked until the Principal Registry RFC is accepted",
     )
     allowed_next_work = {require_non_empty_string(item, "c01_readiness.allowed_next_work") for item in require_non_empty_array(readiness.get("allowed_next_work"), "c01_readiness.allowed_next_work")}
-    missing_tasks = sorted(REQUIRED_C01_TASKS - allowed_next_work)
-    assert_true(not missing_tasks, f"c01_readiness missing IDR tasks: {', '.join(missing_tasks)}")
+    assert_true(
+        allowed_next_work == REQUIRED_C01_TASKS,
+        f"c01_readiness.allowed_next_work must be exactly {', '.join(sorted(REQUIRED_C01_TASKS))}",
+    )
     dependencies = {require_non_empty_string(item, "c01_readiness.required_fnd_dependencies") for item in require_non_empty_array(readiness.get("required_fnd_dependencies"), "c01_readiness.required_fnd_dependencies")}
     missing_deps = sorted(REQUIRED_C01_FND_DEPENDENCIES - dependencies)
     assert_true(not missing_deps, f"c01_readiness missing FND dependencies: {', '.join(missing_deps)}")
@@ -1508,10 +1531,17 @@ def validate_c01_readiness(readiness: Any) -> None:
     non_claims = {require_non_empty_string(item, "c01_readiness.non_claims") for item in require_non_empty_array(readiness.get("non_claims"), "c01_readiness.non_claims")}
     assert_true("no_c01_implementation" in non_claims, "c01_readiness must not claim C01 implementation")
     assert_true("no_principal_registry_service" in non_claims, "c01_readiness must not claim a Principal Registry service")
+    assert_true(
+        "no_accepted_principal_registry_rfc_claim" in non_claims,
+        "c01_readiness must not claim the Principal Registry RFC is accepted",
+    )
 
 
 def validate_foundation_readiness(config: dict[str, Any]) -> None:
-    path = ROOT / config.get("path", FOUNDATION_READINESS_PATH.relative_to(ROOT))
+    path = require_existing_relative_path(
+        config.get("path", str(FOUNDATION_READINESS_PATH.relative_to(ROOT))),
+        "foundation_readiness.path",
+    )
     data = load_json(path)
     require_exact_keys(data, FOUNDATION_READINESS_TOP_LEVEL_KEYS, "foundation readiness fixture")
     assert_true(data.get("schema_version") == FOUNDATION_READINESS_SCHEMA_VERSION, "foundation readiness schema_version mismatch")
