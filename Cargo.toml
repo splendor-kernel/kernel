@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/splendor-types",
+    "crates/splendor-authority",
     "crates/splendor-kernel",
     "crates/splendor-gateway",
     "crates/splendor-store",

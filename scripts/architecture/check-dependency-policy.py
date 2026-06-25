@@ -27,6 +27,7 @@ from typing import Any, Iterable
 ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
     "splendor-types": set(),
     "splendor-store": {"splendor-types"},
+    "splendor-authority": {"splendor-types", "splendor-store"},
     "splendor-gateway": {"splendor-types"},
     "splendor-kernel": {
         "splendor-types",
@@ -56,6 +57,7 @@ CHECKED_DEP_KINDS = {None, "build"}
 RULE_NOTES: dict[str, str] = {
     "splendor-types": "splendor-types is behavior-free canonical IDs/schemas; it must not depend on other internal packages.",
     "splendor-store": "splendor-store is persistence-only; current baseline allows only splendor-types directly.",
+    "splendor-authority": "RFC 0009 / IDR-001 allows splendor-authority to own identity lifecycle decisions over types and storage-only registry persistence.",
     "splendor-gateway": "splendor-gateway is the action/driver boundary; current baseline allows only splendor-types directly.",
     "splendor-kernel": "splendor-kernel is the compatibility composition root; current baseline allows only types/store/gateway directly.",
     "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> kernel/store/gateway/types composition seam only.",

@@ -1,12 +1,12 @@
 //! # Kernel Identifiers
 //!
 //! Stable identifiers for Splendor kernel entities. These identifiers are
-//! intentionally distinct types so fleet, node, instance, tenant, agent, run,
-//! tick, action, state, trace, and message identities cannot be interchanged by
-//! accident. UUID-backed IDs provide predictable formatting and deterministic
-//! derivation where required (for example, trace events use a stable UUID
-//! derived from the run ID and sequence number). State node IDs remain
-//! content-addressed.
+//! intentionally distinct types so principal, fleet, node, instance, tenant,
+//! agent, run, tick, action, state, trace, and message identities cannot be
+//! interchanged by accident. UUID-backed IDs provide predictable formatting and
+//! deterministic derivation where required (for example, trace events use a
+//! stable UUID derived from the run ID and sequence number). State node IDs
+//! remain content-addressed.
 //!
 //! ## Example
 //! ```rust,no_run
@@ -83,6 +83,21 @@ macro_rules! uuid_id {
             }
         }
     };
+}
+
+uuid_id! {
+    /// Unique identifier for a registry principal identity.
+    PrincipalId
+}
+
+uuid_id! {
+    /// Unique identifier for an immutable principal lifecycle event.
+    IdentityEventId
+}
+
+uuid_id! {
+    /// Unique identifier for a proof reference bound to a principal.
+    PrincipalProofRefId
 }
 
 uuid_id! {
@@ -568,6 +583,9 @@ macro_rules! impl_uuid_identity {
 }
 
 impl_uuid_identity!(
+    PrincipalId,
+    IdentityEventId,
+    PrincipalProofRefId,
     FleetId,
     NodeId,
     InstanceId,
