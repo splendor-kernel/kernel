@@ -42,6 +42,7 @@ mod failure_taxonomy;
 mod fleet_telemetry;
 mod governance;
 mod hash;
+mod identity;
 mod ids;
 mod message;
 mod node_registry;
@@ -119,11 +120,15 @@ pub use governance::{
     KillSwitch, KillSwitchStatus, CIRCUIT_BREAKER_SCHEMA_VERSION, GOVERNANCE_STATE_SCHEMA_VERSION,
 };
 pub use hash::{ContentHash, HashAlgorithm};
+pub use identity::{
+    IdentityLifecycleEvent, IdentityLifecycleEventKind, IdentityRevision, Principal,
+    PrincipalBinding, PrincipalDisplay, PrincipalKind, PrincipalProofRef, PrincipalStatus,
+};
 pub use ids::{
-    ActionId, AgentId, ApprovalId, CircuitBreakerId, EscalationId, FleetId,
-    IdentityValidationError, InstanceId, InterventionId, KillSwitchId, MessageId, NodeId, RunId,
-    RuntimeIdentityContext, SnapshotId, StateNodeId, TenantId, TickId, TraceEventId, TraceId,
-    TraceIdentityContext, WorkOrderId, WorkOrderIdError,
+    ActionId, AgentId, ApprovalId, CircuitBreakerId, EscalationId, FleetId, IdentityEventId,
+    IdentityValidationError, InstanceId, InterventionId, KillSwitchId, MessageId, NodeId,
+    PrincipalId, PrincipalProofRefId, RunId, RuntimeIdentityContext, SnapshotId, StateNodeId,
+    TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext, WorkOrderId, WorkOrderIdError,
 };
 pub use message::{
     DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope, MessageSchemaVersion,

@@ -1084,6 +1084,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "splendor-authority"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "splendor-store",
+ "splendor-types",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "splendor-bindings"
 version = "0.1.0"
 dependencies = [

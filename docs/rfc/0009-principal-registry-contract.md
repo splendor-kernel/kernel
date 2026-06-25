@@ -2,25 +2,30 @@
 
 ## Status and Scope
 
-Status: Draft.
+Status: Draft, with a bounded local `IDR-001` implementation evidence slice
+allowed when it preserves the non-claims below.
 
 Scope: 0.2/v2 Principal Registry child RFC for C01,
-`splendor.identity-registry`. This RFC is contract and planning work only. It is
-not implementation evidence, does not change current runtime behavior, and does
-not change stable 0.1 schemas, daemon APIs, OpenAPI schemas, SDKs, generated
-artifacts, Action Gateway behavior, verifier behavior, trace formats, state
-formats, replay semantics, work-order validation, node registration behavior, or
-runtime permission enforcement.
+`splendor.identity-registry`. This RFC remains a Draft contract. This repository
+branch includes only a bounded local `IDR-001` Rust evidence slice: behavior-free
+principal contracts in `splendor-types`, an in-memory storage/CAS seam in
+`splendor-store`, and lifecycle decisions in `splendor-authority`. That local
+slice does not change stable 0.1 schemas, daemon APIs, OpenAPI schemas, SDKs,
+generated artifacts, Action Gateway behavior, verifier behavior, trace formats,
+state formats, replay semantics, work-order validation, node registration
+behavior, or runtime permission enforcement.
 
-Acceptance of this RFC is required before implementing or claiming a stable
-Principal Registry service, proof-verifier adapter contract, revocation
-propagation service, or migration mode. Until executable implementation evidence
-exists, all C01 gold targets remain `not_exercised`.
+Acceptance of this RFC is required before implementing or claiming a stable,
+durable, daemon-integrated Principal Registry service, proof-verifier adapter
+contract, revocation propagation service, or migration mode. Bounded local
+`IDR-001` slices may implement Rust contracts, storage seams, and lifecycle
+tests as experimental evidence only. Until exact executable gold fixtures pass,
+all C01 gold targets remain `not_exercised`.
 
 This RFC preserves the non-claims in
-`docs/rules/v2/foundation-readiness.md`. It does not claim C01 implementation,
-`IDR-001` completion, issue closure, accepted child-RFC status, or any gold pass
-status.
+`docs/rules/v2/foundation-readiness.md`. It does not claim full C01
+implementation, full `IDR-001` completion, issue closure, a stable production
+Principal Registry service, or any gold pass status.
 
 This RFC is the Principal Registry child-RFC draft for the older RFC 0008 / #152
 gate. Current implementation tracking remains the C01 aggregate #181 and child
@@ -31,11 +36,11 @@ task issues #232 through #237.
 | Item | Binding in this RFC | Evidence status |
 | --- | --- | --- |
 | Aggregate issue | #181, `0.2/v2 component: C01 splendor.identity-registry - Identity Registry` | Contract target only; not closed by this RFC. |
-| Child issues | #232 `IDR-001`, #233 `IDR-002`, #234 `IDR-003`, #235 `IDR-004`, #236 `IDR-005`, #237 `IDR-006` | Future implementation targets only. |
+| Child issues | #232 `IDR-001`, #233 `IDR-002`, #234 `IDR-003`, #235 `IDR-004`, #236 `IDR-005`, #237 `IDR-006` | #232 has bounded local evidence only; no child issue is complete. |
 | Sprint | `V2-IA-1 - Principal Registry` | RFC prerequisite target only. |
 | FR bridge | `FR-0.2-02`: identity, authority, secret-reference, and data-use controls without widening tenant, agent, run, or gateway authority | This RFC covers identity registry planning only. |
 | Component | `splendor.identity-registry` | Contract target only. |
-| Owner packages | `splendor-types` for behavior-free contracts, `splendor-authority` for registry lifecycle decisions, `splendor-store` for persistence/CAS only | Proposed implementation ownership; no crate or code change here. |
+| Owner packages | `splendor-types` for behavior-free contracts, `splendor-authority` for registry lifecycle decisions, `splendor-store` for persistence/CAS only | Current bounded local slice follows this ownership; stable durable service remains future work. |
 | Gold targets | `G00`, `G01`, `G03`, `G43`, `G60`, `G73`, `G74`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
 
 ## Motivation
@@ -128,8 +133,10 @@ or policy TTL.
 
 ## Principal Contract
 
-These records are proposed contracts for future implementation. They are not
-current Rust, Python, TypeScript, OpenAPI, daemon, store, or trace schemas.
+These records are the bounded local Rust contracts for this experimental
+`IDR-001` slice where implemented in `splendor-types`. They are not stable
+Python, TypeScript, OpenAPI, daemon, store-durability, event-log, or trace
+schemas.
 
 ### `PrincipalId`
 
@@ -420,12 +427,13 @@ Rules:
 
 ## Integration Plan by IDR Task
 
-This section maps catalog tasks to future implementation slices. It does not
-claim implementation of any task.
+This section maps catalog tasks to implementation slices. The current branch
+implements only a bounded local `IDR-001` contract/lifecycle/storage evidence
+slice. It does not claim full implementation of any task.
 
 | Task | Future implementation plan | Anti-drift constraints | Required future evidence |
 | --- | --- | --- | --- |
-| `IDR-001` | Add behavior-free principal contracts, lifecycle state machine in `splendor-authority`, store history/current-pointer CAS, and typed binding compatibility helpers. | No permissions/data-use/secret refs in metadata; no ID collapse; no display/external subject as stable key. | Principal kind registration, lifecycle transitions, proof rotation, suspension, revocation, duplicate binding rejection, nil-ID rejection, CAS failure behavior. |
+| `IDR-001` | Current bounded local slice adds behavior-free principal contracts, lifecycle state machine in `splendor-authority`, store history/current-pointer CAS, and typed binding compatibility helpers. | No permissions/data-use/secret refs in metadata; no ID collapse; no display/external subject as stable key; no daemon/auth/gateway/work-order integration. | Local tests cover principal kind registration, lifecycle transitions, proof rotation, suspension, revocation, duplicate binding rejection, nil-ID rejection, reserved metadata rejection, credential-like proof-material rejection, and CAS failure behavior. Event Log integration, Authority Service input wiring, and G01/G60 registry-backed evidence remain future work. |
 | `IDR-002` | Add provider-neutral proof verifier and authenticated-principal contracts, then local Unix peer and test mTLS verifiers before optional external adapters. | No OAuth/PKI product in kernel; no bearer strings from action params/prompts; TLS success is authentication only. | Wrong audience, issuer, subject, expired proof, rotated key, revoked principal, stale proof cache, local insecure-mode restrictions. |
 | `IDR-003` | Add node and physical-device ownership/attestation lifecycle using node/instance/device principals and compatibility with existing registration records. | No identity from IP, Kubernetes node name, or serial text alone; no cloud override of local emergency stop; sensor identity is not actuator authority. | Node reimage/new binding, stale lease fencing, quarantine, device/node separation, physical-safety local-veto evidence. |
 | `IDR-004` | Add human and governance-principal lifecycle for approvals, annotations, overrides, and value changes. | No raw biometrics or unnecessary provider payloads; group membership alone grants no capability; self-approval forbidden where policy forbids it. | Two-person value-change denial, stale membership denial, pseudonymous annotation auditability, separation-of-duty evidence. |
@@ -540,9 +548,11 @@ Compatibility with work orders and gateway:
 
 ## Validation Matrix
 
-This RFC itself requires no runtime tests beyond repository validation for a
-docs-only change. Future implementation must provide executable evidence before
-changing any gold status from `not_exercised`.
+This Draft RFC previously required only repository validation as a docs-only
+change. The bounded local `IDR-001` Rust slice in this branch requires the local
+unit, architecture, workspace, and conformance commands listed below. Future
+integration beyond this slice must provide executable evidence before changing
+any gold status from `not_exercised`.
 
 | Area | Required future validation | Gold target status |
 | --- | --- | --- |
