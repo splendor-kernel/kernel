@@ -640,10 +640,7 @@ fn validate_evidence_ref(value: &str) -> Result<(), IdentityRegistryError> {
 }
 
 fn contains_credential_material(value: &str) -> bool {
-    let normalized = value
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .replace(' ', "_");
+    let normalized = value.to_ascii_lowercase().replace(['-', ' '], "_");
     CREDENTIAL_MATERIAL_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))

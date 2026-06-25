@@ -8,6 +8,8 @@ const REGISTRATION_DIGEST: &str =
 const ROTATED_DIGEST: &str =
     "blake3:2222222222222222222222222222222222222222222222222222222222222222";
 
+type CommandMutation = Box<dyn FnOnce(&mut RegisterPrincipal)>;
+
 fn registry() -> IdentityRegistry<InMemoryPrincipalRegistryStore> {
     IdentityRegistry::new(InMemoryPrincipalRegistryStore::default())
 }
@@ -212,7 +214,7 @@ fn identity_proof_rotation_increments_revision_and_records_redacted_event() {
 
 #[test]
 fn identity_rejects_credential_like_proof_material_without_pointer_movement() {
-    let cases: Vec<Box<dyn FnOnce(&mut RegisterPrincipal)>> = vec![
+    let cases: Vec<CommandMutation> = vec![
         Box::new(|command| command.proof_refs[0].proof_digest = "Bearer secret-token".to_string()),
         Box::new(|command| command.proof_refs[0].digest_algorithm = "md5".to_string()),
         Box::new(|command| command.proof_refs[0].proof_digest = "blake3:not-hex".to_string()),
@@ -249,7 +251,7 @@ fn identity_rejects_credential_like_proof_material_without_pointer_movement() {
 
 #[test]
 fn identity_rejects_credential_like_persisted_fields_without_pointer_movement() {
-    let cases: Vec<Box<dyn FnOnce(&mut RegisterPrincipal)>> = vec![
+    let cases: Vec<CommandMutation> = vec![
         Box::new(|command| {
             command
                 .metadata
