@@ -55,6 +55,10 @@ fn grant(
     }
 }
 
+fn validated(grant: CapabilityGrant) -> ValidatedCapabilityGrant {
+    unchecked_validated_grant_for_tests(grant)
+}
+
 fn capability_request(
     subject: PrincipalId,
     operation: AuthorityOperation,
@@ -80,6 +84,83 @@ fn data_operation(verb: AuthorityVerb) -> AuthorityOperation {
         verb,
         name: None,
         resource_schema_version: Some("splendor.data_use.v1".to_string()),
+    }
+}
+
+fn network_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Network,
+        resource_kind: AuthorityResourceKind::Network,
+        verb: AuthorityVerb::Egress,
+        name: None,
+        resource_schema_version: Some("splendor.network_egress.v1".to_string()),
+    }
+}
+
+fn device_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Device,
+        resource_kind: AuthorityResourceKind::Device,
+        verb: AuthorityVerb::Actuate,
+        name: None,
+        resource_schema_version: Some("splendor.device_action.v1".to_string()),
+    }
+}
+
+fn artifact_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Artifact,
+        resource_kind: AuthorityResourceKind::Artifact,
+        verb: AuthorityVerb::Publish,
+        name: None,
+        resource_schema_version: Some("splendor.artifact.v1".to_string()),
+    }
+}
+
+fn state_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::State,
+        resource_kind: AuthorityResourceKind::StatePartition,
+        verb: AuthorityVerb::Read,
+        name: None,
+        resource_schema_version: Some("splendor.state_partition.v1".to_string()),
+    }
+}
+
+fn driver_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Driver,
+        resource_kind: AuthorityResourceKind::DriverOperation,
+        verb: AuthorityVerb::Invoke,
+        name: Some("artifact-store.create".to_string()),
+        resource_schema_version: Some("splendor.driver_operation.v1".to_string()),
+    }
+}
+
+fn workload_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Workload,
+        resource_kind: AuthorityResourceKind::Workload,
+        verb: AuthorityVerb::Admit,
+        name: None,
+        resource_schema_version: Some("splendor.workload.v1".to_string()),
+    }
+}
+
+fn agent_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Agent,
+        resource_kind: AuthorityResourceKind::Agent,
+        verb: AuthorityVerb::Invoke,
+        name: None,
+        resource_schema_version: Some("splendor.agent.v1".to_string()),
     }
 }
 
@@ -169,6 +250,31 @@ struct NarrowingCase {
     mutate: fn(&mut CapabilityGrant),
 }
 
+fn assert_scope_denied_for_operation(
+    operation: AuthorityOperation,
+    scope: CapabilityScope,
+    expected_reason: &str,
+) {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let grant = grant(
+        issuer,
+        subject.clone(),
+        operation.clone(),
+        scope.clone(),
+        now,
+    );
+    let request = capability_request(subject, operation, scope, now);
+    let decision = evaluate_capability_request(&[validated(grant)], &request, now);
+    assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
+    assert!(
+        decision.reasons.contains(&expected_reason.to_string()),
+        "expected {expected_reason}, got {:?}",
+        decision.reasons
+    );
+}
+
 #[test]
 fn authority_allows_matching_grant_and_returns_obligations() {
     let now = OffsetDateTime::now_utc();
@@ -196,7 +302,7 @@ fn authority_allows_matching_grant_and_returns_obligations() {
         now,
     );
 
-    let decision = evaluate_capability_request(&[grant.clone()], &request, now);
+    let decision = evaluate_capability_request(&[validated(grant.clone())], &request, now);
 
     assert_eq!(decision.status, AuthorityDecisionStatus::Allowed);
     assert_eq!(decision.reasons, vec!["capability_allowed"]);
@@ -231,7 +337,7 @@ fn authority_missing_expired_revoked_wrong_audience_and_unvalidated_grants_deny(
         now,
     );
     expired.expires_at = now - time::Duration::seconds(1);
-    let expired_decision = evaluate_capability_request(&[expired], &request, now);
+    let expired_decision = evaluate_capability_request(&[validated(expired)], &request, now);
     assert!(expired_decision
         .reasons
         .contains(&"expired_grant".to_string()));
@@ -246,7 +352,7 @@ fn authority_missing_expired_revoked_wrong_audience_and_unvalidated_grants_deny(
     revoked.revocation = RevocationStatus::Revoked {
         reason: "test_revocation".to_string(),
     };
-    let revoked_decision = evaluate_capability_request(&[revoked], &request, now);
+    let revoked_decision = evaluate_capability_request(&[validated(revoked)], &request, now);
     assert!(revoked_decision
         .reasons
         .contains(&"revoked_grant".to_string()));
@@ -266,8 +372,11 @@ fn authority_missing_expired_revoked_wrong_audience_and_unvalidated_grants_deny(
         scope.clone(),
         now,
     );
-    let wrong_audience_decision =
-        evaluate_capability_request(&[wrong_audience_grant], &wrong_audience_request, now);
+    let wrong_audience_decision = evaluate_capability_request(
+        &[validated(wrong_audience_grant)],
+        &wrong_audience_request,
+        now,
+    );
     assert!(wrong_audience_decision
         .reasons
         .contains(&"audience_not_granted".to_string()));
@@ -276,14 +385,62 @@ fn authority_missing_expired_revoked_wrong_audience_and_unvalidated_grants_deny(
         issuer,
         subject,
         gateway_action_operation("artifact.create"),
-        scope,
+        scope.clone(),
         now,
     );
     unvalidated.validation = None;
-    let unvalidated_decision = evaluate_capability_request(&[unvalidated], &request, now);
+    let unvalidated_decision =
+        evaluate_capability_request(&[validated(unvalidated)], &request, now);
     assert!(unvalidated_decision
         .reasons
         .contains(&"invalid_validation:missing_grant_validation".to_string()));
+
+    let mut not_yet_valid = grant(
+        PrincipalId::new(),
+        request.subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    not_yet_valid.not_before = now + time::Duration::minutes(1);
+    not_yet_valid.expires_at = now + time::Duration::minutes(30);
+    let not_yet_valid_decision =
+        evaluate_capability_request(&[validated(not_yet_valid)], &request, now);
+    assert!(not_yet_valid_decision
+        .reasons
+        .contains(&"grant_not_yet_valid".to_string()));
+
+    let wrong_subject = grant(
+        PrincipalId::new(),
+        PrincipalId::new(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    let wrong_subject_decision =
+        evaluate_capability_request(&[validated(wrong_subject)], &request, now);
+    assert!(wrong_subject_decision
+        .reasons
+        .contains(&"subject_mismatch".to_string()));
+
+    let mut signed = grant(
+        PrincipalId::new(),
+        request.subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope,
+        now,
+    );
+    signed.validation = Some(CapabilityGrantValidation {
+        validation_kind: CapabilityGrantValidationKind::Signed,
+        algorithm: "dummy-ed25519".to_string(),
+        key_id: Some("test-key".to_string()),
+        digest: DIGEST.to_string(),
+        signature: Some("not-a-real-signature".to_string()),
+    });
+    let signed_decision = evaluate_capability_request(&[validated(signed)], &request, now);
+    assert!(signed_decision
+        .reasons
+        .contains(&"invalid_validation:signed_grant_verifier_unavailable".to_string()));
 }
 
 #[test]
@@ -309,7 +466,8 @@ fn authority_requires_audience_and_concrete_scope_binding_for_authorization() {
     );
     let unbound_request =
         capability_request(subject.clone(), operation.clone(), unbound_scope, now);
-    let unbound_decision = evaluate_capability_request(&[unbound_grant], &unbound_request, now);
+    let unbound_decision =
+        evaluate_capability_request(&[validated(unbound_grant)], &unbound_request, now);
     assert_eq!(unbound_decision.status, AuthorityDecisionStatus::Denied);
     assert!(unbound_decision
         .reasons
@@ -331,8 +489,11 @@ fn authority_requires_audience_and_concrete_scope_binding_for_authorization() {
         grant_scope.clone(),
         now,
     );
-    let request_missing_audience_decision =
-        evaluate_capability_request(&[valid_grant.clone()], &request_missing_audience, now);
+    let request_missing_audience_decision = evaluate_capability_request(
+        &[validated(valid_grant.clone())],
+        &request_missing_audience,
+        now,
+    );
     assert!(request_missing_audience_decision
         .reasons
         .contains(&"invalid_scope:capability_request.scope:missing_audience_binding".to_string()));
@@ -349,7 +510,7 @@ fn authority_requires_audience_and_concrete_scope_binding_for_authorization() {
     let valid_request =
         capability_request(subject.clone(), operation.clone(), grant_scope.clone(), now);
     let grant_missing_audience_decision =
-        evaluate_capability_request(&[grant_missing_audience], &valid_request, now);
+        evaluate_capability_request(&[validated(grant_missing_audience)], &valid_request, now);
     assert!(grant_missing_audience_decision
         .reasons
         .contains(&"invalid_scope:capability_grant.scope:missing_audience_binding".to_string()));
@@ -369,7 +530,7 @@ fn authority_requires_audience_and_concrete_scope_binding_for_authorization() {
         now,
     );
     let audience_only_request_decision = evaluate_capability_request(
-        std::slice::from_ref(&valid_grant),
+        &[validated(valid_grant.clone())],
         &audience_only_request,
         now,
     );
@@ -379,10 +540,207 @@ fn authority_requires_audience_and_concrete_scope_binding_for_authorization() {
 
     let audience_only_grant = grant(issuer, subject, operation, audience_only_scope, now);
     let audience_only_grant_decision =
-        evaluate_capability_request(&[audience_only_grant], &valid_request, now);
+        evaluate_capability_request(&[validated(audience_only_grant)], &valid_request, now);
     assert!(audience_only_grant_decision
         .reasons
         .contains(&"invalid_scope:capability_grant.scope:missing_bounded_dimension".to_string()));
+}
+
+#[test]
+fn authority_requires_tenant_or_fleet_and_operation_specific_scope() {
+    let tenant_bound_scope = CapabilityScope {
+        tenant_ids: Some(vec![TenantId::new()]),
+        audiences: Some(vec!["daemon:local".to_string()]),
+        ..Default::default()
+    };
+
+    assert_scope_denied_for_operation(
+        network_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:network_egress_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        device_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:device_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        artifact_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:artifact_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        state_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:state_partition_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        driver_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:driver_operation_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        workload_operation(),
+        tenant_bound_scope.clone(),
+        "invalid_scope:capability_request.scope:workload_or_run_scope_required",
+    );
+    assert_scope_denied_for_operation(
+        agent_operation(),
+        tenant_bound_scope,
+        "invalid_scope:capability_request.scope:agent_scope_required",
+    );
+
+    let agent_and_run_only_scope = CapabilityScope {
+        agent_ids: Some(vec![AgentId::new()]),
+        run_ids: Some(vec![RunId::new()]),
+        audiences: Some(vec!["daemon:local".to_string()]),
+        ..Default::default()
+    };
+    assert_scope_denied_for_operation(
+        gateway_action_operation("artifact.create"),
+        agent_and_run_only_scope,
+        "invalid_scope:capability_request.scope:missing_tenant_or_fleet_binding",
+    );
+}
+
+#[test]
+fn authority_enforces_scope_time_windows_and_containment() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let operation = gateway_action_operation("artifact.create");
+    let base = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+    let request_without_time =
+        capability_request(subject.clone(), operation.clone(), base.clone(), now);
+
+    let mut expired_scope_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        operation.clone(),
+        base.clone(),
+        now,
+    );
+    expired_scope_grant.scope.time.expires_at = Some(now - time::Duration::seconds(1));
+    let expired_scope_decision = evaluate_capability_request(
+        &[validated(expired_scope_grant)],
+        &request_without_time,
+        now,
+    );
+    assert!(expired_scope_decision
+        .reasons
+        .contains(&"invalid_scope:capability_grant.scope.time:scope_time_expired".to_string()));
+
+    let mut constrained_grant_scope = base.clone();
+    constrained_grant_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(1)),
+        expires_at: Some(now + time::Duration::minutes(10)),
+    };
+    let constrained_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        operation.clone(),
+        constrained_grant_scope,
+        now,
+    );
+    let mut broader_request_scope = base.clone();
+    broader_request_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(2)),
+        expires_at: Some(now + time::Duration::minutes(5)),
+    };
+    let broader_request = capability_request(
+        subject.clone(),
+        operation.clone(),
+        broader_request_scope,
+        now,
+    );
+    let broader_request_decision = evaluate_capability_request(
+        &[validated(constrained_grant.clone())],
+        &broader_request,
+        now,
+    );
+    assert!(broader_request_decision
+        .reasons
+        .contains(&"time.not_before_precedes_grant".to_string()));
+
+    let mut missing_request_time_scope = base.clone();
+    missing_request_time_scope.time = AuthorityTimeScope::default();
+    let missing_request_time = capability_request(
+        subject.clone(),
+        operation.clone(),
+        missing_request_time_scope,
+        now,
+    );
+    let missing_request_time_decision =
+        evaluate_capability_request(&[validated(constrained_grant)], &missing_request_time, now);
+    assert!(missing_request_time_decision
+        .reasons
+        .contains(&"time.not_before_missing_from_request".to_string()));
+
+    let mut unconstrained_grant = grant(
+        issuer,
+        subject.clone(),
+        operation.clone(),
+        base.clone(),
+        now,
+    );
+    unconstrained_grant.scope.time = AuthorityTimeScope::default();
+    let mut time_scoped_request_scope = base;
+    time_scoped_request_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::seconds(1)),
+        expires_at: Some(now + time::Duration::minutes(1)),
+    };
+    let time_scoped_request =
+        capability_request(subject, operation, time_scoped_request_scope, now);
+    let time_not_granted_decision =
+        evaluate_capability_request(&[validated(unconstrained_grant)], &time_scoped_request, now);
+    assert!(time_not_granted_decision
+        .reasons
+        .contains(&"time.not_before_not_granted".to_string()));
+}
+
+#[test]
+fn authority_enforces_narrowed_child_scope_time() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let parent_subject = PrincipalId::new();
+    let child_subject = PrincipalId::new();
+    let operation = gateway_action_operation("artifact.create");
+    let mut parent_scope = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+    parent_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(1)),
+        expires_at: Some(now + time::Duration::minutes(20)),
+    };
+    let parent = grant(
+        issuer,
+        parent_subject.clone(),
+        operation.clone(),
+        parent_scope.clone(),
+        now,
+    );
+    let mut child_scope = parent_scope;
+    child_scope.time = AuthorityTimeScope {
+        not_before: Some(now),
+        expires_at: Some(now + time::Duration::minutes(5)),
+    };
+    let mut child = grant(
+        parent_subject,
+        child_subject.clone(),
+        operation.clone(),
+        child_scope.clone(),
+        now,
+    );
+    child.parent_grant_ids = vec![parent.grant_id.clone()];
+    child.max_delegation_depth = 0;
+    ensure_child_grant_narrows(&parent, &child).expect("child scope time narrows parent");
+
+    let later = now + time::Duration::minutes(10);
+    let mut request_scope = child_scope;
+    request_scope.time = AuthorityTimeScope::default();
+    let request = capability_request(child_subject, operation, request_scope, later);
+    let decision = evaluate_capability_request(&[validated(child)], &request, later);
+    assert!(decision
+        .reasons
+        .contains(&"invalid_scope:capability_grant.scope.time:scope_time_expired".to_string()));
 }
 
 #[test]
@@ -784,7 +1142,7 @@ fn authority_metadata_and_extensions_do_not_grant_authority() {
         "x_note".to_string(),
         serde_json::json!("allow artifact.create"),
     );
-    let decision = evaluate_capability_request(&[metadata_only], &request, now);
+    let decision = evaluate_capability_request(&[validated(metadata_only)], &request, now);
     assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
     assert!(decision
         .reasons
@@ -800,7 +1158,8 @@ fn authority_metadata_and_extensions_do_not_grant_authority() {
     reserved_metadata
         .metadata
         .insert("allowed_actions".to_string(), serde_json::json!(["*"]));
-    let reserved_decision = evaluate_capability_request(&[reserved_metadata], &request, now);
+    let reserved_decision =
+        evaluate_capability_request(&[validated(reserved_metadata)], &request, now);
     assert!(reserved_decision
         .reasons
         .contains(&"metadata_reserved_authority_key".to_string()));
@@ -827,7 +1186,7 @@ fn authority_rejects_universal_wildcard_bypass() {
         now,
     );
 
-    let decision = evaluate_capability_request(&[wildcard_grant], &request, now);
+    let decision = evaluate_capability_request(&[validated(wildcard_grant)], &request, now);
 
     assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
     assert!(decision
@@ -859,7 +1218,7 @@ fn authority_data_read_training_eval_and_publication_are_not_one_permission() {
         now,
     );
 
-    let decision = evaluate_capability_request(&[read_grant], &training_request, now);
+    let decision = evaluate_capability_request(&[validated(read_grant)], &training_request, now);
 
     assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
     assert!(decision
@@ -907,7 +1266,7 @@ fn authority_work_order_profile_preserves_existing_allowlists_without_broadening
         max_delegation_depth: 1,
         parent_grant_ids: Vec::new(),
     };
-    let grant = grant_from_work_order(context, &work_order);
+    let grant = grant_from_work_order(context, &work_order).expect("validated work-order grant");
     let scope = CapabilityScope {
         tenant_ids: Some(vec![tenant_id]),
         agent_ids: Some(vec![agent_id]),
@@ -933,13 +1292,50 @@ fn authority_work_order_profile_preserves_existing_allowlists_without_broadening
     );
 
     let allowed = evaluate_capability_request(std::slice::from_ref(&grant), &allowed_request, now);
-    let denied = evaluate_capability_request(&[grant], &denied_request, now);
+    let denied = evaluate_capability_request(&[grant.clone()], &denied_request, now);
 
     assert_eq!(allowed.status, AuthorityDecisionStatus::Allowed);
     assert_eq!(denied.status, AuthorityDecisionStatus::Denied);
     assert!(denied
         .reasons
         .contains(&"operation_not_granted".to_string()));
+}
+
+#[test]
+fn authority_compatibility_builder_fails_closed_for_invalid_generated_profile() {
+    let now = OffsetDateTime::now_utc();
+    let invalid = grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: PrincipalId::new(),
+            audience: "daemon:*".to_string(),
+            validation_digest: DIGEST.to_string(),
+            max_delegation_depth: 1,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: TenantId::new(),
+            agent_id: AgentId::new(),
+            run_id: Some(RunId::new()),
+            quotas: AuthorityBudgetScope::default(),
+        },
+        &["artifact.create".to_string()],
+        &[],
+        &[],
+        now - time::Duration::minutes(1),
+        now + time::Duration::minutes(10),
+        RevocationStatus::Active,
+        None,
+    );
+
+    assert!(matches!(
+        invalid,
+        Err(AuthorityEvaluationError::InvalidToken {
+            field: "audiences",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -979,7 +1375,7 @@ fn authority_composite_effect_requires_separate_operation_decisions() {
         max_delegation_depth: 1,
         parent_grant_ids: Vec::new(),
     };
-    let grant = grant_from_work_order(context, &work_order);
+    let grant = grant_from_work_order(context, &work_order).expect("validated work-order grant");
     let scope = CapabilityScope {
         tenant_ids: Some(vec![tenant_id]),
         agent_ids: Some(vec![agent_id]),

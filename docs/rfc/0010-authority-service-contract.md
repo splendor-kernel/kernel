@@ -8,7 +8,8 @@ Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
 branch includes only a local Rust evidence slice: behavior-free capability and
 scope contracts in `splendor-types`, deterministic local evaluation and narrowing
-logic in `splendor-authority`, and unit tests for allow/deny/narrowing behavior.
+logic in `splendor-authority`, trusted local profile grant wrapping, and unit
+tests for allow/deny/narrowing behavior.
 
 This slice does not change stable 0.1 runtime enforcement, daemon APIs, OpenAPI,
 TypeScript, Python, gateway verifier wiring, trace formats, state formats, replay
@@ -74,12 +75,25 @@ The local AUTH-001 slice adds these behavior-free `splendor-types` contracts:
 
 The local `splendor-authority::capability` module owns evaluation behavior:
 
+- `CapabilityGrant` remains a behavior-free public contract and is not accepted
+  directly by the evaluator;
+- `evaluate_capability_request` consumes only `ValidatedCapabilityGrant` values
+  produced by trusted local profile builders with private raw-grant storage and a
+  read-only `grant()` accessor;
+- raw external grant payloads are not authority and must not be treated as
+  authorization evidence without a trusted validation path;
 - grants must be schema-valid, locally validated/signed, unexpired, unrevoked,
   subject-matched, audience-matched, and operation/scope-contained;
 - authorization grants and requests must carry an explicit audience and at least
-  one concrete bounded scope dimension beyond only time or budget, such as
-  tenant, fleet, agent, run, workload, device, data purpose, artifact, state
-  partition, driver operation, network, or locality;
+  one concrete bounded scope dimension beyond only time or budget, must be bound
+  to a tenant or fleet, and must include operation-specific scope where required
+  such as data purpose, device, artifact, state partition, driver operation,
+  workload/run, agent, or network host/scheme;
+- `CapabilityGrantValidationKind::Signed` does not authorize in this bounded
+  slice because AUTH-002 signature verification is not implemented; signed grants
+  deny with `signed_grant_verifier_unavailable`;
+- grant and request `CapabilityScope.time` windows are enforced against decision
+  time, and requested time scope must be contained by grant time scope;
 - missing, malformed, expired, revoked, wrong-audience, wrong-subject, or
   overbroad grants deny fail-closed;
 - deterministic intersections choose common typed scope, narrower time windows,
@@ -96,8 +110,12 @@ The local `splendor-authority::capability` module owns evaluation behavior:
 | Rule | Required behavior in this slice |
 | --- | --- |
 | Authority is typed | Operation namespace, verb, resource kind, and schema version are explicit enums/fields. |
+| Raw grants are not authority | Evaluator accepts `ValidatedCapabilityGrant`, not raw `CapabilityGrant`; compatibility builders return `Result` and fail closed for invalid generated profiles. |
 | No wildcard bypass | `*` in operation names, audiences, network/locality tokens, validation refs, or driver refs is rejected by the evaluator. |
-| No unbound authority | Authorization evaluation denies grants or requests without an explicit audience and at least one concrete bounded dimension beyond only time/budget. |
+| No unbound authority | Authorization evaluation denies grants or requests without an explicit audience, tenant/fleet binding, and at least one concrete bounded dimension beyond only time/budget. |
+| Operation-specific scope | Network egress needs scheme and host; device, artifact, state, driver, workload, and agent operations need matching concrete scope dimensions. |
+| No raw signed self-attestation | Signed grants deny until AUTH-002 provides real signature verification. |
+| Scope time enforced | Grant and request scope time windows are enforced and request time cannot broaden grant time. |
 | Data purposes stay separate | `read`, `training_use`, `evaluation_use`, and `publication` are distinct scope values and operation verbs. |
 | Extensions are non-authorizing | Metadata is validated with reserved-key guards and ignored for allow decisions. |
 | Delegation narrows | Child grant operations, scopes, time, budgets, obligations, and delegation depth cannot broaden parent authority. |
@@ -129,7 +147,10 @@ mode is defined.
 | Contract serialization | `cargo test -p splendor-types authority --locked` covers typed operations, distinct data purposes, scope identity dimensions, grant/decision round-trip. | `G01/G18/G70` remain `not_exercised`. |
 | Evaluation fail-closed | `cargo test -p splendor-authority --locked` covers missing, expired, revoked, wrong-audience, and missing-validation denial. | `G01` remains `not_exercised`. |
 | Delegation narrowing | Authority tests cover child operation/scope/budget/audience broadening denial and monotonic intersections. | `G18/G70` remain `not_exercised`. |
-| Scope binding | Authority tests cover missing audience, audience-only/budget-only scopes, and empty unbound grant/request denial. | `G01` remains `not_exercised`. |
+| Scope binding | Authority tests cover missing audience, missing tenant/fleet, operation-specific scope, audience-only/budget-only scopes, and empty unbound grant/request denial. | `G01` remains `not_exercised`. |
+| Scope time | Authority tests cover expired grant scope time, broader request scope time, missing request time when grant time is constrained, request time present when grant time is unconstrained, and narrowed child scope time expiry. | `G01/G18` remain `not_exercised`. |
+| Signed grants | Authority tests cover signed dummy grants denying with `signed_grant_verifier_unavailable`. | AUTH-002 remains future work. |
+| Trusted local profile wrapper | Authority tests cover compatibility builder `Result` success and fail-closed invalid generated profile denial. | Raw external grants remain non-authorizing contracts. |
 | Composite effects | Authority tests cover action-only work-order compatibility grants not authorizing adapter or permission operations. | Not gateway integration evidence. |
 | Non-authorizing metadata | Authority tests cover safe metadata not granting authority and reserved metadata denial. | `G01` remains `not_exercised`. |
 | Compatibility profiles | Authority tests cover local `WorkOrder` allowlist profile mapping without broadening. | Not a full work-order issuance integration claim. |

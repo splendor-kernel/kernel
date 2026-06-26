@@ -2,9 +2,11 @@
 //!
 //! This module is a bounded local evidence slice. It evaluates typed capability
 //! grants, computes deterministic scope intersections, and checks that child
-//! grants never broaden parent authority. It does not issue production grants,
-//! replace signed work orders, integrate with the gateway, call stores, or execute
-//! side effects.
+//! grants never broaden parent authority. The public evaluator accepts only
+//! `ValidatedCapabilityGrant` values produced by trusted local profile builders;
+//! raw external `CapabilityGrant` payloads are behavior-free contracts, not
+//! authority. This module does not issue production grants, replace signed work
+//! orders, integrate with the gateway, call stores, or execute side effects.
 //!
 //! Each evaluation call authorizes exactly one `AuthorityOperation`. Callers that
 //! mediate composite privileged effects must evaluate every required operation
@@ -58,6 +60,24 @@ pub struct LegacyScopeProfile {
     pub quotas: AuthorityBudgetScope,
 }
 
+/// Locally validated capability grant accepted by the bounded evaluator.
+///
+/// Raw `CapabilityGrant` remains a behavior-free public contract in
+/// `splendor-types`. The evaluator intentionally consumes only this authority
+/// crate wrapper so external grant payloads are not treated as authority unless a
+/// trusted local builder has validated their shape and profile constraints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedCapabilityGrant {
+    grant: CapabilityGrant,
+}
+
+impl ValidatedCapabilityGrant {
+    /// Returns the underlying behavior-free grant contract for inspection.
+    pub fn grant(&self) -> &CapabilityGrant {
+        &self.grant
+    }
+}
+
 /// Evaluates a request against zero or more grants and returns an explicit
 /// fail-closed authority decision. The first matching grant allows the request;
 /// invalid, expired, revoked, wrong-subject, wrong-audience, or overbroad grants
@@ -67,11 +87,11 @@ pub struct LegacyScopeProfile {
 /// separate successful decisions for each action, adapter, permission,
 /// data-purpose, driver, or other operation needed for that effect.
 pub fn evaluate_capability_request(
-    grants: &[CapabilityGrant],
+    grants: &[ValidatedCapabilityGrant],
     request: &CapabilityRequest,
     now: OffsetDateTime,
 ) -> AuthorityDecision {
-    if let Err(error) = validate_request_shape(request) {
+    if let Err(error) = validate_request_shape(request, now) {
         return denied_decision(request.clone(), now, vec![error.reason_code()]);
     }
 
@@ -84,7 +104,8 @@ pub fn evaluate_capability_request(
     }
 
     let mut denial_reasons = Vec::new();
-    for grant in grants {
+    for validated_grant in grants {
+        let grant = validated_grant.grant();
         match grant_allows_request(grant, request, now) {
             Ok(()) => {
                 return AuthorityDecision {
@@ -245,7 +266,7 @@ pub fn ensure_child_grant_narrows(
 pub fn grant_from_work_order(
     context: CompatibilityGrantContext,
     work_order: &WorkOrder,
-) -> CapabilityGrant {
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
     let scope = CapabilityScope {
         tenant_ids: Some(vec![work_order.tenant_id.clone()]),
         agent_ids: Some(vec![work_order.agent_id.clone()]),
@@ -263,7 +284,7 @@ pub fn grant_from_work_order(
         ..Default::default()
     };
 
-    let mut grant = grant_from_legacy_allowlists(
+    let mut grant = raw_grant_from_legacy_allowlists(
         context,
         LegacyScopeProfile {
             tenant_id: work_order.tenant_id.clone(),
@@ -280,7 +301,7 @@ pub fn grant_from_work_order(
         Some(format!("work_order:{}", work_order.work_order_id.as_str())),
     );
     grant.scope.locality.data_localities = scope.locality.data_localities;
-    grant
+    validate_local_profile_grant(grant)
 }
 
 /// Builds a local compatibility grant from existing delegated authority. This is
@@ -292,7 +313,7 @@ pub fn grant_from_delegated_authority(
     authority: &DelegatedAuthority,
     not_before: OffsetDateTime,
     expires_at: OffsetDateTime,
-) -> CapabilityGrant {
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
     grant_from_legacy_allowlists(
         context,
         scope_profile,
@@ -311,6 +332,31 @@ pub fn grant_from_delegated_authority(
 /// reverse dependency from `splendor-authority` to `splendor-kernel`.
 #[allow(clippy::too_many_arguments)]
 pub fn grant_from_legacy_allowlists(
+    context: CompatibilityGrantContext,
+    scope_profile: LegacyScopeProfile,
+    allowed_actions: &[String],
+    allowed_adapters: &[String],
+    allowed_permissions: &[String],
+    not_before: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    revocation: RevocationStatus,
+    revocation_ref: Option<String>,
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
+    validate_local_profile_grant(raw_grant_from_legacy_allowlists(
+        context,
+        scope_profile,
+        allowed_actions,
+        allowed_adapters,
+        allowed_permissions,
+        not_before,
+        expires_at,
+        revocation,
+        revocation_ref,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_grant_from_legacy_allowlists(
     context: CompatibilityGrantContext,
     scope_profile: LegacyScopeProfile,
     allowed_actions: &[String],
@@ -375,6 +421,21 @@ pub fn grant_from_legacy_allowlists(
     }
 }
 
+fn validate_local_profile_grant(
+    grant: CapabilityGrant,
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
+    validate_grant_shape(&grant)?;
+    for operation in &grant.operations {
+        validate_authorization_scope_binding("capability_grant.scope", &grant.scope, operation)?;
+    }
+    Ok(ValidatedCapabilityGrant { grant })
+}
+
+#[cfg(test)]
+fn unchecked_validated_grant_for_tests(grant: CapabilityGrant) -> ValidatedCapabilityGrant {
+    ValidatedCapabilityGrant { grant }
+}
+
 /// Builds a typed 0.1-compatible gateway action operation.
 pub fn gateway_action_operation(name: impl Into<String>) -> AuthorityOperation {
     AuthorityOperation {
@@ -422,7 +483,15 @@ fn grant_allows_request(
         errors.push(error);
         return Err(errors);
     }
-    if let Err(error) = validate_authorization_scope_binding("capability_grant.scope", &grant.scope)
+    for operation in &grant.operations {
+        if let Err(error) =
+            validate_authorization_scope_binding("capability_grant.scope", &grant.scope, operation)
+        {
+            errors.push(error);
+        }
+    }
+    if let Err(error) =
+        validate_authorization_time("capability_grant.scope.time", &grant.scope.time, now)
     {
         errors.push(error);
     }
@@ -476,7 +545,10 @@ fn grant_allows_request(
     }
 }
 
-fn validate_request_shape(request: &CapabilityRequest) -> Result<(), AuthorityEvaluationError> {
+fn validate_request_shape(
+    request: &CapabilityRequest,
+    now: OffsetDateTime,
+) -> Result<(), AuthorityEvaluationError> {
     if request.schema_version != CAPABILITY_REQUEST_SCHEMA_VERSION {
         return Err(schema_error(
             "capability_request.schema_version",
@@ -489,7 +561,12 @@ fn validate_request_shape(request: &CapabilityRequest) -> Result<(), AuthorityEv
     }
     validate_operation_shape(&request.operation)?;
     validate_scope_shape(&request.scope)?;
-    validate_authorization_scope_binding("capability_request.scope", &request.scope)?;
+    validate_authorization_scope_binding(
+        "capability_request.scope",
+        &request.scope,
+        &request.operation,
+    )?;
+    validate_authorization_time("capability_request.scope.time", &request.scope.time, now)?;
     validate_extension_map(&request.metadata, "capability_request.metadata")?;
     Ok(())
 }
@@ -548,11 +625,9 @@ fn validate_grant_validation(
         "grant_validation.signature",
         validation.signature.as_deref(),
     )?;
-    if validation.validation_kind == CapabilityGrantValidationKind::Signed
-        && (validation.key_id.is_none() || validation.signature.is_none())
-    {
+    if validation.validation_kind == CapabilityGrantValidationKind::Signed {
         return Err(AuthorityEvaluationError::InvalidValidation {
-            reason: "signed_grant_missing_key_or_signature".to_string(),
+            reason: "signed_grant_verifier_unavailable".to_string(),
         });
     }
     Ok(())
@@ -714,6 +789,7 @@ fn validate_scope_shape(scope: &CapabilityScope) -> Result<(), AuthorityEvaluati
 fn validate_authorization_scope_binding(
     dimension: &'static str,
     scope: &CapabilityScope,
+    operation: &AuthorityOperation,
 ) -> Result<(), AuthorityEvaluationError> {
     if scope
         .audiences
@@ -729,6 +805,78 @@ fn validate_authorization_scope_binding(
         return Err(AuthorityEvaluationError::InvalidScope {
             dimension,
             reason: "missing_bounded_dimension".to_string(),
+        });
+    }
+    if !has_scope_values(&scope.tenant_ids) && !has_scope_values(&scope.fleet_ids) {
+        return Err(AuthorityEvaluationError::InvalidScope {
+            dimension,
+            reason: "missing_tenant_or_fleet_binding".to_string(),
+        });
+    }
+    validate_operation_specific_scope(dimension, scope, operation)?;
+    Ok(())
+}
+
+fn validate_authorization_time(
+    dimension: &'static str,
+    scope: &AuthorityTimeScope,
+    now: OffsetDateTime,
+) -> Result<(), AuthorityEvaluationError> {
+    if matches!(scope.not_before, Some(not_before) if now < not_before) {
+        return Err(AuthorityEvaluationError::InvalidScope {
+            dimension,
+            reason: "scope_time_not_yet_valid".to_string(),
+        });
+    }
+    if matches!(scope.expires_at, Some(expires_at) if now >= expires_at) {
+        return Err(AuthorityEvaluationError::InvalidScope {
+            dimension,
+            reason: "scope_time_expired".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_operation_specific_scope(
+    dimension: &'static str,
+    scope: &CapabilityScope,
+    operation: &AuthorityOperation,
+) -> Result<(), AuthorityEvaluationError> {
+    let reason = match operation.namespace {
+        AuthorityOperationNamespace::Data => required_data_purpose(operation).and_then(|purpose| {
+            (!scope
+                .data_purposes
+                .as_ref()
+                .is_some_and(|purposes| purposes.contains(&purpose)))
+            .then_some("data_purpose_missing_for_operation")
+        }),
+        AuthorityOperationNamespace::Network => (!has_scope_values(&scope.network.egress_schemes)
+            || !has_scope_values(&scope.network.egress_hosts))
+        .then_some("network_egress_scope_required"),
+        AuthorityOperationNamespace::Device => {
+            (!has_scope_values(&scope.device_ids)).then_some("device_scope_required")
+        }
+        AuthorityOperationNamespace::Artifact => {
+            (!has_scope_values(&scope.artifact_ids)).then_some("artifact_scope_required")
+        }
+        AuthorityOperationNamespace::State => (!has_scope_values(&scope.state_partition_ids))
+            .then_some("state_partition_scope_required"),
+        AuthorityOperationNamespace::Driver => (!has_scope_values(&scope.driver_operations))
+            .then_some("driver_operation_scope_required"),
+        AuthorityOperationNamespace::Workload => (!has_scope_values(&scope.workload_ids)
+            && !has_scope_values(&scope.run_ids))
+        .then_some("workload_or_run_scope_required"),
+        AuthorityOperationNamespace::Agent => {
+            (!has_scope_values(&scope.agent_ids)).then_some("agent_scope_required")
+        }
+        AuthorityOperationNamespace::Gateway
+        | AuthorityOperationNamespace::Compatibility
+        | AuthorityOperationNamespace::Change => None,
+    };
+    if let Some(reason) = reason {
+        return Err(AuthorityEvaluationError::InvalidScope {
+            dimension,
+            reason: reason.to_string(),
         });
     }
     Ok(())
@@ -908,6 +1056,7 @@ fn scope_contains_request(
         reasons,
     );
     contains_requested_set("audience", &grant.audiences, &request.audiences, reasons);
+    time_contains_request(&grant.time, &request.time, reasons);
     budget_contains_request(&grant.budget, &request.budget, reasons);
     contains_requested_set(
         "network.egress_schemes",
@@ -939,6 +1088,29 @@ fn scope_contains_request(
         &request.locality.data_localities,
         reasons,
     );
+}
+
+fn time_contains_request(
+    grant: &AuthorityTimeScope,
+    request: &AuthorityTimeScope,
+    reasons: &mut Vec<String>,
+) {
+    match (grant.not_before, request.not_before) {
+        (Some(_), None) => reasons.push("time.not_before_missing_from_request".to_string()),
+        (None, Some(_)) => reasons.push("time.not_before_not_granted".to_string()),
+        (Some(granted), Some(requested)) if requested < granted => {
+            reasons.push("time.not_before_precedes_grant".to_string());
+        }
+        _ => {}
+    }
+    match (grant.expires_at, request.expires_at) {
+        (Some(_), None) => reasons.push("time.expires_at_missing_from_request".to_string()),
+        (None, Some(_)) => reasons.push("time.expires_at_not_granted".to_string()),
+        (Some(granted), Some(requested)) if requested > granted => {
+            reasons.push("time.expires_at_exceeds_grant".to_string());
+        }
+        _ => {}
+    }
 }
 
 fn contains_requested_set<T: PartialEq>(

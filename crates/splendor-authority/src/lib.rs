@@ -13,5 +13,6 @@ pub use capability::{
     gateway_action_operation, gateway_adapter_operation, grant_from_delegated_authority,
     grant_from_legacy_allowlists, grant_from_work_order, intersect_capability_scopes,
     AuthorityEvaluationError, CompatibilityGrantContext, LegacyScopeProfile,
+    ValidatedCapabilityGrant,
 };
 pub use identity::{IdentityMutation, IdentityRegistry, IdentityRegistryError, RegisterPrincipal};
