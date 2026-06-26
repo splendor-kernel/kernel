@@ -101,6 +101,46 @@ uuid_id! {
 }
 
 uuid_id! {
+    /// Unique identifier for an immutable capability grant.
+    CapabilityGrantId
+}
+
+uuid_id! {
+    /// Unique identifier for an authority decision record.
+    AuthorityDecisionId
+}
+
+uuid_id! {
+    /// Unique identifier for an authority revocation record.
+    AuthorityRevocationId
+}
+
+uuid_id! {
+    /// Unique identifier for an explicit authority obligation.
+    AuthorityObligationId
+}
+
+uuid_id! {
+    /// Unique identifier for a v2 workload boundary.
+    WorkloadId
+}
+
+uuid_id! {
+    /// Unique identifier for a physical or edge device boundary.
+    DeviceId
+}
+
+uuid_id! {
+    /// Unique identifier for an artifact reference.
+    ArtifactId
+}
+
+uuid_id! {
+    /// Unique identifier for a named state partition.
+    StatePartitionId
+}
+
+uuid_id! {
     /// Unique identifier for a governed fleet boundary.
     FleetId
 }
@@ -586,6 +626,14 @@ impl_uuid_identity!(
     PrincipalId,
     IdentityEventId,
     PrincipalProofRefId,
+    CapabilityGrantId,
+    AuthorityDecisionId,
+    AuthorityRevocationId,
+    AuthorityObligationId,
+    WorkloadId,
+    DeviceId,
+    ArtifactId,
+    StatePartitionId,
     FleetId,
     NodeId,
     InstanceId,
