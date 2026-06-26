@@ -31,6 +31,7 @@
 //! ```
 
 mod approval;
+mod authority;
 mod capabilities;
 mod cloud_helper;
 mod daemon_security;
@@ -59,6 +60,16 @@ mod work_order;
 pub use approval::{
     ApprovalActionScope, ApprovalDecision, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
     APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+};
+pub use authority::{
+    AuthorityBudgetScope, AuthorityDecision, AuthorityDecisionStatus, AuthorityObligation,
+    AuthorityObligationKind, AuthorityOperation, AuthorityOperationNamespace,
+    AuthorityResourceKind, AuthorityTimeScope, AuthorityVerb, CapabilityGrant,
+    CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
+    DataPurpose, DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
+    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
+    CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
+    CAPABILITY_SCOPE_SCHEMA_VERSION, REVOCATION_RECORD_SCHEMA_VERSION,
 };
 pub use capabilities::{
     is_valid_capability_name, CapabilityDocument, CapabilityValidationError,
@@ -125,10 +136,12 @@ pub use identity::{
     PrincipalBinding, PrincipalDisplay, PrincipalKind, PrincipalProofRef, PrincipalStatus,
 };
 pub use ids::{
-    ActionId, AgentId, ApprovalId, CircuitBreakerId, EscalationId, FleetId, IdentityEventId,
-    IdentityValidationError, InstanceId, InterventionId, KillSwitchId, MessageId, NodeId,
-    PrincipalId, PrincipalProofRefId, RunId, RuntimeIdentityContext, SnapshotId, StateNodeId,
-    TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext, WorkOrderId, WorkOrderIdError,
+    ActionId, AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
+    AuthorityRevocationId, CapabilityGrantId, CircuitBreakerId, DeviceId, EscalationId, FleetId,
+    IdentityEventId, IdentityValidationError, InstanceId, InterventionId, KillSwitchId, MessageId,
+    NodeId, PrincipalId, PrincipalProofRefId, RunId, RuntimeIdentityContext, SnapshotId,
+    StateNodeId, StatePartitionId, TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext,
+    WorkOrderId, WorkOrderIdError, WorkloadId,
 };
 pub use message::{
     DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope, MessageSchemaVersion,
