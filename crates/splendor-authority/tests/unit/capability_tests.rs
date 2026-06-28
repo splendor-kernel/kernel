@@ -1292,7 +1292,7 @@ fn authority_work_order_profile_preserves_existing_allowlists_without_broadening
     );
 
     let allowed = evaluate_capability_request(std::slice::from_ref(&grant), &allowed_request, now);
-    let denied = evaluate_capability_request(&[grant.clone()], &denied_request, now);
+    let denied = evaluate_capability_request(std::slice::from_ref(&grant), &denied_request, now);
 
     assert_eq!(allowed.status, AuthorityDecisionStatus::Allowed);
     assert_eq!(denied.status, AuthorityDecisionStatus::Denied);
