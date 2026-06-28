@@ -1,6 +1,7 @@
 use super::*;
 use splendor_types::{
-    AuthorityObligationId, AuthorityObligationKind, WorkOrderId, WorkOrderPlacement,
+    ArtifactId, AuthorityObligationId, AuthorityObligationKind, DeviceId, FleetId,
+    StatePartitionId, WorkOrderId, WorkOrderPlacement, WorkloadId,
 };
 
 const DIGEST: &str = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
@@ -1299,6 +1300,828 @@ fn authority_work_order_profile_preserves_existing_allowlists_without_broadening
     assert!(denied
         .reasons
         .contains(&"operation_not_granted".to_string()));
+}
+
+#[test]
+fn authority_shape_validation_covers_malformed_requests_grants_operations_and_scopes() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let scope = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+
+    let mut request = capability_request(
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    request.schema_version = "splendor.capability_request.v0".to_string();
+    assert_eq!(
+        validate_request_shape(&request, now)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_schema:capability_request.schema_version"
+    );
+
+    let mut request = capability_request(
+        PrincipalId::parse("00000000-0000-0000-0000-000000000000").unwrap(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    assert_eq!(
+        validate_request_shape(&request, now)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_identity:subject"
+    );
+
+    request.subject = subject.clone();
+    request.scope.time.not_before = Some(now + time::Duration::minutes(1));
+    assert_eq!(
+        validate_request_shape(&request, now)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:capability_request.scope.time:scope_time_not_yet_valid"
+    );
+    request.scope.time.not_before = None;
+    request.scope.time.expires_at = Some(now - time::Duration::seconds(1));
+    assert_eq!(
+        validate_request_shape(&request, now)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:capability_request.scope.time:scope_time_expired"
+    );
+
+    let bad_tuple = AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Gateway,
+        resource_kind: AuthorityResourceKind::Action,
+        verb: AuthorityVerb::Read,
+        name: Some("artifact.create".to_string()),
+        resource_schema_version: Some("splendor.action.v1".to_string()),
+    };
+    assert_eq!(
+        validate_operation_shape(&bad_tuple)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_operation:operation_tuple_not_allowed"
+    );
+
+    let mut missing_name = driver_operation();
+    missing_name.name = None;
+    assert_eq!(
+        validate_operation_shape(&missing_name)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_operation:operation_name_required"
+    );
+
+    let mut name_not_allowed = data_operation(AuthorityVerb::Read);
+    name_not_allowed.name = Some("dataset.read".to_string());
+    assert_eq!(
+        validate_operation_shape(&name_not_allowed)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_operation:operation_name_not_allowed_for_typed_tuple"
+    );
+
+    let mut bad_operation_schema = gateway_action_operation("artifact.create");
+    bad_operation_schema.schema_version = "splendor.authority_operation.v0".to_string();
+    assert_eq!(
+        validate_operation_shape(&bad_operation_schema)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_schema:authority_operation.schema_version"
+    );
+
+    let mut bad_resource_schema = gateway_action_operation("artifact.create");
+    bad_resource_schema.resource_schema_version = Some("splendor.*.v1".to_string());
+    assert_eq!(
+        validate_operation_shape(&bad_resource_schema)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_token:authority_operation.resource_schema_version"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.schema_version = "splendor.capability_scope.v0".to_string();
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_schema:capability_scope.schema_version"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.tenant_ids = Some(Vec::new());
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:tenant_ids:empty_scope_set"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.fleet_ids = Some(vec![
+        FleetId::parse("00000000-0000-0000-0000-000000000000").unwrap()
+    ]);
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:fleet_ids:nil_identity"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.audiences = Some(vec![" daemon:local".to_string()]);
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_token:audiences"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.driver_operations = Some(vec![DriverOperationRef {
+        driver: "driver:*".to_string(),
+        operation: "create".to_string(),
+        schema_version: "splendor.driver.v1".to_string(),
+    }]);
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_token:driver_operations.driver"
+    );
+
+    let mut invalid_scope = scope.clone();
+    invalid_scope.time.not_before = Some(now + time::Duration::minutes(1));
+    invalid_scope.time.expires_at = Some(now + time::Duration::minutes(1));
+    assert_eq!(
+        validate_scope_shape(&invalid_scope)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:time:not_before_must_precede_expires_at"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.schema_version = "splendor.capability_grant.v0".to_string();
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_schema:capability_grant.schema_version"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.grant_id =
+        CapabilityGrantId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_identity:grant_id"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.issuer = PrincipalId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_identity:issuer"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.subject = PrincipalId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_identity:subject"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.operations.clear();
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_operation:missing_operations"
+    );
+
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.not_before = invalid_grant.expires_at;
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:time:grant_not_before_must_precede_expires_at"
+    );
+
+    let mut invalid_grant = grant(
+        issuer,
+        subject,
+        gateway_action_operation("artifact.create"),
+        scope,
+        now,
+    );
+    invalid_grant.obligations.push(AuthorityObligation {
+        obligation_id: AuthorityObligationId::parse("00000000-0000-0000-0000-000000000000")
+            .unwrap(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "record evidence".to_string(),
+        parameters: Default::default(),
+    });
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_identity:obligation_id"
+    );
+}
+
+#[test]
+fn authority_scope_intersections_cover_all_dimensions_and_empty_cases() {
+    let now = OffsetDateTime::now_utc();
+    let tenant = TenantId::new();
+    let fleet = FleetId::new();
+    let agent = AgentId::new();
+    let run = RunId::new();
+    let workload = WorkloadId::new();
+    let device = DeviceId::new();
+    let artifact = ArtifactId::new();
+    let state_partition = StatePartitionId::new();
+    let driver_ref = DriverOperationRef {
+        driver: "artifact-store".to_string(),
+        operation: "create".to_string(),
+        schema_version: "splendor.driver_operation.v1".to_string(),
+    };
+
+    let left = CapabilityScope {
+        tenant_ids: Some(vec![tenant.clone(), TenantId::new()]),
+        fleet_ids: Some(vec![fleet.clone(), FleetId::new()]),
+        agent_ids: Some(vec![agent.clone(), AgentId::new()]),
+        run_ids: Some(vec![run.clone(), RunId::new()]),
+        workload_ids: Some(vec![workload.clone(), WorkloadId::new()]),
+        device_ids: Some(vec![device.clone(), DeviceId::new()]),
+        data_purposes: Some(vec![DataPurpose::Read, DataPurpose::TrainingUse]),
+        artifact_ids: Some(vec![artifact.clone(), ArtifactId::new()]),
+        state_partition_ids: Some(vec![state_partition.clone(), StatePartitionId::new()]),
+        driver_operations: Some(vec![driver_ref.clone()]),
+        audiences: Some(vec!["daemon:local".to_string(), "daemon:other".to_string()]),
+        time: AuthorityTimeScope {
+            not_before: Some(now - time::Duration::minutes(5)),
+            expires_at: Some(now + time::Duration::minutes(30)),
+        },
+        budget: AuthorityBudgetScope {
+            max_actions_per_tick: Some(5),
+            max_action_duration_ms: Some(2_000),
+            max_filesystem_read_bytes: Some(10_000),
+            max_filesystem_write_bytes: Some(1_000),
+            max_network_read_bytes: Some(20_000),
+            max_network_write_bytes: Some(2_000),
+            max_http_requests_per_minute: Some(60),
+        },
+        network: NetworkScope {
+            egress_schemes: Some(vec!["https".to_string(), "http".to_string()]),
+            egress_hosts: Some(vec![
+                "api.example.test".to_string(),
+                "other.test".to_string(),
+            ]),
+        },
+        locality: LocalityScope {
+            regions: Some(vec!["eu-west".to_string(), "us-east".to_string()]),
+            zones: Some(vec!["zone-a".to_string(), "zone-b".to_string()]),
+            data_localities: Some(vec!["on_prem".to_string(), "cloud".to_string()]),
+        },
+        ..Default::default()
+    };
+    let right = CapabilityScope {
+        tenant_ids: Some(vec![tenant.clone()]),
+        fleet_ids: Some(vec![fleet.clone()]),
+        agent_ids: Some(vec![agent.clone()]),
+        run_ids: Some(vec![run.clone()]),
+        workload_ids: Some(vec![workload.clone()]),
+        device_ids: Some(vec![device.clone()]),
+        data_purposes: Some(vec![DataPurpose::TrainingUse]),
+        artifact_ids: Some(vec![artifact.clone()]),
+        state_partition_ids: Some(vec![state_partition.clone()]),
+        driver_operations: Some(vec![driver_ref.clone()]),
+        audiences: Some(vec!["daemon:local".to_string()]),
+        time: AuthorityTimeScope {
+            not_before: Some(now),
+            expires_at: Some(now + time::Duration::minutes(10)),
+        },
+        budget: AuthorityBudgetScope {
+            max_actions_per_tick: Some(3),
+            max_action_duration_ms: Some(1_000),
+            max_filesystem_read_bytes: Some(5_000),
+            max_filesystem_write_bytes: Some(500),
+            max_network_read_bytes: Some(10_000),
+            max_network_write_bytes: Some(1_000),
+            max_http_requests_per_minute: Some(30),
+        },
+        network: NetworkScope {
+            egress_schemes: Some(vec!["https".to_string()]),
+            egress_hosts: Some(vec!["api.example.test".to_string()]),
+        },
+        locality: LocalityScope {
+            regions: Some(vec!["eu-west".to_string()]),
+            zones: Some(vec!["zone-a".to_string()]),
+            data_localities: Some(vec!["on_prem".to_string()]),
+        },
+        ..Default::default()
+    };
+
+    let intersection = intersect_capability_scopes(&left, &right).unwrap();
+    assert_eq!(intersection.tenant_ids, Some(vec![tenant]));
+    assert_eq!(intersection.fleet_ids, Some(vec![fleet]));
+    assert_eq!(intersection.agent_ids, Some(vec![agent]));
+    assert_eq!(intersection.run_ids, Some(vec![run]));
+    assert_eq!(intersection.workload_ids, Some(vec![workload]));
+    assert_eq!(intersection.device_ids, Some(vec![device]));
+    assert_eq!(
+        intersection.data_purposes,
+        Some(vec![DataPurpose::TrainingUse])
+    );
+    assert_eq!(intersection.artifact_ids, Some(vec![artifact]));
+    assert_eq!(
+        intersection.state_partition_ids,
+        Some(vec![state_partition])
+    );
+    assert_eq!(intersection.driver_operations, Some(vec![driver_ref]));
+    assert_eq!(
+        intersection.audiences,
+        Some(vec!["daemon:local".to_string()])
+    );
+    assert_eq!(intersection.time.not_before, Some(now));
+    assert_eq!(
+        intersection.time.expires_at,
+        Some(now + time::Duration::minutes(10))
+    );
+    assert_eq!(intersection.budget.max_network_write_bytes, Some(1_000));
+    assert_eq!(
+        intersection.network.egress_schemes,
+        Some(vec!["https".to_string()])
+    );
+    assert_eq!(
+        intersection.locality.data_localities,
+        Some(vec!["on_prem".to_string()])
+    );
+
+    let mut empty_right = right.clone();
+    empty_right.tenant_ids = Some(vec![TenantId::new()]);
+    assert_eq!(
+        intersect_capability_scopes(&left, &empty_right)
+            .unwrap_err()
+            .reason_code(),
+        "empty_intersection:tenant_ids"
+    );
+
+    let left_only = CapabilityScope {
+        tenant_ids: Some(vec![TenantId::new()]),
+        ..Default::default()
+    };
+    assert!(
+        intersect_capability_scopes(&left_only, &CapabilityScope::default())
+            .unwrap()
+            .tenant_ids
+            .is_some()
+    );
+    assert!(
+        intersect_capability_scopes(&CapabilityScope::default(), &left_only)
+            .unwrap()
+            .tenant_ids
+            .is_some()
+    );
+
+    let time_left = CapabilityScope {
+        time: AuthorityTimeScope {
+            not_before: Some(now + time::Duration::minutes(10)),
+            expires_at: None,
+        },
+        ..Default::default()
+    };
+    let time_right = CapabilityScope {
+        time: AuthorityTimeScope {
+            not_before: None,
+            expires_at: Some(now + time::Duration::minutes(1)),
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        intersect_capability_scopes(&time_left, &time_right)
+            .unwrap_err()
+            .reason_code(),
+        "empty_intersection:time"
+    );
+}
+
+#[test]
+fn authority_narrowing_failures_cover_lineage_budget_time_and_obligations() {
+    let now = OffsetDateTime::now_utc();
+    let parent_issuer = PrincipalId::new();
+    let parent_subject = PrincipalId::new();
+    let child_subject = PrincipalId::new();
+    let mut parent_scope = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+    parent_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(1)),
+        expires_at: Some(now + time::Duration::minutes(30)),
+    };
+    parent_scope.budget = AuthorityBudgetScope {
+        max_network_read_bytes: Some(10),
+        max_network_write_bytes: Some(20),
+        ..parent_scope.budget
+    };
+    let obligation = AuthorityObligation {
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "preserve evidence".to_string(),
+        parameters: Default::default(),
+    };
+    let mut parent = grant(
+        parent_issuer,
+        parent_subject.clone(),
+        gateway_action_operation("artifact.create"),
+        parent_scope,
+        now,
+    );
+    parent.max_delegation_depth = 2;
+    parent.obligations.push(obligation.clone());
+
+    let mut child = parent.clone();
+    child.grant_id = CapabilityGrantId::new();
+    child.issuer = parent_subject;
+    child.subject = child_subject;
+    child.parent_grant_ids = vec![parent.grant_id.clone()];
+    child.max_delegation_depth = 1;
+
+    let mut missing_parent = child.clone();
+    missing_parent.parent_grant_ids.clear();
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &missing_parent)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:parent_grant_ids:missing_parent_grant_id"
+    );
+
+    let mut wrong_issuer = child.clone();
+    wrong_issuer.issuer = PrincipalId::new();
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &wrong_issuer)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:issuer:child_issuer_not_parent_subject"
+    );
+
+    let mut exhausted_parent = parent.clone();
+    exhausted_parent.max_delegation_depth = 0;
+    assert_eq!(
+        ensure_child_grant_narrows(&exhausted_parent, &child)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:max_delegation_depth:parent_delegation_depth_exhausted"
+    );
+
+    let mut broad_depth = child.clone();
+    broad_depth.max_delegation_depth = 2;
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &broad_depth)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:max_delegation_depth:child_delegation_depth_broadened"
+    );
+
+    let mut broad_time = child.clone();
+    broad_time.not_before = parent.not_before - time::Duration::seconds(1);
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &broad_time)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:time:child_time_window_broadened"
+    );
+
+    let mut extra_operation = child.clone();
+    extra_operation
+        .operations
+        .push(gateway_adapter_operation("artifact-store"));
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &extra_operation)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:operations:child_operation_not_in_parent"
+    );
+
+    let mut dropped_obligation = child.clone();
+    dropped_obligation.obligations.clear();
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &dropped_obligation)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:obligations:child_dropped_parent_obligation"
+    );
+
+    let mut removed_budget = child.clone();
+    removed_budget.scope.budget.max_network_read_bytes = None;
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &removed_budget)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:budget.max_network_read_bytes:child_removed_budget_limit"
+    );
+
+    let mut increased_budget = child.clone();
+    increased_budget.scope.budget.max_network_write_bytes = Some(21);
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &increased_budget)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:budget.max_network_write_bytes:child_budget_limit_increased"
+    );
+
+    let mut removed_not_before = child.clone();
+    removed_not_before.scope.time.not_before = None;
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &removed_not_before)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:time.not_before:child_removed_not_before"
+    );
+
+    let mut removed_expires = child.clone();
+    removed_expires.scope.time.expires_at = None;
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &removed_expires)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:time.expires_at:child_removed_expires_at"
+    );
+
+    let mut earlier_scope_start = child.clone();
+    earlier_scope_start.scope.time.not_before = parent
+        .scope
+        .time
+        .not_before
+        .map(|not_before| not_before - time::Duration::seconds(1));
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &earlier_scope_start)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:time.not_before:child_started_earlier"
+    );
+
+    let mut later_scope_expiry = child;
+    later_scope_expiry.scope.time.expires_at = parent
+        .scope
+        .time
+        .expires_at
+        .map(|expires_at| expires_at + time::Duration::seconds(1));
+    assert_eq!(
+        ensure_child_grant_narrows(&parent, &later_scope_expiry)
+            .unwrap_err()
+            .reason_code(),
+        "narrowing_violation:time.expires_at:child_expires_later"
+    );
+}
+
+#[test]
+fn authority_containment_covers_scope_budget_and_data_purpose_denials() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let tenant = TenantId::new();
+    let agent = AgentId::new();
+    let run = RunId::new();
+    let mut grant_scope = base_scope(tenant.clone(), agent.clone(), run.clone());
+    grant_scope.workload_ids = Some(vec![WorkloadId::new()]);
+    grant_scope.device_ids = Some(vec![DeviceId::new()]);
+    grant_scope.data_purposes = Some(vec![DataPurpose::Read]);
+    grant_scope.artifact_ids = Some(vec![ArtifactId::new()]);
+    grant_scope.state_partition_ids = Some(vec![StatePartitionId::new()]);
+    grant_scope.driver_operations = Some(vec![DriverOperationRef {
+        driver: "filesystem".to_string(),
+        operation: "read".to_string(),
+        schema_version: "splendor.driver_operation.v1".to_string(),
+    }]);
+    grant_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(1)),
+        expires_at: Some(now + time::Duration::minutes(10)),
+    };
+    grant_scope.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(5),
+        max_action_duration_ms: Some(10),
+        max_filesystem_read_bytes: Some(100),
+        max_http_requests_per_minute: Some(3),
+        ..Default::default()
+    };
+    grant_scope.network = NetworkScope {
+        egress_schemes: Some(vec!["https".to_string()]),
+        egress_hosts: Some(vec!["api.example.test".to_string()]),
+    };
+    grant_scope.locality = LocalityScope {
+        regions: Some(vec!["eu-west".to_string()]),
+        zones: Some(vec!["zone-a".to_string()]),
+        data_localities: Some(vec!["on_prem".to_string()]),
+    };
+    let capability_grant = grant(
+        issuer,
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        grant_scope,
+        now,
+    );
+
+    let mut request_scope = base_scope(tenant, agent, run);
+    request_scope.workload_ids = Some(vec![WorkloadId::new()]);
+    request_scope.device_ids = Some(vec![DeviceId::new()]);
+    request_scope.data_purposes = Some(vec![DataPurpose::Publication]);
+    request_scope.artifact_ids = Some(vec![ArtifactId::new()]);
+    request_scope.state_partition_ids = Some(vec![StatePartitionId::new()]);
+    request_scope.driver_operations = Some(vec![DriverOperationRef {
+        driver: "filesystem".to_string(),
+        operation: "write".to_string(),
+        schema_version: "splendor.driver_operation.v1".to_string(),
+    }]);
+    request_scope.time = AuthorityTimeScope {
+        not_before: Some(now - time::Duration::minutes(2)),
+        expires_at: Some(now + time::Duration::minutes(20)),
+    };
+    request_scope.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(6),
+        max_action_duration_ms: Some(20),
+        max_network_read_bytes: Some(1),
+        max_http_requests_per_minute: None,
+        ..Default::default()
+    };
+    request_scope.network = NetworkScope {
+        egress_schemes: Some(vec!["http".to_string()]),
+        egress_hosts: Some(vec!["evil.example.test".to_string()]),
+    };
+    request_scope.locality = LocalityScope {
+        regions: Some(vec!["us-east".to_string()]),
+        zones: Some(vec!["zone-b".to_string()]),
+        data_localities: Some(vec!["cloud".to_string()]),
+    };
+    let mut request = capability_request(
+        subject,
+        gateway_action_operation("artifact.create"),
+        request_scope,
+        now,
+    );
+    request.scope.budget.max_actions_per_tick = Some(6);
+
+    let decision = evaluate_capability_request(&[validated(capability_grant)], &request, now);
+    assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
+    for reason in [
+        "workload_ids_not_granted",
+        "device_ids_not_granted",
+        "data_purposes_not_granted",
+        "artifact_ids_not_granted",
+        "state_partition_ids_not_granted",
+        "driver_operations_not_granted",
+        "time.not_before_precedes_grant",
+        "time.expires_at_exceeds_grant",
+        "budget.max_actions_per_tick_exceeds_grant",
+        "budget.max_action_duration_ms_exceeds_grant",
+        "budget.max_network_read_bytes_not_granted",
+        "budget.max_http_requests_per_minute_missing_from_request",
+        "network.egress_schemes_not_granted",
+        "network.egress_hosts_not_granted",
+        "locality.regions_not_granted",
+        "locality.zones_not_granted",
+        "locality.data_localities_not_granted",
+    ] {
+        assert!(
+            decision.reasons.contains(&reason.to_string()),
+            "missing {reason} in {:?}",
+            decision.reasons
+        );
+    }
+
+    let mut data_grant_scope = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+    data_grant_scope.data_purposes = Some(vec![DataPurpose::Publication]);
+    let data_subject = PrincipalId::new();
+    let data_grant = grant(
+        PrincipalId::new(),
+        data_subject.clone(),
+        data_operation(AuthorityVerb::Publish),
+        data_grant_scope.clone(),
+        now,
+    );
+    let mut malformed_request_scope = data_grant_scope;
+    malformed_request_scope.data_purposes = None;
+    let malformed_request = CapabilityRequest {
+        schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+        subject: data_subject,
+        operation: data_operation(AuthorityVerb::Publish),
+        scope: malformed_request_scope,
+        requested_at: now,
+        metadata: Default::default(),
+    };
+    let errors = grant_allows_request(&data_grant, &malformed_request, now).unwrap_err();
+    assert!(errors.iter().any(|error| {
+        error.reason_code() == "data_purposes_missing_from_request"
+            || error.reason_code() == "data_purpose_missing_for_operation"
+    }));
+}
+
+#[test]
+fn authority_compatibility_delegated_builder_and_reason_codes_cover_remaining_branches() {
+    let now = OffsetDateTime::now_utc();
+    let tenant = TenantId::new();
+    let agent = AgentId::new();
+    let delegated = DelegatedAuthority {
+        allowed_actions: vec!["artifact.create".to_string()],
+        allowed_adapters: vec!["artifact-store".to_string()],
+        allowed_permissions: vec!["artifact.write".to_string()],
+    };
+    let built = grant_from_delegated_authority(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: PrincipalId::new(),
+            audience: "daemon:local".to_string(),
+            validation_digest: DIGEST.to_string(),
+            max_delegation_depth: 1,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: tenant,
+            agent_id: agent,
+            run_id: None,
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(1),
+                ..Default::default()
+            },
+        },
+        &delegated,
+        now,
+        now + time::Duration::minutes(10),
+    )
+    .unwrap();
+    assert_eq!(built.grant().operations.len(), 3);
+
+    for (error, expected) in [
+        (
+            AuthorityEvaluationError::InvalidOperation {
+                reason: "x".to_string(),
+            },
+            "invalid_operation:x".to_string(),
+        ),
+        (
+            AuthorityEvaluationError::EmptyIntersection {
+                dimension: "tenant_ids",
+            },
+            "empty_intersection:tenant_ids".to_string(),
+        ),
+        (
+            AuthorityEvaluationError::NarrowingViolation {
+                dimension: "operations",
+                reason: "child_operation_not_in_parent",
+            },
+            "narrowing_violation:operations:child_operation_not_in_parent".to_string(),
+        ),
+    ] {
+        assert_eq!(error.reason_code(), expected);
+    }
 }
 
 #[test]
