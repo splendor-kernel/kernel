@@ -2056,7 +2056,7 @@ fn authority_containment_covers_scope_budget_and_data_purpose_denials() {
         requested_at: now,
         metadata: Default::default(),
     };
-    let errors = grant_allows_request(&data_grant, &malformed_request, now).unwrap_err();
+    let errors = grant_allows_request(&validated(data_grant), &malformed_request, now).unwrap_err();
     assert!(errors.iter().any(|error| {
         error.reason_code() == "data_purposes_missing_from_request"
             || error.reason_code() == "data_purpose_missing_for_operation"
