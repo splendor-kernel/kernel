@@ -6,9 +6,11 @@
 
 use splendor_store::{IdentityHistoryRecord, PrincipalRegistryStore, PrincipalRegistryStoreError};
 use splendor_types::{
-    validate_extension_map, FleetId, IdentityEventId, IdentityLifecycleEvent,
-    IdentityLifecycleEventKind, IdentityRevision, Principal, PrincipalBinding, PrincipalDisplay,
-    PrincipalId, PrincipalKind, PrincipalProofRef, PrincipalStatus, TenantId,
+    is_reserved_extension_key, validate_extension_map, FleetId, IdentityEventId,
+    IdentityLifecycleEvent, IdentityLifecycleEventKind, IdentityLookupKey, IdentityLookupSummary,
+    IdentityQuery, IdentityQueryResult, IdentityQuerySummary, IdentityRevision, Principal,
+    PrincipalBinding, PrincipalDisplay, PrincipalId, PrincipalKind, PrincipalProofRef,
+    PrincipalSnapshot, PrincipalStatus, TenantId,
 };
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -300,6 +302,80 @@ where
         Ok(self.store.current_principal(principal_id)?)
     }
 
+    /// Returns a revision-numbered identity snapshot for one principal.
+    ///
+    /// The returned snapshot is an identity fact only. It does not authorize a
+    /// run, capability, data use, approval, gateway execution, or side effect.
+    pub fn snapshot(
+        &self,
+        principal_id: &PrincipalId,
+        expected_revision: Option<IdentityRevision>,
+    ) -> Result<PrincipalSnapshot, IdentityRegistryError> {
+        validate_principal_id(principal_id)?;
+        let principal = self.current_principal_for_query(principal_id)?;
+        principal_snapshot(principal, OffsetDateTime::now_utc(), expected_revision)
+    }
+
+    /// Executes a local Principal Registry identity query.
+    ///
+    /// Query success returns identity facts only. Callers must still perform
+    /// work-order, authority/capability, data-use, approval, quota, verifier, and
+    /// gateway checks before any privileged operation or side effect.
+    pub fn query(
+        &self,
+        query: IdentityQuery,
+    ) -> Result<IdentityQueryResult, IdentityRegistryError> {
+        let read_at = OffsetDateTime::now_utc();
+        let query_summary = IdentityQuerySummary::from_query(&query);
+        let lookup_summary = query_summary.lookup;
+        let principals = match &query.lookup {
+            IdentityLookupKey::PrincipalId { principal_id } => {
+                validate_principal_id(principal_id)?;
+                vec![self.current_principal_for_query(principal_id)?]
+            }
+            IdentityLookupKey::Binding { binding } => {
+                validate_bindings(std::slice::from_ref(binding))?;
+                let principals = self.store.principals_by_binding(binding)?;
+                match principals.len() {
+                    0 => return Err(IdentityRegistryError::NoMatchingPrincipal { lookup_summary }),
+                    1 => principals,
+                    matches => {
+                        return Err(IdentityRegistryError::AmbiguousIdentityLookup {
+                            lookup_summary,
+                            matches,
+                        })
+                    }
+                }
+            }
+            IdentityLookupKey::OwnerTenant { owner_tenant_id } => {
+                if owner_tenant_id.is_nil() {
+                    return Err(IdentityRegistryError::InvalidBinding {
+                        field: "owner_tenant_id",
+                    });
+                }
+                self.store.principals_by_owner_tenant(owner_tenant_id)?
+            }
+            IdentityLookupKey::OwnerFleet { owner_fleet_id } => {
+                if owner_fleet_id.is_nil() {
+                    return Err(IdentityRegistryError::InvalidBinding {
+                        field: "owner_fleet_id",
+                    });
+                }
+                self.store.principals_by_owner_fleet(owner_fleet_id)?
+            }
+        };
+        let snapshots = principals
+            .into_iter()
+            .map(|principal| principal_snapshot(principal, read_at, query.expected_revision))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(IdentityQueryResult {
+            query_summary,
+            read_at,
+            snapshots,
+        })
+    }
+
     /// Loads immutable principal history.
     pub fn history(
         &self,
@@ -307,6 +383,22 @@ where
     ) -> Result<Vec<IdentityHistoryRecord>, IdentityRegistryError> {
         validate_principal_id(principal_id)?;
         Ok(self.store.history(principal_id)?)
+    }
+
+    fn current_principal_for_query(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<Principal, IdentityRegistryError> {
+        self.store
+            .current_principal(principal_id)
+            .map_err(|error| match error {
+                PrincipalRegistryStoreError::PrincipalNotFound { .. } => {
+                    IdentityRegistryError::PrincipalNotFound {
+                        principal_id: principal_id.clone(),
+                    }
+                }
+                error => IdentityRegistryError::Store(error),
+            })
     }
 
     fn transition_status(
@@ -381,6 +473,32 @@ fn validate_principal_id(principal_id: &PrincipalId) -> Result<(), IdentityRegis
         return Err(IdentityRegistryError::InvalidPrincipalId);
     }
     Ok(())
+}
+
+fn principal_snapshot(
+    principal: Principal,
+    read_at: OffsetDateTime,
+    expected_revision: Option<IdentityRevision>,
+) -> Result<PrincipalSnapshot, IdentityRegistryError> {
+    if let Some(expected_revision) = expected_revision {
+        if principal.revision != expected_revision {
+            return Err(IdentityRegistryError::RevisionConflict {
+                principal_id: principal.principal_id,
+                expected: expected_revision,
+                actual: principal.revision,
+            });
+        }
+    }
+
+    Ok(PrincipalSnapshot {
+        principal_id: principal.principal_id,
+        kind: principal.kind,
+        status: principal.status,
+        revision: principal.revision,
+        owner_tenant_id: principal.owner_tenant_id,
+        owner_fleet_id: principal.owner_fleet_id,
+        read_at,
+    })
 }
 
 fn validate_optional_actor_principal_id(
@@ -525,6 +643,9 @@ fn validate_external_subject_part(
 ) -> Result<(), IdentityRegistryError> {
     if value.trim().is_empty() || value.trim() != value {
         return Err(IdentityRegistryError::InvalidExternalSubject { field });
+    }
+    if contains_credential_material(value) || is_reserved_extension_key(value) {
+        return Err(IdentityRegistryError::CredentialMaterial { field });
     }
     Ok(())
 }
@@ -708,6 +829,20 @@ pub enum IdentityRegistryError {
     /// Nil principal IDs cannot be registered, queried, or mutated.
     #[error("principal_id must not be nil")]
     InvalidPrincipalId,
+    /// Exact principal read could not find a current identity record.
+    #[error("principal was not found: {principal_id}")]
+    PrincipalNotFound { principal_id: PrincipalId },
+    /// Exact binding query did not match a current principal.
+    #[error("no principal matched identity lookup: {lookup_summary:?}")]
+    NoMatchingPrincipal {
+        lookup_summary: IdentityLookupSummary,
+    },
+    /// Defensive integrity failure: an exact lookup matched multiple principals.
+    #[error("ambiguous identity lookup matched {matches} principals: {lookup_summary:?}")]
+    AmbiguousIdentityLookup {
+        lookup_summary: IdentityLookupSummary,
+        matches: usize,
+    },
     /// Nil actor principal IDs cannot be recorded into lifecycle events.
     #[error("actor_principal_id must not be nil")]
     InvalidActorPrincipalId,
@@ -720,8 +855,10 @@ pub enum IdentityRegistryError {
     /// Proof reference was missing a redacted identifier or digest field.
     #[error("invalid proof reference field {field}")]
     InvalidProofRef { field: &'static str },
-    /// Credential-like material was supplied in a principal field that is persisted in records or lifecycle events.
-    #[error("credential-like material is not allowed in principal field {field}")]
+    /// Credential-like or reserved-authority material was supplied in a persisted principal field.
+    #[error(
+        "credential-like or reserved-authority material is not allowed in principal field {field}"
+    )]
     CredentialMaterial { field: &'static str },
     /// The requested lifecycle transition is not legal.
     #[error("invalid principal lifecycle transition for {principal_id}: {from:?} -> {to:?}")]

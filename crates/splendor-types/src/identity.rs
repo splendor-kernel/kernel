@@ -192,6 +192,188 @@ pub struct Principal {
     pub superseded_by: Option<PrincipalId>,
 }
 
+/// Explicit Principal Registry lookup key.
+///
+/// These keys identify registry facts only. A successful lookup does not grant
+/// capability, work-order scope, approval, data use, adapter access, gateway
+/// permission, or any other operational authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IdentityLookupKey {
+    /// Exact principal ID lookup.
+    PrincipalId {
+        /// Principal ID to read.
+        principal_id: PrincipalId,
+    },
+    /// Exact typed binding lookup. External-subject matching is canonicalized by
+    /// storage/authority readers; display strings are never lookup keys.
+    Binding {
+        /// Non-authorizing typed binding lookup key.
+        binding: PrincipalBinding,
+    },
+    /// Deterministic query of principals owned by a tenant coordinate.
+    OwnerTenant {
+        /// Tenant owner coordinate. This is not a permission grant.
+        owner_tenant_id: TenantId,
+    },
+    /// Deterministic query of principals owned by a fleet coordinate.
+    OwnerFleet {
+        /// Fleet owner coordinate. This is not a permission grant.
+        owner_fleet_id: FleetId,
+    },
+}
+
+/// Behavior-free query contract for local Principal Registry reads.
+///
+/// The optional `expected_revision` is a freshness guard for callers that already
+/// know the revision they require. Query success returns identity facts only and
+/// never authorizes a runtime operation by itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityQuery {
+    /// Explicit lookup key; free-text identity search is not a privileged path.
+    pub lookup: IdentityLookupKey,
+    /// Optional expected current revision for fail-closed freshness checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<IdentityRevision>,
+}
+
+/// Redacted binding class for Principal Registry query receipts.
+///
+/// This records the kind of binding used without copying caller-supplied lookup
+/// subjects into query results, audit text, or error displays.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBindingLookupKind {
+    /// Tenant compatibility binding.
+    Tenant,
+    /// Fleet compatibility binding.
+    Fleet,
+    /// Node compatibility binding.
+    Node,
+    /// Runtime instance compatibility binding.
+    Instance,
+    /// Agent compatibility binding.
+    Agent,
+    /// Run compatibility binding.
+    Run,
+    /// External provider subject tuple; raw tuple values are intentionally omitted.
+    ExternalSubject,
+}
+
+/// Redacted lookup summary for Principal Registry query receipts and errors.
+///
+/// This type never carries caller-supplied IDs, provider subjects, credentials,
+/// work-order scopes, approval tokens, gateway hints, or other authority-bearing
+/// material. It is safe to include in results and public error displays.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IdentityLookupSummary {
+    /// Exact principal-id lookup; the actual ID is returned only in snapshots.
+    PrincipalId,
+    /// Exact binding lookup; the raw binding value is not echoed.
+    Binding {
+        /// Binding class that was queried.
+        binding_kind: IdentityBindingLookupKind,
+    },
+    /// Owner tenant query; raw owner ID is not echoed in the query receipt.
+    OwnerTenant,
+    /// Owner fleet query; raw owner ID is not echoed in the query receipt.
+    OwnerFleet,
+}
+
+impl IdentityLookupSummary {
+    /// Produces a redacted summary from an explicit lookup key.
+    pub fn from_lookup_key(lookup: &IdentityLookupKey) -> Self {
+        match lookup {
+            IdentityLookupKey::PrincipalId { .. } => Self::PrincipalId,
+            IdentityLookupKey::Binding { binding } => Self::Binding {
+                binding_kind: IdentityBindingLookupKind::from_binding(binding),
+            },
+            IdentityLookupKey::OwnerTenant { .. } => Self::OwnerTenant,
+            IdentityLookupKey::OwnerFleet { .. } => Self::OwnerFleet,
+        }
+    }
+}
+
+impl IdentityBindingLookupKind {
+    /// Produces a redacted binding class from a binding value.
+    pub fn from_binding(binding: &PrincipalBinding) -> Self {
+        match binding {
+            PrincipalBinding::Tenant { .. } => Self::Tenant,
+            PrincipalBinding::Fleet { .. } => Self::Fleet,
+            PrincipalBinding::Node { .. } => Self::Node,
+            PrincipalBinding::Instance { .. } => Self::Instance,
+            PrincipalBinding::Agent { .. } => Self::Agent,
+            PrincipalBinding::Run { .. } => Self::Run,
+            PrincipalBinding::ExternalSubject { .. } => Self::ExternalSubject,
+        }
+    }
+}
+
+/// Redacted Principal Registry query receipt.
+///
+/// The summary is intentionally lossy. It proves what class of read happened
+/// without echoing raw external subjects, credentials, authority scopes, data
+/// refs, approval tokens, gateway hints, or caller-supplied lookup material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityQuerySummary {
+    /// Redacted lookup class.
+    pub lookup: IdentityLookupSummary,
+    /// Optional freshness guard supplied by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<IdentityRevision>,
+}
+
+impl IdentityQuerySummary {
+    /// Produces a redacted query summary from an input query.
+    pub fn from_query(query: &IdentityQuery) -> Self {
+        Self {
+            lookup: IdentityLookupSummary::from_lookup_key(&query.lookup),
+            expected_revision: query.expected_revision,
+        }
+    }
+}
+
+/// Revision-numbered read snapshot of a principal identity fact.
+///
+/// The snapshot intentionally records identity coordinates and lifecycle status;
+/// it is not a capability, work order, approval, data-use grant, verifier result,
+/// gateway decision, or permission token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrincipalSnapshot {
+    /// Principal read from the registry.
+    pub principal_id: PrincipalId,
+    /// Principal kind at the read revision.
+    pub kind: PrincipalKind,
+    /// Lifecycle status at the read revision. Status alone is not authorization.
+    pub status: PrincipalStatus,
+    /// Current identity revision observed by the read.
+    pub revision: IdentityRevision,
+    /// Tenant owner coordinate, where present; not a permission grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_tenant_id: Option<TenantId>,
+    /// Fleet owner coordinate, where present; not a permission grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_fleet_id: Option<FleetId>,
+    /// Timestamp when the local read snapshot was produced.
+    pub read_at: OffsetDateTime,
+}
+
+/// Result for a Principal Registry identity query.
+///
+/// Returned snapshots are identity facts only. Consumers must still perform
+/// work-order, authority/capability, data-use, approval, quota, verifier, and
+/// gateway checks before any privileged operation or side effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityQueryResult {
+    /// Redacted query summary that produced this result.
+    pub query_summary: IdentityQuerySummary,
+    /// Local timestamp shared by every snapshot in this read result.
+    pub read_at: OffsetDateTime,
+    /// Deterministically ordered matching identity snapshots.
+    pub snapshots: Vec<PrincipalSnapshot>,
+}
+
 /// Principal lifecycle event kind.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum IdentityLifecycleEventKind {

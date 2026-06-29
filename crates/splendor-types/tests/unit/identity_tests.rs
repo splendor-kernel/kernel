@@ -119,3 +119,102 @@ fn identity_lifecycle_event_records_digest_and_evidence_refs_only() {
     assert!(encoded.get("token").is_none());
     round_trip(&event);
 }
+
+#[test]
+fn identity_query_and_snapshot_contracts_are_identity_facts_only() {
+    let now = time::OffsetDateTime::now_utc();
+    let principal_id = PrincipalId::new();
+    let tenant_id = TenantId::new();
+    let query = IdentityQuery {
+        lookup: IdentityLookupKey::PrincipalId {
+            principal_id: principal_id.clone(),
+        },
+        expected_revision: Some(IdentityRevision::new(7)),
+    };
+    let snapshot = PrincipalSnapshot {
+        principal_id: principal_id.clone(),
+        kind: PrincipalKind::Service,
+        status: PrincipalStatus::Suspended,
+        revision: IdentityRevision::new(7),
+        owner_tenant_id: Some(tenant_id.clone()),
+        owner_fleet_id: None,
+        read_at: now,
+    };
+    let result = IdentityQueryResult {
+        query_summary: IdentityQuerySummary::from_query(&query),
+        read_at: now,
+        snapshots: vec![snapshot],
+    };
+
+    let encoded = serde_json::to_value(&result).expect("query result json");
+    assert_eq!(encoded["query_summary"]["lookup"]["kind"], "principal_id");
+    assert_eq!(encoded["snapshots"][0]["status"], "suspended");
+    assert_eq!(encoded["snapshots"][0]["revision"], 7);
+    assert_eq!(
+        encoded["snapshots"][0]["owner_tenant_id"],
+        tenant_id.to_string()
+    );
+    assert!(encoded.get("allowed_permissions").is_none());
+    assert!(encoded.get("capability").is_none());
+    assert!(encoded.get("work_order").is_none());
+    round_trip(&result);
+}
+
+#[test]
+fn identity_query_result_redacts_raw_lookup_material() {
+    let now = time::OffsetDateTime::now_utc();
+    let query = IdentityQuery {
+        lookup: IdentityLookupKey::Binding {
+            binding: PrincipalBinding::ExternalSubject {
+                provider: "OIDC".to_string(),
+                issuer: "issuer.example".to_string(),
+                subject: "Subject-Exact".to_string(),
+                audience: "SPLENDOR-DAEMON".to_string(),
+            },
+        },
+        expected_revision: None,
+    };
+    let result = IdentityQueryResult {
+        query_summary: IdentityQuerySummary::from_query(&query),
+        read_at: now,
+        snapshots: Vec::new(),
+    };
+
+    let encoded = serde_json::to_string(&result).expect("query result json");
+    assert!(encoded.contains("external_subject"));
+    assert!(!encoded.contains("Subject-Exact"));
+    assert!(!encoded.contains("issuer.example"));
+    assert!(!encoded.contains("SPLENDOR-DAEMON"));
+    round_trip(&result);
+}
+
+#[test]
+fn identity_lookup_keys_cover_exact_binding_and_owner_queries() {
+    let binding_query = IdentityQuery {
+        lookup: IdentityLookupKey::Binding {
+            binding: PrincipalBinding::ExternalSubject {
+                provider: "OIDC".to_string(),
+                issuer: "issuer.example".to_string(),
+                subject: "Subject-Exact".to_string(),
+                audience: "SPLENDOR-DAEMON".to_string(),
+            },
+        },
+        expected_revision: None,
+    };
+    let tenant_query = IdentityQuery {
+        lookup: IdentityLookupKey::OwnerTenant {
+            owner_tenant_id: TenantId::new(),
+        },
+        expected_revision: None,
+    };
+    let fleet_query = IdentityQuery {
+        lookup: IdentityLookupKey::OwnerFleet {
+            owner_fleet_id: FleetId::new(),
+        },
+        expected_revision: None,
+    };
+
+    round_trip(&binding_query);
+    round_trip(&tenant_query);
+    round_trip(&fleet_query);
+}
