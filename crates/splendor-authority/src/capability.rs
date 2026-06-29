@@ -69,6 +69,13 @@ pub struct LegacyScopeProfile {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedCapabilityGrant {
     grant: CapabilityGrant,
+    trust: ValidatedGrantTrust,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidatedGrantTrust {
+    LocalProfile,
+    VerifiedSigned,
 }
 
 impl ValidatedCapabilityGrant {
@@ -106,7 +113,7 @@ pub fn evaluate_capability_request(
     let mut denial_reasons = Vec::new();
     for validated_grant in grants {
         let grant = validated_grant.grant();
-        match grant_allows_request(grant, request, now) {
+        match grant_allows_request(validated_grant, request, now) {
             Ok(()) => {
                 return AuthorityDecision {
                     schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
@@ -304,6 +311,42 @@ pub fn grant_from_work_order(
     validate_local_profile_grant(grant)
 }
 
+pub(crate) fn grant_from_verified_signed_work_order(
+    context: CompatibilityGrantContext,
+    work_order: &WorkOrder,
+    validation: CapabilityGrantValidation,
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
+    if validation.validation_kind != CapabilityGrantValidationKind::Signed {
+        return Err(AuthorityEvaluationError::InvalidValidation {
+            reason: "verified_work_order_grant_requires_signed_validation".to_string(),
+        });
+    }
+
+    let mut grant = raw_grant_from_legacy_allowlists(
+        context,
+        LegacyScopeProfile {
+            tenant_id: work_order.tenant_id.clone(),
+            agent_id: work_order.agent_id.clone(),
+            run_id: work_order.run_id.clone(),
+            quotas: budget_from_work_order_quotas(&work_order.quotas),
+        },
+        &work_order.allowed_actions,
+        &work_order.allowed_adapters,
+        &work_order.allowed_permissions,
+        work_order.issued_at,
+        work_order.expires_at,
+        work_order.revocation.clone(),
+        Some(format!("work_order:{}", work_order.work_order_id.as_str())),
+    );
+    grant.scope.locality.data_localities = work_order
+        .placement
+        .data_locality
+        .as_ref()
+        .map(|locality| vec![locality.clone()]);
+    grant.validation = Some(validation);
+    validate_verified_signed_grant(grant)
+}
+
 /// Builds a local compatibility grant from existing delegated authority. This is
 /// a profile builder only; local delegation routing and gateway enforcement remain
 /// separate runtime checks until future integration work is explicitly wired.
@@ -424,16 +467,37 @@ fn raw_grant_from_legacy_allowlists(
 fn validate_local_profile_grant(
     grant: CapabilityGrant,
 ) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
-    validate_grant_shape(&grant)?;
+    validate_grant_shape_with_trust(&grant, ValidatedGrantTrust::LocalProfile)?;
     for operation in &grant.operations {
         validate_authorization_scope_binding("capability_grant.scope", &grant.scope, operation)?;
     }
-    Ok(ValidatedCapabilityGrant { grant })
+    Ok(ValidatedCapabilityGrant {
+        grant,
+        trust: ValidatedGrantTrust::LocalProfile,
+    })
 }
 
 #[cfg(test)]
-fn unchecked_validated_grant_for_tests(grant: CapabilityGrant) -> ValidatedCapabilityGrant {
-    ValidatedCapabilityGrant { grant }
+pub(crate) fn unchecked_validated_grant_for_tests(
+    grant: CapabilityGrant,
+) -> ValidatedCapabilityGrant {
+    ValidatedCapabilityGrant {
+        grant,
+        trust: ValidatedGrantTrust::LocalProfile,
+    }
+}
+
+fn validate_verified_signed_grant(
+    grant: CapabilityGrant,
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
+    validate_grant_shape_with_trust(&grant, ValidatedGrantTrust::VerifiedSigned)?;
+    for operation in &grant.operations {
+        validate_authorization_scope_binding("capability_grant.scope", &grant.scope, operation)?;
+    }
+    Ok(ValidatedCapabilityGrant {
+        grant,
+        trust: ValidatedGrantTrust::VerifiedSigned,
+    })
 }
 
 /// Builds a typed 0.1-compatible gateway action operation.
@@ -472,14 +536,27 @@ pub fn compatibility_permission_operation(name: impl Into<String>) -> AuthorityO
     }
 }
 
+/// Builds a typed workload admission operation used by AUTH-002 issuance bridges.
+pub fn workload_admit_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Workload,
+        resource_kind: AuthorityResourceKind::Workload,
+        verb: AuthorityVerb::Admit,
+        name: None,
+        resource_schema_version: Some("splendor.workload.v1".to_string()),
+    }
+}
+
 fn grant_allows_request(
-    grant: &CapabilityGrant,
+    validated_grant: &ValidatedCapabilityGrant,
     request: &CapabilityRequest,
     now: OffsetDateTime,
 ) -> Result<(), Vec<AuthorityEvaluationError>> {
     let mut errors = Vec::new();
+    let grant = validated_grant.grant();
 
-    if let Err(error) = validate_grant_shape(grant) {
+    if let Err(error) = validate_grant_shape_with_trust(grant, validated_grant.trust) {
         errors.push(error);
         return Err(errors);
     }
@@ -572,6 +649,13 @@ fn validate_request_shape(
 }
 
 fn validate_grant_shape(grant: &CapabilityGrant) -> Result<(), AuthorityEvaluationError> {
+    validate_grant_shape_with_trust(grant, ValidatedGrantTrust::LocalProfile)
+}
+
+fn validate_grant_shape_with_trust(
+    grant: &CapabilityGrant,
+    trust: ValidatedGrantTrust,
+) -> Result<(), AuthorityEvaluationError> {
     if grant.schema_version != CAPABILITY_GRANT_SCHEMA_VERSION {
         return Err(schema_error(
             "capability_grant.schema_version",
@@ -604,7 +688,7 @@ fn validate_grant_shape(grant: &CapabilityGrant) -> Result<(), AuthorityEvaluati
         });
     }
     validate_optional_token("revocation_ref", grant.revocation_ref.as_deref())?;
-    validate_grant_validation(grant.validation.as_ref())?;
+    validate_grant_validation(grant.validation.as_ref(), trust)?;
     validate_extension_map(&grant.metadata, "capability_grant.metadata")?;
     for obligation in &grant.obligations {
         validate_obligation(obligation)?;
@@ -614,6 +698,7 @@ fn validate_grant_shape(grant: &CapabilityGrant) -> Result<(), AuthorityEvaluati
 
 fn validate_grant_validation(
     validation: Option<&CapabilityGrantValidation>,
+    trust: ValidatedGrantTrust,
 ) -> Result<(), AuthorityEvaluationError> {
     let validation = validation.ok_or_else(|| AuthorityEvaluationError::InvalidValidation {
         reason: "missing_grant_validation".to_string(),
@@ -626,8 +711,21 @@ fn validate_grant_validation(
         validation.signature.as_deref(),
     )?;
     if validation.validation_kind == CapabilityGrantValidationKind::Signed {
+        if trust != ValidatedGrantTrust::VerifiedSigned {
+            return Err(AuthorityEvaluationError::InvalidValidation {
+                reason: "signed_grant_verifier_unavailable".to_string(),
+            });
+        }
+        if validation.key_id.is_none() {
+            return Err(AuthorityEvaluationError::InvalidValidation {
+                reason: "verified_signed_grant_missing_key_id".to_string(),
+            });
+        }
+        return Ok(());
+    }
+    if trust == ValidatedGrantTrust::VerifiedSigned {
         return Err(AuthorityEvaluationError::InvalidValidation {
-            reason: "signed_grant_verifier_unavailable".to_string(),
+            reason: "verified_grant_requires_signed_validation".to_string(),
         });
     }
     Ok(())
@@ -1470,7 +1568,7 @@ fn intersect_budget_scope(
     }
 }
 
-fn budget_from_work_order_quotas(quotas: &WorkOrderQuotaPolicy) -> AuthorityBudgetScope {
+pub(crate) fn budget_from_work_order_quotas(quotas: &WorkOrderQuotaPolicy) -> AuthorityBudgetScope {
     AuthorityBudgetScope {
         max_actions_per_tick: quotas.max_actions_per_tick,
         max_action_duration_ms: quotas.max_action_duration_ms,

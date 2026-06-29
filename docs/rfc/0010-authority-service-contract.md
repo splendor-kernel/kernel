@@ -2,22 +2,25 @@
 
 ## Status and Scope
 
-Status: Draft, with a bounded local `AUTH-001` implementation evidence slice.
+Status: Draft, with bounded local `AUTH-001` and `AUTH-002a` implementation
+evidence slices.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
-branch includes only a local Rust evidence slice: behavior-free capability and
+branch includes only local Rust evidence slices: behavior-free capability and
 scope contracts in `splendor-types`, deterministic local evaluation and narrowing
-logic in `splendor-authority`, trusted local profile grant wrapping, and unit
-tests for allow/deny/narrowing behavior.
+logic in `splendor-authority`, trusted local profile grant wrapping, a bounded
+signed work-order to verified capability grant bridge, and unit tests for
+allow/deny/narrowing/issuance behavior.
 
 This slice does not change stable 0.1 runtime enforcement, daemon APIs, OpenAPI,
 TypeScript, Python, gateway verifier wiring, trace formats, state formats, replay
-semantics, fleet behavior, or adapter execution. It does not claim full C02,
-full `AUTH-001`, issue closure, or gold completion.
+semantics, fleet behavior, node admission, workload-controller wiring, or adapter
+execution. It does not claim full C02, full `AUTH-001`, full `AUTH-002`, G60,
+G83, issue closure, or gold completion.
 
-Until exact executable fixtures pass, gold targets `G01`, `G18`, and `G70` remain
-`not_exercised`.
+Until exact executable fixtures pass, gold targets `G01`, `G18`, `G60`, `G70`,
+and `G83` remain `not_exercised`.
 
 ## Binding
 
@@ -25,9 +28,10 @@ Until exact executable fixtures pass, gold targets `G01`, `G18`, and `G70` remai
 | --- | --- | --- |
 | Aggregate issue | #182, `0.2/v2 component: C02 splendor.authority-service - Authority Service` | Aggregate target only; not complete. |
 | Child issue | #238, `AUTH-001 - Define a composable capability and scope model` | Bounded local evidence only; not complete. |
+| Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
-| Gold targets | `G01`, `G18`, `G70` | `not_exercised` until executable fixtures/harnesses pass. |
+| Gold targets | `G01`, `G18`, `G60`, `G70`, `G83` | `not_exercised` until executable fixtures/harnesses pass. |
 
 ## Motivation
 
@@ -56,7 +60,7 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, or revocation propagation service.
 - No universal wildcard or metadata/extension-based authority.
-- No claim that `G01`, `G18`, or `G70` passed.
+- No claim that `G01`, `G18`, `G60`, `G70`, or `G83` passed.
 - No closure claim for #182 or #238.
 
 ## Contract Overview
@@ -89,9 +93,9 @@ The local `splendor-authority::capability` module owns evaluation behavior:
   to a tenant or fleet, and must include operation-specific scope where required
   such as data purpose, device, artifact, state partition, driver operation,
   workload/run, agent, or network host/scheme;
-- `CapabilityGrantValidationKind::Signed` does not authorize in this bounded
-  slice because AUTH-002 signature verification is not implemented; signed grants
-  deny with `signed_grant_verifier_unavailable`;
+- `CapabilityGrantValidationKind::Signed` authorizes only when wrapped by the
+  authority-owned work-order issuance bridge's private verified marker; raw
+  signed grants still deny with `signed_grant_verifier_unavailable`;
 - grant and request `CapabilityScope.time` windows are enforced against decision
   time, and requested time scope must be contained by grant time scope;
 - missing, malformed, expired, revoked, wrong-audience, wrong-subject, or
@@ -105,6 +109,23 @@ The local `splendor-authority::capability` module owns evaluation behavior:
   allowlists into typed local grants without validating signatures or changing
   runtime admission.
 
+The bounded `AUTH-002a` slice adds `splendor-authority::issuance`:
+
+- `issue_work_order_capability_grant` validates a signed `WorkOrderEnvelope`
+  through `WorkOrderValidationContext` and `WorkOrderKeyring` before any grant is
+  built;
+- issuer and subject must be active `Principal` records, the issuer must be
+  tenant-bound and bound to a `work_order_signing_key` proof for the issuance
+  audience, and the subject must bind to the work-order tenant and agent;
+- issuer authority is evaluated with `evaluate_capability_request` for the
+  `Workload/Admit` operation over the work-order tenant, agent, run, expiry,
+  quota, audience, and locality scope;
+- only after an allowed issuer decision does the bridge return a
+  `ValidatedCapabilityGrant` for the work-order action, adapter, and permission
+  allowlists;
+- the verified signed grant path uses a private trust marker so raw signed
+  `CapabilityGrant` values still deny with `signed_grant_verifier_unavailable`.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -114,7 +135,7 @@ The local `splendor-authority::capability` module owns evaluation behavior:
 | No wildcard bypass | `*` in operation names, audiences, network/locality tokens, validation refs, or driver refs is rejected by the evaluator. |
 | No unbound authority | Authorization evaluation denies grants or requests without an explicit audience, tenant/fleet binding, and at least one concrete bounded dimension beyond only time/budget. |
 | Operation-specific scope | Network egress needs scheme and host; device, artifact, state, driver, workload, and agent operations need matching concrete scope dimensions. |
-| No raw signed self-attestation | Signed grants deny until AUTH-002 provides real signature verification. |
+| No raw signed self-attestation | Raw signed grants deny unless produced by the bounded authority-owned work-order issuance bridge. |
 | Scope time enforced | Grant and request scope time windows are enforced and request time cannot broaden grant time. |
 | Data purposes stay separate | `read`, `training_use`, `evaluation_use`, and `publication` are distinct scope values and operation verbs. |
 | Extensions are non-authorizing | Metadata is validated with reserved-key guards and ignored for allow decisions. |
@@ -149,19 +170,23 @@ mode is defined.
 | Delegation narrowing | Authority tests cover child operation/scope/budget/audience broadening denial and monotonic intersections. | `G18/G70` remain `not_exercised`. |
 | Scope binding | Authority tests cover missing audience, missing tenant/fleet, operation-specific scope, audience-only/budget-only scopes, and empty unbound grant/request denial. | `G01` remains `not_exercised`. |
 | Scope time | Authority tests cover expired grant scope time, broader request scope time, missing request time when grant time is constrained, request time present when grant time is unconstrained, and narrowed child scope time expiry. | `G01/G18` remain `not_exercised`. |
-| Signed grants | Authority tests cover signed dummy grants denying with `signed_grant_verifier_unavailable`. | AUTH-002 remains future work. |
+| Signed grants | Authority tests cover signed dummy grants denying with `signed_grant_verifier_unavailable`. | Full AUTH-002 remains future work. |
 | Trusted local profile wrapper | Authority tests cover compatibility builder `Result` success and fail-closed invalid generated profile denial. | Raw external grants remain non-authorizing contracts. |
 | Composite effects | Authority tests cover action-only work-order compatibility grants not authorizing adapter or permission operations. | Not gateway integration evidence. |
 | Non-authorizing metadata | Authority tests cover safe metadata not granting authority and reserved metadata denial. | `G01` remains `not_exercised`. |
 | Compatibility profiles | Authority tests cover local `WorkOrder` allowlist profile mapping without broadening. | Not a full work-order issuance integration claim. |
+| Bounded AUTH-002a issuance | Authority tests cover valid signed work-order grant issuance, raw signed grant denial, unsigned/bad-signature/expired/revoked work-order failures, inactive/revoked principal failures, binding mismatch failures, issuer-authority denial, quota/locality non-broadening, and secret/signature-safe errors. | `G60/G83` remain `not_exercised`; no workload-controller, node, fleet, or gateway integration claim. |
 
 ## Future Implementation Requirements
 
-Future PRs that claim more of C02/AUTH-001 must add executable integration
+Future PRs that claim more of C02/AUTH-001/AUTH-002 must add executable integration
 evidence before changing gold status or closing issues:
 
 - gateway/verifier integration with pre-effect authority decision evidence;
-- work-order issuance/signature validation integration (`AUTH-002`);
+- full work-order issuance/signature validation integration (`AUTH-002`),
+  including workload-controller admission wiring, node-side validation, renewal
+  semantics, one-time/non-renewable grant lifetimes, and executable `G60/G83`
+  fixtures;
 - multi-agent delegation chain and causal message fixtures (`AUTH-003`, `G18`,
   `G70`);
 - obligations/approval workflow integration (`AUTH-004`);
