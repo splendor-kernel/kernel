@@ -2,25 +2,29 @@
 
 ## Status and Scope
 
-Status: Draft, with a bounded local `IDR-001` implementation evidence slice
-allowed when it preserves the non-claims below.
+Status: Draft, with bounded local `IDR-001` and `IDR-005a`
+implementation evidence slices allowed when they preserve the non-claims below.
 
 Scope: 0.2/v2 Principal Registry child RFC for C01,
 `splendor.identity-registry`. This RFC remains a Draft contract. This repository
-branch includes only a bounded local `IDR-001` Rust evidence slice: behavior-free
-principal contracts in `splendor-types`, an in-memory storage/CAS seam in
-`splendor-store`, and lifecycle decisions in `splendor-authority`. That local
-slice does not change stable 0.1 schemas, daemon APIs, OpenAPI schemas, SDKs,
-generated artifacts, Action Gateway behavior, verifier behavior, trace formats,
-state formats, replay semantics, work-order validation, node registration
-behavior, or runtime permission enforcement.
+branch includes only bounded local Rust evidence slices: `IDR-001`
+behavior-free principal contracts in `splendor-types`, an in-memory storage/CAS
+seam in `splendor-store`, lifecycle decisions in `splendor-authority`, and an
+`IDR-005a` query/snapshot seam for exact principal lookup, exact binding lookup,
+owner tenant/fleet queries, redacted query summaries, and revision-numbered
+identity snapshots. Those local slices do not change stable 0.1 schemas, daemon
+APIs, OpenAPI schemas, SDKs, generated artifacts, Action Gateway behavior,
+verifier behavior, trace formats, state formats, replay semantics, work-order validation, node
+registration behavior, registry caching, revocation propagation, offline policy,
+or runtime permission enforcement.
 
 Acceptance of this RFC is required before implementing or claiming a stable,
 durable, daemon-integrated Principal Registry service, proof-verifier adapter
-contract, revocation propagation service, or migration mode. Bounded local
-`IDR-001` slices may implement Rust contracts, storage seams, and lifecycle
-tests as experimental evidence only. Until exact executable gold fixtures pass,
-all C01 gold targets remain `not_exercised`.
+contract, revocation propagation service, bounded cache/watch behavior, or
+migration mode. Bounded local `IDR-001` and `IDR-005a` slices may implement Rust
+contracts, storage seams, lifecycle decisions, query snapshots, and local tests
+as experimental evidence only. Until exact executable gold fixtures pass, all
+C01 gold targets remain `not_exercised`.
 
 This RFC preserves the non-claims in
 `docs/rules/v2/foundation-readiness.md`. It does not claim full C01
@@ -36,7 +40,7 @@ task issues #232 through #237.
 | Item | Binding in this RFC | Evidence status |
 | --- | --- | --- |
 | Aggregate issue | #181, `0.2/v2 component: C01 splendor.identity-registry - Identity Registry` | Contract target only; not closed by this RFC. |
-| Child issues | #232 `IDR-001`, #233 `IDR-002`, #234 `IDR-003`, #235 `IDR-004`, #236 `IDR-005`, #237 `IDR-006` | #232 has bounded local evidence only; no child issue is complete. |
+| Child issues | #232 `IDR-001`, #233 `IDR-002`, #234 `IDR-003`, #235 `IDR-004`, #236 `IDR-005`, #237 `IDR-006` | #232 has bounded local evidence only; #236 has bounded local `IDR-005a` query/snapshot evidence only; no child issue is complete. |
 | Sprint | `V2-IA-1 - Principal Registry` | RFC prerequisite target only. |
 | FR bridge | `FR-0.2-02`: identity, authority, secret-reference, and data-use controls without widening tenant, agent, run, or gateway authority | This RFC covers identity registry planning only. |
 | Component | `splendor.identity-registry` | Contract target only. |
@@ -82,7 +86,8 @@ This RFC strengthens planning for these primitives only:
 
 No side effects are introduced by this RFC. No adapter, daemon endpoint, gateway,
 verifier, policy, work-order, state, trace, replay, Python, TypeScript, OpenAPI,
-or Rust runtime behavior changes in this RFC.
+or runtime-loop behavior changes are introduced by these local Rust contract
+evidence slices.
 
 ## Non-Goals
 
@@ -113,8 +118,10 @@ or Rust runtime behavior changes in this RFC.
 ## Contract Overview
 
 The Principal Registry owns identity existence, proof bindings, lifecycle,
-status, ownership coordinates, rotation, revocation, and identity query. It does
-not grant operational capability merely because a principal exists.
+status, ownership coordinates, rotation, revocation, and identity query. The
+bounded local `IDR-005a` seam makes these identity facts queryable through exact
+principal, exact binding, and owner-coordinate snapshots, but it does not grant
+operational capability merely because a principal exists or is queryable.
 
 Layer meanings remain separate:
 
@@ -133,10 +140,10 @@ or policy TTL.
 
 ## Principal Contract
 
-These records are the bounded local Rust contracts for this experimental
-`IDR-001` slice where implemented in `splendor-types`. They are not stable
-Python, TypeScript, OpenAPI, daemon, store-durability, event-log, or trace
-schemas.
+These records are the bounded local Rust contracts for the experimental
+`IDR-001` and `IDR-005a` slices where implemented in `splendor-types`. They are
+not stable Python, TypeScript, OpenAPI, daemon, store-durability, event-log, or
+trace schemas.
 
 ### `PrincipalId`
 
@@ -332,8 +339,11 @@ Allowed lifecycle event kinds for this RFC:
 
 ### Query Keys
 
-Future registry implementations should support only explicit query keys. Free
-text search is not a privileged identity resolution path.
+The bounded local `IDR-005a` slice supports explicit query keys for exact
+principal lookup, exact typed binding lookup, external-subject lookup with
+canonical provider/issuer/audience matching and exact subject semantics, and
+owner tenant/fleet list queries. Free text search is not a privileged identity
+resolution path.
 
 | Query key | Required result behavior |
 | --- | --- |
@@ -346,6 +356,15 @@ text search is not a privileged identity resolution path.
 | `kind + status` | Operational query only; cannot authorize by itself. |
 | `proof_digest` | Verification/audit lookup only; digest must not be used as a bearer credential. |
 | `migration_source_id` | Compatibility lookup from old typed IDs to principal bindings. Ambiguity fails migration. |
+
+Current local query snapshots expose read time, principal ID, kind, lifecycle
+status, revision, and owner tenant/fleet coordinates. Query success is an
+identity fact only; work orders, capability/data-use decisions, approvals,
+quotas, verifiers, and gateway checks remain required before privileged use.
+Current query results and public read errors intentionally carry a redacted
+lookup summary rather than echoing raw external subjects, caller-supplied lookup
+IDs, credentials, work-order scopes, approval tokens, data refs, or gateway
+hints.
 
 ## Lifecycle State Machine
 
@@ -428,8 +447,9 @@ Rules:
 ## Integration Plan by IDR Task
 
 This section maps catalog tasks to implementation slices. The current branch
-implements only a bounded local `IDR-001` contract/lifecycle/storage evidence
-slice. It does not claim full implementation of any task.
+implements bounded local `IDR-001` contract/lifecycle/storage evidence and a
+bounded local `IDR-005a` query/snapshot seam. It does not claim full
+implementation of any task.
 
 | Task | Future implementation plan | Anti-drift constraints | Required future evidence |
 | --- | --- | --- | --- |
@@ -437,7 +457,7 @@ slice. It does not claim full implementation of any task.
 | `IDR-002` | Add provider-neutral proof verifier and authenticated-principal contracts, then local Unix peer and test mTLS verifiers before optional external adapters. | No OAuth/PKI product in kernel; no bearer strings from action params/prompts; TLS success is authentication only. | Wrong audience, issuer, subject, expired proof, rotated key, revoked principal, stale proof cache, local insecure-mode restrictions. |
 | `IDR-003` | Add node and physical-device ownership/attestation lifecycle using node/instance/device principals and compatibility with existing registration records. | No identity from IP, Kubernetes node name, or serial text alone; no cloud override of local emergency stop; sensor identity is not actuator authority. | Node reimage/new binding, stale lease fencing, quarantine, device/node separation, physical-safety local-veto evidence. |
 | `IDR-004` | Add human and governance-principal lifecycle for approvals, annotations, overrides, and value changes. | No raw biometrics or unnecessary provider payloads; group membership alone grants no capability; self-approval forbidden where policy forbids it. | Two-person value-change denial, stale membership denial, pseudonymous annotation auditability, separation-of-duty evidence. |
-| `IDR-005` | Add exact-ID and binding queries, bounded caches, revision snapshots, watches, revocation fan-out, and freshness behavior by risk class. | No indefinitely stale active status; registry reads must not bottleneck pure computation; partial propagation must be visible. | Revocation during long workload, stale cache denial, partition/offline behavior, propagation acknowledgements. |
+| `IDR-005` | Current bounded local `IDR-005a` slice adds behavior-free `IdentityQuery`/lookup/snapshot contracts, redacted `IdentityQuerySummary` receipts, in-memory exact binding and owner read methods, and authority-owned query validation for nil IDs, stale expected revisions, missing matches, ambiguous duplicate typed bindings, and credential/reserved-authority external-subject material. Future slices must still add bounded caches, watches, revocation push/fan-out, propagation acknowledgements, registry-outage behavior, and freshness behavior by risk class. | Current slice: query success is identity fact only, not authorization; query results and public errors do not echo raw external-subject lookup material; no daemon/auth/gateway/work-order integration; no caches, watches, offline policy, revocation fan-out, or durable DB. Future: no indefinitely stale active status; registry reads must not bottleneck pure computation; partial propagation must be visible. | Current local tests cover exact principal lookup, typed binding lookup, external-subject canonical matching, external-subject redaction/rejection, owner tenant/fleet deterministic snapshots, revoked/suspended status queryability, stale expected revision denial, nil query denial, missing binding/no-match, and ambiguous typed binding denial. Future evidence still requires revocation during long workload, stale cache denial, partition/offline behavior, and propagation acknowledgements. |
 | `IDR-006` | Add deterministic migration from existing tenant, agent, node, instance, and governance issuer IDs to principal records, with dual-read/single-write and later dual-write/registry-required modes behind flags. | No human/service inference from free-form metadata; no historical attribution rewrite; local examples may use explicit synthetic principals. | Historical replay preserves tenant/agent/run IDs, ambiguous mapping fails, migration audit report, old IDs remain visible. |
 
 ## Event, Evidence, Trace, and Replay Expectations
@@ -549,10 +569,10 @@ Compatibility with work orders and gateway:
 ## Validation Matrix
 
 This Draft RFC previously required only repository validation as a docs-only
-change. The bounded local `IDR-001` Rust slice in this branch requires the local
-unit, architecture, workspace, and conformance commands listed below. Future
-integration beyond this slice must provide executable evidence before changing
-any gold status from `not_exercised`.
+change. The bounded local `IDR-001` and `IDR-005a` Rust slices in this branch
+require the local unit, architecture, workspace, and conformance commands listed
+below. Future integration beyond these slices must provide executable evidence
+before changing any gold status from `not_exercised`.
 
 | Area | Required future validation | Gold target status |
 | --- | --- | --- |
@@ -564,6 +584,7 @@ any gold status from `not_exercised`.
 | Fleet/node identity | Registry-backed nodes preserve distinct node/instance/principal identities, signed work and node rejection paths are evidenced. | `G60` remains `not_exercised`. |
 | Physical/device identity | Device and node identities remain distinct; local safety veto and offline fallback remain authoritative. | `G73` and `G74` remain `not_exercised`. |
 | Compromised worker | Invalid signature/checkpoint rejection and quarantine preserve principal/node attribution. | `G83` remains `not_exercised`. |
+| Registry query/snapshot | Exact principal lookup, typed binding lookup, owner queries, revision snapshots, nil/stale/missing/ambiguous denial paths, and suspended/revoked identity-fact reads. | `G88` remains `not_exercised`; this is local query evidence only, not cache/offline/revocation propagation evidence. |
 | Offline/revocation freshness | Expired offline policy or stale identity cache degrades or denies according to pinned safe policy. | `G88` remains `not_exercised`. |
 | Migration | Deterministic migration succeeds for explicit IDs, ambiguous migration fails, old API IDs remain visible, historical replay unchanged. | `G00` and `G03` remain `not_exercised`. |
 
@@ -643,6 +664,6 @@ implementation while preserving Splendor's identity separation, authority
 separation, work-order requirements, gateway enforcement, event/evidence
 integrity, replay safety, migration compatibility, and gold evidence honesty.
 
-It is intentionally not code, not a stable service claim, not a daemon auth
-replacement, not an authority service, not a gateway change, and not gold
-evidence.
+The RFC remains Draft. The bounded local Rust slices are not a stable service
+claim, not a daemon auth replacement, not a gateway change, not cache or
+revocation propagation, not migration mode, and not gold evidence.

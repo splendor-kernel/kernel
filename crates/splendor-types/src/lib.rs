@@ -132,8 +132,10 @@ pub use governance::{
 };
 pub use hash::{ContentHash, HashAlgorithm};
 pub use identity::{
-    IdentityLifecycleEvent, IdentityLifecycleEventKind, IdentityRevision, Principal,
-    PrincipalBinding, PrincipalDisplay, PrincipalKind, PrincipalProofRef, PrincipalStatus,
+    IdentityBindingLookupKind, IdentityLifecycleEvent, IdentityLifecycleEventKind,
+    IdentityLookupKey, IdentityLookupSummary, IdentityQuery, IdentityQueryResult,
+    IdentityQuerySummary, IdentityRevision, Principal, PrincipalBinding, PrincipalDisplay,
+    PrincipalKind, PrincipalProofRef, PrincipalSnapshot, PrincipalStatus,
 };
 pub use ids::{
     ActionId, AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,

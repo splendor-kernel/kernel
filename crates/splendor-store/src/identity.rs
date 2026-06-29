@@ -6,7 +6,8 @@
 //! owned by `splendor-authority`.
 
 use splendor_types::{
-    IdentityLifecycleEvent, IdentityRevision, Principal, PrincipalBinding, PrincipalId,
+    FleetId, IdentityLifecycleEvent, IdentityRevision, Principal, PrincipalBinding, PrincipalId,
+    TenantId,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -50,6 +51,30 @@ pub trait PrincipalRegistryStore: Send + Sync {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<Vec<IdentityHistoryRecord>, PrincipalRegistryStoreError>;
+
+    /// Returns current principals that exactly match a typed binding.
+    ///
+    /// This is a storage-only read: it does not decide lifecycle legality or
+    /// authority. External subject provider/issuer/audience matching is
+    /// canonicalized while subject matching remains exact.
+    fn principals_by_binding(
+        &self,
+        binding: &PrincipalBinding,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError>;
+
+    /// Returns current principals owned by the tenant coordinate in deterministic
+    /// order. This is an identity fact read only, not an authorization decision.
+    fn principals_by_owner_tenant(
+        &self,
+        owner_tenant_id: &TenantId,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError>;
+
+    /// Returns current principals owned by the fleet coordinate in deterministic
+    /// order. This is an identity fact read only, not an authorization decision.
+    fn principals_by_owner_fleet(
+        &self,
+        owner_fleet_id: &FleetId,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError>;
 }
 
 /// In-memory identity registry store for local contract evidence and tests.
@@ -180,6 +205,119 @@ impl PrincipalRegistryStore for InMemoryPrincipalRegistryStore {
             }
         })
     }
+
+    fn principals_by_binding(
+        &self,
+        binding: &PrincipalBinding,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| PrincipalRegistryStoreError::Poisoned)?;
+        let mut matches: Vec<Principal> = state
+            .current
+            .values()
+            .filter(|principal| {
+                principal
+                    .bindings
+                    .iter()
+                    .any(|candidate| binding_matches(candidate, binding))
+            })
+            .cloned()
+            .collect();
+        sort_principals(&mut matches);
+        Ok(matches)
+    }
+
+    fn principals_by_owner_tenant(
+        &self,
+        owner_tenant_id: &TenantId,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| PrincipalRegistryStoreError::Poisoned)?;
+        let mut matches: Vec<Principal> = state
+            .current
+            .values()
+            .filter(|principal| principal.owner_tenant_id.as_ref() == Some(owner_tenant_id))
+            .cloned()
+            .collect();
+        sort_principals(&mut matches);
+        Ok(matches)
+    }
+
+    fn principals_by_owner_fleet(
+        &self,
+        owner_fleet_id: &FleetId,
+    ) -> Result<Vec<Principal>, PrincipalRegistryStoreError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| PrincipalRegistryStoreError::Poisoned)?;
+        let mut matches: Vec<Principal> = state
+            .current
+            .values()
+            .filter(|principal| principal.owner_fleet_id.as_ref() == Some(owner_fleet_id))
+            .cloned()
+            .collect();
+        sort_principals(&mut matches);
+        Ok(matches)
+    }
+}
+
+fn sort_principals(principals: &mut [Principal]) {
+    principals.sort_by_key(|principal| principal.principal_id.to_string());
+}
+
+fn binding_matches(candidate: &PrincipalBinding, query: &PrincipalBinding) -> bool {
+    match (candidate, query) {
+        (
+            PrincipalBinding::Tenant { tenant_id: left },
+            PrincipalBinding::Tenant { tenant_id: right },
+        ) => left == right,
+        (
+            PrincipalBinding::Fleet { fleet_id: left },
+            PrincipalBinding::Fleet { fleet_id: right },
+        ) => left == right,
+        (PrincipalBinding::Node { node_id: left }, PrincipalBinding::Node { node_id: right }) => {
+            left == right
+        }
+        (
+            PrincipalBinding::Instance { instance_id: left },
+            PrincipalBinding::Instance { instance_id: right },
+        ) => left == right,
+        (
+            PrincipalBinding::Agent { agent_id: left },
+            PrincipalBinding::Agent { agent_id: right },
+        ) => left == right,
+        (PrincipalBinding::Run { run_id: left }, PrincipalBinding::Run { run_id: right }) => {
+            left == right
+        }
+        (
+            PrincipalBinding::ExternalSubject {
+                provider: left_provider,
+                issuer: left_issuer,
+                subject: left_subject,
+                audience: left_audience,
+            },
+            PrincipalBinding::ExternalSubject {
+                provider: right_provider,
+                issuer: right_issuer,
+                subject: right_subject,
+                audience: right_audience,
+            },
+        ) => {
+            ExternalSubjectIndexKey::new(left_provider, left_issuer, left_subject, left_audience)
+                == ExternalSubjectIndexKey::new(
+                    right_provider,
+                    right_issuer,
+                    right_subject,
+                    right_audience,
+                )
+        }
+        _ => false,
+    }
 }
 
 impl PrincipalRegistryState {
@@ -193,10 +331,6 @@ impl PrincipalRegistryState {
                 if existing_principal_id != principal_id {
                     return Err(
                         PrincipalRegistryStoreError::DuplicateExternalSubjectBinding {
-                            provider: key.provider.clone(),
-                            issuer: key.issuer.clone(),
-                            subject: key.subject.clone(),
-                            audience: key.audience.clone(),
                             existing_principal_id: existing_principal_id.clone(),
                         },
                     );
@@ -258,7 +392,7 @@ impl ExternalSubjectIndexKey {
         Self {
             provider: provider.trim().to_ascii_lowercase(),
             issuer: issuer.trim().to_ascii_lowercase(),
-            subject: subject.trim().to_string(),
+            subject: subject.to_string(),
             audience: audience.trim().to_ascii_lowercase(),
         }
     }
@@ -284,14 +418,8 @@ pub enum PrincipalRegistryStoreError {
         actual: IdentityRevision,
     },
     /// Another principal already owns the same canonical external subject tuple.
-    #[error("duplicate external subject binding for provider={provider} issuer={issuer} subject={subject} audience={audience}")]
-    DuplicateExternalSubjectBinding {
-        provider: String,
-        issuer: String,
-        subject: String,
-        audience: String,
-        existing_principal_id: PrincipalId,
-    },
+    #[error("duplicate external subject binding for existing principal: {existing_principal_id}")]
+    DuplicateExternalSubjectBinding { existing_principal_id: PrincipalId },
     /// Lifecycle event principal ID differs from the stored principal snapshot.
     #[error("identity lifecycle event principal mismatch for {principal_id}; event had {event_principal_id}")]
     EventPrincipalMismatch {
