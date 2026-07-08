@@ -1,4 +1,5 @@
 use super::*;
+use crate::TASK_RESPONSE_SCHEMA;
 
 fn round_trip<T>(value: &T)
 where
@@ -143,4 +144,96 @@ fn authority_grant_and_decision_contracts_round_trip_without_behavior() {
 
     round_trip(&grant);
     round_trip(&decision);
+}
+
+#[test]
+fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
+    let now = time::OffsetDateTime::now_utc();
+    let parent_grant_id = CapabilityGrantId::new();
+    let parent_agent_id = AgentId::new();
+    let child_agent_id = AgentId::new();
+    let child_run_id = RunId::new();
+    let parent_run_id = RunId::new();
+    let child_subject = PrincipalId::new();
+    let mut scope = CapabilityScope {
+        tenant_ids: Some(vec![TenantId::new()]),
+        agent_ids: Some(vec![child_agent_id.clone()]),
+        run_ids: Some(vec![child_run_id.clone()]),
+        audiences: Some(vec!["daemon:local".to_string()]),
+        budget: AuthorityBudgetScope {
+            max_actions_per_tick: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    scope.time.expires_at = Some(now + time::Duration::minutes(10));
+    let child_capability_grant = CapabilityGrant {
+        schema_version: CAPABILITY_GRANT_SCHEMA_VERSION.to_string(),
+        grant_id: CapabilityGrantId::new(),
+        issuer: PrincipalId::new(),
+        subject: child_subject,
+        parent_grant_ids: vec![parent_grant_id.clone()],
+        operations: vec![action_operation("artifact.create")],
+        scope: scope.clone(),
+        not_before: now,
+        expires_at: now + time::Duration::minutes(10),
+        revocation_ref: Some("revocation:delegation".to_string()),
+        revocation: RevocationStatus::Active,
+        obligations: Vec::new(),
+        max_delegation_depth: 0,
+        validation: Some(CapabilityGrantValidation {
+            validation_kind: CapabilityGrantValidationKind::LocallyValidated,
+            algorithm: "local-delegation-v1".to_string(),
+            key_id: None,
+            digest: "blake3:2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+            signature: None,
+        }),
+        metadata: std::collections::BTreeMap::new(),
+    };
+    let result_contract = DelegationResultContract {
+        schema_version: DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION.to_string(),
+        result_schema: TASK_RESPONSE_SCHEMA.to_string(),
+        requires_response: true,
+        max_result_bytes: Some(4096),
+    };
+    let delegation_grant = DelegationGrant {
+        schema_version: DELEGATION_GRANT_SCHEMA_VERSION.to_string(),
+        parent_grant_id: parent_grant_id.clone(),
+        parent_run_id,
+        parent_agent_id,
+        child_run_id,
+        child_agent_id: child_agent_id.clone(),
+        objective: "summarize scoped artifact".to_string(),
+        role_profile: DelegationRoleProfile::Specialist,
+        allowed_message_schemas: vec![TASK_RESPONSE_SCHEMA.to_string()],
+        allowed_recipient_agent_ids: vec![child_agent_id],
+        result_contract,
+        budget: scope.budget,
+        not_before: now,
+        expires_at: now + time::Duration::minutes(10),
+        remaining_delegation_depth: 0,
+        max_fan_out: 1,
+        child_capability_grant,
+    };
+    let chain = DelegationChain {
+        schema_version: DELEGATION_CHAIN_SCHEMA_VERSION.to_string(),
+        root_grant_id: parent_grant_id,
+        grants: vec![delegation_grant.clone()],
+        max_depth: 1,
+    };
+    let json = serde_json::to_value(&delegation_grant).expect("delegation json");
+
+    assert_eq!(json["schema_version"], DELEGATION_GRANT_SCHEMA_VERSION);
+    assert_eq!(json["role_profile"], "specialist");
+    assert_eq!(
+        json["result_contract"]["schema_version"],
+        DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        json["child_capability_grant"]["schema_version"],
+        CAPABILITY_GRANT_SCHEMA_VERSION
+    );
+    round_trip(&delegation_grant);
+    round_trip(&chain);
 }

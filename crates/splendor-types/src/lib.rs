@@ -66,10 +66,13 @@ pub use authority::{
     AuthorityObligationKind, AuthorityOperation, AuthorityOperationNamespace,
     AuthorityResourceKind, AuthorityTimeScope, AuthorityVerb, CapabilityGrant,
     CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
-    DataPurpose, DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
+    DataPurpose, DelegationChain, DelegationGrant, DelegationResultContract, DelegationRoleProfile,
+    DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
     AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
     CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
-    CAPABILITY_SCOPE_SCHEMA_VERSION, REVOCATION_RECORD_SCHEMA_VERSION,
+    CAPABILITY_SCOPE_SCHEMA_VERSION, DELEGATION_CHAIN_SCHEMA_VERSION,
+    DELEGATION_GRANT_SCHEMA_VERSION, DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION,
+    REVOCATION_RECORD_SCHEMA_VERSION,
 };
 pub use capabilities::{
     is_valid_capability_name, CapabilityDocument, CapabilityValidationError,
