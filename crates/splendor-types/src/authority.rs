@@ -25,6 +25,13 @@ pub const CAPABILITY_REQUEST_SCHEMA_VERSION: &str = "splendor.authority.capabili
 pub const AUTHORITY_DECISION_SCHEMA_VERSION: &str = "splendor.authority.decision.v1";
 /// Canonical schema identifier for authority revocation records.
 pub const REVOCATION_RECORD_SCHEMA_VERSION: &str = "splendor.authority.revocation_record.v1";
+/// Canonical schema identifier for behavior-free delegation grants.
+pub const DELEGATION_GRANT_SCHEMA_VERSION: &str = "splendor.authority.delegation_grant.v1";
+/// Canonical schema identifier for behavior-free delegation chains.
+pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation_chain.v1";
+/// Canonical schema identifier for delegated child result contracts.
+pub const DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION: &str =
+    "splendor.authority.delegation_result_contract.v1";
 
 /// Namespace that owns a typed operation verb.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -398,6 +405,98 @@ pub struct CapabilityGrant {
     /// Non-authorizing metadata only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Role/profile requested for a delegated child agent or workload.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRoleProfile {
+    /// Long-lived child agent with bounded delegated authority.
+    Persistent,
+    /// Short-lived child run for a bounded objective.
+    Ephemeral,
+    /// Event-triggered child agent/run.
+    Trigger,
+    /// Critic child that may evaluate or comment but must not receive actuation authority.
+    Critic,
+    /// Evaluator child that may assess results but must not receive actuation authority.
+    Evaluator,
+    /// Actuator-like child whose side effects remain gateway mediated.
+    Actuator,
+    /// Named specialist child with explicit scoped authority.
+    Specialist,
+}
+
+/// Behavior-free contract describing the expected output from a delegated child.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DelegationResultContract {
+    /// Result-contract schema version.
+    pub schema_version: String,
+    /// Versioned schema the child must use for its terminal result/response.
+    pub result_schema: String,
+    /// Whether the parent expects a response message/result.
+    pub requires_response: bool,
+    /// Optional upper bound for inline result bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_result_bytes: Option<u64>,
+}
+
+/// Behavior-free delegation edge that embeds the narrowed child capability grant.
+///
+/// This record is a serializable contract only. Authority validation, parent-edge
+/// checks, fan-out/depth enforcement, message-schema validation, expiry checks,
+/// role restrictions, and child grant wrapping live in `splendor-authority`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationGrant {
+    /// Delegation-grant schema version.
+    pub schema_version: String,
+    /// Parent capability grant that the child grant narrows from.
+    pub parent_grant_id: CapabilityGrantId,
+    /// Parent run that requested delegated work.
+    pub parent_run_id: RunId,
+    /// Parent agent that requested delegated work.
+    pub parent_agent_id: AgentId,
+    /// Child run created for the delegated objective.
+    pub child_run_id: RunId,
+    /// Child agent receiving the delegated objective.
+    pub child_agent_id: AgentId,
+    /// Scoped objective for the child.
+    pub objective: String,
+    /// Child role/profile.
+    pub role_profile: DelegationRoleProfile,
+    /// Message payload schemas the child may send for this delegation.
+    pub allowed_message_schemas: Vec<String>,
+    /// Agent recipients the child may message for this delegation.
+    pub allowed_recipient_agent_ids: Vec<AgentId>,
+    /// Expected terminal result contract.
+    pub result_contract: DelegationResultContract,
+    /// Delegation-level budget cap, mirrored into the child capability scope.
+    pub budget: AuthorityBudgetScope,
+    /// Earliest time the delegation edge may be used.
+    #[serde(with = "time::serde::rfc3339")]
+    pub not_before: OffsetDateTime,
+    /// Latest time the delegation edge may be used.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    /// Remaining child-grant delegation depth after this edge.
+    pub remaining_delegation_depth: u32,
+    /// Maximum children this parent edge may fan out to.
+    pub max_fan_out: u32,
+    /// Embedded behavior-free child capability grant.
+    pub child_capability_grant: CapabilityGrant,
+}
+
+/// Behavior-free ordered delegation chain evidence container.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationChain {
+    /// Delegation-chain schema version.
+    pub schema_version: String,
+    /// Root capability grant for the chain.
+    pub root_grant_id: CapabilityGrantId,
+    /// Ordered delegation edges from root toward the current child.
+    pub grants: Vec<DelegationGrant>,
+    /// Maximum allowed chain depth for the recorded chain evidence.
+    pub max_depth: u32,
 }
 
 /// Authority evaluation request.

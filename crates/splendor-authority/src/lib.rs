@@ -7,6 +7,7 @@
 //! adapter execution.
 
 mod capability;
+mod delegation;
 mod identity;
 mod issuance;
 
@@ -16,6 +17,10 @@ pub use capability::{
     grant_from_legacy_allowlists, grant_from_work_order, intersect_capability_scopes,
     workload_admit_operation, AuthorityEvaluationError, CompatibilityGrantContext,
     LegacyScopeProfile, ValidatedCapabilityGrant,
+};
+pub use delegation::{
+    issue_delegation_child_grant, DelegationChildGrant, DelegationChildGrantRequest,
+    DelegationGrantError, DelegationValidationContext,
 };
 pub use identity::{IdentityMutation, IdentityRegistry, IdentityRegistryError, RegisterPrincipal};
 pub use issuance::{

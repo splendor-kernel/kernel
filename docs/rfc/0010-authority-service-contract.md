@@ -2,25 +2,26 @@
 
 ## Status and Scope
 
-Status: Draft, with bounded local `AUTH-001` and `AUTH-002a` implementation
-evidence slices.
+Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, and `AUTH-003a`
+implementation evidence slices.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
 branch includes only local Rust evidence slices: behavior-free capability and
 scope contracts in `splendor-types`, deterministic local evaluation and narrowing
 logic in `splendor-authority`, trusted local profile grant wrapping, a bounded
-signed work-order to verified capability grant bridge, and unit tests for
-allow/deny/narrowing/issuance behavior.
+signed work-order to verified capability grant bridge, behavior-free delegation
+grant/chain contracts, an authority-owned local child-grant builder, and unit
+tests for allow/deny/narrowing/issuance/delegation behavior.
 
 This slice does not change stable 0.1 runtime enforcement, daemon APIs, OpenAPI,
 TypeScript, Python, gateway verifier wiring, trace formats, state formats, replay
 semantics, fleet behavior, node admission, workload-controller wiring, or adapter
-execution. It does not claim full C02, full `AUTH-001`, full `AUTH-002`, G60,
-G83, issue closure, or gold completion.
+execution. It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full
+`AUTH-003`, G18, G60, G70, G71, G83, issue closure, or gold completion.
 
 Until exact executable fixtures pass, gold targets `G01`, `G18`, `G60`, `G70`,
-and `G83` remain `not_exercised`.
+`G71`, and `G83` remain `not_exercised`.
 
 ## Binding
 
@@ -29,9 +30,10 @@ and `G83` remain `not_exercised`.
 | Aggregate issue | #182, `0.2/v2 component: C02 splendor.authority-service - Authority Service` | Aggregate target only; not complete. |
 | Child issue | #238, `AUTH-001 - Define a composable capability and scope model` | Bounded local evidence only; not complete. |
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
+| Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder evidence only; not complete. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
-| Gold targets | `G01`, `G18`, `G60`, `G70`, `G83` | `not_exercised` until executable fixtures/harnesses pass. |
+| Gold targets | `G01`, `G18`, `G60`, `G70`, `G71`, `G83` | `not_exercised` until executable fixtures/harnesses pass. |
 
 ## Motivation
 
@@ -60,8 +62,10 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, or revocation propagation service.
 - No universal wildcard or metadata/extension-based authority.
-- No claim that `G01`, `G18`, `G60`, `G70`, or `G83` passed.
-- No closure claim for #182 or #238.
+- No runtime local-delegation manager wiring, gateway integration, trace format
+  change, or revocation propagation for delegated children in `AUTH-003a`.
+- No claim that `G01`, `G18`, `G60`, `G70`, `G71`, or `G83` passed.
+- No closure claim for #182, #238, #239, or #240.
 
 ## Contract Overview
 
@@ -126,6 +130,25 @@ The bounded `AUTH-002a` slice adds `splendor-authority::issuance`:
 - the verified signed grant path uses a private trust marker so raw signed
   `CapabilityGrant` values still deny with `signed_grant_verifier_unavailable`.
 
+The bounded `AUTH-003a` slice adds behavior-free delegation contracts and a local
+authority-owned builder:
+
+- `splendor-types` defines `DelegationGrant`, `DelegationChain`,
+  `DelegationRoleProfile`, `DelegationResultContract`, and schema constants;
+- each delegation grant records parent run/agent, child run/agent, objective,
+  role/profile, allowed message schemas, allowed recipients, result contract,
+  budget, expiry, remaining depth, fan-out cap, and the embedded child
+  `CapabilityGrant`;
+- `splendor-authority::delegation::issue_delegation_child_grant` accepts a
+  parent `ValidatedCapabilityGrant`, typed request, and authority context, then
+  builds a validated local child grant only after explicit parent-edge,
+  issuer/subject, message, result, depth, authority-owned fan-out, liveness,
+  narrowing, parent-obligation propagation, and critic/evaluator role checks
+  pass;
+- the builder reuses `ensure_child_grant_narrows` and
+  `evaluate_capability_request`; raw `CapabilityGrant` payloads remain
+  behavior-free contracts and are not accepted as external authority.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -140,6 +163,9 @@ The bounded `AUTH-002a` slice adds `splendor-authority::issuance`:
 | Data purposes stay separate | `read`, `training_use`, `evaluation_use`, and `publication` are distinct scope values and operation verbs. |
 | Extensions are non-authorizing | Metadata is validated with reserved-key guards and ignored for allow decisions. |
 | Delegation narrows | Child grant operations, scopes, time, budgets, obligations, and delegation depth cannot broaden parent authority. |
+| Messages are not authority | Delegation contracts can list allowed message schemas and recipients, but message payloads, sources, metadata, and task text do not authorize child grants. |
+| Fan-out is authority-owned | Local `AUTH-003a` rejects requested fan-out caps that exceed the authority-owned parent-edge limit before issuing a child grant. |
+| Critic/evaluator roles are non-actuating | Local `AUTH-003a` denial tests reject critic/evaluator delegations carrying actuation, external-effect, or delegation-control operations. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -176,11 +202,12 @@ mode is defined.
 | Non-authorizing metadata | Authority tests cover safe metadata not granting authority and reserved metadata denial. | `G01` remains `not_exercised`. |
 | Compatibility profiles | Authority tests cover local `WorkOrder` allowlist profile mapping without broadening. | Not a full work-order issuance integration claim. |
 | Bounded AUTH-002a issuance | Authority tests cover valid signed work-order grant issuance, raw signed grant denial, unsigned/bad-signature/expired/revoked work-order failures, inactive/revoked principal failures, binding mismatch failures, issuer-authority denial, quota/locality non-broadening, and secret/signature-safe errors. | `G60/G83` remain `not_exercised`; no workload-controller, node, fleet, or gateway integration claim. |
+| Bounded AUTH-003a delegation | Authority tests cover local delegation contract round-trip, positive child grant issuance, parent-obligation preservation, missing/wrong parent edge, issuer mismatch, child subject missing/wrong, overbroad operation/scope/audience/time/budget/depth/fan-out, exhausted depth, fan-out exceeded, bad message schema/recipient, revoked/expired/not-yet-valid parent, and critic/evaluator external-effect/control-plane delegation denial. | `G18/G70/G71` remain `not_exercised`; no local-delegation manager, message routing, gateway, trace, revocation propagation, or gold fixture integration claim. |
 
 ## Future Implementation Requirements
 
-Future PRs that claim more of C02/AUTH-001/AUTH-002 must add executable integration
-evidence before changing gold status or closing issues:
+Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003 must add executable
+integration evidence before changing gold status or closing issues:
 
 - gateway/verifier integration with pre-effect authority decision evidence;
 - full work-order issuance/signature validation integration (`AUTH-002`),
@@ -188,7 +215,9 @@ evidence before changing gold status or closing issues:
   semantics, one-time/non-renewable grant lifetimes, and executable `G60/G83`
   fixtures;
 - multi-agent delegation chain and causal message fixtures (`AUTH-003`, `G18`,
-  `G70`);
+  `G70`, `G71`), including runtime local-delegation manager grant references,
+  child cancellation/revocation propagation, cleanup obligations, and evidence
+  storage;
 - obligations/approval workflow integration (`AUTH-004`);
 - revocation, renewal, offline cache, and stale-authority denial (`AUTH-005`);
 - decision evidence/explainability and replay integration (`AUTH-006`);
@@ -196,8 +225,8 @@ evidence before changing gold status or closing issues:
 
 ## Summary
 
-This RFC and implementation slice introduce a typed, deterministic local
-capability grammar/evaluator foundation while preserving Splendor's kernel
-invariants: no side-effect bypass, fail-closed authority checks, no permission
-laundering, no metadata authority, identity separation, and no gold completion
-claim without executable evidence.
+This RFC and implementation slice introduce typed, deterministic local
+capability, issuance, and bounded delegation foundations while preserving
+Splendor's kernel invariants: no side-effect bypass, fail-closed authority
+checks, no permission laundering, no message or metadata authority, identity
+separation, and no gold completion claim without executable evidence.

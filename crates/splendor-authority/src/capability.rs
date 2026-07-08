@@ -464,7 +464,7 @@ fn raw_grant_from_legacy_allowlists(
     }
 }
 
-fn validate_local_profile_grant(
+pub(crate) fn validate_local_profile_grant(
     grant: CapabilityGrant,
 ) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
     validate_grant_shape_with_trust(&grant, ValidatedGrantTrust::LocalProfile)?;
