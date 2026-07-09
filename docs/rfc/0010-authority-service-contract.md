@@ -20,13 +20,15 @@ bridge that records parent/child grant refs after authority-owned child-grant
 issuance, plus a bounded local gateway obligation verifier that validates
 receipt-bound decisions before the existing adapter invocation path.
 
-This slice does not change daemon APIs, OpenAPI, TypeScript, Python, fleet
-behavior, node admission, workload-controller wiring, child revocation
-propagation, approval workflow execution, MFA/provider integration, gate-engine
-migration, obligation receipt storage, production PKI, external revocation
-introspection, or introduce a new adapter execution path. It adds optional local
-trace/message/run-record authority reference fields for `AUTH-003b` and optional
-gateway action obligation evidence for `AUTH-004b`. It does not claim full C02,
+This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
+Python, fleet behavior, node admission, workload-controller wiring, child
+revocation propagation, approval workflow execution, MFA/provider integration,
+gate-engine migration, obligation receipt storage, production PKI, external
+revocation introspection, or introduce a new adapter execution path. It adds
+optional local trace/message/run-record authority reference fields for
+`AUTH-003b`, optional gateway action obligation evidence for `AUTH-004b`, and a
+matching optional `@splendor/types` primitive field for schema parity. It does
+not claim full C02,
 full `AUTH-001`, full `AUTH-002`, full `AUTH-003`, full `AUTH-004`, G11, G18,
 G43, G60, G70, G71, G75, G79, G83, issue closure, or gold completion.
 
@@ -74,8 +76,8 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, or revocation propagation service.
 - No universal wildcard or metadata/extension-based authority.
-- No daemon/API contract change, TypeScript/Python client update, gold fixture,
-  or revocation propagation for delegated children in `AUTH-003b`.
+- No daemon/API contract change, TypeScript/Python client workflow update, gold
+  fixture, or revocation propagation for delegated children in `AUTH-003b`.
 - No approval workflow engine, MFA provider, gate-engine migration, durable
   evidence store, production PKI, external revocation introspection, or full
   gateway/daemon/client obligation workflow in `AUTH-004a`/`AUTH-004b`.
@@ -247,7 +249,9 @@ the existing gateway path:
   authority obligations;
 - this remains a bounded local verifier only: no approval/MFA/gate receipt
   service, durable evidence store, production PKI, external revocation
-  introspection, daemon/API, TypeScript, Python, or gold fixture is added.
+  introspection, daemon/API, TypeScript client workflow, Python, or gold fixture
+  is added. The TypeScript package carries the optional behavior-free primitive
+  field only to keep canonical schema parity with Rust.
 
 ## Guardrails
 
@@ -318,7 +322,7 @@ records before claiming broader AUTH-004 completion.
 | Bounded AUTH-003a delegation | Authority tests cover local delegation contract round-trip, positive child grant issuance, parent-obligation preservation, missing/wrong parent edge, issuer mismatch, child subject missing/wrong, overbroad operation/scope/audience/time/budget/depth/fan-out, exhausted depth, fan-out exceeded, bad message schema/recipient, revoked/expired/not-yet-valid parent, and critic/evaluator external-effect/control-plane delegation denial. | `G18/G70/G71` remain `not_exercised`; no local-delegation manager, message routing, gateway, trace, revocation propagation, or gold fixture integration claim. |
 | Bounded AUTH-003b local delegation wiring | Kernel tests cover positive local child-run creation with run-bound principal plus parent/child grant refs in run record, `TaskRequest`, trace context, and replay; authority denial before `DelegationRequested`/routing/child insertion; parent principal mismatch denial, including agent re-registration after root-run creation; expired/not-yet-valid parent grant denial at actual decision time; future child grant window denial before routing; missing runtime authority evidence despite forged message payload evidence; and unchanged delegated action denial before gateway/adapter execution. | `G18/G70/G71` remain `not_exercised`; no daemon/API, gateway verifier, revocation propagation, or gold fixture integration claim. |
 | Bounded AUTH-004a obligations | Types tests cover conditional decision and obligation receipt serialization with receipt ID, issuer, audience, revocation source, and validation material. Authority tests cover grants without obligations still returning `Allowed`, grants with obligations returning `Conditional`, raw/forged receipt denial before validation, wrong issuer/audience/key/signature denial, exact validated receipt success, duplicate receipt ID denial, duplicate obligation ID denial, extra receipt denial, changed request/scope/params digest mismatch, missing/wrong obligation ID, wrong decision, wrong subject, wrong kind, expired, revoked, malformed evidence digest, unsupported schema, non-conditional decision denial, and conditional parent delegation denial before child grant creation. | `G11/G43/G75/G79` remain `not_exercised`; no gateway verifier, approval workflow, gate-engine, MFA, data-use, quota, safety, daemon/API, TS/Python, adapter execution, production PKI, or external revocation-introspection claim. |
-| Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, missing evidence requiring intervention before adapter execution, raw/forged receipts denying before adapter execution, changed gateway action digest denying, tampered full-decision digest denying, operation/tenant/agent/run scope mismatch denying, expired/revoked/wrong/extra/duplicate receipts denying, and legacy `ApprovalEvidence` alone not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, durable evidence store, production PKI, external revocation introspection, daemon/API, TS/Python, or full AUTH-004/C02 completion claim. |
+| Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, missing evidence requiring intervention before adapter execution, raw/forged receipts denying before adapter execution, changed gateway action digest denying, tampered full-decision digest denying, operation/tenant/agent/run scope mismatch denying, expired/revoked/wrong/extra/duplicate receipts denying, and legacy `ApprovalEvidence` alone not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. TypeScript schema-parity tests cover the optional primitive field without exposing a daemon/client workflow. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, durable evidence store, production PKI, external revocation introspection, daemon/API/client workflow, Python, or full AUTH-004/C02 completion claim. |
 
 ## Future Implementation Requirements
 
