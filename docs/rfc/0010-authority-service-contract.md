@@ -3,7 +3,7 @@
 ## Status and Scope
 
 Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
-`AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, and `AUTH-005b`
+`AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, `AUTH-005b`, and `AUTH-005c`
 implementation evidence slices.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
@@ -19,16 +19,19 @@ matching helpers, and unit tests for allow/deny/narrowing/issuance/delegation/
 obligation behavior. It also includes a bounded runtime-local delegation-manager
 bridge that records parent/child grant refs after authority-owned child-grant
 issuance, plus a bounded local gateway obligation verifier that validates
-receipt-bound decisions before the existing adapter invocation path, and a local
+receipt-bound decisions before the existing adapter invocation path, a local
 authority-owned revocation snapshot plus offline degraded validated-grant cache
-foundation.
+foundation, and a runtime-local delegated child revocation check that consumes a
+trusted authority snapshot and cancels active child runs through the existing
+local delegation finish path when run-record parent or child grant refs are
+revoked.
 
 This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
-Python, fleet behavior, node admission, workload-controller wiring, child
-revocation propagation, approval workflow execution, MFA/provider integration,
-gate-engine migration, obligation receipt storage, production PKI, external
-revocation introspection, lease renewal, revocation watches, incident-controller
-integration, or introduce a new adapter execution path. It adds optional local
+Python, fleet behavior, node admission, workload-controller wiring, approval
+workflow execution, MFA/provider integration, gate-engine migration, obligation
+receipt storage, production PKI, external revocation introspection, production
+lease renewal, revocation watches, incident-controller integration, or introduce
+a new adapter execution path. It adds optional local
 trace/message/run-record authority reference fields for `AUTH-003b`, optional
 gateway action obligation evidence for `AUTH-004b`, and a matching optional
 `@splendor/types` primitive field for schema parity. `AUTH-005a` adds no public
@@ -37,7 +40,9 @@ schema churn; it exposes authority-crate Rust types/functions that cache only
 fail closed under missing/stale/expired cache or disconnected high-risk requests.
 `AUTH-005b` adds no public schema churn; it exposes authority-crate Rust
 types/functions for local renewal preflight with explicit nonce/current digest,
-renewable policy, and lifetime caps.
+renewable policy, and lifetime caps. `AUTH-005c` adds no public schema churn; it
+adds only a local kernel API that consumes an already trusted `RevocationSnapshot`
+and existing run-record authority evidence.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, G11, G18, G43, G60, G70, G71, G73, G75, G79,
 G83, G88, issue closure, or gold completion.
@@ -55,7 +60,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
 | Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder plus `AUTH-003b` runtime-local manager wiring evidence only; not complete. |
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
-| Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache plus `AUTH-005b` local renewal preflight evidence only; no production lease renewal or production revocation service. |
+| Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
@@ -90,12 +95,16 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   external introspection, or incident-controller quarantine workflow.
 - No universal wildcard or metadata/extension-based authority.
 - No daemon/API contract change, TypeScript/Python client workflow update, gold
-  fixture, or revocation propagation for delegated children in `AUTH-003b`.
+  fixture, production revocation watch, external introspection, node/fleet
+  propagation acknowledgement, policy-cache consumption, or incident-controller
+  quarantine flow for delegated children.
 - No approval workflow engine, MFA provider, gate-engine migration, durable
   evidence store, production PKI, external revocation introspection, or full
   gateway/daemon/client obligation workflow in `AUTH-004a`/`AUTH-004b`.
 - No full `AUTH-005` completion claim; `AUTH-005a` is only local Rust cache and
-  revocation snapshot behavior over already validated grants.
+  revocation snapshot behavior over already validated grants, `AUTH-005b` is only
+  local renewal preflight, and `AUTH-005c` is only local manager consumption of a
+  trusted snapshot for already-running local child runs.
 - No claim that `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`,
   `G79`, `G83`, or `G88` passed.
 - No closure claim for #182, #238, #239, #240, #241, #242, #243, or #244.
@@ -330,6 +339,29 @@ The bounded `AUTH-005b` slice adds local renewal preflight behavior in
   gateway/node/fleet/policy-cache consumption, incident-controller integration,
   delegated child revocation propagation, or gold fixture is added.
 
+The bounded `AUTH-005c` slice wires local child revocation propagation into
+`splendor-kernel::LocalDelegationManager`:
+
+- `RevocationSnapshot` exposes an authority-owned helper for checking whether a
+  trusted snapshot contains a revoked `CapabilityGrantId`, without moving
+  snapshot freshness/expiry evaluation into the kernel;
+- `LocalDelegationManager::cancel_child_if_authority_revoked` consumes a trusted
+  `RevocationSnapshot`, reads the child run record's
+  `LocalDelegationAuthorityEvidence`, and cancels only active child runs whose
+  recorded parent or child grant ID appears as revoked in the snapshot;
+- cancellation uses the existing `finish_child_run` path with
+  `TaskResponseStatus::Cancelled` and `TaskFailure` code
+  `authority_grant_revoked`, `retryable=false`, so existing task response,
+  `ChildRunFailed` trace, and replay behavior carry the evidence;
+- unrelated revocations and terminal child runs are deterministic no-ops and do
+  not emit duplicate responses or trace events;
+- message payload grant refs remain non-authorizing and are not inspected for
+  revocation authority;
+- this remains local snapshot consumption only: no production revocation watch,
+  external introspection, daemon/API/client workflow, gateway verifier, node/fleet
+  policy-cache integration, incident-controller quarantine, cleanup obligations,
+  durable evidence store, or gold fixture is added.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -360,6 +392,7 @@ The bounded `AUTH-005b` slice adds local renewal preflight behavior in
 | Renewal is explicit local preflight | Local `AUTH-005b` renewal requires an existing cached validated grant, a proposed validated grant, an explicit nonce, matching current grant digest/revision, and renewable local policy; raw grants are never accepted as renewed authority. |
 | Renewal cannot hide authority change | Local `AUTH-005b` denies proposed renewed grants that change grant identity, issuer, subject, operations, scope/audience, revocation state/ref, obligations, parent grants, validation kind, delegation depth, or start time. |
 | Renewal lifetimes are bounded | Local `AUTH-005b` enforces maximum renewal lifetime and maximum offline cache lifetime, and renewed cache expiry cannot outlive renewed grant expiry. |
+| Child revocation uses run-record evidence | Local `AUTH-005c` cancels active local child runs only from authority-issued run-record parent/child grant refs checked against a trusted `RevocationSnapshot`; message payloads, metadata, and forged refs remain non-authorizing. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -386,12 +419,15 @@ reason codes; it does not add event names, durable revocation-watch events, or
 trace sync behavior. `AUTH-005b` returns structured local renewal results with
 stable nonce/current-revision/cache/snapshot/change/lifetime reason codes; it
 does not add event names, durable lease/nonce events, or trace sync behavior.
-Replay remains inspect-only: it uses recorded parent/child grant refs and stable
-denial reasons without re-running authority evaluation, gateways, adapters, child
-runs, revocation checks, receipt owning services, renewal preflights, offline
-cache refresh, or other side effects. Future durable evidence-store and
-trace-schema work must persist authority decisions, cache freshness,
-revocation-snapshot identity, renewal nonce/current-revision evidence, and
+`AUTH-005c` does not add event names or trace-schema fields; revoked local child
+runs use existing task-response and `ChildRunFailed` trace behavior from the
+local delegation finish path. Replay remains inspect-only: it uses recorded
+parent/child grant refs and stable denial or cancellation reasons without
+re-running authority evaluation, gateways, adapters, child runs, revocation
+checks, receipt owning services, renewal preflights, offline cache refresh, or
+other side effects. Future durable evidence-store and trace-schema work must
+persist authority decisions, cache freshness, revocation-snapshot identity,
+renewal nonce/current-revision evidence, child cancellation evidence, and
 receipt-verification evidence as first-class evidence records before claiming
 broader AUTH-004/AUTH-005 completion.
 
@@ -416,6 +452,7 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, missing evidence requiring intervention before adapter execution, raw/forged receipts denying before adapter execution, changed gateway action digest denying, tampered full-decision digest denying, operation/tenant/agent/run scope mismatch denying, expired/revoked/wrong/extra/duplicate receipts denying, and legacy `ApprovalEvidence` alone not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. TypeScript schema-parity tests cover the optional primitive field without exposing a daemon/client workflow. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, durable evidence store, production PKI, external revocation introspection, daemon/API/client workflow, Python, or full AUTH-004/C02 completion claim. |
 | Bounded AUTH-005a local revocation/cache | Authority tests cover revoked `RevocationRecord` denial over a cached active grant, missing/stale/expired/future-dated cache denial, missing/stale/future-dated revocation snapshot denial, disconnected explicit low-risk data and device-sensing read allow within cached scope/TTL, disconnected scope mismatch denial, unsupported offline read denial, disconnected high-risk device/change/agent-delegation denial or intervention only after matching cached authority, offline TTL expiry denial, and cache APIs that accept validated grants without extending grant expiry. | `G73/G88` remain `not_exercised`; no production revocation service, revocation watches, external introspection, lease renewal, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005b local renewal preflight | Authority tests cover positive renewal from a fresh cached validated grant and active snapshot with matching nonce/current digest, nonce missing/mismatch denial, current digest mismatch denial, missing/non-renewable policy denial, revoked grant/snapshot denial, missing/stale/future-dated snapshot denial, stale/expired/future-dated cached grant denial, changed grant identity/issuer/subject/operations/scope/audience/revocation/obligation/parent/validation-kind/delegation-depth/start-time denial, maximum renewal/offline lifetime denial, and renewed cache expiry not outliving renewed grant expiry. | `G73/G88` remain `not_exercised`; no durable nonce/replay store, production lease service, revocation watches, external introspection, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
+| Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover the snapshot revoked-grant-ID helper. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
 
 ## Future Implementation Requirements
 
@@ -432,16 +469,18 @@ issues:
   fixtures;
 - multi-agent delegation chain and causal message fixtures (`AUTH-003`, `G18`,
   `G70`, `G71`), including executable gold coverage for the local delegation
-  manager bridge, child cancellation/revocation propagation, cleanup obligations,
-  durable evidence storage, and gateway authority-verifier integration;
+  manager bridge beyond the bounded local AUTH-003b/AUTH-005c evidence, cleanup
+  obligations, durable evidence storage, and gateway authority-verifier
+  integration;
 - obligations/approval workflow integration (`AUTH-004`) beyond the bounded local
   gateway verifier, including owning approval/MFA/gate receipt services,
   re-evaluation after obligation satisfaction, durable evidence/trace schema, and
   executable `G11/G43/G75/G79` fixtures;
 - full revocation records/watches, renewal protocols, offline cache consumption,
-  delegated child revocation propagation, stale-authority evidence, and executable
-  `G73/G88` fixtures beyond the bounded local AUTH-005a cache/snapshot foundation
-  and AUTH-005b renewal preflight (`AUTH-005`);
+  production delegated child revocation propagation, stale-authority evidence, and
+  executable `G73/G88` fixtures beyond the bounded local AUTH-005a cache/snapshot
+  foundation, AUTH-005b renewal preflight, and AUTH-005c local child cancellation
+  bridge (`AUTH-005`);
 - decision evidence/explainability and replay integration (`AUTH-006`);
 - adversarial/property suites (`AUTH-007`).
 
@@ -449,9 +488,9 @@ issues:
 
 This RFC and implementation slice introduce typed, deterministic local
 capability, issuance, bounded delegation, conditional obligation receipt, local
-revocation/offline cached-grant, and renewal-preflight foundations plus
-runtime-local delegation grant-reference wiring while preserving Splendor's
-kernel invariants: no side-effect bypass, fail-closed authority checks, no
-permission laundering, no message or metadata authority, identity separation,
-offline cache and renewal are not ambient authority, and no gold completion claim
-without executable evidence.
+revocation/offline cached-grant, renewal-preflight, and delegated child
+revocation foundations plus runtime-local delegation grant-reference wiring while
+preserving Splendor's kernel invariants: no side-effect bypass, fail-closed
+authority checks, no permission laundering, no message or metadata authority,
+identity separation, offline cache and renewal are not ambient authority, and no
+gold completion claim without executable evidence.

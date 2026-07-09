@@ -198,6 +198,17 @@ fn revoked_record(grant_id: CapabilityGrantId, now: OffsetDateTime) -> Revocatio
     }
 }
 
+fn active_record(grant_id: CapabilityGrantId) -> RevocationRecord {
+    RevocationRecord {
+        schema_version: REVOCATION_RECORD_SCHEMA_VERSION.to_string(),
+        revocation_id: AuthorityRevocationId::new(),
+        grant_id,
+        revocation_ref: Some("revocation:local-authority-cache".to_string()),
+        status: RevocationStatus::Active,
+        revoked_at: None,
+    }
+}
+
 fn connected_policy() -> OfflineAuthorityPolicy {
     OfflineAuthorityPolicy::connected(Duration::minutes(20)).expect("connected policy")
 }
@@ -244,6 +255,26 @@ fn revocation_snapshot_denies_cached_grant_even_when_payload_is_active() {
     assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
     assert_eq!(decision.reasons, vec![REASON_AUTHORITY_GRANT_REVOKED]);
     assert!(decision.matched_grant_ids.is_empty());
+}
+
+#[test]
+fn revocation_snapshot_reports_revoked_grant_ids_only() {
+    let fixture = Fixture::new();
+    let revoked_grant_id = CapabilityGrantId::new();
+    let active_grant_id = CapabilityGrantId::new();
+    let snapshot = RevocationSnapshot::with_max_age(
+        vec![
+            revoked_record(revoked_grant_id.clone(), fixture.now),
+            active_record(active_grant_id.clone()),
+        ],
+        fixture.now,
+        Duration::minutes(30),
+    )
+    .expect("revocation snapshot");
+
+    assert!(snapshot.revokes_grant_id(&revoked_grant_id));
+    assert!(!snapshot.revokes_grant_id(&active_grant_id));
+    assert!(!snapshot.revokes_grant_id(&CapabilityGrantId::new()));
 }
 
 #[test]

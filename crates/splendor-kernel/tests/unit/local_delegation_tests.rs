@@ -4,11 +4,12 @@ use crate::{
 };
 use splendor_authority::{
     grant_from_legacy_allowlists, CompatibilityGrantContext, LegacyScopeProfile,
-    ValidatedCapabilityGrant,
+    RevocationSnapshot, ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
 };
 use splendor_types::{
-    AuthorityBudgetScope, CapabilityGrantId, PrincipalId, RevocationStatus, TraceEvent,
-    TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    AuthorityBudgetScope, AuthorityRevocationId, CapabilityGrantId, PrincipalId, RevocationRecord,
+    RevocationStatus, TraceEvent, REVOCATION_RECORD_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    TASK_RESPONSE_SCHEMA,
 };
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration as StdDuration;
@@ -276,6 +277,67 @@ fn authority_input(
     );
     authority.max_fan_out = 3;
     authority
+}
+
+fn revocation_snapshot_for(grant_id: CapabilityGrantId) -> RevocationSnapshot {
+    let now = OffsetDateTime::now_utc();
+    RevocationSnapshot::with_max_age(
+        vec![RevocationRecord {
+            schema_version: REVOCATION_RECORD_SCHEMA_VERSION.to_string(),
+            revocation_id: AuthorityRevocationId::new(),
+            grant_id,
+            revocation_ref: Some("revocation:local-delegation-test".to_string()),
+            status: RevocationStatus::Revoked {
+                reason: "operator_revoked".to_string(),
+            },
+            revoked_at: Some(now),
+        }],
+        now,
+        time::Duration::minutes(30),
+    )
+    .expect("revocation snapshot")
+}
+
+struct CreatedDelegation {
+    manager: LocalDelegationManager,
+    parent: AgentContext,
+    child: AgentContext,
+    parent_run_id: RunId,
+    child_run_id: RunId,
+    parent_runtime: KernelRuntime,
+    child_runtime: KernelRuntime,
+    parent_events: Arc<Mutex<Vec<TraceEvent>>>,
+    child_events: Arc<Mutex<Vec<TraceEvent>>>,
+    authority_evidence: LocalDelegationAuthorityEvidence,
+}
+
+fn create_delegation_for_revocation() -> CreatedDelegation {
+    let (manager, parent, child, parent_principal, child_principal, parent_run_id, child_run_id) =
+        setup_manager();
+    let (parent_runtime, parent_events) = runtime_for(parent_run_id.clone());
+    let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let request = delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
+    let authority = authority_input(&parent_principal, &child_principal, &parent, &request);
+    let child_run = manager
+        .create_child_run(&parent_runtime, &child_runtime, request, authority)
+        .expect("child run created");
+    let authority_evidence = child_run
+        .run
+        .authority_evidence
+        .clone()
+        .expect("authority evidence");
+    CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        authority_evidence,
+    }
 }
 
 fn count_events(events: &[TraceEvent], predicate: impl Fn(&TraceEventKind) -> bool) -> usize {
@@ -905,6 +967,278 @@ fn failed_child_run_returns_structured_task_response_and_replays_causality() {
     assert_eq!(replay.delegations[0].child_run_id, child_run_id);
     assert_eq!(replay.messages.len(), 2, "request and response messages");
     assert_eq!(replay.failures.len(), 2, "child and parent failure traces");
+}
+
+#[test]
+fn revoked_child_grant_cancels_active_child_and_replays_failure() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        authority_evidence,
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds")
+        .expect("child grant revocation cancels child run");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("cancellation failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_GRANT_REVOKED);
+    assert!(!failure.retryable);
+    assert!(failure.trace_id.is_some());
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+    assert!(manager
+        .router()
+        .outbox(&child.agent_id, &parent_run_id)
+        .expect("child response outbox")
+        .iter()
+        .any(|envelope| envelope.message.schema == TASK_RESPONSE_SCHEMA));
+    assert!(manager
+        .router()
+        .inbox(&parent.agent_id, &parent_run_id)
+        .expect("parent response inbox")
+        .iter()
+        .any(|envelope| envelope.message.schema == TASK_RESPONSE_SCHEMA));
+
+    let mut events = parent_events.lock().expect("parent events").clone();
+    events.extend(child_events.lock().expect("child events").clone());
+    let replay = replay_local_delegations(&events);
+    assert_eq!(replay.delegations.len(), 1);
+    assert_eq!(replay.failures.len(), 2, "child and parent failure traces");
+    assert!(replay
+        .failures
+        .iter()
+        .all(|failure| failure.code == REASON_AUTHORITY_GRANT_REVOKED && !failure.retryable));
+}
+
+#[test]
+fn revoked_parent_grant_cancels_active_child() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.parent_capability_grant_id);
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds")
+        .expect("parent grant revocation cancels child run");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("cancellation failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_GRANT_REVOKED);
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn unrelated_revocation_is_noop_and_child_remains_running() {
+    let CreatedDelegation {
+        manager,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        parent_events,
+        child_events,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(CapabilityGrantId::new());
+    let parent_failure_count =
+        count_events(&parent_events.lock().expect("parent events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        });
+    let child_failure_count = count_events(&child_events.lock().expect("child events"), |kind| {
+        matches!(kind, TraceEventKind::ChildRunFailed { .. })
+    });
+    let response_outbox_len = manager
+        .router()
+        .outbox(&child.agent_id, &parent_run_id)
+        .expect("child response outbox")
+        .len();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("revocation check succeeds");
+
+    assert!(response.is_none());
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Running
+    );
+    assert_eq!(
+        manager
+            .router()
+            .outbox(&child.agent_id, &parent_run_id)
+            .expect("child response outbox")
+            .len(),
+        response_outbox_len
+    );
+    assert_eq!(
+        count_events(&parent_events.lock().expect("parent events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        }),
+        parent_failure_count
+    );
+    assert_eq!(
+        count_events(&child_events.lock().expect("child events"), |kind| {
+            matches!(kind, TraceEventKind::ChildRunFailed { .. })
+        }),
+        child_failure_count
+    );
+}
+
+#[test]
+fn terminal_children_are_not_cancelled_again_by_revocation_snapshot() {
+    fn assert_terminal_noop(
+        terminalize: impl FnOnce(&LocalDelegationManager, &KernelRuntime, &KernelRuntime, &RunId),
+        expected_status: LocalRunStatus,
+    ) {
+        let CreatedDelegation {
+            manager,
+            child,
+            parent_run_id,
+            child_run_id,
+            parent_runtime,
+            child_runtime,
+            parent_events,
+            child_events,
+            authority_evidence,
+            ..
+        } = create_delegation_for_revocation();
+        terminalize(&manager, &parent_runtime, &child_runtime, &child_run_id);
+        let parent_failure_count =
+            count_events(&parent_events.lock().expect("parent events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            });
+        let child_failure_count =
+            count_events(&child_events.lock().expect("child events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            });
+        let response_outbox_len = manager
+            .router()
+            .outbox(&child.agent_id, &parent_run_id)
+            .expect("child response outbox")
+            .len();
+        let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+        let response = manager
+            .cancel_child_if_authority_revoked(
+                &parent_runtime,
+                &child_runtime,
+                &child_run_id,
+                &revocations,
+            )
+            .expect("terminal child revocation check is a no-op");
+
+        assert!(response.is_none());
+        assert_eq!(
+            manager.run(&child_run_id).expect("child record").status,
+            expected_status
+        );
+        assert_eq!(
+            manager
+                .router()
+                .outbox(&child.agent_id, &parent_run_id)
+                .expect("child response outbox")
+                .len(),
+            response_outbox_len
+        );
+        assert_eq!(
+            count_events(&parent_events.lock().expect("parent events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            }),
+            parent_failure_count
+        );
+        assert_eq!(
+            count_events(&child_events.lock().expect("child events"), |kind| {
+                matches!(kind, TraceEventKind::ChildRunFailed { .. })
+            }),
+            child_failure_count
+        );
+    }
+
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            manager
+                .complete_child_run(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    serde_json::json!({"summary_ref": "artifact:summary"}),
+                )
+                .expect("child completed");
+        },
+        LocalRunStatus::Completed,
+    );
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            manager
+                .fail_child_run(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    TaskFailure::new("specialist_failed", "specialist failed", false),
+                )
+                .expect("child failed");
+        },
+        LocalRunStatus::Failed,
+    );
+    assert_terminal_noop(
+        |manager, parent_runtime, child_runtime, child_run_id| {
+            let evidence = manager
+                .run(child_run_id)
+                .expect("child record")
+                .authority_evidence
+                .expect("authority evidence");
+            let revocations = revocation_snapshot_for(evidence.child_capability_grant_id);
+            manager
+                .cancel_child_if_authority_revoked(
+                    parent_runtime,
+                    child_runtime,
+                    child_run_id,
+                    &revocations,
+                )
+                .expect("child cancelled")
+                .expect("first revocation cancels child");
+        },
+        LocalRunStatus::Cancelled,
+    );
 }
 
 #[test]

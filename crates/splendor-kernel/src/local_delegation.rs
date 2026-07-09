@@ -13,7 +13,7 @@ use crate::{
 use splendor_authority::{
     compatibility_permission_operation, gateway_action_operation, gateway_adapter_operation,
     issue_delegation_child_grant, DelegationChildGrantRequest, DelegationValidationContext,
-    ValidatedCapabilityGrant,
+    RevocationSnapshot, ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
 };
 use splendor_types::{
     AgentId, AuthorityBudgetScope, AuthorityOperation, CapabilityGrantId, CapabilityScope,
@@ -681,6 +681,54 @@ impl LocalDelegationManager {
         )
     }
 
+    /// Cancels an active child run when its recorded parent or child capability
+    /// grant has been revoked by the trusted local authority snapshot.
+    ///
+    /// This consumes run-record authority evidence only. Message payloads and
+    /// metadata remain non-authorizing and are not inspected. Unrelated
+    /// revocations and terminal child runs are deterministic no-ops.
+    pub fn cancel_child_if_authority_revoked(
+        &self,
+        parent_recorder: &dyn MessageTraceRecorder,
+        child_recorder: &dyn MessageTraceRecorder,
+        child_run_id: &RunId,
+        revocations: &RevocationSnapshot,
+    ) -> Result<Option<LocalTaskResponse>, LocalDelegationError> {
+        let _lifecycle = self.lock_lifecycle()?;
+        ensure_recorder_run(child_recorder, child_run_id)?;
+        let should_cancel = {
+            let state = self.lock_state()?;
+            let child = state
+                .runs
+                .get(child_run_id)
+                .ok_or_else(|| LocalDelegationError::UnknownChildRun(child_run_id.clone()))?;
+            if child.status.is_terminal() || child.response_message_id.is_some() {
+                return Ok(None);
+            }
+            child.authority_evidence.as_ref().is_some_and(|evidence| {
+                revocations.revokes_grant_id(&evidence.parent_capability_grant_id)
+                    || revocations.revokes_grant_id(&evidence.child_capability_grant_id)
+            })
+        };
+        if !should_cancel {
+            return Ok(None);
+        }
+
+        self.finish_child_run_with_lifecycle(
+            parent_recorder,
+            child_recorder,
+            child_run_id,
+            TaskResponseStatus::Cancelled,
+            None,
+            Some(TaskFailure::new(
+                REASON_AUTHORITY_GRANT_REVOKED,
+                "local delegation authority grant was revoked",
+                false,
+            )),
+        )
+        .map(Some)
+    }
+
     /// Cancels a parent run and records the cancellation trace event.
     pub fn cancel_parent_run(
         &self,
@@ -727,6 +775,25 @@ impl LocalDelegationManager {
         failure: Option<TaskFailure>,
     ) -> Result<LocalTaskResponse, LocalDelegationError> {
         let _lifecycle = self.lock_lifecycle()?;
+        self.finish_child_run_with_lifecycle(
+            parent_recorder,
+            child_recorder,
+            child_run_id,
+            status,
+            output,
+            failure,
+        )
+    }
+
+    fn finish_child_run_with_lifecycle(
+        &self,
+        parent_recorder: &dyn MessageTraceRecorder,
+        child_recorder: &dyn MessageTraceRecorder,
+        child_run_id: &RunId,
+        status: TaskResponseStatus,
+        output: Option<serde_json::Value>,
+        failure: Option<TaskFailure>,
+    ) -> Result<LocalTaskResponse, LocalDelegationError> {
         ensure_recorder_run(child_recorder, child_run_id)?;
         let (child, parent) =
             {

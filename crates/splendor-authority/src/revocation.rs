@@ -328,6 +328,19 @@ impl RevocationSnapshot {
         &self.records
     }
 
+    /// Returns whether this trusted snapshot contains a revoked record for the
+    /// supplied grant ID.
+    ///
+    /// This helper intentionally does not evaluate snapshot freshness or expiry;
+    /// callers that need liveness checks should use [`Self::verify_grant_active`]
+    /// with a validated grant.
+    pub fn revokes_grant_id(&self, grant_id: &CapabilityGrantId) -> bool {
+        self.records.iter().any(|record| {
+            &record.grant_id == grant_id
+                && matches!(record.status, RevocationStatus::Revoked { .. })
+        })
+    }
+
     /// Checks a validated grant against this revocation snapshot.
     pub fn verify_grant_active(
         &self,
