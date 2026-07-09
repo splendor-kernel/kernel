@@ -53,6 +53,7 @@ fn request(name: &str) -> splendor_gateway::ActionRequest {
         satisfied_preconditions: vec![],
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 

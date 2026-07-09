@@ -65,6 +65,7 @@ fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionReques
         satisfied_preconditions: vec![],
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 
