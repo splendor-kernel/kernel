@@ -5,6 +5,9 @@ use axum::http::{Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use splendor_authority::{
+    grant_from_legacy_allowlists, CompatibilityGrantContext, LegacyScopeProfile,
+};
 use splendor_daemon::{
     router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
     DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest, RegisteredAction,
@@ -18,9 +21,9 @@ use splendor_kernel::{
     replay_local_delegations, ActionCandidate, AgentContext, AgentIsolationPolicy,
     AgentRuntimeConfig, FleetTelemetryCollector, InMemoryNodeRegistry,
     InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault, KernelRuntime,
-    KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest, LocalRunStatus,
-    LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision, QuotaPolicy,
-    RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
+    KernelRuntimeConfig, LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest,
+    LocalRunStatus, LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision,
+    QuotaPolicy, RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
     StateHandoffScope, TelemetryThresholds, TenantContext, TenantPolicy, TenantRegistry,
     TraceError, TraceEvent, TraceEventKind, TraceSink,
 };
@@ -30,20 +33,21 @@ use splendor_store::{
 };
 use splendor_types::{
     validate_client_connection_policy, validate_daemon_request, validate_work_order, Action,
-    AgentId, AuditAttribution, CallerCredential, ClientConnectionPolicy, ClientPrincipal,
-    ContentHash, CredentialAudience, CredentialBinding, DaemonEndpoint, DataLocality,
-    DelegatedAuthority, DenialSignal, EndpointScope, FailureCategory, FailureSignal, FleetId,
-    HealthStatus, InstanceHealth, InstanceId, InstanceTelemetry, Message, MessageDeliveryStatus,
-    MessageEnvelope, MessageId, NodeHealth, NodeId, NodeKind, NodeOnlineState, NodeRegistration,
-    Percept, PerceptProvenance, PlacementCandidate, PlacementDecisionStatus, PlacementRequest,
-    PlacementTarget, QuotaSignal, QuotaUsage, RegistryScope, RemoteMessageEnvelope,
-    RemoteMessageRetryPolicy, RevocationStatus, RunId, RunStatus as FleetRunStatus, RunTelemetry,
-    SideEffectClass, StateHandoffAuthority, StateReference, StateReferenceMode, TaskFailure,
-    TaskRequest, TaskResponse, TaskResponseStatus, TelemetryAuthority, TenantId, TraceEventId,
-    TraceId, TraceSyncFailure, TraceSyncTelemetry, VerificationResult, WorkOrder,
-    WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement,
-    WorkOrderQuotaPolicy, WorkOrderSignature, WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
-    TASK_RESPONSE_SCHEMA, WORK_ORDER_SCHEMA_VERSION,
+    AgentId, AuditAttribution, AuthorityBudgetScope, CallerCredential, CapabilityGrantId,
+    ClientConnectionPolicy, ClientPrincipal, ContentHash, CredentialAudience, CredentialBinding,
+    DaemonEndpoint, DataLocality, DelegatedAuthority, DenialSignal, EndpointScope, FailureCategory,
+    FailureSignal, FleetId, HealthStatus, InstanceHealth, InstanceId, InstanceTelemetry, Message,
+    MessageDeliveryStatus, MessageEnvelope, MessageId, NodeHealth, NodeId, NodeKind,
+    NodeOnlineState, NodeRegistration, Percept, PerceptProvenance, PlacementCandidate,
+    PlacementDecisionStatus, PlacementRequest, PlacementTarget, PrincipalId, QuotaSignal,
+    QuotaUsage, RegistryScope, RemoteMessageEnvelope, RemoteMessageRetryPolicy, RevocationStatus,
+    RunId, RunStatus as FleetRunStatus, RunTelemetry, SideEffectClass, StateHandoffAuthority,
+    StateReference, StateReferenceMode, TaskFailure, TaskRequest, TaskResponse, TaskResponseStatus,
+    TelemetryAuthority, TenantId, TraceEventId, TraceId, TraceSyncFailure, TraceSyncTelemetry,
+    VerificationResult, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderId,
+    WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy, WorkOrderSignature,
+    WorkOrderValidationContext, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -1208,12 +1212,61 @@ fn delegated_authority(actions: &[&str], permissions: &[&str]) -> DelegatedAutho
     }
 }
 
+fn local_delegation_authority(
+    parent_principal: PrincipalId,
+    child_principal: PrincipalId,
+    tenant_id: &TenantId,
+    request: &LocalDelegationRequest,
+) -> TestResult<LocalDelegationAuthority> {
+    let parent_grant = grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: parent_principal,
+            audience: "daemon:local".to_string(),
+            validation_digest:
+                "blake3:5555555555555555555555555555555555555555555555555555555555555555"
+                    .to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_id: request.target_agent_id.clone(),
+            run_id: Some(request.child_run_id.clone()),
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(4),
+                max_action_duration_ms: Some(1_000),
+                ..AuthorityBudgetScope::default()
+            },
+        },
+        &request.delegated_authority.allowed_actions,
+        &request.delegated_authority.allowed_adapters,
+        &request.delegated_authority.allowed_permissions,
+        OffsetDateTime::now_utc() - Duration::minutes(1),
+        OffsetDateTime::now_utc() + Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("local_delegation:e2e".to_string()),
+    )?;
+    let mut authority = LocalDelegationAuthority::new(
+        parent_grant,
+        child_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
+    authority.max_fan_out = 4;
+    Ok(authority)
+}
+
 fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
     let tenant_id = TenantId::parse("00000000-0000-0000-0000-000000000301")?;
     let orchestrator = AgentId::parse("00000000-0000-0000-0000-000000000302")?;
     let specialist_a = AgentId::parse("00000000-0000-0000-0000-000000000303")?;
     let specialist_b = AgentId::parse("00000000-0000-0000-0000-000000000304")?;
     let parent_run = RunId::parse("00000000-0000-0000-0000-000000000305")?;
+    let orchestrator_principal = PrincipalId::parse("00000000-0000-0000-0000-000000000321")?;
+    let specialist_a_principal = PrincipalId::parse("00000000-0000-0000-0000-000000000322")?;
+    let specialist_b_principal = PrincipalId::parse("00000000-0000-0000-0000-000000000323")?;
     let manager = LocalDelegationManager::new();
     let parent_authority =
         delegated_authority(&["parse.document", "summarize.document"], &["doc.read"]);
@@ -1234,16 +1287,19 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         ..AgentRuntimeConfig::default()
     };
     let specialist_b_config = specialist_a_config.clone();
-    manager.register_agent(
+    manager.register_agent_with_principal(
         AgentContext::new(orchestrator.clone(), tenant_id.clone(), parent_config),
+        orchestrator_principal.clone(),
         parent_authority.clone(),
     )?;
-    manager.register_agent(
+    manager.register_agent_with_principal(
         AgentContext::new(specialist_a.clone(), tenant_id.clone(), specialist_a_config),
+        specialist_a_principal.clone(),
         delegated_authority(&["parse.document"], &["doc.read"]),
     )?;
-    manager.register_agent(
+    manager.register_agent_with_principal(
         AgentContext::new(specialist_b.clone(), tenant_id.clone(), specialist_b_config),
+        specialist_b_principal.clone(),
         delegated_authority(&["summarize.document"], &["doc.read"]),
     )?;
     manager.register_root_run(parent_run.clone(), orchestrator.clone())?;
@@ -1251,18 +1307,26 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
     let (parent_runtime, parent_events) = runtime_for(parent_run.clone());
     let child_a_run = RunId::parse("00000000-0000-0000-0000-000000000306")?;
     let (child_a_runtime, child_a_events) = runtime_for(child_a_run.clone());
+    let child_a_request = LocalDelegationRequest {
+        parent_run_id: parent_run.clone(),
+        child_run_id: child_a_run.clone(),
+        source_agent_id: orchestrator.clone(),
+        target_agent_id: specialist_a.clone(),
+        objective: "parse doc A".to_string(),
+        delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
+        parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
+    };
+    let child_a_authority = local_delegation_authority(
+        orchestrator_principal.clone(),
+        specialist_a_principal.clone(),
+        &tenant_id,
+        &child_a_request,
+    )?;
     let child_a = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
-        LocalDelegationRequest {
-            parent_run_id: parent_run.clone(),
-            child_run_id: child_a_run.clone(),
-            source_agent_id: orchestrator.clone(),
-            target_agent_id: specialist_a.clone(),
-            objective: "parse doc A".to_string(),
-            delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
-            parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
-        },
+        child_a_request,
+        child_a_authority,
     )?;
     assert_eq!(child_a.run.parent_run_id, Some(parent_run.clone()));
     assert_eq!(
@@ -1277,18 +1341,26 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
 
     let child_b_run = RunId::parse("00000000-0000-0000-0000-000000000307")?;
     let (child_b_runtime, child_b_events) = runtime_for(child_b_run.clone());
+    let child_b_request = LocalDelegationRequest {
+        parent_run_id: parent_run.clone(),
+        child_run_id: child_b_run.clone(),
+        source_agent_id: orchestrator.clone(),
+        target_agent_id: specialist_b.clone(),
+        objective: "summarize doc A".to_string(),
+        delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
+        parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
+    };
+    let child_b_authority = local_delegation_authority(
+        orchestrator_principal.clone(),
+        specialist_b_principal,
+        &tenant_id,
+        &child_b_request,
+    )?;
     let child_b = manager.create_child_run(
         &parent_runtime,
         &child_b_runtime,
-        LocalDelegationRequest {
-            parent_run_id: parent_run.clone(),
-            child_run_id: child_b_run.clone(),
-            source_agent_id: orchestrator.clone(),
-            target_agent_id: specialist_b.clone(),
-            objective: "summarize doc A".to_string(),
-            delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
-            parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
-        },
+        child_b_request,
+        child_b_authority,
     )?;
 
     let response = manager.complete_child_run(
@@ -1330,17 +1402,25 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         .reasons;
     assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
     manager.cancel_parent_run(&parent_runtime, &parent_run, "done")?;
+    let cancelled_request = LocalDelegationRequest::new(
+        parent_run.clone(),
+        orchestrator,
+        specialist_a,
+        "late child",
+        delegated_authority(&["parse.document"], &["doc.read"]),
+        None,
+    );
+    let cancelled_authority = local_delegation_authority(
+        orchestrator_principal,
+        specialist_a_principal,
+        &tenant_id,
+        &cancelled_request,
+    )?;
     let cancelled_attempt = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
-        LocalDelegationRequest::new(
-            parent_run.clone(),
-            orchestrator,
-            specialist_a,
-            "late child",
-            delegated_authority(&["parse.document"], &["doc.read"]),
-            None,
-        ),
+        cancelled_request,
+        cancelled_authority,
     );
     assert!(cancelled_attempt.is_err());
 
@@ -2393,6 +2473,8 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
     let shared = AgentId::parse("00000000-0000-0000-0000-000000001004")?;
     let run_id = RunId::parse("00000000-0000-0000-0000-000000001005")?;
     let child_run = RunId::parse("00000000-0000-0000-0000-000000001006")?;
+    let orchestrator_principal = PrincipalId::parse("00000000-0000-0000-0000-000000001021")?;
+    let shared_principal = PrincipalId::parse("00000000-0000-0000-0000-000000001022")?;
     let manager = LocalDelegationManager::new();
     let config = AgentRuntimeConfig {
         isolation: AgentIsolationPolicy {
@@ -2402,30 +2484,40 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         },
         ..AgentRuntimeConfig::default()
     };
-    manager.register_agent(
+    manager.register_agent_with_principal(
         AgentContext::new(orchestrator.clone(), tenant_a.clone(), config),
+        orchestrator_principal.clone(),
         delegated_authority(&["document.parse"], &["doc.read"]),
     )?;
-    manager.register_agent(
+    manager.register_agent_with_principal(
         AgentContext::new(shared.clone(), tenant_b, AgentRuntimeConfig::default()),
+        shared_principal.clone(),
         delegated_authority(&["document.parse"], &["doc.read"]),
     )?;
     manager.register_root_run(run_id.clone(), orchestrator.clone())?;
     let (parent_runtime, parent_events) = runtime_for(run_id.clone());
     let (child_runtime, _) = runtime_for(child_run.clone());
+    let tenant_mismatch_request = LocalDelegationRequest {
+        parent_run_id: run_id.clone(),
+        child_run_id: child_run,
+        source_agent_id: orchestrator,
+        target_agent_id: shared,
+        objective: "parse tenant B doc".to_string(),
+        delegated_authority: delegated_authority(&["document.parse"], &["doc.read"]),
+        parent_causal_trace_id: Some(TraceId::from_run_sequence(&run_id, 1)),
+    };
+    let tenant_mismatch_authority = local_delegation_authority(
+        orchestrator_principal,
+        shared_principal,
+        &tenant_a,
+        &tenant_mismatch_request,
+    )?;
     let tenant_mismatch = manager
         .create_child_run(
             &parent_runtime,
             &child_runtime,
-            LocalDelegationRequest {
-                parent_run_id: run_id.clone(),
-                child_run_id: child_run,
-                source_agent_id: orchestrator,
-                target_agent_id: shared,
-                objective: "parse tenant B doc".to_string(),
-                delegated_authority: delegated_authority(&["document.parse"], &["doc.read"]),
-                parent_causal_trace_id: Some(TraceId::from_run_sequence(&run_id, 1)),
-            },
+            tenant_mismatch_request,
+            tenant_mismatch_authority,
         )
         .unwrap_err()
         .to_string();
@@ -2852,6 +2944,8 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     let remote_specialist = AgentId::parse("00000000-0000-0000-0000-000000000804")?;
     let run_id = RunId::parse("00000000-0000-0000-0000-000000000805")?;
     let child_run_id = RunId::parse("00000000-0000-0000-0000-000000000806")?;
+    let orchestrator_principal = PrincipalId::parse("00000000-0000-0000-0000-000000000821")?;
+    let local_specialist_principal = PrincipalId::parse("00000000-0000-0000-0000-000000000822")?;
     let resumed_state_run_id = run_id.clone();
     let now = fixed_time();
 
@@ -3013,33 +3107,43 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         },
         ..AgentRuntimeConfig::default()
     };
-    delegation.register_agent(
+    delegation.register_agent_with_principal(
         AgentContext::new(orchestrator.clone(), tenant_id.clone(), parent_config),
+        orchestrator_principal.clone(),
         delegated_authority(&["allowed_action", "summarize.local"], &[]),
     )?;
-    delegation.register_agent(
+    delegation.register_agent_with_principal(
         AgentContext::new(
             local_specialist.clone(),
             tenant_id.clone(),
             specialist_config,
         ),
+        local_specialist_principal.clone(),
         delegated_authority(&["summarize.local"], &[]),
     )?;
     delegation.register_root_run(run_id.clone(), orchestrator.clone())?;
     let (parent_runtime, parent_events) = runtime_for(run_id.clone());
     let (child_runtime, child_events) = runtime_for(child_run_id.clone());
+    let child_request = LocalDelegationRequest {
+        parent_run_id: run_id.clone(),
+        child_run_id: child_run_id.clone(),
+        source_agent_id: orchestrator.clone(),
+        target_agent_id: local_specialist.clone(),
+        objective: "local final-journey specialist".to_string(),
+        delegated_authority: delegated_authority(&["summarize.local"], &[]),
+        parent_causal_trace_id: causal_trace_id.clone(),
+    };
+    let child_authority = local_delegation_authority(
+        orchestrator_principal,
+        local_specialist_principal,
+        &tenant_id,
+        &child_request,
+    )?;
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,
-        LocalDelegationRequest {
-            parent_run_id: run_id.clone(),
-            child_run_id: child_run_id.clone(),
-            source_agent_id: orchestrator.clone(),
-            target_agent_id: local_specialist.clone(),
-            objective: "local final-journey specialist".to_string(),
-            delegated_authority: delegated_authority(&["summarize.local"], &[]),
-            parent_causal_trace_id: causal_trace_id.clone(),
-        },
+        child_request,
+        child_authority,
     )?;
     let laundering_denial = child
         .child_agent

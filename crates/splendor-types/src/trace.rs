@@ -23,10 +23,10 @@ use crate::{
     Action, AgentId, ApprovalTraceContext, AuditAttribution, CircuitBreakerTraceContext,
     Constraint, ContentHash, EscalationContext, Feedback, GovernanceObjectKind, GovernanceScope,
     GovernanceState, GovernanceTransition, GovernanceTransitionError,
-    GovernanceTransitionRejection, IdentityValidationError, MessageId, MessageTraceContext,
-    PolicyBundleId, PolicyBundleTraceContext, RemoteMessageTraceContext, Reward, RunId, SnapshotId,
-    StateHandoffTraceContext, TaskFailure, TenantId, TickId, TraceEventId, TraceId,
-    TraceIdentityContext, VerificationResult, WorkOrderId,
+    GovernanceTransitionRejection, IdentityValidationError, LocalDelegationAuthorityEvidence,
+    MessageId, MessageTraceContext, PolicyBundleId, PolicyBundleTraceContext,
+    RemoteMessageTraceContext, Reward, RunId, SnapshotId, StateHandoffTraceContext, TaskFailure,
+    TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext, VerificationResult, WorkOrderId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -952,6 +952,10 @@ pub struct LocalDelegationTraceContext {
     pub target_agent_id: AgentId,
     /// Scoped child objective.
     pub objective: String,
+    /// Non-authorizing parent/child authority grant references captured before
+    /// local child-run routing or replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
 }
 
 impl LocalDelegationTraceContext {
@@ -970,6 +974,15 @@ impl LocalDelegationTraceContext {
     /// Returns a copy with the parent trace event that caused this delegation.
     pub fn with_parent_trace(mut self, trace_id: TraceId) -> Self {
         self.parent_trace_id = Some(trace_id);
+        self
+    }
+
+    /// Returns a copy with non-authorizing authority grant references.
+    pub fn with_authority_evidence(
+        mut self,
+        authority_evidence: LocalDelegationAuthorityEvidence,
+    ) -> Self {
+        self.authority_evidence = Some(authority_evidence);
         self
     }
 }
