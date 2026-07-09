@@ -3,16 +3,17 @@
 //! Authority-plane decision logic. This local evidence surface currently covers
 //! the Principal Registry lifecycle state machine from IDR-001 plus bounded
 //! AUTH-001 capability grammar/evaluator, AUTH-002a work-order grant issuance,
-//! AUTH-003 delegation, AUTH-004 obligation receipt, and AUTH-005a local
-//! revocation/offline-cache foundation slices. It does not replace daemon
-//! authentication, gateway verification, revocation-watch services, lease renewal,
-//! or adapter execution.
+//! AUTH-003 delegation, AUTH-004 obligation receipt, and AUTH-005 local
+//! revocation/offline-cache plus bounded renewal preflight slices. It does not
+//! replace daemon authentication, gateway verification, revocation-watch services,
+//! production lease renewal, or adapter execution.
 
 mod capability;
 mod delegation;
 mod identity;
 mod issuance;
 mod obligations;
+mod renewal;
 mod revocation;
 
 pub use capability::{
@@ -36,6 +37,26 @@ pub use obligations::{
     validate_authority_obligation_receipt, verify_obligation_receipts,
     AuthorityObligationReceiptValidationContext, ObligationReceiptError,
     ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
+};
+pub use renewal::{
+    renew_cached_authority_grant, AuthorityGrantRenewalContextError, AuthorityGrantRenewalPolicy,
+    AuthorityGrantRenewalPolicyError, AuthorityGrantRenewalRequest, AuthorityGrantRenewalResult,
+    AuthorityGrantRenewalStatus, TrustedAuthorityRenewalContext,
+    REASON_AUTHORITY_RENEWAL_AUDIENCE_CHANGED, REASON_AUTHORITY_RENEWAL_CACHE_OUTLIVES_GRANT,
+    REASON_AUTHORITY_RENEWAL_CACHE_WINDOW_INVALID,
+    REASON_AUTHORITY_RENEWAL_CURRENT_REVISION_MISMATCH,
+    REASON_AUTHORITY_RENEWAL_CURRENT_REVISION_MISSING,
+    REASON_AUTHORITY_RENEWAL_DELEGATION_DEPTH_CHANGED, REASON_AUTHORITY_RENEWAL_GRANT_FUTURE_DATED,
+    REASON_AUTHORITY_RENEWAL_GRANT_ID_CHANGED, REASON_AUTHORITY_RENEWAL_ISSUER_CHANGED,
+    REASON_AUTHORITY_RENEWAL_LIFETIME_EXCEEDED, REASON_AUTHORITY_RENEWAL_NONCE_MISMATCH,
+    REASON_AUTHORITY_RENEWAL_NONCE_MISSING, REASON_AUTHORITY_RENEWAL_NON_RENEWABLE,
+    REASON_AUTHORITY_RENEWAL_NOT_BEFORE_CHANGED, REASON_AUTHORITY_RENEWAL_OBLIGATIONS_CHANGED,
+    REASON_AUTHORITY_RENEWAL_OFFLINE_LIFETIME_EXCEEDED,
+    REASON_AUTHORITY_RENEWAL_OPERATIONS_CHANGED, REASON_AUTHORITY_RENEWAL_PARENT_GRANTS_CHANGED,
+    REASON_AUTHORITY_RENEWAL_POLICY_MISSING, REASON_AUTHORITY_RENEWAL_RENEWED_GRANT_EXPIRED,
+    REASON_AUTHORITY_RENEWAL_REVOCATION_REF_CHANGED,
+    REASON_AUTHORITY_RENEWAL_REVOCATION_STATE_CHANGED, REASON_AUTHORITY_RENEWAL_SCOPE_CHANGED,
+    REASON_AUTHORITY_RENEWAL_SUBJECT_CHANGED, REASON_AUTHORITY_RENEWAL_VALIDATION_KIND_CHANGED,
 };
 pub use revocation::{
     evaluate_cached_capability_request, AuthorityConnectivity, AuthorityGrantCache,
