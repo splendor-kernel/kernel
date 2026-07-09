@@ -515,7 +515,10 @@ fn ensure_parent_authorizes_child(
             metadata: Default::default(),
         };
         let decision = evaluate_capability_request(std::slice::from_ref(parent), &request, now);
-        if decision.status != AuthorityDecisionStatus::Allowed {
+        if !matches!(
+            decision.status,
+            AuthorityDecisionStatus::Allowed | AuthorityDecisionStatus::Conditional
+        ) {
             return Err(map_parent_denial(&decision.reasons));
         }
     }

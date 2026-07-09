@@ -5,7 +5,8 @@ use splendor_types::{
     AuthorityBudgetScope, AuthorityDecisionStatus, AuthorityObligation, AuthorityObligationId,
     AuthorityObligationKind, AuthorityOperationNamespace, AuthorityResourceKind,
     AuthorityTimeScope, CapabilityGrantValidation, CapabilityGrantValidationKind,
-    CapabilityRequest, DataPurpose, DeviceId, TenantId, TASK_RESPONSE_SCHEMA,
+    CapabilityRequest, DataPurpose, DeviceId, TenantId, AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+    TASK_RESPONSE_SCHEMA,
 };
 
 const DIGEST: &str = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
@@ -258,6 +259,7 @@ fn delegation_preserves_parent_obligations_in_child_capability_grant() {
     let fixture = Fixture::new();
     let mut parent_grant = parent_grant(&fixture).grant().clone();
     let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
         obligation_id: AuthorityObligationId::new(),
         kind: AuthorityObligationKind::EvidenceRequired,
         description: "evidence.required".to_string(),
@@ -286,6 +288,7 @@ fn delegation_preserves_parent_obligations_in_child_capability_grant() {
         },
         fixture.now,
     );
+    assert_eq!(decision.status, AuthorityDecisionStatus::Conditional);
     assert_eq!(decision.obligations, vec![obligation]);
 }
 
