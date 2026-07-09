@@ -38,13 +38,13 @@ pub struct AuthorityObligationReceiptValidationContext {
 impl AuthorityObligationReceiptValidationContext {
     /// Builds trusted local validation context for the receipt owning service.
     ///
-    /// The constructor is crate-scoped so requester-side code cannot turn an
-    /// arbitrary raw receipt into a validated receipt by choosing its own local
-    /// issuer/secret tuple. Future gateway wiring should obtain this context
-    /// through the authority-owned receipt service boundary, not from request
-    /// payloads.
-    #[cfg(test)]
-    pub(crate) fn new(
+    /// This constructor is a configuration seam for the authority-owned receipt
+    /// service or a local gateway composition root. It must not be populated from
+    /// requester payloads; a caller that supplies its own issuer/secret tuple is
+    /// not trusted authority. Future production integrations should replace this
+    /// deterministic local context with PKI/IAM-backed validation while keeping
+    /// the gateway input behavior-free.
+    pub fn trusted_local(
         issuer: PrincipalId,
         audience: impl Into<String>,
         key_id: impl Into<String>,
@@ -59,6 +59,39 @@ impl AuthorityObligationReceiptValidationContext {
             validation_secret: validation_secret.into(),
             revocation_ref: revocation_ref.into(),
             now,
+        }
+    }
+
+    /// Owning-service issuer expected on receipts validated by this context.
+    pub fn issuer(&self) -> &PrincipalId {
+        &self.issuer
+    }
+
+    /// Audience binding expected on receipts validated by this context.
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    /// Key identifier expected on local receipt validation material.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Revocation source coordinate expected on receipts validated by this context.
+    pub fn revocation_ref(&self) -> &str {
+        &self.revocation_ref
+    }
+
+    /// Validation time used for expiry/not-before/revocation checks.
+    pub fn now(&self) -> OffsetDateTime {
+        self.now
+    }
+
+    /// Returns a copy of this context with a different validation time.
+    pub fn at_time(&self, now: OffsetDateTime) -> Self {
+        Self {
+            now,
+            ..self.clone()
         }
     }
 }
@@ -173,6 +206,22 @@ pub fn validate_authority_obligation_receipt(
         receipt,
         trust: ValidatedReceiptTrust::LocalSignature,
     })
+}
+
+/// Adds deterministic local validation material to a raw receipt contract.
+///
+/// This helper models the authority-owned receipt service issuing local evidence
+/// after an obligation has been satisfied. It is intentionally a bounded local
+/// seam for tests and embedded gateway configuration; it is not production PKI,
+/// does not perform an approval/MFA/gate workflow, and must not be called with a
+/// context derived from requester payloads.
+pub fn issue_local_authority_obligation_receipt(
+    mut receipt: AuthorityObligationReceipt,
+    context: &AuthorityObligationReceiptValidationContext,
+) -> Result<AuthorityObligationReceipt, ObligationReceiptError> {
+    receipt.validation.digest = obligation_receipt_validation_digest(&receipt)?;
+    receipt.validation.signature = local_obligation_receipt_signature(&receipt, context)?;
+    Ok(receipt)
 }
 
 /// Verifies that validated receipts satisfy every obligation carried by a

@@ -2599,6 +2599,7 @@ async fn submit_action(
         satisfied_preconditions: request.satisfied_preconditions,
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.approval_evidence,
+        authority_obligation_evidence: None,
     };
     if !slot
         .allowed_actions
@@ -3006,6 +3007,7 @@ async fn submit_physical_action(
         satisfied_preconditions: request.action_request.satisfied_preconditions.clone(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.action_request.approval_evidence.clone(),
+        authority_obligation_evidence: None,
     };
     let mut physical_gateway = VerifiedActionGateway::new(Arc::new(slot.tenant_registry.clone()));
     physical_gateway.set_circuit_breaker_evaluator(Arc::new(slot.circuit_breakers.clone()));
@@ -4983,6 +4985,7 @@ mod tests {
             satisfied_preconditions: Vec::new(),
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
+            authority_obligation_evidence: None,
         }
     }
 
@@ -5145,6 +5148,7 @@ mod tests {
             satisfied_preconditions: Vec::new(),
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
+            authority_obligation_evidence: None,
         }
     }
 

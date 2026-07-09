@@ -1,11 +1,21 @@
 use super::*;
+use splendor_authority::{
+    canonical_authority_request_digest, gateway_action_operation,
+    issue_local_authority_obligation_receipt, AuthorityObligationReceiptValidationContext,
+};
 use splendor_types::{
-    AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, CircuitBreaker,
+    AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, AuthorityDecision,
+    AuthorityDecisionId, AuthorityDecisionStatus, AuthorityObligation, AuthorityObligationKind,
+    AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
+    AuthorityObligationReceiptValidationKind, CapabilityRequest, CapabilityScope, CircuitBreaker,
     CircuitBreakerId, CircuitBreakerScope, EffectCertainty, ErrorCategory, FleetId, InstanceId,
-    NodeId, QuotaUsage, RetryClass, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
-    APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    NodeId, PrincipalId, QuotaUsage, RetryClass, RevocationStatus, RunId, RuntimeIdentityContext,
+    SideEffectClass, TenantId, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
+    AUTHORITY_OBLIGATION_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
     UNKNOWN_ADAPTER_FAILURE_REASON,
 };
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,6 +65,7 @@ fn sample_action() -> ActionRequest {
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 
@@ -238,6 +249,30 @@ struct CountingAdapter {
 
 struct DenyResourceVerifier;
 
+struct DefaultPostSafetyVerifier;
+
+impl SafetyVerifier for DefaultPostSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::Allowed(VerificationResult::allow())
+    }
+}
+
+struct NotRequiredSafetyVerifier;
+
+impl SafetyVerifier for NotRequiredSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::NotRequired
+    }
+}
+
+struct InconsistentSafetyVerifier;
+
+impl SafetyVerifier for InconsistentSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::Allowed(VerificationResult::deny("inconsistent_safety_allow"))
+    }
+}
+
 impl ResourceBoundaryVerifier for DenyResourceVerifier {
     fn verify_resource_boundary(
         &self,
@@ -285,6 +320,7 @@ fn base_request() -> ActionRequest {
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 
@@ -345,6 +381,56 @@ fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
     }
 }
 
+#[test]
+fn gateway_default_trait_helpers_cover_fail_closed_edges() {
+    let non_physical = base_request();
+    let physical = physical_request();
+    let adapter_result = AdapterResult {
+        output: serde_json::json!({"ok": true}),
+        satisfied_postconditions: Vec::new(),
+    };
+    let simulated = SimulatedSafetyVerifier::new(safe_safety_snapshot());
+
+    assert!(matches!(
+        simulated.verify_pre(&non_physical, Some("adapter")),
+        SafetyVerification::NotRequired
+    ));
+    assert!(matches!(
+        simulated.verify_post(&non_physical, Some("adapter"), &adapter_result),
+        SafetyVerification::NotRequired
+    ));
+    assert!(AdapterError::Failed("provider failed".to_string())
+        .taxonomy()
+        .reason_code
+        .as_str()
+        .contains("adapter"));
+    assert!(
+        NoopCircuitBreakerEvaluator
+            .verify_runtime_admission(&RuntimeIdentityContext::default())
+            .allowed
+    );
+    assert!(StaticCircuitBreakerEvaluator::new(Vec::new())
+        .breakers()
+        .is_empty());
+
+    let default_post = Some(Arc::new(DefaultPostSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let post = verify_safety_post(&default_post, &physical, Some("robotics"), &adapter_result);
+    assert!(matches!(post, SafetyVerification::NeedsIntervention(_)));
+
+    let not_required = Some(Arc::new(NotRequiredSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let pre = verify_safety_pre(&not_required, &physical, Some("robotics"));
+    assert!(matches!(pre, SafetyVerification::NeedsIntervention(_)));
+
+    let inconsistent = Some(Arc::new(InconsistentSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let pre = verify_safety_pre(&inconsistent, &physical, Some("robotics"));
+    match pre {
+        SafetyVerification::NeedsIntervention(result) => assert!(result
+            .reasons
+            .contains(&"safety_verifier_inconsistent".to_string())),
+        other => panic!("expected inconsistent safety intervention, got {other:?}"),
+    }
+}
+
 fn approval_policy_for(request: &ActionRequest) -> ApprovalPolicy {
     let mut policy = ApprovalPolicy::new(
         "approval_policy_test",
@@ -386,6 +472,604 @@ fn approval_gateway(
         approval_policy_for(request),
     ])));
     gateway
+}
+
+const OBLIGATION_RECEIPT_AUDIENCE: &str = "daemon:local";
+const OBLIGATION_RECEIPT_KEY_ID: &str = "gateway-receipt-key-1";
+const OBLIGATION_RECEIPT_SECRET: &str = "gateway-owned-receipt-secret";
+const OBLIGATION_RECEIPT_REVOCATION_REF: &str = "revocation:gateway-obligation-test";
+const OBLIGATION_EVIDENCE_DIGEST: &str =
+    "blake3:5555555555555555555555555555555555555555555555555555555555555555";
+const PLACEHOLDER_DIGEST: &str =
+    "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn gateway_authority_context(
+    issuer: PrincipalId,
+    now: OffsetDateTime,
+) -> AuthorityObligationReceiptValidationContext {
+    AuthorityObligationReceiptValidationContext::trusted_local(
+        issuer,
+        OBLIGATION_RECEIPT_AUDIENCE,
+        OBLIGATION_RECEIPT_KEY_ID,
+        OBLIGATION_RECEIPT_SECRET,
+        OBLIGATION_RECEIPT_REVOCATION_REF,
+        now,
+    )
+}
+
+fn authority_decision_for(
+    request: &ActionRequest,
+    adapter: &str,
+    subject: PrincipalId,
+    now: OffsetDateTime,
+) -> AuthorityDecision {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY.to_string(),
+        serde_json::Value::String(
+            canonical_gateway_authority_action_digest(request, Some(adapter))
+                .expect("gateway action digest"),
+        ),
+    );
+    let capability_request = CapabilityRequest {
+        schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+        subject,
+        operation: gateway_action_operation(&request.action.name),
+        scope: CapabilityScope {
+            tenant_ids: Some(vec![request.tenant_id.clone()]),
+            agent_ids: Some(vec![request.agent_id.clone()]),
+            run_ids: Some(vec![request.run_id.clone()]),
+            audiences: Some(vec![OBLIGATION_RECEIPT_AUDIENCE.to_string()]),
+            ..Default::default()
+        },
+        requested_at: request.requested_at,
+        metadata,
+    };
+    let mut decision = AuthorityDecision {
+        schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
+        decision_id: AuthorityDecisionId::new(),
+        request: capability_request,
+        status: AuthorityDecisionStatus::Conditional,
+        reasons: vec!["capability_conditional".to_string()],
+        matched_grant_ids: Vec::new(),
+        obligations: vec![AuthorityObligation {
+            schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+            obligation_id: splendor_types::AuthorityObligationId::new(),
+            kind: AuthorityObligationKind::ApprovalRequired,
+            description: "gateway obligation satisfied by authority receipt".to_string(),
+            parameters: BTreeMap::new(),
+        }],
+        decided_at: now,
+    };
+    bind_gateway_authority_decision_digest(&mut decision);
+    decision
+}
+
+fn bind_gateway_authority_decision_digest(decision: &mut AuthorityDecision) {
+    let decision_digest =
+        canonical_gateway_authority_decision_digest(decision).expect("authority decision digest");
+    decision.request.metadata.insert(
+        GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY.to_string(),
+        serde_json::Value::String(decision_digest),
+    );
+}
+
+fn unsigned_obligation_receipt(
+    decision: &AuthorityDecision,
+    issuer: PrincipalId,
+    now: OffsetDateTime,
+) -> AuthorityObligationReceipt {
+    let obligation = decision
+        .obligations
+        .first()
+        .expect("conditional decision obligation");
+    AuthorityObligationReceipt {
+        schema_version: AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION.to_string(),
+        receipt_id: AuthorityObligationReceiptId::new(),
+        issuer,
+        audience: OBLIGATION_RECEIPT_AUDIENCE.to_string(),
+        obligation_id: obligation.obligation_id.clone(),
+        kind: obligation.kind,
+        subject: decision.request.subject.clone(),
+        authority_decision_id: decision.decision_id.clone(),
+        canonical_request_digest: canonical_authority_request_digest(&decision.request)
+            .expect("authority request digest"),
+        evidence_digest: OBLIGATION_EVIDENCE_DIGEST.to_string(),
+        evidence_ref: Some("approval-evidence:gateway-obligation-test".to_string()),
+        issued_at: now - time::Duration::seconds(1),
+        expires_at: now + time::Duration::minutes(10),
+        revocation: RevocationStatus::Active,
+        revocation_ref: OBLIGATION_RECEIPT_REVOCATION_REF.to_string(),
+        approval_id: None,
+        approval_trace_event_id: None,
+        validation: AuthorityObligationReceiptValidation {
+            validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+            algorithm: "local-obligation-receipt-v1".to_string(),
+            key_id: OBLIGATION_RECEIPT_KEY_ID.to_string(),
+            digest: PLACEHOLDER_DIGEST.to_string(),
+            signature: PLACEHOLDER_DIGEST.to_string(),
+        },
+    }
+}
+
+fn issue_obligation_receipt(
+    receipt: AuthorityObligationReceipt,
+    context: &AuthorityObligationReceiptValidationContext,
+) -> AuthorityObligationReceipt {
+    issue_local_authority_obligation_receipt(receipt, context).expect("issued receipt")
+}
+
+fn authority_evidence_for(
+    request: &ActionRequest,
+    adapter: &str,
+    now: OffsetDateTime,
+) -> (
+    PrincipalId,
+    AuthorityObligationReceiptValidationContext,
+    GatewayAuthorityObligationEvidence,
+) {
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let context = gateway_authority_context(issuer.clone(), now);
+    let decision = authority_decision_for(request, adapter, subject, now);
+    let receipt = issue_obligation_receipt(
+        unsigned_obligation_receipt(&decision, issuer.clone(), now),
+        &context,
+    );
+    (
+        issuer,
+        context,
+        GatewayAuthorityObligationEvidence {
+            decision,
+            receipts: vec![receipt],
+        },
+    )
+}
+
+fn authority_gateway(
+    context: AuthorityObligationReceiptValidationContext,
+    adapter: Arc<CountingAdapter>,
+) -> VerifiedActionGateway {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    gateway.register_adapter("noop", "adapter", adapter);
+    gateway.set_authority_obligation_verifier(Arc::new(
+        LocalAuthorityObligationVerifier::require_all(context),
+    ));
+    gateway
+}
+
+fn authority_gateway_with_verifier(
+    verifier: Arc<dyn AuthorityObligationVerifier>,
+    adapter: Arc<CountingAdapter>,
+) -> VerifiedActionGateway {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    gateway.register_adapter("noop", "adapter", adapter);
+    gateway.set_authority_obligation_verifier(verifier);
+    gateway
+}
+
+fn assert_authority_denied(
+    mut request: ActionRequest,
+    context: AuthorityObligationReceiptValidationContext,
+    reason: &str,
+    expected_status: ActionStatus,
+) {
+    let adapter = Arc::new(CountingAdapter::default());
+    request.adapter = Some("adapter".to_string());
+    let outcome = authority_gateway(context, adapter.clone())
+        .submit(request)
+        .expect("outcome");
+    assert_eq!(outcome.status, expected_status);
+    assert!(
+        outcome.verification.reasons.contains(&reason.to_string()),
+        "expected {reason}, got {:?}",
+        outcome.verification.reasons
+    );
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn authority_obligation_valid_exact_receipt_allows_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+    request.authority_obligation_evidence = Some(evidence);
+    let adapter = Arc::new(CountingAdapter::default());
+
+    let outcome = authority_gateway(context, adapter.clone())
+        .submit(request)
+        .expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+    assert_eq!(
+        outcome.verification.artifacts["authority_obligation"]["authority_obligation_status"]
+            .as_str(),
+        Some("satisfied")
+    );
+}
+
+#[test]
+fn authority_obligation_supplied_without_configured_verifier_needs_intervention() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, _context, evidence) = authority_evidence_for(&request, "adapter", now);
+    request.authority_obligation_evidence = Some(evidence);
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"authority_obligation_verifier_unavailable".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn authority_obligation_required_missing_evidence_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let context = gateway_authority_context(issuer, now);
+    let request = base_request();
+
+    assert_authority_denied(
+        request,
+        context,
+        "authority_obligation_evidence_required",
+        ActionStatus::NeedsIntervention,
+    );
+}
+
+#[test]
+fn authority_obligation_requirement_matchers_preserve_optional_default() {
+    let now = OffsetDateTime::now_utc();
+    let context = gateway_authority_context(PrincipalId::new(), now);
+
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::new(context.clone())),
+        adapter.clone(),
+    )
+    .submit(request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+
+    assert_authority_denied(
+        base_request(),
+        context.clone(),
+        "authority_obligation_evidence_required",
+        ActionStatus::NeedsIntervention,
+    );
+
+    let mut mismatched_adapter_request = base_request();
+    mismatched_adapter_request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::requiring(
+            context.clone(),
+            vec![AuthorityObligationRequirement::action_adapter(
+                "noop", "other",
+            )],
+        )),
+        adapter.clone(),
+    )
+    .submit(mismatched_adapter_request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+
+    let mut matching_adapter_request = base_request();
+    matching_adapter_request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::requiring(
+            context,
+            vec![
+                AuthorityObligationRequirement::action("other_action"),
+                AuthorityObligationRequirement::action_adapter("noop", "adapter"),
+            ],
+        )),
+        adapter.clone(),
+    )
+    .submit(matching_adapter_request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"authority_obligation_evidence_required".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn authority_obligation_raw_or_forged_receipt_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let context = gateway_authority_context(issuer.clone(), now);
+    let decision = authority_decision_for(&request, "adapter", subject, now);
+    request.authority_obligation_evidence = Some(GatewayAuthorityObligationEvidence {
+        receipts: vec![unsigned_obligation_receipt(&decision, issuer, now)],
+        decision,
+    });
+
+    assert_authority_denied(
+        request,
+        context,
+        "obligation_receipt_validation_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_changed_action_digest_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+    request.action.params = serde_json::json!({"ok": false, "changed": true});
+    request.authority_obligation_evidence = Some(evidence);
+
+    assert_authority_denied(
+        request,
+        context,
+        "authority_decision_action_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_tampered_decision_digest_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: splendor_types::AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::HumanReview,
+        description: "tampered obligation added after receipt issuance".to_string(),
+        parameters: BTreeMap::new(),
+    });
+    request.authority_obligation_evidence = Some(evidence);
+
+    assert_authority_denied(
+        request,
+        context,
+        "authority_decision_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_rebound_tampered_decision_fails_receipt_digest() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: splendor_types::AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::HumanReview,
+        description: "tampered obligation added and rebound".to_string(),
+        parameters: BTreeMap::new(),
+    });
+    bind_gateway_authority_decision_digest(&mut evidence.decision);
+    request.authority_obligation_evidence = Some(evidence);
+
+    assert_authority_denied(
+        request,
+        context,
+        "obligation_receipt_request_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_malformed_decision_metadata_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    for case in [
+        "non_conditional",
+        "missing_action_digest",
+        "missing_decision_digest",
+        "verifier_unavailable",
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        let (issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+        let (context, reason, status) = match case {
+            "non_conditional" => {
+                evidence.decision.status = AuthorityDecisionStatus::Allowed;
+                (
+                    context,
+                    "authority_decision_not_conditional",
+                    ActionStatus::Denied,
+                )
+            }
+            "missing_action_digest" => {
+                evidence
+                    .decision
+                    .request
+                    .metadata
+                    .remove(GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY);
+                (
+                    context,
+                    "authority_decision_action_digest_missing",
+                    ActionStatus::Denied,
+                )
+            }
+            "missing_decision_digest" => {
+                evidence
+                    .decision
+                    .request
+                    .metadata
+                    .remove(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY);
+                (
+                    context,
+                    "authority_decision_digest_missing",
+                    ActionStatus::Denied,
+                )
+            }
+            "verifier_unavailable" => (
+                AuthorityObligationReceiptValidationContext::trusted_local(
+                    issuer,
+                    OBLIGATION_RECEIPT_AUDIENCE,
+                    OBLIGATION_RECEIPT_KEY_ID,
+                    "",
+                    OBLIGATION_RECEIPT_REVOCATION_REF,
+                    now,
+                ),
+                "obligation_receipt_validation_secret_unavailable",
+                ActionStatus::NeedsIntervention,
+            ),
+            _ => unreachable!("covered cases"),
+        };
+        request.authority_obligation_evidence = Some(evidence);
+
+        assert_authority_denied(request, context, reason, status);
+    }
+}
+
+#[test]
+fn authority_obligation_operation_and_scope_mismatch_block_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    for case in ["operation", "tenant", "agent", "run"] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+        let reason = match case {
+            "operation" => {
+                evidence.decision.request.operation = gateway_action_operation("other_action");
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_operation_mismatch"
+            }
+            "tenant" => {
+                evidence.decision.request.scope.tenant_ids = Some(vec![TenantId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_tenant_scope_mismatch"
+            }
+            "agent" => {
+                evidence.decision.request.scope.agent_ids = Some(vec![AgentId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_agent_scope_mismatch"
+            }
+            "run" => {
+                evidence.decision.request.scope.run_ids = Some(vec![RunId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_run_scope_mismatch"
+            }
+            _ => unreachable!("covered cases"),
+        };
+        request.authority_obligation_evidence = Some(evidence);
+
+        assert_authority_denied(request, context, reason, ActionStatus::Denied);
+    }
+}
+
+#[test]
+fn authority_obligation_bad_receipts_block_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    for case in [
+        "expired",
+        "revoked",
+        "wrong_decision",
+        "wrong_kind",
+        "duplicate",
+        "extra",
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        let (issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+        let reason = match case {
+            "expired" => {
+                let mut receipt =
+                    unsigned_obligation_receipt(&evidence.decision, issuer.clone(), now);
+                receipt.expires_at = now - time::Duration::seconds(1);
+                evidence.receipts = vec![issue_obligation_receipt(receipt, &context)];
+                "obligation_receipt_expired"
+            }
+            "revoked" => {
+                let mut receipt =
+                    unsigned_obligation_receipt(&evidence.decision, issuer.clone(), now);
+                receipt.revocation = RevocationStatus::Revoked {
+                    reason: "test_revoked".to_string(),
+                };
+                evidence.receipts = vec![issue_obligation_receipt(receipt, &context)];
+                "obligation_receipt_revoked"
+            }
+            "wrong_decision" => {
+                let mut receipt =
+                    unsigned_obligation_receipt(&evidence.decision, issuer.clone(), now);
+                receipt.authority_decision_id = AuthorityDecisionId::new();
+                evidence.receipts = vec![issue_obligation_receipt(receipt, &context)];
+                "obligation_receipt_decision_mismatch"
+            }
+            "wrong_kind" => {
+                let mut receipt =
+                    unsigned_obligation_receipt(&evidence.decision, issuer.clone(), now);
+                receipt.kind = AuthorityObligationKind::HumanReview;
+                evidence.receipts = vec![issue_obligation_receipt(receipt, &context)];
+                "obligation_receipt_kind_mismatch"
+            }
+            "duplicate" => {
+                let duplicate = evidence.receipts[0].clone();
+                evidence.receipts.push(duplicate);
+                "duplicate_obligation_receipt_id"
+            }
+            "extra" => {
+                let mut extra =
+                    unsigned_obligation_receipt(&evidence.decision, issuer.clone(), now);
+                extra.receipt_id = AuthorityObligationReceiptId::new();
+                extra.obligation_id = splendor_types::AuthorityObligationId::new();
+                evidence
+                    .receipts
+                    .push(issue_obligation_receipt(extra, &context));
+                "extra_obligation_receipt"
+            }
+            _ => unreachable!("covered cases"),
+        };
+        request.authority_obligation_evidence = Some(evidence);
+
+        assert_authority_denied(request, context, reason, ActionStatus::Denied);
+    }
+}
+
+#[test]
+fn legacy_approval_evidence_alone_does_not_satisfy_authority_obligations() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let context = gateway_authority_context(issuer, now);
+    let mut request = base_request();
+    request.approval_evidence = Some(approval_evidence_for(&request));
+
+    assert_authority_denied(
+        request,
+        context,
+        "authority_obligation_evidence_required",
+        ActionStatus::NeedsIntervention,
+    );
 }
 
 #[test]

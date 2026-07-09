@@ -2,8 +2,8 @@
 
 ## Status and Scope
 
-Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`, `AUTH-003b`,
-and `AUTH-004a` implementation evidence slices.
+Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
+`AUTH-003b`, `AUTH-004a`, and `AUTH-004b` implementation evidence slices.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -17,17 +17,18 @@ contracts, trusted local receipt validation wrappers, exact fail-closed receipt
 matching helpers, and unit tests for allow/deny/narrowing/issuance/delegation/
 obligation behavior. It also includes a bounded runtime-local delegation-manager
 bridge that records parent/child grant refs after authority-owned child-grant
-issuance.
+issuance, plus a bounded local gateway obligation verifier that validates
+receipt-bound decisions before the existing adapter invocation path.
 
-This slice does not change stable 0.1 gateway verifier wiring, daemon APIs,
-OpenAPI, TypeScript, Python, fleet behavior, node admission, workload-controller
-wiring, child revocation propagation, approval workflow execution, MFA/provider
-integration, gate-engine migration, obligation receipt storage, production PKI,
-external revocation introspection, or adapter execution. It adds optional local
-trace/message/run-record authority reference fields for `AUTH-003b`. It does not
-claim full C02, full `AUTH-001`, full
-`AUTH-002`, full `AUTH-003`, full `AUTH-004`, G11, G18, G43, G60, G70, G71, G75,
-G79, G83, issue closure, or gold completion.
+This slice does not change daemon APIs, OpenAPI, TypeScript, Python, fleet
+behavior, node admission, workload-controller wiring, child revocation
+propagation, approval workflow execution, MFA/provider integration, gate-engine
+migration, obligation receipt storage, production PKI, external revocation
+introspection, or introduce a new adapter execution path. It adds optional local
+trace/message/run-record authority reference fields for `AUTH-003b` and optional
+gateway action obligation evidence for `AUTH-004b`. It does not claim full C02,
+full `AUTH-001`, full `AUTH-002`, full `AUTH-003`, full `AUTH-004`, G11, G18,
+G43, G60, G70, G71, G75, G79, G83, issue closure, or gold completion.
 
 Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
 `G60`, `G70`, `G71`, `G75`, `G79`, and `G83` remain `not_exercised`.
@@ -40,7 +41,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
 | Child issue | #238, `AUTH-001 - Define a composable capability and scope model` | Bounded local evidence only; not complete. |
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
 | Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder plus `AUTH-003b` runtime-local manager wiring evidence only; not complete. |
-| Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision and receipt matching evidence only; not complete. |
+| Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G75`, `G79`, `G83` | `not_exercised` until executable fixtures/harnesses pass. |
@@ -66,17 +67,18 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
 
 - No production issuance service, PKI/OAuth/IAM product, or daemon authentication
   replacement.
-- No gateway/verifier pipeline integration or new adapter execution path.
+- No new adapter execution path; `AUTH-004b` only verifies local authority
+  obligation receipts before the existing gateway adapter invocation.
 - No daemon, OpenAPI, TypeScript, Python, fleet, product, or physical safety
   behavior.
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, or revocation propagation service.
 - No universal wildcard or metadata/extension-based authority.
-- No gateway integration, daemon/API contract change, TypeScript/Python client
-  update, gold fixture, or revocation propagation for delegated children in
-  `AUTH-003b`.
-- No approval workflow engine, MFA provider, gate-engine migration, or gateway
-  obligation receipt verifier in `AUTH-004a`.
+- No daemon/API contract change, TypeScript/Python client update, gold fixture,
+  or revocation propagation for delegated children in `AUTH-003b`.
+- No approval workflow engine, MFA provider, gate-engine migration, durable
+  evidence store, production PKI, external revocation introspection, or full
+  gateway/daemon/client obligation workflow in `AUTH-004a`/`AUTH-004b`.
 - No claim that `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G75`, `G79`,
   or `G83` passed.
 - No closure claim for #182, #238, #239, #240, or #241.
@@ -223,9 +225,29 @@ receipt matching:
   `Conditional` parent authority decision as enough to issue a child grant; it
   denies with `parent_obligations_unsatisfied` before child grant creation while
   preserving the behavior-free obligation propagation rule for narrowed grants;
-- no gateway, daemon/API, TypeScript, Python, MFA, approval workflow, gate-engine,
-  data-use, quota, safety, or adapter execution integration is included in this
-  slice.
+- no gateway verifier, daemon/API, TypeScript, Python, MFA, approval workflow,
+  gate-engine, data-use, quota, safety, durable evidence-store, production PKI,
+  external revocation-introspection, or adapter execution integration is included
+  in `AUTH-004a`.
+
+The bounded `AUTH-004b` slice wires local obligation receipt verification into
+the existing gateway path:
+
+- `ActionRequest` can carry optional behavior-free
+  `GatewayAuthorityObligationEvidence` containing a conditional decision and raw
+  receipts;
+- `LocalAuthorityObligationVerifier` validates each raw receipt with trusted
+  authority-owned local context before matching it against the decision;
+- the verifier requires receipt-bound integrity metadata for both the exact
+  gateway action digest and the full conditional decision digest, so changing
+  action parameters or tampering with the obligation set fails closed before
+  adapter execution;
+- the verifier checks the decision operation plus tenant/agent/run scope against
+  the gateway action request, and legacy `ApprovalEvidence` alone does not satisfy
+  authority obligations;
+- this remains a bounded local verifier only: no approval/MFA/gate receipt
+  service, durable evidence store, production PKI, external revocation
+  introspection, daemon/API, TypeScript, Python, or gold fixture is added.
 
 ## Guardrails
 
@@ -248,6 +270,7 @@ receipt matching:
 | Obligations are conditional authority | Local `AUTH-004a` returns `Conditional` for matching grants with obligations instead of unconditional allow. |
 | Raw receipts are not authority | Local `AUTH-004a` raw receipt contracts must first be wrapped as `ValidatedAuthorityObligationReceipt` through trusted owning-service context; requester-fabricated receipt fields do not satisfy obligations. |
 | Receipts are exact and typed | Local `AUTH-004a` receipt verification requires validated receipts with matching receipt ID uniqueness, obligation ID/kind, subject, decision ID, canonical request digest, evidence digest, audience, expiry, and active revocation state; duplicate, missing, or extra receipts deny. |
+| Gateway verifies receipts pre-effect | Local `AUTH-004b` adds optional behavior-free `ActionRequest` authority obligation evidence and a configurable gateway verifier that validates trusted receipts, requires receipt-bound integrity digests for the exact gateway action and full conditional authority decision, checks action operation plus tenant/agent/run scope binding, and blocks adapter execution on missing required evidence, forged/raw receipts, stale/revoked receipts, duplicate/extra receipts, wrong decision/subject/kind/scope, tampered obligation sets, or changed action parameters. |
 | Approval is not a bypass | Receipt verification does not replace capability, quota, safety, data-use, policy, or gateway checks and does not accept free-form `approved` text, metadata, or extensions as authority. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
@@ -266,13 +289,16 @@ those operation decisions explicitly.
 This RFC does not add event or trace variants. `AUTH-003b` adds optional
 authority-reference fields to existing local delegation message payloads, trace
 contexts, run records, and replay summaries. `AUTH-004a` adds behavior-free
-receipt contracts and local verification helpers only; it does not persist
-receipt evidence or wire gateway trace events. Replay remains inspect-only: it
-uses recorded parent/child grant refs and stable denial reasons without re-running
-authority evaluation, gateways, adapters, child runs, revocation checks, receipt
-owning services, or other side effects. Future gateway/driver integration must
-record authority decisions and obligation receipt verification as pre-effect
-evidence before execution.
+receipt contracts and local verification helpers. `AUTH-004b` records bounded
+pre-effect obligation verification results, action digests, and decision-integrity
+digests in existing `ActionOutcome.verification` artifacts so current trace events
+can carry denial/allow evidence without adding new event names. Replay remains
+inspect-only: it uses recorded parent/child grant
+refs and stable denial reasons without re-running authority evaluation, gateways,
+adapters, child runs, revocation checks, receipt owning services, or other side
+effects. Future durable evidence-store and trace-schema work must persist
+authority decisions and receipt-verification evidence as first-class evidence
+records before claiming broader AUTH-004 completion.
 
 ## Validation Matrix
 
@@ -292,13 +318,16 @@ evidence before execution.
 | Bounded AUTH-003a delegation | Authority tests cover local delegation contract round-trip, positive child grant issuance, parent-obligation preservation, missing/wrong parent edge, issuer mismatch, child subject missing/wrong, overbroad operation/scope/audience/time/budget/depth/fan-out, exhausted depth, fan-out exceeded, bad message schema/recipient, revoked/expired/not-yet-valid parent, and critic/evaluator external-effect/control-plane delegation denial. | `G18/G70/G71` remain `not_exercised`; no local-delegation manager, message routing, gateway, trace, revocation propagation, or gold fixture integration claim. |
 | Bounded AUTH-003b local delegation wiring | Kernel tests cover positive local child-run creation with run-bound principal plus parent/child grant refs in run record, `TaskRequest`, trace context, and replay; authority denial before `DelegationRequested`/routing/child insertion; parent principal mismatch denial, including agent re-registration after root-run creation; expired/not-yet-valid parent grant denial at actual decision time; future child grant window denial before routing; missing runtime authority evidence despite forged message payload evidence; and unchanged delegated action denial before gateway/adapter execution. | `G18/G70/G71` remain `not_exercised`; no daemon/API, gateway verifier, revocation propagation, or gold fixture integration claim. |
 | Bounded AUTH-004a obligations | Types tests cover conditional decision and obligation receipt serialization with receipt ID, issuer, audience, revocation source, and validation material. Authority tests cover grants without obligations still returning `Allowed`, grants with obligations returning `Conditional`, raw/forged receipt denial before validation, wrong issuer/audience/key/signature denial, exact validated receipt success, duplicate receipt ID denial, duplicate obligation ID denial, extra receipt denial, changed request/scope/params digest mismatch, missing/wrong obligation ID, wrong decision, wrong subject, wrong kind, expired, revoked, malformed evidence digest, unsupported schema, non-conditional decision denial, and conditional parent delegation denial before child grant creation. | `G11/G43/G75/G79` remain `not_exercised`; no gateway verifier, approval workflow, gate-engine, MFA, data-use, quota, safety, daemon/API, TS/Python, adapter execution, production PKI, or external revocation-introspection claim. |
+| Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, missing evidence requiring intervention before adapter execution, raw/forged receipts denying before adapter execution, changed gateway action digest denying, tampered full-decision digest denying, operation/tenant/agent/run scope mismatch denying, expired/revoked/wrong/extra/duplicate receipts denying, and legacy `ApprovalEvidence` alone not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, durable evidence store, production PKI, external revocation introspection, daemon/API, TS/Python, or full AUTH-004/C02 completion claim. |
 
 ## Future Implementation Requirements
 
 Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004 must add
 executable integration evidence before changing gold status or closing issues:
 
-- gateway/verifier integration with pre-effect authority decision evidence;
+- durable gateway/driver evidence integration beyond the bounded local AUTH-004b
+  verifier, including first-class evidence-store records and trace-schema
+  assertions for pre-effect authority decisions;
 - full work-order issuance/signature validation integration (`AUTH-002`),
   including workload-controller admission wiring, node-side validation, renewal
   semantics, one-time/non-renewable grant lifetimes, and executable `G60/G83`
@@ -307,10 +336,10 @@ executable integration evidence before changing gold status or closing issues:
   `G70`, `G71`), including executable gold coverage for the local delegation
   manager bridge, child cancellation/revocation propagation, cleanup obligations,
   durable evidence storage, and gateway authority-verifier integration;
-- obligations/approval workflow integration (`AUTH-004`), including gateway/driver
-  obligation receipt verification before invocation, owning approval/MFA/gate
-  receipt services, re-evaluation after obligation satisfaction, and executable
-  `G11/G43/G75/G79` fixtures;
+- obligations/approval workflow integration (`AUTH-004`) beyond the bounded local
+  gateway verifier, including owning approval/MFA/gate receipt services,
+  re-evaluation after obligation satisfaction, durable evidence/trace schema, and
+  executable `G11/G43/G75/G79` fixtures;
 - revocation, renewal, offline cache, and stale-authority denial (`AUTH-005`);
 - decision evidence/explainability and replay integration (`AUTH-006`);
 - adversarial/property suites (`AUTH-007`).

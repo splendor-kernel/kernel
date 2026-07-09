@@ -28,7 +28,7 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
     "splendor-types": set(),
     "splendor-store": {"splendor-types"},
     "splendor-authority": {"splendor-types", "splendor-store"},
-    "splendor-gateway": {"splendor-types"},
+    "splendor-gateway": {"splendor-types", "splendor-authority"},
     "splendor-kernel": {
         "splendor-types",
         "splendor-store",
@@ -59,7 +59,7 @@ RULE_NOTES: dict[str, str] = {
     "splendor-types": "splendor-types is behavior-free canonical IDs/schemas; it must not depend on other internal packages.",
     "splendor-store": "splendor-store is persistence-only; current baseline allows only splendor-types directly.",
     "splendor-authority": "RFC 0009 / IDR-001 allows splendor-authority to own identity lifecycle decisions over types and storage-only registry persistence.",
-    "splendor-gateway": "splendor-gateway is the action/driver boundary; current baseline allows only splendor-types directly.",
+    "splendor-gateway": "splendor-gateway is the action/driver boundary; AUTH-004b allows the narrow splendor-authority edge to validate obligation receipts before adapter invocation.",
     "splendor-kernel": "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local delegation authority bridge in addition to types/store/gateway.",
     "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> kernel/store/gateway/types composition seam only.",
     "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL allows existing embedded-local CLI edges to kernel/store/gateway/types and filesystem/http adapters only.",
@@ -342,7 +342,7 @@ def run_self_test() -> int:
             metadata_fixture(
                 {
                     "splendor-types": [],
-                    "splendor-gateway": ["splendor-types"],
+                    "splendor-gateway": ["splendor-types", "splendor-authority"],
                     "splendor-kernel": ["splendor-types", "splendor-gateway"],
                     "splendor-adapter-http": ["splendor-types", "splendor-gateway", "splendor-kernel"],
                 }
@@ -374,7 +374,7 @@ def run_self_test() -> int:
             metadata_fixture(
                 {
                     "splendor-types": [],
-                    "splendor-gateway": ["splendor-types"],
+                    "splendor-gateway": ["splendor-types", "splendor-authority"],
                     "splendor-kernel": [("splendor-adapter-http", "dev")],
                     "splendor-adapter-http": ["splendor-gateway", "splendor-kernel"],
                 }
