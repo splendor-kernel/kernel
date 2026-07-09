@@ -121,6 +121,11 @@ uuid_id! {
 }
 
 uuid_id! {
+    /// Unique identifier for an authority obligation receipt.
+    AuthorityObligationReceiptId
+}
+
+uuid_id! {
     /// Unique identifier for a v2 workload boundary.
     WorkloadId
 }
@@ -630,6 +635,7 @@ impl_uuid_identity!(
     AuthorityDecisionId,
     AuthorityRevocationId,
     AuthorityObligationId,
+    AuthorityObligationReceiptId,
     WorkloadId,
     DeviceId,
     ArtifactId,

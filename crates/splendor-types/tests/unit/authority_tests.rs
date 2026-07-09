@@ -147,6 +147,112 @@ fn authority_grant_and_decision_contracts_round_trip_without_behavior() {
 }
 
 #[test]
+fn authority_obligations_and_receipts_are_typed_and_schema_versioned() {
+    let now = time::OffsetDateTime::now_utc();
+    let obligation_id = AuthorityObligationId::new();
+    let decision_id = AuthorityDecisionId::new();
+    let subject = PrincipalId::new();
+    let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: obligation_id.clone(),
+        kind: AuthorityObligationKind::HumanReview,
+        description: "human reviewer must approve high-risk operation".to_string(),
+        parameters: std::collections::BTreeMap::new(),
+    };
+    let receipt = AuthorityObligationReceipt {
+        schema_version: AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION.to_string(),
+        receipt_id: AuthorityObligationReceiptId::new(),
+        issuer: PrincipalId::new(),
+        audience: "daemon:local".to_string(),
+        obligation_id,
+        kind: AuthorityObligationKind::HumanReview,
+        subject: subject.clone(),
+        authority_decision_id: decision_id.clone(),
+        canonical_request_digest:
+            "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        evidence_digest: "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            .to_string(),
+        evidence_ref: Some("approval-evidence:review-1".to_string()),
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(10),
+        revocation: RevocationStatus::Active,
+        revocation_ref: "revocation:receipt-review-1".to_string(),
+        approval_id: Some(ApprovalId::new()),
+        approval_trace_event_id: Some(TraceEventId::new()),
+        validation: AuthorityObligationReceiptValidation {
+            validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+            algorithm: "local-obligation-receipt-v1".to_string(),
+            key_id: "receipt-key-1".to_string(),
+            digest: "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_string(),
+            signature: "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_string(),
+        },
+    };
+    let statuses = vec![
+        AuthorityDecisionStatus::Allowed,
+        AuthorityDecisionStatus::Denied,
+        AuthorityDecisionStatus::Conditional,
+        AuthorityDecisionStatus::NeedsApproval,
+        AuthorityDecisionStatus::NeedsIntervention,
+    ];
+    let kinds = vec![
+        AuthorityObligationKind::ApprovalRequired,
+        AuthorityObligationKind::MfaAssurance,
+        AuthorityObligationKind::DedicatedIsolation,
+        AuthorityObligationKind::NetworkDeny,
+        AuthorityObligationKind::HumanReview,
+        AuthorityObligationKind::IndependentEvaluator,
+        AuthorityObligationKind::LocalSafetyVerifier,
+        AuthorityObligationKind::PostconditionCheck,
+        AuthorityObligationKind::MaximumBlastRadius,
+        AuthorityObligationKind::EvidenceRequired,
+    ];
+    let json = serde_json::to_value(&receipt).expect("receipt json");
+
+    assert_eq!(
+        json["schema_version"],
+        AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION
+    );
+    assert_eq!(json["obligation_id"], receipt.obligation_id.to_string());
+    assert_eq!(json["receipt_id"], receipt.receipt_id.to_string());
+    assert_eq!(json["issuer"], receipt.issuer.to_string());
+    assert_eq!(json["audience"], "daemon:local");
+    assert_eq!(json["kind"], "human_review");
+    assert_eq!(json["subject"], subject.to_string());
+    assert_eq!(json["authority_decision_id"], decision_id.to_string());
+    assert_eq!(json["validation"]["validation_kind"], "local_signature");
+    assert_eq!(json["validation"]["key_id"], "receipt-key-1");
+    assert_eq!(
+        serde_json::to_value(&statuses).expect("statuses json"),
+        serde_json::json!([
+            "allowed",
+            "denied",
+            "conditional",
+            "needs_approval",
+            "needs_intervention"
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(&kinds).expect("kinds json"),
+        serde_json::json!([
+            "approval_required",
+            "mfa_assurance",
+            "dedicated_isolation",
+            "network_deny",
+            "human_review",
+            "independent_evaluator",
+            "local_safety_verifier",
+            "postcondition_check",
+            "maximum_blast_radius",
+            "evidence_required"
+        ])
+    );
+    round_trip(&obligation);
+    round_trip(&receipt);
+}
+
+#[test]
 fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
     let now = time::OffsetDateTime::now_utc();
     let parent_grant_id = CapabilityGrantId::new();

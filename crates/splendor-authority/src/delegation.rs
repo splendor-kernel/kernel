@@ -192,6 +192,9 @@ pub enum DelegationGrantError {
     /// Parent grant failed evaluator validation for a reason not otherwise mapped.
     #[error("parent grant is invalid: {reason_code}")]
     ParentGrantInvalid { reason_code: String },
+    /// Parent authority matched but carries unsatisfied obligations.
+    #[error("parent authority obligations are unsatisfied")]
+    ParentObligationsUnsatisfied,
 }
 
 impl DelegationGrantError {
@@ -226,6 +229,7 @@ impl DelegationGrantError {
             Self::InvalidIdentity { .. } => "invalid_delegation_identity",
             Self::ChildGrantInvalid { .. } => "child_grant_invalid",
             Self::ParentGrantInvalid { .. } => "parent_grant_invalid",
+            Self::ParentObligationsUnsatisfied => "parent_obligations_unsatisfied",
         }
     }
 }
@@ -515,8 +519,12 @@ fn ensure_parent_authorizes_child(
             metadata: Default::default(),
         };
         let decision = evaluate_capability_request(std::slice::from_ref(parent), &request, now);
-        if decision.status != AuthorityDecisionStatus::Allowed {
-            return Err(map_parent_denial(&decision.reasons));
+        match decision.status {
+            AuthorityDecisionStatus::Allowed => {}
+            AuthorityDecisionStatus::Conditional => {
+                return Err(DelegationGrantError::ParentObligationsUnsatisfied);
+            }
+            _ => return Err(map_parent_denial(&decision.reasons)),
         }
     }
     Ok(())
