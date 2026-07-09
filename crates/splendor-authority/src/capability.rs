@@ -700,8 +700,19 @@ fn validate_grant_shape_with_trust(
     validate_optional_token("revocation_ref", grant.revocation_ref.as_deref())?;
     validate_grant_validation(grant.validation.as_ref(), trust)?;
     validate_extension_map(&grant.metadata, "capability_grant.metadata")?;
-    for obligation in &grant.obligations {
+    for (index, obligation) in grant.obligations.iter().enumerate() {
         validate_obligation(obligation)?;
+        if grant
+            .obligations
+            .iter()
+            .skip(index + 1)
+            .any(|candidate| candidate.obligation_id == obligation.obligation_id)
+        {
+            return Err(AuthorityEvaluationError::InvalidScope {
+                dimension: "obligations",
+                reason: "duplicate_obligation_id".to_string(),
+            });
+        }
     }
     Ok(())
 }

@@ -6,8 +6,8 @@
 
 use crate::{
     AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
-    AuthorityRevocationId, CapabilityGrantId, DeviceId, FleetId, PrincipalId, RevocationStatus,
-    RunId, StatePartitionId, TenantId, TraceEventId, WorkloadId,
+    AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, DeviceId, FleetId,
+    PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId, WorkloadId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -389,12 +389,49 @@ pub enum AuthorityObligationKind {
     EvidenceRequired,
 }
 
-/// Behavior-free receipt proving an owning service completed one authority
+/// Behavior-free validation material for an authority obligation receipt.
+///
+/// This contract is not authorizing by itself. `splendor-authority` must validate
+/// it against trusted owning-service context before any receipt can satisfy an
+/// obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthorityObligationReceiptValidation {
+    /// Validation mode for this bounded slice.
+    pub validation_kind: AuthorityObligationReceiptValidationKind,
+    /// Signing or validation algorithm label.
+    pub algorithm: String,
+    /// Key identifier expected by the owning service validation context.
+    pub key_id: String,
+    /// Digest over the canonical receipt payload excluding this validation block.
+    pub digest: String,
+    /// Deterministic local signature/MAC for this bounded slice.
+    pub signature: String,
+}
+
+/// Authority obligation receipt validation mode.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityObligationReceiptValidationKind {
+    /// Deterministic local validation path used by this bounded evidence slice.
+    LocalSignature,
+}
+
+/// Behavior-free receipt claiming an owning service completed one authority
 /// obligation for one exact authority decision/request digest.
+///
+/// Raw receipts are serialized contracts only. They do not satisfy obligations
+/// unless `splendor-authority` wraps them as validated receipts using a trusted
+/// owning-service context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthorityObligationReceipt {
     /// Receipt schema version.
     pub schema_version: String,
+    /// Distinct receipt identity.
+    pub receipt_id: AuthorityObligationReceiptId,
+    /// Principal for the service that owns/signed the receipt.
+    pub issuer: PrincipalId,
+    /// Audience this receipt was issued for.
+    pub audience: String,
     /// Obligation satisfied by this receipt.
     pub obligation_id: AuthorityObligationId,
     /// Obligation kind satisfied by this receipt.
@@ -418,12 +455,17 @@ pub struct AuthorityObligationReceipt {
     pub expires_at: OffsetDateTime,
     /// Current revocation state supplied by the owning service/revocation path.
     pub revocation: RevocationStatus,
+    /// Revocation lookup/source coordinate for the owning service path.
+    pub revocation_ref: String,
     /// Optional approval identity for approval-backed obligations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<ApprovalId>,
     /// Optional trace event for approval/request evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_trace_event_id: Option<TraceEventId>,
+    /// Behavior-free validation material. It is not authorizing until checked by
+    /// `splendor-authority` with trusted owning-service context.
+    pub validation: AuthorityObligationReceiptValidation,
 }
 
 /// Immutable capability grant contract for this local AUTH-001 slice.

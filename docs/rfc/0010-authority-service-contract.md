@@ -13,17 +13,19 @@ logic in `splendor-authority`, trusted local profile grant wrapping, a bounded
 signed work-order to verified capability grant bridge, behavior-free delegation
 grant/chain contracts, an authority-owned local child-grant builder, conditional
 authority decisions for grants with obligations, behavior-free obligation receipt
-contracts, fail-closed local receipt matching helpers, and unit tests for
-allow/deny/narrowing/issuance/delegation/obligation behavior. It also includes a
-bounded runtime-local delegation-manager bridge that records parent/child grant
-refs after authority-owned child-grant issuance.
+contracts, trusted local receipt validation wrappers, exact fail-closed receipt
+matching helpers, and unit tests for allow/deny/narrowing/issuance/delegation/
+obligation behavior. It also includes a bounded runtime-local delegation-manager
+bridge that records parent/child grant refs after authority-owned child-grant
+issuance.
 
 This slice does not change stable 0.1 gateway verifier wiring, daemon APIs,
 OpenAPI, TypeScript, Python, fleet behavior, node admission, workload-controller
 wiring, child revocation propagation, approval workflow execution, MFA/provider
-integration, gate-engine migration, obligation receipt storage, or adapter
-execution. It adds optional local trace/message/run-record authority reference
-fields for `AUTH-003b`. It does not claim full C02, full `AUTH-001`, full
+integration, gate-engine migration, obligation receipt storage, production PKI,
+external revocation introspection, or adapter execution. It adds optional local
+trace/message/run-record authority reference fields for `AUTH-003b`. It does not
+claim full C02, full `AUTH-001`, full
 `AUTH-002`, full `AUTH-003`, full `AUTH-004`, G11, G18, G43, G60, G70, G71, G75,
 G79, G83, issue closure, or gold completion.
 
@@ -195,17 +197,32 @@ receipt matching:
   network deny, human review, independent evaluator, local safety verifier,
   postcondition check, and maximum blast radius, plus
   `AuthorityObligationReceipt`;
-- each receipt binds one obligation ID/kind to the original subject principal,
+- each raw receipt remains behavior-free and carries a receipt ID, owning-service
+  issuer principal, audience, one obligation ID/kind, original subject principal,
   authority decision ID, canonical request digest, evidence digest/reference,
-  issuance/expiry times, revocation state, and optional approval identity/trace
-  reference;
+  issuance/expiry times, revocation source/state, optional approval identity/trace
+  reference, and local validation material;
 - `splendor-authority::canonical_authority_request_digest` produces a stable
   `blake3:` digest over the authority request contract for receipt binding;
-- `splendor-authority::verify_obligation_receipts` verifies exact receipt
-  matches for conditional decisions and denies missing, wrong decision, wrong
-  subject, wrong obligation ID, wrong kind, wrong request digest, expired,
-  revoked, malformed request digest, malformed evidence digest, and unsupported
-  schema cases with stable reason codes;
+- `splendor-authority::validate_authority_obligation_receipt` wraps raw receipts
+  as `ValidatedAuthorityObligationReceipt` only after a trusted owning-service
+  context supplies expected issuer, audience, key ID, local validation secret,
+  revocation source, and decision time; wrong issuer, audience, key, signature,
+  expiry, revocation, malformed digest/reference, or unsupported schema fails
+  closed with stable reason codes;
+- the local validation context is authority-service owned, not a requester wire
+  contract; this bounded slice does not expose a requester-constructible context
+  as authority;
+- `splendor-authority::verify_obligation_receipts` accepts only validated
+  receipts, requires an exact receipt set for conditional decisions, rejects
+  duplicate receipt IDs, duplicate obligation IDs, and extra receipts, and denies
+  missing, wrong decision, wrong subject, wrong obligation ID, wrong kind, wrong
+  request digest, expired, revoked, malformed request digest, malformed evidence
+  digest, and unsupported schema cases with stable reason codes;
+- `splendor-authority::issue_delegation_child_grant` does not treat a
+  `Conditional` parent authority decision as enough to issue a child grant; it
+  denies with `parent_obligations_unsatisfied` before child grant creation while
+  preserving the behavior-free obligation propagation rule for narrowed grants;
 - no gateway, daemon/API, TypeScript, Python, MFA, approval workflow, gate-engine,
   data-use, quota, safety, or adapter execution integration is included in this
   slice.
@@ -229,7 +246,8 @@ receipt matching:
 | Critic/evaluator roles are non-actuating | Local `AUTH-003a` denial tests reject critic/evaluator delegations carrying actuation, external-effect, or delegation-control operations. |
 | Local delegation fails closed | Local `AUTH-003b` denies before task routing and child insertion when authority evidence is missing/invalid, parent principal binding fails, grant liveness fails, or child-grant issuance fails. |
 | Obligations are conditional authority | Local `AUTH-004a` returns `Conditional` for matching grants with obligations instead of unconditional allow. |
-| Receipts are exact and typed | Local `AUTH-004a` receipt verification requires matching obligation ID/kind, subject, decision ID, canonical request digest, evidence digest, expiry, and active revocation state. |
+| Raw receipts are not authority | Local `AUTH-004a` raw receipt contracts must first be wrapped as `ValidatedAuthorityObligationReceipt` through trusted owning-service context; requester-fabricated receipt fields do not satisfy obligations. |
+| Receipts are exact and typed | Local `AUTH-004a` receipt verification requires validated receipts with matching receipt ID uniqueness, obligation ID/kind, subject, decision ID, canonical request digest, evidence digest, audience, expiry, and active revocation state; duplicate, missing, or extra receipts deny. |
 | Approval is not a bypass | Receipt verification does not replace capability, quota, safety, data-use, policy, or gateway checks and does not accept free-form `approved` text, metadata, or extensions as authority. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
@@ -273,7 +291,7 @@ evidence before execution.
 | Bounded AUTH-002a issuance | Authority tests cover valid signed work-order grant issuance, raw signed grant denial, unsigned/bad-signature/expired/revoked work-order failures, inactive/revoked principal failures, binding mismatch failures, issuer-authority denial, quota/locality non-broadening, and secret/signature-safe errors. | `G60/G83` remain `not_exercised`; no workload-controller, node, fleet, or gateway integration claim. |
 | Bounded AUTH-003a delegation | Authority tests cover local delegation contract round-trip, positive child grant issuance, parent-obligation preservation, missing/wrong parent edge, issuer mismatch, child subject missing/wrong, overbroad operation/scope/audience/time/budget/depth/fan-out, exhausted depth, fan-out exceeded, bad message schema/recipient, revoked/expired/not-yet-valid parent, and critic/evaluator external-effect/control-plane delegation denial. | `G18/G70/G71` remain `not_exercised`; no local-delegation manager, message routing, gateway, trace, revocation propagation, or gold fixture integration claim. |
 | Bounded AUTH-003b local delegation wiring | Kernel tests cover positive local child-run creation with run-bound principal plus parent/child grant refs in run record, `TaskRequest`, trace context, and replay; authority denial before `DelegationRequested`/routing/child insertion; parent principal mismatch denial, including agent re-registration after root-run creation; expired/not-yet-valid parent grant denial at actual decision time; future child grant window denial before routing; missing runtime authority evidence despite forged message payload evidence; and unchanged delegated action denial before gateway/adapter execution. | `G18/G70/G71` remain `not_exercised`; no daemon/API, gateway verifier, revocation propagation, or gold fixture integration claim. |
-| Bounded AUTH-004a obligations | Types tests cover conditional decision and obligation receipt serialization. Authority tests cover grants without obligations still returning `Allowed`, grants with obligations returning `Conditional`, exact matching receipt success, changed request/scope/params digest mismatch, missing/wrong obligation ID, wrong decision, wrong subject, wrong kind, expired, revoked, malformed evidence digest, unsupported schema, and non-conditional decision denial. | `G11/G43/G75/G79` remain `not_exercised`; no gateway verifier, approval workflow, gate-engine, MFA, data-use, quota, safety, daemon/API, TS/Python, or adapter execution integration claim. |
+| Bounded AUTH-004a obligations | Types tests cover conditional decision and obligation receipt serialization with receipt ID, issuer, audience, revocation source, and validation material. Authority tests cover grants without obligations still returning `Allowed`, grants with obligations returning `Conditional`, raw/forged receipt denial before validation, wrong issuer/audience/key/signature denial, exact validated receipt success, duplicate receipt ID denial, duplicate obligation ID denial, extra receipt denial, changed request/scope/params digest mismatch, missing/wrong obligation ID, wrong decision, wrong subject, wrong kind, expired, revoked, malformed evidence digest, unsupported schema, non-conditional decision denial, and conditional parent delegation denial before child grant creation. | `G11/G43/G75/G79` remain `not_exercised`; no gateway verifier, approval workflow, gate-engine, MFA, data-use, quota, safety, daemon/API, TS/Python, adapter execution, production PKI, or external revocation-introspection claim. |
 
 ## Future Implementation Requirements
 

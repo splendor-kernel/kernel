@@ -1586,6 +1586,35 @@ fn authority_shape_validation_covers_malformed_requests_grants_operations_and_sc
         "invalid_scope:time:grant_not_before_must_precede_expires_at"
     );
 
+    let duplicate_obligation_id = AuthorityObligationId::new();
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: duplicate_obligation_id.clone(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "record evidence".to_string(),
+        parameters: Default::default(),
+    });
+    invalid_grant.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: duplicate_obligation_id,
+        kind: AuthorityObligationKind::HumanReview,
+        description: "review evidence".to_string(),
+        parameters: Default::default(),
+    });
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:obligations:duplicate_obligation_id"
+    );
+
     let mut invalid_grant = grant(
         issuer,
         subject,
