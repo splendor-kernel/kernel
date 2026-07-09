@@ -780,6 +780,7 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 

@@ -100,7 +100,7 @@ fn validation_context(
     issuer: PrincipalId,
     now: OffsetDateTime,
 ) -> AuthorityObligationReceiptValidationContext {
-    AuthorityObligationReceiptValidationContext::new(
+    AuthorityObligationReceiptValidationContext::trusted_local(
         issuer,
         RECEIPT_AUDIENCE,
         RECEIPT_KEY_ID,
@@ -249,7 +249,7 @@ fn raw_or_forged_obligation_receipts_do_not_validate_as_trusted() {
         "obligation_receipt_validation_digest_mismatch",
     );
 
-    let forged_context = AuthorityObligationReceiptValidationContext::new(
+    let forged_context = AuthorityObligationReceiptValidationContext::trusted_local(
         issuer,
         RECEIPT_AUDIENCE,
         RECEIPT_KEY_ID,

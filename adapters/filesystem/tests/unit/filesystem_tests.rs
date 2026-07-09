@@ -24,6 +24,7 @@ fn build_action(tenant_id: TenantId, name: &str, params: serde_json::Value) -> A
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
+        authority_obligation_evidence: None,
     }
 }
 

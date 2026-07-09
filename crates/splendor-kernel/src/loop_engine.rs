@@ -677,6 +677,7 @@ impl LoopEngine {
                     satisfied_preconditions: candidate.satisfied_preconditions.clone(),
                     requested_at: OffsetDateTime::now_utc(),
                     approval_evidence: candidate.approval_evidence.clone(),
+                    authority_obligation_evidence: None,
                 };
 
                 match self.gateway.submit(request) {

@@ -135,6 +135,7 @@ impl PhysicalSimulationHarness {
                 satisfied_preconditions,
                 requested_at: OffsetDateTime::now_utc(),
                 approval_evidence: None,
+                authority_obligation_evidence: None,
             })
             .expect("gateway outcome");
         self.record_gateway_outcome(action, &outcome);

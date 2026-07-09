@@ -29,7 +29,8 @@ pub use issuance::{
     WorkOrderGrantIssuanceResult,
 };
 pub use obligations::{
-    canonical_authority_request_digest, validate_authority_obligation_receipt,
-    verify_obligation_receipts, AuthorityObligationReceiptValidationContext,
-    ObligationReceiptError, ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
+    canonical_authority_request_digest, issue_local_authority_obligation_receipt,
+    validate_authority_obligation_receipt, verify_obligation_receipts,
+    AuthorityObligationReceiptValidationContext, ObligationReceiptError,
+    ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
 };

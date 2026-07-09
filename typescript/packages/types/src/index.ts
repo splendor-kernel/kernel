@@ -259,6 +259,11 @@ export interface ApprovalEvidence {
   trace_event_id: TraceEventId | null;
 }
 
+export interface GatewayAuthorityObligationEvidence {
+  decision: JsonValue;
+  receipts: JsonValue[];
+}
+
 export interface ApprovalTraceContext {
   approval_id: ApprovalId;
   tenant_id: TenantId;
@@ -923,6 +928,7 @@ export interface ActionRequest {
   satisfied_preconditions: string[];
   requested_at: ISODateTime;
   approval_evidence: ApprovalEvidence | null;
+  authority_obligation_evidence: GatewayAuthorityObligationEvidence | null;
 }
 
 export interface ActionOutcome {
@@ -1400,7 +1406,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "quota_usage",
     "satisfied_preconditions",
     "requested_at",
-    "approval_evidence"
+    "approval_evidence",
+    "authority_obligation_evidence"
   ],
   action_outcome: ["action_id", "status", "verification", "post_verification", "output", "error", "completed_at"],
   external_governance_reference: ["provider", "reference_id", "endpoint"],

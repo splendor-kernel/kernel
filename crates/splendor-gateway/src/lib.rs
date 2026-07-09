@@ -30,15 +30,21 @@
 //!     satisfied_preconditions: vec![],
 //!     requested_at: OffsetDateTime::now_utc(),
 //!     approval_evidence: None,
+//!     authority_obligation_evidence: None,
 //! };
 //! assert!(ActionGateway::submit(&gateway, request).is_err());
 //! ```
 
 use serde::{Deserialize, Serialize};
+use splendor_authority::{
+    gateway_action_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
+    AuthorityObligationReceiptValidationContext,
+};
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
-    ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, CircuitBreaker,
-    CircuitBreakerScope, EffectCertainty, ErrorCategory, ErrorTaxonomy, IdentityValidationError,
+    ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, AuthorityDecision,
+    AuthorityDecisionStatus, AuthorityObligationReceipt, CircuitBreaker, CircuitBreakerScope,
+    ContentHash, EffectCertainty, ErrorCategory, ErrorTaxonomy, IdentityValidationError,
     QuotaUsage, ReasonCode, RetryClass, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
     VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
     FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
@@ -49,6 +55,30 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 pub use splendor_types::ActionId;
+
+/// Metadata key inside `AuthorityDecision.request.metadata` that binds a
+/// conditional authority decision to the exact gateway action request.
+pub const GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY: &str =
+    "splendor.integrity.action_request_hash";
+
+/// Metadata key inside `AuthorityDecision.request.metadata` that binds the
+/// request digest signed by receipts to the full conditional decision payload.
+pub const GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY: &str = "splendor.integrity.decision_hash";
+
+/// Behavior-free authority obligation evidence carried with a gateway action.
+///
+/// Raw receipts in this envelope are not authority. The gateway accepts them
+/// only after a configured authority-owned verifier validates each receipt using
+/// trusted local context and then matches the validated receipts to the embedded
+/// conditional authority decision before adapter execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GatewayAuthorityObligationEvidence {
+    /// Conditional authority decision whose obligations must be satisfied.
+    pub decision: AuthorityDecision,
+    /// Raw obligation receipts to validate and match against the decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<AuthorityObligationReceipt>,
+}
 
 /// Request payload submitted to the action gateway.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +104,9 @@ pub struct ActionRequest {
     /// Optional approval grant/denial evidence presented for this action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_evidence: Option<ApprovalEvidence>,
+    /// Optional behavior-free authority obligation evidence for conditional decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_obligation_evidence: Option<GatewayAuthorityObligationEvidence>,
 }
 
 impl ActionRequest {
@@ -661,6 +694,364 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
     }
 }
 
+/// Result returned by an authority obligation verifier.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthorityObligationVerification {
+    /// No obligation evidence is required for this action and none was supplied.
+    NotRequired,
+    /// Conditional obligation receipts validated and matched exactly.
+    Allowed(VerificationResult),
+    /// Obligation evidence was present but invalid or did not satisfy the decision.
+    Denied(VerificationResult),
+    /// Required evidence or the verifier itself is unavailable; fail closed.
+    NeedsIntervention(VerificationResult),
+}
+
+/// Verifies conditional authority obligation receipts before adapter execution.
+pub trait AuthorityObligationVerifier: Send + Sync {
+    /// Verifies behavior-free authority obligation evidence for the action.
+    fn verify_obligations(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+        now: OffsetDateTime,
+    ) -> AuthorityObligationVerification;
+}
+
+/// Default authority obligation verifier.
+///
+/// When no authority evidence is required and none is supplied, existing gateway
+/// behavior is unchanged. If conditional evidence is supplied without a trusted
+/// local verifier, the gateway fails closed rather than ignoring it.
+#[derive(Clone, Debug, Default)]
+pub struct NoAuthorityObligationVerifier;
+
+impl AuthorityObligationVerifier for NoAuthorityObligationVerifier {
+    fn verify_obligations(
+        &self,
+        action: &ActionRequest,
+        _adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> AuthorityObligationVerification {
+        if action.authority_obligation_evidence.is_some() {
+            return AuthorityObligationVerification::NeedsIntervention(
+                authority_obligation_result(
+                    false,
+                    vec!["authority_obligation_verifier_unavailable".to_string()],
+                    "verifier_unavailable",
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+        AuthorityObligationVerification::NotRequired
+    }
+}
+
+/// Action/adapter matcher for requiring authority obligation evidence locally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityObligationRequirement {
+    /// Optional exact action name. `None` matches any action.
+    pub action_name: Option<String>,
+    /// Optional exact effective adapter ID. `None` matches any adapter.
+    pub adapter: Option<String>,
+}
+
+impl AuthorityObligationRequirement {
+    /// Requires authority obligation evidence for every action.
+    pub fn all() -> Self {
+        Self {
+            action_name: None,
+            adapter: None,
+        }
+    }
+
+    /// Requires authority obligation evidence for one action name.
+    pub fn action(action_name: impl Into<String>) -> Self {
+        Self {
+            action_name: Some(action_name.into()),
+            adapter: None,
+        }
+    }
+
+    /// Requires authority obligation evidence for one action/adapter pair.
+    pub fn action_adapter(action_name: impl Into<String>, adapter: impl Into<String>) -> Self {
+        Self {
+            action_name: Some(action_name.into()),
+            adapter: Some(adapter.into()),
+        }
+    }
+
+    fn matches(&self, action: &ActionRequest, adapter: Option<&str>) -> bool {
+        let action_matches = self
+            .action_name
+            .as_ref()
+            .map(|expected| expected == &action.action.name)
+            .unwrap_or(true);
+        let adapter_matches = self
+            .adapter
+            .as_ref()
+            .map(|expected| Some(expected.as_str()) == adapter)
+            .unwrap_or(true);
+        action_matches && adapter_matches
+    }
+}
+
+/// Local deterministic authority obligation verifier backed by trusted receipt context.
+///
+/// The context is supplied by gateway runtime configuration or an authority-owned
+/// receipt service seam. Request payloads never control this verifier context.
+#[derive(Clone, Debug)]
+pub struct LocalAuthorityObligationVerifier {
+    context: AuthorityObligationReceiptValidationContext,
+    requirements: Vec<AuthorityObligationRequirement>,
+}
+
+impl LocalAuthorityObligationVerifier {
+    /// Creates a verifier that validates supplied obligation evidence but does not require it.
+    pub fn new(context: AuthorityObligationReceiptValidationContext) -> Self {
+        Self {
+            context,
+            requirements: Vec::new(),
+        }
+    }
+
+    /// Creates a verifier with explicit action/adapter requirements.
+    pub fn requiring(
+        context: AuthorityObligationReceiptValidationContext,
+        requirements: Vec<AuthorityObligationRequirement>,
+    ) -> Self {
+        Self {
+            context,
+            requirements,
+        }
+    }
+
+    /// Creates a verifier that requires authority obligation evidence for every action.
+    pub fn require_all(context: AuthorityObligationReceiptValidationContext) -> Self {
+        Self::requiring(context, vec![AuthorityObligationRequirement::all()])
+    }
+}
+
+impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
+    fn verify_obligations(
+        &self,
+        action: &ActionRequest,
+        adapter: Option<&str>,
+        now: OffsetDateTime,
+    ) -> AuthorityObligationVerification {
+        let required = self
+            .requirements
+            .iter()
+            .any(|requirement| requirement.matches(action, adapter));
+        let Some(evidence) = action.authority_obligation_evidence.as_ref() else {
+            if required {
+                return AuthorityObligationVerification::NeedsIntervention(
+                    authority_obligation_result(
+                        false,
+                        vec!["authority_obligation_evidence_required".to_string()],
+                        "required",
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                );
+            }
+            return AuthorityObligationVerification::NotRequired;
+        };
+
+        if evidence.decision.status != AuthorityDecisionStatus::Conditional {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_not_conditional".to_string()],
+                "denied",
+                Some(evidence),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let decision_binding_reasons =
+            authority_decision_action_binding_reasons(&evidence.decision, action);
+        if !decision_binding_reasons.is_empty() {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                decision_binding_reasons,
+                "denied",
+                Some(evidence),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let expected_action_digest =
+            match canonical_gateway_authority_action_digest(action, adapter) {
+                Ok(digest) => digest,
+                Err(reason) => {
+                    return AuthorityObligationVerification::NeedsIntervention(
+                        authority_obligation_result(
+                            false,
+                            vec![reason],
+                            "digest_unavailable",
+                            Some(evidence),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                    )
+                }
+            };
+        let Some(decision_action_digest) = evidence
+            .decision
+            .request
+            .metadata
+            .get(GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_action_digest_missing".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        if decision_action_digest != expected_action_digest {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_action_digest_mismatch".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let expected_decision_digest =
+            match canonical_gateway_authority_decision_digest(&evidence.decision) {
+                Ok(digest) => digest,
+                Err(reason) => {
+                    return AuthorityObligationVerification::NeedsIntervention(
+                        authority_obligation_result(
+                            false,
+                            vec![reason],
+                            "decision_digest_unavailable",
+                            Some(evidence),
+                            Some(expected_action_digest),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                    )
+                }
+            };
+        let Some(decision_digest) = evidence
+            .decision
+            .request
+            .metadata
+            .get(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_digest_missing".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        if decision_digest != expected_decision_digest {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_digest_mismatch".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let context = self.context.at_time(now);
+        let mut validated_receipts = Vec::with_capacity(evidence.receipts.len());
+        let mut validation_reasons = Vec::new();
+        for receipt in &evidence.receipts {
+            match validate_authority_obligation_receipt(receipt.clone(), &context) {
+                Ok(validated) => validated_receipts.push(validated),
+                Err(error) => push_unique_string(&mut validation_reasons, error.reason_code()),
+            }
+        }
+        if !validation_reasons.is_empty() {
+            let status = if validation_reasons
+                .iter()
+                .any(|reason| reason == "obligation_receipt_validation_secret_unavailable")
+            {
+                "verifier_unavailable"
+            } else {
+                "denied"
+            };
+            let result = authority_obligation_result(
+                false,
+                validation_reasons,
+                status,
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            );
+            return if status == "verifier_unavailable" {
+                AuthorityObligationVerification::NeedsIntervention(result)
+            } else {
+                AuthorityObligationVerification::Denied(result)
+            };
+        }
+
+        let verification = verify_obligation_receipts(&evidence.decision, &validated_receipts, now);
+        if !verification.allowed {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                verification.reasons,
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                verification
+                    .satisfied_obligation_ids
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+                Vec::new(),
+            ));
+        }
+
+        AuthorityObligationVerification::Allowed(authority_obligation_result(
+            true,
+            Vec::new(),
+            "satisfied",
+            Some(evidence),
+            Some(expected_action_digest),
+            verification
+                .satisfied_obligation_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            evidence
+                .receipts
+                .iter()
+                .map(|receipt| receipt.receipt_id.to_string())
+                .collect(),
+        ))
+    }
+}
+
 /// Evaluates tripped circuit breakers before adapter execution.
 pub trait CircuitBreakerEvaluator: Send + Sync {
     /// Verifies whether the action is allowed under the current breaker state.
@@ -780,6 +1171,7 @@ pub struct VerifiedActionGateway {
     invariant_evaluator: Arc<dyn InvariantEvaluator>,
     resource_boundary_verifier: Arc<dyn ResourceBoundaryVerifier>,
     approval_verifier: Arc<dyn ApprovalVerifier>,
+    authority_obligation_verifier: Arc<dyn AuthorityObligationVerifier>,
     safety_verifier: Option<Arc<dyn SafetyVerifier>>,
     circuit_breaker_evaluator: Arc<dyn CircuitBreakerEvaluator>,
     runtime_identity: RuntimeIdentityContext,
@@ -794,6 +1186,7 @@ impl VerifiedActionGateway {
             invariant_evaluator: Arc::new(SimpleInvariantEvaluator),
             resource_boundary_verifier: Arc::new(NoopResourceBoundaryVerifier),
             approval_verifier: Arc::new(NoApprovalVerifier),
+            authority_obligation_verifier: Arc::new(NoAuthorityObligationVerifier),
             safety_verifier: None,
             circuit_breaker_evaluator: Arc::new(NoopCircuitBreakerEvaluator),
             runtime_identity: RuntimeIdentityContext::default(),
@@ -829,6 +1222,14 @@ impl VerifiedActionGateway {
     /// Overrides the approval verifier used by the gateway.
     pub fn set_approval_verifier(&mut self, verifier: Arc<dyn ApprovalVerifier>) {
         self.approval_verifier = verifier;
+    }
+
+    /// Overrides the authority obligation verifier used before adapter execution.
+    pub fn set_authority_obligation_verifier(
+        &mut self,
+        verifier: Arc<dyn AuthorityObligationVerifier>,
+    ) {
+        self.authority_obligation_verifier = verifier;
     }
 
     /// Overrides the local physical safety verifier used by the gateway.
@@ -961,6 +1362,22 @@ impl ActionGateway for VerifiedActionGateway {
             }
         };
 
+        let authority_obligation_verification = self
+            .authority_obligation_verifier
+            .verify_obligations(&action, Some(adapter_id), OffsetDateTime::now_utc());
+        let authority_obligation_grant = match authority_obligation_verification {
+            AuthorityObligationVerification::NotRequired => None,
+            AuthorityObligationVerification::Allowed(result) => Some(result),
+            AuthorityObligationVerification::Denied(mut result) => {
+                attach_request_context(&mut result, &action);
+                return Ok(denied_outcome(action.action_id, result));
+            }
+            AuthorityObligationVerification::NeedsIntervention(mut result) => {
+                attach_request_context(&mut result, &action);
+                return Ok(needs_intervention_outcome(action.action_id, result));
+            }
+        };
+
         let quota_result = self.tenant_access.verify_quota(
             &action.tenant_id,
             &action.agent_id,
@@ -973,6 +1390,13 @@ impl ActionGateway for VerifiedActionGateway {
         }
         if let Some(approval_grant) = approval_grant {
             attach_allowed_artifact(&mut verification, "approval", approval_grant.artifacts);
+        }
+        if let Some(authority_obligation_grant) = authority_obligation_grant {
+            attach_allowed_artifact(
+                &mut verification,
+                "authority_obligation",
+                authority_obligation_grant.artifacts,
+            );
         }
 
         match verify_safety_pre(&self.safety_verifier, &action, Some(adapter_id)) {
@@ -1153,6 +1577,199 @@ fn check_conditions(reason: &str, expected: &[String], satisfied: &[String]) -> 
             "satisfied": satisfied,
             "missing": missing,
         }),
+    }
+}
+
+/// Computes the deterministic digest authority decisions must bind to for this
+/// exact gateway action request and effective adapter.
+///
+/// The digest excludes authority obligation evidence itself and legacy approval
+/// evidence so neither requester-supplied receipt metadata nor legacy approval
+/// grants can become authority. The resulting digest must be present in the
+/// authority decision request metadata under
+/// [`GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY`] and is itself bound by the
+/// validated obligation receipts through the canonical authority request digest.
+pub fn canonical_gateway_authority_action_digest(
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> Result<String, String> {
+    let payload = GatewayAuthorityActionDigestPayload {
+        schema_version: "splendor.gateway.authority_action_binding.v1",
+        action_id: &action.action_id,
+        tenant_id: &action.tenant_id,
+        agent_id: &action.agent_id,
+        run_id: &action.run_id,
+        action: &action.action,
+        effective_adapter,
+        quota_usage: action.quota_usage,
+        satisfied_preconditions: &action.satisfied_preconditions,
+        requested_at: action.requested_at,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("gateway_action_request_digest_unavailable:{error}"))?;
+    Ok(ContentHash::blake3(bytes).to_string())
+}
+
+/// Computes the deterministic digest that receipt-bound authority requests must
+/// carry to protect the complete conditional decision from requester tampering.
+///
+/// The digest covers the full decision payload except the digest metadata field
+/// itself. Because obligation receipts sign the canonical authority request
+/// digest, a requester cannot update this metadata after receipt issuance without
+/// invalidating the signed receipt request digest.
+pub fn canonical_gateway_authority_decision_digest(
+    decision: &AuthorityDecision,
+) -> Result<String, String> {
+    let mut request = decision.request.clone();
+    request
+        .metadata
+        .remove(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY);
+    let payload = GatewayAuthorityDecisionDigestPayload {
+        schema_version: "splendor.gateway.authority_decision_binding.v1",
+        decision_schema_version: &decision.schema_version,
+        decision_id: &decision.decision_id,
+        request: &request,
+        status: decision.status,
+        reasons: &decision.reasons,
+        matched_grant_ids: &decision.matched_grant_ids,
+        obligations: &decision.obligations,
+        decided_at: decision.decided_at,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("authority_decision_digest_unavailable:{error}"))?;
+    Ok(ContentHash::blake3(bytes).to_string())
+}
+
+#[derive(Serialize)]
+struct GatewayAuthorityActionDigestPayload<'a> {
+    schema_version: &'static str,
+    action_id: &'a ActionId,
+    tenant_id: &'a TenantId,
+    agent_id: &'a AgentId,
+    run_id: &'a RunId,
+    action: &'a Action,
+    effective_adapter: Option<&'a str>,
+    quota_usage: QuotaUsage,
+    satisfied_preconditions: &'a [String],
+    #[serde(with = "time::serde::rfc3339")]
+    requested_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct GatewayAuthorityDecisionDigestPayload<'a> {
+    schema_version: &'static str,
+    decision_schema_version: &'a str,
+    decision_id: &'a splendor_types::AuthorityDecisionId,
+    request: &'a splendor_types::CapabilityRequest,
+    status: AuthorityDecisionStatus,
+    reasons: &'a [String],
+    matched_grant_ids: &'a [splendor_types::CapabilityGrantId],
+    obligations: &'a [splendor_types::AuthorityObligation],
+    #[serde(with = "time::serde::rfc3339")]
+    decided_at: OffsetDateTime,
+}
+
+fn authority_decision_action_binding_reasons(
+    decision: &AuthorityDecision,
+    action: &ActionRequest,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let expected_operation = gateway_action_operation(action.action.name.clone());
+    if decision.request.operation != expected_operation {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_operation_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(
+        decision.request.scope.tenant_ids.as_ref(),
+        &action.tenant_id,
+    ) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_tenant_scope_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(decision.request.scope.agent_ids.as_ref(), &action.agent_id) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_agent_scope_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(decision.request.scope.run_ids.as_ref(), &action.run_id) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_run_scope_mismatch".to_string(),
+        );
+    }
+    reasons
+}
+
+fn scope_exactly_matches<T: PartialEq>(values: Option<&Vec<T>>, expected: &T) -> bool {
+    values.is_some_and(|values| values.len() == 1 && values.first() == Some(expected))
+}
+
+fn authority_obligation_result(
+    allowed: bool,
+    reasons: Vec<String>,
+    status: &str,
+    evidence: Option<&GatewayAuthorityObligationEvidence>,
+    action_digest: Option<String>,
+    satisfied_obligation_ids: Vec<String>,
+    receipt_ids: Vec<String>,
+) -> VerificationResult {
+    let derived_receipt_ids = if receipt_ids.is_empty() {
+        evidence
+            .map(|evidence| {
+                evidence
+                    .receipts
+                    .iter()
+                    .map(|receipt| receipt.receipt_id.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        receipt_ids
+    };
+    let obligation_ids = evidence
+        .map(|evidence| {
+            evidence
+                .decision
+                .obligations
+                .iter()
+                .map(|obligation| obligation.obligation_id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let decision_digest = evidence.and_then(|evidence| {
+        evidence
+            .decision
+            .request
+            .metadata
+            .get(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    VerificationResult {
+        allowed,
+        reasons: if allowed { Vec::new() } else { reasons },
+        artifacts: serde_json::json!({
+            "verifier": "authority_obligation_verifier",
+            "authority_obligation_status": status,
+            "decision_id": evidence.map(|evidence| evidence.decision.decision_id.to_string()),
+            "decision_status": evidence.map(|evidence| format!("{:?}", evidence.decision.status)),
+            "obligation_ids": obligation_ids,
+            "receipt_ids": derived_receipt_ids,
+            "satisfied_obligation_ids": satisfied_obligation_ids,
+            "gateway_action_request_digest": action_digest,
+            "authority_decision_digest": decision_digest,
+        }),
+    }
+}
+
+fn push_unique_string(reasons: &mut Vec<String>, reason: String) {
+    if !reasons.iter().any(|existing| existing == &reason) {
+        reasons.push(reason);
     }
 }
 
