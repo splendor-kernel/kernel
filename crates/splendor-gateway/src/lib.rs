@@ -37,7 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
-    validate_authority_obligation_receipt, verify_obligation_receipts,
+    gateway_action_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
     AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
@@ -59,7 +59,11 @@ pub use splendor_types::ActionId;
 /// Metadata key inside `AuthorityDecision.request.metadata` that binds a
 /// conditional authority decision to the exact gateway action request.
 pub const GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY: &str =
-    "splendor.gateway.action_request_digest";
+    "splendor.integrity.action_request_hash";
+
+/// Metadata key inside `AuthorityDecision.request.metadata` that binds the
+/// request digest signed by receipts to the full conditional decision payload.
+pub const GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY: &str = "splendor.integrity.decision_hash";
 
 /// Behavior-free authority obligation evidence carried with a gateway action.
 ///
@@ -871,6 +875,20 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
             ));
         }
 
+        let decision_binding_reasons =
+            authority_decision_action_binding_reasons(&evidence.decision, action);
+        if !decision_binding_reasons.is_empty() {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                decision_binding_reasons,
+                "denied",
+                Some(evidence),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
         let expected_action_digest =
             match canonical_gateway_authority_action_digest(action, adapter) {
                 Ok(digest) => digest,
@@ -909,6 +927,52 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
             return AuthorityObligationVerification::Denied(authority_obligation_result(
                 false,
                 vec!["authority_decision_action_digest_mismatch".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let expected_decision_digest =
+            match canonical_gateway_authority_decision_digest(&evidence.decision) {
+                Ok(digest) => digest,
+                Err(reason) => {
+                    return AuthorityObligationVerification::NeedsIntervention(
+                        authority_obligation_result(
+                            false,
+                            vec![reason],
+                            "decision_digest_unavailable",
+                            Some(evidence),
+                            Some(expected_action_digest),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                    )
+                }
+            };
+        let Some(decision_digest) = evidence
+            .decision
+            .request
+            .metadata
+            .get(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_digest_missing".to_string()],
+                "denied",
+                Some(evidence),
+                Some(expected_action_digest),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        if decision_digest != expected_decision_digest {
+            return AuthorityObligationVerification::Denied(authority_obligation_result(
+                false,
+                vec!["authority_decision_digest_mismatch".to_string()],
                 "denied",
                 Some(evidence),
                 Some(expected_action_digest),
@@ -1546,6 +1610,36 @@ pub fn canonical_gateway_authority_action_digest(
     Ok(ContentHash::blake3(bytes).to_string())
 }
 
+/// Computes the deterministic digest that receipt-bound authority requests must
+/// carry to protect the complete conditional decision from requester tampering.
+///
+/// The digest covers the full decision payload except the digest metadata field
+/// itself. Because obligation receipts sign the canonical authority request
+/// digest, a requester cannot update this metadata after receipt issuance without
+/// invalidating the signed receipt request digest.
+pub fn canonical_gateway_authority_decision_digest(
+    decision: &AuthorityDecision,
+) -> Result<String, String> {
+    let mut request = decision.request.clone();
+    request
+        .metadata
+        .remove(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY);
+    let payload = GatewayAuthorityDecisionDigestPayload {
+        schema_version: "splendor.gateway.authority_decision_binding.v1",
+        decision_schema_version: &decision.schema_version,
+        decision_id: &decision.decision_id,
+        request: &request,
+        status: decision.status,
+        reasons: &decision.reasons,
+        matched_grant_ids: &decision.matched_grant_ids,
+        obligations: &decision.obligations,
+        decided_at: decision.decided_at,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("authority_decision_digest_unavailable:{error}"))?;
+    Ok(ContentHash::blake3(bytes).to_string())
+}
+
 #[derive(Serialize)]
 struct GatewayAuthorityActionDigestPayload<'a> {
     schema_version: &'static str,
@@ -1559,6 +1653,60 @@ struct GatewayAuthorityActionDigestPayload<'a> {
     satisfied_preconditions: &'a [String],
     #[serde(with = "time::serde::rfc3339")]
     requested_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct GatewayAuthorityDecisionDigestPayload<'a> {
+    schema_version: &'static str,
+    decision_schema_version: &'a str,
+    decision_id: &'a splendor_types::AuthorityDecisionId,
+    request: &'a splendor_types::CapabilityRequest,
+    status: AuthorityDecisionStatus,
+    reasons: &'a [String],
+    matched_grant_ids: &'a [splendor_types::CapabilityGrantId],
+    obligations: &'a [splendor_types::AuthorityObligation],
+    #[serde(with = "time::serde::rfc3339")]
+    decided_at: OffsetDateTime,
+}
+
+fn authority_decision_action_binding_reasons(
+    decision: &AuthorityDecision,
+    action: &ActionRequest,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let expected_operation = gateway_action_operation(action.action.name.clone());
+    if decision.request.operation != expected_operation {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_operation_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(
+        decision.request.scope.tenant_ids.as_ref(),
+        &action.tenant_id,
+    ) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_tenant_scope_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(decision.request.scope.agent_ids.as_ref(), &action.agent_id) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_agent_scope_mismatch".to_string(),
+        );
+    }
+    if !scope_exactly_matches(decision.request.scope.run_ids.as_ref(), &action.run_id) {
+        push_unique_string(
+            &mut reasons,
+            "authority_decision_run_scope_mismatch".to_string(),
+        );
+    }
+    reasons
+}
+
+fn scope_exactly_matches<T: PartialEq>(values: Option<&Vec<T>>, expected: &T) -> bool {
+    values.is_some_and(|values| values.len() == 1 && values.first() == Some(expected))
 }
 
 fn authority_obligation_result(
@@ -1593,6 +1741,15 @@ fn authority_obligation_result(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let decision_digest = evidence.and_then(|evidence| {
+        evidence
+            .decision
+            .request
+            .metadata
+            .get(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
     VerificationResult {
         allowed,
         reasons: if allowed { Vec::new() } else { reasons },
@@ -1605,6 +1762,7 @@ fn authority_obligation_result(
             "receipt_ids": derived_receipt_ids,
             "satisfied_obligation_ids": satisfied_obligation_ids,
             "gateway_action_request_digest": action_digest,
+            "authority_decision_digest": decision_digest,
         }),
     }
 }

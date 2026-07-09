@@ -1,20 +1,19 @@
 use super::*;
 use splendor_authority::{
-    canonical_authority_request_digest, issue_local_authority_obligation_receipt,
-    AuthorityObligationReceiptValidationContext,
+    canonical_authority_request_digest, gateway_action_operation,
+    issue_local_authority_obligation_receipt, AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
     AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, AuthorityDecision,
     AuthorityDecisionId, AuthorityDecisionStatus, AuthorityObligation, AuthorityObligationKind,
     AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
-    AuthorityObligationReceiptValidationKind, AuthorityOperation, AuthorityOperationNamespace,
-    AuthorityResourceKind, AuthorityVerb, CapabilityRequest, CapabilityScope, CircuitBreaker,
+    AuthorityObligationReceiptValidationKind, CapabilityRequest, CapabilityScope, CircuitBreaker,
     CircuitBreakerId, CircuitBreakerScope, EffectCertainty, ErrorCategory, FleetId, InstanceId,
     NodeId, PrincipalId, QuotaUsage, RetryClass, RevocationStatus, RunId, RuntimeIdentityContext,
     SideEffectClass, TenantId, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
     AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
-    AUTHORITY_OBLIGATION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
-    CAPABILITY_REQUEST_SCHEMA_VERSION, UNKNOWN_ADAPTER_FAILURE_REASON,
+    AUTHORITY_OBLIGATION_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
+    UNKNOWN_ADAPTER_FAILURE_REASON,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -424,17 +423,6 @@ fn gateway_authority_context(
     )
 }
 
-fn gateway_authority_operation(action_name: &str) -> AuthorityOperation {
-    AuthorityOperation {
-        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
-        namespace: AuthorityOperationNamespace::Gateway,
-        resource_kind: AuthorityResourceKind::Action,
-        verb: AuthorityVerb::Invoke,
-        name: Some(action_name.to_string()),
-        resource_schema_version: None,
-    }
-}
-
 fn authority_decision_for(
     request: &ActionRequest,
     adapter: &str,
@@ -452,7 +440,7 @@ fn authority_decision_for(
     let capability_request = CapabilityRequest {
         schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
         subject,
-        operation: gateway_authority_operation(&request.action.name),
+        operation: gateway_action_operation(&request.action.name),
         scope: CapabilityScope {
             tenant_ids: Some(vec![request.tenant_id.clone()]),
             agent_ids: Some(vec![request.agent_id.clone()]),
@@ -463,7 +451,7 @@ fn authority_decision_for(
         requested_at: request.requested_at,
         metadata,
     };
-    AuthorityDecision {
+    let mut decision = AuthorityDecision {
         schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
         decision_id: AuthorityDecisionId::new(),
         request: capability_request,
@@ -478,7 +466,18 @@ fn authority_decision_for(
             parameters: BTreeMap::new(),
         }],
         decided_at: now,
-    }
+    };
+    bind_gateway_authority_decision_digest(&mut decision);
+    decision
+}
+
+fn bind_gateway_authority_decision_digest(decision: &mut AuthorityDecision) {
+    let decision_digest =
+        canonical_gateway_authority_decision_digest(decision).expect("authority decision digest");
+    decision.request.metadata.insert(
+        GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY.to_string(),
+        serde_json::Value::String(decision_digest),
+    );
 }
 
 fn unsigned_obligation_receipt(
@@ -687,6 +686,65 @@ fn authority_obligation_changed_action_digest_blocks_adapter_execution() {
         "authority_decision_action_digest_mismatch",
         ActionStatus::Denied,
     );
+}
+
+#[test]
+fn authority_obligation_tampered_decision_digest_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: splendor_types::AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::HumanReview,
+        description: "tampered obligation added after receipt issuance".to_string(),
+        parameters: BTreeMap::new(),
+    });
+    request.authority_obligation_evidence = Some(evidence);
+
+    assert_authority_denied(
+        request,
+        context,
+        "authority_decision_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_operation_and_scope_mismatch_block_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    for case in ["operation", "tenant", "agent", "run"] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+        let reason = match case {
+            "operation" => {
+                evidence.decision.request.operation = gateway_action_operation("other_action");
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_operation_mismatch"
+            }
+            "tenant" => {
+                evidence.decision.request.scope.tenant_ids = Some(vec![TenantId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_tenant_scope_mismatch"
+            }
+            "agent" => {
+                evidence.decision.request.scope.agent_ids = Some(vec![AgentId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_agent_scope_mismatch"
+            }
+            "run" => {
+                evidence.decision.request.scope.run_ids = Some(vec![RunId::new()]);
+                bind_gateway_authority_decision_digest(&mut evidence.decision);
+                "authority_decision_run_scope_mismatch"
+            }
+            _ => unreachable!("covered cases"),
+        };
+        request.authority_obligation_evidence = Some(evidence);
+
+        assert_authority_denied(request, context, reason, ActionStatus::Denied);
+    }
 }
 
 #[test]
