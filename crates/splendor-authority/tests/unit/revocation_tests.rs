@@ -687,6 +687,47 @@ fn cache_api_wraps_validated_grants_and_cannot_extend_grant_expiry() {
     let error = CachedAuthorityGrant::try_new(grant, fixture.now, fixture.now + Duration::hours(2))
         .expect_err("cache must not outlive grant");
     assert_eq!(error.reason_code(), "authority_cache_outlives_grant");
+
+    let invalid_window = CachedAuthorityGrant::try_new(
+        grant_for(&fixture, data_read_operation(), data_scope(&fixture)),
+        fixture.now,
+        fixture.now,
+    )
+    .expect_err("cache expiry must be after cached_at");
+    assert_eq!(
+        invalid_window.reason_code(),
+        "authority_cache_window_invalid"
+    );
+
+    let cached_after_expiry = CachedAuthorityGrant::try_new(
+        grant_for(&fixture, data_read_operation(), data_scope(&fixture)),
+        fixture.now + Duration::hours(2),
+        fixture.now + Duration::hours(3),
+    )
+    .expect_err("cache cannot be installed after grant expiry");
+    assert_eq!(
+        cached_after_expiry.reason_code(),
+        "authority_cache_after_grant_expiry"
+    );
+
+    let replacement_grant = grant_for(&fixture, data_read_operation(), data_scope(&fixture));
+    let mut replacement_cache = AuthorityGrantCache::new();
+    assert!(replacement_cache
+        .insert_validated(
+            replacement_grant.clone(),
+            fixture.now,
+            fixture.now + Duration::minutes(5),
+        )
+        .expect("first insert succeeds")
+        .is_none());
+    assert!(replacement_cache
+        .insert_validated(
+            replacement_grant,
+            fixture.now + Duration::seconds(1),
+            fixture.now + Duration::minutes(6),
+        )
+        .expect("replacement insert succeeds")
+        .is_some());
 }
 
 #[test]
@@ -713,5 +754,106 @@ fn revocation_snapshot_rejects_duplicate_or_malformed_records() {
     assert_eq!(
         malformed_error.reason_code(),
         "authority_revocation_record_schema_invalid"
+    );
+
+    let invalid_window = RevocationSnapshot::try_new(Vec::new(), fixture.now, fixture.now)
+        .expect_err("snapshot expiry must be after refresh");
+    assert_eq!(
+        invalid_window.reason_code(),
+        "authority_revocation_snapshot_window_invalid"
+    );
+
+    let invalid_max_age = RevocationSnapshot::with_max_age(Vec::new(), fixture.now, Duration::ZERO)
+        .expect_err("snapshot max age must be positive");
+    assert_eq!(
+        invalid_max_age.reason_code(),
+        "authority_revocation_snapshot_max_age_invalid"
+    );
+
+    let mut nil_revocation = revoked_record(CapabilityGrantId::new(), fixture.now);
+    nil_revocation.revocation_id =
+        AuthorityRevocationId::parse("00000000-0000-0000-0000-000000000000")
+            .expect("nil revocation id parses");
+    let nil_revocation_error =
+        RevocationSnapshot::with_max_age(vec![nil_revocation], fixture.now, Duration::minutes(30))
+            .expect_err("nil revocation id must fail");
+    assert_eq!(
+        nil_revocation_error.reason_code(),
+        "authority_revocation_record_id_invalid"
+    );
+
+    let mut nil_grant = revoked_record(
+        CapabilityGrantId::parse("00000000-0000-0000-0000-000000000000")
+            .expect("nil grant id parses"),
+        fixture.now,
+    );
+    nil_grant.revocation_id = AuthorityRevocationId::new();
+    let nil_grant_error =
+        RevocationSnapshot::with_max_age(vec![nil_grant], fixture.now, Duration::minutes(30))
+            .expect_err("nil grant id must fail");
+    assert_eq!(
+        nil_grant_error.reason_code(),
+        "authority_revocation_record_grant_id_invalid"
+    );
+}
+
+#[test]
+fn revocation_snapshot_accessors_and_ref_checks_are_fail_closed() {
+    let fixture = Fixture::new();
+    let grant = grant_for(&fixture, data_read_operation(), data_scope(&fixture));
+    let mut active_mismatch = revoked_record(grant.grant().grant_id.clone(), fixture.now);
+    active_mismatch.status = RevocationStatus::Active;
+    active_mismatch.revocation_ref = Some("revocation:other-source".to_string());
+
+    let snapshot = RevocationSnapshot::try_new(
+        vec![active_mismatch],
+        fixture.now,
+        fixture.now + Duration::minutes(30),
+    )
+    .expect("snapshot with active mismatch record builds");
+
+    assert_eq!(snapshot.refreshed_at(), fixture.now);
+    assert_eq!(snapshot.expires_at(), fixture.now + Duration::minutes(30));
+    assert_eq!(snapshot.records().len(), 1);
+
+    let mismatch = snapshot
+        .verify_grant_active(&grant, fixture.now)
+        .expect_err("revocation source mismatch must fail closed");
+    assert_eq!(
+        mismatch.reason_code(),
+        REASON_AUTHORITY_REVOCATION_REF_MISMATCH
+    );
+
+    let mut payload_revoked = grant.grant().clone();
+    payload_revoked.revocation = RevocationStatus::Revoked {
+        reason: "payload_revoked".to_string(),
+    };
+    let payload_revoked = unchecked_validated_grant_for_tests(payload_revoked);
+    let active_snapshot = active_snapshot(fixture.now);
+    let payload_error = active_snapshot
+        .verify_grant_active(&payload_revoked, fixture.now)
+        .expect_err("revoked grant payload must fail closed");
+    assert_eq!(payload_error.reason_code(), REASON_AUTHORITY_GRANT_REVOKED);
+}
+
+#[test]
+fn offline_policy_invalid_durations_return_stable_reason_codes() {
+    let connected_error = OfflineAuthorityPolicy::connected(Duration::ZERO)
+        .expect_err("zero connected freshness must fail");
+    assert_eq!(
+        connected_error.reason_code(),
+        "authority_offline_policy_invalid_duration"
+    );
+
+    let disconnected_error = OfflineAuthorityPolicy::disconnected(
+        Duration::minutes(1),
+        Duration::ZERO,
+        vec![data_read_operation()],
+        AuthorityOfflineHighRiskBehavior::Deny,
+    )
+    .expect_err("zero offline grant ttl must fail");
+    assert_eq!(
+        disconnected_error.reason_code(),
+        "authority_offline_policy_invalid_duration"
     );
 }
