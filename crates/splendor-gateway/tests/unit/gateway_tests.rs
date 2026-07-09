@@ -249,6 +249,30 @@ struct CountingAdapter {
 
 struct DenyResourceVerifier;
 
+struct DefaultPostSafetyVerifier;
+
+impl SafetyVerifier for DefaultPostSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::Allowed(VerificationResult::allow())
+    }
+}
+
+struct NotRequiredSafetyVerifier;
+
+impl SafetyVerifier for NotRequiredSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::NotRequired
+    }
+}
+
+struct InconsistentSafetyVerifier;
+
+impl SafetyVerifier for InconsistentSafetyVerifier {
+    fn verify_pre(&self, _action: &ActionRequest, _adapter: Option<&str>) -> SafetyVerification {
+        SafetyVerification::Allowed(VerificationResult::deny("inconsistent_safety_allow"))
+    }
+}
+
 impl ResourceBoundaryVerifier for DenyResourceVerifier {
     fn verify_resource_boundary(
         &self,
@@ -354,6 +378,56 @@ fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
             "status:estop.latest".to_string(),
             "status:collision.summary".to_string(),
         ],
+    }
+}
+
+#[test]
+fn gateway_default_trait_helpers_cover_fail_closed_edges() {
+    let non_physical = base_request();
+    let physical = physical_request();
+    let adapter_result = AdapterResult {
+        output: serde_json::json!({"ok": true}),
+        satisfied_postconditions: Vec::new(),
+    };
+    let simulated = SimulatedSafetyVerifier::new(safe_safety_snapshot());
+
+    assert!(matches!(
+        simulated.verify_pre(&non_physical, Some("adapter")),
+        SafetyVerification::NotRequired
+    ));
+    assert!(matches!(
+        simulated.verify_post(&non_physical, Some("adapter"), &adapter_result),
+        SafetyVerification::NotRequired
+    ));
+    assert!(AdapterError::Failed("provider failed".to_string())
+        .taxonomy()
+        .reason_code
+        .as_str()
+        .contains("adapter"));
+    assert!(
+        NoopCircuitBreakerEvaluator
+            .verify_runtime_admission(&RuntimeIdentityContext::default())
+            .allowed
+    );
+    assert!(StaticCircuitBreakerEvaluator::new(Vec::new())
+        .breakers()
+        .is_empty());
+
+    let default_post = Some(Arc::new(DefaultPostSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let post = verify_safety_post(&default_post, &physical, Some("robotics"), &adapter_result);
+    assert!(matches!(post, SafetyVerification::NeedsIntervention(_)));
+
+    let not_required = Some(Arc::new(NotRequiredSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let pre = verify_safety_pre(&not_required, &physical, Some("robotics"));
+    assert!(matches!(pre, SafetyVerification::NeedsIntervention(_)));
+
+    let inconsistent = Some(Arc::new(InconsistentSafetyVerifier) as Arc<dyn SafetyVerifier>);
+    let pre = verify_safety_pre(&inconsistent, &physical, Some("robotics"));
+    match pre {
+        SafetyVerification::NeedsIntervention(result) => assert!(result
+            .reasons
+            .contains(&"safety_verifier_inconsistent".to_string())),
+        other => panic!("expected inconsistent safety intervention, got {other:?}"),
     }
 }
 
@@ -568,6 +642,20 @@ fn authority_gateway(
     gateway
 }
 
+fn authority_gateway_with_verifier(
+    verifier: Arc<dyn AuthorityObligationVerifier>,
+    adapter: Arc<CountingAdapter>,
+) -> VerifiedActionGateway {
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    gateway.register_adapter("noop", "adapter", adapter);
+    gateway.set_authority_obligation_verifier(verifier);
+    gateway
+}
+
 fn assert_authority_denied(
     mut request: ActionRequest,
     context: AuthorityObligationReceiptValidationContext,
@@ -650,6 +738,70 @@ fn authority_obligation_required_missing_evidence_blocks_adapter_execution() {
 }
 
 #[test]
+fn authority_obligation_requirement_matchers_preserve_optional_default() {
+    let now = OffsetDateTime::now_utc();
+    let context = gateway_authority_context(PrincipalId::new(), now);
+
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::new(context.clone())),
+        adapter.clone(),
+    )
+    .submit(request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+
+    assert_authority_denied(
+        base_request(),
+        context.clone(),
+        "authority_obligation_evidence_required",
+        ActionStatus::NeedsIntervention,
+    );
+
+    let mut mismatched_adapter_request = base_request();
+    mismatched_adapter_request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::requiring(
+            context.clone(),
+            vec![AuthorityObligationRequirement::action_adapter(
+                "noop", "other",
+            )],
+        )),
+        adapter.clone(),
+    )
+    .submit(mismatched_adapter_request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+
+    let mut matching_adapter_request = base_request();
+    matching_adapter_request.adapter = Some("adapter".to_string());
+    let adapter = Arc::new(CountingAdapter::default());
+    let outcome = authority_gateway_with_verifier(
+        Arc::new(LocalAuthorityObligationVerifier::requiring(
+            context,
+            vec![
+                AuthorityObligationRequirement::action("other_action"),
+                AuthorityObligationRequirement::action_adapter("noop", "adapter"),
+            ],
+        )),
+        adapter.clone(),
+    )
+    .submit(matching_adapter_request)
+    .expect("outcome");
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"authority_obligation_evidence_required".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
 fn authority_obligation_raw_or_forged_receipt_blocks_adapter_execution() {
     let now = OffsetDateTime::now_utc();
     let mut request = base_request();
@@ -709,6 +861,95 @@ fn authority_obligation_tampered_decision_digest_blocks_adapter_execution() {
         "authority_decision_digest_mismatch",
         ActionStatus::Denied,
     );
+}
+
+#[test]
+fn authority_obligation_rebound_tampered_decision_fails_receipt_digest() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: splendor_types::AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::HumanReview,
+        description: "tampered obligation added and rebound".to_string(),
+        parameters: BTreeMap::new(),
+    });
+    bind_gateway_authority_decision_digest(&mut evidence.decision);
+    request.authority_obligation_evidence = Some(evidence);
+
+    assert_authority_denied(
+        request,
+        context,
+        "obligation_receipt_request_digest_mismatch",
+        ActionStatus::Denied,
+    );
+}
+
+#[test]
+fn authority_obligation_malformed_decision_metadata_blocks_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    for case in [
+        "non_conditional",
+        "missing_action_digest",
+        "missing_decision_digest",
+        "verifier_unavailable",
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        let (issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+        let (context, reason, status) = match case {
+            "non_conditional" => {
+                evidence.decision.status = AuthorityDecisionStatus::Allowed;
+                (
+                    context,
+                    "authority_decision_not_conditional",
+                    ActionStatus::Denied,
+                )
+            }
+            "missing_action_digest" => {
+                evidence
+                    .decision
+                    .request
+                    .metadata
+                    .remove(GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY);
+                (
+                    context,
+                    "authority_decision_action_digest_missing",
+                    ActionStatus::Denied,
+                )
+            }
+            "missing_decision_digest" => {
+                evidence
+                    .decision
+                    .request
+                    .metadata
+                    .remove(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY);
+                (
+                    context,
+                    "authority_decision_digest_missing",
+                    ActionStatus::Denied,
+                )
+            }
+            "verifier_unavailable" => (
+                AuthorityObligationReceiptValidationContext::trusted_local(
+                    issuer,
+                    OBLIGATION_RECEIPT_AUDIENCE,
+                    OBLIGATION_RECEIPT_KEY_ID,
+                    "",
+                    OBLIGATION_RECEIPT_REVOCATION_REF,
+                    now,
+                ),
+                "obligation_receipt_validation_secret_unavailable",
+                ActionStatus::NeedsIntervention,
+            ),
+            _ => unreachable!("covered cases"),
+        };
+        request.authority_obligation_evidence = Some(evidence);
+
+        assert_authority_denied(request, context, reason, status);
+    }
 }
 
 #[test]
