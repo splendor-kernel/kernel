@@ -149,11 +149,12 @@ pub use ids::{
     WorkOrderId, WorkOrderIdError, WorkloadId,
 };
 pub use message::{
-    DelegatedAuthority, Message, MessageDeliveryStatus, MessageEnvelope, MessageSchemaVersion,
-    MessageTraceContext, MessageTraceLinks, MessageValidationError, RemoteMessageEnvelope,
-    RemoteMessageEnvelopeVersion, RemoteMessageRetryPolicy, RemoteMessageTraceContext,
-    RemoteMessageValidationError, TaskFailure, TaskRequest, TaskResponse, TaskResponseStatus,
-    TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    DelegatedAuthority, LocalDelegationAuthorityEvidence, Message, MessageDeliveryStatus,
+    MessageEnvelope, MessageSchemaVersion, MessageTraceContext, MessageTraceLinks,
+    MessageValidationError, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion,
+    RemoteMessageRetryPolicy, RemoteMessageTraceContext, RemoteMessageValidationError, TaskFailure,
+    TaskRequest, TaskResponse, TaskResponseStatus,
+    LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
 };
 pub use node_registry::{
     HealthStatus, InstanceHealth, InstanceHeartbeat, InstanceRegistration, ManagementAuditEvent,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    RevocationStatus, WorkOrder, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    WORK_ORDER_SCHEMA_VERSION,
+    CapabilityGrantId, LocalDelegationAuthorityEvidence, RevocationStatus, WorkOrder, WorkOrderId,
+    WorkOrderPlacement, WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
 };
 use uuid::Uuid;
 
@@ -276,6 +276,80 @@ fn task_request_payload_must_match_message_run_and_target() {
     assert!(error
         .to_string()
         .contains("target_agent_id must match message target_agent_id"));
+}
+
+#[test]
+fn task_request_authority_evidence_is_optional_behavior_free_and_validated() {
+    let parent_run_id = RunId::new();
+    let child_run_id = RunId::new();
+    let target_agent_id = AgentId::new();
+    let evidence = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::new(),
+        CapabilityGrantId::new(),
+    );
+    let request = TaskRequest::new(
+        parent_run_id,
+        child_run_id,
+        target_agent_id,
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("valid task request")
+    .with_authority_evidence(evidence.clone())
+    .expect("evidence refs are valid");
+    assert_eq!(request.authority_evidence, Some(evidence.clone()));
+
+    let payload = serde_json::to_value(&request).expect("request json");
+    let decoded = TaskRequest::from_payload(&payload).expect("decode with authority evidence");
+    assert_eq!(decoded.authority_evidence, Some(evidence));
+
+    let missing_evidence = TaskRequest::new(
+        RunId::new(),
+        RunId::new(),
+        AgentId::new(),
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("legacy payloads remain valid");
+    assert!(missing_evidence.authority_evidence.is_none());
+
+    let mut invalid_schema = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::new(),
+        CapabilityGrantId::new(),
+    );
+    invalid_schema.schema_version =
+        "splendor.message.local_delegation_authority_evidence.v2".to_string();
+    assert!(TaskRequest::new(
+        RunId::new(),
+        RunId::new(),
+        AgentId::new(),
+        "summarize ledger",
+        DelegatedAuthority::empty(),
+    )
+    .expect("valid task request")
+    .with_authority_evidence(invalid_schema)
+    .expect_err("invalid evidence schema is rejected")
+    .to_string()
+    .contains("invalid local delegation authority evidence schema_version"));
+
+    let nil_parent = LocalDelegationAuthorityEvidence::issued(
+        CapabilityGrantId::from(Uuid::nil()),
+        CapabilityGrantId::new(),
+    );
+    assert!(nil_parent
+        .validate()
+        .expect_err("nil parent grant rejected")
+        .to_string()
+        .contains("parent_capability_grant_id is required"));
+
+    let same_grant = CapabilityGrantId::new();
+    let same_parent_child =
+        LocalDelegationAuthorityEvidence::issued(same_grant.clone(), same_grant);
+    assert!(same_parent_child
+        .validate()
+        .expect_err("parent and child grant IDs must be distinct")
+        .to_string()
+        .contains("child_capability_grant_id must differ"));
 }
 
 #[test]

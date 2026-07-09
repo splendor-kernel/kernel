@@ -17,7 +17,8 @@ service is involved.
 4. Create a child run with:
    - explicit target specialist agent;
    - objective `summarize receivables`;
-   - delegated authority limited to `query`/`sql`/`finance.read`.
+   - delegated authority limited to `query`/`sql`/`finance.read`;
+   - trusted `LocalDelegationAuthority` from a parent `ValidatedCapabilityGrant`.
 5. Pass the returned scoped child `AgentContext` to the child loop engine.
 6. If the child proposes `publish`, or proposes `query` without explicitly naming
    the delegated `sql` adapter, the loop engine records an action denial and does
@@ -27,15 +28,17 @@ service is involved.
 
 ## Minimal Rust shape
 
-```rust,no_run
+```rust,ignore
 use splendor_kernel::{
     AgentContext, AgentRuntimeConfig, DelegatedAuthority, KernelRuntime,
     KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest,
 };
-use splendor_types::{AgentId, RunId, TenantId};
+use splendor_types::{AgentId, PrincipalId, RunId, TenantId};
 
 let manager = LocalDelegationManager::new();
 let tenant_id = TenantId::new();
+let orchestrator_principal = PrincipalId::new();
+let specialist_principal = PrincipalId::new();
 let orchestrator = AgentContext::new(
     AgentId::new(),
     tenant_id.clone(),
@@ -47,12 +50,12 @@ let specialist = AgentContext::new(
     AgentRuntimeConfig::default(),
 );
 
-manager.register_agent(orchestrator.clone(), DelegatedAuthority {
+manager.register_agent_with_principal(orchestrator.clone(), orchestrator_principal, DelegatedAuthority {
     allowed_actions: vec!["query".into(), "publish".into()],
     allowed_adapters: vec!["sql".into(), "artifact".into()],
     allowed_permissions: vec!["finance.read".into(), "artifact.publish".into()],
 })?;
-manager.register_agent(specialist.clone(), DelegatedAuthority {
+manager.register_agent_with_principal(specialist.clone(), specialist_principal, DelegatedAuthority {
     allowed_actions: vec!["query".into()],
     allowed_adapters: vec!["sql".into()],
     allowed_permissions: vec!["finance.read".into()],
@@ -85,7 +88,11 @@ let mut request = LocalDelegationRequest::new(
 );
 request.child_run_id = child_run_id;
 
-let child = manager.create_child_run(&parent_runtime, &child_runtime, request)?;
+// Build LocalDelegationAuthority from a trusted parent ValidatedCapabilityGrant
+// issued by the authority/work-order path. The TaskRequest grant refs are
+// replay evidence only and do not authorize the child by themselves.
+let authority = build_local_delegation_authority(&request)?;
+let child = manager.create_child_run(&parent_runtime, &child_runtime, request, authority)?;
 assert!(child.child_agent.delegated_authority.is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -95,7 +102,7 @@ assert!(child.child_agent.delegated_authority.is_some());
 Parent run trace includes:
 
 - `DelegationRequested`
-- `MessageQueued` / `MessageDelivered` for `task_request.v1`
+- `MessageQueued` / `MessageDelivered` for `task_request.v1` with authority refs
 - `ChildRunCompleted` or `ChildRunFailed` after response
 
 Child run trace includes:
@@ -105,8 +112,8 @@ Child run trace includes:
 - `ChildRunCompleted` or `ChildRunFailed`
 
 Replay through `replay_local_delegations(events)` reconstructs the parent/child
-edge and task request/response messages without executing policies, gateways, or
-adapters.
+edge, authority grant refs, and task request/response messages without executing
+policies, gateways, adapters, child runs, or live authority evaluation.
 
 ## What is intentionally not allowed
 

@@ -1,18 +1,18 @@
 use super::*;
 use crate::{
-    ActionId, AgentId, ApprovalDecision, ApprovalId, AuditAttribution, CircuitBreaker,
-    CircuitBreakerId, CircuitBreakerScope, CircuitBreakerState, ClientPrincipal,
+    ActionId, AgentId, ApprovalDecision, ApprovalId, AuditAttribution, CapabilityGrantId,
+    CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CircuitBreakerState, ClientPrincipal,
     DelegatedAuthority, EscalationContext, EscalationDecision, EscalationId, EscalationScope,
     EscalationTrigger, FleetId, GovernanceExtensions, GovernanceIssuer, GovernanceObjectRef,
     GovernanceScope, GovernanceState, GovernanceTraceEventKindError, GovernanceTraceLink,
     GovernanceTransition, GovernanceTransitionError, InstanceId, InterventionId, KillSwitchId,
-    LocalDelegationTraceContext, Message, MessageEnvelope, MessageId, MessageTraceContext, NodeId,
-    OfflineTraceIntervalTraceContext, Percept, PerceptProvenance, RemoteMessageEnvelope,
-    RemoteMessageRetryPolicy, RemoteMessageTraceContext, RevocationStatus, SideEffectClass,
-    SnapshotId, StateHandoffTraceContext, StateReferenceMode, TaskFailure, TaskRequest, TenantId,
-    TraceId, TraceSyncBoundaryTraceContext, WorkOrder, WorkOrderEnvelope, WorkOrderId,
-    WorkOrderPlacement, WorkOrderQuotaPolicy, GOVERNANCE_STATE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
-    WORK_ORDER_SCHEMA_VERSION,
+    LocalDelegationAuthorityEvidence, LocalDelegationTraceContext, Message, MessageEnvelope,
+    MessageId, MessageTraceContext, NodeId, OfflineTraceIntervalTraceContext, Percept,
+    PerceptProvenance, RemoteMessageEnvelope, RemoteMessageRetryPolicy, RemoteMessageTraceContext,
+    RevocationStatus, SideEffectClass, SnapshotId, StateHandoffTraceContext, StateReferenceMode,
+    TaskFailure, TaskRequest, TenantId, TraceId, TraceSyncBoundaryTraceContext, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    GOVERNANCE_STATE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, WORK_ORDER_SCHEMA_VERSION,
 };
 
 #[test]
@@ -511,6 +511,10 @@ fn local_delegation_trace_events_round_trip() {
         source_agent_id: AgentId::new(),
         target_agent_id: AgentId::new(),
         objective: "summarize ledger".to_string(),
+        authority_evidence: Some(LocalDelegationAuthorityEvidence::issued(
+            CapabilityGrantId::new(),
+            CapabilityGrantId::new(),
+        )),
     };
     let failure = TaskFailure::new("child_failed", "specialist failed", false)
         .with_trace_id(TraceId::from_run_sequence(&child_run_id, 2));
