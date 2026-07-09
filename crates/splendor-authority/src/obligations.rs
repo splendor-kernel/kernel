@@ -3,9 +3,10 @@
 //! This module validates authority obligation receipts with a trusted local
 //! owning-service context before matching them to a conditional authority
 //! decision. Raw `AuthorityObligationReceipt` values remain behavior-free
-//! contracts and cannot satisfy obligations directly. This bounded slice does not
-//! implement a human approval workflow, MFA provider, gate engine, durable
-//! evidence store, production PKI, or gateway invocation wiring.
+//! contracts and cannot satisfy obligations directly. The paired bounded gateway
+//! slice can invoke these helpers before adapter execution, but this module still
+//! does not implement a human approval workflow, MFA provider, gate engine,
+//! durable evidence store, production PKI, or external revocation service.
 
 use serde::Serialize;
 use splendor_types::{
