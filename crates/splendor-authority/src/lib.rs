@@ -10,6 +10,7 @@ mod capability;
 mod delegation;
 mod identity;
 mod issuance;
+mod obligations;
 
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
@@ -26,4 +27,9 @@ pub use identity::{IdentityMutation, IdentityRegistry, IdentityRegistryError, Re
 pub use issuance::{
     issue_work_order_capability_grant, WorkOrderGrantIssuance, WorkOrderGrantIssuanceError,
     WorkOrderGrantIssuanceResult,
+};
+pub use obligations::{
+    canonical_authority_request_digest, validate_authority_obligation_receipt,
+    verify_obligation_receipts, AuthorityObligationReceiptValidationContext,
+    ObligationReceiptError, ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
 };

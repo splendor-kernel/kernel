@@ -5,7 +5,8 @@ use splendor_types::{
     AuthorityBudgetScope, AuthorityDecisionStatus, AuthorityObligation, AuthorityObligationId,
     AuthorityObligationKind, AuthorityOperationNamespace, AuthorityResourceKind,
     AuthorityTimeScope, CapabilityGrantValidation, CapabilityGrantValidationKind,
-    CapabilityRequest, DataPurpose, DeviceId, TenantId, TASK_RESPONSE_SCHEMA,
+    CapabilityRequest, DataPurpose, DeviceId, TenantId, AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+    TASK_RESPONSE_SCHEMA,
 };
 
 const DIGEST: &str = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
@@ -254,10 +255,11 @@ fn delegation_builds_narrow_child_capability_grant() {
 }
 
 #[test]
-fn delegation_preserves_parent_obligations_in_child_capability_grant() {
+fn delegation_denies_conditional_parent_obligations_before_child_grant_creation() {
     let fixture = Fixture::new();
     let mut parent_grant = parent_grant(&fixture).grant().clone();
     let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
         obligation_id: AuthorityObligationId::new(),
         kind: AuthorityObligationKind::EvidenceRequired,
         description: "evidence.required".to_string(),
@@ -267,15 +269,43 @@ fn delegation_preserves_parent_obligations_in_child_capability_grant() {
     let parent = unchecked_validated_grant_for_tests(parent_grant);
     let request = request_for(&fixture, &parent);
 
-    let result = issue_delegation_child_grant(&parent, request.clone(), context_for(&fixture))
-        .expect("delegation child grant should preserve parent obligations");
+    let reason = issue_delegation_child_grant(&parent, request.clone(), context_for(&fixture))
+        .expect_err("conditional parent obligations must block child issuance")
+        .reason_code();
 
-    assert_eq!(
-        result.delegation_grant().child_capability_grant.obligations,
-        vec![obligation.clone()]
+    assert_eq!(reason, "parent_obligations_unsatisfied");
+
+    let raw_child = build_raw_child_grant(
+        &request,
+        &fixture.child_subject,
+        &parent.grant().grant_id,
+        &parent.grant().obligations,
     );
+    assert_eq!(raw_child.obligations, vec![obligation]);
+}
+
+#[test]
+fn delegation_child_grant_evaluation_still_returns_conditional_when_obligations_exist() {
+    let fixture = Fixture::new();
+    let parent = parent_grant(&fixture);
+    let request = request_for(&fixture, &parent);
+    let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "evidence.required".to_string(),
+        parameters: Default::default(),
+    };
+    let mut raw_child = build_raw_child_grant(
+        &request,
+        &fixture.child_subject,
+        &parent.grant().grant_id,
+        std::slice::from_ref(&obligation),
+    );
+    raw_child.parent_grant_ids = Vec::new();
+    let child = unchecked_validated_grant_for_tests(raw_child);
     let decision = evaluate_capability_request(
-        std::slice::from_ref(result.child_grant()),
+        std::slice::from_ref(&child),
         &CapabilityRequest {
             schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
             subject: fixture.child_subject,
@@ -286,6 +316,7 @@ fn delegation_preserves_parent_obligations_in_child_capability_grant() {
         },
         fixture.now,
     );
+    assert_eq!(decision.status, AuthorityDecisionStatus::Conditional);
     assert_eq!(decision.obligations, vec![obligation]);
 }
 
@@ -596,6 +627,10 @@ fn delegation_reason_mappers_cover_remaining_stable_codes() {
     ] {
         assert_eq!(map_parent_denial(&reasons).reason_code(), expected);
     }
+    assert_eq!(
+        DelegationGrantError::ParentObligationsUnsatisfied.reason_code(),
+        "parent_obligations_unsatisfied"
+    );
 
     for (dimension, reason, expected) in [
         (

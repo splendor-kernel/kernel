@@ -21,9 +21,9 @@ use splendor_types::{
     CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
     DataPurpose, DelegatedAuthority, DriverOperationRef, LocalityScope, NetworkScope, PrincipalId,
     RevocationStatus, RunId, TenantId, WorkOrder, WorkOrderQuotaPolicy,
-    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
-    CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
-    CAPABILITY_SCOPE_SCHEMA_VERSION,
+    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+    AUTHORITY_OPERATION_SCHEMA_VERSION, CAPABILITY_GRANT_SCHEMA_VERSION,
+    CAPABILITY_REQUEST_SCHEMA_VERSION, CAPABILITY_SCOPE_SCHEMA_VERSION,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -86,7 +86,9 @@ impl ValidatedCapabilityGrant {
 }
 
 /// Evaluates a request against zero or more grants and returns an explicit
-/// fail-closed authority decision. The first matching grant allows the request;
+/// fail-closed authority decision. The first matching grant allows the request
+/// only when it carries no obligations; matching grants with obligations return
+/// `Conditional`;
 /// invalid, expired, revoked, wrong-subject, wrong-audience, or overbroad grants
 /// are treated as denial evidence rather than skipped into an implicit allow.
 ///
@@ -115,12 +117,20 @@ pub fn evaluate_capability_request(
         let grant = validated_grant.grant();
         match grant_allows_request(validated_grant, request, now) {
             Ok(()) => {
+                let (status, reason) = if grant.obligations.is_empty() {
+                    (AuthorityDecisionStatus::Allowed, "capability_allowed")
+                } else {
+                    (
+                        AuthorityDecisionStatus::Conditional,
+                        "capability_conditional",
+                    )
+                };
                 return AuthorityDecision {
                     schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
                     decision_id: AuthorityDecisionId::new(),
                     request: request.clone(),
-                    status: AuthorityDecisionStatus::Allowed,
-                    reasons: vec!["capability_allowed".to_string()],
+                    status,
+                    reasons: vec![reason.to_string()],
                     matched_grant_ids: vec![grant.grant_id.clone()],
                     obligations: grant.obligations.clone(),
                     decided_at: now,
@@ -690,8 +700,19 @@ fn validate_grant_shape_with_trust(
     validate_optional_token("revocation_ref", grant.revocation_ref.as_deref())?;
     validate_grant_validation(grant.validation.as_ref(), trust)?;
     validate_extension_map(&grant.metadata, "capability_grant.metadata")?;
-    for obligation in &grant.obligations {
+    for (index, obligation) in grant.obligations.iter().enumerate() {
         validate_obligation(obligation)?;
+        if grant
+            .obligations
+            .iter()
+            .skip(index + 1)
+            .any(|candidate| candidate.obligation_id == obligation.obligation_id)
+        {
+            return Err(AuthorityEvaluationError::InvalidScope {
+                dimension: "obligations",
+                reason: "duplicate_obligation_id".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -1073,6 +1094,13 @@ fn validate_time_scope(scope: &AuthorityTimeScope) -> Result<(), AuthorityEvalua
 }
 
 fn validate_obligation(obligation: &AuthorityObligation) -> Result<(), AuthorityEvaluationError> {
+    if obligation.schema_version != AUTHORITY_OBLIGATION_SCHEMA_VERSION {
+        return Err(schema_error(
+            "authority_obligation.schema_version",
+            AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+            &obligation.schema_version,
+        ));
+    }
     if obligation.obligation_id.is_nil() {
         return Err(AuthorityEvaluationError::InvalidIdentity {
             field: "obligation_id",

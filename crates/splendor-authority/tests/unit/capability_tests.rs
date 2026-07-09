@@ -2,6 +2,7 @@ use super::*;
 use splendor_types::{
     ArtifactId, AuthorityObligationId, AuthorityObligationKind, DeviceId, FleetId,
     StatePartitionId, WorkOrderId, WorkOrderPlacement, WorkloadId,
+    AUTHORITY_OBLIGATION_SCHEMA_VERSION,
 };
 
 const DIGEST: &str = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
@@ -277,7 +278,35 @@ fn assert_scope_denied_for_operation(
 }
 
 #[test]
-fn authority_allows_matching_grant_and_returns_obligations() {
+fn authority_allows_matching_grant_without_obligations() {
+    let now = OffsetDateTime::now_utc();
+    let issuer = PrincipalId::new();
+    let subject = PrincipalId::new();
+    let scope = base_scope(TenantId::new(), AgentId::new(), RunId::new());
+    let grant = grant(
+        issuer,
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    let request = capability_request(
+        subject,
+        gateway_action_operation("artifact.create"),
+        scope,
+        now,
+    );
+
+    let decision = evaluate_capability_request(&[validated(grant.clone())], &request, now);
+
+    assert_eq!(decision.status, AuthorityDecisionStatus::Allowed);
+    assert_eq!(decision.reasons, vec!["capability_allowed"]);
+    assert_eq!(decision.matched_grant_ids, vec![grant.grant_id]);
+    assert!(decision.obligations.is_empty());
+}
+
+#[test]
+fn authority_returns_conditional_matching_grant_with_obligations() {
     let now = OffsetDateTime::now_utc();
     let issuer = PrincipalId::new();
     let subject = PrincipalId::new();
@@ -290,6 +319,7 @@ fn authority_allows_matching_grant_and_returns_obligations() {
         now,
     );
     let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
         obligation_id: AuthorityObligationId::new(),
         kind: AuthorityObligationKind::EvidenceRequired,
         description: "record decision evidence".to_string(),
@@ -305,8 +335,8 @@ fn authority_allows_matching_grant_and_returns_obligations() {
 
     let decision = evaluate_capability_request(&[validated(grant.clone())], &request, now);
 
-    assert_eq!(decision.status, AuthorityDecisionStatus::Allowed);
-    assert_eq!(decision.reasons, vec!["capability_allowed"]);
+    assert_eq!(decision.status, AuthorityDecisionStatus::Conditional);
+    assert_eq!(decision.reasons, vec!["capability_conditional"]);
     assert_eq!(decision.matched_grant_ids, vec![grant.grant_id]);
     assert_eq!(decision.obligations, vec![obligation]);
 }
@@ -1556,6 +1586,35 @@ fn authority_shape_validation_covers_malformed_requests_grants_operations_and_sc
         "invalid_scope:time:grant_not_before_must_precede_expires_at"
     );
 
+    let duplicate_obligation_id = AuthorityObligationId::new();
+    let mut invalid_grant = grant(
+        issuer.clone(),
+        subject.clone(),
+        gateway_action_operation("artifact.create"),
+        scope.clone(),
+        now,
+    );
+    invalid_grant.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: duplicate_obligation_id.clone(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "record evidence".to_string(),
+        parameters: Default::default(),
+    });
+    invalid_grant.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: duplicate_obligation_id,
+        kind: AuthorityObligationKind::HumanReview,
+        description: "review evidence".to_string(),
+        parameters: Default::default(),
+    });
+    assert_eq!(
+        validate_grant_shape(&invalid_grant)
+            .unwrap_err()
+            .reason_code(),
+        "invalid_scope:obligations:duplicate_obligation_id"
+    );
+
     let mut invalid_grant = grant(
         issuer,
         subject,
@@ -1564,6 +1623,7 @@ fn authority_shape_validation_covers_malformed_requests_grants_operations_and_sc
         now,
     );
     invalid_grant.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
         obligation_id: AuthorityObligationId::parse("00000000-0000-0000-0000-000000000000")
             .unwrap(),
         kind: AuthorityObligationKind::EvidenceRequired,
@@ -1772,6 +1832,7 @@ fn authority_narrowing_failures_cover_lineage_budget_time_and_obligations() {
         ..parent_scope.budget
     };
     let obligation = AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
         obligation_id: AuthorityObligationId::new(),
         kind: AuthorityObligationKind::EvidenceRequired,
         description: "preserve evidence".to_string(),

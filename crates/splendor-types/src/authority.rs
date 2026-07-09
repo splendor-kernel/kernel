@@ -5,9 +5,9 @@
 //! expiry, revocation, and wildcard rejection live in `splendor-authority`.
 
 use crate::{
-    AgentId, ArtifactId, AuthorityDecisionId, AuthorityObligationId, AuthorityRevocationId,
-    CapabilityGrantId, DeviceId, FleetId, PrincipalId, RevocationStatus, RunId, StatePartitionId,
-    TenantId, WorkloadId,
+    AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
+    AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, DeviceId, FleetId,
+    PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId, WorkloadId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,6 +23,11 @@ pub const CAPABILITY_GRANT_SCHEMA_VERSION: &str = "splendor.authority.capability
 pub const CAPABILITY_REQUEST_SCHEMA_VERSION: &str = "splendor.authority.capability_request.v1";
 /// Canonical schema identifier for authority decisions.
 pub const AUTHORITY_DECISION_SCHEMA_VERSION: &str = "splendor.authority.decision.v1";
+/// Canonical schema identifier for authority obligations.
+pub const AUTHORITY_OBLIGATION_SCHEMA_VERSION: &str = "splendor.authority.obligation.v1";
+/// Canonical schema identifier for authority obligation receipts.
+pub const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION: &str =
+    "splendor.authority.obligation_receipt.v1";
 /// Canonical schema identifier for authority revocation records.
 pub const REVOCATION_RECORD_SCHEMA_VERSION: &str = "splendor.authority.revocation_record.v1";
 /// Canonical schema identifier for behavior-free delegation grants.
@@ -335,9 +340,12 @@ pub enum CapabilityGrantValidationKind {
     LocallyValidated,
 }
 
-/// Explicit obligation returned with an authority allow decision.
+/// Explicit obligation returned with a conditional authority decision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthorityObligation {
+    /// Obligation schema version.
+    #[serde(default = "authority_obligation_schema_version")]
+    pub schema_version: String,
     /// Distinct obligation identity.
     pub obligation_id: AuthorityObligationId,
     /// Obligation kind.
@@ -349,12 +357,28 @@ pub struct AuthorityObligation {
     pub parameters: BTreeMap<String, serde_json::Value>,
 }
 
-/// Obligation kind. Full approval/intervention semantics remain future AUTH-004 work.
+/// Obligation kind. Full approval/intervention workflow semantics remain future AUTH-004 work.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityObligationKind {
     /// Approval evidence is required before a later effect stage.
     ApprovalRequired,
+    /// Stronger caller authentication or assurance, such as MFA, is required.
+    MfaAssurance,
+    /// Operation must run in a dedicated isolation boundary.
+    DedicatedIsolation,
+    /// Network egress must be denied for the obligated operation.
+    NetworkDeny,
+    /// A human review/adjudication step must complete.
+    HumanReview,
+    /// An independent evaluator must assess the result or proposal.
+    IndependentEvaluator,
+    /// A local safety verifier must approve the bounded action.
+    LocalSafetyVerifier,
+    /// A postcondition verifier must run after the operation.
+    PostconditionCheck,
+    /// A maximum blast-radius bound must be enforced.
+    MaximumBlastRadius,
     /// Redaction must occur before output or evidence publication.
     RedactionRequired,
     /// Operation must stay in local-only execution.
@@ -363,6 +387,85 @@ pub enum AuthorityObligationKind {
     SimulationOnly,
     /// Additional evidence must be recorded.
     EvidenceRequired,
+}
+
+/// Behavior-free validation material for an authority obligation receipt.
+///
+/// This contract is not authorizing by itself. `splendor-authority` must validate
+/// it against trusted owning-service context before any receipt can satisfy an
+/// obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthorityObligationReceiptValidation {
+    /// Validation mode for this bounded slice.
+    pub validation_kind: AuthorityObligationReceiptValidationKind,
+    /// Signing or validation algorithm label.
+    pub algorithm: String,
+    /// Key identifier expected by the owning service validation context.
+    pub key_id: String,
+    /// Digest over the canonical receipt payload excluding this validation block.
+    pub digest: String,
+    /// Deterministic local signature/MAC for this bounded slice.
+    pub signature: String,
+}
+
+/// Authority obligation receipt validation mode.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityObligationReceiptValidationKind {
+    /// Deterministic local validation path used by this bounded evidence slice.
+    LocalSignature,
+}
+
+/// Behavior-free receipt claiming an owning service completed one authority
+/// obligation for one exact authority decision/request digest.
+///
+/// Raw receipts are serialized contracts only. They do not satisfy obligations
+/// unless `splendor-authority` wraps them as validated receipts using a trusted
+/// owning-service context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthorityObligationReceipt {
+    /// Receipt schema version.
+    pub schema_version: String,
+    /// Distinct receipt identity.
+    pub receipt_id: AuthorityObligationReceiptId,
+    /// Principal for the service that owns/signed the receipt.
+    pub issuer: PrincipalId,
+    /// Audience this receipt was issued for.
+    pub audience: String,
+    /// Obligation satisfied by this receipt.
+    pub obligation_id: AuthorityObligationId,
+    /// Obligation kind satisfied by this receipt.
+    pub kind: AuthorityObligationKind,
+    /// Subject principal bound to the original authority decision.
+    pub subject: PrincipalId,
+    /// Original authority decision this receipt satisfies.
+    pub authority_decision_id: AuthorityDecisionId,
+    /// Deterministic digest of the exact canonical authority request.
+    pub canonical_request_digest: String,
+    /// Digest of owning-service evidence for the satisfied obligation.
+    pub evidence_digest: String,
+    /// Optional opaque evidence reference. This is a reference, not authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+    /// Receipt issuance time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub issued_at: OffsetDateTime,
+    /// Receipt expiry time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    /// Current revocation state supplied by the owning service/revocation path.
+    pub revocation: RevocationStatus,
+    /// Revocation lookup/source coordinate for the owning service path.
+    pub revocation_ref: String,
+    /// Optional approval identity for approval-backed obligations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
+    /// Optional trace event for approval/request evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_trace_event_id: Option<TraceEventId>,
+    /// Behavior-free validation material. It is not authorizing until checked by
+    /// `splendor-authority` with trusted owning-service context.
+    pub validation: AuthorityObligationReceiptValidation,
 }
 
 /// Immutable capability grant contract for this local AUTH-001 slice.
@@ -522,10 +625,12 @@ pub struct CapabilityRequest {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityDecisionStatus {
-    /// Request is allowed subject to returned obligations.
+    /// Request is allowed with no unsatisfied authority obligations.
     Allowed,
     /// Request is denied fail-closed.
     Denied,
+    /// Request matched authority but cannot execute until obligations are satisfied.
+    Conditional,
     /// Request cannot proceed without approval. Full workflow remains AUTH-004.
     NeedsApproval,
     /// Request cannot proceed without operator/runtime intervention.
@@ -554,6 +659,10 @@ pub struct AuthorityDecision {
     /// Decision timestamp.
     #[serde(with = "time::serde::rfc3339")]
     pub decided_at: OffsetDateTime,
+}
+
+fn authority_obligation_schema_version() -> String {
+    AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string()
 }
 
 /// Revocation record for a capability grant.

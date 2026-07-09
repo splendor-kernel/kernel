@@ -63,12 +63,14 @@ pub use approval::{
 };
 pub use authority::{
     AuthorityBudgetScope, AuthorityDecision, AuthorityDecisionStatus, AuthorityObligation,
-    AuthorityObligationKind, AuthorityOperation, AuthorityOperationNamespace,
+    AuthorityObligationKind, AuthorityObligationReceipt, AuthorityObligationReceiptValidation,
+    AuthorityObligationReceiptValidationKind, AuthorityOperation, AuthorityOperationNamespace,
     AuthorityResourceKind, AuthorityTimeScope, AuthorityVerb, CapabilityGrant,
     CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
     DataPurpose, DelegationChain, DelegationGrant, DelegationResultContract, DelegationRoleProfile,
     DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
-    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
+    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
+    AUTHORITY_OBLIGATION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
     CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
     CAPABILITY_SCOPE_SCHEMA_VERSION, DELEGATION_CHAIN_SCHEMA_VERSION,
     DELEGATION_GRANT_SCHEMA_VERSION, DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION,
@@ -142,11 +144,11 @@ pub use identity::{
 };
 pub use ids::{
     ActionId, AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
-    AuthorityRevocationId, CapabilityGrantId, CircuitBreakerId, DeviceId, EscalationId, FleetId,
-    IdentityEventId, IdentityValidationError, InstanceId, InterventionId, KillSwitchId, MessageId,
-    NodeId, PrincipalId, PrincipalProofRefId, RunId, RuntimeIdentityContext, SnapshotId,
-    StateNodeId, StatePartitionId, TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext,
-    WorkOrderId, WorkOrderIdError, WorkloadId,
+    AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, CircuitBreakerId,
+    DeviceId, EscalationId, FleetId, IdentityEventId, IdentityValidationError, InstanceId,
+    InterventionId, KillSwitchId, MessageId, NodeId, PrincipalId, PrincipalProofRefId, RunId,
+    RuntimeIdentityContext, SnapshotId, StateNodeId, StatePartitionId, TenantId, TickId,
+    TraceEventId, TraceId, TraceIdentityContext, WorkOrderId, WorkOrderIdError, WorkloadId,
 };
 pub use message::{
     DelegatedAuthority, LocalDelegationAuthorityEvidence, Message, MessageDeliveryStatus,
