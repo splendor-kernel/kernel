@@ -315,6 +315,13 @@ fn current_digest_mismatch_denies() {
     assert!(result
         .reasons()
         .contains(&REASON_AUTHORITY_RENEWAL_CURRENT_REVISION_MISMATCH.to_string()));
+
+    let context_error = TrustedAuthorityRenewalContext::new(NONCE, " ", fixture.now)
+        .expect_err("empty current digest fails closed");
+    assert_eq!(
+        context_error.reason_code(),
+        REASON_AUTHORITY_RENEWAL_CURRENT_REVISION_MISSING
+    );
 }
 
 #[test]

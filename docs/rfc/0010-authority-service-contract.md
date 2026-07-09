@@ -3,8 +3,8 @@
 ## Status and Scope
 
 Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
-`AUTH-003b`, `AUTH-004a`, `AUTH-004b`, and `AUTH-005a` implementation
-evidence slices.
+`AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, and `AUTH-005b`
+implementation evidence slices.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -35,6 +35,9 @@ gateway action obligation evidence for `AUTH-004b`, and a matching optional
 schema churn; it exposes authority-crate Rust types/functions that cache only
 `ValidatedCapabilityGrant` wrappers, check `RevocationRecord` snapshots, and
 fail closed under missing/stale/expired cache or disconnected high-risk requests.
+`AUTH-005b` adds no public schema churn; it exposes authority-crate Rust
+types/functions for local renewal preflight with explicit nonce/current digest,
+renewable policy, and lifetime caps.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, G11, G18, G43, G60, G70, G71, G73, G75, G79,
 G83, G88, issue closure, or gold completion.
@@ -52,7 +55,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
 | Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder plus `AUTH-003b` runtime-local manager wiring evidence only; not complete. |
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
-| Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot and offline validated-grant cache evidence only; no lease renewal or production revocation service. |
+| Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache plus `AUTH-005b` local renewal preflight evidence only; no production lease renewal or production revocation service. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
