@@ -626,6 +626,68 @@ fn authority_evidence_for(
     )
 }
 
+fn hostile_authority_values() -> Vec<String> {
+    vec![
+        "authority-reason-secret-do-not-export".to_string(),
+        "reason-with-crlf\r\nforged-header: allow".to_string(),
+        "reason-with-ansi-\u{1b}[31m-and-control-\u{7}".to_string(),
+        "capability_allowed\nmisleading-allow".to_string(),
+        format!("oversized-secret:{}", "x".repeat(8_192)),
+        "decision-schema-secret-do-not-export".to_string(),
+        "request-schema-secret-do-not-export".to_string(),
+        "operation-schema-secret-do-not-export".to_string(),
+        "resource-schema-secret-do-not-export".to_string(),
+    ]
+}
+
+fn poison_authority_decision(decision: &mut AuthorityDecision, hostile: &[String]) {
+    decision.reasons = hostile[..5].to_vec();
+    decision.schema_version = hostile[5].clone();
+    decision.request.schema_version = hostile[6].clone();
+    decision.request.operation.schema_version = hostile[7].clone();
+    decision.request.operation.resource_schema_version = Some(hostile[8].clone());
+}
+
+fn assert_hostile_authority_values_absent(value: &serde_json::Value, hostile: &[String]) {
+    let encoded = serde_json::to_string(value).expect("verification artifact JSON");
+    for forbidden in hostile {
+        assert!(
+            !encoded.contains(forbidden),
+            "leaked hostile input: {forbidden}"
+        );
+    }
+}
+
+fn hostile_authority_evidence_for(
+    request: &ActionRequest,
+    adapter: &str,
+    now: OffsetDateTime,
+    hostile: &[String],
+) -> (
+    AuthorityObligationReceiptValidationContext,
+    GatewayAuthorityObligationEvidence,
+) {
+    let issuer = PrincipalId::new();
+    let context = gateway_authority_context(issuer.clone(), now);
+    let mut decision = authority_decision_for(request, adapter, PrincipalId::new(), now);
+    poison_authority_decision(&mut decision, hostile);
+    // Exact gateway operation matching is part of the trusted path. Hostile
+    // operation/resource schema strings are exercised only on untrusted paths.
+    decision.request.operation = gateway_action_operation(&request.action.name);
+    bind_gateway_authority_decision_digest(&mut decision);
+    let receipt = issue_obligation_receipt(
+        unsigned_obligation_receipt(&decision, issuer, now),
+        &context,
+    );
+    (
+        context,
+        GatewayAuthorityObligationEvidence {
+            decision,
+            receipts: vec![receipt],
+        },
+    )
+}
+
 fn authority_gateway(
     context: AuthorityObligationReceiptValidationContext,
     adapter: Arc<CountingAdapter>,
@@ -742,29 +804,93 @@ fn authority_obligation_supplied_without_configured_verifier_needs_intervention(
 }
 
 #[test]
-fn authority_obligation_artifact_marks_evidence_projection_unavailable() {
+fn authority_obligation_untrusted_paths_do_not_project_hostile_decision_details() {
     let now = OffsetDateTime::now_utc();
+    let hostile = hostile_authority_values();
+
     let mut request = base_request();
     request.adapter = Some("adapter".to_string());
-    let (_issuer, _context, mut evidence) = authority_evidence_for(&request, "adapter", now);
-    evidence.decision.decision_id =
-        AuthorityDecisionId::parse("00000000-0000-0000-0000-000000000000")
-            .expect("nil decision ID");
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    poison_authority_decision(&mut evidence.decision, &hostile);
     request.authority_obligation_evidence = Some(evidence);
+
     let adapter = Arc::new(CountingAdapter::default());
     let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
         quota: VerificationResult::allow(),
     }));
     gateway.register_adapter("noop", "adapter", adapter.clone());
+    let no_verifier = gateway
+        .submit(request.clone())
+        .expect("no-verifier outcome");
+    assert_eq!(no_verifier.status, ActionStatus::NeedsIntervention);
+    assert_hostile_authority_values_absent(&no_verifier.verification.artifacts, &hostile);
+    assert!(no_verifier.verification.artifacts["authority_decision_evidence_digest"].is_null());
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 
-    let outcome = gateway.submit(request).expect("outcome");
+    let adapter = Arc::new(CountingAdapter::default());
+    let denied = authority_gateway(context, adapter.clone())
+        .submit(request)
+        .expect("early-denial outcome");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_hostile_authority_values_absent(&denied.verification.artifacts, &hostile);
+    assert!(denied.verification.artifacts["authority_decision_evidence_digest"].is_null());
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
 
-    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+#[test]
+fn authority_obligation_trusted_receipt_projects_only_normalized_explanation() {
+    let now = OffsetDateTime::now_utc();
+    let hostile = hostile_authority_values();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (context, evidence) = hostile_authority_evidence_for(&request, "adapter", now, &hostile);
+    request.authority_obligation_evidence = Some(evidence);
+    let adapter = Arc::new(CountingAdapter::default());
+
+    let outcome = authority_gateway(context, adapter.clone())
+        .submit(request)
+        .expect("trusted receipt outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
+    let artifact = &outcome.verification.artifacts["authority_obligation"];
+    assert_hostile_authority_values_absent(artifact, &hostile);
     assert_eq!(
-        outcome.verification.artifacts["authority_decision_evidence_unavailable"].as_str(),
-        Some("authority_evidence_decision_identity_invalid")
+        artifact["authority_decision_explanation"],
+        serde_json::json!([{
+            "category": "provider_unknown",
+            "reason_codes": ["authority_reason_unknown"]
+        }])
     );
+    assert!(artifact["authority_decision_evidence_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("blake3:")));
+}
+
+#[test]
+fn authority_obligation_malformed_decision_identity_is_rejected_before_projection() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.decision_id =
+        AuthorityDecisionId::parse("00000000-0000-0000-0000-000000000000")
+            .expect("nil decision ID");
+    bind_gateway_authority_decision_digest(&mut evidence.decision);
+    request.authority_obligation_evidence = Some(evidence);
+    let adapter = Arc::new(CountingAdapter::default());
+
+    let outcome = authority_gateway(context, adapter.clone())
+        .submit(request)
+        .expect("malformed identity outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "obligation_receipt_request_digest_mismatch"));
     assert!(outcome.verification.artifacts["authority_decision_evidence_digest"].is_null());
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }

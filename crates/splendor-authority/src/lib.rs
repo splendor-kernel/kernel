@@ -33,13 +33,14 @@ pub use delegation::{
 pub use evidence::{
     authority_decision_evidence, authority_reason_category, compare_authority_evidence,
     evaluate_cached_capability_request_with_evidence, evaluate_capability_request_with_evidence,
-    AuthorityCacheEntryEvidence, AuthorityCachedEvaluationEvidence, AuthorityConnectivityEvidence,
-    AuthorityDecisionEvidence, AuthorityDecisionExplanation, AuthorityDecisionWithEvidence,
+    normalize_authority_reason_code, AuthorityCacheEntryEvidence,
+    AuthorityCachedEvaluationEvidence, AuthorityConnectivityEvidence, AuthorityDecisionEvidence,
+    AuthorityDecisionExplanation, AuthorityDecisionSchemaEvidence, AuthorityDecisionWithEvidence,
     AuthorityEvidenceComparison, AuthorityEvidenceComparisonLabel, AuthorityEvidenceCompleteness,
     AuthorityEvidenceError, AuthorityEvidenceMissingFact, AuthorityEvidenceWithheldField,
     AuthorityExplanationBranch, AuthorityExplanationCategory, AuthorityFreshnessStatus,
     AuthorityGrantEvidence, AuthorityObligationEvidence, AuthorityRevocationSnapshotEvidence,
-    RedactedAuthorityDecisionEvidence, RedactedAuthorityOperation,
+    RedactedAuthorityDecisionEvidence, RedactedAuthorityGrantEvidence, RedactedAuthorityOperation,
     AUTHORITY_DECISION_EVIDENCE_SCHEMA_VERSION,
 };
 pub use identity::{IdentityMutation, IdentityRegistry, IdentityRegistryError, RegisterPrincipal};
