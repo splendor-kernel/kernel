@@ -37,8 +37,8 @@
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
-    gateway_action_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationReceiptValidationContext,
+    authority_decision_evidence, gateway_action_operation, validate_authority_obligation_receipt,
+    verify_obligation_receipts, AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
@@ -733,18 +733,18 @@ impl AuthorityObligationVerifier for NoAuthorityObligationVerifier {
         _adapter: Option<&str>,
         _now: OffsetDateTime,
     ) -> AuthorityObligationVerification {
-        if action.authority_obligation_evidence.is_some() {
-            return AuthorityObligationVerification::NeedsIntervention(
-                authority_obligation_result(
-                    false,
-                    vec!["authority_obligation_verifier_unavailable".to_string()],
-                    "verifier_unavailable",
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                ),
+        if let Some(evidence) = action.authority_obligation_evidence.as_ref() {
+            let mut result = authority_obligation_result(
+                false,
+                vec!["authority_obligation_verifier_unavailable".to_string()],
+                "verifier_unavailable",
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
             );
+            attach_authority_decision_evidence_projection(&mut result, &evidence.decision);
+            return AuthorityObligationVerification::NeedsIntervention(result);
         }
         AuthorityObligationVerification::NotRequired
     }
@@ -1750,7 +1750,7 @@ fn authority_obligation_result(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     });
-    VerificationResult {
+    let mut result = VerificationResult {
         allowed,
         reasons: if allowed { Vec::new() } else { reasons },
         artifacts: serde_json::json!({
@@ -1764,7 +1764,64 @@ fn authority_obligation_result(
             "gateway_action_request_digest": action_digest,
             "authority_decision_digest": decision_digest,
         }),
+    };
+    if let Some(evidence) = evidence {
+        attach_authority_decision_evidence_projection(&mut result, &evidence.decision);
     }
+    result
+}
+
+fn attach_authority_decision_evidence_projection(
+    result: &mut VerificationResult,
+    decision: &AuthorityDecision,
+) {
+    let (digest, completeness, explanation, unavailable) =
+        match authority_decision_evidence(decision).and_then(|record| record.redacted()) {
+            Ok(record) => match (
+                serde_json::to_value(record.completeness),
+                serde_json::to_value(record.explanation.branches),
+            ) {
+                (Ok(completeness), Ok(explanation)) => (
+                    serde_json::Value::String(record.decision_digest),
+                    completeness,
+                    explanation,
+                    serde_json::Value::Null,
+                ),
+                _ => unavailable_authority_decision_evidence_projection(
+                    "authority_evidence_projection_serialization_unavailable",
+                ),
+            },
+            Err(error) => unavailable_authority_decision_evidence_projection(error.reason_code()),
+        };
+    let Some(artifacts) = result.artifacts.as_object_mut() else {
+        return;
+    };
+    artifacts.insert("authority_decision_evidence_digest".to_string(), digest);
+    artifacts.insert(
+        "authority_decision_evidence_completeness".to_string(),
+        completeness,
+    );
+    artifacts.insert("authority_decision_explanation".to_string(), explanation);
+    artifacts.insert(
+        "authority_decision_evidence_unavailable".to_string(),
+        unavailable,
+    );
+}
+
+fn unavailable_authority_decision_evidence_projection(
+    reason: &str,
+) -> (
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+) {
+    (
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::Value::Array(Vec::new()),
+        serde_json::Value::String(reason.to_string()),
+    )
 }
 
 fn push_unique_string(reasons: &mut Vec<String>, reason: String) {

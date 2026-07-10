@@ -696,6 +696,25 @@ fn authority_obligation_valid_exact_receipt_allows_adapter_execution() {
             .as_str(),
         Some("satisfied")
     );
+    let authority_artifact = &outcome.verification.artifacts["authority_obligation"];
+    assert!(authority_artifact["authority_decision_evidence_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("blake3:")));
+    assert_eq!(
+        authority_artifact["authority_decision_evidence_completeness"].as_str(),
+        Some("decision_only")
+    );
+    assert_eq!(
+        authority_artifact["authority_decision_explanation"][0]["category"].as_str(),
+        Some("obligations_gate")
+    );
+    assert_eq!(
+        authority_artifact["authority_decision_explanation"][0]["reason_codes"][0].as_str(),
+        Some("capability_conditional")
+    );
+    assert!(authority_artifact["authority_decision_evidence_unavailable"].is_null());
+    let artifact_json = serde_json::to_string(authority_artifact).expect("artifact JSON");
+    assert!(!artifact_json.contains("gateway obligation satisfied by authority receipt"));
 }
 
 #[test]
@@ -719,6 +738,34 @@ fn authority_obligation_supplied_without_configured_verifier_needs_intervention(
         .verification
         .reasons
         .contains(&"authority_obligation_verifier_unavailable".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn authority_obligation_artifact_marks_evidence_projection_unavailable() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_issuer, _context, mut evidence) = authority_evidence_for(&request, "adapter", now);
+    evidence.decision.decision_id =
+        AuthorityDecisionId::parse("00000000-0000-0000-0000-000000000000")
+            .expect("nil decision ID");
+    request.authority_obligation_evidence = Some(evidence);
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert_eq!(
+        outcome.verification.artifacts["authority_decision_evidence_unavailable"].as_str(),
+        Some("authority_evidence_decision_identity_invalid")
+    );
+    assert!(outcome.verification.artifacts["authority_decision_evidence_digest"].is_null());
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }
 

@@ -4,12 +4,15 @@
 //! the Principal Registry lifecycle state machine from IDR-001 plus bounded
 //! AUTH-001 capability grammar/evaluator, AUTH-002a work-order grant issuance,
 //! AUTH-003 delegation, AUTH-004 obligation receipt, and AUTH-005 local
-//! revocation/offline-cache plus bounded renewal preflight slices. It does not
-//! replace daemon authentication, gateway verification, revocation-watch services,
-//! production lease renewal, or adapter execution.
+//! revocation/offline-cache plus bounded renewal preflight slices. AUTH-006a adds
+//! local redacted decision evidence and inspect-only comparison. It does not
+//! replace daemon authentication, durable evidence/replay services, gateway
+//! verification, revocation-watch services, production lease renewal, or adapter
+//! execution.
 
 mod capability;
 mod delegation;
+mod evidence;
 mod identity;
 mod issuance;
 mod obligations;
@@ -26,6 +29,18 @@ pub use capability::{
 pub use delegation::{
     issue_delegation_child_grant, DelegationChildGrant, DelegationChildGrantRequest,
     DelegationGrantError, DelegationValidationContext,
+};
+pub use evidence::{
+    authority_decision_evidence, authority_reason_category, compare_authority_evidence,
+    evaluate_cached_capability_request_with_evidence, evaluate_capability_request_with_evidence,
+    AuthorityCacheEntryEvidence, AuthorityCachedEvaluationEvidence, AuthorityConnectivityEvidence,
+    AuthorityDecisionEvidence, AuthorityDecisionExplanation, AuthorityDecisionWithEvidence,
+    AuthorityEvidenceComparison, AuthorityEvidenceComparisonLabel, AuthorityEvidenceCompleteness,
+    AuthorityEvidenceError, AuthorityEvidenceMissingFact, AuthorityEvidenceWithheldField,
+    AuthorityExplanationBranch, AuthorityExplanationCategory, AuthorityFreshnessStatus,
+    AuthorityGrantEvidence, AuthorityObligationEvidence, AuthorityRevocationSnapshotEvidence,
+    RedactedAuthorityDecisionEvidence, RedactedAuthorityOperation,
+    AUTHORITY_DECISION_EVIDENCE_SCHEMA_VERSION,
 };
 pub use identity::{IdentityMutation, IdentityRegistry, IdentityRegistryError, RegisterPrincipal};
 pub use issuance::{
