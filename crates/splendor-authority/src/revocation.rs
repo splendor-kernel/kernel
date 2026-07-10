@@ -328,18 +328,38 @@ impl RevocationSnapshot {
         &self.records
     }
 
-    /// Checks a validated grant against this revocation snapshot.
-    pub fn verify_grant_active(
-        &self,
-        grant: &ValidatedCapabilityGrant,
-        now: OffsetDateTime,
-    ) -> Result<(), AuthorityRevocationCheckError> {
+    /// Checks whether this trusted snapshot is live at the evaluation time.
+    pub fn check_live(&self, now: OffsetDateTime) -> Result<(), AuthorityRevocationCheckError> {
         if now < self.refreshed_at {
             return Err(AuthorityRevocationCheckError::SnapshotFutureDated);
         }
         if now >= self.expires_at {
             return Err(AuthorityRevocationCheckError::SnapshotStale);
         }
+        Ok(())
+    }
+
+    /// Returns whether this live trusted snapshot contains a revoked record for
+    /// the supplied grant ID.
+    pub fn revokes_grant_id_at(
+        &self,
+        grant_id: &CapabilityGrantId,
+        now: OffsetDateTime,
+    ) -> Result<bool, AuthorityRevocationCheckError> {
+        self.check_live(now)?;
+        Ok(self.records.iter().any(|record| {
+            &record.grant_id == grant_id
+                && matches!(record.status, RevocationStatus::Revoked { .. })
+        }))
+    }
+
+    /// Checks a validated grant against this revocation snapshot.
+    pub fn verify_grant_active(
+        &self,
+        grant: &ValidatedCapabilityGrant,
+        now: OffsetDateTime,
+    ) -> Result<(), AuthorityRevocationCheckError> {
+        self.check_live(now)?;
         if matches!(grant.grant().revocation, RevocationStatus::Revoked { .. }) {
             return Err(AuthorityRevocationCheckError::GrantRevoked {
                 grant_id: grant.grant().grant_id.clone(),
