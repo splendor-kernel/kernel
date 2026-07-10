@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
+const REASON_MISSING_AUTHORITY_EVIDENCE: &str = "missing_authority_evidence";
+
 /// Lifecycle status for local parent/child runs known to the delegation manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalRunStatus {
@@ -267,6 +269,9 @@ pub enum LocalDelegationError {
     /// Child run ID was already registered.
     #[error("child run {0} is already registered")]
     DuplicateChildRun(RunId),
+    /// Run ID was already registered as either a root or child run.
+    #[error("run {0} is already registered")]
+    DuplicateRun(RunId),
     /// Child run was already completed, failed, denied, or cancelled.
     #[error("child run {child_run_id} is already finished with status {status:?}")]
     ChildRunAlreadyFinished {
@@ -381,13 +386,17 @@ impl LocalDelegationManager {
         Ok(())
     }
 
-    /// Registers an active root/parent run.
+    /// Registers an active root/parent run without replacing any existing run.
     pub fn register_root_run(
         &self,
         run_id: RunId,
         agent_id: AgentId,
     ) -> Result<LocalRunRecord, LocalDelegationError> {
+        let _lifecycle = self.lock_lifecycle()?;
         let mut state = self.lock_state()?;
+        if state.runs.contains_key(&run_id) {
+            return Err(LocalDelegationError::DuplicateRun(run_id));
+        }
         let agent = state
             .agents
             .get(&agent_id)
@@ -689,7 +698,8 @@ impl LocalDelegationManager {
     /// metadata remain non-authorizing and are not inspected. Unrelated
     /// revocations and terminal child runs are deterministic no-ops. Stale or
     /// future-dated snapshots fail closed by cancelling authority-backed active
-    /// child runs with the authority-owned snapshot reason code.
+    /// child runs with the authority-owned snapshot reason code. A record known
+    /// to be a child but missing authority evidence also cancels fail-closed.
     pub fn cancel_child_if_authority_revoked(
         &self,
         parent_recorder: &dyn MessageTraceRecorder,
@@ -708,19 +718,22 @@ impl LocalDelegationManager {
             if child.status.is_terminal() || child.response_message_id.is_some() {
                 return Ok(None);
             }
-            let Some(evidence) = child.authority_evidence.as_ref() else {
-                return Ok(None);
-            };
-            match revocations.revokes_grant_id_at(&evidence.parent_capability_grant_id, now) {
-                Err(error) => Some(error.reason_code().to_string()),
-                Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
-                Ok(false) => match revocations
-                    .revokes_grant_id_at(&evidence.child_capability_grant_id, now)
-                {
+            if let Some(evidence) = child.authority_evidence.as_ref() {
+                match revocations.revokes_grant_id_at(&evidence.parent_capability_grant_id, now) {
                     Err(error) => Some(error.reason_code().to_string()),
                     Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
-                    Ok(false) => None,
-                },
+                    Ok(false) => match revocations
+                        .revokes_grant_id_at(&evidence.child_capability_grant_id, now)
+                    {
+                        Err(error) => Some(error.reason_code().to_string()),
+                        Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
+                        Ok(false) => None,
+                    },
+                }
+            } else if child.parent_run_id.is_some() {
+                Some(REASON_MISSING_AUTHORITY_EVIDENCE.to_string())
+            } else {
+                None
             }
         };
         let Some(cancellation_reason) = cancellation_reason else {
@@ -1127,7 +1140,7 @@ fn validate_authority_evidence(
     let evidence = authority
         .authority_evidence
         .clone()
-        .ok_or_else(|| "missing_authority_evidence".to_string())?;
+        .ok_or_else(|| REASON_MISSING_AUTHORITY_EVIDENCE.to_string())?;
     evidence
         .validate()
         .map_err(|_| "invalid_authority_evidence".to_string())?;
@@ -1164,6 +1177,8 @@ fn child_grant_liveness_denial(
 fn revocation_cancellation_failure(reason_code: String) -> TaskFailure {
     let reason = if reason_code == REASON_AUTHORITY_GRANT_REVOKED {
         "local delegation authority grant was revoked"
+    } else if reason_code == REASON_MISSING_AUTHORITY_EVIDENCE {
+        "local delegation child authority evidence was missing"
     } else {
         "local delegation revocation snapshot was not live"
     };
