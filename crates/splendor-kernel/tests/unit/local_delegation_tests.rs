@@ -5,6 +5,7 @@ use crate::{
 use splendor_authority::{
     grant_from_legacy_allowlists, CompatibilityGrantContext, LegacyScopeProfile,
     RevocationSnapshot, ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
+    REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
 };
 use splendor_types::{
     AuthorityBudgetScope, AuthorityRevocationId, CapabilityGrantId, PrincipalId, RevocationRecord,
@@ -41,6 +42,20 @@ impl MessageTraceRecorder for SimpleRecorder {
 
     fn record_message_event(&self, _kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
         Ok(TraceId::new())
+    }
+}
+
+struct FailingRecorder {
+    run_id: RunId,
+}
+
+impl MessageTraceRecorder for FailingRecorder {
+    fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    fn record_message_event(&self, _kind: TraceEventKind) -> Result<TraceId, MessageRouterError> {
+        Err(MessageRouterError::StorageUnavailable)
     }
 }
 
@@ -296,6 +311,59 @@ fn revocation_snapshot_for(grant_id: CapabilityGrantId) -> RevocationSnapshot {
         time::Duration::minutes(30),
     )
     .expect("revocation snapshot")
+}
+
+fn stale_revocation_snapshot() -> RevocationSnapshot {
+    let refreshed_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+    RevocationSnapshot::with_max_age(Vec::new(), refreshed_at, time::Duration::minutes(1))
+        .expect("stale revocation snapshot")
+}
+
+fn future_dated_revocation_snapshot() -> RevocationSnapshot {
+    let refreshed_at = OffsetDateTime::now_utc() + time::Duration::minutes(10);
+    RevocationSnapshot::with_max_age(Vec::new(), refreshed_at, time::Duration::minutes(30))
+        .expect("future-dated revocation snapshot")
+}
+
+fn fill_child_response_outbox(
+    manager: &LocalDelegationManager,
+    parent: &AgentContext,
+    child: &AgentContext,
+    parent_run_id: &RunId,
+    child_run_id: &RunId,
+) {
+    let recorder = SimpleRecorder {
+        run_id: parent_run_id.clone(),
+    };
+    for index in 0..1024 {
+        let response = TaskResponse::new(
+            parent_run_id.clone(),
+            child_run_id.clone(),
+            TaskResponseStatus::Completed,
+            Some(serde_json::json!({ "filler": index })),
+            None,
+        )
+        .expect("filler response");
+        let message = Message::new(
+            MessageId::new(),
+            child.agent_id.clone(),
+            parent.agent_id.clone(),
+            parent_run_id.clone(),
+            TASK_RESPONSE_SCHEMA,
+            serde_json::to_value(response).expect("filler response payload"),
+            None,
+            false,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("filler message");
+        manager
+            .router()
+            .send(
+                &recorder,
+                MessageEnvelope::new(message).expect("filler envelope"),
+            )
+            .expect("filler message routed");
+    }
 }
 
 struct CreatedDelegation {
@@ -1058,6 +1126,137 @@ fn revoked_parent_grant_cancels_active_child() {
         manager.run(&child_run_id).expect("child record").status,
         LocalRunStatus::Cancelled
     );
+}
+
+#[test]
+fn stale_revocation_snapshot_cancels_active_child_fail_closed() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = stale_revocation_snapshot();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("stale snapshot cancellation finishes")
+        .expect("stale snapshot cancels active child");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("stale snapshot failure");
+    assert_eq!(failure.code, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE);
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn future_dated_revocation_snapshot_cancels_active_child_fail_closed() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = future_dated_revocation_snapshot();
+
+    let response = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect("future snapshot cancellation finishes")
+        .expect("future snapshot cancels active child");
+
+    assert_eq!(response.response.status, TaskResponseStatus::Cancelled);
+    let failure = response.response.failure.expect("future snapshot failure");
+    assert_eq!(
+        failure.code,
+        REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED
+    );
+    assert!(!failure.retryable);
+    assert_eq!(
+        manager.run(&child_run_id).expect("child record").status,
+        LocalRunStatus::Cancelled
+    );
+}
+
+#[test]
+fn revocation_trace_failure_still_marks_child_cancelled() {
+    let CreatedDelegation {
+        manager,
+        child_run_id,
+        parent_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+    let failing_child_recorder = FailingRecorder {
+        run_id: child_run_id.clone(),
+    };
+
+    let error = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &failing_child_recorder,
+            &child_run_id,
+            &revocations,
+        )
+        .expect_err("child trace failure surfaces");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::Router(MessageRouterError::StorageUnavailable)
+    ));
+    let child_record = manager.run(&child_run_id).expect("child record");
+    assert_eq!(child_record.status, LocalRunStatus::Cancelled);
+    assert!(child_record.response_message_id.is_none());
+}
+
+#[test]
+fn revocation_response_routing_failure_still_marks_child_cancelled() {
+    let CreatedDelegation {
+        manager,
+        parent,
+        child,
+        parent_run_id,
+        child_run_id,
+        parent_runtime,
+        child_runtime,
+        authority_evidence,
+        ..
+    } = create_delegation_for_revocation();
+    fill_child_response_outbox(&manager, &parent, &child, &parent_run_id, &child_run_id);
+    let revocations = revocation_snapshot_for(authority_evidence.child_capability_grant_id);
+
+    let error = manager
+        .cancel_child_if_authority_revoked(
+            &parent_runtime,
+            &child_runtime,
+            &child_run_id,
+            &revocations,
+        )
+        .expect_err("response routing failure surfaces");
+
+    assert!(matches!(
+        error,
+        LocalDelegationError::Router(MessageRouterError::OutboxFull { .. })
+    ));
+    let child_record = manager.run(&child_run_id).expect("child record");
+    assert_eq!(child_record.status, LocalRunStatus::Cancelled);
+    assert!(child_record.response_message_id.is_none());
 }
 
 #[test]

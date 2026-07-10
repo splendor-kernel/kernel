@@ -22,9 +22,8 @@ issuance, plus a bounded local gateway obligation verifier that validates
 receipt-bound decisions before the existing adapter invocation path, a local
 authority-owned revocation snapshot plus offline degraded validated-grant cache
 foundation, and a runtime-local delegated child revocation check that consumes a
-trusted authority snapshot and cancels active child runs through the existing
-local delegation finish path when run-record parent or child grant refs are
-revoked.
+trusted live authority snapshot and cancels active child runs when run-record
+parent or child grant refs are revoked or snapshot liveness is uncertain.
 
 This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
 Python, fleet behavior, node admission, workload-controller wiring, approval
@@ -342,17 +341,23 @@ The bounded `AUTH-005b` slice adds local renewal preflight behavior in
 The bounded `AUTH-005c` slice wires local child revocation propagation into
 `splendor-kernel::LocalDelegationManager`:
 
-- `RevocationSnapshot` exposes an authority-owned helper for checking whether a
-  trusted snapshot contains a revoked `CapabilityGrantId`, without moving
-  snapshot freshness/expiry evaluation into the kernel;
+- `RevocationSnapshot` exposes authority-owned helpers for snapshot liveness and
+  live revoked-`CapabilityGrantId` lookup; the kernel consumes the helper result
+  and does not independently interpret snapshot freshness/expiry;
 - `LocalDelegationManager::cancel_child_if_authority_revoked` consumes a trusted
   `RevocationSnapshot`, reads the child run record's
-  `LocalDelegationAuthorityEvidence`, and cancels only active child runs whose
-  recorded parent or child grant ID appears as revoked in the snapshot;
-- cancellation uses the existing `finish_child_run` path with
-  `TaskResponseStatus::Cancelled` and `TaskFailure` code
-  `authority_grant_revoked`, `retryable=false`, so existing task response,
-  `ChildRunFailed` trace, and replay behavior carry the evidence;
+  `LocalDelegationAuthorityEvidence`, and cancels active child runs when a
+  recorded parent or child grant ID appears as revoked in the snapshot or the
+  trusted snapshot fails its authority-owned liveness check;
+- stale or future-dated trusted snapshots cancel active child runs fail-closed
+  with `TaskFailure` codes `authority_revocation_snapshot_stale` or
+  `authority_revocation_snapshot_future_dated`, `retryable=false`;
+- revocation cancellation marks the child run terminal/cancelled before fallible
+  trace recording or response routing. If trace or router work fails, the method
+  returns the error but does not leave the child run active;
+- successful cancellation emits `TaskResponseStatus::Cancelled` and `ChildRunFailed`
+  trace behavior with stable failure reason codes so replay can inspect the
+  cancellation without re-running authority checks;
 - unrelated revocations and terminal child runs are deterministic no-ops and do
   not emit duplicate responses or trace events;
 - message payload grant refs remain non-authorizing and are not inspected for
@@ -393,6 +398,7 @@ The bounded `AUTH-005c` slice wires local child revocation propagation into
 | Renewal cannot hide authority change | Local `AUTH-005b` denies proposed renewed grants that change grant identity, issuer, subject, operations, scope/audience, revocation state/ref, obligations, parent grants, validation kind, delegation depth, or start time. |
 | Renewal lifetimes are bounded | Local `AUTH-005b` enforces maximum renewal lifetime and maximum offline cache lifetime, and renewed cache expiry cannot outlive renewed grant expiry. |
 | Child revocation uses run-record evidence | Local `AUTH-005c` cancels active local child runs only from authority-issued run-record parent/child grant refs checked against a trusted `RevocationSnapshot`; message payloads, metadata, and forged refs remain non-authorizing. |
+| Child revocation uncertainty fails closed | Local `AUTH-005c` cancels active child runs when the trusted snapshot is stale or future-dated and marks the child cancelled before fallible trace or response routing. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -419,14 +425,17 @@ reason codes; it does not add event names, durable revocation-watch events, or
 trace sync behavior. `AUTH-005b` returns structured local renewal results with
 stable nonce/current-revision/cache/snapshot/change/lifetime reason codes; it
 does not add event names, durable lease/nonce events, or trace sync behavior.
-`AUTH-005c` does not add event names or trace-schema fields; revoked local child
-runs use existing task-response and `ChildRunFailed` trace behavior from the
-local delegation finish path. Replay remains inspect-only: it uses recorded
-parent/child grant refs and stable denial or cancellation reasons without
-re-running authority evaluation, gateways, adapters, child runs, revocation
-checks, receipt owning services, renewal preflights, offline cache refresh, or
-other side effects. Future durable evidence-store and trace-schema work must
-persist authority decisions, cache freshness, revocation-snapshot identity,
+`AUTH-005c` does not add event names or trace-schema fields; revoked or
+snapshot-uncertain local child runs use existing task-response and
+`ChildRunFailed` trace behavior when trace/router work succeeds. The child run is
+still marked terminal/cancelled before fallible trace/router work, so a trace or
+response-routing failure does not leave revoked/uncertain delegated authority
+running. Replay remains inspect-only: it uses recorded parent/child grant refs
+and stable denial or cancellation reasons without re-running authority
+evaluation, gateways, adapters, child runs, revocation checks, receipt owning
+services, renewal preflights, offline cache refresh, or other side effects.
+Future durable evidence-store and trace-schema work must persist authority
+decisions, cache freshness, revocation-snapshot identity,
 renewal nonce/current-revision evidence, child cancellation evidence, and
 receipt-verification evidence as first-class evidence records before claiming
 broader AUTH-004/AUTH-005 completion.
@@ -452,7 +461,7 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, missing evidence requiring intervention before adapter execution, raw/forged receipts denying before adapter execution, changed gateway action digest denying, tampered full-decision digest denying, operation/tenant/agent/run scope mismatch denying, expired/revoked/wrong/extra/duplicate receipts denying, and legacy `ApprovalEvidence` alone not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. TypeScript schema-parity tests cover the optional primitive field without exposing a daemon/client workflow. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, durable evidence store, production PKI, external revocation introspection, daemon/API/client workflow, Python, or full AUTH-004/C02 completion claim. |
 | Bounded AUTH-005a local revocation/cache | Authority tests cover revoked `RevocationRecord` denial over a cached active grant, missing/stale/expired/future-dated cache denial, missing/stale/future-dated revocation snapshot denial, disconnected explicit low-risk data and device-sensing read allow within cached scope/TTL, disconnected scope mismatch denial, unsupported offline read denial, disconnected high-risk device/change/agent-delegation denial or intervention only after matching cached authority, offline TTL expiry denial, and cache APIs that accept validated grants without extending grant expiry. | `G73/G88` remain `not_exercised`; no production revocation service, revocation watches, external introspection, lease renewal, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005b local renewal preflight | Authority tests cover positive renewal from a fresh cached validated grant and active snapshot with matching nonce/current digest, nonce missing/mismatch denial, current digest mismatch denial, missing/non-renewable policy denial, revoked grant/snapshot denial, missing/stale/future-dated snapshot denial, stale/expired/future-dated cached grant denial, changed grant identity/issuer/subject/operations/scope/audience/revocation/obligation/parent/validation-kind/delegation-depth/start-time denial, maximum renewal/offline lifetime denial, and renewed cache expiry not outliving renewed grant expiry. | `G73/G88` remain `not_exercised`; no durable nonce/replay store, production lease service, revocation watches, external introspection, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
-| Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover the snapshot revoked-grant-ID helper. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
+| Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, stale/future-dated trusted snapshot fail-closed child cancellation, trace recorder failure after revocation, response-routing failure after revocation, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover live snapshot revoked-grant-ID lookup and stale/future lookup denial reason codes. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
 
 ## Future Implementation Requirements
 

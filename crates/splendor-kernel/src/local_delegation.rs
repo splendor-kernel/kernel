@@ -682,11 +682,14 @@ impl LocalDelegationManager {
     }
 
     /// Cancels an active child run when its recorded parent or child capability
-    /// grant has been revoked by the trusted local authority snapshot.
+    /// grant has been revoked by the trusted live local authority snapshot, or
+    /// when snapshot liveness cannot be established.
     ///
     /// This consumes run-record authority evidence only. Message payloads and
     /// metadata remain non-authorizing and are not inspected. Unrelated
-    /// revocations and terminal child runs are deterministic no-ops.
+    /// revocations and terminal child runs are deterministic no-ops. Stale or
+    /// future-dated snapshots fail closed by cancelling authority-backed active
+    /// child runs with the authority-owned snapshot reason code.
     pub fn cancel_child_if_authority_revoked(
         &self,
         parent_recorder: &dyn MessageTraceRecorder,
@@ -695,8 +698,8 @@ impl LocalDelegationManager {
         revocations: &RevocationSnapshot,
     ) -> Result<Option<LocalTaskResponse>, LocalDelegationError> {
         let _lifecycle = self.lock_lifecycle()?;
-        ensure_recorder_run(child_recorder, child_run_id)?;
-        let should_cancel = {
+        let now = OffsetDateTime::now_utc();
+        let cancellation_reason = {
             let state = self.lock_state()?;
             let child = state
                 .runs
@@ -705,26 +708,30 @@ impl LocalDelegationManager {
             if child.status.is_terminal() || child.response_message_id.is_some() {
                 return Ok(None);
             }
-            child.authority_evidence.as_ref().is_some_and(|evidence| {
-                revocations.revokes_grant_id(&evidence.parent_capability_grant_id)
-                    || revocations.revokes_grant_id(&evidence.child_capability_grant_id)
-            })
+            let Some(evidence) = child.authority_evidence.as_ref() else {
+                return Ok(None);
+            };
+            match revocations.revokes_grant_id_at(&evidence.parent_capability_grant_id, now) {
+                Err(error) => Some(error.reason_code().to_string()),
+                Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
+                Ok(false) => match revocations
+                    .revokes_grant_id_at(&evidence.child_capability_grant_id, now)
+                {
+                    Err(error) => Some(error.reason_code().to_string()),
+                    Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
+                    Ok(false) => None,
+                },
+            }
         };
-        if !should_cancel {
+        let Some(cancellation_reason) = cancellation_reason else {
             return Ok(None);
-        }
+        };
 
-        self.finish_child_run_with_lifecycle(
+        self.cancel_child_run_for_revocation_with_lifecycle(
             parent_recorder,
             child_recorder,
             child_run_id,
-            TaskResponseStatus::Cancelled,
-            None,
-            Some(TaskFailure::new(
-                REASON_AUTHORITY_GRANT_REVOKED,
-                "local delegation authority grant was revoked",
-                false,
-            )),
+            revocation_cancellation_failure(cancellation_reason),
         )
         .map(Some)
     }
@@ -918,6 +925,110 @@ impl LocalDelegationManager {
         })
     }
 
+    fn cancel_child_run_for_revocation_with_lifecycle(
+        &self,
+        parent_recorder: &dyn MessageTraceRecorder,
+        child_recorder: &dyn MessageTraceRecorder,
+        child_run_id: &RunId,
+        failure: TaskFailure,
+    ) -> Result<LocalTaskResponse, LocalDelegationError> {
+        let (child, parent) =
+            {
+                let mut state = self.lock_state()?;
+                let child =
+                    state.runs.get(child_run_id).cloned().ok_or_else(|| {
+                        LocalDelegationError::UnknownChildRun(child_run_id.clone())
+                    })?;
+                if child.status.is_terminal() || child.response_message_id.is_some() {
+                    return Err(LocalDelegationError::ChildRunAlreadyFinished {
+                        child_run_id: child_run_id.clone(),
+                        status: child.status,
+                    });
+                }
+                let parent_run_id = child
+                    .parent_run_id
+                    .clone()
+                    .ok_or_else(|| LocalDelegationError::UnknownParentRun(child_run_id.clone()))?;
+                let parent =
+                    state.runs.get(&parent_run_id).cloned().ok_or_else(|| {
+                        LocalDelegationError::UnknownParentRun(parent_run_id.clone())
+                    })?;
+                if let Some(child_record) = state.runs.get_mut(child_run_id) {
+                    child_record.status = LocalRunStatus::Cancelled;
+                }
+                (child, parent)
+            };
+
+        ensure_recorder_run(child_recorder, child_run_id)?;
+        ensure_recorder_run(parent_recorder, &parent.run_id)?;
+        let mut context = LocalDelegationTraceContext {
+            parent_run_id: parent.run_id.clone(),
+            child_run_id: child.run_id.clone(),
+            parent_trace_id: child.parent_trace_id.clone(),
+            request_message_id: child.request_message_id.clone(),
+            response_message_id: None,
+            source_agent_id: parent.agent_id.clone(),
+            target_agent_id: child.agent_id.clone(),
+            objective: child.objective.clone().unwrap_or_default(),
+            authority_evidence: child.authority_evidence.clone(),
+        };
+
+        let child_trace_id =
+            child_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                delegation: context.clone(),
+                failure: failure.clone(),
+            })?;
+        let failure = failure.with_trace_id(child_trace_id.clone());
+        let response = TaskResponse::new(
+            parent.run_id.clone(),
+            child.run_id.clone(),
+            TaskResponseStatus::Cancelled,
+            None,
+            Some(failure.clone()),
+        )?;
+        let response_message = Message::new(
+            MessageId::new(),
+            child.agent_id.clone(),
+            parent.agent_id.clone(),
+            parent.run_id.clone(),
+            TASK_RESPONSE_SCHEMA,
+            serde_json::to_value(response.clone()).map_err(|error| {
+                MessageValidationError::PayloadValidationFailed {
+                    schema: TASK_RESPONSE_SCHEMA.to_string(),
+                    reason: error.to_string(),
+                }
+            })?,
+            Some(child_trace_id.clone()),
+            false,
+            OffsetDateTime::now_utc(),
+        )?;
+        let response_message_id = response_message.message_id.clone();
+        let routed_response = self
+            .router
+            .send(parent_recorder, MessageEnvelope::new(response_message)?)?;
+
+        {
+            let mut state = self.lock_state()?;
+            if let Some(child_record) = state.runs.get_mut(child_run_id) {
+                child_record.response_message_id = Some(response_message_id.clone());
+            }
+        }
+        context = context.with_response_message(response_message_id);
+
+        let parent_trace_id =
+            parent_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                delegation: context,
+                failure,
+            })?;
+
+        Ok(LocalTaskResponse {
+            response,
+            response_message: routed_response,
+            parent_trace_id,
+            child_trace_id,
+        })
+    }
+
     fn lock_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, LocalDelegationState>, LocalDelegationError> {
@@ -1048,6 +1159,15 @@ fn child_grant_liveness_denial(
         return Some("child_grant_expired");
     }
     None
+}
+
+fn revocation_cancellation_failure(reason_code: String) -> TaskFailure {
+    let reason = if reason_code == REASON_AUTHORITY_GRANT_REVOKED {
+        "local delegation authority grant was revoked"
+    } else {
+        "local delegation revocation snapshot was not live"
+    };
+    TaskFailure::new(reason_code, reason, false)
 }
 
 fn delegation_child_grant_request(

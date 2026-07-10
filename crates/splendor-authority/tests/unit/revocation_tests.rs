@@ -258,7 +258,7 @@ fn revocation_snapshot_denies_cached_grant_even_when_payload_is_active() {
 }
 
 #[test]
-fn revocation_snapshot_reports_revoked_grant_ids_only() {
+fn live_revocation_snapshot_reports_revoked_grant_ids_only() {
     let fixture = Fixture::new();
     let revoked_grant_id = CapabilityGrantId::new();
     let active_grant_id = CapabilityGrantId::new();
@@ -272,9 +272,54 @@ fn revocation_snapshot_reports_revoked_grant_ids_only() {
     )
     .expect("revocation snapshot");
 
-    assert!(snapshot.revokes_grant_id(&revoked_grant_id));
-    assert!(!snapshot.revokes_grant_id(&active_grant_id));
-    assert!(!snapshot.revokes_grant_id(&CapabilityGrantId::new()));
+    assert!(snapshot
+        .revokes_grant_id_at(&revoked_grant_id, fixture.now)
+        .expect("live revoked lookup"));
+    assert!(!snapshot
+        .revokes_grant_id_at(&active_grant_id, fixture.now)
+        .expect("live active lookup"));
+    assert!(!snapshot
+        .revokes_grant_id_at(&CapabilityGrantId::new(), fixture.now)
+        .expect("live missing lookup"));
+}
+
+#[test]
+fn revoked_grant_id_lookup_requires_live_snapshot() {
+    let fixture = Fixture::new();
+    let grant_id = CapabilityGrantId::new();
+    let stale_snapshot = RevocationSnapshot::with_max_age(
+        vec![revoked_record(
+            grant_id.clone(),
+            fixture.now - Duration::minutes(10),
+        )],
+        fixture.now - Duration::minutes(10),
+        Duration::minutes(1),
+    )
+    .expect("stale snapshot builds for fail-closed lookup");
+    let future_snapshot = RevocationSnapshot::with_max_age(
+        vec![revoked_record(
+            grant_id.clone(),
+            fixture.now + Duration::minutes(5),
+        )],
+        fixture.now + Duration::minutes(5),
+        Duration::minutes(30),
+    )
+    .expect("future snapshot builds for fail-closed lookup");
+
+    let stale = stale_snapshot
+        .revokes_grant_id_at(&grant_id, fixture.now)
+        .expect_err("stale snapshot rejects revoked-id lookup");
+    assert_eq!(
+        stale.reason_code(),
+        REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE
+    );
+    let future = future_snapshot
+        .revokes_grant_id_at(&grant_id, fixture.now)
+        .expect_err("future snapshot rejects revoked-id lookup");
+    assert_eq!(
+        future.reason_code(),
+        REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED
+    );
 }
 
 #[test]
