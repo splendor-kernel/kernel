@@ -733,13 +733,13 @@ impl AuthorityObligationVerifier for NoAuthorityObligationVerifier {
         _adapter: Option<&str>,
         _now: OffsetDateTime,
     ) -> AuthorityObligationVerification {
-        if action.authority_obligation_evidence.is_some() {
+        if let Some(evidence) = action.authority_obligation_evidence.as_ref() {
             return AuthorityObligationVerification::NeedsIntervention(
                 authority_obligation_result(
                     false,
                     vec!["authority_obligation_verifier_unavailable".to_string()],
                     "verifier_unavailable",
-                    None,
+                    Some(evidence),
                     None,
                     Vec::new(),
                     Vec::new(),
@@ -1055,7 +1055,7 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
                     false,
                     vec!["authority_decision_evidence_projection_unavailable".to_string()],
                     "evidence_projection_unavailable",
-                    None,
+                    Some(evidence),
                     Some(expected_action_digest),
                     Vec::new(),
                     Vec::new(),
@@ -1732,10 +1732,12 @@ fn authority_obligation_result(
     satisfied_obligation_ids: Vec<String>,
     receipt_ids: Vec<String>,
 ) -> VerificationResult {
-    // Decision details are trusted for artifact projection only after exact local
-    // receipt validation/matching has allowed the obligation result.
-    let evidence = if allowed { evidence } else { None };
-    let derived_receipt_ids = if receipt_ids.is_empty() {
+    // Typed IDs/status are bounded compatibility coordinates. Detailed decision
+    // projection and digest strings remain trusted-only after exact receipt match.
+    let trusted_evidence = if allowed { evidence } else { None };
+    let derived_receipt_ids = if allowed && !receipt_ids.is_empty() {
+        receipt_ids
+    } else {
         evidence
             .map(|evidence| {
                 evidence
@@ -1745,8 +1747,6 @@ fn authority_obligation_result(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
-    } else {
-        receipt_ids
     };
     let obligation_ids = evidence
         .map(|evidence| {
@@ -1758,7 +1758,7 @@ fn authority_obligation_result(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let decision_digest = evidence.and_then(|evidence| {
+    let decision_digest = trusted_evidence.and_then(|evidence| {
         evidence
             .decision
             .request
@@ -1767,6 +1767,12 @@ fn authority_obligation_result(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     });
+    let action_digest = if allowed { action_digest } else { None };
+    let satisfied_obligation_ids = if allowed {
+        satisfied_obligation_ids
+    } else {
+        Vec::new()
+    };
     VerificationResult {
         allowed,
         reasons: if allowed { Vec::new() } else { reasons },
@@ -1774,13 +1780,23 @@ fn authority_obligation_result(
             "verifier": "authority_obligation_verifier",
             "authority_obligation_status": status,
             "decision_id": evidence.map(|evidence| evidence.decision.decision_id.to_string()),
-            "decision_status": evidence.map(|evidence| format!("{:?}", evidence.decision.status)),
+            "decision_status": evidence.map(|evidence| authority_decision_status_label(evidence.decision.status)),
             "obligation_ids": obligation_ids,
             "receipt_ids": derived_receipt_ids,
             "satisfied_obligation_ids": satisfied_obligation_ids,
             "gateway_action_request_digest": action_digest,
             "authority_decision_digest": decision_digest,
         }),
+    }
+}
+
+fn authority_decision_status_label(status: AuthorityDecisionStatus) -> &'static str {
+    match status {
+        AuthorityDecisionStatus::Allowed => "allowed",
+        AuthorityDecisionStatus::Denied => "denied",
+        AuthorityDecisionStatus::Conditional => "conditional",
+        AuthorityDecisionStatus::NeedsApproval => "needs_approval",
+        AuthorityDecisionStatus::NeedsIntervention => "needs_intervention",
     }
 }
 
