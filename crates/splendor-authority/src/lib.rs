@@ -88,3 +88,7 @@ pub use revocation::{
     REASON_AUTHORITY_REVOCATION_SNAPSHOT_MISSING, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
     REASON_AUTHORITY_SCOPE_MISMATCH,
 };
+
+#[cfg(test)]
+#[path = "../tests/unit/adversarial_property_tests.rs"]
+mod adversarial_property_tests;
