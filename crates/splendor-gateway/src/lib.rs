@@ -37,8 +37,8 @@
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
-    gateway_action_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationReceiptValidationContext,
+    authority_decision_evidence, gateway_action_operation, validate_authority_obligation_receipt,
+    verify_obligation_receipts, AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
@@ -733,13 +733,13 @@ impl AuthorityObligationVerifier for NoAuthorityObligationVerifier {
         _adapter: Option<&str>,
         _now: OffsetDateTime,
     ) -> AuthorityObligationVerification {
-        if action.authority_obligation_evidence.is_some() {
+        if let Some(evidence) = action.authority_obligation_evidence.as_ref() {
             return AuthorityObligationVerification::NeedsIntervention(
                 authority_obligation_result(
                     false,
                     vec!["authority_obligation_verifier_unavailable".to_string()],
                     "verifier_unavailable",
-                    None,
+                    Some(evidence),
                     None,
                     Vec::new(),
                     Vec::new(),
@@ -1032,12 +1032,12 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
             ));
         }
 
-        AuthorityObligationVerification::Allowed(authority_obligation_result(
+        let mut result = authority_obligation_result(
             true,
             Vec::new(),
             "satisfied",
             Some(evidence),
-            Some(expected_action_digest),
+            Some(expected_action_digest.clone()),
             verification
                 .satisfied_obligation_ids
                 .into_iter()
@@ -1048,7 +1048,21 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
                 .iter()
                 .map(|receipt| receipt.receipt_id.to_string())
                 .collect(),
-        ))
+        );
+        if attach_authority_decision_evidence_projection(&mut result, &evidence.decision).is_err() {
+            return AuthorityObligationVerification::NeedsIntervention(
+                authority_obligation_result(
+                    false,
+                    vec!["authority_decision_evidence_projection_unavailable".to_string()],
+                    "evidence_projection_unavailable",
+                    Some(evidence),
+                    Some(expected_action_digest),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+        AuthorityObligationVerification::Allowed(result)
     }
 }
 
@@ -1718,7 +1732,12 @@ fn authority_obligation_result(
     satisfied_obligation_ids: Vec<String>,
     receipt_ids: Vec<String>,
 ) -> VerificationResult {
-    let derived_receipt_ids = if receipt_ids.is_empty() {
+    // Typed IDs/status are bounded compatibility coordinates. Detailed decision
+    // projection and digest strings remain trusted-only after exact receipt match.
+    let trusted_evidence = if allowed { evidence } else { None };
+    let derived_receipt_ids = if allowed && !receipt_ids.is_empty() {
+        receipt_ids
+    } else {
         evidence
             .map(|evidence| {
                 evidence
@@ -1728,8 +1747,6 @@ fn authority_obligation_result(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
-    } else {
-        receipt_ids
     };
     let obligation_ids = evidence
         .map(|evidence| {
@@ -1741,7 +1758,7 @@ fn authority_obligation_result(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let decision_digest = evidence.and_then(|evidence| {
+    let decision_digest = trusted_evidence.and_then(|evidence| {
         evidence
             .decision
             .request
@@ -1750,6 +1767,12 @@ fn authority_obligation_result(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     });
+    let action_digest = if allowed { action_digest } else { None };
+    let satisfied_obligation_ids = if allowed {
+        satisfied_obligation_ids
+    } else {
+        Vec::new()
+    };
     VerificationResult {
         allowed,
         reasons: if allowed { Vec::new() } else { reasons },
@@ -1757,7 +1780,7 @@ fn authority_obligation_result(
             "verifier": "authority_obligation_verifier",
             "authority_obligation_status": status,
             "decision_id": evidence.map(|evidence| evidence.decision.decision_id.to_string()),
-            "decision_status": evidence.map(|evidence| format!("{:?}", evidence.decision.status)),
+            "decision_status": evidence.map(|evidence| authority_decision_status_label(evidence.decision.status)),
             "obligation_ids": obligation_ids,
             "receipt_ids": derived_receipt_ids,
             "satisfied_obligation_ids": satisfied_obligation_ids,
@@ -1765,6 +1788,52 @@ fn authority_obligation_result(
             "authority_decision_digest": decision_digest,
         }),
     }
+}
+
+fn authority_decision_status_label(status: AuthorityDecisionStatus) -> &'static str {
+    match status {
+        AuthorityDecisionStatus::Allowed => "allowed",
+        AuthorityDecisionStatus::Denied => "denied",
+        AuthorityDecisionStatus::Conditional => "conditional",
+        AuthorityDecisionStatus::NeedsApproval => "needs_approval",
+        AuthorityDecisionStatus::NeedsIntervention => "needs_intervention",
+    }
+}
+
+fn attach_authority_decision_evidence_projection(
+    result: &mut VerificationResult,
+    decision: &AuthorityDecision,
+) -> Result<(), &'static str> {
+    let (digest, completeness, explanation, unavailable) =
+        match authority_decision_evidence(decision).and_then(|record| record.redacted()) {
+            Ok(record) => match (
+                serde_json::to_value(record.completeness),
+                serde_json::to_value(record.explanation.branches),
+            ) {
+                (Ok(completeness), Ok(explanation)) => (
+                    serde_json::Value::String(record.decision_digest),
+                    completeness,
+                    explanation,
+                    serde_json::Value::Null,
+                ),
+                _ => return Err("authority_evidence_projection_serialization_unavailable"),
+            },
+            Err(error) => return Err(error.reason_code()),
+        };
+    let Some(artifacts) = result.artifacts.as_object_mut() else {
+        return Err("authority_evidence_projection_artifact_unavailable");
+    };
+    artifacts.insert("authority_decision_evidence_digest".to_string(), digest);
+    artifacts.insert(
+        "authority_decision_evidence_completeness".to_string(),
+        completeness,
+    );
+    artifacts.insert("authority_decision_explanation".to_string(), explanation);
+    artifacts.insert(
+        "authority_decision_evidence_unavailable".to_string(),
+        unavailable,
+    );
+    Ok(())
 }
 
 fn push_unique_string(reasons: &mut Vec<String>, reason: String) {
