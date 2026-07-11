@@ -4,7 +4,7 @@
 
 Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
 `AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, `AUTH-005b`, and `AUTH-005c`
-implementation evidence slices.
+implementation evidence slices plus bounded local `AUTH-006a` decision evidence.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -23,7 +23,12 @@ receipt-bound decisions before the existing adapter invocation path, a local
 authority-owned revocation snapshot plus offline degraded validated-grant cache
 foundation, and a runtime-local delegated child revocation check that consumes a
 trusted live authority snapshot and cancels active child runs when run-record
-parent or child grant refs are revoked or snapshot liveness is uncertain.
+parent or child grant refs are revoked or snapshot liveness is uncertain. A
+bounded authority-owned `AUTH-006a` module now constructs deterministic local
+decision evidence, redacted explanation views, explicit completeness/freshness
+facts, and inspect-only comparisons. The existing gateway obligation verifier
+artifact projects only the redacted evidence digest and normalized reason-tree
+summary after trusted receipt validation and exact matching.
 
 This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
 Python, fleet behavior, node admission, workload-controller wiring, approval
@@ -43,10 +48,10 @@ renewable policy, and lifetime caps. `AUTH-005c` adds no public schema churn; it
 adds only a local kernel API that consumes an already trusted `RevocationSnapshot`
 and existing run-record authority evidence.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
-full `AUTH-004`, full `AUTH-005`, G11, G18, G43, G60, G70, G71, G73, G75, G79,
-G83, G88, issue closure, or gold completion.
+full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
+G60, G70, G71, G73, G75, G79, G83, G88, issue closure, or gold completion.
 
-Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
+Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `G43`,
 `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, and `G88` remain
 `not_exercised`.
 
@@ -60,9 +65,10 @@ Until exact executable fixtures pass, gold targets `G01`, `G11`, `G18`, `G43`,
 | Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder plus `AUTH-003b` runtime-local manager wiring evidence only; not complete. |
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
+| Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
-| Gold targets | `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
+| Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
 
 ## Motivation
 
@@ -104,7 +110,11 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   revocation snapshot behavior over already validated grants, `AUTH-005b` is only
   local renewal preflight, and `AUTH-005c` is only local manager consumption of a
   trusted snapshot for already-running local child runs.
-- No claim that `G01`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`,
+- No durable Evidence Service/bundle/store or access-control service, event/trace
+  schema, policy archive, historical-policy re-evaluation, protected-eval
+  subsystem, daemon/API/client workflow, or full FND-009 implementation. Local
+  `AUTH-006a` evidence is inspect-only and is never authority.
+- No claim that `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`,
   `G79`, `G83`, or `G88` passed.
 - No closure claim for #182, #238, #239, #240, #241, #242, #243, or #244.
 
@@ -374,6 +384,50 @@ The bounded `AUTH-005c` slice wires local child revocation propagation into
   policy-cache integration, incident-controller quarantine, cleanup obligations,
   durable evidence store, or gold fixture is added.
 
+The bounded `AUTH-006a` slice adds local decision evidence in
+`splendor-authority::evidence` and a redacted gateway artifact projection:
+
+- decision-only, validated-grant evaluation, and cached evaluation records state
+  their completeness and missing facts explicitly; they do not fabricate policy,
+  data-use, grant-revision, or cache facts that the caller did not supply;
+- records retain decision/subject/grant/obligation identity, a canonical typed
+  operation classification, status/timestamp, domain-separated restricted grant
+  validation/revision digests, bounded normalized reason codes, deterministic
+  category branches, and available cache/snapshot freshness facts;
+- requester-provided reason text is never preserved: known evaluator patterns map
+  to bounded static codes and every unknown, hostile, oversized, control/ANSI, or
+  misleading value maps to `authority_reason_unknown`;
+- caller-provided decision/request/operation/resource/grant/scope/obligation
+  schema strings are never copied; evidence records only canonical/static validity
+  classifications where applicable;
+- exact request/scope and concrete operation-name binding is explicitly
+  missing/withheld. This local serializable model does not publish low-entropy
+  unkeyed request/operation digests; exact binding requires a future keyed,
+  access-controlled evidence service;
+- raw request scopes, request/grant metadata, signatures, key IDs/material,
+  credentials, nonces, concrete operation names/protected-eval IDs,
+  revocation-record payloads, obligation descriptions, and obligation parameters
+  are never copied into evidence records;
+- restricted evidence may retain domain-separated grant token/revision digests;
+  tenant/operator redaction preserves typed operation classification,
+  decision/grant identity, causal normalized reason shape, status, and the safe
+  decision-record digest while removing those restricted grant digests;
+- normal and cached wrappers call the existing evaluators unchanged; evidence
+  construction failure returns a stable unavailable error instead of fabricating
+  evidence or converting a denial/conditional result to allow;
+- comparison accepts only two already-recorded evidence objects labelled
+  historical/current/counterfactual and reports status/reason/digest changes; it
+  does not load policy, resolve secrets, contact revocation providers, invoke the
+  gateway/adapter, mutate history, or claim historical policy re-evaluation;
+- the existing `authority_obligation_result` artifact adds a decision-only
+  redacted evidence digest, completeness, and normalized explanation summary only
+  after trusted local receipts validate and match the exact conditional decision;
+  no-verifier, unavailable, or early-denial paths retain only bounded typed
+  compatibility coordinates (decision ID/static status, obligation IDs, and
+  receipt IDs). They do not retain requester reasons, schemas, metadata/digest
+  strings, or detailed evidence projection. If final projection fails, the
+  gateway returns `NeedsIntervention` and does not execute the adapter.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -407,6 +461,9 @@ The bounded `AUTH-005c` slice wires local child revocation propagation into
 | Child revocation uses run-record evidence | Local `AUTH-005c` cancels active local child runs only from authority-issued run-record parent/child grant refs checked against a trusted `RevocationSnapshot`; message payloads, metadata, and forged refs remain non-authorizing. |
 | Child revocation uncertainty fails closed | Local `AUTH-005c` cancels active child runs when the trusted snapshot is stale or future-dated and marks the child cancelled before fallible trace or response routing. |
 | Run identity cannot be resurrected | Root registration is lifecycle-serialized and rejects every existing run ID with `DuplicateRun`, preserving root/child identity, terminal state, and authority evidence. A known child with missing authority evidence cancels with `missing_authority_evidence`. |
+| Evidence is never authority | Local AUTH-006a evidence and comparisons are inspection artifacts only and cannot satisfy capabilities, receipts, obligations, approvals, verifiers, or gateway execution. |
+| Evidence is explicit and redacted | Completeness/missing/withheld fields prevent fabricated evaluator facts; reasons are bounded static codes; exact request/operation binding is declared missing; redacted views preserve safe identity/status/causal shape without raw scopes, caller schema strings, restricted grant digests, metadata, signatures, key IDs/material, or free-form obligation details. |
+| Evidence projection follows trust validation | Gateway evidence projection occurs only after trusted local receipt validation and exact matching. Untrusted/early-denial artifacts preserve only typed decision/obligation/receipt coordinates for compatibility, never requester reasons, schemas, metadata/digests, or detailed projection; projection failure prevents adapter execution. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -442,6 +499,11 @@ running. Replay remains inspect-only: it uses recorded parent/child grant refs
 and stable denial or cancellation reasons without re-running authority
 evaluation, gateways, adapters, child runs, revocation checks, receipt owning
 services, renewal preflights, offline cache refresh, or other side effects.
+`AUTH-006a` adds no event, trace, state, or wire schema. Its comparison helper is
+inspect-only over supplied records and its gateway projection reuses the existing
+authority-obligation verification artifact without re-running authority. The
+projection is emitted only after trusted receipt validation/exact matching; a
+projection failure fails closed before adapter execution.
 Future durable evidence-store and trace-schema work must persist authority
 decisions, cache freshness, revocation-snapshot identity,
 renewal nonce/current-revision evidence, child cancellation evidence, and
@@ -470,10 +532,11 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-005a local revocation/cache | Authority tests cover revoked `RevocationRecord` denial over a cached active grant, missing/stale/expired/future-dated cache denial, missing/stale/future-dated revocation snapshot denial, disconnected explicit low-risk data and device-sensing read allow within cached scope/TTL, disconnected scope mismatch denial, unsupported offline read denial, disconnected high-risk device/change/agent-delegation denial or intervention only after matching cached authority, offline TTL expiry denial, and cache APIs that accept validated grants without extending grant expiry. | `G73/G88` remain `not_exercised`; no production revocation service, revocation watches, external introspection, lease renewal, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005b local renewal preflight | Authority tests cover positive renewal from a fresh cached validated grant and active snapshot with matching nonce/current digest, nonce missing/mismatch denial, current digest mismatch denial, missing/non-renewable policy denial, revoked grant/snapshot denial, missing/stale/future-dated snapshot denial, stale/expired/future-dated cached grant denial, changed grant identity/issuer/subject/operations/scope/audience/revocation/obligation/parent/validation-kind/delegation-depth/start-time denial, maximum renewal/offline lifetime denial, and renewed cache expiry not outliving renewed grant expiry. | `G73/G88` remain `not_exercised`; no durable nonce/replay store, production lease service, revocation watches, external introspection, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, stale/future-dated trusted snapshot fail-closed child cancellation, missing authority evidence on a known child, trace recorder failure after revocation, response-routing failure after revocation, active/cancelled child and duplicate-root registration rejection without mutation, concurrent root-registration/revocation lifecycle serialization, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover live snapshot revoked-grant-ID lookup and stale/future lookup denial reason codes. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
+| Bounded AUTH-006a decision evidence | Authority tests cover deterministic safe decision/restricted revision digests, domain separation, set/hash canonicalization, normalized evaluator reason-category trees, explicit missing exact-request binding, decision/grant/cache completeness, cache versus offline-TTL freshness, restricted/redacted leak absence, inspect-only comparisons, and explicit evidence-unavailable errors. Gateway tests cover trusted-only normalized projection, safe typed denial coordinates, hostile reason/schema/metadata-digest omission on no-verifier/early-denial paths, and zero adapter execution on malformed evidence. | `G01/G03` remain `not_exercised`; no exact request/operation digest claim, keyed evidence binding, durable Evidence Service, bundle/store/access controls, trace schema, policy archive/re-evaluation engine, daemon/API/client workflow, full FND-009, or full AUTH-006/C02 completion claim. |
 
 ## Future Implementation Requirements
 
-Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004/AUTH-005
+Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004/AUTH-005/AUTH-006
 must add executable integration evidence before changing gold status or closing
 issues:
 
@@ -498,7 +561,12 @@ issues:
   executable `G73/G88` fixtures beyond the bounded local AUTH-005a cache/snapshot
   foundation, AUTH-005b renewal preflight, and AUTH-005c local child cancellation
   bridge (`AUTH-005`);
-- decision evidence/explainability and replay integration (`AUTH-006`);
+- durable decision evidence bundles/access control, policy-version historical
+  re-evaluation, replay-service integration, and executable `G01/G03` fixtures
+  beyond bounded local `AUTH-006a` records/comparison (`AUTH-006`);
+- keyed, access-controlled exact request/scope/concrete-operation binding; current
+  serializable restricted/redacted records intentionally make no exact-binding,
+  request-digest, or protected-operation-digest claim;
 - adversarial/property suites (`AUTH-007`).
 
 ## Summary
@@ -506,8 +574,9 @@ issues:
 This RFC and implementation slice introduce typed, deterministic local
 capability, issuance, bounded delegation, conditional obligation receipt, local
 revocation/offline cached-grant, renewal-preflight, and delegated child
-revocation foundations plus runtime-local delegation grant-reference wiring while
-preserving Splendor's kernel invariants: no side-effect bypass, fail-closed
-authority checks, no permission laundering, no message or metadata authority,
-identity separation, offline cache and renewal are not ambient authority, and no
-gold completion claim without executable evidence.
+revocation foundations, runtime-local delegation grant-reference wiring, and
+bounded redacted local decision evidence while preserving Splendor's kernel
+invariants: no side-effect bypass, fail-closed authority checks, no permission
+laundering, no message/metadata/evidence authority, identity separation, offline
+cache and renewal are not ambient authority, inspect-only comparison has no live
+effects, and no gold completion claim exists without executable evidence.
