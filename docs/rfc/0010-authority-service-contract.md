@@ -4,7 +4,8 @@
 
 Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
 `AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, `AUTH-005b`, and `AUTH-005c`
-implementation evidence slices plus bounded local `AUTH-006a` decision evidence.
+implementation evidence slices plus bounded local `AUTH-006a` decision evidence
+and deterministic `AUTH-007a` adversarial/property evidence.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -29,6 +30,11 @@ decision evidence, redacted explanation views, explicit completeness/freshness
 facts, and inspect-only comparisons. The existing gateway obligation verifier
 artifact projects only the redacted evidence digest and normalized reason-tree
 summary after trusted receipt validation and exact matching.
+`AUTH-007a` adds a dependency-free, seed-reproducible unit-test corpus over the
+implemented local capability algebra, delegation builder, revocation/cache
+evaluator, and evidence normalization. It runs bounded 256- or 512-case
+properties with fixed timestamps and deterministic identities; every property
+failure reports its seed and case.
 
 This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
 Python, fleet behavior, node admission, workload-controller wiring, approval
@@ -49,10 +55,11 @@ adds only a local kernel API that consumes an already trusted `RevocationSnapsho
 and existing run-record authority evidence.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
-G60, G70, G71, G73, G75, G79, G83, G88, issue closure, or gold completion.
+G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
+closure, or gold completion.
 
 Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `G43`,
-`G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, and `G88` remain
+`G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G80`, `G83`, `G86`, and `G88` remain
 `not_exercised`.
 
 ## Binding
@@ -66,9 +73,10 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
+| Catalog task | `AUTH-007 - Build authority adversarial/property test suites` | Bounded `AUTH-007a` deterministic local algebra/delegation/revocation/evidence properties only; no serialized fuzzing, all-plane confused-deputy harness, cross-version IAM parity, mutation testing, formal proof, or full task completion. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
-| Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G83`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
+| Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G80`, `G83`, `G86`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
 
 ## Motivation
 
@@ -115,7 +123,11 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   subsystem, daemon/API/client workflow, or full FND-009 implementation. Local
   `AUTH-006a` evidence is inspect-only and is never authority.
 - No claim that `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`,
-  `G79`, `G83`, or `G88` passed.
+  `G79`, `G80`, `G83`, `G86`, or `G88` passed.
+- No serialized grant/work-order/approval fuzz harness, all-plane
+  confused-deputy coverage, cross-version IAM/cache parity matrix, mutation
+  testing, formal proof, or full `AUTH-007` claim. `AUTH-007a` is a bounded
+  deterministic local property corpus only.
 - No closure claim for #182, #238, #239, #240, #241, #242, #243, or #244.
 
 ## Contract Overview
@@ -428,6 +440,27 @@ The bounded `AUTH-006a` slice adds local decision evidence in
   strings, or detailed evidence projection. If final projection fails, the
   gateway returns `NeedsIntervention` and does not execute the adapter.
 
+The bounded `AUTH-007a` slice adds local adversarial/property coverage:
+
+- 256-case scope properties prove no broadening, semantic commutativity after
+  canonical set normalization, idempotence, and deterministic rejection of
+  empty/disjoint dimensions;
+- 512-case budget properties cover `None`/bounded/extreme-value intersections
+  and repeated narrowing without arithmetic overflow or authority growth;
+- 256-case fixed-time properties cover exact grant start/expiry boundaries,
+  child-window narrowing, and denial stability when unrelated grants are added;
+- 256-case audience/subject/metadata properties prove mismatches remain denied,
+  reserved or hostile extension keys do not authorize, and malformed local
+  grants are rejected by the real local validation path;
+- 256-case delegation properties cover strictly decreasing depth, exhausted
+  depth/fan-out, bounded child budgets/windows, and critic/evaluator denial for
+  external-effect or delegation-control operations;
+- 256-case revocation/cache properties cover active-to-revoked monotonicity,
+  unrelated active-record resistance, and missing/stale/future cache/snapshot
+  uncertainty remaining non-allowing;
+- 512-case denial/evidence properties prove ordered reason stability for the
+  same facts and bounded normalization/redaction of generated hostile reasons.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -464,6 +497,7 @@ The bounded `AUTH-006a` slice adds local decision evidence in
 | Evidence is never authority | Local AUTH-006a evidence and comparisons are inspection artifacts only and cannot satisfy capabilities, receipts, obligations, approvals, verifiers, or gateway execution. |
 | Evidence is explicit and redacted | Completeness/missing/withheld fields prevent fabricated evaluator facts; reasons are bounded static codes; exact request/operation binding is declared missing; redacted views preserve safe identity/status/causal shape without raw scopes, caller schema strings, restricted grant digests, metadata, signatures, key IDs/material, or free-form obligation details. |
 | Evidence projection follows trust validation | Gateway evidence projection occurs only after trusted local receipt validation and exact matching. Untrusted/early-denial artifacts preserve only typed decision/obligation/receipt coordinates for compatibility, never requester reasons, schemas, metadata/digests, or detailed projection; projection failure prevents adapter execution. |
+| Property evidence is bounded and reproducible | Local `AUTH-007a` uses deterministic IDs, fixed timestamps, explicit seeded generation, real local grant validation/evaluation/delegation/revocation paths, and seed/case-labelled failures. It does not substitute for fuzz, gold, mutation, cross-version, or distributed confused-deputy evidence. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -504,6 +538,9 @@ inspect-only over supplied records and its gateway projection reuses the existin
 authority-obligation verification artifact without re-running authority. The
 projection is emitted only after trusted receipt validation/exact matching; a
 projection failure fails closed before adapter execution.
+`AUTH-007a` is test and documentation evidence only. It adds no runtime event,
+trace, state, replay, schema, gateway, adapter, or authority semantics and
+executes no live side effects.
 Future durable evidence-store and trace-schema work must persist authority
 decisions, cache freshness, revocation-snapshot identity,
 renewal nonce/current-revision evidence, child cancellation evidence, and
@@ -533,10 +570,11 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-005b local renewal preflight | Authority tests cover positive renewal from a fresh cached validated grant and active snapshot with matching nonce/current digest, nonce missing/mismatch denial, current digest mismatch denial, missing/non-renewable policy denial, revoked grant/snapshot denial, missing/stale/future-dated snapshot denial, stale/expired/future-dated cached grant denial, changed grant identity/issuer/subject/operations/scope/audience/revocation/obligation/parent/validation-kind/delegation-depth/start-time denial, maximum renewal/offline lifetime denial, and renewed cache expiry not outliving renewed grant expiry. | `G73/G88` remain `not_exercised`; no durable nonce/replay store, production lease service, revocation watches, external introspection, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, stale/future-dated trusted snapshot fail-closed child cancellation, missing authority evidence on a known child, trace recorder failure after revocation, response-routing failure after revocation, active/cancelled child and duplicate-root registration rejection without mutation, concurrent root-registration/revocation lifecycle serialization, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover live snapshot revoked-grant-ID lookup and stale/future lookup denial reason codes. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
 | Bounded AUTH-006a decision evidence | Authority tests cover deterministic safe decision/restricted revision digests, domain separation, set/hash canonicalization, normalized evaluator reason-category trees, explicit missing exact-request binding, decision/grant/cache completeness, cache versus offline-TTL freshness, restricted/redacted leak absence, inspect-only comparisons, and explicit evidence-unavailable errors. Gateway tests cover trusted-only normalized projection, safe typed denial coordinates, hostile reason/schema/metadata-digest omission on no-verifier/early-denial paths, and zero adapter execution on malformed evidence. | `G01/G03` remain `not_exercised`; no exact request/operation digest claim, keyed evidence binding, durable Evidence Service, bundle/store/access controls, trace schema, policy archive/re-evaluation engine, daemon/API/client workflow, full FND-009, or full AUTH-006/C02 completion claim. |
+| Bounded AUTH-007a deterministic adversarial/property suite | `cargo test -p splendor-authority adversarial_property --locked` runs eight dependency-free properties: 256 cases each for scope algebra, empty/disjoint rejection, fixed-time/audience/subject behavior, delegation restrictions, and revocation/cache monotonicity; 512 cases each for budget accumulation and deterministic denial/evidence normalization. Inputs use fixed time and deterministic IDs; failures identify seed/case. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no serialized fuzz, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02 claim. |
 
 ## Future Implementation Requirements
 
-Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004/AUTH-005/AUTH-006
+Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004/AUTH-005/AUTH-006/AUTH-007
 must add executable integration evidence before changing gold status or closing
 issues:
 
@@ -567,7 +605,10 @@ issues:
 - keyed, access-controlled exact request/scope/concrete-operation binding; current
   serializable restricted/redacted records intentionally make no exact-binding,
   request-digest, or protected-operation-digest claim;
-- adversarial/property suites (`AUTH-007`).
+- remaining `AUTH-007` evidence: serialized grant/work-order/approval fuzzing,
+  all-plane confused-deputy paths, cross-version policy/cache scenarios,
+  external capability-algebra fixtures, mutation testing, and executable gold
+  harnesses beyond bounded local `AUTH-007a` deterministic properties.
 
 ## Summary
 
@@ -579,4 +620,5 @@ bounded redacted local decision evidence while preserving Splendor's kernel
 invariants: no side-effect bypass, fail-closed authority checks, no permission
 laundering, no message/metadata/evidence authority, identity separation, offline
 cache and renewal are not ambient authority, inspect-only comparison has no live
-effects, and no gold completion claim exists without executable evidence.
+effects, deterministic local adversarial/property failures are reproducible by
+seed/case, and no gold completion claim exists without executable evidence.
