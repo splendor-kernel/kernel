@@ -13,7 +13,7 @@ use splendor_types::{
     DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION, REVOCATION_RECORD_SCHEMA_VERSION,
     TASK_RESPONSE_SCHEMA,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use time::{Duration, OffsetDateTime};
 
 const ALGEBRA_CASES: u64 = 256;
@@ -1328,60 +1328,90 @@ fn adversarial_property_revocation_and_cache_uncertainty_are_monotonic() {
             now + Duration::hours(1),
         );
         let uncertainty = [
-            evaluate_cached_capability_request(&cache, None, &policy, &request, now),
-            evaluate_cached_capability_request(
-                &AuthorityGrantCache::new(),
-                Some(&active_snapshot),
-                &policy,
-                &request,
-                now,
+            (
+                "missing_snapshot",
+                REASON_AUTHORITY_REVOCATION_SNAPSHOT_MISSING,
+                evaluate_cached_capability_request(&cache, None, &policy, &request, now),
             ),
-            evaluate_cached_capability_request(
-                &cache,
-                Some(&stale_snapshot),
-                &policy,
-                &request,
-                now,
+            (
+                "missing_cache",
+                REASON_AUTHORITY_CACHE_MISSING,
+                evaluate_cached_capability_request(
+                    &AuthorityGrantCache::new(),
+                    Some(&active_snapshot),
+                    &policy,
+                    &request,
+                    now,
+                ),
             ),
-            evaluate_cached_capability_request(
-                &cache,
-                Some(&future_snapshot),
-                &policy,
-                &request,
-                now,
+            (
+                "stale_snapshot",
+                REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
+                evaluate_cached_capability_request(
+                    &cache,
+                    Some(&stale_snapshot),
+                    &policy,
+                    &request,
+                    now,
+                ),
             ),
-            evaluate_cached_capability_request(
-                &stale_cache,
-                Some(&active_snapshot),
-                &policy,
-                &request,
-                now,
+            (
+                "future_snapshot",
+                REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED,
+                evaluate_cached_capability_request(
+                    &cache,
+                    Some(&future_snapshot),
+                    &policy,
+                    &request,
+                    now,
+                ),
             ),
-            evaluate_cached_capability_request(
-                &future_cache,
-                Some(&active_snapshot),
-                &policy,
-                &request,
-                now,
+            (
+                "stale_cache",
+                REASON_AUTHORITY_CACHE_STALE,
+                evaluate_cached_capability_request(
+                    &stale_cache,
+                    Some(&active_snapshot),
+                    &policy,
+                    &request,
+                    now,
+                ),
+            ),
+            (
+                "future_cache",
+                REASON_AUTHORITY_CACHE_FUTURE_DATED,
+                evaluate_cached_capability_request(
+                    &future_cache,
+                    Some(&active_snapshot),
+                    &policy,
+                    &request,
+                    now,
+                ),
             ),
         ];
-        for (case, decision) in uncertainty.into_iter().enumerate() {
-            assert_ne!(
+        for (case, expected_reason, decision) in uncertainty {
+            assert_eq!(
                 decision.status,
-                AuthorityDecisionStatus::Allowed,
-                "seed={seed} case=cache_uncertainty_{case} reasons={:?}",
+                AuthorityDecisionStatus::Denied,
+                "seed={seed} case=cache_uncertainty_{case}_status reasons={:?}",
                 decision.reasons
+            );
+            assert_eq!(
+                decision.reasons,
+                vec![expected_reason],
+                "seed={seed} case=cache_uncertainty_{case}_reason"
             );
         }
     }
 }
 
 fn hostile_reason(seed: u64, rng: &mut Seeded) -> String {
+    let sentinel = format!("hostile-sentinel-{seed}");
     match rng.bounded(4) {
-        0 => format!("hostile-secret-{seed}-{}", rng.next()),
-        1 => format!("capability_allowed\r\nforged-{seed}-{}", rng.next()),
-        2 => format!("\u{1b}[31msecret-{seed}-{}\u{7}", rng.next()),
-        _ => format!("oversized-secret-{seed}-{}{}", rng.next(), "x".repeat(300)),
+        0 => format!("{sentinel}-plain-{}", rng.next()),
+        1 => format!("{sentinel}\r\nforged-{}", rng.next()),
+        2 => format!("\u{1b}[31m{sentinel}-ansi-{}\u{7}", rng.next()),
+        _ => format!("{sentinel}-oversized-{}{}", rng.next(), "x".repeat(300)),
     }
 }
 
@@ -1408,12 +1438,76 @@ fn adversarial_property_denials_and_evidence_normalization_are_deterministic_and
             },
         );
         let request = request(subject, operation, scope, now);
-        let first = evaluate_capability_request(std::slice::from_ref(&grant), &request, now);
-        let second = evaluate_capability_request(std::slice::from_ref(&grant), &request, now);
+        let first =
+            evaluate_capability_request_with_evidence(std::slice::from_ref(&grant), &request, now)
+                .unwrap_or_else(|error| {
+                    panic!("seed={seed} case=first_evaluator_evidence error={error:?}")
+                });
+        let second =
+            evaluate_capability_request_with_evidence(std::slice::from_ref(&grant), &request, now)
+                .unwrap_or_else(|error| {
+                    panic!("seed={seed} case=second_evaluator_evidence error={error:?}")
+                });
+        let expected_raw_reasons = vec![
+            "subject_mismatch".to_string(),
+            "grant_not_yet_valid".to_string(),
+            "revoked_grant".to_string(),
+            "operation_not_granted".to_string(),
+        ];
         assert_eq!(
-            (first.status, &first.reasons),
-            (second.status, &second.reasons),
+            first.decision.status,
+            AuthorityDecisionStatus::Denied,
+            "seed={seed} case=evaluator_denied_status reasons={:?}",
+            first.decision.reasons
+        );
+        assert_eq!(
+            first.decision.reasons, expected_raw_reasons,
+            "seed={seed} case=exact_ordered_denial_reasons"
+        );
+        assert_eq!(
+            (first.decision.status, &first.decision.reasons),
+            (second.decision.status, &second.decision.reasons),
             "seed={seed} case=ordered_denial_reasons"
+        );
+        assert_eq!(
+            first.evidence.status,
+            AuthorityDecisionStatus::Denied,
+            "seed={seed} case=evidence_denied_status"
+        );
+        assert_eq!(
+            first.evidence.reason_codes,
+            vec![
+                "authority_grant_revoked",
+                "grant_not_yet_valid",
+                "operation_not_granted",
+                "subject_mismatch",
+            ],
+            "seed={seed} case=evaluator_normalized_reason_codes"
+        );
+        let explanation_categories = first
+            .evidence
+            .explanation
+            .branches
+            .iter()
+            .map(|branch| branch.category)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            explanation_categories,
+            BTreeSet::from([
+                AuthorityExplanationCategory::IdentityValidation,
+                AuthorityExplanationCategory::Scope,
+                AuthorityExplanationCategory::Revocation,
+                AuthorityExplanationCategory::ExpiryTime,
+            ]),
+            "seed={seed} case=evaluator_normalized_reason_classes"
+        );
+        assert_eq!(
+            first.evidence.reason_codes, second.evidence.reason_codes,
+            "seed={seed} case=evaluator_evidence_reason_determinism"
+        );
+        assert_eq!(
+            first.evidence.explanation, second.evidence.explanation,
+            "seed={seed} case=evaluator_evidence_class_determinism"
         );
 
         let mut rng = Seeded::new(seed, 0xe71d_eace);
@@ -1447,5 +1541,20 @@ fn adversarial_property_denials_and_evidence_normalization_are_deterministic_and
             !encoded.contains(&hostile),
             "seed={seed} case=hostile_reason_leak hostile={hostile:?}"
         );
+        let sentinel = format!("hostile-sentinel-{seed}");
+        for (case, fragment) in [
+            ("seed_sentinel", sentinel.as_str()),
+            ("sentinel_prefix", "hostile-sentinel-"),
+            ("escaped_crlf", "\\r\\n"),
+            ("escaped_escape_lower", "\\u001b"),
+            ("escaped_escape_upper", "\\u001B"),
+            ("ansi_sequence", "[31m"),
+            ("escaped_bell", "\\u0007"),
+        ] {
+            assert!(
+                !encoded.contains(fragment),
+                "seed={seed} case=hostile_{case}_leak fragment={fragment:?} encoded={encoded}"
+            );
+        }
     }
 }
