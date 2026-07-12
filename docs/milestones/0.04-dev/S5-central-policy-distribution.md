@@ -85,7 +85,9 @@ New event variants:
 - `PolicyExpired { policy_bundle_id, version, action }`
 - `PolicyRevoked { policy_bundle_id, version, reason }`
 
-`PolicyBundleAccepted` is emitted after a validated bundle is attached to a run.
+`PolicyBundleAccepted` is persisted after validation/monotonic preparation and
+before cache commit. It is required evidence for authority mutation; if a later
+trace or commit step fails, it remains partial non-authorizing evidence.
 `PolicySyncFailed` is emitted when candidate authority is not installed. The
 prior bundle remains installed; a matching trusted revocation may additionally
 tombstone/block it. `PolicyExpired` / `PolicyRevoked` explain fail-closed runtime

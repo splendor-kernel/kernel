@@ -172,11 +172,28 @@ exact bundle content; the audit `version` label is never an ordering key:
 - equal-issued-at different-content candidates deny
   `policy_cache_install_conflict`;
 - an exact retry is idempotent and cannot clear a revocation/expiry tombstone;
-- a strictly newer validated candidate may refresh current authority and clear
-  prior tombstones;
+- an exact retry cannot reconnect a disconnected cache;
+- a strictly newer validated candidate may refresh current authority, clear
+  prior tombstones, and reconnect after required trace evidence is durable;
 - a revoked candidate blocks current authority only when signed bundle identity,
   tenant/agent scope, and non-older issuance match. Older/unrelated revocations
   fail without mutating current authority.
+
+The cache retains the exact trusted revoked candidate as an issuance/content
+watermark. Active refresh must be strictly newer than current authority and that
+watermark. Older revocations cannot replace it; exact revocation retry is
+idempotent; equal-issued-at different revocation content conflicts fail closed.
+
+Each cache has an immutable tenant+agent owner. `ValidatedPolicyBundle` retains
+the validation context tenant/agent, including the receiving agent for a
+tenant-wide bundle. Cross-owner wrappers fail `policy_cache_owner_mismatch`, and
+cross-owner action requests deny `policy_cache_request_owner_mismatch` before
+gateway forwarding.
+
+Active install/reconnect and revocation use prepare/preview/commit. The daemon
+persists required `PolicyBundleAccepted`, reconnect, or revocation events before
+commit. Trace failure leaves prior authority/connectivity unchanged; a partial
+non-authorizing trace is permitted.
 
 `disconnected: true` may be retained before a failed sync because it narrows
 authority. `disconnected: false` takes effect only atomically with an accepted
@@ -193,8 +210,8 @@ reason codes before entering trace or cache snapshots.
 
 | Variant | Canonical event class | Purpose |
 | --- | --- | --- |
-| `PolicyBundleAccepted { bundle }` | `policy.bundle.accepted` | A valid bundle was installed or recorded for a run. |
-| `PolicyBundleRejected { policy_bundle_id?, version?, reason }` | `policy.bundle.rejected` | A supplied bundle failed validation before runtime authority changed. |
+| `PolicyBundleAccepted { bundle }` | `policy.bundle.accepted` | A valid monotonic candidate was accepted for commit. It is persisted before authority mutation; a later trace/commit failure can leave this as partial non-authorizing evidence. |
+| `PolicyBundleRejected { policy_bundle_id?, version?, reason }` | `policy.bundle.rejected` | Candidate was not installed as active authority. A matching trusted revoked candidate may still apply a tombstone after required revocation traces are persisted. |
 | `PolicySyncFailed { policy_bundle_id?, version?, reason }` | `policy.sync.failed` | Candidate authority was not installed. The prior cache remains installed; a matching trusted revocation candidate may additionally tombstone/block that prior cache. |
 | `PolicyExpired { policy_bundle_id, version, action? }` | `policy.expired` | Expired policy denied policy invocation or action execution. |
 | `PolicyRevoked { policy_bundle_id, version, reason }` | `policy.revoked` | Revocation denied policy invocation or action execution. |

@@ -307,6 +307,8 @@ pub struct ValidatedPolicyBundle {
     validated_at: OffsetDateTime,
     signature_algorithm: String,
     signature_key_id: String,
+    validation_tenant_id: TenantId,
+    validation_agent_id: Option<AgentId>,
 }
 
 impl ValidatedPolicyBundle {
@@ -328,6 +330,17 @@ impl ValidatedPolicyBundle {
     /// Returns the trace-safe signing key identity. Signature bytes are omitted.
     pub fn signature_key_id(&self) -> &str {
         &self.signature_key_id
+    }
+
+    /// Returns the tenant context against which this wrapper was validated.
+    pub fn validation_tenant_id(&self) -> &TenantId {
+        &self.validation_tenant_id
+    }
+
+    /// Returns the optional agent context against which this wrapper was
+    /// validated. Tenant-wide bundles still retain the receiving agent context.
+    pub fn validation_agent_id(&self) -> Option<&AgentId> {
+        self.validation_agent_id.as_ref()
     }
 
     /// Consumes the wrapper and returns the validated policy bundle.
@@ -458,6 +471,8 @@ pub fn validate_policy_bundle_candidate(
             validated_at: context.now,
             signature_algorithm: POLICY_BUNDLE_SIGNATURE_ALGORITHM.to_string(),
             signature_key_id: signature.key_id.clone(),
+            validation_tenant_id: context.tenant_id.clone(),
+            validation_agent_id: context.agent_id.clone(),
         },
     })
 }

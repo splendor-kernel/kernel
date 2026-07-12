@@ -16,6 +16,11 @@ Rust contract:
 splendor_kernel::{
     PolicyCache,
     PolicyCacheConfig,
+    PolicyCacheOwner,
+    PolicyCacheInstallPlan,
+    PolicyCacheInstallResult,
+    PolicyCacheRevocationPlan,
+    PolicyCacheRevocationMetadata,
     PolicyCacheSnapshot,
     PolicyCacheValidationMetadata,
     PolicyDistributionGateway,
@@ -30,11 +35,13 @@ splendor_kernel::{
 | Field | Purpose |
 | --- | --- |
 | `enforcement_required` | Whether missing policy authority denies policy invocation/action execution. |
+| `owner` | Immutable tenant+agent cache owner. Validated wrappers and action requests must match it. |
 | `disconnected` | Whether the runtime is explicitly operating without central policy connectivity. |
 | `bundle` | Current validated bundle metadata and authority. |
 | `validation` | Trusted signature algorithm/key-id metadata and validation time from `ValidatedPolicyBundle`, without signature material. |
 | `last_sync_at` | Last successful bundle install/sync time. |
 | `revoked_reason` | Local revocation marker applied to the current bundle. |
+| `revocation` | Exact trusted revoked candidate watermark metadata used to prevent older active/revoked replay. |
 | `last_sync_failure` | Sanitized sync failure reason and timestamp. |
 
 `PolicyCacheSnapshot` exposes trace/API-safe status: bundle version, scope, TTL,
@@ -70,13 +77,15 @@ from arbitrary action names or side-effect classes.
 ## Lifecycle
 
 1. A run is created with a validated policy bundle, or a bundle is synced later.
-2. `PolicyCache::install_validated` consumes only a `ValidatedPolicyBundle` and
-   records `last_sync_at` plus trusted validation metadata. There is no raw
-   bundle/envelope production insertion API.
-3. Central disconnection is marked by `set_disconnected_with_trace(true, time)`.
+2. `PolicyCache::prepare_install` consumes only a `ValidatedPolicyBundle` and
+   computes a non-mutating monotonic plan. Required acceptance/connectivity trace
+   events are persisted from `plan.preview()` before `commit_install(plan)`.
+   There is no raw bundle/envelope production insertion API.
+3. Central disconnection is marked by `mark_disconnected_with_trace(time)`.
 4. The gateway wrapper applies the decision rules before adapters can run.
-5. Reconnect is marked by `set_disconnected_with_trace(false, time)`; a new valid
-   bundle may then update cache status without resetting trace continuity.
+5. Reconnect can be planned only by a first or strictly newer accepted active
+   policy. An exact retry never reconnects. Commit occurs only after the required
+   reconnect trace is durable.
 
 Policy validation occurs before installation. Unsupported, future-issued, and
 expired sync candidates record `PolicyBundleRejected` plus `PolicySyncFailed`
@@ -84,9 +93,27 @@ and leave the last trusted cached bundle unchanged. A matching revoked candidate
 uses the existing revocation path to block the current cached bundle. None of
 these failures installs candidate authority or creates an alternate adapter path.
 Older active candidates, same-issued-at content conflicts, and unrelated/older
-revocation candidates likewise fail before authority mutation. An exact retry
-does not clear tombstones; only a strictly newer trusted install can refresh and
-clear them. Reconnect is emitted only from that accepted install path.
+revocation candidates likewise fail before authority mutation. The exact trusted
+revoked candidate remains as a watermark: older active/revoked candidates cannot
+clear or replace it, exact revocation retry is idempotent, and equal-time
+different revocation content conflicts. Only active authority strictly newer
+than both current authority and that watermark clears it. Reconnect is emitted
+only for an initial/strictly-newer accepted install, never an exact retry.
+
+## Rust migration
+
+| Removed/changed API | Current API |
+| --- | --- |
+| `PolicyCache::new(config)` | `PolicyCache::new(config, PolicyCacheOwner { tenant_id, agent_id })` |
+| `install_validated(...)` or raw bundle/envelope insertion | `prepare_install(ValidatedPolicyBundle, reconnect)` → persist preview events → `commit_install(plan)` |
+| `apply_validated_revocation(...)` or raw revocation marker | `prepare_revocation(ValidatedPolicyBundle)` → persist revocation events → `commit_revocation(plan)` |
+| `set_disconnected_with_trace(true, at)` | `mark_disconnected_with_trace(at)` |
+| `set_disconnected_with_trace(false, at)` | No direct equivalent; only first/strictly-newer prepared install can reconnect after trace persistence. |
+
+Plans are cache-instance/revision bound. A stale plan or a plan prepared by a
+different cache fails closed. A trace append may leave partial non-authorizing
+evidence, but authority/reconnect is not committed unless all required events
+were persisted.
 
 ## Trace behavior
 

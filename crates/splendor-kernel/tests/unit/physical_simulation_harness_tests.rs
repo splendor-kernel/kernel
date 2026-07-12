@@ -68,9 +68,12 @@ struct PhysicalSimulationHarness {
 }
 
 impl PhysicalSimulationHarness {
-    fn new(snapshot: SimulatedSafetySnapshot, policy_cache: Option<Arc<PolicyCache>>) -> Self {
-        let tenant_id = TenantId::new();
-        let agent_id = AgentId::new();
+    fn new(
+        snapshot: SimulatedSafetySnapshot,
+        policy_cache: Option<Arc<PolicyCache>>,
+        identity: Option<(TenantId, AgentId)>,
+    ) -> Self {
+        let (tenant_id, agent_id) = identity.unwrap_or_else(|| (TenantId::new(), AgentId::new()));
         let run_id = RunId::new();
         let adapter = Arc::new(SimulatedRoboticsAdapter::new());
         let mut verified = VerifiedActionGateway::new(Arc::new(AllowPhysicalTenantAccess));
@@ -106,11 +109,15 @@ impl PhysicalSimulationHarness {
     }
 
     fn safe() -> Self {
-        Self::new(safe_snapshot(), None)
+        Self::new(safe_snapshot(), None, None)
     }
 
-    fn with_policy_cache(cache: Arc<PolicyCache>) -> Self {
-        Self::new(safe_snapshot(), Some(cache))
+    fn with_policy_cache(cache: Arc<PolicyCache>, owner: &PolicyCacheOwner) -> Self {
+        Self::new(
+            safe_snapshot(),
+            Some(cache),
+            Some((owner.tenant_id.clone(), owner.agent_id.clone())),
+        )
     }
 
     fn submit_physical_action(
@@ -444,6 +451,7 @@ fn physical_harness_safety_intervention_never_reaches_adapter() {
             ..safe_snapshot()
         },
         None,
+        None,
     );
 
     let denied = harness.submit_physical_action(
@@ -468,18 +476,28 @@ fn physical_harness_safety_intervention_never_reaches_adapter() {
 
 #[test]
 fn physical_harness_offline_interval_syncs_without_duplicates() {
-    let cache = Arc::new(PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: true,
-    }));
-    let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone());
-    cache
-        .install_validated(
+    let owner = PolicyCacheOwner {
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+    };
+    let cache = Arc::new(PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        owner.clone(),
+    ));
+    let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone(), &owner);
+    let plan = cache
+        .prepare_install(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             false,
         )
+        .expect("trusted physical policy prepares");
+    cache
+        .commit_install(plan)
         .expect("trusted physical policy installs");
     let mut scope = TraceSyncScope::new(harness.run_id.to_string());
     scope.node_id = Some("node-sim-drone-01".to_string());
@@ -564,18 +582,28 @@ fn physical_harness_offline_interval_syncs_without_duplicates() {
 
 #[test]
 fn physical_harness_operator_intervention_then_override_request_is_traced() {
-    let cache = Arc::new(PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: true,
-    }));
-    let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone());
-    cache
-        .install_validated(
+    let owner = PolicyCacheOwner {
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+    };
+    let cache = Arc::new(PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        owner.clone(),
+    ));
+    let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone(), &owner);
+    let plan = cache
+        .prepare_install(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             false,
         )
+        .expect("trusted physical policy prepares");
+    cache
+        .commit_install(plan)
         .expect("trusted physical policy installs");
     cache.mark_disconnected();
 
@@ -588,14 +616,17 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
     assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
     assert_eq!(harness.adapter.call_count(), 0);
 
-    cache
-        .install_validated(
+    let plan = cache
+        .prepare_install(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             true,
         )
+        .expect("strict newer trusted policy prepares");
+    cache
+        .commit_install(plan)
         .expect("strict newer trusted policy reconnects");
     let override_request = harness.submit_physical_action(
         "request_operator_override",

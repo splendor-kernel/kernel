@@ -86,6 +86,12 @@ types/functions for local renewal preflight with explicit nonce/current digest,
 renewable policy, and lifetime caps. `AUTH-005c` adds no public schema churn; it
 adds only a local kernel API that consumes an already trusted `RevocationSnapshot`
 and existing run-record authority evidence.
+`AUTH-007d` does change the public Rust cache API and daemon-visible behavior:
+`PolicyCache` construction requires an explicit tenant+agent owner, policy
+mutation uses validated-wrapper-only prepare/preview/commit plans, direct
+reconnect/raw insertion seams are removed, revocation watermarks are retained,
+and stable owner/watermark/concurrent-mutation denials are observable. Daemon
+endpoint/request-response and trace-event wire shapes remain unchanged.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
 G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
@@ -623,6 +629,16 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   Clock rollback denies policy invocation and action verification with
   `policy_clock_rollback`; observed expiry cannot become active after time moves
   backwards;
+- the exact trusted revoked candidate is retained as a watermark. Intermediate
+  active replay and older/equal-conflicting revocations cannot supersede it;
+  only an active candidate strictly newer than current authority and watermark
+  clears it;
+- caches are tenant+agent owner-bound, including validation context for
+  tenant-wide bundles and action-request identity checks;
+- install/reconnect/revocation is planned without mutation, required events are
+  persisted, then the cache-instance/revision-bound plan commits. Trace failure
+  leaves authority/connectivity unchanged; partial non-authorizing trace is
+  permitted;
 - a historical 0.04-shaped `splendor.policy_bundle.v1` payload signed over the
   old one-field degraded-mode serialization decodes with current defaults but
   fails current signature verification with `bad_policy_signature`. This is a
@@ -668,7 +684,7 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
 | Property evidence is bounded and reproducible | Local `AUTH-007a` uses deterministic IDs, fixed timestamps, explicit seeded generation, real local grant validation/evaluation/delegation/revocation paths, and seed/case-labelled failures. It does not substitute for fuzz, gold, mutation, cross-version, or distributed confused-deputy evidence. |
 | Serialized mutation evidence is bounded and trusted-path checked | Local `AUTH-007b` serializes canonical positive fixtures, round-trips every baseline fixture, asserts every mutation differs from its serialized baseline, and requires serde rejection or denial by existing validation/issuance/evaluation. Receipt semantic mutations are recomputed with the test-only trusted fixture key before exact denial checks; forged-signature mutations remain separate. It never constructs unchecked trusted wrappers, mocks signatures/audience/expiry/revocation, or treats deserialization as authority. |
 | Parent grant replay is run-bound | Local `AUTH-007c` requires an explicit exact trusted root-run/validated-grant binding, including private trust state. Grant IDs are unique across root/child bindings within one manager; unbound, exact-content-mismatched, or child-ID-colliding creation denies before request/routing/start/child/fan-out effects with stable reasons. This is not cross-instance binding or durable binding-event evidence. |
-| Version/cache uncertainty fails closed | Local `AUTH-007d` accepts only exact current-v1 authorizing families, rejects v0/v2 and unknown closed enums, rejects future-issued signed policies before install, installs only `ValidatedPolicyBundle`, enforces monotonic signed issuance/content, keeps revocation and expiry tombstones monotonic, gates reconnect on accepted install, rejects runtime clock rollback, and preserves or blocks the last trusted daemon cache according to scoped revocation semantics. Historical same-label signatures are not called compatible when current normalization changes signed bytes. |
+| Version/cache uncertainty fails closed | Local `AUTH-007d` accepts only exact current-v1 authorizing families, rejects v0/v2 and unknown closed enums, rejects future-issued signed policies before install, installs only owner-bound `ValidatedPolicyBundle`, enforces current-authority plus exact revocation-watermark monotonicity, denies exact-retry reconnect, persists required trace before cache broadening, rejects runtime clock rollback, and preserves or blocks the last trusted daemon cache according to scoped revocation semantics. Historical same-label signatures are not called compatible when current normalization changes signed bytes. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects

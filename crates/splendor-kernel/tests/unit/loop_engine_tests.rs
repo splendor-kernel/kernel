@@ -1550,11 +1550,20 @@ fn loop_engine_rejects_policy_before_policy_invoked_when_bundle_expired() {
         &keyring,
     )
     .expect("policy was valid before expiry");
-    let cache = crate::PolicyCache::new(crate::PolicyCacheConfig {
-        enforcement_required: true,
-    });
+    let cache = crate::PolicyCache::new(
+        crate::PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        crate::PolicyCacheOwner {
+            tenant_id: agent.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        },
+    );
+    let plan = cache
+        .prepare_install(validated, false)
+        .expect("trusted loop policy prepares");
     cache
-        .install_validated(validated, false)
+        .commit_install(plan)
         .expect("trusted loop policy installs");
     let mut engine = LoopEngine::with_runtime(
         agent,

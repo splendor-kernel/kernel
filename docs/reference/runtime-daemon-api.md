@@ -145,6 +145,12 @@ errors now also include monotonic cache reasons such as
 `policy_cache_install_rollback`, `policy_cache_install_conflict`, and scoped
 revocation mismatch reasons. A failed candidate cannot reconnect a disconnected
 cache.
+Run caches are bound to the run tenant+agent. Exact active retry cannot
+reconnect, and active refresh must advance both current authority and any trusted
+revocation watermark. The daemon prepares cache mutation, persists required
+acceptance/connectivity/revocation events, then commits. Trace failure leaves
+prior authority/connectivity unchanged; a partial non-authorizing trace may
+remain.
 
 ## Run lifecycle
 

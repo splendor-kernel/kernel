@@ -10,6 +10,7 @@ use splendor_daemon::{
     StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
     TraceExportResponse, TracePageResponse,
 };
+use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
     AuditAttribution, CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
@@ -19,8 +20,71 @@ use splendor_types::{
     TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
     APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use tower::ServiceExt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyTraceFailureTarget {
+    Accepted,
+    Reconnected,
+}
+
+#[derive(Default)]
+struct FailingPolicyTraceStore {
+    inner: InMemoryTraceStore,
+    fail_next: Mutex<Option<PolicyTraceFailureTarget>>,
+}
+
+impl FailingPolicyTraceStore {
+    fn arm(&self, target: PolicyTraceFailureTarget) {
+        *self.fail_next.lock().expect("trace failure lock") = Some(target);
+    }
+}
+
+impl TraceStore for FailingPolicyTraceStore {
+    fn append(&self, run_id: &str, payload: Value) -> Result<u64, TraceStoreError> {
+        let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok();
+        let target = *self
+            .fail_next
+            .lock()
+            .map_err(|_| TraceStoreError::Poisoned)?;
+        let should_fail = matches!(
+            (target, event.as_ref().map(|event| &event.kind)),
+            (
+                Some(PolicyTraceFailureTarget::Accepted),
+                Some(TraceEventKind::PolicyBundleAccepted { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::Reconnected),
+                Some(TraceEventKind::PolicyConnectivityChanged {
+                    disconnected: false,
+                    ..
+                })
+            )
+        );
+        if should_fail {
+            *self
+                .fail_next
+                .lock()
+                .map_err(|_| TraceStoreError::Poisoned)? = None;
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read(run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read_range(run_id, start, end)
+    }
+}
 
 fn principal() -> ClientPrincipal {
     ClientPrincipal::new("app_test", "client_test")
@@ -288,6 +352,50 @@ async fn call_empty<T: DeserializeOwned>(
         )
     });
     (status, parsed)
+}
+
+async fn submit_allowed_action(
+    app: axum::Router,
+    run_id: RunId,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+) -> splendor_gateway::ActionOutcome {
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{run_id}/traces?redaction_policy=none"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces
+        .records
+        .first()
+        .and_then(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .map(|event| event.trace_event_id)
+        .expect("run trace identity");
+    let submit = SubmitActionRequest {
+        action_id: None,
+        run_id,
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(attribution()),
+        causal_trace_id: Some(causal_trace_id),
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+    };
+    let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app,
+        Method::POST,
+        "/actions",
+        serde_json::to_value(submit).expect("submit action request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    outcome
 }
 
 async fn call_empty_with_credential<T: DeserializeOwned>(
@@ -2050,6 +2158,355 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
             "scenario={scenario} adapter must remain uncalled"
         );
     }
+}
+
+#[tokio::test]
+async fn policy_sync_revocation_watermark_and_exact_retry_reconnect_attacks_fail_closed() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let now = OffsetDateTime::now_utc();
+    let t10 = now - time::Duration::minutes(30);
+    let t15 = now - time::Duration::minutes(20);
+    let t19 = now - time::Duration::minutes(11);
+    let t20 = now - time::Duration::minutes(10);
+    let t21 = now - time::Duration::minutes(5);
+    let expires_at = now + time::Duration::hours(1);
+    let active_t10 = signed_policy_bundle_with_window(
+        "pol_watermark",
+        "active-t10",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        t10,
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let mut create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "allowed_action".to_string(),
+            adapter: "daemon.local".to_string(),
+        }],
+    );
+    create.policy_bundle_required = true;
+    create.policy_bundle = Some(active_t10.clone());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let disconnect = PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: None,
+        sync_error: Some("central_unavailable".to_string()),
+        disconnected: Some(true),
+    };
+    let (status, disconnected): (StatusCode, PolicySyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(disconnect).expect("disconnect request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(disconnected.cache_status.disconnected);
+
+    let exact_retry = PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: Some(active_t10.clone()),
+        sync_error: None,
+        disconnected: Some(false),
+    };
+    let (status, exact): (StatusCode, PolicySyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(exact_retry).expect("exact retry"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(exact.cache_status.disconnected);
+    let denied = submit_allowed_action(
+        app.clone(),
+        created.run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+    )
+    .await;
+    assert_eq!(denied.status, splendor_gateway::ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["offline_action_not_allowed"]
+    );
+
+    let revoked_t20 = signed_policy_bundle_with_window(
+        "pol_watermark",
+        "revoked-t20",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        t20,
+        expires_at,
+        RevocationStatus::Revoked {
+            reason: "revoked_at_t20".to_string(),
+        },
+    );
+    let revocation_sync = |policy_bundle| PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: Some(policy_bundle),
+        sync_error: None,
+        disconnected: Some(false),
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(revocation_sync(revoked_t20.clone())).expect("T20 revocation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "revoked_policy_bundle");
+
+    let active_t15 = signed_policy_bundle_with_window(
+        "pol_watermark",
+        "active-t15",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        t15,
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(revocation_sync(active_t15)).expect("T15 replay"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "policy_cache_revocation_watermark");
+
+    let older_revocation = signed_policy_bundle_with_window(
+        "pol_watermark",
+        "revoked-t19",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        t19,
+        expires_at,
+        RevocationStatus::Revoked {
+            reason: "revoked_at_t19".to_string(),
+        },
+    );
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(revocation_sync(older_revocation)).expect("older revocation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "policy_cache_revocation_rollback");
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(revocation_sync(revoked_t20)).expect("exact revocation retry"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "revoked_policy_bundle");
+
+    let denied = submit_allowed_action(
+        app.clone(),
+        created.run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+    )
+    .await;
+    assert_eq!(denied.status, splendor_gateway::ActionStatus::Denied);
+    assert_eq!(denied.verification.reasons, vec!["policy_revoked"]);
+
+    let inspected_before_refresh: RunInspectResponse = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await
+    .1;
+    assert_eq!(inspected_before_refresh.adapter_executions, 0);
+    assert_eq!(
+        inspected_before_refresh
+            .policy_bundle
+            .expect("T10 authority remains")
+            .version,
+        "active-t10"
+    );
+
+    let active_t21 = signed_policy_bundle_with_window(
+        "pol_watermark",
+        "active-t21",
+        tenant_id,
+        Some(agent_id),
+        t21,
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let (status, refreshed): (StatusCode, PolicySyncResponse) = call_json(
+        app,
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(revocation_sync(active_t21)).expect("T21 refresh"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(refreshed.accepted);
+    assert!(!refreshed.cache_status.disconnected);
+    assert_eq!(
+        refreshed.policy_bundle.expect("T21 authority").version,
+        "active-t21"
+    );
+}
+
+#[tokio::test]
+async fn policy_sync_trace_failures_do_not_commit_authority_or_reconnect() {
+    let trace_store = Arc::new(FailingPolicyTraceStore::default());
+    let app = router(DaemonState::with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+    ));
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+    let active_t10 = signed_policy_bundle_with_window(
+        "pol_trace_atomic",
+        "active-t10",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        now - time::Duration::minutes(30),
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let mut create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "allowed_action".to_string(),
+            adapter: "daemon.local".to_string(),
+        }],
+    );
+    create.policy_bundle_required = true;
+    create.policy_bundle = Some(active_t10);
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    trace_store.arm(PolicyTraceFailureTarget::Accepted);
+    let active_t20 = signed_policy_bundle_with_window(
+        "pol_trace_atomic",
+        "active-t20",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        now - time::Duration::minutes(10),
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let sync = |bundle, disconnected| PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: Some(bundle),
+        sync_error: None,
+        disconnected,
+    };
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(sync(active_t20, None)).expect("T20 sync"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.code, "trace_error");
+    let inspected: RunInspectResponse = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await
+    .1;
+    assert_eq!(
+        inspected.policy_bundle.expect("prior authority").version,
+        "active-t10"
+    );
+
+    let disconnect = PolicySyncRequest {
+        credential: None,
+        audit_attribution: Some(attribution()),
+        policy_bundle: None,
+        sync_error: Some("central_unavailable".to_string()),
+        disconnected: Some(true),
+    };
+    let (status, disconnected): (StatusCode, PolicySyncResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(disconnect).expect("disconnect request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(disconnected.cache_status.disconnected);
+
+    trace_store.arm(PolicyTraceFailureTarget::Reconnected);
+    let active_t21 = signed_policy_bundle_with_window(
+        "pol_trace_atomic",
+        "active-t21",
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        now - time::Duration::minutes(5),
+        expires_at,
+        RevocationStatus::Active,
+    );
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/policies/sync", created.run_id),
+        serde_json::to_value(sync(active_t21, Some(false))).expect("reconnect sync"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.code, "trace_error");
+
+    let denied =
+        submit_allowed_action(app.clone(), created.run_id.clone(), tenant_id, agent_id).await;
+    assert_eq!(denied.status, splendor_gateway::ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["offline_action_not_allowed"]
+    );
+    let inspected: RunInspectResponse =
+        call_empty(app, Method::GET, &format!("/runs/{}", created.run_id))
+            .await
+            .1;
+    assert_eq!(inspected.adapter_executions, 0);
+    assert_eq!(
+        inspected.policy_bundle.expect("prior authority").version,
+        "active-t10"
+    );
 }
 
 #[tokio::test]
