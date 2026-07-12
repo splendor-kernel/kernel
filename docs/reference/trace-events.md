@@ -385,7 +385,7 @@ classes:
 | --- | --- | --- |
 | `PolicyBundleAccepted` | `policy.bundle.accepted` | A signed policy bundle validated and became run-local authority metadata. |
 | `PolicyBundleRejected` | `policy.bundle.rejected` | A supplied policy bundle failed validation before authority changed. |
-| `PolicySyncFailed` | `policy.sync.failed` | Central policy sync failed and cached authority was preserved. |
+| `PolicySyncFailed` | `policy.sync.failed` | Candidate authority was not installed and the prior bundle remains installed; a matching trusted revocation may additionally tombstone/block it. |
 | `PolicyExpired` | `policy.expired` | TTL checks denied policy invocation or action forwarding. |
 | `PolicyRevoked` | `policy.revoked` | Revocation denied policy invocation or action forwarding. |
 

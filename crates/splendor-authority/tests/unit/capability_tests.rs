@@ -176,8 +176,14 @@ fn trusted_v1_exact_family_version_matrix_rejects_v0_and_v2() {
             error.reason_code(),
             "invalid_schema:capability_grant.schema_version"
         );
-        let cache = AuthorityGrantCache::new();
-        assert!(cache.is_empty(), "unsupported raw grant never enters cache");
+        assert!(matches!(
+            error,
+            AuthorityEvaluationError::InvalidSchema {
+                field: "capability_grant.schema_version",
+                expected: CAPABILITY_GRANT_SCHEMA_VERSION,
+                ref actual,
+            } if actual.ends_with(suffix)
+        ));
 
         let mut unsupported_record = active_record.clone();
         unsupported_record.schema_version =

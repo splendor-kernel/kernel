@@ -140,6 +140,11 @@ When `CreateRunRequest.policy_bundle_required` is true, the daemon also requires
 a signed policy bundle and rejects invalid, future-issued, expired, revoked,
 malformed, or incompatible bundles before policy invocation or adapter execution
 can occur.
+The endpoint and request/response shapes are unchanged, but daemon-visible policy
+errors now also include monotonic cache reasons such as
+`policy_cache_install_rollback`, `policy_cache_install_conflict`, and scoped
+revocation mismatch reasons. A failed candidate cannot reconnect a disconnected
+cache.
 
 ## Run lifecycle
 
@@ -256,8 +261,9 @@ PolicyRevoked
 ```
 
 Policy sync emits daemon audit attribution for `splendor.policies.sync`. A sync
-failure records `PolicySyncFailed` and leaves the current cached authority
-unchanged.
+failure records `PolicySyncFailed`; the prior cached bundle remains installed.
+A matching trusted revocation candidate may additionally tombstone and block
+that prior bundle, while unrelated or older revocations cannot mutate it.
 
 Action submissions through `/actions` emit normal action trace events:
 

@@ -32,7 +32,7 @@ splendor_kernel::{
 | `enforcement_required` | Whether missing policy authority denies policy invocation/action execution. |
 | `disconnected` | Whether the runtime is explicitly operating without central policy connectivity. |
 | `bundle` | Current validated bundle metadata and authority. |
-| `validation` | Signature algorithm/key-id metadata and validation time without signature material. |
+| `validation` | Trusted signature algorithm/key-id metadata and validation time from `ValidatedPolicyBundle`, without signature material. |
 | `last_sync_at` | Last successful bundle install/sync time. |
 | `revoked_reason` | Local revocation marker applied to the current bundle. |
 | `last_sync_failure` | Sanitized sync failure reason and timestamp. |
@@ -62,6 +62,7 @@ and sync failure state. It does not expose detached signatures or secrets.
 | Disconnected, within TTL | Any other action | Deny `offline_action_not_allowed`; adapter not called. |
 | Disconnected, expired bundle | Any action, including explicit low-risk read-only | Deny `policy_expired`; adapter not called. |
 | Missing or revoked bundle | Any action/policy invocation | Fail closed. |
+| Runtime time before trusted validation/maximum observed time | Any action/policy invocation | Deny `policy_clock_rollback`; adapter not called. |
 
 This makes low-risk cached behavior explicit and avoids inferring broad authority
 from arbitrary action names or side-effect classes.
@@ -69,8 +70,9 @@ from arbitrary action names or side-effect classes.
 ## Lifecycle
 
 1. A run is created with a validated policy bundle, or a bundle is synced later.
-2. `PolicyCache::install_validated` or `install_validated_envelope` installs the
-   bundle and records `last_sync_at` plus validation metadata.
+2. `PolicyCache::install_validated` consumes only a `ValidatedPolicyBundle` and
+   records `last_sync_at` plus trusted validation metadata. There is no raw
+   bundle/envelope production insertion API.
 3. Central disconnection is marked by `set_disconnected_with_trace(true, time)`.
 4. The gateway wrapper applies the decision rules before adapters can run.
 5. Reconnect is marked by `set_disconnected_with_trace(false, time)`; a new valid
@@ -81,6 +83,10 @@ expired sync candidates record `PolicyBundleRejected` plus `PolicySyncFailed`
 and leave the last trusted cached bundle unchanged. A matching revoked candidate
 uses the existing revocation path to block the current cached bundle. None of
 these failures installs candidate authority or creates an alternate adapter path.
+Older active candidates, same-issued-at content conflicts, and unrelated/older
+revocation candidates likewise fail before authority mutation. An exact retry
+does not clear tombstones; only a strictly newer trusted install can refresh and
+clear them. Reconnect is emitted only from that accepted install path.
 
 ## Trace behavior
 
@@ -112,6 +118,7 @@ refresh bundles, invoke policy code, or execute adapters.
 | Bundle revoked | Deny with `policy_revoked`. |
 | Signed bundle issued after the receiver clock | Reject with `future_issued_policy_bundle` before cache installation. |
 | Central sync failed | Record failure and keep previous authority. |
+| Clock moved behind trusted validation/observation time | Deny `policy_clock_rollback`; latched expiry cannot reactivate. |
 
 ## Security notes
 

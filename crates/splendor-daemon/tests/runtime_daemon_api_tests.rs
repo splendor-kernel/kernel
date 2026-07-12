@@ -1769,7 +1769,15 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
 
 #[tokio::test]
 async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed() {
-    for scenario in ["unsupported", "future", "expired", "revoked"] {
+    for scenario in [
+        "unsupported",
+        "future",
+        "expired",
+        "bad_signature",
+        "rollback",
+        "unrelated_revoked",
+        "revoked",
+    ] {
         let app = router(DaemonState::local_dev());
         let tenant_id = TenantId::parse("10000000-0000-4000-8000-000000000001").expect("tenant id");
         let agent_id = AgentId::parse("20000000-0000-4000-8000-000000000002").expect("agent id");
@@ -1795,6 +1803,26 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
         .await;
         assert_eq!(status, StatusCode::OK, "scenario={scenario}");
 
+        let disconnect = PolicySyncRequest {
+            credential: None,
+            audit_attribution: Some(attribution()),
+            policy_bundle: None,
+            sync_error: Some("central_unavailable".to_string()),
+            disconnected: Some(true),
+        };
+        let (status, disconnected): (StatusCode, PolicySyncResponse) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/policies/sync", created.run_id),
+            serde_json::to_value(disconnect).expect("disconnect request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+        assert!(
+            disconnected.cache_status.disconnected,
+            "scenario={scenario}"
+        );
+
         let (issued_at, expires_at, revocation) = match scenario {
             "future" => (
                 now + time::Duration::hours(1),
@@ -1812,6 +1840,23 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
                 RevocationStatus::Revoked {
                     reason: "central_revocation".to_string(),
                 },
+            ),
+            "unrelated_revoked" => (
+                now - time::Duration::minutes(1),
+                now + time::Duration::hours(2),
+                RevocationStatus::Revoked {
+                    reason: "unrelated_revocation".to_string(),
+                },
+            ),
+            "rollback" => (
+                now - time::Duration::minutes(10),
+                now + time::Duration::hours(2),
+                RevocationStatus::Active,
+            ),
+            "bad_signature" => (
+                now - time::Duration::minutes(1),
+                now + time::Duration::hours(2),
+                RevocationStatus::Active,
             ),
             "unsupported" => (
                 now - time::Duration::minutes(5),
@@ -1836,15 +1881,24 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
         );
         if scenario == "unsupported" {
             candidate.bundle.schema_version = "splendor.policy_bundle.v2".to_string();
+        } else if scenario == "bad_signature" {
+            candidate
+                .signature
+                .as_mut()
+                .expect("candidate signature")
+                .signature = "bad".to_string();
         }
         let expected_reason = match scenario {
             "unsupported" => "malformed_policy_bundle",
             "future" => "future_issued_policy_bundle",
             "expired" => "expired_policy_bundle",
+            "bad_signature" => "bad_policy_signature",
+            "rollback" => "policy_cache_install_rollback",
+            "unrelated_revoked" => "policy_cache_revocation_unrelated",
             "revoked" => "revoked_policy_bundle",
             _ => unreachable!("bounded policy sync scenario"),
         };
-        let expected_status = if scenario == "unsupported" {
+        let expected_status = if scenario == "unsupported" || scenario == "bad_signature" {
             StatusCode::BAD_REQUEST
         } else {
             StatusCode::FORBIDDEN
@@ -1854,7 +1908,7 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
             audit_attribution: Some(attribution()),
             policy_bundle: Some(candidate),
             sync_error: None,
-            disconnected: (scenario != "revoked").then_some(true),
+            disconnected: Some(false),
         };
         let (status, error): (StatusCode, ApiErrorBody) = call_json(
             app.clone(),
@@ -1923,6 +1977,16 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
                     && reason == expected_reason
             )),
             "scenario={scenario} missing policy.sync.failed"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                &event.kind,
+                TraceEventKind::PolicyConnectivityChanged {
+                    disconnected: false,
+                    ..
+                }
+            )),
+            "scenario={scenario} failed candidate must not reconnect"
         );
         if scenario == "revoked" {
             assert!(events.iter().any(|event| matches!(

@@ -12,6 +12,11 @@
   clock now fail closed with `future_issued_policy_bundle` before installation;
   equality remains valid. Historical 0.04-shaped v1 signatures are characterized
   as `bad_policy_signature` under current normalization, not claimed compatible.
+- Hardened policy cache mutation so production callers must supply a trusted
+  `ValidatedPolicyBundle`; signed issuance/content is monotonic, exact retries do
+  not clear tombstones, only strictly newer authority refreshes, revoked
+  candidates are identity/scope/age-bound, reconnect requires accepted install,
+  and clock rollback or latched expiry cannot reactivate policy authority.
 - Bound local delegating root runs to one exact trusted validated capability
   grant, including private trust state, within one manager. Cross-run/shared-
   principal and same-ID/different-content replay now fail before message routing

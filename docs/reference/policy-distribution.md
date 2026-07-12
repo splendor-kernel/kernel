@@ -163,6 +163,26 @@ The endpoint can:
 - mark the local run cache as disconnected or reconnected;
 - apply a revocation marker when a revoked bundle is received.
 
+Installation accepts only `ValidatedPolicyBundle`, which carries trusted
+`validated_at`, signature algorithm, and key ID metadata but no signature bytes
+or secret material. Cache mutation is monotonic using signed `issued_at` plus
+exact bundle content; the audit `version` label is never an ordering key:
+
+- older candidates deny `policy_cache_install_rollback`;
+- equal-issued-at different-content candidates deny
+  `policy_cache_install_conflict`;
+- an exact retry is idempotent and cannot clear a revocation/expiry tombstone;
+- a strictly newer validated candidate may refresh current authority and clear
+  prior tombstones;
+- a revoked candidate blocks current authority only when signed bundle identity,
+  tenant/agent scope, and non-older issuance match. Older/unrelated revocations
+  fail without mutating current authority.
+
+`disconnected: true` may be retained before a failed sync because it narrows
+authority. `disconnected: false` takes effect only atomically with an accepted
+trusted monotonic install. Invalid, future, expired, bad-signature, revoked,
+rollback, or conflict candidates cannot reconnect the cache.
+
 Sync failures are visible in the run trace and cache status, but they never
 broaden authority. Free-form upstream error strings are reduced to sanitized
 reason codes before entering trace or cache snapshots.
@@ -175,7 +195,7 @@ reason codes before entering trace or cache snapshots.
 | --- | --- | --- |
 | `PolicyBundleAccepted { bundle }` | `policy.bundle.accepted` | A valid bundle was installed or recorded for a run. |
 | `PolicyBundleRejected { policy_bundle_id?, version?, reason }` | `policy.bundle.rejected` | A supplied bundle failed validation before runtime authority changed. |
-| `PolicySyncFailed { policy_bundle_id?, version?, reason }` | `policy.sync.failed` | Central sync failed and cached authority was left unchanged. |
+| `PolicySyncFailed { policy_bundle_id?, version?, reason }` | `policy.sync.failed` | Candidate authority was not installed. The prior cache remains installed; a matching trusted revocation candidate may additionally tombstone/block that prior cache. |
 | `PolicyExpired { policy_bundle_id, version, action? }` | `policy.expired` | Expired policy denied policy invocation or action execution. |
 | `PolicyRevoked { policy_bundle_id, version, reason }` | `policy.revoked` | Revocation denied policy invocation or action execution. |
 
@@ -204,7 +224,9 @@ This preserves the invariant that no side effect bypasses the action gateway.
 | Expired bundle at installation | Reject bundle with `expired_policy_bundle`. |
 | Expired cached bundle at runtime | Deny policy invocation and actions; no action is forwarded to adapters from an expired bundle. |
 | Revoked bundle | Reject installation or deny future policy/action authority with `policy_revoked`. |
-| Sync failure | Record `PolicySyncFailed`; keep prior cached authority unchanged. |
+| Sync failure | Record `PolicySyncFailed`; prior cached bundle remains installed. A matching trusted revocation candidate may additionally tombstone/block it. |
+| Signed rollback or equal-time conflict | Reject before mutation with `policy_cache_install_rollback` or `policy_cache_install_conflict`. |
+| Runtime clock rollback | Deny policy invocation/actions with `policy_clock_rollback`; once expiry is observed it remains latched until a strictly newer trusted refresh. |
 
 ## Replay behavior
 

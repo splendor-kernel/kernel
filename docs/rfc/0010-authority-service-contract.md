@@ -68,8 +68,9 @@ unsupported/future/expired candidates, apply the existing revocation block for a
 revoked candidate, record rejection/sync-failure traces, and keep blocked action
 attempts at zero adapter calls.
 
-This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
-Python, fleet behavior, node admission, workload-controller wiring, approval
+This slice does not change daemon endpoint or request/response shapes, OpenAPI,
+TypeScript client workflows, Python, fleet behavior, node admission,
+workload-controller wiring, approval
 workflow execution, MFA/provider integration, gate-engine migration, obligation
 receipt storage, production PKI, external revocation introspection, production
 lease renewal, revocation watches, incident-controller integration, or introduce
@@ -603,6 +604,25 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   events, preserves the last trusted cache for unsupported/future/expired
   candidates, and applies the existing current-cache revocation block for the
   matching revoked candidate. Blocked action attempts execute no adapter;
+- correction hardening makes policy installation consume only
+  `ValidatedPolicyBundle` with trusted validation time, signature algorithm, and
+  key ID metadata; raw bundle/envelope cache insertion APIs are removed;
+- signed installation is monotonic by `issued_at` and exact signed bundle
+  content, never by the free-form audit `version`: older candidates deny with
+  `policy_cache_install_rollback`, equal-time different-content candidates deny
+  with `policy_cache_install_conflict`, and exact retries are idempotent without
+  clearing revocation or expiry tombstones. A strictly newer validated candidate
+  may explicitly refresh authority and clear those tombstones;
+- a signed revoked candidate blocks current authority only when bundle identity,
+  tenant/agent scope, and non-older issuance match. Older or unrelated revocations
+  produce stable sync failures and cannot mutate current authority;
+- disconnection may be recorded before a failed sync, but reconnect is atomic
+  with an accepted trusted monotonic install. Validation, revocation, rollback,
+  or signature failure cannot reconnect the cache;
+- runtime observation tracks trusted validation/maximum time and latches expiry.
+  Clock rollback denies policy invocation and action verification with
+  `policy_clock_rollback`; observed expiry cannot become active after time moves
+  backwards;
 - a historical 0.04-shaped `splendor.policy_bundle.v1` payload signed over the
   old one-field degraded-mode serialization decodes with current defaults but
   fails current signature verification with `bad_policy_signature`. This is a
@@ -648,7 +668,7 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
 | Property evidence is bounded and reproducible | Local `AUTH-007a` uses deterministic IDs, fixed timestamps, explicit seeded generation, real local grant validation/evaluation/delegation/revocation paths, and seed/case-labelled failures. It does not substitute for fuzz, gold, mutation, cross-version, or distributed confused-deputy evidence. |
 | Serialized mutation evidence is bounded and trusted-path checked | Local `AUTH-007b` serializes canonical positive fixtures, round-trips every baseline fixture, asserts every mutation differs from its serialized baseline, and requires serde rejection or denial by existing validation/issuance/evaluation. Receipt semantic mutations are recomputed with the test-only trusted fixture key before exact denial checks; forged-signature mutations remain separate. It never constructs unchecked trusted wrappers, mocks signatures/audience/expiry/revocation, or treats deserialization as authority. |
 | Parent grant replay is run-bound | Local `AUTH-007c` requires an explicit exact trusted root-run/validated-grant binding, including private trust state. Grant IDs are unique across root/child bindings within one manager; unbound, exact-content-mismatched, or child-ID-colliding creation denies before request/routing/start/child/fan-out effects with stable reasons. This is not cross-instance binding or durable binding-event evidence. |
-| Version/cache uncertainty fails closed | Local `AUTH-007d` accepts only exact current-v1 authorizing families, rejects v0/v2 and unknown closed enums, rejects future-issued signed policies before install, caches only trusted validated grants, and preserves or blocks the last trusted daemon cache according to existing sync/revocation semantics. Historical same-label signatures are not called compatible when current normalization changes signed bytes. |
+| Version/cache uncertainty fails closed | Local `AUTH-007d` accepts only exact current-v1 authorizing families, rejects v0/v2 and unknown closed enums, rejects future-issued signed policies before install, installs only `ValidatedPolicyBundle`, enforces monotonic signed issuance/content, keeps revocation and expiry tombstones monotonic, gates reconnect on accepted install, rejects runtime clock rollback, and preserves or blocks the last trusted daemon cache according to scoped revocation semantics. Historical same-label signatures are not called compatible when current normalization changes signed bytes. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -696,9 +716,10 @@ multi-scope compatibility profile, and replay rejection records, but no
 serialized schema, new event kind, gateway, adapter, or remote authority
 semantic. Its denials reuse `DelegationRejected`, and replay remains inspect-only.
 The matrix does not execute gateway or adapter side effects.
-The `AUTH-007d` production change is limited to future-issued policy validation;
-daemon tests exercise existing rejection/sync-failure/revocation traces and
-gateway denial semantics without adding an event or cache schema.
+The `AUTH-007d` production correction changes policy validation/cache mutation
+semantics and daemon-visible reason behavior without changing endpoint,
+request/response, event, or wire schema shapes. Daemon tests exercise existing
+rejection/sync-failure/revocation traces and gateway denial semantics.
 Future durable evidence-store and trace-schema work must persist authority
 decisions, cache freshness, revocation-snapshot identity,
 renewal nonce/current-revision evidence, child cancellation evidence, and

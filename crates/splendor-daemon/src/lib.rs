@@ -22,25 +22,26 @@ use splendor_gateway::{
 };
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
-    LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyDecision,
-    PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler, SchedulerConfig,
-    SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
-    TraceEventKind,
+    LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyCacheInstallError,
+    PolicyDecision, PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler,
+    SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
+    TenantRegistry, TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateNodeId, StateStore, TraceRecord,
     TraceStore, TraceStoreError,
 };
 use splendor_types::{
-    is_allowed_physical_action, validate_policy_bundle, AppPrincipal, ApprovalEvidence,
-    ApprovalPolicy, ApprovalTraceContext, AuditAttribution, CallerCredential, CircuitBreaker,
-    ClientPrincipal, CredentialAudience, CredentialBinding, DaemonEndpoint, DaemonSecurityDecision,
-    DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
-    InsecureDevMode, LocalTransportBinding, NodeId, PerceptProvenance, PolicyBundleEnvelope,
-    PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
-    PolicyBundleValidationError, RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId,
-    WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
-    WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    is_allowed_physical_action, validate_policy_bundle, validate_policy_bundle_candidate,
+    AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext, AuditAttribution,
+    CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience, CredentialBinding,
+    DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError, DaemonSecurityRequest,
+    EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding, NodeId,
+    PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
+    PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
+    TraceEvent, TraceEventId, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope,
+    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
+    FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -1684,10 +1685,10 @@ async fn create_run(
                 &state.inner.policy_bundle_keyring,
             )
             .map_err(policy_bundle_error)?;
-            Some(
-                policy_cache
-                    .install_validated(validated.into_policy_bundle(), OffsetDateTime::now_utc()),
-            )
+            let installed = policy_cache
+                .install_validated(validated, false)
+                .map_err(policy_cache_install_error)?;
+            Some(installed.bundle)
         }
         None => None,
     };
@@ -2084,11 +2085,9 @@ async fn sync_policy(
     record_daemon_audit(slot, "splendor.policies.sync", security.audit_attribution)?;
 
     let now = OffsetDateTime::now_utc();
-    if let Some(disconnected) = request.disconnected {
-        if let Some(event) = slot
-            .policy_cache
-            .set_disconnected_with_trace(disconnected, now)
-        {
+    let reconnect_requested = request.disconnected == Some(false);
+    if request.disconnected == Some(true) {
+        if let Some(event) = slot.policy_cache.mark_disconnected_with_trace(now) {
             record_run_event(slot, event)?;
         }
     }
@@ -2127,7 +2126,7 @@ async fn sync_policy(
     })?;
     let policy_bundle_id = Some(envelope.bundle.policy_bundle_id.clone());
     let version = Some(envelope.bundle.version.clone());
-    let validation = validate_policy_bundle(
+    let validation = validate_policy_bundle_candidate(
         &envelope,
         &PolicyBundleValidationContext {
             tenant_id: slot.tenant_id.clone(),
@@ -2138,59 +2137,111 @@ async fn sync_policy(
     );
 
     match validation {
-        Ok(validated) => {
-            let trace_context = slot
-                .policy_cache
-                .install_validated(validated.into_policy_bundle(), now);
-            record_run_event(
-                slot,
-                TraceEventKind::PolicyBundleAccepted {
-                    bundle: trace_context.clone(),
-                },
-            )?;
-            slot.updated_at = OffsetDateTime::now_utc();
-            Ok(Json(PolicySyncResponse {
-                run_id,
-                accepted: true,
-                policy_bundle: Some(trace_context),
-                cache_status: policy_cache_response(&slot.policy_cache),
-            }))
-        }
-        Err(error) => {
-            let reason = error.reason_code().to_string();
-            record_run_event(
-                slot,
-                TraceEventKind::PolicyBundleRejected {
-                    policy_bundle_id: policy_bundle_id.clone(),
-                    version: version.clone(),
-                    reason: reason.clone(),
-                },
-            )?;
-            slot.policy_cache.record_sync_failure(reason.clone(), now);
-            record_run_event(
-                slot,
-                TraceEventKind::PolicySyncFailed {
-                    policy_bundle_id: policy_bundle_id.clone(),
-                    version: version.clone(),
-                    reason: reason.clone(),
-                },
-            )?;
-            if let PolicyBundleValidationError::Revoked { reason } = &error {
-                let sanitized_reason = sanitize_policy_reason(reason);
-                if let Some(bundle) = slot.policy_cache.revoke_current(sanitized_reason.clone()) {
-                    record_run_event(
-                        slot,
-                        TraceEventKind::PolicyRevoked {
-                            policy_bundle_id: bundle.policy_bundle_id,
-                            version: bundle.version,
-                            reason: sanitized_reason,
-                        },
-                    )?;
+        Ok(candidate) => match candidate.validated().bundle().revocation.clone() {
+            RevocationStatus::Active => {
+                match slot
+                    .policy_cache
+                    .install_validated(candidate.into_validated(), reconnect_requested)
+                {
+                    Ok(installed) => {
+                        record_run_event(
+                            slot,
+                            TraceEventKind::PolicyBundleAccepted {
+                                bundle: installed.bundle.clone(),
+                            },
+                        )?;
+                        if let Some(event) = installed.connectivity_event {
+                            record_run_event(slot, event)?;
+                        }
+                        slot.updated_at = OffsetDateTime::now_utc();
+                        Ok(Json(PolicySyncResponse {
+                            run_id,
+                            accepted: true,
+                            policy_bundle: Some(installed.bundle),
+                            cache_status: policy_cache_response(&slot.policy_cache),
+                        }))
+                    }
+                    Err(error) => {
+                        let reason = error.reason_code().to_string();
+                        record_policy_sync_rejection(slot, policy_bundle_id, version, reason, now)?;
+                        Err(policy_cache_install_error(error))
+                    }
                 }
             }
+            RevocationStatus::Revoked { reason } => {
+                let revocation_reason = reason;
+                match slot
+                    .policy_cache
+                    .apply_validated_revocation(candidate.into_validated())
+                {
+                    Ok(revoked) => {
+                        let rejection_reason = "revoked_policy_bundle".to_string();
+                        record_policy_sync_rejection(
+                            slot,
+                            policy_bundle_id,
+                            version,
+                            rejection_reason,
+                            now,
+                        )?;
+                        record_run_event(
+                            slot,
+                            TraceEventKind::PolicyRevoked {
+                                policy_bundle_id: revoked.bundle.policy_bundle_id,
+                                version: revoked.bundle.version,
+                                reason: revoked.reason,
+                            },
+                        )?;
+                        Err(policy_bundle_error(PolicyBundleValidationError::Revoked {
+                            reason: revocation_reason,
+                        }))
+                    }
+                    Err(error) => {
+                        let rejection_reason = error.reason_code().to_string();
+                        record_policy_sync_rejection(
+                            slot,
+                            policy_bundle_id,
+                            version,
+                            rejection_reason,
+                            now,
+                        )?;
+                        Err(policy_cache_install_error(error))
+                    }
+                }
+            }
+        },
+        Err(error) => {
+            let reason = error.reason_code().to_string();
+            record_policy_sync_rejection(slot, policy_bundle_id, version, reason, now)?;
             Err(policy_bundle_error(error))
         }
     }
+}
+
+fn record_policy_sync_rejection(
+    slot: &mut RunSlot,
+    policy_bundle_id: Option<splendor_types::PolicyBundleId>,
+    version: Option<String>,
+    reason: String,
+    observed_at: OffsetDateTime,
+) -> Result<(), ApiError> {
+    record_run_event(
+        slot,
+        TraceEventKind::PolicyBundleRejected {
+            policy_bundle_id: policy_bundle_id.clone(),
+            version: version.clone(),
+            reason: reason.clone(),
+        },
+    )?;
+    slot.policy_cache
+        .record_sync_failure(reason.clone(), observed_at);
+    record_run_event(
+        slot,
+        TraceEventKind::PolicySyncFailed {
+            policy_bundle_id,
+            version,
+            reason,
+        },
+    )
 }
 
 async fn state_head(
@@ -4667,35 +4718,12 @@ fn policy_bundle_error(error: PolicyBundleValidationError) -> ApiError {
     ApiError::new(status, error.reason_code(), error.reason_code())
 }
 
-fn sanitize_policy_reason(reason: &str) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        return "policy_reason_unspecified".to_string();
-    }
-    let lowercase = trimmed.to_ascii_lowercase();
-    let sensitive_markers = [
-        "secret",
-        "signature",
-        "token",
-        "credential",
-        "password",
-        "bearer",
-        "apikey",
-        "api_key",
-        "key=",
-    ];
-    let safe_code = trimmed.len() <= 80
-        && trimmed.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        });
-    if !safe_code
-        || sensitive_markers
-            .iter()
-            .any(|marker| lowercase.contains(marker))
-    {
-        return "policy_reason_redacted".to_string();
-    }
-    trimmed.to_string()
+fn policy_cache_install_error(error: PolicyCacheInstallError) -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        error.reason_code(),
+        error.reason_code(),
+    )
 }
 
 fn daemon_security_code(error: &DaemonSecurityError) -> &'static str {

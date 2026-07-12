@@ -60,6 +60,12 @@ fn signed_policy_bundle_validates_and_preserves_trace_metadata() {
         .expect("validated policy bundle");
 
     assert_eq!(validated.bundle().policy_bundle_id.as_str(), "pol_test");
+    assert_eq!(validated.validated_at(), fixed_now());
+    assert_eq!(
+        validated.signature_algorithm(),
+        POLICY_BUNDLE_SIGNATURE_ALGORITHM
+    );
+    assert_eq!(validated.signature_key_id(), KEY_ID);
     let trace = PolicyBundleTraceContext::from(validated.bundle());
     assert_eq!(trace.policy_bundle_id.as_str(), "pol_test");
     assert_eq!(trace.version, "2026.05.29");

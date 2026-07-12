@@ -264,7 +264,10 @@ impl PolicyBundleKeyring {
         Ok(())
     }
 
-    fn verify(&self, envelope: &PolicyBundleEnvelope) -> Result<(), PolicyBundleValidationError> {
+    fn verify<'a>(
+        &self,
+        envelope: &'a PolicyBundleEnvelope,
+    ) -> Result<&'a WorkOrderSignature, PolicyBundleValidationError> {
         let signature = envelope
             .signature
             .as_ref()
@@ -282,7 +285,7 @@ impl PolicyBundleKeyring {
         if !constant_time_eq(expected.as_bytes(), signature.signature.trim().as_bytes()) {
             return Err(PolicyBundleValidationError::BadSignature);
         }
-        Ok(())
+        Ok(signature)
     }
 }
 
@@ -301,6 +304,9 @@ pub struct PolicyBundleValidationContext {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedPolicyBundle {
     bundle: PolicyBundle,
+    validated_at: OffsetDateTime,
+    signature_algorithm: String,
+    signature_key_id: String,
 }
 
 impl ValidatedPolicyBundle {
@@ -309,9 +315,46 @@ impl ValidatedPolicyBundle {
         &self.bundle
     }
 
+    /// Returns the trusted receiver validation time.
+    pub fn validated_at(&self) -> OffsetDateTime {
+        self.validated_at
+    }
+
+    /// Returns the trace-safe signature algorithm label.
+    pub fn signature_algorithm(&self) -> &str {
+        &self.signature_algorithm
+    }
+
+    /// Returns the trace-safe signing key identity. Signature bytes are omitted.
+    pub fn signature_key_id(&self) -> &str {
+        &self.signature_key_id
+    }
+
     /// Consumes the wrapper and returns the validated policy bundle.
     pub fn into_policy_bundle(self) -> PolicyBundle {
         self.bundle
+    }
+}
+
+/// Trusted policy-sync candidate after signature, scope, and time validation.
+///
+/// Unlike [`validate_policy_bundle`], this function's output may carry a signed
+/// revocation marker so the cache can compare it monotonically with current
+/// authority before applying a tombstone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedPolicyBundleCandidate {
+    validated: ValidatedPolicyBundle,
+}
+
+impl ValidatedPolicyBundleCandidate {
+    /// Returns the trusted validated bundle and metadata.
+    pub fn validated(&self) -> &ValidatedPolicyBundle {
+        &self.validated
+    }
+
+    /// Consumes this sync candidate into its trusted validated wrapper.
+    pub fn into_validated(self) -> ValidatedPolicyBundle {
+        self.validated
     }
 }
 
@@ -366,8 +409,24 @@ pub fn validate_policy_bundle(
     context: &PolicyBundleValidationContext,
     keyring: &PolicyBundleKeyring,
 ) -> Result<ValidatedPolicyBundle, PolicyBundleValidationError> {
+    let candidate = validate_policy_bundle_candidate(envelope, context, keyring)?;
+    if let RevocationStatus::Revoked { reason } = &candidate.validated.bundle.revocation {
+        return Err(PolicyBundleValidationError::Revoked {
+            reason: reason.clone(),
+        });
+    }
+    Ok(candidate.into_validated())
+}
+
+/// Validates a signed policy sync candidate while retaining a trusted revoked
+/// candidate for monotonic cache comparison.
+pub fn validate_policy_bundle_candidate(
+    envelope: &PolicyBundleEnvelope,
+    context: &PolicyBundleValidationContext,
+    keyring: &PolicyBundleKeyring,
+) -> Result<ValidatedPolicyBundleCandidate, PolicyBundleValidationError> {
     envelope.bundle.validate_shape()?;
-    keyring.verify(envelope)?;
+    let signature = keyring.verify(envelope)?;
 
     if envelope.bundle.tenant_id != context.tenant_id {
         return Err(PolicyBundleValidationError::Incompatible {
@@ -393,14 +452,13 @@ pub fn validate_policy_bundle(
     if envelope.bundle.expires_at <= context.now {
         return Err(PolicyBundleValidationError::Expired);
     }
-    if let RevocationStatus::Revoked { reason } = &envelope.bundle.revocation {
-        return Err(PolicyBundleValidationError::Revoked {
-            reason: reason.clone(),
-        });
-    }
-
-    Ok(ValidatedPolicyBundle {
-        bundle: envelope.bundle.clone(),
+    Ok(ValidatedPolicyBundleCandidate {
+        validated: ValidatedPolicyBundle {
+            bundle: envelope.bundle.clone(),
+            validated_at: context.now,
+            signature_algorithm: POLICY_BUNDLE_SIGNATURE_ALGORITHM.to_string(),
+            signature_key_id: signature.key_id.clone(),
+        },
     })
 }
 

@@ -10,10 +10,12 @@ use splendor_store::{
     TraceBufferAppendMode, TraceStore, TraceSyncScope,
 };
 use splendor_types::{
-    DeviceCapability, DeviceCapabilityCategory, DeviceLocalPolicyIndicators, DeviceNodeKind,
-    DeviceProfile, DeviceSafetyConstraint, MessageTraceContext, OfflineHighRiskBehavior,
-    PolicyBundle, PolicyBundleId, PolicyDegradedMode, RemoteMessageTraceContext, RevocationStatus,
-    RouteWaypointProposal, ALLOWED_PHYSICAL_ACTIONS, ROUTE_PLAN_PROPOSAL_SCHEMA,
+    validate_policy_bundle, DeviceCapability, DeviceCapabilityCategory,
+    DeviceLocalPolicyIndicators, DeviceNodeKind, DeviceProfile, DeviceSafetyConstraint,
+    MessageTraceContext, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope,
+    PolicyBundleId, PolicyBundleKeyring, PolicyBundleValidationContext, PolicyDegradedMode,
+    RemoteMessageTraceContext, RevocationStatus, RouteWaypointProposal, ValidatedPolicyBundle,
+    ALLOWED_PHYSICAL_ACTIONS, ROUTE_PLAN_PROPOSAL_SCHEMA,
 };
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -352,6 +354,30 @@ fn policy_bundle(tenant_id: TenantId, agent_id: AgentId) -> PolicyBundle {
     }
 }
 
+fn validated_policy_bundle(bundle: PolicyBundle) -> ValidatedPolicyBundle {
+    let validated_at = OffsetDateTime::now_utc();
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        bundle.clone(),
+        "physical-policy-key",
+        b"physical-policy-secret",
+    )
+    .expect("signed physical policy");
+    let mut keyring = PolicyBundleKeyring::new();
+    keyring
+        .insert_shared_secret("physical-policy-key", b"physical-policy-secret")
+        .expect("physical policy key");
+    validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: bundle.tenant_id.clone(),
+            agent_id: bundle.agent_id.clone(),
+            now: validated_at,
+        },
+        &keyring,
+    )
+    .expect("validated physical policy")
+}
+
 fn assert_replayable_with_state_head(harness: &PhysicalSimulationHarness) {
     let replay = harness.replay_trace();
     assert!(!replay.is_empty());
@@ -446,10 +472,15 @@ fn physical_harness_offline_interval_syncs_without_duplicates() {
         enforcement_required: true,
     }));
     let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone());
-    cache.install_validated(
-        policy_bundle(harness.tenant_id.clone(), harness.agent_id.clone()),
-        OffsetDateTime::now_utc(),
-    );
+    cache
+        .install_validated(
+            validated_policy_bundle(policy_bundle(
+                harness.tenant_id.clone(),
+                harness.agent_id.clone(),
+            )),
+            false,
+        )
+        .expect("trusted physical policy installs");
     let mut scope = TraceSyncScope::new(harness.run_id.to_string());
     scope.node_id = Some("node-sim-drone-01".to_string());
     scope.instance_id = Some("instance-physical-sim".to_string());
@@ -459,7 +490,7 @@ fn physical_harness_offline_interval_syncs_without_duplicates() {
         .trace
         .begin_offline_interval(&scope, Some("simulated_link_loss".to_string()))
         .expect("offline start");
-    if let Some(event) = cache.set_disconnected_with_trace(true, OffsetDateTime::now_utc()) {
+    if let Some(event) = cache.mark_disconnected_with_trace(OffsetDateTime::now_utc()) {
         harness.emit(event);
     }
 
@@ -537,11 +568,16 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
         enforcement_required: true,
     }));
     let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone());
-    cache.install_validated(
-        policy_bundle(harness.tenant_id.clone(), harness.agent_id.clone()),
-        OffsetDateTime::now_utc(),
-    );
-    cache.set_disconnected(true);
+    cache
+        .install_validated(
+            validated_policy_bundle(policy_bundle(
+                harness.tenant_id.clone(),
+                harness.agent_id.clone(),
+            )),
+            false,
+        )
+        .expect("trusted physical policy installs");
+    cache.mark_disconnected();
 
     let intervention = harness.submit_physical_action(
         "move_to_waypoint",
@@ -552,7 +588,15 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
     assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
     assert_eq!(harness.adapter.call_count(), 0);
 
-    cache.set_disconnected(false);
+    cache
+        .install_validated(
+            validated_policy_bundle(policy_bundle(
+                harness.tenant_id.clone(),
+                harness.agent_id.clone(),
+            )),
+            true,
+        )
+        .expect("strict newer trusted policy reconnects");
     let override_request = harness.submit_physical_action(
         "request_operator_override",
         SideEffectClass::Custom("physical.high_level".to_string()),
