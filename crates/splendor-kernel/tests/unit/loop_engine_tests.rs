@@ -5,14 +5,26 @@ use splendor_store::{
     StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceStoreError,
 };
 use splendor_types::{
-    ActionId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalTraceContext, ConstraintKind,
-    ConstraintScope, DelegatedAuthority, PerceptProvenance, PolicyBundle, PolicyBundleId,
-    PolicyBundleTraceContext, PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, TenantId,
-    TraceEvent, WorkOrder, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    WORK_ORDER_SCHEMA_VERSION,
+    validate_policy_bundle, ActionId, ApprovalDecision, ApprovalEvidence, ApprovalId,
+    ApprovalTraceContext, ConstraintKind, ConstraintScope, DelegatedAuthority, PerceptProvenance,
+    PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyDegradedMode, QuotaUsage,
+    RevocationStatus, RunId, TenantId, TraceEvent, WorkOrder, WorkOrderId, WorkOrderPlacement,
+    WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+struct LoopPolicyTraceRecorder;
+
+impl crate::PolicyCacheMutationRecorder for LoopPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), crate::PolicyCacheTraceError> {
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 struct CapturingTraceSink {
@@ -1527,14 +1539,40 @@ fn loop_engine_rejects_policy_before_policy_invoked_when_bundle_expired() {
         splendor_types::TenantId::new(),
         crate::AgentRuntimeConfig::default(),
     );
-    let cache = crate::PolicyCache::with_bundle(
-        policy_bundle_for(
-            &agent,
-            OffsetDateTime::now_utc() - time::Duration::minutes(1),
-            false,
-        ),
-        OffsetDateTime::now_utc(),
+    let expires_at = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    let bundle = policy_bundle_for(&agent, expires_at, false);
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        bundle.clone(),
+        "loop-policy-key",
+        b"loop-policy-secret",
+    )
+    .expect("signed loop policy");
+    let mut keyring = PolicyBundleKeyring::new();
+    keyring
+        .insert_shared_secret("loop-policy-key", b"loop-policy-secret")
+        .expect("loop policy key");
+    let validated = validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: bundle.tenant_id.clone(),
+            agent_id: bundle.agent_id.clone(),
+            now: expires_at - time::Duration::minutes(1),
+        },
+        &keyring,
+    )
+    .expect("policy was valid before expiry");
+    let cache = crate::PolicyCache::new(
+        crate::PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        crate::PolicyCacheOwner {
+            tenant_id: agent.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        },
     );
+    cache
+        .install_validated_traced(validated, false, &LoopPolicyTraceRecorder)
+        .expect("trusted loop policy installs");
     let mut engine = LoopEngine::with_runtime(
         agent,
         graph,

@@ -94,8 +94,13 @@ fn authority_scope_carries_distinct_identity_dimensions() {
 fn authority_grant_and_decision_contracts_round_trip_without_behavior() {
     let now = time::OffsetDateTime::now_utc();
     let scope = CapabilityScope {
-        tenant_ids: Some(vec![TenantId::new()]),
-        agent_ids: Some(vec![AgentId::new()]),
+        tenant_ids: Some(vec![TenantId::parse(
+            "10000000-0000-4000-8000-000000000001",
+        )
+        .expect("tenant id")]),
+        agent_ids: Some(vec![
+            AgentId::parse("20000000-0000-4000-8000-000000000002").expect("agent id")
+        ]),
         audiences: Some(vec!["daemon:local".to_string()]),
         ..Default::default()
     };
@@ -342,4 +347,56 @@ fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
     );
     round_trip(&delegation_grant);
     round_trip(&chain);
+}
+
+#[test]
+fn policy_distribution_unknown_authority_validation_enums_fail_serde() {
+    let now = time::OffsetDateTime::parse(
+        "2026-07-12T12:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed authority time");
+    let scope = CapabilityScope {
+        tenant_ids: Some(vec![TenantId::new()]),
+        agent_ids: Some(vec![AgentId::new()]),
+        audiences: Some(vec!["daemon:local".to_string()]),
+        ..Default::default()
+    };
+    let grant = CapabilityGrant {
+        schema_version: CAPABILITY_GRANT_SCHEMA_VERSION.to_string(),
+        grant_id: CapabilityGrantId::parse("30000000-0000-4000-8000-000000000003")
+            .expect("grant id"),
+        issuer: PrincipalId::parse("40000000-0000-4000-8000-000000000004").expect("issuer id"),
+        subject: PrincipalId::parse("50000000-0000-4000-8000-000000000005").expect("subject id"),
+        parent_grant_ids: Vec::new(),
+        operations: vec![action_operation("artifact.create")],
+        scope,
+        not_before: now,
+        expires_at: now + time::Duration::hours(1),
+        revocation_ref: None,
+        revocation: RevocationStatus::Active,
+        obligations: Vec::new(),
+        max_delegation_depth: 0,
+        validation: Some(CapabilityGrantValidation {
+            validation_kind: CapabilityGrantValidationKind::LocallyValidated,
+            algorithm: "local-test-v1".to_string(),
+            key_id: None,
+            digest: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            signature: None,
+        }),
+        metadata: Default::default(),
+    };
+
+    for (path, value) in [
+        ("/validation/validation_kind", "future_validator"),
+        ("/operations/0/namespace", "future_namespace"),
+        ("/operations/0/resource_kind", "future_resource"),
+        ("/operations/0/verb", "future_verb"),
+    ] {
+        let mut raw = serde_json::to_value(&grant).expect("grant json");
+        *raw.pointer_mut(path).expect("enum field") = serde_json::json!(value);
+        serde_json::from_value::<CapabilityGrant>(raw)
+            .expect_err("unknown closed authority enum must fail serde");
+    }
 }

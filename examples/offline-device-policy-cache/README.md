@@ -20,16 +20,16 @@ degraded_mode:
 ## Expected behavior
 
 1. A validated signed bundle is installed in `PolicyCache`.
-2. Disconnection calls `set_disconnected_with_trace(true, observed_at)` and emits
+2. Disconnection calls `mark_disconnected_with_trace(observed_at)` and emits
    `PolicyConnectivityChanged`.
 3. `read_battery` with `SideEffectClass::ReadOnly` proceeds to the normal gateway
    and verifier chain while within TTL.
 4. `move_to_waypoint` returns `NeedsIntervention`; the adapter is not called.
 5. After TTL expiry, even explicit low-risk read-only cached actions deny
    `policy_expired`; no action is forwarded to adapters from an expired bundle.
-6. Reconnect emits `PolicyConnectivityChanged { disconnected: false, ... }`; a
-   new validated bundle can update cache `last_sync_at` without breaking trace
-   continuity.
+6. A first or strictly newer active bundle installed through
+   `install_validated_traced` can emit reconnect evidence and update cache
+   `last_sync_at`; no direct reconnect setter exists.
 
 ## Smoke commands
 

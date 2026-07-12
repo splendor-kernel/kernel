@@ -383,9 +383,9 @@ classes:
 
 | Rust variant | Canonical event class | Purpose |
 | --- | --- | --- |
-| `PolicyBundleAccepted` | `policy.bundle.accepted` | A signed policy bundle validated and became run-local authority metadata. |
-| `PolicyBundleRejected` | `policy.bundle.rejected` | A supplied policy bundle failed validation before authority changed. |
-| `PolicySyncFailed` | `policy.sync.failed` | Central policy sync failed and cached authority was preserved. |
+| `PolicyBundleAccepted` | `policy.bundle.accepted` | A signed monotonic candidate was accepted for commit and traced before mutation; later trace/commit failure can leave partial non-authorizing evidence. |
+| `PolicyBundleRejected` | `policy.bundle.rejected` | Candidate was not installed as active authority; a matching trusted revoked candidate may still tombstone current authority after revocation trace persistence. |
+| `PolicySyncFailed` | `policy.sync.failed` | Candidate authority was not installed and the prior bundle remains installed; a matching trusted revocation may additionally tombstone/block it. |
 | `PolicyExpired` | `policy.expired` | TTL checks denied policy invocation or action forwarding. |
 | `PolicyRevoked` | `policy.revoked` | Revocation denied policy invocation or action forwarding. |
 
@@ -394,6 +394,11 @@ version, tenant ID, optional agent ID, expiry, and degraded-mode flags. It omits
 signature material, shared secrets, caller credentials, and policy-language
 internals. Replay inspects these events but does not refresh bundles, contact a
 policy distributor, invoke policies, or execute adapters.
+
+These pre-commit events are prepared/non-authorizing evidence. Event presence
+alone is not proof that cache mutation committed; cache snapshot/runtime
+decision is authoritative. No mutation-attempt ID or terminal-status event is
+added in this compatibility slice.
 
 ### Remote Message Events
 

@@ -1,11 +1,364 @@
 use super::*;
+use crate::{
+    evaluate_cached_capability_request, AuthorityGrantCache, AuthorityOfflineHighRiskBehavior,
+    OfflineAuthorityPolicy, RevocationSnapshot, REASON_AUTHORITY_CACHE_EXPIRED,
+    REASON_AUTHORITY_CACHE_FUTURE_DATED, REASON_AUTHORITY_CACHE_STALE,
+    REASON_AUTHORITY_GRANT_REVOKED, REASON_AUTHORITY_OFFLINE_TTL_EXPIRED,
+    REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
+};
 use splendor_types::{
-    ArtifactId, AuthorityObligationId, AuthorityObligationKind, DeviceId, FleetId,
-    StatePartitionId, WorkOrderId, WorkOrderPlacement, WorkloadId,
-    AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+    ArtifactId, AuthorityObligationId, AuthorityObligationKind, AuthorityRevocationId, DataPurpose,
+    DeviceId, FleetId, RevocationRecord, StatePartitionId, WorkOrderId, WorkOrderPlacement,
+    WorkloadId, AUTHORITY_OBLIGATION_SCHEMA_VERSION, REVOCATION_RECORD_SCHEMA_VERSION,
 };
 
 const DIGEST: &str = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
+
+fn trusted_v1_now() -> OffsetDateTime {
+    OffsetDateTime::parse(
+        "2026-07-12T12:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed trusted-v1 time")
+}
+
+fn trusted_v1_data_read_operation() -> AuthorityOperation {
+    AuthorityOperation {
+        schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Data,
+        resource_kind: AuthorityResourceKind::Data,
+        verb: AuthorityVerb::Read,
+        name: None,
+        resource_schema_version: Some("splendor.data_use.v1".to_string()),
+    }
+}
+
+fn trusted_v1_fixture() -> (ValidatedCapabilityGrant, CapabilityRequest) {
+    let now = trusted_v1_now();
+    let tenant_id = TenantId::parse("10000000-0000-4000-8000-000000000001").expect("tenant id");
+    let agent_id = AgentId::parse("20000000-0000-4000-8000-000000000002").expect("agent id");
+    let run_id = RunId::parse("30000000-0000-4000-8000-000000000003").expect("run id");
+    let subject = PrincipalId::parse("40000000-0000-4000-8000-000000000004").expect("subject id");
+    let seeded = grant_from_legacy_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::parse("50000000-0000-4000-8000-000000000005")
+                .expect("grant id"),
+            issuer: PrincipalId::parse("60000000-0000-4000-8000-000000000006").expect("issuer id"),
+            subject: subject.clone(),
+            audience: "daemon:local".to_string(),
+            validation_digest: DIGEST.to_string(),
+            max_delegation_depth: 0,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: Some(run_id.clone()),
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(5),
+                ..Default::default()
+            },
+        },
+        &["fixture.seed".to_string()],
+        &[],
+        &[],
+        now - time::Duration::hours(1),
+        now + time::Duration::hours(2),
+        RevocationStatus::Active,
+        Some("revocation:trusted-v1".to_string()),
+    )
+    .expect("normal legacy builder produces trusted seed grant");
+
+    let operation = trusted_v1_data_read_operation();
+    let mut raw = seeded.grant().clone();
+    raw.operations = vec![operation.clone()];
+    raw.scope.data_purposes = Some(vec![DataPurpose::Read]);
+    let grant = validate_local_profile_grant(raw)
+        .expect("production local-profile validation accepts narrowed data-read fixture");
+    let mut request_scope = grant.grant().scope.clone();
+    request_scope.budget.max_actions_per_tick = Some(1);
+    let request = CapabilityRequest {
+        schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+        subject,
+        operation,
+        scope: request_scope,
+        requested_at: now,
+        metadata: Default::default(),
+    };
+    (grant, request)
+}
+
+fn trusted_v1_cache(
+    grant: ValidatedCapabilityGrant,
+    cached_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> AuthorityGrantCache {
+    let mut cache = AuthorityGrantCache::new();
+    cache
+        .insert_validated(grant, cached_at, expires_at)
+        .expect("trusted validated grant enters cache");
+    cache
+}
+
+fn trusted_v1_active_record(grant_id: CapabilityGrantId) -> RevocationRecord {
+    RevocationRecord {
+        schema_version: REVOCATION_RECORD_SCHEMA_VERSION.to_string(),
+        revocation_id: AuthorityRevocationId::parse("70000000-0000-4000-8000-000000000007")
+            .expect("revocation id"),
+        grant_id,
+        revocation_ref: Some("revocation:trusted-v1".to_string()),
+        status: RevocationStatus::Active,
+        revoked_at: None,
+    }
+}
+
+#[test]
+fn trusted_v1_exact_family_version_matrix_rejects_v0_and_v2() {
+    let now = trusted_v1_now();
+    let (grant, request) = trusted_v1_fixture();
+    let allowed = evaluate_capability_request(std::slice::from_ref(&grant), &request, now);
+    assert_eq!(allowed.status, AuthorityDecisionStatus::Allowed);
+    assert_eq!(allowed.reasons, vec!["capability_allowed"]);
+
+    let active_record = trusted_v1_active_record(grant.grant().grant_id.clone());
+    let active_snapshot = RevocationSnapshot::with_max_age(
+        vec![active_record.clone()],
+        now - time::Duration::minutes(1),
+        time::Duration::minutes(30),
+    )
+    .expect("current v1 revocation record enters trusted snapshot");
+    active_snapshot
+        .verify_grant_active(&grant, now)
+        .expect("current v1 active record preserves current v1 grant");
+
+    for suffix in ["v0", "v2"] {
+        let mut operation_request = request.clone();
+        operation_request.operation.schema_version =
+            format!("splendor.authority.operation.{suffix}");
+        let decision =
+            evaluate_capability_request(std::slice::from_ref(&grant), &operation_request, now);
+        assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
+        assert_eq!(
+            decision.reasons,
+            vec!["invalid_schema:authority_operation.schema_version"]
+        );
+
+        let mut scope_request = request.clone();
+        scope_request.scope.schema_version = format!("splendor.authority.scope.{suffix}");
+        let decision =
+            evaluate_capability_request(std::slice::from_ref(&grant), &scope_request, now);
+        assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
+        assert_eq!(
+            decision.reasons,
+            vec!["invalid_schema:capability_scope.schema_version"]
+        );
+
+        let mut versioned_request = request.clone();
+        versioned_request.schema_version =
+            format!("splendor.authority.capability_request.{suffix}");
+        let decision =
+            evaluate_capability_request(std::slice::from_ref(&grant), &versioned_request, now);
+        assert_eq!(decision.status, AuthorityDecisionStatus::Denied);
+        assert_eq!(
+            decision.reasons,
+            vec!["invalid_schema:capability_request.schema_version"]
+        );
+
+        let mut raw_grant = grant.grant().clone();
+        raw_grant.schema_version = format!("splendor.authority.capability_grant.{suffix}");
+        let raw_grant: CapabilityGrant = serde_json::from_value(
+            serde_json::to_value(raw_grant).expect("unsupported raw grant json"),
+        )
+        .expect("behavior-free raw grant parses before authority validation");
+        let error = validate_local_profile_grant(raw_grant)
+            .expect_err("unsupported raw grant cannot enter a trusted wrapper");
+        assert_eq!(
+            error.reason_code(),
+            "invalid_schema:capability_grant.schema_version"
+        );
+        assert!(matches!(
+            error,
+            AuthorityEvaluationError::InvalidSchema {
+                field: "capability_grant.schema_version",
+                expected: CAPABILITY_GRANT_SCHEMA_VERSION,
+                ref actual,
+            } if actual.ends_with(suffix)
+        ));
+
+        let mut unsupported_record = active_record.clone();
+        unsupported_record.schema_version =
+            format!("splendor.authority.revocation_record.{suffix}");
+        let error = RevocationSnapshot::with_max_age(
+            vec![unsupported_record],
+            now - time::Duration::minutes(1),
+            time::Duration::minutes(30),
+        )
+        .expect_err("unsupported revocation record cannot enter trusted snapshot");
+        assert_eq!(
+            error.reason_code(),
+            "authority_revocation_record_schema_invalid"
+        );
+    }
+}
+
+#[test]
+fn trusted_v1_authority_cache_and_snapshot_staleness_matrix_is_non_vacuous() {
+    let now = trusted_v1_now();
+    let (grant, request) = trusted_v1_fixture();
+    let fresh_cached_at = now - time::Duration::minutes(5);
+    let cache_expires_at = now + time::Duration::hours(1);
+    let active_snapshot = RevocationSnapshot::with_max_age(
+        vec![trusted_v1_active_record(grant.grant().grant_id.clone())],
+        now - time::Duration::minutes(1),
+        time::Duration::minutes(30),
+    )
+    .expect("live active snapshot");
+    let connected = OfflineAuthorityPolicy::connected(time::Duration::minutes(30))
+        .expect("connected cache policy");
+    let disconnected = OfflineAuthorityPolicy::disconnected(
+        time::Duration::minutes(30),
+        time::Duration::minutes(10),
+        vec![trusted_v1_data_read_operation()],
+        AuthorityOfflineHighRiskBehavior::Deny,
+    )
+    .expect("disconnected cache policy");
+
+    let fresh_cache = trusted_v1_cache(grant.clone(), fresh_cached_at, cache_expires_at);
+    let connected_allow = evaluate_cached_capability_request(
+        &fresh_cache,
+        Some(&active_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(connected_allow.status, AuthorityDecisionStatus::Allowed);
+    assert_eq!(connected_allow.reasons, vec!["capability_allowed"]);
+
+    let disconnected_allow = evaluate_cached_capability_request(
+        &fresh_cache,
+        Some(&active_snapshot),
+        &disconnected,
+        &request,
+        now,
+    );
+    assert_eq!(disconnected_allow.status, AuthorityDecisionStatus::Allowed);
+    assert_eq!(disconnected_allow.reasons, vec!["capability_allowed"]);
+
+    let stale_cache = trusted_v1_cache(
+        grant.clone(),
+        now - time::Duration::minutes(31),
+        cache_expires_at,
+    );
+    let stale = evaluate_cached_capability_request(
+        &stale_cache,
+        Some(&active_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(stale.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(stale.reasons, vec![REASON_AUTHORITY_CACHE_STALE]);
+
+    let future_cache = trusted_v1_cache(
+        grant.clone(),
+        now + time::Duration::minutes(1),
+        cache_expires_at,
+    );
+    let future = evaluate_cached_capability_request(
+        &future_cache,
+        Some(&active_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(future.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(future.reasons, vec![REASON_AUTHORITY_CACHE_FUTURE_DATED]);
+
+    let expired_cache = trusted_v1_cache(grant.clone(), now - time::Duration::minutes(5), now);
+    let expired = evaluate_cached_capability_request(
+        &expired_cache,
+        Some(&active_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(expired.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(expired.reasons, vec![REASON_AUTHORITY_CACHE_EXPIRED]);
+
+    let stale_snapshot = RevocationSnapshot::with_max_age(
+        Vec::new(),
+        now - time::Duration::minutes(31),
+        time::Duration::minutes(30),
+    )
+    .expect("stale trusted snapshot fixture");
+    let stale = evaluate_cached_capability_request(
+        &fresh_cache,
+        Some(&stale_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(stale.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(
+        stale.reasons,
+        vec![REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE]
+    );
+
+    let future_snapshot = RevocationSnapshot::with_max_age(
+        Vec::new(),
+        now + time::Duration::minutes(1),
+        time::Duration::minutes(30),
+    )
+    .expect("future trusted snapshot fixture");
+    let future = evaluate_cached_capability_request(
+        &fresh_cache,
+        Some(&future_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(future.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(
+        future.reasons,
+        vec![REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED]
+    );
+
+    let mut revoked_record = trusted_v1_active_record(grant.grant().grant_id.clone());
+    revoked_record.status = RevocationStatus::Revoked {
+        reason: "operator_revoked".to_string(),
+    };
+    revoked_record.revoked_at = Some(now);
+    let revoked_snapshot = RevocationSnapshot::with_max_age(
+        vec![revoked_record],
+        now - time::Duration::minutes(1),
+        time::Duration::minutes(30),
+    )
+    .expect("live revoked snapshot");
+    let revoked = evaluate_cached_capability_request(
+        &fresh_cache,
+        Some(&revoked_snapshot),
+        &connected,
+        &request,
+        now,
+    );
+    assert_eq!(revoked.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(revoked.reasons, vec![REASON_AUTHORITY_GRANT_REVOKED]);
+
+    let offline_ttl_cache =
+        trusted_v1_cache(grant, now - time::Duration::minutes(11), cache_expires_at);
+    let offline_ttl = evaluate_cached_capability_request(
+        &offline_ttl_cache,
+        Some(&active_snapshot),
+        &disconnected,
+        &request,
+        now,
+    );
+    assert_eq!(offline_ttl.status, AuthorityDecisionStatus::Denied);
+    assert_eq!(
+        offline_ttl.reasons,
+        vec![REASON_AUTHORITY_OFFLINE_TTL_EXPIRED]
+    );
+}
 
 fn validation() -> CapabilityGrantValidation {
     CapabilityGrantValidation {

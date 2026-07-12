@@ -137,8 +137,23 @@ directly; `/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
 When `CreateRunRequest.policy_bundle_required` is true, the daemon also requires
-a signed policy bundle and rejects invalid, expired, revoked, malformed, or
-incompatible bundles before policy invocation or adapter execution can occur.
+a signed policy bundle and rejects invalid, future-issued, expired, revoked,
+malformed, or incompatible bundles before policy invocation or adapter execution
+can occur.
+The endpoint and request/response shapes are unchanged, but daemon-visible policy
+errors now also include monotonic cache reasons such as
+`policy_cache_install_rollback`, `policy_cache_install_conflict`, and scoped
+revocation mismatch reasons. A failed candidate cannot reconnect a disconnected
+cache.
+Run caches are bound to the run tenant+agent. Exact active retry cannot
+reconnect, and active refresh must advance both current authority and any trusted
+revocation watermark. The daemon prepares cache mutation, persists required
+acceptance/connectivity/revocation events, then commits. Trace failure leaves
+prior active-install authority/connectivity unchanged. Matching revocation trace
+failure additionally latches the exact pending watermark and denies
+`policy_evidence_unavailable`; durable retry reconciles it. Mutation goes through
+the cache's high-level traced methods, not public plan/commit seams. A partial
+prepared/non-authorizing trace may remain and does not by itself prove commit.
 
 ## Run lifecycle
 
@@ -255,8 +270,9 @@ PolicyRevoked
 ```
 
 Policy sync emits daemon audit attribution for `splendor.policies.sync`. A sync
-failure records `PolicySyncFailed` and leaves the current cached authority
-unchanged.
+failure records `PolicySyncFailed`; the prior cached bundle remains installed.
+A matching trusted revocation candidate may additionally tombstone and block
+that prior bundle, while unrelated or older revocations cannot mutate it.
 
 Action submissions through `/actions` emit normal action trace events:
 

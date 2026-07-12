@@ -4,6 +4,26 @@
 
 ### Added
 
+- Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
+  matrices for authority operation/scope/grant/request/revocation/policy
+  contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and
+  daemon policy-sync preservation/blocking evidence.
+- Signed policy bundles whose `issued_at` is later than the receiver validation
+  clock now fail closed with `future_issued_policy_bundle` before installation;
+  equality remains valid. Historical 0.04-shaped v1 signatures are characterized
+  as `bad_policy_signature` under current normalization, not claimed compatible.
+- Hardened policy cache mutation so production callers must supply a trusted
+  `ValidatedPolicyBundle`; signed issuance/content is monotonic, exact retries do
+  not clear tombstones, only strictly newer authority refreshes, revoked
+  candidates are identity/scope/age-bound, reconnect requires accepted install,
+  and clock rollback or latched expiry cannot reactivate policy authority.
+- Added exact signed revocation watermarks, tenant+agent cache ownership,
+  exact-retry reconnect denial, and trace-before-commit mutation. Public callers
+  now use high-level recorder-bound methods; internal plans/commit are private.
+  Revocation trace failure latches an exact deny-only pending watermark. Public
+  Rust cache construction/mutation APIs changed; daemon wire shapes did not.
+  Post-trace commit races now preserve and latch still-applicable exact
+  revocation evidence while leaving strictly newer active winners unpoisoned.
 - Bound local delegating root runs to one exact trusted validated capability
   grant, including private trust state, within one manager. Cross-run/shared-
   principal and same-ID/different-content replay now fail before message routing
@@ -23,6 +43,10 @@
 
 ### Explicitly not included
 
+- No new authorizing schema version, TypeScript/OpenAPI parity change, policy
+  cache persistence/fleet redesign, resident persistence/watch, canonical
+  historical-signature migration seam, or broad rolling-version compatibility
+  claim. The in-memory cache state and public Rust mutation API did change.
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.
