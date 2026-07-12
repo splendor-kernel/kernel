@@ -21,7 +21,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Barrier;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::thread;
+use std::time::Duration as StdDuration;
 
 use super::combine_verifications;
 use super::InvariantEvaluator;
@@ -632,6 +635,46 @@ fn authority_evidence_for(
     )
 }
 
+fn complete_live_conditional_fixture(
+    mut request: ActionRequest,
+    now: OffsetDateTime,
+) -> (
+    ActionRequest,
+    PrincipalId,
+    AuthorityObligationReceiptValidationContext,
+    Vec<AuthorityDecision>,
+) {
+    request.adapter = Some("adapter".to_string());
+    request.action.required_permissions = vec!["fixture.write".to_string()];
+    let (issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+    let action_decision = evidence.decision;
+    let mut receipts = evidence.receipts;
+    let mut adapter_decision = action_decision.clone();
+    adapter_decision.decision_id = AuthorityDecisionId::new();
+    adapter_decision.request.operation = gateway_adapter_operation("adapter");
+    bind_gateway_authority_decision_digest(&mut adapter_decision);
+    receipts.push(issue_obligation_receipt(
+        unsigned_obligation_receipt(&adapter_decision, issuer.clone(), now),
+        &context,
+    ));
+    let mut permission_decision = action_decision.clone();
+    permission_decision.decision_id = AuthorityDecisionId::new();
+    permission_decision.request.operation = compatibility_permission_operation("fixture.write");
+    bind_gateway_authority_decision_digest(&mut permission_decision);
+    receipts.push(issue_obligation_receipt(
+        unsigned_obligation_receipt(&permission_decision, issuer.clone(), now),
+        &context,
+    ));
+    request.authority_obligation_receipts = receipts;
+    request.authority_obligation_evidence = None;
+    (
+        request,
+        issuer,
+        context,
+        vec![action_decision, adapter_decision, permission_decision],
+    )
+}
+
 fn hostile_authority_values() -> Vec<String> {
     vec![
         "authority-reason-secret-do-not-export".to_string(),
@@ -823,6 +866,19 @@ struct OrderingAuthorityRecorder {
     adapter: Arc<CountingAdapter>,
 }
 
+struct DelayingResourceVerifier(StdDuration);
+
+impl ResourceBoundaryVerifier for DelayingResourceVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        thread::sleep(self.0);
+        VerificationResult::allow()
+    }
+}
+
 impl PreEffectAuthorityDecisionRecorder for OrderingAuthorityRecorder {
     fn record_pre_effect_authority_allow(
         &self,
@@ -934,6 +990,150 @@ fn live_conditional_authority_uses_only_raw_receipts_and_records_before_effect()
         .reasons
         .contains(&"authority_decision_request_mismatch".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+}
+
+#[test]
+fn live_conditional_authority_rejects_every_unmatched_or_extra_receipt() {
+    let now = OffsetDateTime::now_utc();
+    let (request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let mut unrelated_decision = decisions[0].clone();
+    unrelated_decision.decision_id = AuthorityDecisionId::new();
+    bind_gateway_authority_decision_digest(&mut unrelated_decision);
+    let unrelated = issue_obligation_receipt(
+        unsigned_obligation_receipt(&unrelated_decision, issuer, now),
+        &context,
+    );
+    let mut forged = request.authority_obligation_receipts[0].clone();
+    forged.receipt_id = AuthorityObligationReceiptId::new();
+    let replayed_extra = request.authority_obligation_receipts[0].clone();
+
+    for (label, extra, expected_reason) in [
+        (
+            "unrelated",
+            unrelated,
+            "authority_obligation_receipt_unmatched_current_decision",
+        ),
+        (
+            "forged",
+            forged,
+            "obligation_receipt_validation_digest_mismatch",
+        ),
+        (
+            "replayed_extra",
+            replayed_extra,
+            "duplicate_obligation_receipt_id",
+        ),
+    ] {
+        let adapter = Arc::new(CountingAdapter::default());
+        let mut gateway = authority_gateway(context.clone(), adapter.clone());
+        gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+            decisions: decisions.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            adapter: adapter.clone(),
+        }));
+        let mut attempted = request.clone();
+        attempted.authority_obligation_receipts.push(extra);
+
+        let outcome = gateway.submit(attempted).expect("extra receipt denial");
+
+        assert_eq!(outcome.status, ActionStatus::Denied, "{label}");
+        assert!(
+            outcome
+                .verification
+                .reasons
+                .contains(&expected_reason.to_string()),
+            "{label}: {:?}",
+            outcome.verification.reasons
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0, "{label}");
+    }
+}
+
+#[test]
+fn receipt_expiring_during_blocking_verifier_work_never_reaches_adapter() {
+    let now = OffsetDateTime::now_utc();
+    let (mut request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    request.authority_obligation_receipts = decisions
+        .iter()
+        .map(|decision| {
+            let mut receipt = unsigned_obligation_receipt(decision, issuer.clone(), now);
+            receipt.expires_at = now + time::Duration::milliseconds(40);
+            issue_obligation_receipt(receipt, &context)
+        })
+        .collect();
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = authority_gateway(context, adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        adapter: adapter.clone(),
+    }));
+    gateway.set_resource_boundary_verifier(Arc::new(DelayingResourceVerifier(
+        StdDuration::from_millis(100),
+    )));
+
+    let outcome = gateway.submit(request).expect("expired receipt denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"obligation_receipt_expired".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn concurrent_submissions_with_the_same_receipts_execute_at_most_once() {
+    let now = OffsetDateTime::now_utc();
+    let (request, _issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let adapter = Arc::new(CountingAdapter::default());
+    let records = Arc::new(AtomicUsize::new(0));
+    let mut gateway = authority_gateway(context, adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::clone(&records),
+        adapter: adapter.clone(),
+    }));
+    let gateway = Arc::new(gateway);
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let gateway = Arc::clone(&gateway);
+            let barrier = Arc::clone(&barrier);
+            let request = request.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                gateway.submit(request).expect("concurrent receipt outcome")
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("receipt worker"))
+        .collect::<Vec<_>>();
+
+    let executions = *adapter.calls.lock().expect("adapter calls") as usize;
+    assert!(executions <= 1, "adapter executed {executions} times");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == ActionStatus::Executed)
+            .count(),
+        executions
+    );
+    assert_eq!(records.load(Ordering::SeqCst), executions);
 }
 
 #[test]

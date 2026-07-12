@@ -4,6 +4,9 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ACTION_STATUS_VALUES,
+  AUTHORITY_OPERATION_NAMESPACE_VALUES,
+  AUTHORITY_RESOURCE_KIND_VALUES,
+  AUTHORITY_VERB_VALUES,
   CANONICAL_SCHEMA_FIELDS,
   ENDPOINT_SCOPE_LABELS,
   ENDPOINT_SCOPE_VALUES,
@@ -21,6 +24,7 @@ import type {
   ApprovalRequest,
   AuthorityObligationReceipt,
   AuthorityObligationReceiptValidation,
+  DaemonActionCandidate,
   ExternalApprovalMapping,
   ExternalGovernanceAdapterContract,
   GovernedArtifactRef,
@@ -296,7 +300,20 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
   }
   assert.match(extractOpenApiSchemaBlock(openapi, "DaemonActionCandidate"), /maxItems: 64/);
   assert.match(extractOpenApiSchemaBlock(openapi, "SubmitActionRequest"), /maxItems: 64/);
-  assert.match(extractOpenApiSchemaBlock(openapi, "RegisteredAction"), /additionalProperties: false/);
+  const registeredActionSchema = extractOpenApiSchemaBlock(openapi, "RegisteredAction");
+  assert.match(registeredActionSchema, /additionalProperties: false/);
+  assert.match(registeredActionSchema, /uniqueItems: true/);
+  assert.match(registeredActionSchema, /maxItems: 64/);
+
+  const rustNamespaces = extractEnumVariants(authority, "AuthorityOperationNamespace").map(pascalToSnake);
+  const rustResourceKinds = extractEnumVariants(authority, "AuthorityResourceKind").map(pascalToSnake);
+  const rustVerbs = extractEnumVariants(authority, "AuthorityVerb").map(pascalToSnake);
+  assert.deepEqual([...AUTHORITY_OPERATION_NAMESPACE_VALUES], rustNamespaces);
+  assert.deepEqual([...AUTHORITY_RESOURCE_KIND_VALUES], rustResourceKinds);
+  assert.deepEqual([...AUTHORITY_VERB_VALUES], rustVerbs);
+  assert.deepEqual(extractOpenApiStringEnum(openapi, "AuthorityOperationNamespace"), rustNamespaces);
+  assert.deepEqual(extractOpenApiStringEnum(openapi, "AuthorityResourceKind"), rustResourceKinds);
+  assert.deepEqual(extractOpenApiStringEnum(openapi, "AuthorityVerb"), rustVerbs);
 
   const validation: AuthorityObligationReceiptValidation = {
     validation_kind: "local_signature",
@@ -327,8 +344,12 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     adapter: "fixture.local",
     required_permissions: ["fixture.write"]
   };
+  const candidateIdentity: Pick<DaemonActionCandidate, "action_id"> = {
+    action_id: "00000000-0000-4000-8000-000000000006" as DaemonActionCandidate["action_id"]
+  };
   assert.equal(receipt.kind, "human_review");
   assert.deepEqual(profile.required_permissions, ["fixture.write"]);
+  assert.equal(candidateIdentity.action_id, "00000000-0000-4000-8000-000000000006");
 
   const invalidValidation: AuthorityObligationReceiptValidation = {
     ...validation,

@@ -680,6 +680,24 @@ fn resign_daemon_work_order(envelope: &mut WorkOrderEnvelope) {
         .expect("resigned work order");
 }
 
+fn daemon_run_work_order(
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    run_id: Option<RunId>,
+) -> WorkOrderEnvelope {
+    let mut envelope =
+        daemon_work_order(tenant_id, agent_id, run_id, vec![EndpointScope::RunsCreate]);
+    envelope.work_order.allowed_actions = vec![
+        "allowed_action".to_string(),
+        "failing_action".to_string(),
+        "denied_action".to_string(),
+    ];
+    envelope.work_order.allowed_adapters = vec!["daemon.local".to_string()];
+    envelope.work_order.allowed_permissions.clear();
+    resign_daemon_work_order(&mut envelope);
+    envelope
+}
+
 fn daemon_work_order_authorization(
     tenant_id: TenantId,
     agent_id: AgentId,
@@ -734,6 +752,17 @@ fn daemon_registered_actions() -> Vec<RegisteredAction> {
         required_permissions: Some(required_permissions),
     })
     .collect()
+}
+
+fn daemon_run_registered_actions() -> Vec<RegisteredAction> {
+    ["allowed_action", "failing_action", "denied_action"]
+        .into_iter()
+        .map(|name| RegisteredAction {
+            name: name.to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
+        })
+        .collect()
 }
 
 fn daemon_percept(schema: &str) -> Percept {
@@ -802,12 +831,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         idempotency_key: "idem_kernel_e2e_daemon".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
-        work_order: daemon_work_order(
-            tenant_id.clone(),
-            agent_id.clone(),
-            None,
-            vec![EndpointScope::RunsCreate],
-        ),
+        work_order: daemon_run_work_order(tenant_id.clone(), agent_id.clone(), None),
         credential: None,
         audit_attribution: Some(attribution(false)),
         allowed_actions: vec!["allowed_action".to_string(), "failing_action".to_string()],
@@ -823,7 +847,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: daemon_registered_actions(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.kernel_e2e.v1".to_string()],
@@ -1036,12 +1060,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         idempotency_key: "idem_kernel_e2e_locked".to_string(),
         tenant_id: locked_tenant.clone(),
         agent_id: locked_agent.clone(),
-        work_order: daemon_work_order(
-            locked_tenant.clone(),
-            locked_agent.clone(),
-            None,
-            vec![EndpointScope::RunsCreate],
-        ),
+        work_order: daemon_run_work_order(locked_tenant.clone(), locked_agent.clone(), None),
         credential: Some(credential(
             locked_tenant.clone(),
             vec![EndpointScope::RunsCreate],
@@ -1053,7 +1072,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         policy_actions: Vec::new(),
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: daemon_registered_actions(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: Vec::new(),
@@ -3037,11 +3056,10 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         idempotency_key: "idem_final_cross_primitive_journey".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: orchestrator.clone(),
-        work_order: daemon_work_order(
+        work_order: daemon_run_work_order(
             tenant_id.clone(),
             orchestrator.clone(),
             Some(run_id.clone()),
-            vec![EndpointScope::RunsCreate],
         ),
         credential: None,
         audit_attribution: Some(attribution(false)),
@@ -3058,7 +3076,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: daemon_registered_actions(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.final_journey.v1".to_string()],

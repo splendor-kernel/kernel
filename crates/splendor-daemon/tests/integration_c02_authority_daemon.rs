@@ -93,7 +93,7 @@ fn replay_credential(tenant_id: TenantId) -> CallerCredential {
     }
 }
 
-fn resident_credential(instance_id: InstanceId, tenant_id: TenantId) -> CallerCredential {
+fn resident_credential_metadata(instance_id: InstanceId, tenant_id: TenantId) -> CallerCredential {
     CallerCredential {
         credential_id: format!("cred_c02_resident_{}", TraceId::new()),
         principal: ClientPrincipal::new("app_c02_resident", "client_c02_resident"),
@@ -160,6 +160,15 @@ fn signed_work_order(
         b"splendor-local-work-order-secret",
     )
     .expect("signed work order")
+}
+
+fn resign_local_work_order(envelope: &mut WorkOrderEnvelope) {
+    *envelope = WorkOrderEnvelope::signed_with_shared_secret(
+        envelope.work_order.clone(),
+        "work-order-local-key",
+        b"splendor-local-work-order-secret",
+    )
+    .expect("re-signed local work order");
 }
 
 fn create_request(
@@ -668,13 +677,82 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
 }
 
 #[tokio::test]
-async fn resident_daemon_requires_scoped_credentials_and_preserves_c02_effect_authority() {
+async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+
+    let mut narrowed = create_request(
+        "wo_c02_narrowed_profile",
+        tenant_id.clone(),
+        agent_id.clone(),
+        OffsetDateTime::now_utc() + Duration::minutes(5),
+        false,
+    );
+    narrowed
+        .work_order
+        .work_order
+        .allowed_permissions
+        .push("fixture.audit".to_string());
+    resign_local_work_order(&mut narrowed.work_order);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, "/runs", narrowed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "trusted_action_profile_permission_mismatch");
+
+    let mut ambiguous = create_request(
+        "wo_c02_ambiguous_adapter",
+        tenant_id.clone(),
+        agent_id.clone(),
+        OffsetDateTime::now_utc() + Duration::minutes(5),
+        false,
+    );
+    ambiguous
+        .work_order
+        .work_order
+        .allowed_adapters
+        .push("fixture.secondary".to_string());
+    resign_local_work_order(&mut ambiguous.work_order);
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, "/runs", ambiguous).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "ambiguous_work_order_action_adapter_profile");
+
+    for (label, permissions, expected_code) in [
+        (
+            "duplicate_permissions",
+            vec![PERMISSION.to_string(), PERMISSION.to_string()],
+            "registered_action_required_permissions_duplicate",
+        ),
+        (
+            "permission_limit",
+            vec![PERMISSION.to_string(); 65],
+            "registered_action_required_permissions_limit_exceeded",
+        ),
+    ] {
+        let mut invalid = create_request(
+            &format!("wo_c02_{label}"),
+            tenant_id.clone(),
+            agent_id.clone(),
+            OffsetDateTime::now_utc() + Duration::minutes(5),
+            false,
+        );
+        invalid.registered_actions[0].required_permissions = Some(permissions);
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json(app.clone(), Method::POST, "/runs", invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_eq!(error.code, expected_code, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
     let instance_id = InstanceId::new();
     let state = DaemonState::new(DaemonConfig::resident(instance_id.clone()));
     let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
-    let credential = resident_credential(instance_id.clone(), tenant_id.clone());
+    let credential = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
     let mut create = create_request(
         "wo_c02_resident",
         tenant_id.clone(),
@@ -766,7 +844,7 @@ async fn resident_daemon_requires_scoped_credentials_and_preserves_c02_effect_au
             .expect("resident replay authority count"),
         evaluations_before_replay
     );
-    let read_credential = resident_credential(instance_id.clone(), tenant_id.clone());
+    let read_credential = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
     let (status, inspected): (StatusCode, RunInspectResponse) = call_empty_with_credential(
         app.clone(),
         Method::GET,
@@ -778,7 +856,7 @@ async fn resident_daemon_requires_scoped_credentials_and_preserves_c02_effect_au
     assert_eq!(inspected.adapter_executions, 2);
 
     let invalid_cases = {
-        let valid = resident_credential(instance_id.clone(), tenant_id.clone());
+        let valid = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
         let mut wrong_tenant = valid.clone();
         wrong_tenant.binding = CredentialBinding::Tenant {
             tenant_id: TenantId::new(),

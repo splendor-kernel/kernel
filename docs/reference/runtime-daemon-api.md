@@ -86,9 +86,12 @@ Run admission also derives one immutable trusted action profile per action. The
 profile binds the action to its effective adapter and exact permission set before
 any requester or policy candidate reaches live authority evaluation. An omitted
 `RegisteredAction.required_permissions` field means the full signed work-order
-permission set. It never means an empty set; an explicit empty array declares no
-required permission operations. Work orders with multiple adapters must register
-the action/adapter pairing explicitly.
+permission set. When present, the field must contain that same complete set,
+without duplicates and with at most 64 entries; it cannot narrow authority
+operations. Because the current work-order schema has independent action and
+adapter lists but no signed exact pairing, a work order allowing multiple adapters
+is rejected with `ambiguous_work_order_action_adapter_profile` rather than trusting
+a caller-selected Cartesian pair.
 
 The runtime daemon API was originally the 0.02-S5 local control boundary for
 Splendor runs.
@@ -302,7 +305,8 @@ OutcomeRecorded
 
 For an allowed C02-protected effect, `ActionVerificationCompleted` is durably
 appended by the gateway after all pre-effect verifiers allow, after an atomic
-final authority permit re-check, and before the adapter is called. The permit is
+final authority permit re-check, and after final receipt validation plus atomic
+one-use consumption, but before the adapter is called. The permit is
 held through evidence recording and adapter execution. Expiry or revocation
 before permit acquisition denies; revocation closes new admission and waits for
 earlier permitted effects to leave the adapter boundary. Its
@@ -322,8 +326,11 @@ is not current authority. When the live C02 evaluation is conditional, the
 gateway regenerates the current action decision and passes it with the raw
 receipts to `LocalAuthorityObligationVerifier`; missing, forged, stale, revoked,
 replayed, extra/missing per-decision, or mismatched receipts fail closed. Raw
-receipts are partitioned by exact decision ID, capped at 64 per action request,
-and are not fresh authority. Current signed-work-order compatibility
+receipts are first checked against the complete current conditional-decision set;
+no unknown decision receipt is ignored. They are then partitioned by exact
+decision ID, capped at 64 per action request, validated only after all blocking
+verifiers and the final authority check, and consumed atomically as one collection.
+They are not fresh authority. Current signed-work-order compatibility
 grants contain no obligations, so receipt issuance/provider workflows remain
 downstream C01/AUTH-004 adoption rather than daemon-owned behavior.
 
@@ -377,6 +384,9 @@ Required 0.02-S5 failures include:
 | Resume from `waiting_for_approval` without evidence | `403` | `approval_required` |
 | Gateway denial | `200` with `ActionOutcome.status = Denied` | action outcome |
 | Governance intervention required | `200` with `ActionOutcome.status = NeedsIntervention` | action outcome |
+| Multiple unsigned action/adapter pairings | `400` | `ambiguous_work_order_action_adapter_profile` |
+| Narrowed registered permission profile | `400` | `trusted_action_profile_permission_mismatch` |
+| Duplicate/oversized registered permissions | `400` | `registered_action_required_permissions_duplicate` / `registered_action_required_permissions_limit_exceeded` |
 
 Gateway denials are action outcomes, not HTTP transport failures, because the
 gateway successfully evaluated and denied the requested action.
@@ -416,9 +426,11 @@ synthetic opaque local principal IDs because daemon admission does not yet recei
 C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
 with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
 watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, physical helper-plan
-adoption, or gold completion is claimed here. The current local and authenticated
-resident run-effect service path is complete as non-gold component evidence;
-C02 gold targets remain explicitly `not_exercised`.
+adoption, or gold completion is claimed here. The current local run-effect path
+and resident-mode metadata/scope composition are complete as non-gold component
+evidence. C02 does not cryptographically authenticate resident caller credentials;
+production caller authentication and principal proof binding remain deferred to
+C01. C02 gold targets remain explicitly `not_exercised`.
 
 Run 0.1 conformance validation from the repository root:
 

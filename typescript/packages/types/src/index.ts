@@ -1026,6 +1026,7 @@ export interface RunConfig {
 }
 
 export interface DaemonActionCandidate {
+  action_id?: ActionId | null;
   action: Action;
   adapter: string | null;
   quota_usage: QuotaUsage | null;
@@ -1349,12 +1350,60 @@ export interface ReplayResponse {
   authority_decisions: AuthorityDecisionReplayEvent[];
 }
 
+export const AUTHORITY_OPERATION_NAMESPACE_VALUES = [
+  "agent",
+  "workload",
+  "gateway",
+  "data",
+  "artifact",
+  "state",
+  "driver",
+  "network",
+  "device",
+  "change",
+  "compatibility"
+] as const;
+export type AuthorityOperationNamespace = (typeof AUTHORITY_OPERATION_NAMESPACE_VALUES)[number];
+
+export const AUTHORITY_RESOURCE_KIND_VALUES = [
+  "agent",
+  "workload",
+  "action",
+  "adapter",
+  "permission",
+  "data",
+  "artifact",
+  "state_partition",
+  "driver_operation",
+  "network",
+  "device",
+  "change"
+] as const;
+export type AuthorityResourceKind = (typeof AUTHORITY_RESOURCE_KIND_VALUES)[number];
+
+export const AUTHORITY_VERB_VALUES = [
+  "invoke",
+  "use",
+  "read",
+  "write",
+  "publish",
+  "train",
+  "evaluate",
+  "admit",
+  "delegate",
+  "egress",
+  "actuate",
+  "propose",
+  "activate"
+] as const;
+export type AuthorityVerb = (typeof AUTHORITY_VERB_VALUES)[number];
+
 export interface GatewayAuthorityDecisionSummary {
   decision_id: string;
   status: "allowed" | "denied" | "conditional" | "needs_approval" | "needs_intervention";
-  namespace: string;
-  resource_kind: string;
-  verb: string;
+  namespace: AuthorityOperationNamespace;
+  resource_kind: AuthorityResourceKind;
+  verb: AuthorityVerb;
   decision_digest: string;
   reason_codes: string[];
   matched_grant_ids: string[];

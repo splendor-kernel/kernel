@@ -11,13 +11,17 @@
   authority allow evidence before adapter execution, and expose inspect-only
   replay summaries. Gold evidence remains `not_exercised`.
 - Completed the non-gold production-local C02 service path for current local and
-  authenticated resident daemon run effects: immutable action/adapter/exact-
+  resident-mode daemon run effects: immutable action/adapter/exact-
   permission profiles prevent permission omission and adapter recombination;
   a final owned effect permit closes expiry/revocation TOCTOU races; revocation
   waits for earlier permitted adapter calls; scheduler authority traces retain
-  one tick identity; and conditional receipts are exact, bounded, one-use, closed
-  Rust/OpenAPI objects with TypeScript/OpenAPI parity tests. Future privileged
-  planes and all gold cases remain downstream/not exercised.
+  one tick identity; and conditional receipts reject every unknown extra, validate
+  after blocking verifiers, and atomically consume once before evidence/adapter.
+  Registered profiles require the complete signed permission set and ambiguous
+  multi-adapter work orders fail admission. Closed Rust/OpenAPI objects and exact
+  TypeScript authority unions have parity tests. Resident credential tests cover
+  metadata/scope checks only; production authentication remains deferred to C01.
+  Future privileged planes and all gold cases remain downstream/not exercised.
 - Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
   matrices for authority operation/scope/grant/request/revocation/policy
   contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and

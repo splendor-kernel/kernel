@@ -3101,6 +3101,51 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GatewayAuthorityDecisionSummary'
+    AuthorityOperationNamespace:
+      type: string
+      enum:
+        - agent
+        - workload
+        - gateway
+        - data
+        - artifact
+        - state
+        - driver
+        - network
+        - device
+        - change
+        - compatibility
+    AuthorityResourceKind:
+      type: string
+      enum:
+        - agent
+        - workload
+        - action
+        - adapter
+        - permission
+        - data
+        - artifact
+        - state_partition
+        - driver_operation
+        - network
+        - device
+        - change
+    AuthorityVerb:
+      type: string
+      enum:
+        - invoke
+        - use
+        - read
+        - write
+        - publish
+        - train
+        - evaluate
+        - admit
+        - delegate
+        - egress
+        - actuate
+        - propose
+        - activate
     GatewayAuthorityDecisionSummary:
       type: object
       required: [decision_id, status, namespace, resource_kind, verb, decision_digest, reason_codes, matched_grant_ids, obligation_ids]
@@ -3112,11 +3157,11 @@ components:
           type: string
           enum: [allowed, denied, conditional, needs_approval, needs_intervention]
         namespace:
-          type: string
+          $ref: '#/components/schemas/AuthorityOperationNamespace'
         resource_kind:
-          type: string
+          $ref: '#/components/schemas/AuthorityResourceKind'
         verb:
-          type: string
+          $ref: '#/components/schemas/AuthorityVerb'
         decision_digest:
           type: string
         reason_codes:

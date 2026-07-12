@@ -46,7 +46,7 @@ use splendor_types::{
     ValidatedWorkOrder, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
     WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -246,7 +246,8 @@ impl DaemonConfig {
         }
     }
 
-    /// Authenticated resident daemon configuration for acceptance/fleet tests.
+    /// Resident-mode daemon configuration for metadata/scope boundary tests.
+    /// Caller credential cryptographic authentication remains a C01 concern.
     pub fn resident(instance_id: splendor_types::InstanceId) -> Self {
         let mut config = Self::local_dev();
         config.expected_audience = CredentialAudience::Instance { instance_id };
@@ -1461,6 +1462,7 @@ fn ensure_request_does_not_widen_work_order(
     )?;
 
     for registration in &request.registered_actions {
+        validate_registered_action_permissions(registration)?;
         ensure_member(
             "registered_action.name",
             &registration.name,
@@ -1538,6 +1540,28 @@ fn ensure_member(field: &str, value: &str, allowed: &[String]) -> Result<(), Api
         "work_order_scope_widening",
         format!("{field} `{value}` is not authorized by the signed work order"),
     ))
+}
+
+fn validate_registered_action_permissions(registration: &RegisteredAction) -> Result<(), ApiError> {
+    let Some(required_permissions) = registration.required_permissions.as_ref() else {
+        return Ok(());
+    };
+    if required_permissions.len() > 64 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "registered_action_required_permissions_limit_exceeded",
+            "registered action required_permissions cannot contain more than 64 entries",
+        ));
+    }
+    let unique = required_permissions.iter().collect::<HashSet<_>>();
+    if unique.len() != required_permissions.len() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "registered_action_required_permissions_duplicate",
+            "registered action required_permissions cannot contain duplicates",
+        ));
+    }
+    Ok(())
 }
 
 fn work_order_error(error: WorkOrderValidationError) -> ApiError {
@@ -4165,16 +4189,33 @@ fn action_profiles_for_request(
     request: &CreateRunRequest,
     work_order: &WorkOrder,
 ) -> Result<Vec<splendor_gateway::TrustedActionProfile>, ApiError> {
+    if work_order.allowed_adapters.len() > 1 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "ambiguous_work_order_action_adapter_profile",
+            "signed work orders with multiple adapters require a signed or server-owned exact action pairing",
+        ));
+    }
+    let full_required_permissions =
+        normalized_permission_set(work_order.allowed_permissions.clone());
     let mut profiles = HashMap::new();
     for registration in &request.registered_actions {
-        let required_permissions = registration
-            .required_permissions
-            .clone()
-            .unwrap_or_else(|| work_order.allowed_permissions.clone());
+        validate_registered_action_permissions(registration)?;
+        if let Some(required_permissions) = registration.required_permissions.as_ref() {
+            if normalized_permission_set(required_permissions.clone()) != full_required_permissions
+                || required_permissions.len() != full_required_permissions.len()
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "trusted_action_profile_permission_mismatch",
+                    "registered action permissions must equal the full signed work-order permission set",
+                ));
+            }
+        }
         let profile = splendor_gateway::TrustedActionProfile {
             action_name: registration.name.clone(),
             adapter: registration.adapter.clone(),
-            required_permissions: normalized_permission_set(required_permissions),
+            required_permissions: full_required_permissions.clone(),
         };
         if profiles
             .insert(registration.name.clone(), profile)
@@ -4190,25 +4231,16 @@ fn action_profiles_for_request(
     let fallback_adapter = match work_order.allowed_adapters.as_slice() {
         [adapter] => adapter.clone(),
         [] => "daemon.local".to_string(),
-        _ => String::new(),
+        _ => unreachable!("multiple adapters rejected above"),
     };
     for action_name in &work_order.allowed_actions {
         if !profiles.contains_key(action_name) {
-            if fallback_adapter.is_empty() {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "trusted_action_profile_required",
-                    "each action requires an explicit adapter profile when multiple adapters are allowed",
-                ));
-            }
             profiles.insert(
                 action_name.clone(),
                 splendor_gateway::TrustedActionProfile {
                     action_name: action_name.clone(),
                     adapter: fallback_adapter.clone(),
-                    required_permissions: normalized_permission_set(
-                        work_order.allowed_permissions.clone(),
-                    ),
+                    required_permissions: full_required_permissions.clone(),
                 },
             );
         }
@@ -5963,12 +5995,58 @@ mod tests {
             "trusted_action_profile_permission_mismatch"
         );
 
+        let mut narrowed_registration = request.clone();
+        narrowed_registration.registered_actions = vec![RegisteredAction {
+            name: "policy_only".to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
+        }];
+        let error = action_profiles_for_request(&narrowed_registration, &permission_work_order)
+            .expect_err("registered profile cannot narrow signed permissions");
+        assert_eq!(
+            error.body.code,
+            "trusted_action_profile_permission_mismatch"
+        );
+
+        let mut duplicate_permissions = request.clone();
+        duplicate_permissions.registered_actions = vec![RegisteredAction {
+            name: "policy_only".to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(vec!["unit.write".to_string(); 2]),
+        }];
+        let error = action_profiles_for_request(&duplicate_permissions, &permission_work_order)
+            .expect_err("duplicate registered permissions must fail admission");
+        assert_eq!(
+            error.body.code,
+            "registered_action_required_permissions_duplicate"
+        );
+
+        let mut excessive_permissions = request.clone();
+        excessive_permissions.registered_actions = vec![RegisteredAction {
+            name: "policy_only".to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(
+                (0..65)
+                    .map(|index| format!("unit.permission.{index}"))
+                    .collect(),
+            ),
+        }];
+        let error = action_profiles_for_request(&excessive_permissions, &permission_work_order)
+            .expect_err("oversized registered permissions must fail admission");
+        assert_eq!(
+            error.body.code,
+            "registered_action_required_permissions_limit_exceeded"
+        );
+
         let mut multi_adapter_work_order = work_order.clone();
         multi_adapter_work_order.allowed_adapters =
             vec!["daemon.local".to_string(), "daemon.secondary".to_string()];
         let error = action_profiles_for_request(&request, &multi_adapter_work_order)
-            .expect_err("multiple adapters require explicit action profiles");
-        assert_eq!(error.body.code, "trusted_action_profile_required");
+            .expect_err("unsigned action pairing cannot disambiguate multiple adapters");
+        assert_eq!(
+            error.body.code,
+            "ambiguous_work_order_action_adapter_profile"
+        );
 
         let mut direct_registration_request = request.clone();
         direct_registration_request.policy_actions = vec![DaemonActionCandidate {
