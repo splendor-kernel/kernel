@@ -395,6 +395,7 @@ pub enum AuthorityObligationKind {
 /// it against trusted owning-service context before any receipt can satisfy an
 /// obligation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityObligationReceiptValidation {
     /// Validation mode for this bounded slice.
     pub validation_kind: AuthorityObligationReceiptValidationKind,
@@ -423,6 +424,7 @@ pub enum AuthorityObligationReceiptValidationKind {
 /// unless `splendor-authority` wraps them as validated receipts using a trusted
 /// owning-service context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityObligationReceipt {
     /// Receipt schema version.
     pub schema_version: String,

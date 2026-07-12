@@ -251,6 +251,7 @@ fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionReques
         tenant_id: cache_owner().tenant_id,
         agent_id: cache_owner().agent_id,
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params: serde_json::json!({}),

@@ -19,9 +19,12 @@ import type {
   ApprovalDenial,
   ApprovalGrant,
   ApprovalRequest,
+  AuthorityObligationReceipt,
+  AuthorityObligationReceiptValidation,
   ExternalApprovalMapping,
   ExternalGovernanceAdapterContract,
-  GovernedArtifactRef
+  GovernedArtifactRef,
+  RegisteredAction
 } from "@splendor/types";
 
 const repoRoot = process.cwd();
@@ -251,6 +254,88 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.health_response, extractStructFields(daemon, "HealthResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.version_response, extractStructFields(daemon, "VersionResponse"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.capabilities_response, extractStructFields(daemon, "CapabilitiesResponse"));
+});
+
+test("C02 obligation receipt and trusted action profile contracts stay exact", () => {
+  const authority = readRepoFile("crates/splendor-types/src/authority.rs");
+  const openapi = readRepoFile("openapi/splendor-runtime-daemon.yaml");
+  const receiptFields = [
+    "schema_version",
+    "receipt_id",
+    "issuer",
+    "audience",
+    "obligation_id",
+    "kind",
+    "subject",
+    "authority_decision_id",
+    "canonical_request_digest",
+    "evidence_digest",
+    "evidence_ref",
+    "issued_at",
+    "expires_at",
+    "revocation",
+    "revocation_ref",
+    "approval_id",
+    "approval_trace_event_id",
+    "validation"
+  ];
+  const validationFields = ["validation_kind", "algorithm", "key_id", "digest", "signature"];
+
+  assert.deepEqual(extractStructFields(authority, "AuthorityObligationReceipt"), receiptFields);
+  assert.deepEqual(
+    extractStructFields(authority, "AuthorityObligationReceiptValidation"),
+    validationFields
+  );
+  for (const [schema, fields] of [
+    ["AuthorityObligationReceipt", receiptFields],
+    ["AuthorityObligationReceiptValidation", validationFields]
+  ] as const) {
+    const block = extractOpenApiSchemaBlock(openapi, schema);
+    assert.match(block, /additionalProperties: false/);
+    for (const field of fields) assert.match(block, new RegExp(`^        ${field}:`, "m"));
+  }
+  assert.match(extractOpenApiSchemaBlock(openapi, "DaemonActionCandidate"), /maxItems: 64/);
+  assert.match(extractOpenApiSchemaBlock(openapi, "SubmitActionRequest"), /maxItems: 64/);
+  assert.match(extractOpenApiSchemaBlock(openapi, "RegisteredAction"), /additionalProperties: false/);
+
+  const validation: AuthorityObligationReceiptValidation = {
+    validation_kind: "local_signature",
+    algorithm: "local-obligation-receipt-v1",
+    key_id: "key-1",
+    digest: "blake3:digest",
+    signature: "blake3:signature"
+  };
+  const receipt: AuthorityObligationReceipt = {
+    schema_version: "splendor.authority_obligation_receipt.v1",
+    receipt_id: "00000000-0000-4000-8000-000000000001" as AuthorityObligationReceipt["receipt_id"],
+    issuer: "00000000-0000-4000-8000-000000000002" as AuthorityObligationReceipt["issuer"],
+    audience: "daemon:local",
+    obligation_id: "00000000-0000-4000-8000-000000000003" as AuthorityObligationReceipt["obligation_id"],
+    kind: "human_review",
+    subject: "00000000-0000-4000-8000-000000000004" as AuthorityObligationReceipt["subject"],
+    authority_decision_id: "00000000-0000-4000-8000-000000000005" as AuthorityObligationReceipt["authority_decision_id"],
+    canonical_request_digest: "blake3:request",
+    evidence_digest: "blake3:evidence",
+    issued_at: "2026-07-12T00:00:00Z",
+    expires_at: "2026-07-12T00:05:00Z",
+    revocation: "active",
+    revocation_ref: "revocation:receipt-1",
+    validation
+  };
+  const profile: RegisteredAction = {
+    name: "fixture.write",
+    adapter: "fixture.local",
+    required_permissions: ["fixture.write"]
+  };
+  assert.equal(receipt.kind, "human_review");
+  assert.deepEqual(profile.required_permissions, ["fixture.write"]);
+
+  const invalidValidation: AuthorityObligationReceiptValidation = {
+    ...validation,
+    // @ts-expect-error validation contract rejects unknown credential fields
+    credential: "secret"
+  };
+  assert.equal(invalidValidation.validation_kind, "local_signature");
 });
 
 test("TypeScript governance approval statuses mirror Rust object validators", () => {

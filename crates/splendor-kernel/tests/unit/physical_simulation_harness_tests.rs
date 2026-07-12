@@ -149,6 +149,7 @@ impl PhysicalSimulationHarness {
                 tenant_id: self.tenant_id.clone(),
                 agent_id: self.agent_id.clone(),
                 run_id: self.run_id.clone(),
+                tick_id: None,
                 action: action.clone(),
                 adapter: Some(ROBOTICS_ADAPTER_ID.to_string()),
                 quota_usage: QuotaUsage::single_action(),

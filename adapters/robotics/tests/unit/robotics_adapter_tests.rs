@@ -39,6 +39,7 @@ fn request(name: &str) -> splendor_gateway::ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params: serde_json::json!({"physical_action": true, "target_ref": "zone:A"}),

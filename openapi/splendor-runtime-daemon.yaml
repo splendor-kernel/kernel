@@ -2512,18 +2512,103 @@ components:
             type: string
         authority_obligation_receipts:
           type: array
+          maxItems: 64
           description: Raw non-authorizing receipts validated only against a regenerated live C02 conditional decision.
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/AuthorityObligationReceipt'
     RegisteredAction:
       type: object
+      additionalProperties: false
       required: [name, adapter]
       properties:
         name:
           type: string
         adapter:
           type: string
+        required_permissions:
+          type: array
+          uniqueItems: true
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+    AuthorityObligationReceiptValidation:
+      type: object
+      additionalProperties: false
+      required: [validation_kind, algorithm, key_id, digest, signature]
+      properties:
+        validation_kind:
+          type: string
+          enum: [local_signature]
+        algorithm:
+          type: string
+          minLength: 1
+        key_id:
+          type: string
+          minLength: 1
+        digest:
+          type: string
+          minLength: 1
+        signature:
+          type: string
+          minLength: 1
+    AuthorityObligationReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema_version, receipt_id, issuer, audience, obligation_id, kind, subject, authority_decision_id, canonical_request_digest, evidence_digest, issued_at, expires_at, revocation, revocation_ref, validation]
+      properties:
+        schema_version:
+          type: string
+          minLength: 1
+        receipt_id:
+          type: string
+          format: uuid
+        issuer:
+          type: string
+          format: uuid
+        audience:
+          type: string
+          minLength: 1
+        obligation_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [approval_required, mfa_assurance, dedicated_isolation, network_deny, human_review, independent_evaluator, local_safety_verifier, postcondition_check, maximum_blast_radius, redaction_required, local_only, simulation_only, evidence_required]
+        subject:
+          type: string
+          format: uuid
+        authority_decision_id:
+          type: string
+          format: uuid
+        canonical_request_digest:
+          type: string
+          minLength: 1
+        evidence_digest:
+          type: string
+          minLength: 1
+        evidence_ref:
+          type: string
+          minLength: 1
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revocation:
+          $ref: '#/components/schemas/RevocationStatus'
+        revocation_ref:
+          type: string
+          minLength: 1
+        approval_id:
+          type: string
+          format: uuid
+        approval_trace_event_id:
+          type: string
+          format: uuid
+        validation:
+          $ref: '#/components/schemas/AuthorityObligationReceiptValidation'
     TraceRecord:
       type: object
       required: [run_id, sequence, payload, recorded_at, event_hash, prev_event_hash]
@@ -3110,10 +3195,10 @@ components:
             - $ref: '#/components/schemas/ApprovalEvidence'
         authority_obligation_receipts:
           type: array
+          maxItems: 64
           description: Raw non-authorizing receipts; requester-supplied authority decisions are ignored by the live C02 path.
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/AuthorityObligationReceipt'
     HealthResponse:
       type: object
       required: [status, local_only, runtime_available]

@@ -90,7 +90,10 @@ pub use revocation::{
     REASON_AUTHORITY_REVOCATION_SNAPSHOT_MISSING, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
     REASON_AUTHORITY_SCOPE_MISMATCH,
 };
-pub use run_authority::{LocalRunAuthorityAdmissionError, LocalSignedWorkOrderRunAuthority};
+pub use run_authority::{
+    LocalRunAuthorityAdmissionError, LocalRunAuthorityEffectPermit,
+    LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
+};
 
 #[cfg(test)]
 #[path = "../tests/unit/adversarial_property_tests.rs"]

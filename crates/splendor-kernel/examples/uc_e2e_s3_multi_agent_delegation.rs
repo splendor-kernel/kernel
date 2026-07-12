@@ -767,6 +767,7 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         tenant_id: input.tenant_id,
         agent_id: input.agent_id,
         run_id: input.run_id,
+        tick_id: None,
         action: Action {
             name: input.name.to_string(),
             params: serde_json::json!({"ref": format!("fixture:{}", input.name)}),

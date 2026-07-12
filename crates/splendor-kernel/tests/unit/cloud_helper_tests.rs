@@ -127,6 +127,7 @@ fn accepted_helper_plan_still_executes_only_through_local_gateway() {
             tenant_id,
             agent_id,
             run_id,
+            tick_id: None,
             action: validation.bounded_actions[0].clone(),
             adapter: Some("robotics".to_string()),
             quota_usage: QuotaUsage::single_action(),

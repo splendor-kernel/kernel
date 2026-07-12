@@ -23,6 +23,10 @@ export type InterventionId = string;
 export type CircuitBreakerId = string;
 export type KillSwitchId = string;
 export type PolicyBundleId = string;
+export type PrincipalId = string;
+export type AuthorityDecisionId = string;
+export type AuthorityObligationId = string;
+export type AuthorityObligationReceiptId = string;
 
 export const CIRCUIT_BREAKER_SCHEMA_VERSION = "splendor.circuit_breaker.v1" as const;
 
@@ -261,7 +265,51 @@ export interface ApprovalEvidence {
 
 export interface GatewayAuthorityObligationEvidence {
   decision: JsonValue;
-  receipts: JsonValue[];
+  receipts: AuthorityObligationReceipt[];
+}
+
+export type AuthorityObligationKind =
+  | "approval_required"
+  | "mfa_assurance"
+  | "dedicated_isolation"
+  | "network_deny"
+  | "human_review"
+  | "independent_evaluator"
+  | "local_safety_verifier"
+  | "postcondition_check"
+  | "maximum_blast_radius"
+  | "redaction_required"
+  | "local_only"
+  | "simulation_only"
+  | "evidence_required";
+
+export interface AuthorityObligationReceiptValidation {
+  validation_kind: "local_signature";
+  algorithm: string;
+  key_id: string;
+  digest: string;
+  signature: string;
+}
+
+export interface AuthorityObligationReceipt {
+  schema_version: string;
+  receipt_id: AuthorityObligationReceiptId;
+  issuer: PrincipalId;
+  audience: string;
+  obligation_id: AuthorityObligationId;
+  kind: AuthorityObligationKind;
+  subject: PrincipalId;
+  authority_decision_id: AuthorityDecisionId;
+  canonical_request_digest: string;
+  evidence_digest: string;
+  evidence_ref?: string;
+  issued_at: ISODateTime;
+  expires_at: ISODateTime;
+  revocation: RevocationStatus;
+  revocation_ref: string;
+  approval_id?: ApprovalId;
+  approval_trace_event_id?: TraceEventId;
+  validation: AuthorityObligationReceiptValidation;
 }
 
 export interface ApprovalTraceContext {
@@ -922,6 +970,7 @@ export interface ActionRequest {
   tenant_id: TenantId;
   agent_id: AgentId;
   run_id: RunId;
+  tick_id?: TickId;
   action: Action;
   adapter: string | null;
   quota_usage: QuotaUsage;
@@ -929,7 +978,7 @@ export interface ActionRequest {
   requested_at: ISODateTime;
   approval_evidence: ApprovalEvidence | null;
   authority_obligation_evidence: GatewayAuthorityObligationEvidence | null;
-  authority_obligation_receipts?: JsonValue[];
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface ActionOutcome {
@@ -981,12 +1030,13 @@ export interface DaemonActionCandidate {
   adapter: string | null;
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
-  authority_obligation_receipts?: JsonValue[];
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface RegisteredAction {
   name: string;
   adapter: string;
+  required_permissions?: string[];
 }
 
 export interface TenantConfig {
@@ -1360,7 +1410,7 @@ export interface SubmitActionRequest {
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
   approval_evidence: ApprovalEvidence | null;
-  authority_obligation_receipts?: JsonValue[];
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface HealthResponse {
@@ -1424,6 +1474,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "tenant_id",
     "agent_id",
     "run_id",
+    "tick_id",
     "action",
     "adapter",
     "quota_usage",

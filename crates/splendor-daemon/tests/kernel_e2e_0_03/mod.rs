@@ -713,6 +713,29 @@ fn daemon_action(name: &str) -> Action {
     }
 }
 
+fn daemon_registered_actions() -> Vec<RegisteredAction> {
+    [
+        ("allowed_action", "daemon.local", Vec::new()),
+        ("failing_action", "daemon.local", Vec::new()),
+        ("denied_action", "daemon.local", Vec::new()),
+        ("finance.query", "sql", vec!["finance.read".to_string()]),
+        (
+            "artifact.create",
+            "artifact-store",
+            vec!["artifact.create".to_string()],
+        ),
+        ("message.send", "remote.message", Vec::new()),
+        ("state.handoff", "state", vec!["state.read".to_string()]),
+    ]
+    .into_iter()
+    .map(|(name, adapter, required_permissions)| RegisteredAction {
+        name: name.to_string(),
+        adapter: adapter.to_string(),
+        required_permissions: Some(required_permissions),
+    })
+    .collect()
+}
+
 fn daemon_percept(schema: &str) -> Percept {
     Percept {
         schema: schema.to_string(),
@@ -800,7 +823,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.kernel_e2e.v1".to_string()],
@@ -1030,7 +1053,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         policy_actions: Vec::new(),
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: Vec::new(),
@@ -3035,7 +3058,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.final_journey.v1".to_string()],
@@ -3739,6 +3762,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         registered_actions: vec![RegisteredAction {
             name: "fixture.allowed".to_string(),
             adapter: "fixture".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),

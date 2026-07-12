@@ -10,6 +10,14 @@
   permission operations, fail closed on live expiry/revocation, persist redacted
   authority allow evidence before adapter execution, and expose inspect-only
   replay summaries. Gold evidence remains `not_exercised`.
+- Completed the non-gold production-local C02 service path for current local and
+  authenticated resident daemon run effects: immutable action/adapter/exact-
+  permission profiles prevent permission omission and adapter recombination;
+  a final owned effect permit closes expiry/revocation TOCTOU races; revocation
+  waits for earlier permitted adapter calls; scheduler authority traces retain
+  one tick identity; and conditional receipts are exact, bounded, one-use, closed
+  Rust/OpenAPI objects with TypeScript/OpenAPI parity tests. Future privileged
+  planes and all gold cases remain downstream/not exercised.
 - Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
   matrices for authority operation/scope/grant/request/revocation/policy
   contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and
@@ -49,10 +57,12 @@
 
 ### Explicitly not included
 
-- No new authorizing schema version, TypeScript/OpenAPI parity change, policy
-  cache persistence/fleet redesign, resident persistence/watch, canonical
+- No new authorizing schema version, policy cache persistence/fleet redesign,
+  resident persistence/watch, canonical
   historical-signature migration seam, or broad rolling-version compatibility
-  claim. The in-memory cache state and public Rust mutation API did change.
+  claim. The additive exact receipt/profile/tick contract fields and parity tests
+  are limited to the current C02 daemon effect path. The in-memory cache state and
+  public Rust mutation API did change.
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.

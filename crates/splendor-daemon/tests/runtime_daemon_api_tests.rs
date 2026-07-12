@@ -636,7 +636,11 @@ fn assert_trace_records_preserve_identity_and_reasons(
                 .payload
                 .pointer("/kind/ActionDenied/result/reasons")
                 .and_then(Value::as_array)
-                .is_some_and(|reasons| reasons.iter().any(|reason| reason == "action_not_allowed"))
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason == "trusted_action_profile_missing")
+                })
         }),
         "denial reason should remain visible"
     );
@@ -1259,7 +1263,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
         .verification
         .reasons
         .iter()
-        .any(|reason| reason == "action_not_allowed"));
+        .any(|reason| reason == "trusted_action_profile_missing"));
 
     let (status, redacted_read): (StatusCode, TracePageResponse) = call_empty(
         app.clone(),
@@ -1355,6 +1359,7 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
             vec![RegisteredAction {
                 name: "allowed_action".to_string(),
                 adapter: "daemon.local".to_string(),
+                required_permissions: Some(Vec::new()),
             }],
         ))
         .expect("create request"),
@@ -2208,6 +2213,7 @@ async fn policy_sync_revocation_watermark_and_exact_retry_reconnect_attacks_fail
         vec![RegisteredAction {
             name: "allowed_action".to_string(),
             adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     create.policy_bundle_required = true;
@@ -2423,6 +2429,7 @@ async fn policy_sync_trace_failures_do_not_commit_authority_or_reconnect() {
         vec![RegisteredAction {
             name: "allowed_action".to_string(),
             adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     create.policy_bundle_required = true;
@@ -2561,6 +2568,7 @@ async fn revocation_trace_stage_failures_latch_pending_deny_and_reconcile_on_ret
             vec![RegisteredAction {
                 name: "allowed_action".to_string(),
                 adapter: "daemon.local".to_string(),
+                required_permissions: Some(Vec::new()),
             }],
         );
         create.policy_bundle_required = true;
@@ -3695,6 +3703,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         vec![RegisteredAction {
             name: "extra_action".to_string(),
             adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     widened_registration_name.allowed_actions.clear();
@@ -3715,6 +3724,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
         vec![RegisteredAction {
             name: "allowed_action".to_string(),
             adapter: "extra.adapter".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     widened_registration.allowed_actions.clear();
@@ -3830,7 +3840,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         .verification
         .reasons
         .iter()
-        .any(|reason| reason == "permission_denied"));
+        .any(|reason| reason == "trusted_action_profile_permission_mismatch"));
     let disallowed_submit = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),
@@ -3859,7 +3869,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         .verification
         .reasons
         .iter()
-        .any(|reason| reason == "action_not_allowed"));
+        .any(|reason| reason == "trusted_action_profile_missing"));
     let (status, traces): (StatusCode, TracePageResponse) = call_empty(
         app,
         Method::GET,
@@ -3896,6 +3906,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         vec![RegisteredAction {
             name: "allowed_action".to_string(),
             adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     create.approval_policies = vec![approval_policy(&tenant_id, &agent_id, "allowed_action")];
@@ -4054,6 +4065,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         vec![RegisteredAction {
             name: "allowed_action".to_string(),
             adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
     );
     let mut expired_policy =

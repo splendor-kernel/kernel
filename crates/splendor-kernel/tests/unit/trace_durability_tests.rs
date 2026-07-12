@@ -48,6 +48,7 @@ fn request(side_effect_class: SideEffectClass) -> ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: "file.write".to_string(),
             params: serde_json::json!({"path": "out.txt"}),

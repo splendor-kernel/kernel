@@ -730,6 +730,7 @@ impl LoopEngine {
                     tenant_id: self.agent.tenant_id.clone(),
                     agent_id: self.agent.agent_id.clone(),
                     run_id: self.runtime.run_id().clone(),
+                    tick_id: Some(TickId::from(tick_id)),
                     action: action.clone(),
                     adapter: candidate.adapter.clone(),
                     quota_usage: candidate.usage,

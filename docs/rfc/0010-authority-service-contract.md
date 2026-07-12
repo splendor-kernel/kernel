@@ -8,7 +8,8 @@ implementation evidence slices plus bounded local `AUTH-006a` decision evidence
 and deterministic `AUTH-007a` adversarial/property plus `AUTH-007b` serialized
 mutation evidence, bounded `AUTH-007c` local-delegation confused-deputy replay
 evidence, bounded `AUTH-007d` exact-family version/cache-staleness evidence, and
-a production-local daemon/kernel/gateway C02 integration slice.
+a completed non-gold production-local daemon/kernel/gateway C02 service
+integration for the current run-effect surfaces.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -109,7 +110,10 @@ endpoint/request-response and trace-event wire shapes remain unchanged.
 Post-trace revocation commit races preserve the exact validated candidate and
 atomically latch it as pending deny-only evidence when it remains applicable;
 strictly newer active winners are not poisoned by obsolete revocation.
-It finalizes the production-local C02 effect path for current daemon runs. It
+It finalizes the non-gold production-local C02 service effect path for current
+daemon runs. This completion statement is limited to current local/resident
+daemon run effects; future Artifact, Driver, Data-Use, Evidence, Fleet, and
+physical helper-plan consumers remain explicit downstream adoption work. It
 does not claim all future privileged-plane adoption, full C01-backed issuance,
 full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
@@ -191,8 +195,10 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   testing, formal proof, external fixture publication, or full `AUTH-007` claim.
   `AUTH-007a` through `AUTH-007d` are bounded deterministic local
   corpora/integration evidence only. They do not cover Driver, Artifact Registry,
-  physical helper-plan, remote/fleet confused-deputy paths, a canonical
-  historical policy-signature migration seam, or TypeScript/OpenAPI parity.
+  physical helper-plan, remote/fleet confused-deputy paths, or a canonical
+  historical policy-signature migration seam. TypeScript/OpenAPI parity in this
+  slice is limited to the exact local receipt and registered-action profile
+  fields; it is not cross-language IAM/cache parity.
 - No closure claim for #182, #238, #239, #240, #241, #242, #243, or #244.
 
 ## Contract Overview
@@ -697,13 +703,43 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   `ActionAdapter::execute`. The recorder shares the loop runtime cursor. Missing
   or failed durable append returns `NeedsIntervention` with zero adapter calls;
   outer daemon/loop code does not append a duplicate post-effect completion event.
+- Admission derives an immutable trusted action profile for each work-order
+  action. The profile fixes the action name, effective adapter, and exact required
+  permission set. Request or policy permission omission, extra permissions,
+  duplicate permissions, and adapter/action recombination deny before live
+  authority evaluation. Multiple work-order adapters require an explicit profile
+  for each action rather than a first-adapter default.
+- After every other pre-effect verifier allows, the gateway re-evaluates the
+  exact typed operation tuple and acquires an owned final-effect permit. Expiry or
+  revocation before acquisition denies with zero adapter calls. Revocation closes
+  new permit admission and waits for earlier permitted adapter executions to
+  leave the boundary; a permit that linearized before expiry remains valid while
+  its required pre-effect evidence append and adapter call complete.
+  Existing custom evaluator implementations inherit a `NotRequired` final-permit
+  default for source compatibility; if they return an early live evaluation but
+  do not implement the final permit, the gateway returns `NeedsIntervention`.
 - Conditional live decisions regenerate the current decision in the gateway.
   Requesters may submit only raw receipts; requester-supplied decision envelopes
   are not the current authority. `LocalAuthorityObligationVerifier` validates the
   raw owning-service receipts against the regenerated action decision before the
   pre-effect evidence append. Current signed-work-order compatibility grants have
   no obligations; the conditional path is retained in production gateway code and
-  exercised by the real gateway verifier/adapter test.
+  exercised by the real gateway verifier/adapter test. Receipts are partitioned
+  by exact decision ID, validated per operation, capped at 64 per request, and
+  consumed once by the local verifier so replay cannot invoke the adapter.
+- Raw receipt, validation, and registered-action profile structs reject unknown
+  fields in Rust; OpenAPI marks those objects closed, and TypeScript/OpenAPI
+  parity tests cover exact fields and receipt bounds.
+  `RegisteredAction.required_permissions` is additive and
+  optional on the wire, but omission means the full signed work-order permission
+  set, not no permissions. An explicit empty array declares an action with no
+  required permission operations.
+- Scheduler-created `ActionRequest` values carry their `tick_id`; the started,
+  single pre-effect completion, and terminal action records for that action retain
+  the same tick identity and ordering.
+- The authenticated resident daemon path uses the same handle, profiles, final
+  permit, evidence recorder, and replay behavior. Wrong tenant binding, audience,
+  expiry, and revocation fail before run admission.
 - Inspect-only replay reads durable verification records, including effect-free
   denials, and returns redacted typed decision summaries and digests. Allowed
   decisions are durably recorded before the effect. Replay does not call authority evaluators,

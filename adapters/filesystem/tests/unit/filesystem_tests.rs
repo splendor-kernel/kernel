@@ -10,6 +10,7 @@ fn build_action(tenant_id: TenantId, name: &str, params: serde_json::Value) -> A
         tenant_id,
         agent_id: splendor_types::AgentId::new(),
         run_id: splendor_types::RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params,

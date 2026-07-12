@@ -87,6 +87,7 @@ fn build_action(name: &str, params: serde_json::Value) -> ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: splendor_types::AgentId::new(),
         run_id: splendor_types::RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params,

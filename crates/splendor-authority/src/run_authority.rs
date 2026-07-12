@@ -15,8 +15,8 @@ use splendor_types::{
     CapabilityGrantId, CapabilityRequest, CapabilityScope, PrincipalId, RunId, ValidatedWorkOrder,
     AUTHORITY_DECISION_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -30,8 +30,54 @@ struct LocalSignedWorkOrderRunAuthorityInner {
     grant: crate::ValidatedCapabilityGrant,
     request_scope: CapabilityScope,
     subject: PrincipalId,
-    revoked: AtomicBool,
+    state: Mutex<LocalRunAuthorityState>,
+    quiesced: Condvar,
     evaluation_count: AtomicU64,
+}
+
+#[derive(Default)]
+struct LocalRunAuthorityState {
+    revoked: bool,
+    generation: u64,
+    in_flight_effects: u64,
+}
+
+/// Owned linearization guard for one final effect authorization.
+///
+/// Acquisition atomically checks the exact operation tuple against current grant
+/// expiry and revocation. The permit remains valid until dropped. Revocation
+/// closes admission first and does not return until all earlier permits drop, so
+/// a completed revocation cannot invisibly invalidate an in-flight effect.
+pub struct LocalRunAuthorityEffectPermit {
+    inner: Arc<LocalSignedWorkOrderRunAuthorityInner>,
+    generation: u64,
+}
+
+impl LocalRunAuthorityEffectPermit {
+    /// Authority generation at which this permit linearized.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for LocalRunAuthorityEffectPermit {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        state.in_flight_effects = state.in_flight_effects.saturating_sub(1);
+        if state.in_flight_effects == 0 {
+            self.inner.quiesced.notify_all();
+        }
+    }
+}
+
+/// Final authority evaluation and optional owned effect permit.
+pub struct LocalRunAuthorityPermitEvaluation {
+    /// Fresh decisions for the exact requested operation tuple.
+    pub decisions: Vec<AuthorityDecision>,
+    /// Present only when every operation remains authorized at linearization.
+    pub permit: Option<LocalRunAuthorityEffectPermit>,
 }
 
 /// Fail-closed compatibility admission errors.
@@ -108,7 +154,8 @@ impl LocalSignedWorkOrderRunAuthority {
                 grant,
                 request_scope,
                 subject,
-                revoked: AtomicBool::new(false),
+                state: Mutex::new(LocalRunAuthorityState::default()),
+                quiesced: Condvar::new(),
                 evaluation_count: AtomicU64::new(0),
             }),
         })
@@ -120,34 +167,96 @@ impl LocalSignedWorkOrderRunAuthority {
         operation: AuthorityOperation,
         now: OffsetDateTime,
     ) -> AuthorityDecision {
-        self.inner.evaluation_count.fetch_add(1, Ordering::SeqCst);
-        let request = CapabilityRequest {
-            schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
-            subject: self.inner.subject.clone(),
-            operation,
-            scope: self.inner.request_scope.clone(),
-            requested_at: now,
-            metadata: Default::default(),
+        let revoked = match self.inner.state.lock() {
+            Ok(state) => state.revoked,
+            Err(_) => {
+                return unavailable_decision(
+                    &self.inner,
+                    operation,
+                    now,
+                    "authority_state_unavailable",
+                )
+            }
         };
-        if self.inner.revoked.load(Ordering::SeqCst) {
-            return AuthorityDecision {
-                schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
-                decision_id: AuthorityDecisionId::new(),
-                request,
-                status: AuthorityDecisionStatus::Denied,
-                reasons: vec!["authority_grant_revoked".to_string()],
-                matched_grant_ids: Vec::new(),
-                obligations: Vec::new(),
-                decided_at: now,
-            };
-        }
-        evaluate_capability_request(std::slice::from_ref(&self.inner.grant), &request, now)
+        evaluate_operation(&self.inner, operation, now, revoked)
     }
 
-    /// Monotonically revokes this live local run grant. Revocation cannot be
-    /// cleared or renewed through this bounded compatibility seam.
+    /// Acquires the final owned effect permit after all other pre-effect checks.
+    /// The ordered operation list must contain the exact action, effective
+    /// adapter, and trusted permission profile required by the effect.
+    pub fn acquire_effect_permit(
+        &self,
+        operations: Vec<AuthorityOperation>,
+        now: OffsetDateTime,
+    ) -> LocalRunAuthorityPermitEvaluation {
+        if operations.is_empty() {
+            return LocalRunAuthorityPermitEvaluation {
+                decisions: Vec::new(),
+                permit: None,
+            };
+        }
+        let Ok(mut state) = self.inner.state.lock() else {
+            return LocalRunAuthorityPermitEvaluation {
+                decisions: operations
+                    .into_iter()
+                    .map(|operation| {
+                        unavailable_decision(
+                            &self.inner,
+                            operation,
+                            now,
+                            "authority_state_unavailable",
+                        )
+                    })
+                    .collect(),
+                permit: None,
+            };
+        };
+        let decisions = operations
+            .into_iter()
+            .map(|operation| evaluate_operation(&self.inner, operation, now, state.revoked))
+            .collect::<Vec<_>>();
+        let allowed = decisions.iter().all(|decision| {
+            matches!(
+                decision.status,
+                AuthorityDecisionStatus::Allowed | AuthorityDecisionStatus::Conditional
+            )
+        });
+        if !allowed {
+            return LocalRunAuthorityPermitEvaluation {
+                decisions,
+                permit: None,
+            };
+        }
+        state.in_flight_effects = state.in_flight_effects.saturating_add(1);
+        LocalRunAuthorityPermitEvaluation {
+            decisions,
+            permit: Some(LocalRunAuthorityEffectPermit {
+                inner: Arc::clone(&self.inner),
+                generation: state.generation,
+            }),
+        }
+    }
+
+    /// Monotonically revokes this live local run grant and waits for effects that
+    /// acquired an earlier permit to leave the adapter boundary. New permits are
+    /// denied as soon as revocation takes the authority-state lock.
     pub fn revoke(&self) {
-        self.inner.revoked.store(true, Ordering::SeqCst);
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        state.revoked = true;
+        state.generation = state.generation.saturating_add(1);
+        while state.in_flight_effects > 0 {
+            let Ok(next) = self.inner.quiesced.wait(state) else {
+                return;
+            };
+            state = next;
+        }
+    }
+
+    /// Current monotonic authority generation.
+    pub fn generation(&self) -> Option<u64> {
+        self.inner.state.lock().ok().map(|state| state.generation)
     }
 
     /// Number of typed operation evaluations performed by this handle.
@@ -158,6 +267,63 @@ impl LocalSignedWorkOrderRunAuthority {
     /// Opaque grant identity retained for trace/evidence correlation.
     pub fn grant_id(&self) -> &CapabilityGrantId {
         &self.inner.grant.grant().grant_id
+    }
+}
+
+fn evaluate_operation(
+    inner: &LocalSignedWorkOrderRunAuthorityInner,
+    operation: AuthorityOperation,
+    now: OffsetDateTime,
+    revoked: bool,
+) -> AuthorityDecision {
+    inner.evaluation_count.fetch_add(1, Ordering::SeqCst);
+    let request = operation_request(inner, operation, now);
+    if revoked {
+        return AuthorityDecision {
+            schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
+            decision_id: AuthorityDecisionId::new(),
+            request,
+            status: AuthorityDecisionStatus::Denied,
+            reasons: vec!["authority_grant_revoked".to_string()],
+            matched_grant_ids: Vec::new(),
+            obligations: Vec::new(),
+            decided_at: now,
+        };
+    }
+    evaluate_capability_request(std::slice::from_ref(&inner.grant), &request, now)
+}
+
+fn unavailable_decision(
+    inner: &LocalSignedWorkOrderRunAuthorityInner,
+    operation: AuthorityOperation,
+    now: OffsetDateTime,
+    reason: &str,
+) -> AuthorityDecision {
+    inner.evaluation_count.fetch_add(1, Ordering::SeqCst);
+    AuthorityDecision {
+        schema_version: AUTHORITY_DECISION_SCHEMA_VERSION.to_string(),
+        decision_id: AuthorityDecisionId::new(),
+        request: operation_request(inner, operation, now),
+        status: AuthorityDecisionStatus::NeedsIntervention,
+        reasons: vec![reason.to_string()],
+        matched_grant_ids: Vec::new(),
+        obligations: Vec::new(),
+        decided_at: now,
+    }
+}
+
+fn operation_request(
+    inner: &LocalSignedWorkOrderRunAuthorityInner,
+    operation: AuthorityOperation,
+    now: OffsetDateTime,
+) -> CapabilityRequest {
+    CapabilityRequest {
+        schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+        subject: inner.subject.clone(),
+        operation,
+        scope: inner.request_scope.clone(),
+        requested_at: now,
+        metadata: Default::default(),
     }
 }
 

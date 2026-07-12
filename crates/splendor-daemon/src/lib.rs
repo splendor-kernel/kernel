@@ -334,6 +334,7 @@ struct RunSlot {
     gateway: Arc<dyn ActionGateway>,
     run_authority: RunAuthorityHandle,
     authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
+    action_profiles: Vec<splendor_gateway::TrustedActionProfile>,
     tenant_registry: TenantRegistry,
     circuit_breakers: SharedCircuitBreakerEvaluator,
     policy_cache: PolicyCache,
@@ -877,10 +878,12 @@ pub struct CircuitBreakerSyncResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RegisteredAction {
     pub name: String,
     pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_permissions: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1468,6 +1471,15 @@ fn ensure_request_does_not_widen_work_order(
             &registration.adapter,
             &work_order.allowed_adapters,
         )?;
+        if let Some(required_permissions) = &registration.required_permissions {
+            for permission in required_permissions {
+                ensure_member(
+                    "registered_action.required_permission",
+                    permission,
+                    &work_order.allowed_permissions,
+                )?;
+            }
+        }
     }
 
     for candidate in &request.policy_actions {
@@ -1775,9 +1787,13 @@ async fn create_run(
     tenant_registry.insert(tenant_context);
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
+    let action_profiles = action_profiles_for_request(&request, &validated_work_order)?;
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
     gateway.set_action_authority_evaluator(Arc::new(run_authority.clone()));
     gateway.set_pre_effect_authority_recorder(Arc::clone(&authority_recorder));
+    gateway
+        .set_trusted_action_profiles(action_profiles.clone())
+        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason.clone(), reason))?;
     gateway.set_resource_boundary_verifier(Arc::new(DataArtifactBoundaryVerifier::new(
         request.tenant_id.clone(),
         validated_work_order.data_refs.clone(),
@@ -1789,11 +1805,10 @@ async fn create_run(
     }
     let circuit_breakers = SharedCircuitBreakerEvaluator::new(request.circuit_breakers.clone());
     gateway.set_circuit_breaker_evaluator(Arc::new(circuit_breakers.clone()));
-    let registrations = registrations_for_request(&request, &validated_work_order);
-    for registration in registrations {
+    for profile in &action_profiles {
         gateway.register_adapter(
-            registration.name,
-            registration.adapter,
+            profile.action_name.clone(),
+            profile.adapter.clone(),
             Arc::new(RecordingAdapter {
                 executions: Arc::clone(&adapter_executions),
             }),
@@ -1905,6 +1920,7 @@ async fn create_run(
         gateway,
         run_authority,
         authority_recorder,
+        action_profiles,
         tenant_registry,
         circuit_breakers,
         policy_cache,
@@ -2798,6 +2814,7 @@ async fn submit_action(
         tenant_id: request.tenant_id,
         agent_id: request.agent_id,
         run_id: request.run_id,
+        tick_id: None,
         action: request.action.clone(),
         adapter: request.adapter,
         quota_usage: request
@@ -3163,6 +3180,7 @@ async fn submit_physical_action(
         tenant_id: request.action_request.tenant_id.clone(),
         agent_id: request.action_request.agent_id.clone(),
         run_id: request.action_request.run_id.clone(),
+        tick_id: None,
         action: request.action_request.action.clone(),
         adapter: request.action_request.adapter.clone(),
         quota_usage: request
@@ -3178,6 +3196,11 @@ async fn submit_physical_action(
     let mut physical_gateway = VerifiedActionGateway::new(Arc::new(slot.tenant_registry.clone()));
     physical_gateway.set_action_authority_evaluator(Arc::new(slot.run_authority.clone()));
     physical_gateway.set_pre_effect_authority_recorder(Arc::clone(&slot.authority_recorder));
+    physical_gateway
+        .set_trusted_action_profiles(slot.action_profiles.clone())
+        .map_err(|reason| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, reason.clone(), reason)
+        })?;
     physical_gateway.set_circuit_breaker_evaluator(Arc::new(slot.circuit_breakers.clone()));
     physical_gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
         simulated_safety_snapshot(&request, &profile, &action_name),
@@ -4138,39 +4161,94 @@ async fn run_lifecycle_tick(
     }))
 }
 
-fn registrations_for_request(
+fn action_profiles_for_request(
     request: &CreateRunRequest,
     work_order: &WorkOrder,
-) -> Vec<RegisteredAction> {
-    let mut registrations = request.registered_actions.clone();
-    let fallback_adapter = work_order
-        .allowed_adapters
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "daemon.local".to_string());
-    for action_name in &work_order.allowed_actions {
-        if registrations.iter().all(|entry| &entry.name != action_name) {
-            registrations.push(RegisteredAction {
-                name: action_name.clone(),
-                adapter: fallback_adapter.clone(),
-            });
-        }
-    }
-    for action in &request.policy_actions {
-        if registrations
-            .iter()
-            .all(|entry| entry.name != action.action.name)
+) -> Result<Vec<splendor_gateway::TrustedActionProfile>, ApiError> {
+    let mut profiles = HashMap::new();
+    for registration in &request.registered_actions {
+        let required_permissions = registration
+            .required_permissions
+            .clone()
+            .unwrap_or_else(|| work_order.allowed_permissions.clone());
+        let profile = splendor_gateway::TrustedActionProfile {
+            action_name: registration.name.clone(),
+            adapter: registration.adapter.clone(),
+            required_permissions: normalized_permission_set(required_permissions),
+        };
+        if profiles
+            .insert(registration.name.clone(), profile)
+            .is_some()
         {
-            registrations.push(RegisteredAction {
-                name: action.action.name.clone(),
-                adapter: action
-                    .adapter
-                    .clone()
-                    .unwrap_or_else(|| fallback_adapter.clone()),
-            });
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "duplicate_registered_action_profile",
+                "registered action profiles must be unique by action name",
+            ));
         }
     }
-    registrations
+    let fallback_adapter = match work_order.allowed_adapters.as_slice() {
+        [adapter] => adapter.clone(),
+        [] => "daemon.local".to_string(),
+        _ => String::new(),
+    };
+    for action_name in &work_order.allowed_actions {
+        if !profiles.contains_key(action_name) {
+            if fallback_adapter.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "trusted_action_profile_required",
+                    "each action requires an explicit adapter profile when multiple adapters are allowed",
+                ));
+            }
+            profiles.insert(
+                action_name.clone(),
+                splendor_gateway::TrustedActionProfile {
+                    action_name: action_name.clone(),
+                    adapter: fallback_adapter.clone(),
+                    required_permissions: normalized_permission_set(
+                        work_order.allowed_permissions.clone(),
+                    ),
+                },
+            );
+        }
+    }
+    for candidate in &request.policy_actions {
+        let Some(profile) = profiles.get(&candidate.action.name) else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "trusted_action_profile_missing",
+                "policy action has no trusted action profile",
+            ));
+        };
+        let effective_adapter = candidate.adapter.as_deref().unwrap_or(&profile.adapter);
+        if effective_adapter != profile.adapter {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "trusted_action_profile_adapter_mismatch",
+                "policy action adapter does not match its trusted profile",
+            ));
+        }
+        if normalized_permission_set(candidate.action.required_permissions.clone())
+            != profile.required_permissions
+            || candidate.action.required_permissions.len() != profile.required_permissions.len()
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "trusted_action_profile_permission_mismatch",
+                "policy action permissions do not match its trusted profile",
+            ));
+        }
+    }
+    let mut profiles = profiles.into_values().collect::<Vec<_>>();
+    profiles.sort_by(|left, right| left.action_name.cmp(&right.action_name));
+    Ok(profiles)
+}
+
+fn normalized_permission_set(mut permissions: Vec<String>) -> Vec<String> {
+    permissions.sort();
+    permissions.dedup();
+    permissions
 }
 
 fn encode_initial_state(value: Option<serde_json::Value>) -> Result<StateData, ApiError> {
@@ -5155,6 +5233,7 @@ mod tests {
             tenant_id: TenantId::new(),
             agent_id: splendor_types::AgentId::new(),
             run_id: RunId::new(),
+            tick_id: None,
             action: physical_action(action_name),
             adapter: Some("device-sim".to_string()),
             quota_usage: splendor_types::QuotaUsage::single_action(),
@@ -5311,6 +5390,7 @@ mod tests {
             tenant_id,
             agent_id: splendor_types::AgentId::new(),
             run_id: RunId::new(),
+            tick_id: None,
             action: Action {
                 name: action_name.to_string(),
                 params,
@@ -5859,10 +5939,36 @@ mod tests {
             initial_state: None,
             snapshot_interval: None,
         };
-        let registrations = registrations_for_request(&request, &work_order);
+        let registrations =
+            action_profiles_for_request(&request, &work_order).expect("trusted action profiles");
         assert_eq!(registrations.len(), 1);
-        assert_eq!(registrations[0].name, "policy_only");
+        assert_eq!(registrations[0].action_name, "policy_only");
         assert_eq!(registrations[0].adapter, "daemon.local");
+        assert!(
+            serde_json::from_value::<RegisteredAction>(serde_json::json!({
+                "name": "policy_only",
+                "adapter": "daemon.local",
+                "required_permissions": [],
+                "credential": "not-authority"
+            }))
+            .is_err()
+        );
+
+        let mut permission_work_order = work_order.clone();
+        permission_work_order.allowed_permissions = vec!["unit.write".to_string()];
+        let error = action_profiles_for_request(&request, &permission_work_order)
+            .expect_err("policy permission omission must fail admission");
+        assert_eq!(
+            error.body.code,
+            "trusted_action_profile_permission_mismatch"
+        );
+
+        let mut multi_adapter_work_order = work_order.clone();
+        multi_adapter_work_order.allowed_adapters =
+            vec!["daemon.local".to_string(), "daemon.secondary".to_string()];
+        let error = action_profiles_for_request(&request, &multi_adapter_work_order)
+            .expect_err("multiple adapters require explicit action profiles");
+        assert_eq!(error.body.code, "trusted_action_profile_required");
 
         let mut direct_registration_request = request.clone();
         direct_registration_request.policy_actions = vec![DaemonActionCandidate {
@@ -5881,10 +5987,9 @@ mod tests {
             satisfied_preconditions: Vec::new(),
             authority_obligation_receipts: Vec::new(),
         }];
-        let registrations = registrations_for_request(&direct_registration_request, &work_order);
-        assert_eq!(registrations.len(), 2);
-        assert_eq!(registrations[1].name, "policy_fallback");
-        assert_eq!(registrations[1].adapter, "daemon.local");
+        let error = action_profiles_for_request(&direct_registration_request, &work_order)
+            .expect_err("out-of-work-order policy action must fail");
+        assert_eq!(error.body.code, "trusted_action_profile_missing");
 
         let lock = lock_error();
         assert_eq!(lock.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -5924,6 +6029,7 @@ mod tests {
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
             run_authority,
             authority_recorder: Arc::new(splendor_gateway::NoPreEffectAuthorityDecisionRecorder),
+            action_profiles: Vec::new(),
             tenant_registry: TenantRegistry::new(),
             circuit_breakers: SharedCircuitBreakerEvaluator::default(),
             policy_cache: PolicyCache::new(

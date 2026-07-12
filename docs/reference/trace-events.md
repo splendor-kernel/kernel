@@ -151,12 +151,19 @@ trace and do not authorize adapter execution outside the gateway.
 On the production-local C02 daemon path, an allowed
 `ActionVerificationCompleted` is the mandatory pre-effect authority evidence
 record. The gateway appends it after live typed action/adapter/permission
-authority plus existing pre-effect verifiers allow and before adapter execution.
+authority plus existing pre-effect verifiers allow, and after the atomic final
+authority permit re-check, but before adapter execution. The permit is held
+through this durable append and adapter execution. Revocation closes new permit
+admission and waits for earlier permitted effects; expiry or revocation observed
+before permit acquisition denies without adapter execution.
 `result.artifacts.authority` contains redacted decision summaries/digests and
 `pre_effect_recorded: true`. Append failure prevents the adapter call. Outer
 daemon/loop code emits this event only for denied/unrecorded paths, so it does not
 mislabel a post-effect append as pre-effect evidence or duplicate an allowed
 completion event.
+Scheduler actions retain one `tick_id` on verification-started, the single
+pre-effect verification-completed event, and the terminal action event. Direct
+daemon action submissions do not invent a scheduler tick identity.
 - `RemoteMessageAccepted { remote_message: RemoteMessageTraceContext }`
 - `RemoteMessageRejected { remote_message: RemoteMessageTraceContext, reason: String }`
 - `RemoteMessageDelivered { remote_message: RemoteMessageTraceContext }`

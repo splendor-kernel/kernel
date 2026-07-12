@@ -53,6 +53,7 @@ fn sample_action() -> ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: "noop".to_string(),
             params: serde_json::json!({"ok": true}),
@@ -309,6 +310,7 @@ fn base_request() -> ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: "noop".to_string(),
             params: serde_json::json!({"ok": true}),
@@ -738,6 +740,82 @@ impl ActionAuthorityEvaluator for FixedLiveAuthorityEvaluator {
         self.calls.fetch_add(1, Ordering::SeqCst);
         ActionAuthorityEvaluation::Evaluated(self.decisions.clone())
     }
+
+    fn acquire_final_effect_permit(
+        &self,
+        _action: &ActionRequest,
+        _effective_adapter: Option<&str>,
+        _expected_decisions: &[AuthorityDecision],
+        _now: OffsetDateTime,
+    ) -> FinalEffectAuthorityEvaluation {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        FinalEffectAuthorityEvaluation::Permitted {
+            decisions: self.decisions.clone(),
+            permit: AuthorityEffectPermit::new(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ScriptedFinalAuthority {
+    NotRequired,
+    Denied(Vec<AuthorityDecision>),
+    Permitted(Vec<AuthorityDecision>),
+}
+
+#[derive(Clone)]
+struct ScriptedAuthorityEvaluator {
+    early: Option<Vec<AuthorityDecision>>,
+    final_evaluation: ScriptedFinalAuthority,
+}
+
+#[derive(Clone)]
+struct EarlyOnlyAuthorityEvaluator(Vec<AuthorityDecision>);
+
+impl ActionAuthorityEvaluator for EarlyOnlyAuthorityEvaluator {
+    fn evaluate_action_authority(
+        &self,
+        _action: &ActionRequest,
+        _effective_adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> ActionAuthorityEvaluation {
+        ActionAuthorityEvaluation::Evaluated(self.0.clone())
+    }
+}
+
+impl ActionAuthorityEvaluator for ScriptedAuthorityEvaluator {
+    fn evaluate_action_authority(
+        &self,
+        _action: &ActionRequest,
+        _effective_adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> ActionAuthorityEvaluation {
+        self.early
+            .clone()
+            .map(ActionAuthorityEvaluation::Evaluated)
+            .unwrap_or(ActionAuthorityEvaluation::NotRequired)
+    }
+
+    fn acquire_final_effect_permit(
+        &self,
+        _action: &ActionRequest,
+        _effective_adapter: Option<&str>,
+        _expected_decisions: &[AuthorityDecision],
+        _now: OffsetDateTime,
+    ) -> FinalEffectAuthorityEvaluation {
+        match &self.final_evaluation {
+            ScriptedFinalAuthority::NotRequired => FinalEffectAuthorityEvaluation::NotRequired,
+            ScriptedFinalAuthority::Denied(decisions) => {
+                FinalEffectAuthorityEvaluation::Denied(decisions.clone())
+            }
+            ScriptedFinalAuthority::Permitted(decisions) => {
+                FinalEffectAuthorityEvaluation::Permitted {
+                    decisions: decisions.clone(),
+                    permit: AuthorityEffectPermit::new(()),
+                }
+            }
+        }
+    }
 }
 
 struct OrderingAuthorityRecorder {
@@ -764,20 +842,53 @@ fn live_conditional_authority_uses_only_raw_receipts_and_records_before_effect()
     let mut request = base_request();
     request.adapter = Some("adapter".to_string());
     request.action.required_permissions = vec!["fixture.write".to_string()];
-    let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+    let (issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
     let live_decision = evidence.decision;
-    request.authority_obligation_receipts = evidence.receipts;
-    request.authority_obligation_evidence = None;
+    let mut receipts = evidence.receipts;
     let mut adapter_decision = live_decision.clone();
+    adapter_decision.decision_id = AuthorityDecisionId::new();
     adapter_decision.request.operation = gateway_adapter_operation("adapter");
     bind_gateway_authority_decision_digest(&mut adapter_decision);
+    receipts.push(issue_obligation_receipt(
+        unsigned_obligation_receipt(&adapter_decision, issuer.clone(), now),
+        &context,
+    ));
     let mut permission_decision = live_decision.clone();
+    permission_decision.decision_id = AuthorityDecisionId::new();
     permission_decision.request.operation = compatibility_permission_operation("fixture.write");
     bind_gateway_authority_decision_digest(&mut permission_decision);
+    receipts.push(issue_obligation_receipt(
+        unsigned_obligation_receipt(&permission_decision, issuer, now),
+        &context,
+    ));
+    request.authority_obligation_receipts = receipts;
+    request.authority_obligation_evidence = None;
 
     let evaluations = Arc::new(AtomicUsize::new(0));
     let records = Arc::new(AtomicUsize::new(0));
     let adapter = Arc::new(CountingAdapter::default());
+    let single_adapter = Arc::new(CountingAdapter::default());
+    let mut single_gateway = authority_gateway(context.clone(), single_adapter.clone());
+    single_gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: vec![
+            live_decision.clone(),
+            adapter_decision.clone(),
+            permission_decision.clone(),
+        ],
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    single_gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        adapter: single_adapter.clone(),
+    }));
+    let mut one_receipt = request.clone();
+    one_receipt.authority_obligation_receipts.truncate(1);
+    let incomplete = single_gateway
+        .submit(one_receipt)
+        .expect("operation-bound receipt denial");
+    assert_eq!(incomplete.status, ActionStatus::Denied);
+    assert_eq!(*single_adapter.calls.lock().expect("adapter calls"), 0);
+
     let mut gateway = authority_gateway(context, adapter.clone());
     gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
         decisions: vec![
@@ -795,12 +906,22 @@ fn live_conditional_authority_uses_only_raw_receipts_and_records_before_effect()
     let outcome = gateway.submit(request.clone()).expect("outcome");
 
     assert_eq!(outcome.status, ActionStatus::Executed);
-    assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    assert_eq!(evaluations.load(Ordering::SeqCst), 2);
     assert_eq!(records.load(Ordering::SeqCst), 1);
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
     assert!(authority_pre_effect_evidence_recorded(
         &outcome.verification
     ));
+
+    let replayed = gateway
+        .submit(request.clone())
+        .expect("receipt replay denial");
+    assert_eq!(replayed.status, ActionStatus::Denied);
+    assert!(replayed
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
 
     gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
         decisions: vec![live_decision, adapter_decision],
@@ -813,6 +934,196 @@ fn live_conditional_authority_uses_only_raw_receipts_and_records_before_effect()
         .reasons
         .contains(&"authority_decision_request_mismatch".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+}
+
+#[test]
+fn trusted_action_profile_rejects_permission_omission_and_adapter_recombination() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = basic_live_authority_gateway(adapter.clone());
+    gateway
+        .set_trusted_action_profiles(vec![TrustedActionProfile {
+            action_name: "noop".to_string(),
+            adapter: "adapter".to_string(),
+            required_permissions: vec!["fixture.read".to_string(), "fixture.write".to_string()],
+        }])
+        .expect("trusted profile");
+
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    for (permissions, adapter_name, expected_reason) in [
+        (
+            vec!["fixture.read".to_string()],
+            "adapter",
+            "trusted_action_profile_permission_mismatch",
+        ),
+        (
+            vec!["fixture.read".to_string(), "fixture.admin".to_string()],
+            "adapter",
+            "trusted_action_profile_permission_mismatch",
+        ),
+        (
+            vec!["fixture.read".to_string(), "fixture.write".to_string()],
+            "other-adapter",
+            "trusted_action_profile_adapter_mismatch",
+        ),
+    ] {
+        request.action.required_permissions = permissions;
+        request.adapter = Some(adapter_name.to_string());
+        let outcome = gateway.submit(request.clone()).expect("profile denial");
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert!(outcome
+            .verification
+            .reasons
+            .contains(&expected_reason.to_string()));
+    }
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn live_authority_never_projects_raw_evaluator_reasons() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    request.action.required_permissions = vec!["fixture.write".to_string()];
+    let mut decisions = live_decisions_with_status(&request, AuthorityDecisionStatus::Denied);
+    for decision in &mut decisions {
+        decision.reasons = vec!["raw-secret-evaluator-reason\r\nforged: allow".to_string()];
+        bind_gateway_authority_decision_digest(decision);
+    }
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = basic_live_authority_gateway(adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+
+    let outcome = gateway.submit(request).expect("redacted denial");
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    let encoded = serde_json::to_string(&outcome).expect("outcome JSON");
+    assert!(!encoded.contains("raw-secret-evaluator-reason"));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn trusted_profile_receipt_limit_and_final_permit_failures_are_fail_closed() {
+    let mut profile_gateway = basic_live_authority_gateway(Arc::new(CountingAdapter::default()));
+    assert_eq!(
+        profile_gateway
+            .set_trusted_action_profiles(vec![TrustedActionProfile {
+                action_name: String::new(),
+                adapter: "adapter".to_string(),
+                required_permissions: Vec::new(),
+            }])
+            .expect_err("empty action profile"),
+        "trusted_action_profile_invalid"
+    );
+    assert_eq!(
+        profile_gateway
+            .set_trusted_action_profiles(vec![
+                TrustedActionProfile {
+                    action_name: "noop".to_string(),
+                    adapter: "adapter".to_string(),
+                    required_permissions: Vec::new(),
+                },
+                TrustedActionProfile {
+                    action_name: "noop".to_string(),
+                    adapter: "adapter.secondary".to_string(),
+                    required_permissions: Vec::new(),
+                },
+            ])
+            .expect_err("duplicate action profile"),
+        "trusted_action_profile_duplicate"
+    );
+
+    let mut receipt_limited = base_request();
+    let (_, _, evidence) =
+        authority_evidence_for(&receipt_limited, "adapter", OffsetDateTime::now_utc());
+    receipt_limited.authority_obligation_receipts = vec![evidence.receipts[0].clone(); 65];
+    let outcome = basic_live_authority_gateway(Arc::new(CountingAdapter::default()))
+        .submit(receipt_limited)
+        .expect("receipt limit outcome");
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_limit_exceeded".to_string()));
+
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    request.action.required_permissions = vec!["fixture.write".to_string()];
+    let allowed = live_decisions_with_status(&request, AuthorityDecisionStatus::Allowed);
+    let denied = live_decisions_with_status(&request, AuthorityDecisionStatus::Denied);
+    let mut mismatched = allowed.clone();
+    mismatched[0]
+        .matched_grant_ids
+        .push(CapabilityGrantId::new());
+
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut legacy_evaluator_gateway = basic_live_authority_gateway(adapter.clone());
+    legacy_evaluator_gateway
+        .set_action_authority_evaluator(Arc::new(EarlyOnlyAuthorityEvaluator(allowed.clone())));
+    let outcome = legacy_evaluator_gateway
+        .submit(request.clone())
+        .expect("legacy evaluator fails closed");
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"final_effect_authority_permit_unavailable".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+
+    for (early, final_evaluation, expected_status, expected_reason) in [
+        (
+            Some(allowed.clone()),
+            ScriptedFinalAuthority::NotRequired,
+            ActionStatus::NeedsIntervention,
+            "final_effect_authority_permit_unavailable",
+        ),
+        (
+            Some(allowed.clone()),
+            ScriptedFinalAuthority::Permitted(mismatched),
+            ActionStatus::NeedsIntervention,
+            "final_effect_authority_generation_mismatch",
+        ),
+        (
+            Some(allowed.clone()),
+            ScriptedFinalAuthority::Denied(denied),
+            ActionStatus::Denied,
+            "action_not_allowed",
+        ),
+        (
+            Some(allowed.clone()),
+            ScriptedFinalAuthority::Denied(allowed.clone()),
+            ActionStatus::NeedsIntervention,
+            "final_effect_authority_permit_missing",
+        ),
+        (
+            None,
+            ScriptedFinalAuthority::Permitted(allowed),
+            ActionStatus::NeedsIntervention,
+            "unexpected_final_effect_authority_permit",
+        ),
+    ] {
+        let adapter = Arc::new(CountingAdapter::default());
+        let mut gateway = basic_live_authority_gateway(adapter.clone());
+        gateway.set_action_authority_evaluator(Arc::new(ScriptedAuthorityEvaluator {
+            early,
+            final_evaluation,
+        }));
+        let outcome = gateway
+            .submit(request.clone())
+            .expect("final permit outcome");
+        assert_eq!(outcome.status, expected_status);
+        assert!(
+            outcome
+                .verification
+                .reasons
+                .iter()
+                .any(|reason| reason == expected_reason),
+            "expected {expected_reason}, got {:?}",
+            outcome.verification.reasons
+        );
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+    }
 }
 
 fn live_decisions_with_status(
@@ -980,7 +1291,7 @@ fn live_authority_fails_closed_for_incomplete_status_and_evidence_paths() {
     assert!(outcome
         .verification
         .reasons
-        .contains(&"authority_obligation_receipt_sources_ambiguous".to_string()));
+        .contains(&"requester_authority_decision_non_authorizing".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
 }
 

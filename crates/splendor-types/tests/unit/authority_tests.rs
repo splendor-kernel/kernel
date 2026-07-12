@@ -228,6 +228,12 @@ fn authority_obligations_and_receipts_are_typed_and_schema_versioned() {
     assert_eq!(json["authority_decision_id"], decision_id.to_string());
     assert_eq!(json["validation"]["validation_kind"], "local_signature");
     assert_eq!(json["validation"]["key_id"], "receipt-key-1");
+    let mut unknown_receipt = json.clone();
+    unknown_receipt["allowed_permissions"] = serde_json::json!(["admin"]);
+    assert!(serde_json::from_value::<AuthorityObligationReceipt>(unknown_receipt).is_err());
+    let mut unknown_validation = json.clone();
+    unknown_validation["validation"]["credential"] = serde_json::json!("secret");
+    assert!(serde_json::from_value::<AuthorityObligationReceipt>(unknown_validation).is_err());
     assert_eq!(
         serde_json::to_value(&statuses).expect("statuses json"),
         serde_json::json!([

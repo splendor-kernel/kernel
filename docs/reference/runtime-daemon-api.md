@@ -82,6 +82,14 @@ typed action, effective adapter, and every required permission. Existing copied
 allowlists may narrow but cannot independently allow. No layer replaces the
 others.
 
+Run admission also derives one immutable trusted action profile per action. The
+profile binds the action to its effective adapter and exact permission set before
+any requester or policy candidate reaches live authority evaluation. An omitted
+`RegisteredAction.required_permissions` field means the full signed work-order
+permission set. It never means an empty set; an explicit empty array declares no
+required permission operations. Work orders with multiple adapters must register
+the action/adapter pairing explicitly.
+
 The runtime daemon API was originally the 0.02-S5 local control boundary for
 Splendor runs.
 It exposes a minimal HTTP surface for creating, starting, pausing, resuming,
@@ -170,6 +178,8 @@ prepared/non-authorizing trace may remain and does not by itself prove commit.
 - a queued perceptor for daemon-submitted percepts;
 - a scheduler containing one loop engine;
 - a `VerifiedActionGateway` with explicitly registered local adapters;
+- immutable action/adapter/exact-permission profiles derived from the validated
+  work order and explicit registrations;
 - one opaque live C02 run-authority handle admitted only from
   `ValidatedWorkOrder` (not a raw request payload);
 - one shared-runtime pre-effect authority evidence recorder;
@@ -291,18 +301,29 @@ OutcomeRecorded
 ```
 
 For an allowed C02-protected effect, `ActionVerificationCompleted` is durably
-appended by the gateway after all pre-effect verifiers allow and before the
-adapter is called. Its `result.artifacts.authority` contains only redacted typed
+appended by the gateway after all pre-effect verifiers allow, after an atomic
+final authority permit re-check, and before the adapter is called. The permit is
+held through evidence recording and adapter execution. Expiry or revocation
+before permit acquisition denies; revocation closes new admission and waits for
+earlier permitted effects to leave the adapter boundary. Its
+`result.artifacts.authority` contains only redacted typed
 decision summaries/digests and `pre_effect_recorded: true`. Append failure returns
 `NeedsIntervention` and the adapter count remains unchanged. The loop and daemon
 do not append a second post-effect completion event for that action.
+
+Scheduler actions copy the scheduler `tick_id` into the gateway request. Their
+verification-started, exactly one verification-completed, and terminal action
+events therefore retain one tick identity in order. Direct `/actions` requests
+remain outside a scheduler tick and do not fabricate a tick ID.
 
 `SubmitActionRequest.authority_obligation_receipts` and daemon policy candidates
 accept raw owning-service receipts only. A requester-supplied authority decision
 is not current authority. When the live C02 evaluation is conditional, the
 gateway regenerates the current action decision and passes it with the raw
 receipts to `LocalAuthorityObligationVerifier`; missing, forged, stale, revoked,
-or mismatched receipts fail closed. Current signed-work-order compatibility
+replayed, extra/missing per-decision, or mismatched receipts fail closed. Raw
+receipts are partitioned by exact decision ID, capped at 64 per action request,
+and are not fresh authority. Current signed-work-order compatibility
 grants contain no obligations, so receipt issuance/provider workflows remain
 downstream C01/AUTH-004 adoption rather than daemon-owned behavior.
 
@@ -386,13 +407,18 @@ daemon endpoints and error shapes. It does not stabilize private Rust internals,
 production authentication infrastructure, native Node bindings, browser runtime
 behavior, fleet scheduling, or undocumented API fields.
 
-The additive raw-receipt and replay-authority-summary fields are the bounded v2
-C02 production-local integration. The current compatibility admission uses
+The additive exact raw-receipt, registered-action permission profile, optional
+gateway `tick_id`, and replay-authority-summary fields are the bounded v2 C02
+production-local integration. Receipt and registered-action profile objects are
+closed in Rust/OpenAPI, and TypeScript/OpenAPI contract tests retain field parity.
+The current compatibility admission uses
 synthetic opaque local principal IDs because daemon admission does not yet receive
 C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
 with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
-watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, or gold completion is
-claimed here. C02 gold targets remain explicitly `not_exercised`.
+watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, physical helper-plan
+adoption, or gold completion is claimed here. The current local and authenticated
+resident run-effect service path is complete as non-gold component evidence;
+C02 gold targets remain explicitly `not_exercised`.
 
 Run 0.1 conformance validation from the repository root:
 
