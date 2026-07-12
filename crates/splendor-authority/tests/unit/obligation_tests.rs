@@ -464,6 +464,43 @@ fn obligation_receipt_verification_rechecks_expiry_after_validation() {
 }
 
 #[test]
+fn local_receipt_ledger_rejects_clock_rollback_and_latches_expiry() {
+    let now = OffsetDateTime::now_utc();
+    let decision = conditional_decision(now);
+    let issuer = PrincipalId::new();
+    let context = validation_context(issuer.clone(), now);
+    let receipt = sign_receipt(unsigned_receipt_for(&decision, issuer, now), &context);
+    let ledger = InMemoryAuthorityObligationReceiptLedger::default();
+
+    ledger
+        .validate_receipts(
+            std::slice::from_ref(&receipt),
+            &context,
+            now + time::Duration::seconds(1),
+        )
+        .expect("forward receipt validation");
+    let rollback = ledger
+        .validate_receipts(std::slice::from_ref(&receipt), &context, now)
+        .expect_err("rollback denied");
+    assert_eq!(
+        rollback.reason_code(),
+        "authority_obligation_receipt_clock_rollback"
+    );
+
+    let expiry = ledger
+        .validate_receipts(std::slice::from_ref(&receipt), &context, receipt.expires_at)
+        .expect_err("expiry denied");
+    assert_eq!(expiry.reason_code(), "obligation_receipt_expired");
+    let rolled_back_after_expiry = ledger
+        .claim_receipts(&[receipt], &context, now)
+        .expect_err("latched expiry denied");
+    assert_eq!(
+        rolled_back_after_expiry.reason_code(),
+        "obligation_receipt_expired"
+    );
+}
+
+#[test]
 fn obligation_receipt_request_digest_changes_when_scope_or_params_change() {
     let now = OffsetDateTime::now_utc();
     let decision = conditional_decision(now);

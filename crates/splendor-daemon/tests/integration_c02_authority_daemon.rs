@@ -345,6 +345,68 @@ async fn inspect(app: axum::Router, run_id: &RunId) -> RunInspectResponse {
     .expect("inspect response")
 }
 
+async fn assert_direct_action_trace(
+    app: axum::Router,
+    run_id: &RunId,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+    action_id: &splendor_types::ActionId,
+) {
+    let events = traces(app, run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .filter(|event| event.identity.action_id.as_ref() == Some(action_id))
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty(), "action-scoped trace events");
+    assert!(events.iter().all(|event| {
+        event.identity.run_id == *run_id
+            && event.identity.tenant_id.as_ref() == Some(tenant_id)
+            && event.identity.agent_id.as_ref() == Some(agent_id)
+            && event.identity.action_id.as_ref() == Some(action_id)
+            && event.identity.tick_id.is_none()
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                TraceEventKind::ActionVerificationCompleted { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                TraceEventKind::ActionExecuted { .. }
+                    | TraceEventKind::ActionDenied { .. }
+                    | TraceEventKind::ActionNeedsApproval { .. }
+                    | TraceEventKind::ActionNeedsIntervention { .. }
+                    | TraceEventKind::ActionFailed { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::OutcomeRecorded { .. }))
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
     let state = DaemonState::local_dev();
@@ -424,6 +486,15 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
     )
     .await;
     assert_eq!(allowed.status, ActionStatus::Executed);
+    let mut direct_action_ids = vec![allowed.action_id.clone()];
+    assert_direct_action_trace(
+        app.clone(),
+        &created.run_id,
+        &tenant_id,
+        &agent_id,
+        &allowed.action_id,
+    )
+    .await;
     assert_eq!(
         allowed
             .verification
@@ -491,6 +562,15 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
             .reasons
             .iter()
             .any(|reason| reason == expected_reason));
+        assert_direct_action_trace(
+            app.clone(),
+            &created.run_id,
+            &tenant_id,
+            &agent_id,
+            &denied.action_id,
+        )
+        .await;
+        direct_action_ids.push(denied.action_id.clone());
     }
     assert_eq!(
         inspect(app.clone(), &created.run_id)
@@ -541,6 +621,16 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
             .adapter_executions,
         executions_before_replay
     );
+    for action_id in &direct_action_ids {
+        assert_direct_action_trace(
+            app.clone(),
+            &created.run_id,
+            &tenant_id,
+            &agent_id,
+            action_id,
+        )
+        .await;
+    }
 
     state
         .revoke_run_authority_for_local_control(&created.run_id, audit())
@@ -697,8 +787,8 @@ async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
     resign_local_work_order(&mut narrowed.work_order);
     let (status, error): (StatusCode, ApiErrorBody) =
         call_json(app.clone(), Method::POST, "/runs", narrowed).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error.code, "trusted_action_profile_permission_mismatch");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "work_order_permission_profile_mismatch");
 
     let mut ambiguous = create_request(
         "wo_c02_ambiguous_adapter",

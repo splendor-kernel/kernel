@@ -306,7 +306,7 @@ OutcomeRecorded
 For an allowed C02-protected effect, `ActionVerificationCompleted` is durably
 appended by the gateway after all pre-effect verifiers allow, after an atomic
 final authority permit re-check, and after final receipt validation plus atomic
-one-use consumption, but before the adapter is called. The permit is
+one-use claim, but before the adapter is called. The permits are
 held through evidence recording and adapter execution. Expiry or revocation
 before permit acquisition denies; revocation closes new admission and waits for
 earlier permitted effects to leave the adapter boundary. Its
@@ -318,7 +318,10 @@ do not append a second post-effect completion event for that action.
 Scheduler actions copy the scheduler `tick_id` into the gateway request. Their
 verification-started, exactly one verification-completed, and terminal action
 events therefore retain one tick identity in order. Direct `/actions` requests
-remain outside a scheduler tick and do not fabricate a tick ID.
+remain outside a scheduler tick and do not fabricate a tick ID. Direct and
+run-bound physical requests allocate the effective action ID before verification;
+their started, single completed, terminal, and outcome records share the exact
+run/tenant/agent/action identity through the run's common trace cursor.
 
 `SubmitActionRequest.authority_obligation_receipts` and daemon policy candidates
 accept raw owning-service receipts only. A requester-supplied authority decision
@@ -328,11 +331,23 @@ receipts to `LocalAuthorityObligationVerifier`; missing, forged, stale, revoked,
 replayed, extra/missing per-decision, or mismatched receipts fail closed. Raw
 receipts are first checked against the complete current conditional-decision set;
 no unknown decision receipt is ignored. They are then partitioned by exact
-decision ID, capped at 64 per action request, validated only after all blocking
-verifiers and the final authority check, and consumed atomically as one collection.
+decision ID only after receipt IDs have been checked for global uniqueness, capped
+at 64 per action request, validated only after all blocking verifiers and the final
+authority check, and claimed atomically as one collection. Claim is the receipt
+effect linearization point: expiry after claim does not cancel that exact in-flight
+effect, while durable trace failure burns the receipt and still prevents adapter
+execution. Trusted time is monotonic and observed expiry is latched, so clock
+rollback cannot reactivate an unclaimed receipt. The current authority-owned
+ledger is shared by verifier instances within one process-local run; it is
+in-memory and does not claim process-restart durability.
 They are not fresh authority. Current signed-work-order compatibility
 grants contain no obligations, so receipt issuance/provider workflows remain
 downstream C01/AUTH-004 adoption rather than daemon-owned behavior.
+
+For create-run compatibility admission, a non-empty request-level
+`allowed_permissions` list must equal the complete signed work-order permission
+profile. Subset narrowing is rejected because the executable trusted action
+profile is exact; omission continues to select the complete signed profile.
 
 Approval flows may also emit `ApprovalRequested`, `ApprovalGranted`,
 `ApprovalDenied`, `ApprovalExpired`, and `ApprovalRevoked`. These are verifier

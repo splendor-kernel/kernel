@@ -1455,11 +1455,16 @@ fn ensure_request_does_not_widen_work_order(
         &request.allowed_adapters,
         &work_order.allowed_adapters,
     )?;
-    ensure_optional_subset(
-        "allowed_permissions",
-        &request.allowed_permissions,
-        &work_order.allowed_permissions,
-    )?;
+    if !request.allowed_permissions.is_empty()
+        && normalized_permission_set(request.allowed_permissions.clone())
+            != normalized_permission_set(work_order.allowed_permissions.clone())
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "work_order_permission_profile_mismatch",
+            "create-run allowed_permissions must exactly match the signed compatibility profile",
+        ));
+    }
 
     for registration in &request.registered_actions {
         validate_registered_action_permissions(registration)?;
@@ -2827,14 +2832,16 @@ async fn submit_action(
     )?;
     record_daemon_audit(slot, "splendor.actions.submit", security.audit_attribution)?;
 
-    record_run_event(
+    let effective_action_id = request.action_id.clone().unwrap_or_else(ActionId::new);
+    record_run_action_event(
         slot,
+        &effective_action_id,
         TraceEventKind::ActionVerificationStarted {
             action: request.action.clone(),
         },
     )?;
     let action_request = ActionRequest {
-        action_id: request.action_id.unwrap_or_else(ActionId::new),
+        action_id: effective_action_id.clone(),
         tenant_id: request.tenant_id,
         agent_id: request.agent_id,
         run_id: request.run_id,
@@ -2858,8 +2865,9 @@ async fn submit_action(
         )
     })?;
     if !authority_pre_effect_evidence_recorded(&outcome.verification) {
-        record_run_event(
+        record_run_action_event(
             slot,
+            &effective_action_id,
             TraceEventKind::ActionVerificationCompleted {
                 action: request.action.clone(),
                 result: outcome.verification.clone(),
@@ -2869,8 +2877,9 @@ async fn submit_action(
     match outcome.status {
         ActionStatus::Executed => {
             record_approval_event_if_present(slot, &outcome)?;
-            record_run_event(
+            record_run_action_event(
                 slot,
+                &effective_action_id,
                 TraceEventKind::ActionExecuted {
                     action: request.action.clone(),
                     outcome: outcome.output.clone().unwrap_or(serde_json::Value::Null),
@@ -2880,8 +2889,9 @@ async fn submit_action(
         ActionStatus::Denied => {
             record_approval_event_if_present(slot, &outcome)?;
             update_status_for_approval_denial(slot, &outcome);
-            record_run_event(
+            record_run_action_event(
                 slot,
+                &effective_action_id,
                 TraceEventKind::ActionDenied {
                     action: request.action.clone(),
                     result: outcome.verification.clone(),
@@ -2895,8 +2905,9 @@ async fn submit_action(
                 slot.pending_approval = Some(approval);
             }
             record_approval_event_if_present(slot, &outcome)?;
-            record_run_event(
+            record_run_action_event(
                 slot,
+                &effective_action_id,
                 TraceEventKind::ActionNeedsApproval {
                     action: request.action.clone(),
                     result: outcome.verification.clone(),
@@ -2914,16 +2925,18 @@ async fn submit_action(
         ActionStatus::NeedsIntervention => {
             record_approval_event_if_present(slot, &outcome)?;
             slot.status = RunStatus::Failed;
-            record_run_event(
+            record_run_action_event(
                 slot,
+                &effective_action_id,
                 TraceEventKind::ActionNeedsIntervention {
                     action: request.action.clone(),
                     result: outcome.verification.clone(),
                 },
             )
         }
-        ActionStatus::Failed => record_run_event(
+        ActionStatus::Failed => record_run_action_event(
             slot,
+            &effective_action_id,
             TraceEventKind::ActionFailed {
                 action: request.action.clone(),
                 error: outcome
@@ -2937,8 +2950,9 @@ async fn submit_action(
             },
         ),
     }?;
-    record_run_event(
+    record_run_action_event(
         slot,
+        &effective_action_id,
         TraceEventKind::OutcomeRecorded {
             outcome: serde_json::json!({
                 "source": "daemon.action",
@@ -3130,6 +3144,18 @@ async fn submit_physical_action(
         "splendor.devices.actions.submit",
         security.audit_attribution.clone(),
     )?;
+    let effective_action_id = request
+        .action_request
+        .action_id
+        .clone()
+        .unwrap_or_else(ActionId::new);
+    record_run_action_event(
+        slot,
+        &effective_action_id,
+        TraceEventKind::ActionVerificationStarted {
+            action: request.action_request.action.clone(),
+        },
+    )?;
     record_physical_run_event(
         slot,
         "safety.verification.started",
@@ -3200,7 +3226,7 @@ async fn submit_physical_action(
         serde_json::json!({"allowed": true, "node_id": node_id}),
     )?;
     let action_request = ActionRequest {
-        action_id: request.action_request.action_id.clone().unwrap_or_default(),
+        action_id: effective_action_id.clone(),
         tenant_id: request.action_request.tenant_id.clone(),
         agent_id: request.action_request.agent_id.clone(),
         run_id: request.action_request.run_id.clone(),
@@ -3250,9 +3276,20 @@ async fn submit_physical_action(
             error.to_string(),
         )
     })?;
-    if outcome.status == ActionStatus::Executed {
-        record_run_event(
+    if !authority_pre_effect_evidence_recorded(&outcome.verification) {
+        record_run_action_event(
             slot,
+            &effective_action_id,
+            TraceEventKind::ActionVerificationCompleted {
+                action: request.action_request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+    }
+    if outcome.status == ActionStatus::Executed {
+        record_run_action_event(
+            slot,
+            &effective_action_id,
             TraceEventKind::ActionExecuted {
                 action: request.action_request.action.clone(),
                 outcome: outcome.output.clone().unwrap_or(serde_json::Value::Null),
@@ -3261,13 +3298,15 @@ async fn submit_physical_action(
     } else {
         record_physical_denial(
             slot,
+            &effective_action_id,
             &request.action_request.action,
             &outcome,
             "safety.verification.denied",
         )?;
     }
-    record_run_event(
+    record_run_action_event(
         slot,
+        &effective_action_id,
         TraceEventKind::OutcomeRecorded {
             outcome: serde_json::json!({"source": "daemon.physical_action", "action_outcome": outcome}),
             feedback: None,
@@ -3588,6 +3627,7 @@ fn simulated_safety_snapshot(
 
 fn record_physical_denial(
     slot: &RunSlot,
+    action_id: &ActionId,
     action: &Action,
     outcome: &ActionOutcome,
     event_type: &str,
@@ -3599,15 +3639,17 @@ fn record_physical_denial(
         serde_json::json!({"verification": outcome.verification, "status": outcome.status}),
     )?;
     match outcome.status {
-        ActionStatus::NeedsIntervention => record_run_event(
+        ActionStatus::NeedsIntervention => record_run_action_event(
             slot,
+            action_id,
             TraceEventKind::ActionNeedsIntervention {
                 action: action.clone(),
                 result: outcome.verification.clone(),
             },
         ),
-        _ => record_run_event(
+        _ => record_run_action_event(
             slot,
+            action_id,
             TraceEventKind::ActionDenied {
                 action: action.clone(),
                 result: outcome.verification.clone(),
@@ -4337,6 +4379,23 @@ fn record_run_event(slot: &RunSlot, kind: TraceEventKind) -> Result<(), ApiError
         })
 }
 
+fn record_run_action_event(
+    slot: &RunSlot,
+    action_id: &ActionId,
+    kind: TraceEventKind,
+) -> Result<(), ApiError> {
+    slot.scheduler
+        .record_action_event_for_agent(&slot.agent_id, action_id, kind)
+        .map(|_| ())
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "trace_error",
+                error.to_string(),
+            )
+        })
+}
+
 fn record_run_event_returning_id(
     slot: &RunSlot,
     kind: TraceEventKind,
@@ -5045,6 +5104,20 @@ mod tests {
         }
     }
 
+    fn unit_replay_credential(tenant_id: TenantId) -> CallerCredential {
+        CallerCredential {
+            credential_id: "unit_credential".to_string(),
+            principal: unit_audit().principal,
+            scopes: vec![splendor_types::EndpointScope::ReplayCreate],
+            binding: splendor_types::CredentialBinding::Tenant { tenant_id },
+            audience: splendor_types::CredentialAudience::Daemon {
+                daemon_id: "daemon_local".to_string(),
+            },
+            expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            revocation: splendor_types::RevocationStatus::Active,
+        }
+    }
+
     fn unit_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile {
         DeviceRuntimeProfile {
             node_id,
@@ -5257,6 +5330,66 @@ mod tests {
             safety_context,
             operator_intervention_evidence: None,
         }
+    }
+
+    fn assert_non_tick_action_trace(state: &DaemonState, run_id: &RunId, action_id: &ActionId) {
+        let runs = state.inner.runs.lock().expect("runs");
+        let slot = runs.get(run_id).expect("run slot");
+        let events = slot
+            .trace_store
+            .read(&run_id.to_string())
+            .expect("trace records")
+            .into_iter()
+            .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+            .filter(|event| event.identity.action_id.as_ref() == Some(action_id))
+            .collect::<Vec<_>>();
+        assert!(events.iter().all(|event| {
+            event.identity.run_id == *run_id
+                && event.identity.tenant_id.as_ref() == Some(&slot.tenant_id)
+                && event.identity.agent_id.as_ref() == Some(&slot.agent_id)
+                && event.identity.action_id.as_ref() == Some(action_id)
+        }));
+        assert!(events.iter().all(|event| event.identity.tick_id.is_none()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    TraceEventKind::ActionVerificationStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    TraceEventKind::ActionVerificationCompleted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    TraceEventKind::ActionExecuted { .. }
+                        | TraceEventKind::ActionDenied { .. }
+                        | TraceEventKind::ActionNeedsIntervention { .. }
+                        | TraceEventKind::ActionFailed { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, TraceEventKind::OutcomeRecorded { .. }))
+                .count(),
+            1
+        );
     }
 
     fn unit_action_request(action_name: &str) -> ActionRequest {
@@ -6462,34 +6595,47 @@ mod tests {
         .await
         .expect("register profile");
 
+        let executed_request = physical_request(
+            run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+            "move_to_waypoint",
+            safe_context(),
+        );
+        let executed_action_id = executed_request
+            .action_request
+            .action_id
+            .clone()
+            .expect("physical action id");
         let executed = submit_physical_action(
             Path(node_id.clone()),
             State(state.clone()),
-            Json(physical_request(
-                run_id.clone(),
-                tenant_id.clone(),
-                agent_id.clone(),
-                "move_to_waypoint",
-                safe_context(),
-            )),
+            Json(executed_request),
         )
         .await
         .expect("execute bounded action")
         .0;
         assert_eq!(executed.status, ActionStatus::Executed);
+        assert_non_tick_action_trace(&state, &run_id, &executed_action_id);
 
         let mut geofence = safe_context();
         geofence.zone_ref = Some("zone_b".to_string());
+        let denied_request = physical_request(
+            run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+            "move_to_waypoint",
+            geofence,
+        );
+        let denied_action_id = denied_request
+            .action_request
+            .action_id
+            .clone()
+            .expect("physical action id");
         let denied = submit_physical_action(
             Path(node_id.clone()),
             State(state.clone()),
-            Json(physical_request(
-                run_id.clone(),
-                tenant_id.clone(),
-                agent_id.clone(),
-                "move_to_waypoint",
-                geofence,
-            )),
+            Json(denied_request),
         )
         .await
         .expect("geofence returns denied outcome")
@@ -6499,6 +6645,45 @@ mod tests {
         assert_eq!(
             denied.verification.artifacts["source"].as_str(),
             Some("safety_verifier")
+        );
+        assert_non_tick_action_trace(&state, &run_id, &denied_action_id);
+
+        let executions_before_replay = state
+            .inner
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .expect("run")
+            .adapter_executions
+            .load(Ordering::SeqCst);
+        let replay = replay_run(
+            Path(run_id.clone()),
+            State(state.clone()),
+            Json(ReplayRequest {
+                credential: Some(unit_replay_credential(tenant_id.clone())),
+                audit_attribution: Some(unit_audit()),
+                mode: "inspect_only".to_string(),
+                side_effects_allowed: false,
+            }),
+        )
+        .await
+        .expect("inspect-only physical replay")
+        .0;
+        assert!(replay.action_event_count >= 2);
+        assert_non_tick_action_trace(&state, &run_id, &executed_action_id);
+        assert_non_tick_action_trace(&state, &run_id, &denied_action_id);
+        assert_eq!(
+            state
+                .inner
+                .runs
+                .lock()
+                .expect("runs")
+                .get(&run_id)
+                .expect("run")
+                .adapter_executions
+                .load(Ordering::SeqCst),
+            executions_before_replay
         );
 
         let mut low_battery = safe_context();

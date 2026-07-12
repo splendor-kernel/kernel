@@ -2,7 +2,9 @@ use super::*;
 use splendor_authority::{
     canonical_authority_request_digest, compatibility_permission_operation,
     gateway_action_operation, gateway_adapter_operation, issue_local_authority_obligation_receipt,
-    AuthorityObligationReceiptValidationContext,
+    AuthorityObligationEffectPermit, AuthorityObligationReceiptLedger,
+    AuthorityObligationReceiptValidationContext, InMemoryAuthorityObligationReceiptLedger,
+    ObligationReceiptLedgerError, ValidatedAuthorityObligationReceipt,
 };
 use splendor_types::{
     AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, AuthorityDecision,
@@ -741,15 +743,31 @@ fn authority_gateway(
     context: AuthorityObligationReceiptValidationContext,
     adapter: Arc<CountingAdapter>,
 ) -> VerifiedActionGateway {
+    authority_gateway_with_ledger(
+        context,
+        Arc::new(InMemoryAuthorityObligationReceiptLedger::default()),
+        adapter,
+    )
+}
+
+fn authority_gateway_with_ledger(
+    context: AuthorityObligationReceiptValidationContext,
+    ledger: Arc<dyn AuthorityObligationReceiptLedger>,
+    adapter: Arc<CountingAdapter>,
+) -> VerifiedActionGateway {
     let tenant_access = Arc::new(TestTenantAccess {
         policy: VerificationResult::allow(),
         quota: VerificationResult::allow(),
     });
     let mut gateway = VerifiedActionGateway::new(tenant_access);
-    gateway.register_adapter("noop", "adapter", adapter);
+    gateway.register_adapter("noop", "adapter", adapter.clone());
     gateway.set_authority_obligation_verifier(Arc::new(
-        LocalAuthorityObligationVerifier::require_all(context),
+        LocalAuthorityObligationVerifier::require_all(context, ledger),
     ));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        adapter,
+    }));
     gateway
 }
 
@@ -868,6 +886,39 @@ struct OrderingAuthorityRecorder {
 
 struct DelayingResourceVerifier(StdDuration);
 
+struct DelayingClaimRecorder {
+    delay: StdDuration,
+    ledger: Arc<dyn AuthorityObligationReceiptLedger>,
+    context: AuthorityObligationReceiptValidationContext,
+    receipts: Vec<AuthorityObligationReceipt>,
+    adapter: Arc<CountingAdapter>,
+}
+
+struct FailingAuthorityRecorder;
+
+#[derive(Debug)]
+struct UnavailableReceiptLedger;
+
+impl AuthorityObligationReceiptLedger for UnavailableReceiptLedger {
+    fn validate_receipts(
+        &self,
+        _receipts: &[AuthorityObligationReceipt],
+        _context: &AuthorityObligationReceiptValidationContext,
+        _now: OffsetDateTime,
+    ) -> Result<Vec<ValidatedAuthorityObligationReceipt>, ObligationReceiptLedgerError> {
+        Err(ObligationReceiptLedgerError::Unavailable)
+    }
+
+    fn claim_receipts(
+        &self,
+        _receipts: &[AuthorityObligationReceipt],
+        _context: &AuthorityObligationReceiptValidationContext,
+        _now: OffsetDateTime,
+    ) -> Result<AuthorityObligationEffectPermit, ObligationReceiptLedgerError> {
+        Err(ObligationReceiptLedgerError::Unavailable)
+    }
+}
+
 impl ResourceBoundaryVerifier for DelayingResourceVerifier {
     fn verify_resource_boundary(
         &self,
@@ -889,6 +940,37 @@ impl PreEffectAuthorityDecisionRecorder for OrderingAuthorityRecorder {
         assert!(authority_pre_effect_evidence_recorded(verification));
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+impl PreEffectAuthorityDecisionRecorder for DelayingClaimRecorder {
+    fn record_pre_effect_authority_allow(
+        &self,
+        _action: &ActionRequest,
+        verification: &VerificationResult,
+    ) -> Result<(), String> {
+        assert!(authority_pre_effect_evidence_recorded(verification));
+        assert_eq!(*self.adapter.calls.lock().expect("adapter calls"), 0);
+        let replay = self
+            .ledger
+            .claim_receipts(&self.receipts, &self.context, OffsetDateTime::now_utc())
+            .expect_err("receipt must already be claimed before recording");
+        assert_eq!(
+            replay.reason_code(),
+            "authority_obligation_receipt_replayed"
+        );
+        thread::sleep(self.delay);
+        Ok(())
+    }
+}
+
+impl PreEffectAuthorityDecisionRecorder for FailingAuthorityRecorder {
+    fn record_pre_effect_authority_allow(
+        &self,
+        _action: &ActionRequest,
+        _verification: &VerificationResult,
+    ) -> Result<(), String> {
+        Err("injected_trace_failure".to_string())
     }
 }
 
@@ -1054,6 +1136,40 @@ fn live_conditional_authority_rejects_every_unmatched_or_extra_receipt() {
 }
 
 #[test]
+fn duplicate_receipt_identity_across_distinct_current_decisions_is_rejected_globally() {
+    let now = OffsetDateTime::now_utc();
+    let (mut request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let shared_receipt_id = AuthorityObligationReceiptId::new();
+    request.authority_obligation_receipts = decisions
+        .iter()
+        .enumerate()
+        .map(|(index, decision)| {
+            let mut receipt = unsigned_obligation_receipt(decision, issuer.clone(), now);
+            if index < 2 {
+                receipt.receipt_id = shared_receipt_id.clone();
+            }
+            issue_obligation_receipt(receipt, &context)
+        })
+        .collect();
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = authority_gateway(context, adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+
+    let outcome = gateway.submit(request).expect("duplicate receipt denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"duplicate_obligation_receipt_id".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
 fn receipt_expiring_during_blocking_verifier_work_never_reaches_adapter() {
     let now = OffsetDateTime::now_utc();
     let (mut request, issuer, context, decisions) =
@@ -1087,6 +1203,117 @@ fn receipt_expiring_during_blocking_verifier_work_never_reaches_adapter() {
         .verification
         .reasons
         .contains(&"obligation_receipt_expired".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn claimed_receipt_permit_survives_expiry_during_durable_recording() {
+    let now = OffsetDateTime::now_utc();
+    let (mut request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    request.authority_obligation_receipts = decisions
+        .iter()
+        .map(|decision| {
+            let mut receipt = unsigned_obligation_receipt(decision, issuer.clone(), now);
+            receipt.expires_at = now + time::Duration::milliseconds(150);
+            issue_obligation_receipt(receipt, &context)
+        })
+        .collect();
+    let ledger = Arc::new(InMemoryAuthorityObligationReceiptLedger::default());
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway =
+        authority_gateway_with_ledger(context.clone(), ledger.clone(), adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(DelayingClaimRecorder {
+        delay: StdDuration::from_millis(250),
+        ledger,
+        context,
+        receipts: request.authority_obligation_receipts.clone(),
+        adapter: adapter.clone(),
+    }));
+
+    let outcome = gateway.submit(request).expect("delayed recorder outcome");
+
+    if outcome.status == ActionStatus::Executed {
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+    } else {
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert!(outcome
+            .verification
+            .reasons
+            .contains(&"obligation_receipt_expired".to_string()));
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+    }
+}
+
+#[test]
+fn trace_failure_burns_receipts_and_shared_ledger_survives_verifier_recreation() {
+    let now = OffsetDateTime::now_utc();
+    let (request, _issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let ledger = Arc::new(InMemoryAuthorityObligationReceiptLedger::default());
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut failing =
+        authority_gateway_with_ledger(context.clone(), ledger.clone(), adapter.clone());
+    failing.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: decisions.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    failing.set_pre_effect_authority_recorder(Arc::new(FailingAuthorityRecorder));
+
+    let failed = failing
+        .submit(request.clone())
+        .expect("trace failure outcome");
+    assert_eq!(failed.status, ActionStatus::NeedsIntervention);
+    assert!(failed
+        .verification
+        .reasons
+        .contains(&"authority_evidence_append_failed".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+
+    let mut recreated = authority_gateway_with_ledger(context, ledger, adapter.clone());
+    recreated.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    recreated.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        adapter: adapter.clone(),
+    }));
+    let replayed = recreated
+        .submit(request)
+        .expect("shared-ledger replay denial");
+    assert_eq!(replayed.status, ActionStatus::Denied);
+    assert!(replayed
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn unavailable_receipt_ledger_fails_closed_without_adapter_execution() {
+    let now = OffsetDateTime::now_utc();
+    let (request, _issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway =
+        authority_gateway_with_ledger(context, Arc::new(UnavailableReceiptLedger), adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+
+    let outcome = gateway.submit(request).expect("unavailable ledger outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_replay_state_unavailable".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
 }
 
@@ -1734,7 +1961,10 @@ fn authority_obligation_requirement_matchers_preserve_optional_default() {
     request.adapter = Some("adapter".to_string());
     let adapter = Arc::new(CountingAdapter::default());
     let outcome = authority_gateway_with_verifier(
-        Arc::new(LocalAuthorityObligationVerifier::new(context.clone())),
+        Arc::new(LocalAuthorityObligationVerifier::new(
+            context.clone(),
+            Arc::new(InMemoryAuthorityObligationReceiptLedger::default()),
+        )),
         adapter.clone(),
     )
     .submit(request)
@@ -1758,6 +1988,7 @@ fn authority_obligation_requirement_matchers_preserve_optional_default() {
             vec![AuthorityObligationRequirement::action_adapter(
                 "noop", "other",
             )],
+            Arc::new(InMemoryAuthorityObligationReceiptLedger::default()),
         )),
         adapter.clone(),
     )
@@ -1776,6 +2007,7 @@ fn authority_obligation_requirement_matchers_preserve_optional_default() {
                 AuthorityObligationRequirement::action("other_action"),
                 AuthorityObligationRequirement::action_adapter("noop", "adapter"),
             ],
+            Arc::new(InMemoryAuthorityObligationReceiptLedger::default()),
         )),
         adapter.clone(),
     )

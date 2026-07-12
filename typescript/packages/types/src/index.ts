@@ -291,8 +291,11 @@ export interface AuthorityObligationReceiptValidation {
   signature: string;
 }
 
+export const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION =
+  "splendor.authority.obligation_receipt.v1" as const;
+
 export interface AuthorityObligationReceipt {
-  schema_version: string;
+  schema_version: typeof AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION;
   receipt_id: AuthorityObligationReceiptId;
   issuer: PrincipalId;
   audience: string;
@@ -302,13 +305,13 @@ export interface AuthorityObligationReceipt {
   authority_decision_id: AuthorityDecisionId;
   canonical_request_digest: string;
   evidence_digest: string;
-  evidence_ref?: string;
+  evidence_ref?: string | null;
   issued_at: ISODateTime;
   expires_at: ISODateTime;
   revocation: RevocationStatus;
   revocation_ref: string;
-  approval_id?: ApprovalId;
-  approval_trace_event_id?: TraceEventId;
+  approval_id?: ApprovalId | null;
+  approval_trace_event_id?: TraceEventId | null;
   validation: AuthorityObligationReceiptValidation;
 }
 

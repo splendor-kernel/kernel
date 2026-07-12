@@ -14,10 +14,13 @@
   resident-mode daemon run effects: immutable action/adapter/exact-
   permission profiles prevent permission omission and adapter recombination;
   a final owned effect permit closes expiry/revocation TOCTOU races; revocation
-  waits for earlier permitted adapter calls; scheduler authority traces retain
-  one tick identity; and conditional receipts reject every unknown extra, validate
-  after blocking verifiers, and atomically consume once before evidence/adapter.
-  Registered profiles require the complete signed permission set and ambiguous
+  waits for earlier permitted adapter calls; monotonic time latches observed
+  expiry; scheduler traces retain one tick identity; direct/physical traces retain
+  one action identity; and conditional receipts reject globally duplicated or
+  unknown extras, validate after blocking verifiers, and atomically claim an owned
+  one-use effect permit before evidence/adapter. Trace failure burns the claim.
+  The shared receipt ledger is process-local and does not claim restart durability.
+  Registered and non-empty request profiles require the complete signed permission set and ambiguous
   multi-adapter work orders fail admission. Closed Rust/OpenAPI objects and exact
   TypeScript authority unions have parity tests. Resident credential tests cover
   metadata/scope checks only; production authentication remains deferred to C01.

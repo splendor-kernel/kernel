@@ -3620,7 +3620,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(error.code, "work_order_scope_widening");
+    assert_eq!(error.code, "work_order_permission_profile_mismatch");
 
     let mut widened_policy = create_request(
         tenant_id.clone(),

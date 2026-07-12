@@ -614,6 +614,23 @@ impl LoopEngine {
         self.runtime.record_event(kind).map_err(LoopError::Trace)
     }
 
+    /// Records a non-tick action event with the run's tenant/agent/action scope
+    /// through the same durable cursor used by scheduler ticks.
+    pub fn record_runtime_action_event(
+        &self,
+        action_id: &ActionId,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, LoopError> {
+        let identity = self
+            .runtime
+            .trace_identity()
+            .with_tenant_agent(self.agent.tenant_id.clone(), self.agent.agent_id.clone())
+            .with_action_id(action_id.clone());
+        self.runtime
+            .record_event_with_identity(identity, kind)
+            .map_err(LoopError::Trace)
+    }
+
     /// Executes a single tick of the loop engine.
     pub fn tick(&mut self, tick_id: u64) -> Result<TickOutcome, LoopError> {
         let start = Instant::now();

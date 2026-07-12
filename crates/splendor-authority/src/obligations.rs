@@ -14,7 +14,9 @@ use splendor_types::{
     AuthorityObligationReceiptId, AuthorityObligationReceiptValidationKind, CapabilityRequest,
     ContentHash, PrincipalId, RevocationStatus, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
 };
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::Mutex;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -121,6 +123,188 @@ impl fmt::Debug for AuthorityObligationReceiptValidationContext {
 pub struct ValidatedAuthorityObligationReceipt {
     receipt: AuthorityObligationReceipt,
     trust: ValidatedReceiptTrust,
+}
+
+/// Authority-owned one-use receipt state used by gateway verifiers.
+///
+/// Implementations own both trusted-time observation and the linearized claim.
+/// Validation and claim must fail closed when that state is unavailable.
+pub trait AuthorityObligationReceiptLedger: Send + Sync {
+    /// Validates receipts at a monotonic trusted time without consuming them.
+    fn validate_receipts(
+        &self,
+        receipts: &[AuthorityObligationReceipt],
+        context: &AuthorityObligationReceiptValidationContext,
+        now: OffsetDateTime,
+    ) -> Result<Vec<ValidatedAuthorityObligationReceipt>, ObligationReceiptLedgerError>;
+
+    /// Atomically revalidates and permanently claims each receipt exactly once.
+    /// This claim is the effect linearization point.
+    fn claim_receipts(
+        &self,
+        receipts: &[AuthorityObligationReceipt],
+        context: &AuthorityObligationReceiptValidationContext,
+        now: OffsetDateTime,
+    ) -> Result<AuthorityObligationEffectPermit, ObligationReceiptLedgerError>;
+}
+
+/// Owned proof that exact obligation receipts were valid and claimed once.
+///
+/// Expiry after this value is returned does not cancel the already-linearized
+/// in-flight effect. The gateway retains this permit through evidence append and
+/// adapter execution. A claim is intentionally not released on drop.
+#[derive(Debug)]
+pub struct AuthorityObligationEffectPermit {
+    receipt_ids: Vec<AuthorityObligationReceiptId>,
+}
+
+impl AuthorityObligationEffectPermit {
+    /// Receipt identities atomically burned by this permit.
+    pub fn receipt_ids(&self) -> &[AuthorityObligationReceiptId] {
+        &self.receipt_ids
+    }
+}
+
+/// Process-local authority-owned receipt ledger.
+///
+/// Clones of a verifier should receive the same `Arc` of this ledger. This
+/// implementation is suitable only for current process-local runs; it does not
+/// claim restart durability.
+#[derive(Debug, Default)]
+pub struct InMemoryAuthorityObligationReceiptLedger {
+    state: Mutex<InMemoryAuthorityObligationReceiptState>,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryAuthorityObligationReceiptState {
+    max_observed_time: Option<OffsetDateTime>,
+    consumed_receipts: HashSet<String>,
+    expired_receipts: HashSet<String>,
+}
+
+impl AuthorityObligationReceiptLedger for InMemoryAuthorityObligationReceiptLedger {
+    fn validate_receipts(
+        &self,
+        receipts: &[AuthorityObligationReceipt],
+        context: &AuthorityObligationReceiptValidationContext,
+        now: OffsetDateTime,
+    ) -> Result<Vec<ValidatedAuthorityObligationReceipt>, ObligationReceiptLedgerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ObligationReceiptLedgerError::Unavailable)?;
+        validate_receipts_at_monotonic_time(&mut state, receipts, context, now)
+    }
+
+    fn claim_receipts(
+        &self,
+        receipts: &[AuthorityObligationReceipt],
+        context: &AuthorityObligationReceiptValidationContext,
+        now: OffsetDateTime,
+    ) -> Result<AuthorityObligationEffectPermit, ObligationReceiptLedgerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ObligationReceiptLedgerError::Unavailable)?;
+        validate_receipts_at_monotonic_time(&mut state, receipts, context, now)?;
+        if receipts.iter().any(|receipt| {
+            state
+                .consumed_receipts
+                .contains(&receipt.receipt_id.to_string())
+        }) {
+            return Err(ObligationReceiptLedgerError::Replayed);
+        }
+        state.consumed_receipts.extend(
+            receipts
+                .iter()
+                .map(|receipt| receipt.receipt_id.to_string()),
+        );
+        Ok(AuthorityObligationEffectPermit {
+            receipt_ids: receipts
+                .iter()
+                .map(|receipt| receipt.receipt_id.clone())
+                .collect(),
+        })
+    }
+}
+
+fn validate_receipts_at_monotonic_time(
+    state: &mut InMemoryAuthorityObligationReceiptState,
+    receipts: &[AuthorityObligationReceipt],
+    context: &AuthorityObligationReceiptValidationContext,
+    now: OffsetDateTime,
+) -> Result<Vec<ValidatedAuthorityObligationReceipt>, ObligationReceiptLedgerError> {
+    let previous = state.max_observed_time;
+    let effective_now = previous.map_or(now, |observed| observed.max(now));
+    state.max_observed_time = Some(effective_now);
+
+    for receipt in receipts {
+        if effective_now >= receipt.expires_at {
+            state
+                .expired_receipts
+                .insert(receipt.receipt_id.to_string());
+        }
+    }
+    if receipts.iter().any(|receipt| {
+        state
+            .expired_receipts
+            .contains(&receipt.receipt_id.to_string())
+    }) {
+        return Err(ObligationReceiptLedgerError::Expired);
+    }
+    if previous.is_some_and(|observed| now < observed) {
+        return Err(ObligationReceiptLedgerError::ClockRollback);
+    }
+
+    receipts
+        .iter()
+        .cloned()
+        .map(|receipt| {
+            validate_authority_obligation_receipt(receipt, &context.at_time(effective_now))
+                .map_err(ObligationReceiptLedgerError::Validation)
+        })
+        .collect()
+}
+
+/// Stable fail-closed errors from authority-owned receipt state.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ObligationReceiptLedgerError {
+    /// Trusted one-use or time state could not be read.
+    #[error("authority obligation receipt ledger unavailable")]
+    Unavailable,
+    /// Trusted wall-clock observation moved backwards.
+    #[error("authority obligation receipt clock rollback")]
+    ClockRollback,
+    /// Receipt expiry was observed and latched.
+    #[error("authority obligation receipt expired")]
+    Expired,
+    /// A receipt was already claimed.
+    #[error("authority obligation receipt replayed")]
+    Replayed,
+    /// Trusted receipt validation failed.
+    #[error("authority obligation receipt validation failed: {0}")]
+    Validation(ObligationReceiptError),
+}
+
+impl ObligationReceiptLedgerError {
+    /// Stable normalized reason code used at the gateway boundary.
+    pub fn reason_code(&self) -> String {
+        match self {
+            Self::Unavailable => {
+                "authority_obligation_receipt_replay_state_unavailable".to_string()
+            }
+            Self::ClockRollback => "authority_obligation_receipt_clock_rollback".to_string(),
+            Self::Expired => "obligation_receipt_expired".to_string(),
+            Self::Replayed => "authority_obligation_receipt_replayed".to_string(),
+            Self::Validation(error) => error.reason_code(),
+        }
+    }
+
+    /// Whether this failure represents unavailable verifier/ledger state.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+            || matches!(self, Self::Validation(error) if error.reason_code() == "obligation_receipt_validation_secret_unavailable")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

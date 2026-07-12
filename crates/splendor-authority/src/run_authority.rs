@@ -38,6 +38,8 @@ struct LocalSignedWorkOrderRunAuthorityInner {
 #[derive(Default)]
 struct LocalRunAuthorityState {
     revoked: bool,
+    expired: bool,
+    max_observed_time: Option<OffsetDateTime>,
     generation: u64,
     in_flight_effects: u64,
 }
@@ -167,8 +169,8 @@ impl LocalSignedWorkOrderRunAuthority {
         operation: AuthorityOperation,
         now: OffsetDateTime,
     ) -> AuthorityDecision {
-        let revoked = match self.inner.state.lock() {
-            Ok(state) => state.revoked,
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
             Err(_) => {
                 return unavailable_decision(
                     &self.inner,
@@ -178,7 +180,14 @@ impl LocalSignedWorkOrderRunAuthority {
                 )
             }
         };
-        evaluate_operation(&self.inner, operation, now, revoked)
+        match observe_authority_time(&self.inner, &mut state, now) {
+            AuthorityTimeObservation::Current(effective_now) => {
+                evaluate_operation(&self.inner, operation, effective_now, state.revoked)
+            }
+            AuthorityTimeObservation::Rollback => {
+                unavailable_decision(&self.inner, operation, now, "authority_clock_rollback")
+            }
+        }
     }
 
     /// Acquires the final owned effect permit after all other pre-effect checks.
@@ -211,9 +220,17 @@ impl LocalSignedWorkOrderRunAuthority {
                 permit: None,
             };
         };
+        let time = observe_authority_time(&self.inner, &mut state, now);
         let decisions = operations
             .into_iter()
-            .map(|operation| evaluate_operation(&self.inner, operation, now, state.revoked))
+            .map(|operation| match time {
+                AuthorityTimeObservation::Current(effective_now) => {
+                    evaluate_operation(&self.inner, operation, effective_now, state.revoked)
+                }
+                AuthorityTimeObservation::Rollback => {
+                    unavailable_decision(&self.inner, operation, now, "authority_clock_rollback")
+                }
+            })
             .collect::<Vec<_>>();
         let allowed = decisions.iter().all(|decision| {
             matches!(
@@ -267,6 +284,33 @@ impl LocalSignedWorkOrderRunAuthority {
     /// Opaque grant identity retained for trace/evidence correlation.
     pub fn grant_id(&self) -> &CapabilityGrantId {
         &self.inner.grant.grant().grant_id
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuthorityTimeObservation {
+    Current(OffsetDateTime),
+    Rollback,
+}
+
+fn observe_authority_time(
+    inner: &LocalSignedWorkOrderRunAuthorityInner,
+    state: &mut LocalRunAuthorityState,
+    now: OffsetDateTime,
+) -> AuthorityTimeObservation {
+    let previous = state.max_observed_time;
+    let effective_now = previous.map_or(now, |observed| observed.max(now));
+    state.max_observed_time = Some(effective_now);
+    if effective_now >= inner.grant.grant().expires_at {
+        state.expired = true;
+    }
+    if state.expired {
+        return AuthorityTimeObservation::Current(effective_now);
+    }
+    if previous.is_some_and(|observed| now < observed) {
+        AuthorityTimeObservation::Rollback
+    } else {
+        AuthorityTimeObservation::Current(effective_now)
     }
 }
 

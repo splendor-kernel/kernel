@@ -2559,7 +2559,7 @@ components:
       properties:
         schema_version:
           type: string
-          minLength: 1
+          enum: [splendor.authority.obligation_receipt.v1]
         receipt_id:
           type: string
           format: uuid
@@ -2588,7 +2588,7 @@ components:
           type: string
           minLength: 1
         evidence_ref:
-          type: string
+          type: [string, 'null']
           minLength: 1
         issued_at:
           type: string
@@ -2602,10 +2602,10 @@ components:
           type: string
           minLength: 1
         approval_id:
-          type: string
+          type: [string, 'null']
           format: uuid
         approval_trace_event_id:
-          type: string
+          type: [string, 'null']
           format: uuid
         validation:
           $ref: '#/components/schemas/AuthorityObligationReceiptValidation'
@@ -2746,6 +2746,7 @@ components:
             type: string
         allowed_permissions:
           type: array
+          description: Empty selects the complete signed compatibility profile; non-empty must exactly equal it.
           items:
             type: string
         policy_actions:

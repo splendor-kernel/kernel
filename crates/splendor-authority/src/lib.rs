@@ -53,8 +53,10 @@ pub use issuance::{
 pub use obligations::{
     canonical_authority_request_digest, issue_local_authority_obligation_receipt,
     validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationReceiptValidationContext, ObligationReceiptError,
-    ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
+    AuthorityObligationEffectPermit, AuthorityObligationReceiptLedger,
+    AuthorityObligationReceiptValidationContext, InMemoryAuthorityObligationReceiptLedger,
+    ObligationReceiptError, ObligationReceiptLedgerError, ObligationReceiptVerification,
+    ValidatedAuthorityObligationReceipt,
 };
 pub use renewal::{
     renew_cached_authority_grant, AuthorityGrantRenewalContextError, AuthorityGrantRenewalPolicy,

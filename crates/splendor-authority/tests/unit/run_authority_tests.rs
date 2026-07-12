@@ -130,6 +130,37 @@ fn final_effect_permit_rechecks_expiry_after_early_allow() {
 }
 
 #[test]
+fn live_run_authority_rejects_clock_rollback_and_latches_observed_expiry() {
+    let now = OffsetDateTime::now_utc();
+    let authority = admitted(now);
+    let operation = gateway_action_operation("fixture.write");
+
+    assert_eq!(
+        authority
+            .evaluate_operation(operation.clone(), now + Duration::seconds(1))
+            .status,
+        AuthorityDecisionStatus::Allowed
+    );
+    let rollback = authority.evaluate_operation(operation.clone(), now);
+    assert_eq!(rollback.status, AuthorityDecisionStatus::NeedsIntervention);
+    assert_eq!(rollback.reasons, vec!["authority_clock_rollback"]);
+
+    let expired = authority.evaluate_operation(operation.clone(), now + Duration::seconds(2));
+    assert_eq!(expired.status, AuthorityDecisionStatus::Denied);
+    assert!(expired.reasons.contains(&"expired_grant".to_string()));
+
+    let rolled_back_after_expiry = authority.acquire_effect_permit(vec![operation], now);
+    assert!(rolled_back_after_expiry.permit.is_none());
+    assert_eq!(
+        rolled_back_after_expiry.decisions[0].status,
+        AuthorityDecisionStatus::Denied
+    );
+    assert!(rolled_back_after_expiry.decisions[0]
+        .reasons
+        .contains(&"expired_grant".to_string()));
+}
+
+#[test]
 fn admission_errors_are_stable_and_empty_permit_requests_fail_closed() {
     let now = OffsetDateTime::now_utc();
     let tenant_id = TenantId::new();

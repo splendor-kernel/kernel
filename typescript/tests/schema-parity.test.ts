@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   ACTION_STATUS_VALUES,
   AUTHORITY_OPERATION_NAMESPACE_VALUES,
+  AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
   AUTHORITY_RESOURCE_KIND_VALUES,
   AUTHORITY_VERB_VALUES,
   CANONICAL_SCHEMA_FIELDS,
@@ -284,6 +285,11 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     "validation"
   ];
   const validationFields = ["validation_kind", "algorithm", "key_id", "digest", "signature"];
+  const rustReceiptVersion =
+    /pub const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION:\s*&str\s*=\s*\n?\s*"([^"]+)"/.exec(
+      authority
+    )?.[1];
+  assert.equal(AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION, rustReceiptVersion);
 
   assert.deepEqual(extractStructFields(authority, "AuthorityObligationReceipt"), receiptFields);
   assert.deepEqual(
@@ -304,6 +310,17 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
   assert.match(registeredActionSchema, /additionalProperties: false/);
   assert.match(registeredActionSchema, /uniqueItems: true/);
   assert.match(registeredActionSchema, /maxItems: 64/);
+  const receiptSchema = extractOpenApiSchemaBlock(openapi, "AuthorityObligationReceipt");
+  assert.match(
+    receiptSchema,
+    /enum: \[splendor\.authority\.obligation_receipt\.v1\]/
+  );
+  for (const nullable of ["evidence_ref", "approval_id", "approval_trace_event_id"]) {
+    assert.match(
+      receiptSchema,
+      new RegExp(`^        ${nullable}:\\n          type: \\[string, 'null'\\]`, "m")
+    );
+  }
 
   const rustNamespaces = extractEnumVariants(authority, "AuthorityOperationNamespace").map(pascalToSnake);
   const rustResourceKinds = extractEnumVariants(authority, "AuthorityResourceKind").map(pascalToSnake);
@@ -323,7 +340,7 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     signature: "blake3:signature"
   };
   const receipt: AuthorityObligationReceipt = {
-    schema_version: "splendor.authority_obligation_receipt.v1",
+    schema_version: AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
     receipt_id: "00000000-0000-4000-8000-000000000001" as AuthorityObligationReceipt["receipt_id"],
     issuer: "00000000-0000-4000-8000-000000000002" as AuthorityObligationReceipt["issuer"],
     audience: "daemon:local",
@@ -333,10 +350,13 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     authority_decision_id: "00000000-0000-4000-8000-000000000005" as AuthorityObligationReceipt["authority_decision_id"],
     canonical_request_digest: "blake3:request",
     evidence_digest: "blake3:evidence",
+    evidence_ref: null,
     issued_at: "2026-07-12T00:00:00Z",
     expires_at: "2026-07-12T00:05:00Z",
     revocation: "active",
     revocation_ref: "revocation:receipt-1",
+    approval_id: null,
+    approval_trace_event_id: null,
     validation
   };
   const profile: RegisteredAction = {

@@ -40,8 +40,8 @@
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
     authority_decision_evidence, compatibility_permission_operation, gateway_action_operation,
-    gateway_adapter_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationReceiptValidationContext,
+    gateway_adapter_operation, verify_obligation_receipts, AuthorityObligationEffectPermit,
+    AuthorityObligationReceiptLedger, AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
@@ -854,15 +854,18 @@ impl PreEffectAuthorityDecisionRecorder for NoPreEffectAuthorityDecisionRecorder
 
 /// Returns whether this verification was durably recorded before adapter execution.
 pub fn authority_pre_effect_evidence_recorded(result: &VerificationResult) -> bool {
-    result
-        .artifacts
-        .pointer("/authority/pre_effect_recorded")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+    ["authority", "authority_obligation"].iter().any(|key| {
+        result
+            .artifacts
+            .get(*key)
+            .and_then(|artifact| artifact.get("pre_effect_recorded"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
 }
 
 /// Result returned by an authority obligation verifier.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum AuthorityObligationVerification {
     /// No obligation evidence is required for this action and none was supplied.
     NotRequired,
@@ -872,6 +875,13 @@ pub enum AuthorityObligationVerification {
     Denied(VerificationResult),
     /// Required evidence or the verifier itself is unavailable; fail closed.
     NeedsIntervention(VerificationResult),
+    /// Exact receipts were valid and atomically claimed at the effect boundary.
+    Permitted {
+        /// Final receipt verification result.
+        verification: VerificationResult,
+        /// Authority-owned one-use permit retained through the effect.
+        permit: AuthorityObligationEffectPermit,
+    },
 }
 
 /// Verifies conditional authority obligation receipts before adapter execution.
@@ -884,10 +894,10 @@ pub trait AuthorityObligationVerifier: Send + Sync {
         now: OffsetDateTime,
     ) -> AuthorityObligationVerification;
 
-    /// Atomically consumes a fully verified receipt collection at the final
+    /// Atomically claims a fully verified receipt collection at the final
     /// effect boundary. Implementations that do not own one-use state fail
     /// closed when receipts are present.
-    fn consume_verified_receipts(
+    fn claim_verified_receipts(
         &self,
         _receipts: &[AuthorityObligationReceipt],
         _now: OffsetDateTime,
@@ -989,20 +999,23 @@ impl AuthorityObligationRequirement {
 ///
 /// The context is supplied by gateway runtime configuration or an authority-owned
 /// receipt service seam. Request payloads never control this verifier context.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalAuthorityObligationVerifier {
     context: AuthorityObligationReceiptValidationContext,
     requirements: Vec<AuthorityObligationRequirement>,
-    consumed_receipts: Arc<std::sync::Mutex<HashSet<String>>>,
+    ledger: Arc<dyn AuthorityObligationReceiptLedger>,
 }
 
 impl LocalAuthorityObligationVerifier {
     /// Creates a verifier that validates supplied obligation evidence but does not require it.
-    pub fn new(context: AuthorityObligationReceiptValidationContext) -> Self {
+    pub fn new(
+        context: AuthorityObligationReceiptValidationContext,
+        ledger: Arc<dyn AuthorityObligationReceiptLedger>,
+    ) -> Self {
         Self {
             context,
             requirements: Vec::new(),
-            consumed_receipts: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            ledger,
         }
     }
 
@@ -1010,17 +1023,21 @@ impl LocalAuthorityObligationVerifier {
     pub fn requiring(
         context: AuthorityObligationReceiptValidationContext,
         requirements: Vec<AuthorityObligationRequirement>,
+        ledger: Arc<dyn AuthorityObligationReceiptLedger>,
     ) -> Self {
         Self {
             context,
             requirements,
-            consumed_receipts: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            ledger,
         }
     }
 
     /// Creates a verifier that requires authority obligation evidence for every action.
-    pub fn require_all(context: AuthorityObligationReceiptValidationContext) -> Self {
-        Self::requiring(context, vec![AuthorityObligationRequirement::all()])
+    pub fn require_all(
+        context: AuthorityObligationReceiptValidationContext,
+        ledger: Arc<dyn AuthorityObligationReceiptLedger>,
+    ) -> Self {
+        Self::requiring(context, vec![AuthorityObligationRequirement::all()], ledger)
     }
 }
 
@@ -1170,39 +1187,36 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
             ));
         }
 
-        let context = self.context.at_time(now);
-        let mut validated_receipts = Vec::with_capacity(evidence.receipts.len());
-        let mut validation_reasons = Vec::new();
-        for receipt in &evidence.receipts {
-            match validate_authority_obligation_receipt(receipt.clone(), &context) {
-                Ok(validated) => validated_receipts.push(validated),
-                Err(error) => push_unique_string(&mut validation_reasons, error.reason_code()),
-            }
-        }
-        if !validation_reasons.is_empty() {
-            let status = if validation_reasons
-                .iter()
-                .any(|reason| reason == "obligation_receipt_validation_secret_unavailable")
+        let validated_receipts =
+            match self
+                .ledger
+                .validate_receipts(&evidence.receipts, &self.context, now)
             {
-                "verifier_unavailable"
-            } else {
-                "denied"
+                Ok(receipts) => receipts,
+                Err(error) => {
+                    let status = if error.is_unavailable()
+                        || error.reason_code() == "authority_obligation_receipt_clock_rollback"
+                    {
+                        "verifier_unavailable"
+                    } else {
+                        "denied"
+                    };
+                    let result = authority_obligation_result(
+                        false,
+                        vec![error.reason_code()],
+                        status,
+                        Some(evidence),
+                        Some(expected_action_digest),
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    return if status == "verifier_unavailable" {
+                        AuthorityObligationVerification::NeedsIntervention(result)
+                    } else {
+                        AuthorityObligationVerification::Denied(result)
+                    };
+                }
             };
-            let result = authority_obligation_result(
-                false,
-                validation_reasons,
-                status,
-                Some(evidence),
-                Some(expected_action_digest),
-                Vec::new(),
-                Vec::new(),
-            );
-            return if status == "verifier_unavailable" {
-                AuthorityObligationVerification::NeedsIntervention(result)
-            } else {
-                AuthorityObligationVerification::Denied(result)
-            };
-        }
 
         let verification = verify_obligation_receipts(&evidence.decision, &validated_receipts, now);
         if !verification.allowed {
@@ -1254,7 +1268,7 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
         AuthorityObligationVerification::Allowed(result)
     }
 
-    fn consume_verified_receipts(
+    fn claim_verified_receipts(
         &self,
         receipts: &[AuthorityObligationReceipt],
         now: OffsetDateTime,
@@ -1263,71 +1277,35 @@ impl AuthorityObligationVerifier for LocalAuthorityObligationVerifier {
             return AuthorityObligationVerification::NotRequired;
         }
 
-        let context = self.context.at_time(now);
-        let mut validation_reasons = Vec::new();
-        for receipt in receipts {
-            if let Err(error) = validate_authority_obligation_receipt(receipt.clone(), &context) {
-                push_unique_string(&mut validation_reasons, error.reason_code());
+        match self.ledger.claim_receipts(receipts, &self.context, now) {
+            Ok(permit) => AuthorityObligationVerification::Permitted {
+                verification: VerificationResult::allow(),
+                permit,
+            },
+            Err(error) => {
+                let status = if error.is_unavailable()
+                    || error.reason_code() == "authority_obligation_receipt_clock_rollback"
+                {
+                    "verifier_unavailable"
+                } else {
+                    "denied"
+                };
+                let result = authority_obligation_result(
+                    false,
+                    vec![error.reason_code()],
+                    status,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                );
+                if status == "verifier_unavailable" {
+                    AuthorityObligationVerification::NeedsIntervention(result)
+                } else {
+                    AuthorityObligationVerification::Denied(result)
+                }
             }
         }
-        if !validation_reasons.is_empty() {
-            let status = if validation_reasons
-                .iter()
-                .any(|reason| reason == "obligation_receipt_validation_secret_unavailable")
-            {
-                "verifier_unavailable"
-            } else {
-                "denied"
-            };
-            let result = authority_obligation_result(
-                false,
-                validation_reasons,
-                status,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-            );
-            return if status == "verifier_unavailable" {
-                AuthorityObligationVerification::NeedsIntervention(result)
-            } else {
-                AuthorityObligationVerification::Denied(result)
-            };
-        }
-
-        let Ok(mut consumed) = self.consumed_receipts.lock() else {
-            return AuthorityObligationVerification::NeedsIntervention(
-                authority_obligation_result(
-                    false,
-                    vec!["authority_obligation_receipt_replay_state_unavailable".to_string()],
-                    "verifier_unavailable",
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                ),
-            );
-        };
-        if receipts
-            .iter()
-            .any(|receipt| consumed.contains(&receipt.receipt_id.to_string()))
-        {
-            return AuthorityObligationVerification::Denied(authority_obligation_result(
-                false,
-                vec!["authority_obligation_receipt_replayed".to_string()],
-                "denied",
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-            ));
-        }
-        consumed.extend(
-            receipts
-                .iter()
-                .map(|receipt| receipt.receipt_id.to_string()),
-        );
-        AuthorityObligationVerification::Allowed(VerificationResult::allow())
     }
 }
 
@@ -1590,6 +1568,16 @@ impl ActionGateway for VerifiedActionGateway {
         if action.authority_obligation_receipts.len() > 64 {
             let mut verification =
                 VerificationResult::deny("authority_obligation_receipt_limit_exceeded");
+            attach_request_context(&mut verification, &action);
+            return Ok(denied_outcome(action.action_id, verification));
+        }
+        let receipt_ids = action
+            .authority_obligation_receipts
+            .iter()
+            .map(|receipt| receipt.receipt_id.clone())
+            .collect::<HashSet<_>>();
+        if receipt_ids.len() != action.authority_obligation_receipts.len() {
+            let mut verification = VerificationResult::deny("duplicate_obligation_receipt_id");
             attach_request_context(&mut verification, &action);
             return Ok(denied_outcome(action.action_id, verification));
         }
@@ -1929,6 +1917,13 @@ impl ActionGateway for VerifiedActionGateway {
                             attach_request_context(&mut result, &action);
                             return Ok(needs_intervention_outcome(action.action_id, result));
                         }
+                        AuthorityObligationVerification::Permitted { .. } => {
+                            let mut result = VerificationResult::deny(
+                                "authority_obligation_receipt_claimed_before_final_boundary",
+                            );
+                            attach_request_context(&mut result, &action);
+                            return Ok(needs_intervention_outcome(action.action_id, result));
+                        }
                     }
                 }
             }
@@ -1958,6 +1953,13 @@ impl ActionGateway for VerifiedActionGateway {
                     attach_request_context(&mut result, &action);
                     return Ok(needs_intervention_outcome(action.action_id, result));
                 }
+                AuthorityObligationVerification::Permitted { .. } => {
+                    let mut result = VerificationResult::deny(
+                        "authority_obligation_receipt_claimed_before_final_boundary",
+                    );
+                    attach_request_context(&mut result, &action);
+                    return Ok(needs_intervention_outcome(action.action_id, result));
+                }
             }
             action
                 .authority_obligation_evidence
@@ -1966,12 +1968,30 @@ impl ActionGateway for VerifiedActionGateway {
                 .unwrap_or_default()
         };
 
+        let mut obligation_effect_permit = None;
         if !authority_obligation_grants.is_empty() {
             match self
                 .authority_obligation_verifier
-                .consume_verified_receipts(receipts_to_consume, OffsetDateTime::now_utc())
+                .claim_verified_receipts(receipts_to_consume, OffsetDateTime::now_utc())
             {
-                AuthorityObligationVerification::Allowed(_) => {}
+                AuthorityObligationVerification::Permitted {
+                    verification: claim_verification,
+                    permit,
+                } => {
+                    if !claim_verification.allowed {
+                        let mut result =
+                            VerificationResult::deny("authority_obligation_receipt_claim_invalid");
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_intervention_outcome(action.action_id, result));
+                    }
+                    obligation_effect_permit = Some(permit);
+                }
+                AuthorityObligationVerification::Allowed(_) => {
+                    let mut result =
+                        VerificationResult::deny("authority_obligation_effect_permit_unavailable");
+                    attach_request_context(&mut result, &action);
+                    return Ok(needs_intervention_outcome(action.action_id, result));
+                }
                 AuthorityObligationVerification::NotRequired => {
                     let mut result = VerificationResult::deny(
                         "authority_obligation_verifier_did_not_consume_receipts",
@@ -2001,11 +2021,16 @@ impl ActionGateway for VerifiedActionGateway {
             attach_allowed_artifact(&mut verification, "authority_obligation", artifacts);
         }
 
-        if prepared_authority.is_some() {
-            {
+        let requires_pre_effect_record =
+            prepared_authority.is_some() || obligation_effect_permit.is_some();
+        if requires_pre_effect_record {
+            for key in ["authority", "authority_obligation"] {
+                if verification.artifacts.get(key).is_none() {
+                    continue;
+                }
                 let authority_artifact = verification
                     .artifacts
-                    .get_mut("authority")
+                    .get_mut(key)
                     .and_then(serde_json::Value::as_object_mut)
                     .ok_or_else(|| {
                         GatewayError::VerificationFailed(
@@ -2021,19 +2046,22 @@ impl ActionGateway for VerifiedActionGateway {
                 .pre_effect_authority_recorder
                 .record_pre_effect_authority_allow(&action, &verification)
             {
-                if let Some(authority_artifact) = verification
-                    .artifacts
-                    .get_mut("authority")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    authority_artifact.insert(
-                        "pre_effect_recorded".to_string(),
-                        serde_json::Value::Bool(false),
-                    );
+                for key in ["authority", "authority_obligation"] {
+                    if let Some(authority_artifact) = verification
+                        .artifacts
+                        .get_mut(key)
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        authority_artifact.insert(
+                            "pre_effect_recorded".to_string(),
+                            serde_json::Value::Bool(false),
+                        );
+                    }
                 }
                 let mut result = VerificationResult::deny("authority_evidence_append_failed");
                 result.artifacts = serde_json::json!({
                     "authority": verification.artifacts.get("authority").cloned(),
+                    "authority_obligation": verification.artifacts.get("authority_obligation").cloned(),
                     "recorder_reason": bounded_recorder_reason(&reason),
                 });
                 attach_request_context(&mut result, &action);
@@ -2055,7 +2083,7 @@ impl ActionGateway for VerifiedActionGateway {
                 })
             }
         };
-        drop(effect_permit);
+        drop((effect_permit, obligation_effect_permit));
 
         let post_verification = self
             .invariant_evaluator
