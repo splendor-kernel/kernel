@@ -32,6 +32,8 @@ const REASON_MISSING_AUTHORITY_EVIDENCE: &str = "missing_authority_evidence";
 pub const REASON_MISSING_PARENT_RUN_GRANT_BINDING: &str = "missing_parent_run_grant_binding";
 /// Stable denial reason when child creation supplies a grant other than the run-bound grant.
 pub const REASON_PARENT_RUN_GRANT_MISMATCH: &str = "parent_run_grant_mismatch";
+/// Stable denial reason when a proposed child grant ID is already bound in this manager.
+pub const REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION: &str = "child_capability_grant_id_collision";
 
 /// Lifecycle status for local parent/child runs known to the delegation manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,17 +368,28 @@ pub enum LocalDelegationError {
 }
 
 /// Local-only delegation manager for parent/child run admission and trace links.
-#[derive(Debug)]
 pub struct LocalDelegationManager {
     router: LocalMessageRouter,
     lifecycle: Mutex<()>,
     state: Mutex<LocalDelegationState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LocalDelegationState {
     agents: HashMap<AgentId, LocalAgentRegistration>,
     runs: HashMap<RunId, LocalRunRecord>,
+    run_grants: HashMap<RunId, ValidatedCapabilityGrant>,
+}
+
+impl std::fmt::Debug for LocalDelegationManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalDelegationManager")
+            .field("router", &self.router)
+            .field("lifecycle", &"<mutex>")
+            .field("state", &"<redacted trusted grant bindings>")
+            .finish()
+    }
 }
 
 impl LocalDelegationManager {
@@ -460,11 +473,13 @@ impl LocalDelegationManager {
 
     /// Binds a registered root run to one trusted validated capability grant.
     ///
-    /// The manager snapshots only the immutable grant ID on the run record. The
-    /// grant subject must equal the run's immutable principal snapshot. A
-    /// same-run/same-grant retry is idempotent; a different grant for the same
-    /// run or the same grant for another run fails closed. Child runs are bound
-    /// automatically when authority issuance succeeds and must not call this API.
+    /// The manager privately retains the exact validated grant, including its
+    /// trust marker, while the public run record exposes only the grant ID for
+    /// evidence. The grant subject must equal the run's immutable principal
+    /// snapshot. A same-run/exact-grant retry is idempotent; different validated
+    /// content for the same run or grant-ID reuse by another run fails closed.
+    /// Child runs are bound automatically when authority issuance succeeds and
+    /// must not call this trusted local run-admission API.
     pub fn bind_root_run_capability_grant(
         &self,
         run_id: &RunId,
@@ -491,19 +506,21 @@ impl LocalDelegationManager {
                 grant_subject_id: grant.grant().subject.clone(),
             });
         }
-        if let Some(bound_grant_id) = run.capability_grant_id.as_ref() {
-            if bound_grant_id == &grant_id {
+        if let Some(bound_grant) = state.run_grants.get(run_id) {
+            if bound_grant == grant {
                 return Ok(run);
             }
             return Err(LocalDelegationError::ParentRunGrantBindingConflict {
                 run_id: run_id.clone(),
-                bound_grant_id: bound_grant_id.clone(),
+                bound_grant_id: bound_grant.grant().grant_id.clone(),
                 supplied_grant_id: grant_id,
             });
         }
-        if let Some((bound_run_id, _)) = state.runs.iter().find(|(candidate_run_id, record)| {
-            *candidate_run_id != run_id && record.capability_grant_id.as_ref() == Some(&grant_id)
-        }) {
+        if let Some((bound_run_id, _)) =
+            state.run_grants.iter().find(|(candidate_run_id, bound)| {
+                *candidate_run_id != run_id && bound.grant().grant_id == grant_id
+            })
+        {
             return Err(LocalDelegationError::CapabilityGrantRunBindingConflict {
                 grant_id,
                 bound_run_id: bound_run_id.clone(),
@@ -516,7 +533,9 @@ impl LocalDelegationManager {
             .get_mut(run_id)
             .ok_or_else(|| LocalDelegationError::UnknownParentRun(run_id.clone()))?;
         run.capability_grant_id = Some(grant_id);
-        Ok(run.clone())
+        let run = run.clone();
+        state.run_grants.insert(run_id.clone(), grant.clone());
+        Ok(run)
     }
 
     /// Creates a child run from an explicit target, objective, and delegated scope.
@@ -532,7 +551,7 @@ impl LocalDelegationManager {
         ensure_recorder_run(child_recorder, &request.child_run_id)?;
         let mut trace_context = request.trace_context();
 
-        let (parent_run, target_agent, duplicate_child_run) = {
+        let (parent_run, parent_bound_grant, target_agent, duplicate_child_run) = {
             let state = self.lock_state()?;
             let parent_run = state
                 .runs
@@ -541,6 +560,7 @@ impl LocalDelegationManager {
                 .ok_or_else(|| {
                     LocalDelegationError::UnknownParentRun(request.parent_run_id.clone())
                 })?;
+            let parent_bound_grant = state.run_grants.get(&request.parent_run_id).cloned();
             let target_agent = state
                 .agents
                 .get(&request.target_agent_id)
@@ -549,7 +569,12 @@ impl LocalDelegationManager {
                     LocalDelegationError::UnknownAgent(request.target_agent_id.clone())
                 })?;
             let duplicate_child_run = state.runs.contains_key(&request.child_run_id);
-            (parent_run, target_agent, duplicate_child_run)
+            (
+                parent_run,
+                parent_bound_grant,
+                target_agent,
+                duplicate_child_run,
+            )
         };
 
         if parent_run.status == LocalRunStatus::Cancelled {
@@ -579,16 +604,32 @@ impl LocalDelegationManager {
             })?;
             return Err(LocalDelegationError::TenantMismatch);
         }
-        let supplied_parent_grant_id = &authority.parent_capability_grant.grant().grant_id;
-        let parent_binding_denial = match parent_run.capability_grant_id.as_ref() {
+        let parent_binding_denial = match parent_bound_grant.as_ref() {
             None => Some(REASON_MISSING_PARENT_RUN_GRANT_BINDING),
-            Some(bound_grant_id) if bound_grant_id != supplied_parent_grant_id => {
+            Some(bound_grant) if bound_grant != &authority.parent_capability_grant => {
                 Some(REASON_PARENT_RUN_GRANT_MISMATCH)
             }
             Some(_) => None,
         };
         if let Some(reason) = parent_binding_denial {
             let reason = reason.to_string();
+            parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                delegation: trace_context,
+                reason: reason.clone(),
+            })?;
+            return Err(LocalDelegationError::AuthorityDenied { reason });
+        }
+        let child_grant_id_collision = if let Some(evidence) = authority.authority_evidence.as_ref()
+        {
+            self.lock_state()?
+                .run_grants
+                .values()
+                .any(|bound| bound.grant().grant_id == evidence.child_capability_grant_id)
+        } else {
+            false
+        };
+        if child_grant_id_collision {
+            let reason = REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION.to_string();
             parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
                 delegation: trace_context,
                 reason: reason.clone(),
@@ -688,6 +729,7 @@ impl LocalDelegationManager {
                 .clone(),
             issued_child_grant.child_grant().grant().grant_id.clone(),
         );
+        let child_capability_grant = issued_child_grant.child_grant().clone();
         trace_context = trace_context.with_authority_evidence(issued_evidence.clone());
 
         let requested_trace =
@@ -759,6 +801,9 @@ impl LocalDelegationManager {
         state
             .runs
             .insert(request.child_run_id, child_record.clone());
+        state
+            .run_grants
+            .insert(child_record.run_id.clone(), child_capability_grant);
 
         Ok(LocalChildRun {
             run: child_record,
@@ -1186,6 +1231,17 @@ pub struct LocalDelegationReplay {
     pub messages: Vec<MessageTraceContext>,
     /// Structured child failures seen during replay.
     pub failures: Vec<TaskFailure>,
+    /// Rejected delegation contexts with their stable denial reasons.
+    pub rejections: Vec<LocalDelegationRejection>,
+}
+
+/// Inspect-only replay evidence for one rejected local delegation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalDelegationRejection {
+    /// Parent/child and authority-evidence context recorded with the rejection.
+    pub delegation: LocalDelegationTraceContext,
+    /// Stable fail-closed reason recorded by the manager.
+    pub reason: String,
 }
 
 /// Reconstructs parent/child causal relationships and task message exchange from
@@ -1208,7 +1264,7 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                     replay.delegations.push(delegation.clone());
                 }
             }
-            TraceEventKind::DelegationRejected { delegation, .. } => {
+            TraceEventKind::DelegationRejected { delegation, reason } => {
                 let key = (
                     delegation.parent_run_id.clone(),
                     delegation.child_run_id.clone(),
@@ -1217,6 +1273,10 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                     seen_delegations.push(key);
                     replay.delegations.push(delegation.clone());
                 }
+                replay.rejections.push(LocalDelegationRejection {
+                    delegation: delegation.clone(),
+                    reason: reason.clone(),
+                });
             }
             TraceEventKind::ChildRunFailed {
                 delegation,

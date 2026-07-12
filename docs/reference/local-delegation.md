@@ -107,8 +107,10 @@ authority and fails closed before gateway submission.
    refs.
 4. Call
    `bind_root_run_capability_grant(&parent_run_id, &authority.parent_capability_grant)`.
-   The subject must match the root principal snapshot. Same-run/same-grant retry
-   is idempotent; the binding cannot be replaced or reused for another run.
+   The subject must match the root principal snapshot. The manager privately
+   retains the exact `ValidatedCapabilityGrant`, including its trust marker.
+   Same-run retry is idempotent only for exact equality; the binding cannot be
+   replaced or reused for another run in that manager.
 5. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
    with an explicit target agent, child run ID, objective, and delegated
    authority.
@@ -152,7 +154,12 @@ request/response message IDs when available, and optional non-authorizing
 `LocalDelegationAuthorityEvidence` refs. Denied authority issuance may record a
 stable `authority_reason` such as `overbroad_operation` or
 `missing_authority_evidence`. Root binding denials use the exact stable reasons
-`missing_parent_run_grant_binding` and `parent_run_grant_mismatch`.
+`missing_parent_run_grant_binding` and `parent_run_grant_mismatch`. Proposed
+child grant-ID reuse records `child_capability_grant_id_collision`.
+
+`LocalDelegationReplay.rejections` preserves each `DelegationRejected` context
+and stable reason. Replay remains inspect-only and introduces no authority or
+side effects.
 
 ## State behavior
 
@@ -163,10 +170,11 @@ and child agents. Agent state remains committed through normal state graph nodes
 by each loop engine.
 
 For a delegating root, `capability_grant_id` is populated only by the explicit
-trusted binding API. Binding denials and child-creation denials leave the full run
-record unchanged, including child fan-out and delegated authority. The manager
-has no separate mutable budget/depth consumption ledger; those limits remain
-immutable fields on validated grants and issued child grants.
+trusted binding API and remains evidence only. The manager separately retains the
+exact validated grant privately. Binding denials and child-creation denials leave
+the full run record unchanged, including child fan-out and delegated authority.
+The manager has no separate mutable budget/depth consumption ledger; those
+limits remain immutable fields on validated grants and issued child grants.
 
 Successful child records are automatically bound to the issued child grant ID
 for evidence and revocation. This is not an authorizing grant retrieval surface.
@@ -199,12 +207,18 @@ gateways, adapters, child runs, authority evaluation, or side effects.
 - Supplied trusted parent grant ID differs from the immutable root binding:
   exactly one `DelegationRejected` with `parent_run_grant_mismatch` and the same
   zero-effect behavior.
+- Supplied trusted parent grant reuses the bound ID but differs in any validated
+  content or trust state: `parent_run_grant_mismatch` with the same zero effects.
 - Root binding with a grant subject different from the run principal:
   `ParentRunGrantSubjectMismatch`.
 - Different grant for an already-bound root:
   `ParentRunGrantBindingConflict`.
 - Same grant ID for another root in the same manager:
   `CapabilityGrantRunBindingConflict`.
+- Proposed child grant ID collides with any root or child exact binding in the
+  same manager: exactly one `DelegationRejected` with
+  `child_capability_grant_id_collision` before request/routing/start/insertion or
+  fan-out effects.
 - Explicit binding of an existing child record:
   `ParentGrantBindingRequiresRootRun`; successful children are already bound.
 - Missing or mismatched target/objective: structured message validation failure.
@@ -237,6 +251,12 @@ but delegating callers must now explicitly bind a trusted grant before
 tightening. It adds no serialized grant/message/trace schema and no daemon,
 Python, or TypeScript contract.
 
+The additive `LegacyMultiScopeProfile` and
+`grant_from_legacy_multi_scope_allowlists` authority compatibility builder allow
+one parent grant to cover explicit non-empty lists of local child agent and run
+IDs. They use the existing local-profile validator; nil identities, empty lists,
+invalid audiences, and wildcard-like broad audience input fail closed.
+
 The bounded `AUTH-007c` matrix uses the public manager/authority/router/trace path
 and covers tenant, parent agent/shared-principal, parent principal/run, child
 agent/run, audience, and unrelated grant/evidence replay. The message target is
@@ -249,6 +269,11 @@ Grant-ID uniqueness is local to one `LocalDelegationManager`. The different-
 tenant matrix case uses an isolated manager only to exercise the validated
 grant's tenant scope; it is not cross-manager, cross-instance, or typed audience
 binding evidence.
+
+`bind_root_run_capability_grant` is trusted local run-admission setup. It does not
+currently emit a durable binding trace event because adding an event variant
+would expand the public trace schema. Child-creation denials remain durably
+represented by the existing `DelegationRejected` event when recording succeeds.
 
 The implementation remains local-only `AUTH-003b`/`AUTH-007c` wiring. It
 deliberately does not introduce signed work orders, remote dispatch, fleet

@@ -136,5 +136,8 @@ policies, gateways, adapters, child runs, or live authority evaluation.
   IDs for evidence/revocation only; a broader replacement grant fails the
   immutable run binding, and the exact child scope cannot cover a distinct
   grandchild agent/run.
+- Root binding retains the exact validated grant privately in one local manager;
+  the public run-record grant ID is evidence only. Binding setup itself has no
+  durable trace event in this bounded local example.
 - Remote dispatch, signed work orders, fleet placement, and long-lived child
   services are out of scope for this example.
