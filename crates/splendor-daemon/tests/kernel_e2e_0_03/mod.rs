@@ -1298,7 +1298,11 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority(&["parse.document"], &["doc.read"]),
     )?;
     manager.register_agent_with_principal(
-        AgentContext::new(specialist_b.clone(), tenant_id.clone(), specialist_b_config),
+        AgentContext::new(
+            specialist_b.clone(),
+            tenant_id.clone(),
+            specialist_b_config.clone(),
+        ),
         specialist_b_principal.clone(),
         delegated_authority(&["summarize.document"], &["doc.read"]),
     )?;
@@ -1322,6 +1326,8 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         &tenant_id,
         &child_a_request,
     )?;
+    manager
+        .bind_root_run_capability_grant(&parent_run, &child_a_authority.parent_capability_grant)?;
     let child_a = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -1350,13 +1356,41 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
     };
+    // The legacy fixture issues one child-specific parent grant per successful
+    // edge, so this second local manager is a separate compatibility boundary.
+    // It is not evidence of cross-manager or cross-instance grant uniqueness.
+    let child_b_manager = LocalDelegationManager::new();
+    child_b_manager.register_agent_with_principal(
+        AgentContext::new(
+            orchestrator.clone(),
+            tenant_id.clone(),
+            AgentRuntimeConfig {
+                isolation: AgentIsolationPolicy {
+                    allowed_message_schemas: vec![TASK_REQUEST_SCHEMA.to_string()],
+                    allowed_message_recipients: vec![specialist_b.clone()],
+                    ..AgentIsolationPolicy::default()
+                },
+                ..AgentRuntimeConfig::default()
+            },
+        ),
+        orchestrator_principal.clone(),
+        parent_authority,
+    )?;
+    child_b_manager.register_agent_with_principal(
+        AgentContext::new(specialist_b.clone(), tenant_id.clone(), specialist_b_config),
+        specialist_b_principal.clone(),
+        delegated_authority(&["summarize.document"], &["doc.read"]),
+    )?;
+    child_b_manager.register_root_run(parent_run.clone(), orchestrator.clone())?;
     let child_b_authority = local_delegation_authority(
         orchestrator_principal.clone(),
         specialist_b_principal,
         &tenant_id,
         &child_b_request,
     )?;
-    let child_b = manager.create_child_run(
+    child_b_manager
+        .bind_root_run_capability_grant(&parent_run, &child_b_authority.parent_capability_grant)?;
+    let child_b = child_b_manager.create_child_run(
         &parent_runtime,
         &child_b_runtime,
         child_b_request,
@@ -1373,7 +1407,7 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         response.response.status,
         splendor_types::TaskResponseStatus::Completed
     );
-    let failure = manager.fail_child_run(
+    let failure = child_b_manager.fail_child_run(
         &parent_runtime,
         &child_b_runtime,
         &child_b_run,
@@ -1430,7 +1464,10 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
     let replay = replay_local_delegations(&events);
     assert_eq!(replay.delegations.len(), 2);
     assert!(!replay.messages.is_empty());
-    assert_eq!(manager.run(&child_b_run)?.status, LocalRunStatus::Failed);
+    assert_eq!(
+        child_b_manager.run(&child_b_run)?.status,
+        LocalRunStatus::Failed
+    );
     let causal_graph_artifact = write_json_artifact(
         &artifacts.join("K-E2E-003-causal-graph.json"),
         &json!({
@@ -2512,6 +2549,10 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         &tenant_a,
         &tenant_mismatch_request,
     )?;
+    manager.bind_root_run_capability_grant(
+        &run_id,
+        &tenant_mismatch_authority.parent_capability_grant,
+    )?;
     let tenant_mismatch = manager
         .create_child_run(
             &parent_runtime,
@@ -3139,6 +3180,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         &tenant_id,
         &child_request,
     )?;
+    delegation.bind_root_run_capability_grant(&run_id, &child_authority.parent_capability_grant)?;
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,

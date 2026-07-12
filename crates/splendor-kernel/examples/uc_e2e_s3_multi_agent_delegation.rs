@@ -271,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     manager.register_agent_with_principal(
         other_specialist.clone(),
-        other_specialist_principal,
+        other_specialist_principal.clone(),
         delegated.clone(),
     )?;
     manager.register_root_run(parent_run_id.clone(), orchestrator_id.clone())?;
@@ -296,6 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tenant_id,
         &request,
     )?;
+    let bound_parent_grant = child_authority.parent_capability_grant.clone();
+    manager
+        .bind_root_run_capability_grant(&parent_run_id, &child_authority.parent_capability_grant)?;
     let child_run =
         manager.create_child_run(&parent_runtime, &child_runtime, request, child_authority)?;
     let consumed_request = manager.router().consume(
@@ -457,12 +460,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
     let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
-    let overbroad_authority = local_delegation_authority(
-        orchestrator_principal.clone(),
+    let mut overbroad_authority = LocalDelegationAuthority::new(
+        bound_parent_grant.clone(),
         specialist_principal.clone(),
-        &tenant_id,
-        &overbroad,
-    )?;
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    overbroad_authority.max_fan_out = 4;
     let before_events = manager
         .router()
         .outbox(&orchestrator_id, &parent_run_id)?
@@ -505,12 +509,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
     let cross_child_run_id = cross_tenant.child_run_id.clone();
     let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
-    let cross_authority = local_delegation_authority(
-        orchestrator_principal,
-        specialist_principal,
-        &tenant_id,
-        &cross_tenant,
-    )?;
+    let mut cross_authority = LocalDelegationAuthority::new(
+        bound_parent_grant,
+        other_specialist_principal,
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    cross_authority.max_fan_out = 4;
     let cross_result = manager.create_child_run(
         &parent_runtime,
         &cross_runtime,

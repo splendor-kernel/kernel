@@ -4,6 +4,10 @@
 
 ### Added
 
+- Bound local delegating root runs to one trusted validated capability grant ID,
+  preventing cross-run/shared-principal grant replay before message routing or
+  child effects. Unbound roots remain compatible for non-delegating use;
+  delegation now fails closed with stable binding reasons.
 - Added a partial FND-012 performance budget contract in `splendor-types`, a
   machine-readable 0.2 fixture, and conformance validation for mandatory
   latency/throughput metrics, benchmark environment capture, regression
@@ -16,6 +20,11 @@
 
 ### Explicitly not included
 
+- No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
+  Registry, physical helper-plan, remote/fleet, typed-instance, and independent
+  response-recipient confused-deputy paths remain deferred or unexpressible.
+- No recursive local delegation: child records retain issued grant IDs only for
+  evidence/revocation, and broader replacement grants fail the immutable binding.
 - No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7
   soak, 1,000-node, GPU/training, robotics, live fleet, or physical hardware
   benchmark was executed by this slice.
