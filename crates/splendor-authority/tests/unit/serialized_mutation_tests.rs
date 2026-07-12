@@ -99,18 +99,89 @@ fn deserialize<T: DeserializeOwned>(_case: Case<'_>, value: Value) -> Result<T, 
     serde_json::from_value(value)
 }
 
-fn remove(value: &mut Value, object_pointer: &str, key: &str) {
-    value
-        .pointer_mut(object_pointer)
-        .and_then(Value::as_object_mut)
-        .unwrap_or_else(|| panic!("invalid test mutation object pointer {object_pointer}"))
-        .remove(key);
+struct SerializedMutation<'a> {
+    case: Case<'a>,
+    baseline: Value,
+    value: Value,
 }
 
-fn set(value: &mut Value, pointer: &str, replacement: Value) {
-    *value
-        .pointer_mut(pointer)
-        .unwrap_or_else(|| panic!("invalid test mutation pointer {pointer}")) = replacement;
+impl<'a> SerializedMutation<'a> {
+    fn new(case: Case<'a>, baseline: Value) -> Self {
+        Self {
+            case,
+            value: baseline.clone(),
+            baseline,
+        }
+    }
+
+    fn remove(&mut self, object_pointer: &str, key: &str) {
+        let removed = self
+            .value
+            .pointer_mut(object_pointer)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{} invalid_object_pointer={object_pointer}", self.case))
+            .remove(key);
+        assert!(removed.is_some(), "{} missing_key={key}", self.case);
+    }
+
+    fn set(&mut self, pointer: &str, replacement: Value) {
+        *self
+            .value
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("{} invalid_value_pointer={pointer}", self.case)) =
+            replacement;
+    }
+
+    fn insert(&mut self, object_pointer: &str, key: &str, value: Value) {
+        self.value
+            .pointer_mut(object_pointer)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{} invalid_object_pointer={object_pointer}", self.case))
+            .insert(key.to_string(), value);
+    }
+
+    fn finish(self) -> Value {
+        assert_ne!(
+            self.value, self.baseline,
+            "{} serialized_mutation_equaled_baseline",
+            self.case
+        );
+        self.value
+    }
+}
+
+fn remove_with_context(
+    value: &mut Value,
+    object_pointer: &str,
+    key: &str,
+    fixture: &str,
+    mutation: u64,
+    seed: u64,
+) {
+    let removed = value
+        .pointer_mut(object_pointer)
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| {
+            panic!("fixture={fixture} mutation=operator_{mutation} seed={seed} invalid_object_pointer={object_pointer}")
+        })
+        .remove(key);
+    assert!(
+        removed.is_some(),
+        "fixture={fixture} mutation=operator_{mutation} seed={seed} missing_key={key}"
+    );
+}
+
+fn set_with_context(
+    value: &mut Value,
+    pointer: &str,
+    replacement: Value,
+    fixture: &str,
+    mutation: u64,
+    seed: u64,
+) {
+    *value.pointer_mut(pointer).unwrap_or_else(|| {
+        panic!("fixture={fixture} mutation=operator_{mutation} seed={seed} invalid_value_pointer={pointer}")
+    }) = replacement;
 }
 
 fn scope(seed: u64, agents: Vec<AgentId>, runs: Vec<RunId>) -> CapabilityScope {
@@ -212,163 +283,170 @@ fn positive_capability(fixture: &CapabilityFixture, seed: u64) -> ValidatedCapab
 
 fn mutate_capability(seed: u64, fixture: &CapabilityFixture) -> (&'static str, bool, Value) {
     let index = seed % 32;
-    let grant = index < 19;
-    let mut value = if grant {
+    let is_grant = index < 19;
+    let mutation = [
+        "grant.missing_schema",
+        "grant.null_schema",
+        "grant.wrong_type_grant_id",
+        "grant.nil_grant_id",
+        "grant.nil_issuer",
+        "grant.nil_subject",
+        "grant.missing_operations",
+        "grant.empty_operations",
+        "grant.unknown_operation_enum",
+        "grant.wildcard_operation",
+        "grant.unknown_scope_schema",
+        "grant.nil_scope_identity",
+        "grant.wildcard_audience",
+        "grant.invalid_time_window",
+        "grant.missing_validation",
+        "grant.malformed_validation_algorithm",
+        "grant.forged_signed_downgrade",
+        "grant.duplicate_set_with_wildcard",
+        "grant.nested_reserved_metadata",
+        "request.missing_schema",
+        "request.null_subject",
+        "request.nil_subject",
+        "request.unknown_operation_enum",
+        "request.wildcard_operation",
+        "request.missing_scope_schema",
+        "request.nil_scope_identity",
+        "request.wildcard_audience",
+        "request.wrong_type_timestamp",
+        "request.nested_reserved_metadata",
+        "request.wrong_subject",
+        "request.ungranted_operation",
+        "request.overbroad_tenant",
+    ][index as usize];
+    let fixture_name = if is_grant {
+        "capability_grant"
+    } else {
+        "capability_request"
+    };
+    let baseline = if is_grant {
         serialize("capability_grant", &fixture.grant, seed)
     } else {
         serialize("capability_request", &fixture.request, seed)
     };
-    let mutation = match index {
+    let mut serialized = SerializedMutation::new(
+        Case {
+            fixture: fixture_name,
+            mutation,
+            seed,
+        },
+        baseline,
+    );
+    match index {
         0 => {
-            remove(&mut value, "", "schema_version");
-            "grant.missing_schema"
+            serialized.remove("", "schema_version");
         }
         1 => {
-            set(&mut value, "/schema_version", Value::Null);
-            "grant.null_schema"
+            serialized.set("/schema_version", Value::Null);
         }
         2 => {
-            set(&mut value, "/grant_id", json!(7));
-            "grant.wrong_type_grant_id"
+            serialized.set("/grant_id", json!(7));
         }
         3 => {
-            set(&mut value, "/grant_id", json!(NIL_ID));
-            "grant.nil_grant_id"
+            serialized.set("/grant_id", json!(NIL_ID));
         }
         4 => {
-            set(&mut value, "/issuer", json!(NIL_ID));
-            "grant.nil_issuer"
+            serialized.set("/issuer", json!(NIL_ID));
         }
         5 => {
-            set(&mut value, "/subject", json!(NIL_ID));
-            "grant.nil_subject"
+            serialized.set("/subject", json!(NIL_ID));
         }
         6 => {
-            remove(&mut value, "", "operations");
-            "grant.missing_operations"
+            serialized.remove("", "operations");
         }
         7 => {
-            set(&mut value, "/operations", json!([]));
-            "grant.empty_operations"
+            serialized.set("/operations", json!([]));
         }
         8 => {
-            set(&mut value, "/operations/0/namespace", json!("unknown"));
-            "grant.unknown_operation_enum"
+            serialized.set("/operations/0/namespace", json!("unknown"));
         }
         9 => {
-            set(&mut value, "/operations/0/name", json!("artifact.*"));
-            "grant.wildcard_operation"
+            serialized.set("/operations/0/name", json!("artifact.*"));
         }
         10 => {
-            set(
-                &mut value,
+            serialized.set(
                 "/scope/schema_version",
                 json!("splendor.authority.scope.v0"),
             );
-            "grant.unknown_scope_schema"
         }
         11 => {
-            set(&mut value, "/scope/tenant_ids/0", json!(NIL_ID));
-            "grant.nil_scope_identity"
+            serialized.set("/scope/tenant_ids/0", json!(NIL_ID));
         }
         12 => {
-            set(&mut value, "/scope/audiences/0", json!("daemon:*"));
-            "grant.wildcard_audience"
+            serialized.set("/scope/audiences/0", json!("daemon:*"));
         }
         13 => {
-            let expiry = value["expires_at"].clone();
-            set(&mut value, "/not_before", expiry);
-            "grant.invalid_time_window"
+            let expiry = serialized.value["expires_at"].clone();
+            serialized.set("/not_before", expiry);
         }
         14 => {
-            remove(&mut value, "", "validation");
-            "grant.missing_validation"
+            serialized.remove("", "validation");
         }
         15 => {
-            set(&mut value, "/validation/algorithm", json!(" "));
-            "grant.malformed_validation_algorithm"
+            serialized.set("/validation/algorithm", json!(" "));
         }
         16 => {
-            set(&mut value, "/validation/validation_kind", json!("signed"));
-            let validation = value["validation"]
-                .as_object_mut()
-                .expect("validation object");
-            validation.insert("key_id".to_string(), json!("forged-key"));
-            validation.insert("signature".to_string(), json!(DIGEST_B));
-            "grant.forged_signed_downgrade"
+            serialized.set("/validation/validation_kind", json!("signed"));
+            serialized.insert("/validation", "key_id", json!("forged-key"));
+            serialized.insert("/validation", "signature", json!(DIGEST_B));
         }
         17 => {
-            let operation = value["operations"][0].clone();
-            value["operations"] = json!([operation.clone(), operation]);
-            set(&mut value, "/operations/1/name", json!("*"));
-            "grant.duplicate_set_with_wildcard"
+            let operation = serialized.value["operations"][0].clone();
+            serialized.set("/operations", json!([operation.clone(), operation]));
+            serialized.set("/operations/1/name", json!("*"));
         }
         18 => {
-            value["metadata"] = json!({"safe": [{"Approval-Token": "forged"}]});
-            "grant.nested_reserved_metadata"
+            serialized.insert(
+                "",
+                "metadata",
+                json!({"safe": [{"Approval-Token": "forged"}]}),
+            );
         }
         19 => {
-            remove(&mut value, "", "schema_version");
-            "request.missing_schema"
+            serialized.remove("", "schema_version");
         }
         20 => {
-            set(&mut value, "/subject", Value::Null);
-            "request.null_subject"
+            serialized.set("/subject", Value::Null);
         }
         21 => {
-            set(&mut value, "/subject", json!(NIL_ID));
-            "request.nil_subject"
+            serialized.set("/subject", json!(NIL_ID));
         }
         22 => {
-            set(&mut value, "/operation/verb", json!("superuser"));
-            "request.unknown_operation_enum"
+            serialized.set("/operation/verb", json!("superuser"));
         }
         23 => {
-            set(&mut value, "/operation/name", json!("artifact.*"));
-            "request.wildcard_operation"
+            serialized.set("/operation/name", json!("artifact.*"));
         }
         24 => {
-            remove(&mut value, "/scope", "schema_version");
-            "request.missing_scope_schema"
+            serialized.remove("/scope", "schema_version");
         }
         25 => {
-            set(&mut value, "/scope/tenant_ids/0", json!(NIL_ID));
-            "request.nil_scope_identity"
+            serialized.set("/scope/tenant_ids/0", json!(NIL_ID));
         }
         26 => {
-            set(&mut value, "/scope/audiences/0", json!("daemon:*"));
-            "request.wildcard_audience"
+            serialized.set("/scope/audiences/0", json!("daemon:*"));
         }
         27 => {
-            set(&mut value, "/requested_at", json!({"forged": true}));
-            "request.wrong_type_timestamp"
+            serialized.set("/requested_at", json!({"forged": true}));
         }
         28 => {
-            value["metadata"] = json!({"items": [{"quota.override": 999}]});
-            "request.nested_reserved_metadata"
+            serialized.insert("", "metadata", json!({"items": [{"quota.override": 999}]}));
         }
         29 => {
-            set(
-                &mut value,
-                "/subject",
-                json!(principal_id(seed, 9).to_string()),
-            );
-            "request.wrong_subject"
+            serialized.set("/subject", json!(principal_id(seed, 9).to_string()));
         }
         30 => {
-            set(&mut value, "/operation/name", json!("artifact.publish"));
-            "request.ungranted_operation"
+            serialized.set("/operation/name", json!("artifact.publish"));
         }
         _ => {
-            set(
-                &mut value,
-                "/scope/tenant_ids/0",
-                json!(tenant_id(seed, 9).to_string()),
-            );
-            "request.overbroad_tenant"
+            serialized.set("/scope/tenant_ids/0", json!(tenant_id(seed, 9).to_string()));
         }
-    };
-    (mutation, grant, value)
+    }
+    (mutation, is_grant, serialized.finish())
 }
 
 #[test]
@@ -387,8 +465,15 @@ fn serialized_mutation_capability_grants_and_requests_fail_closed() {
             seed,
         };
         if is_grant {
-            let Ok(raw) = deserialize::<CapabilityGrant>(case, value) else {
-                continue;
+            let raw = match deserialize::<CapabilityGrant>(case, value) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    assert!(
+                        matches!(seed % 32, 0 | 1 | 2 | 6 | 8),
+                        "{case} unexpected_serde_rejection={error}"
+                    );
+                    continue;
+                }
             };
             match validate_local_profile_grant(raw) {
                 Err(_) => {}
@@ -407,8 +492,15 @@ fn serialized_mutation_capability_grants_and_requests_fail_closed() {
                 }
             }
         } else {
-            let Ok(request) = deserialize::<CapabilityRequest>(case, value) else {
-                continue;
+            let request = match deserialize::<CapabilityRequest>(case, value) {
+                Ok(request) => request,
+                Err(error) => {
+                    assert!(
+                        matches!(seed % 32, 19 | 20 | 22 | 24 | 27),
+                        "{case} unexpected_serde_rejection={error}"
+                    );
+                    continue;
+                }
             };
             let decision =
                 evaluate_capability_request(std::slice::from_ref(&positive), &request, fixture.now);
@@ -497,8 +589,13 @@ fn work_order_fixture(seed: u64) -> WorkOrderFixture {
     );
     let work_order = WorkOrder {
         schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
-        work_order_id: WorkOrderId::try_new(format!("wo_auth007b_{seed}"))
-            .expect("deterministic work order id"),
+        work_order_id: WorkOrderId::try_new(format!("wo_auth007b_{seed}")).unwrap_or_else(
+            |error| {
+                panic!(
+                    "fixture=work_order mutation=fixture_work_order_id seed={seed} error={error:?}"
+                )
+            },
+        ),
         tenant_id: tenant.clone(),
         agent_id: agent.clone(),
         run_id: Some(run.clone()),
@@ -521,7 +618,9 @@ fn work_order_fixture(seed: u64) -> WorkOrderFixture {
         WORK_ORDER_KEY_ID,
         WORK_ORDER_SECRET,
     )
-    .expect("deterministic signed work order");
+    .unwrap_or_else(|error| {
+        panic!("fixture=work_order mutation=fixture_sign seed={seed} error={error:?}")
+    });
     let validation_context = WorkOrderValidationContext {
         tenant_id: tenant.clone(),
         agent_id: agent.clone(),
@@ -532,7 +631,9 @@ fn work_order_fixture(seed: u64) -> WorkOrderFixture {
     let mut keyring = WorkOrderKeyring::new();
     keyring
         .insert_shared_secret(WORK_ORDER_KEY_ID, WORK_ORDER_SECRET)
-        .expect("deterministic keyring");
+        .unwrap_or_else(|error| {
+            panic!("fixture=work_order mutation=fixture_keyring seed={seed} error={error:?}")
+        });
     let issuer_grant = validate_local_profile_grant(CapabilityGrant {
         schema_version: CAPABILITY_GRANT_SCHEMA_VERSION.to_string(),
         grant_id: grant_id(seed, 20),
@@ -564,7 +665,9 @@ fn work_order_fixture(seed: u64) -> WorkOrderFixture {
         validation: Some(validation("auth007b-issuer-grant-v1")),
         metadata: BTreeMap::new(),
     })
-    .expect("real local issuer grant validation");
+    .unwrap_or_else(|error| {
+        panic!("fixture=work_order mutation=fixture_issuer_grant seed={seed} error={error:?}")
+    });
     WorkOrderFixture {
         envelope,
         validation_context,
@@ -593,198 +696,221 @@ fn issue_fixture(
     })
 }
 
-fn mutate_work_order(
-    seed: u64,
-    envelope: &WorkOrderEnvelope,
-) -> (&'static str, bool, &'static str, Value) {
-    let mut value = serialize("work_order", envelope, seed);
-    let (mutation, resign, audience) = match seed % 32 {
+fn mutate_work_order(seed: u64, envelope: &WorkOrderEnvelope) -> (&'static str, bool, Value) {
+    let index = seed % 32;
+    let mutation = [
+        "missing_signature",
+        "null_signature",
+        "blank_signature_key",
+        "unknown_algorithm_malformed_signature",
+        "unknown_key_or_algorithm",
+        "forged_signature",
+        "unknown_schema",
+        "tampered_work_order_id",
+        "tampered_tenant",
+        "tampered_agent",
+        "tampered_run",
+        "tampered_objective",
+        "tampered_action_allowlist",
+        "tampered_adapter_allowlist",
+        "tampered_permission_allowlist",
+        "tampered_data_ref",
+        "tampered_quota",
+        "tampered_placement",
+        "tampered_locality",
+        "tampered_capability_requirement",
+        "tampered_issued_at",
+        "tampered_expiry",
+        "tampered_revocation",
+        "missing_tenant",
+        "empty_action_allowlist",
+        "blank_adapter_allowlist",
+        "malformed_quotas",
+        "malformed_data_refs",
+        "missing_placement_target",
+        "trusted_resigned_expired",
+        "trusted_resigned_revoked",
+        "trusted_resigned_tenant_binding_mismatch",
+    ][index as usize];
+    let baseline = serialize("work_order", envelope, seed);
+    let mut serialized = SerializedMutation::new(
+        Case {
+            fixture: "work_order",
+            mutation,
+            seed,
+        },
+        baseline,
+    );
+    let resign = match index {
         0 => {
-            remove(&mut value, "", "signature");
-            ("missing_signature", false, AUDIENCE)
+            serialized.remove("", "signature");
+            false
         }
         1 => {
-            set(&mut value, "/signature", Value::Null);
-            ("null_signature", false, AUDIENCE)
+            serialized.set("/signature", Value::Null);
+            false
         }
         2 => {
-            set(&mut value, "/signature/key_id", json!(" "));
-            set(&mut value, "/signature/signature", json!(""));
-            ("blank_signature_key", false, AUDIENCE)
+            serialized.set("/signature/key_id", json!(" "));
+            serialized.set("/signature/signature", json!(""));
+            false
         }
         3 => {
-            set(&mut value, "/signature/signature", json!({"forged": true}));
-            value["signature"]
-                .as_object_mut()
-                .expect("signature object")
-                .insert("algorithm".to_string(), json!("none"));
-            ("unknown_algorithm_malformed_signature", false, AUDIENCE)
+            serialized.set("/signature/signature", json!({"forged": true}));
+            serialized.insert("/signature", "algorithm", json!("none"));
+            false
         }
         4 => {
-            set(
-                &mut value,
-                "/signature/key_id",
-                json!("unknown-algorithm:key"),
-            );
-            ("unknown_key_or_algorithm", false, AUDIENCE)
+            serialized.set("/signature/key_id", json!("unknown-algorithm:key"));
+            false
         }
         5 => {
-            set(&mut value, "/signature/signature", json!(DIGEST_B));
-            ("forged_signature", false, AUDIENCE)
+            serialized.set("/signature/signature", json!(DIGEST_B));
+            false
         }
         6 => {
-            set(
-                &mut value,
-                "/schema_version",
-                json!("splendor.work_order.v0"),
-            );
-            ("unknown_schema", false, AUDIENCE)
+            serialized.set("/schema_version", json!("splendor.work_order.v0"));
+            false
         }
         7 => {
-            set(
-                &mut value,
-                "/work_order_id",
-                json!(format!("wo_tampered_{seed}")),
-            );
-            ("tampered_work_order_id", false, AUDIENCE)
+            serialized.set("/work_order_id", json!(format!("wo_tampered_{seed}")));
+            false
         }
         8 => {
-            set(
-                &mut value,
-                "/tenant_id",
-                json!(tenant_id(seed, 9).to_string()),
-            );
-            ("tampered_tenant", false, AUDIENCE)
+            serialized.set("/tenant_id", json!(tenant_id(seed, 9).to_string()));
+            false
         }
         9 => {
-            set(
-                &mut value,
-                "/agent_id",
-                json!(agent_id(seed, 9).to_string()),
-            );
-            ("tampered_agent", false, AUDIENCE)
+            serialized.set("/agent_id", json!(agent_id(seed, 9).to_string()));
+            false
         }
         10 => {
-            set(&mut value, "/run_id", json!(run_id(seed, 9).to_string()));
-            ("tampered_run", false, AUDIENCE)
+            serialized.set("/run_id", json!(run_id(seed, 9).to_string()));
+            false
         }
         11 => {
-            set(&mut value, "/objective", json!("tampered objective"));
-            ("tampered_objective", false, AUDIENCE)
+            serialized.set("/objective", json!("tampered objective"));
+            false
         }
         12 => {
-            set(&mut value, "/allowed_actions/0", json!("artifact.publish"));
-            ("tampered_action_allowlist", false, AUDIENCE)
+            serialized.set("/allowed_actions/0", json!("artifact.publish"));
+            false
         }
         13 => {
-            set(&mut value, "/allowed_adapters/0", json!("shell"));
-            ("tampered_adapter_allowlist", false, AUDIENCE)
+            serialized.set("/allowed_adapters/0", json!("shell"));
+            false
         }
         14 => {
-            set(&mut value, "/allowed_permissions/0", json!("admin.all"));
-            ("tampered_permission_allowlist", false, AUDIENCE)
+            serialized.set("/allowed_permissions/0", json!("admin.all"));
+            false
         }
         15 => {
-            set(&mut value, "/data_refs/0", json!("dataset:other"));
-            ("tampered_data_ref", false, AUDIENCE)
+            serialized.set("/data_refs/0", json!("dataset:other"));
+            false
         }
         16 => {
-            set(&mut value, "/quotas/max_actions_per_tick", json!(999));
-            ("tampered_quota", false, AUDIENCE)
+            serialized.set("/quotas/max_actions_per_tick", json!(999));
+            false
         }
         17 => {
-            set(&mut value, "/placement/target", json!("physical_robot"));
-            ("tampered_placement", false, AUDIENCE)
+            serialized.set("/placement/target", json!("physical_robot"));
+            false
         }
         18 => {
-            set(
-                &mut value,
-                "/placement/data_locality",
-                json!("restricted-other"),
-            );
-            ("tampered_locality", false, AUDIENCE)
+            serialized.set("/placement/data_locality", json!("restricted-other"));
+            false
         }
         19 => {
-            set(&mut value, "/placement/requires_gpu", json!(true));
-            ("tampered_capability_requirement", false, AUDIENCE)
+            serialized.set("/placement/requires_gpu", json!(true));
+            false
         }
         20 => {
-            set(&mut value, "/issued_at", json!("2020-01-01T00:00:00Z"));
-            ("tampered_issued_at", false, AUDIENCE)
+            serialized.set("/issued_at", json!("2020-01-01T00:00:00Z"));
+            false
         }
         21 => {
-            set(&mut value, "/expires_at", json!("2099-01-01T00:00:00Z"));
-            ("tampered_expiry", false, AUDIENCE)
+            serialized.set("/expires_at", json!("2099-01-01T00:00:00Z"));
+            false
         }
         22 => {
-            set(
-                &mut value,
-                "/revocation",
-                json!({"revoked":{"reason":"tampered"}}),
-            );
-            ("tampered_revocation", false, AUDIENCE)
+            serialized.set("/revocation", json!({"revoked":{"reason":"tampered"}}));
+            false
         }
         23 => {
-            remove(&mut value, "", "tenant_id");
-            ("missing_tenant", false, AUDIENCE)
+            serialized.remove("", "tenant_id");
+            false
         }
         24 => {
-            set(&mut value, "/allowed_actions", json!([]));
-            ("empty_action_allowlist", false, AUDIENCE)
+            serialized.set("/allowed_actions", json!([]));
+            false
         }
         25 => {
-            set(&mut value, "/allowed_adapters/0", json!(" "));
-            ("blank_adapter_allowlist", false, AUDIENCE)
+            serialized.set("/allowed_adapters/0", json!(" "));
+            false
         }
         26 => {
-            set(&mut value, "/quotas", json!(["not-an-object"]));
-            ("malformed_quotas", false, AUDIENCE)
+            serialized.set("/quotas", json!(["not-an-object"]));
+            false
         }
         27 => {
-            set(
-                &mut value,
-                "/data_refs",
-                json!({"extensions":{"authority":"allow"}}),
-            );
-            ("malformed_data_refs_extensions", false, AUDIENCE)
+            serialized.set("/data_refs", json!({"not":"a-list"}));
+            false
         }
         28 => {
-            remove(&mut value, "/placement", "target");
-            ("missing_placement_target", false, AUDIENCE)
+            serialized.remove("/placement", "target");
+            false
         }
         29 => {
-            set(&mut value, "/issued_at", json!("2020-01-01T00:00:00Z"));
-            set(&mut value, "/expires_at", json!("2020-01-01T00:01:00Z"));
-            ("trusted_resigned_expired", true, AUDIENCE)
+            serialized.set("/issued_at", json!("2020-01-01T00:00:00Z"));
+            serialized.set("/expires_at", json!("2020-01-01T00:01:00Z"));
+            true
         }
         30 => {
-            set(
-                &mut value,
-                "/revocation",
-                json!({"revoked":{"reason":"operator"}}),
-            );
-            ("trusted_resigned_revoked", true, AUDIENCE)
+            serialized.set("/revocation", json!({"revoked":{"reason":"operator"}}));
+            true
         }
-        _ => ("trusted_resigned_wrong_audience", true, OTHER_AUDIENCE),
+        _ => {
+            serialized.set("/tenant_id", json!(tenant_id(seed, 31).to_string()));
+            true
+        }
     };
-    (mutation, resign, audience, value)
+    (mutation, resign, serialized.finish())
 }
 
 #[test]
 fn serialized_mutation_signed_work_orders_fail_validation_and_issuance() {
     for seed in 0..CASES_PER_FAMILY {
         let fixture = work_order_fixture(seed);
-        issue_fixture(&fixture, &fixture.envelope, AUDIENCE).unwrap_or_else(|error| {
+        let positive_value = serialize("work_order", &fixture.envelope, seed);
+        let positive: WorkOrderEnvelope = deserialize(
+            Case {
+                fixture: "work_order",
+                mutation: "positive_round_trip",
+                seed,
+            },
+            positive_value,
+        )
+        .unwrap_or_else(|error| {
+            panic!("fixture=work_order mutation=positive_round_trip seed={seed} error={error}")
+        });
+        issue_fixture(&fixture, &positive, AUDIENCE).unwrap_or_else(|error| {
             panic!("fixture=work_order mutation=positive_control seed={seed} error={error:?}")
         });
-        let (mutation, resign, audience, value) = mutate_work_order(seed, &fixture.envelope);
+        let (mutation, resign, value) = mutate_work_order(seed, &fixture.envelope);
         let case = Case {
             fixture: "work_order",
             mutation,
             seed,
         };
-        let Ok(mut envelope) = deserialize::<WorkOrderEnvelope>(case, value) else {
-            continue;
+        let mut envelope = match deserialize::<WorkOrderEnvelope>(case, value) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                assert!(
+                    matches!(seed % 32, 3 | 23 | 26 | 27 | 28),
+                    "{case} unexpected_serde_rejection={error}"
+                );
+                continue;
+            }
         };
         if resign {
             envelope = WorkOrderEnvelope::signed_with_shared_secret(
@@ -794,7 +920,7 @@ fn serialized_mutation_signed_work_orders_fail_validation_and_issuance() {
             )
             .unwrap_or_else(|error| panic!("{case} trusted_resign_failed={error:?}"));
         }
-        let error = issue_fixture(&fixture, &envelope, audience)
+        let error = issue_fixture(&fixture, &envelope, AUDIENCE)
             .unwrap_err_or_else(|_| panic!("{case} unexpectedly_issued"));
         let expected = match seed % 32 {
             0..=3 => Some("unsigned_work_order"),
@@ -803,7 +929,7 @@ fn serialized_mutation_signed_work_orders_fail_validation_and_issuance() {
             6 | 24 | 25 | 28 => Some("malformed_work_order"),
             29 => Some("expired_work_order"),
             30 => Some("revoked_work_order"),
-            31 => Some("issuer_signature_binding_mismatch"),
+            31 => Some("incompatible_work_order"),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -844,8 +970,9 @@ fn receipt_fixture(seed: u64) -> ReceiptFixture {
         description: "authority owned approval obligation".to_string(),
         parameters: BTreeMap::new(),
     }];
-    let grant =
-        validate_local_profile_grant(capability.grant).expect("real conditional grant validation");
+    let grant = validate_local_profile_grant(capability.grant).unwrap_or_else(|error| {
+        panic!("fixture=obligation_receipt mutation=fixture_conditional_grant seed={seed} error={error:?}")
+    });
     let mut decision =
         evaluate_capability_request(std::slice::from_ref(&grant), &capability.request, now);
     decision.decision_id = decision_id(seed, 1);
@@ -868,7 +995,9 @@ fn receipt_fixture(seed: u64) -> ReceiptFixture {
         subject: decision.request.subject.clone(),
         authority_decision_id: decision.decision_id.clone(),
         canonical_request_digest: canonical_authority_request_digest(&decision.request)
-            .expect("request digest"),
+            .unwrap_or_else(|error| {
+                panic!("fixture=obligation_receipt mutation=fixture_request_digest seed={seed} error={error:?}")
+            }),
         evidence_digest: DIGEST_B.to_string(),
         evidence_ref: Some("evidence:auth007b-receipt".to_string()),
         issued_at: now - Duration::seconds(1),
@@ -885,8 +1014,9 @@ fn receipt_fixture(seed: u64) -> ReceiptFixture {
             signature: PLACEHOLDER_DIGEST.to_string(),
         },
     };
-    let receipt =
-        issue_local_authority_obligation_receipt(raw, &context).expect("trusted receipt issuance");
+    let receipt = issue_local_authority_obligation_receipt(raw, &context).unwrap_or_else(|error| {
+        panic!("fixture=obligation_receipt mutation=fixture_issue seed={seed} error={error:?}")
+    });
     ReceiptFixture {
         decision,
         receipt,
@@ -918,211 +1048,308 @@ fn positive_receipt(fixture: &ReceiptFixture, seed: u64) -> ValidatedAuthorityOb
     receipt
 }
 
-fn mutate_receipt(seed: u64, receipt: &AuthorityObligationReceipt) -> (&'static str, bool, Value) {
-    let mut value = serialize("obligation_receipt", receipt, seed);
-    let (mutation, resign) = match seed % 32 {
+fn mutate_receipt(
+    seed: u64,
+    receipt: &AuthorityObligationReceipt,
+) -> (&'static str, Option<usize>, Value) {
+    let index = seed % 32;
+    let mutation = [
+        "missing_schema",
+        "missing_receipt_id",
+        "null_issuer",
+        "wrong_type_kind",
+        "unknown_schema",
+        "nil_receipt_id",
+        "nil_issuer",
+        "wrong_audience",
+        "nil_obligation_id",
+        "unknown_kind",
+        "nil_subject",
+        "nil_decision_id",
+        "malformed_request_digest",
+        "malformed_evidence_digest",
+        "wildcard_evidence_ref",
+        "future_issued_at",
+        "expired_receipt",
+        "revoked_receipt",
+        "wrong_revocation_source",
+        "missing_validation",
+        "unknown_validation_kind",
+        "downgraded_algorithm",
+        "unknown_key",
+        "tampered_validation_digest",
+        "forged_signature",
+        "trusted_wrong_subject",
+        "trusted_wrong_decision",
+        "trusted_wrong_obligation",
+        "trusted_wrong_kind",
+        "trusted_wrong_request_digest",
+        "duplicate_receipt_collection_entry",
+        "extra_receipt_collection_entry",
+    ][index as usize];
+    let baseline = serialize("obligation_receipts", &vec![receipt.clone()], seed);
+    let mut serialized = SerializedMutation::new(
+        Case {
+            fixture: "obligation_receipt_collection",
+            mutation,
+            seed,
+        },
+        baseline,
+    );
+    let resign_index = match index {
         0 => {
-            remove(&mut value, "", "schema_version");
-            ("missing_schema", false)
+            serialized.remove("/0", "schema_version");
+            None
         }
         1 => {
-            remove(&mut value, "", "receipt_id");
-            ("missing_receipt_id", false)
+            serialized.remove("/0", "receipt_id");
+            None
         }
         2 => {
-            set(&mut value, "/issuer", Value::Null);
-            ("null_issuer", false)
+            serialized.set("/0/issuer", Value::Null);
+            None
         }
         3 => {
-            set(&mut value, "/kind", json!({"approval":true}));
-            ("wrong_type_kind", false)
+            serialized.set("/0/kind", json!({"approval":true}));
+            None
         }
         4 => {
-            set(
-                &mut value,
-                "/schema_version",
+            serialized.set(
+                "/0/schema_version",
                 json!("splendor.authority.obligation_receipt.v0"),
             );
-            ("unknown_schema", false)
+            Some(0)
         }
         5 => {
-            set(&mut value, "/receipt_id", json!(NIL_ID));
-            ("nil_receipt_id", false)
+            serialized.set("/0/receipt_id", json!(NIL_ID));
+            Some(0)
         }
         6 => {
-            set(&mut value, "/issuer", json!(NIL_ID));
-            ("nil_issuer", false)
+            serialized.set("/0/issuer", json!(NIL_ID));
+            Some(0)
         }
         7 => {
-            set(&mut value, "/audience", json!("daemon:*"));
-            ("wildcard_audience", false)
+            serialized.set("/0/audience", json!(OTHER_AUDIENCE));
+            Some(0)
         }
         8 => {
-            set(&mut value, "/obligation_id", json!(NIL_ID));
-            ("nil_obligation_id", false)
+            serialized.set("/0/obligation_id", json!(NIL_ID));
+            Some(0)
         }
         9 => {
-            set(&mut value, "/kind", json!("root_override"));
-            ("unknown_kind", false)
+            serialized.set("/0/kind", json!("root_override"));
+            None
         }
         10 => {
-            set(&mut value, "/subject", json!(NIL_ID));
-            ("nil_subject", false)
+            serialized.set("/0/subject", json!(NIL_ID));
+            Some(0)
         }
         11 => {
-            set(&mut value, "/authority_decision_id", json!(NIL_ID));
-            ("nil_decision_id", false)
+            serialized.set("/0/authority_decision_id", json!(NIL_ID));
+            Some(0)
         }
         12 => {
-            set(&mut value, "/canonical_request_digest", json!("approved"));
-            ("malformed_request_digest", false)
+            serialized.set("/0/canonical_request_digest", json!("approved"));
+            Some(0)
         }
         13 => {
-            set(&mut value, "/evidence_digest", json!("approved"));
-            ("malformed_evidence_digest", false)
+            serialized.set("/0/evidence_digest", json!("approved"));
+            Some(0)
         }
         14 => {
-            set(&mut value, "/evidence_ref", json!("evidence:*"));
-            ("wildcard_evidence_ref", false)
+            serialized.set("/0/evidence_ref", json!("evidence:*"));
+            Some(0)
         }
         15 => {
-            set(&mut value, "/issued_at", json!("2099-01-01T00:00:00Z"));
-            ("future_issued_at", false)
+            serialized.set("/0/issued_at", json!("2099-01-01T00:00:00Z"));
+            Some(0)
         }
         16 => {
-            set(&mut value, "/expires_at", json!("2020-01-01T00:00:00Z"));
-            ("expired_receipt", false)
+            serialized.set("/0/expires_at", json!("2020-01-01T00:00:00Z"));
+            Some(0)
         }
         17 => {
-            set(
-                &mut value,
-                "/revocation",
-                json!({"revoked":{"reason":"withdrawn"}}),
-            );
-            ("revoked_receipt", false)
+            serialized.set("/0/revocation", json!({"revoked":{"reason":"withdrawn"}}));
+            Some(0)
         }
         18 => {
-            set(&mut value, "/revocation_ref", json!("revocation:other"));
-            ("wrong_revocation_source", false)
+            serialized.set("/0/revocation_ref", json!("revocation:other"));
+            Some(0)
         }
         19 => {
-            remove(&mut value, "", "validation");
-            ("missing_validation", false)
+            serialized.remove("/0", "validation");
+            None
         }
         20 => {
-            set(&mut value, "/validation/validation_kind", json!("signed"));
-            ("unknown_validation_kind", false)
+            serialized.set("/0/validation/validation_kind", json!("signed"));
+            None
         }
         21 => {
-            set(&mut value, "/validation/algorithm", json!("none"));
-            ("downgraded_algorithm", false)
+            serialized.set("/0/validation/algorithm", json!("none"));
+            None
         }
         22 => {
-            set(&mut value, "/validation/key_id", json!("unknown-key"));
-            ("unknown_key", false)
+            serialized.set("/0/validation/key_id", json!("unknown-key"));
+            None
         }
         23 => {
-            set(&mut value, "/validation/digest", json!(DIGEST_B));
-            ("tampered_validation_digest", false)
+            serialized.set("/0/validation/digest", json!(DIGEST_B));
+            None
         }
         24 => {
-            set(&mut value, "/validation/signature", json!(DIGEST_B));
-            ("forged_signature", false)
+            serialized.set("/0/validation/signature", json!(DIGEST_B));
+            None
         }
         25 => {
-            set(
-                &mut value,
-                "/subject",
-                json!(principal_id(seed, 31).to_string()),
-            );
-            ("trusted_wrong_subject", true)
+            serialized.set("/0/subject", json!(principal_id(seed, 31).to_string()));
+            Some(0)
         }
         26 => {
-            set(
-                &mut value,
-                "/authority_decision_id",
+            serialized.set(
+                "/0/authority_decision_id",
                 json!(decision_id(seed, 31).to_string()),
             );
-            ("trusted_wrong_decision", true)
+            Some(0)
         }
         27 => {
-            set(
-                &mut value,
-                "/obligation_id",
+            serialized.set(
+                "/0/obligation_id",
                 json!(obligation_id(seed, 31).to_string()),
             );
-            ("trusted_wrong_obligation", true)
+            Some(0)
         }
         28 => {
-            set(&mut value, "/kind", json!("human_review"));
-            ("trusted_wrong_kind", true)
+            serialized.set("/0/kind", json!("human_review"));
+            Some(0)
         }
         29 => {
-            set(&mut value, "/canonical_request_digest", json!(DIGEST_A));
-            ("trusted_wrong_request_digest", true)
+            serialized.set("/0/canonical_request_digest", json!(DIGEST_A));
+            Some(0)
         }
-        30 => ("duplicate_receipt", false),
-        _ => ("extra_receipt", true),
+        30 => {
+            let first = serialized.value[0].clone();
+            serialized.set("", json!([first.clone(), first]));
+            None
+        }
+        _ => {
+            let first = serialized.value[0].clone();
+            let mut extra = first.clone();
+            extra["receipt_id"] = json!(receipt_id(seed, 31).to_string());
+            extra["obligation_id"] = json!(obligation_id(seed, 31).to_string());
+            serialized.set("", json!([first, extra]));
+            Some(1)
+        }
     };
-    if seed % 32 == 31 {
-        set(
-            &mut value,
-            "/receipt_id",
-            json!(receipt_id(seed, 31).to_string()),
-        );
-        set(
-            &mut value,
-            "/obligation_id",
-            json!(obligation_id(seed, 31).to_string()),
-        );
-    }
-    (mutation, resign, value)
+    (mutation, resign_index, serialized.finish())
 }
 
 #[test]
 fn serialized_mutation_obligation_receipts_fail_trusted_validation_or_matching() {
     for seed in 0..CASES_PER_FAMILY {
         let fixture = receipt_fixture(seed);
-        let positive = positive_receipt(&fixture, seed);
-        let (mutation, resign, value) = mutate_receipt(seed, &fixture.receipt);
+        let _positive = positive_receipt(&fixture, seed);
+        let positive_collection: Vec<AuthorityObligationReceipt> = deserialize(
+            Case {
+                fixture: "obligation_receipt_collection",
+                mutation: "positive_round_trip",
+                seed,
+            },
+            serialize(
+                "obligation_receipts",
+                &vec![fixture.receipt.clone()],
+                seed,
+            ),
+        )
+        .unwrap_or_else(|error| {
+            panic!("fixture=obligation_receipt_collection mutation=positive_round_trip seed={seed} error={error}")
+        });
+        assert_eq!(
+            positive_collection.len(),
+            1,
+            "fixture=obligation_receipt_collection mutation=positive_round_trip seed={seed}"
+        );
+        let (mutation, resign_index, value) = mutate_receipt(seed, &fixture.receipt);
         let case = Case {
-            fixture: "obligation_receipt",
+            fixture: "obligation_receipt_collection",
             mutation,
             seed,
         };
-        if seed % 32 == 30 {
-            let verification = verify_obligation_receipts(
-                &fixture.decision,
-                &[positive.clone(), positive],
-                fixture.now,
-            );
-            assert!(!verification.allowed, "{case} unexpectedly_authorized");
-            assert!(
-                verification
-                    .reasons
-                    .contains(&"duplicate_obligation_receipt_id".to_string()),
-                "{case} reasons={:?}",
-                verification.reasons
-            );
-            continue;
-        }
-        let Ok(mut receipt) = deserialize::<AuthorityObligationReceipt>(case, value) else {
-            continue;
+        let mut receipts = match deserialize::<Vec<AuthorityObligationReceipt>>(case, value) {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                assert!(
+                    matches!(seed % 32, 0..=3 | 9 | 19 | 20),
+                    "{case} unexpected_serde_rejection={error}"
+                );
+                continue;
+            }
         };
-        if resign {
-            receipt = issue_local_authority_obligation_receipt(receipt, &fixture.context)
+        if let Some(index) = resign_index {
+            let receipt = receipts
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| panic!("{case} missing_reissue_index={index}"));
+            let reissued = issue_local_authority_obligation_receipt(receipt, &fixture.context)
                 .unwrap_or_else(|error| panic!("{case} trusted_reissue_failed={error:?}"));
+            *receipts
+                .get_mut(index)
+                .unwrap_or_else(|| panic!("{case} missing_reissue_target={index}")) = reissued;
         }
-        let Ok(validated) = validate_authority_obligation_receipt(receipt, &fixture.context) else {
+        let mut validated = Vec::new();
+        let mut validation_error = None;
+        for receipt in receipts {
+            match validate_authority_obligation_receipt(receipt, &fixture.context) {
+                Ok(receipt) => validated.push(receipt),
+                Err(error) => {
+                    validation_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = validation_error {
+            let expected = match seed % 32 {
+                4 => "obligation_receipt_schema_unsupported",
+                5 => "obligation_receipt_id_invalid",
+                6 => "obligation_receipt_issuer_invalid",
+                7 => "obligation_receipt_audience_mismatch",
+                8 => "obligation_receipt_obligation_id_invalid",
+                10 => "obligation_receipt_subject_invalid",
+                11 => "obligation_receipt_decision_id_invalid",
+                12 => "obligation_receipt_request_digest_malformed",
+                13 => "obligation_receipt_evidence_digest_malformed",
+                14 => "obligation_receipt_evidence_ref_malformed",
+                15 => "obligation_receipt_not_yet_valid",
+                16 => "obligation_receipt_expired",
+                17 => "obligation_receipt_revoked",
+                18 => "obligation_receipt_revocation_ref_mismatch",
+                21 => "obligation_receipt_algorithm_mismatch",
+                22 => "obligation_receipt_key_mismatch",
+                23 => "obligation_receipt_validation_digest_mismatch",
+                24 => "obligation_receipt_signature_mismatch",
+                other => {
+                    panic!("{case} unexpected_validation_rejection_index={other} error={error:?}")
+                }
+            };
+            assert_eq!(error.reason_code(), expected, "{case} error={error:?}");
             continue;
-        };
-        let receipts = if seed % 32 == 31 {
-            vec![positive, validated]
-        } else {
-            vec![validated]
-        };
-        let verification = verify_obligation_receipts(&fixture.decision, &receipts, fixture.now);
+        }
+        let verification = verify_obligation_receipts(&fixture.decision, &validated, fixture.now);
         assert!(!verification.allowed, "{case} unexpectedly_authorized");
+        let expected_reason = match seed % 32 {
+            25 => "obligation_receipt_subject_mismatch",
+            26 => "obligation_receipt_decision_mismatch",
+            27 => "obligation_receipt_id_mismatch",
+            28 => "obligation_receipt_kind_mismatch",
+            29 => "obligation_receipt_request_digest_mismatch",
+            30 => "duplicate_obligation_receipt_id",
+            31 => "extra_obligation_receipt",
+            other => panic!("{case} unexpected_matching_rejection_index={other}"),
+        };
+        assert!(
+            verification.reasons.contains(&expected_reason.to_string()),
+            "{case} expected_reason={expected_reason} reasons={:?}",
+            verification.reasons
+        );
     }
 }
 
@@ -1216,7 +1443,11 @@ fn delegation_fixture(seed: u64) -> DelegationFixture {
         validation: Some(validation("auth007b-delegation-root-v1")),
         metadata: BTreeMap::new(),
     })
-    .expect("real root validation");
+    .unwrap_or_else(|error| {
+        panic!(
+            "fixture=delegation_chain mutation=fixture_root_validation seed={seed} error={error:?}"
+        )
+    });
     let first_request = DelegationChildGrantRequest {
         parent_grant_id: Some(root.grant().grant_id.clone()),
         issuer: parent_subject,
@@ -1248,8 +1479,12 @@ fn delegation_fixture(seed: u64) -> DelegationFixture {
         max_fan_out: 3,
         validation_digest: DIGEST_A.to_string(),
     };
-    let first = issue_edge(&root, first_request, first_subject.clone(), now)
-        .expect("real first delegation issuance");
+    let first =
+        issue_edge(&root, first_request, first_subject.clone(), now).unwrap_or_else(|error| {
+            panic!(
+                "fixture=delegation_chain mutation=fixture_first_edge seed={seed} error={error:?}"
+            )
+        });
     let second_request = DelegationChildGrantRequest {
         parent_grant_id: Some(first.child_grant().grant().grant_id.clone()),
         issuer: first_subject,
@@ -1283,7 +1518,9 @@ fn delegation_fixture(seed: u64) -> DelegationFixture {
         second_subject.clone(),
         now,
     )
-    .expect("real second delegation issuance");
+    .unwrap_or_else(|error| {
+        panic!("fixture=delegation_chain mutation=fixture_second_edge seed={seed} error={error:?}")
+    });
     DelegationFixture {
         root: root.clone(),
         subjects: [first.child_grant().grant().subject.clone(), second_subject],
@@ -1324,8 +1561,30 @@ fn validate_serialized_chain(
 }
 
 fn mutate_delegation(seed: u64, chain: &DelegationChain) -> (&'static str, Value) {
-    let mut value = serialize("delegation_chain", chain, seed);
-    let mutation = match seed % 32 {
+    let mutation_index = seed % 32;
+    let remove = |value: &mut Value, object_pointer: &str, key: &str| {
+        remove_with_context(
+            value,
+            object_pointer,
+            key,
+            "delegation_chain",
+            mutation_index,
+            seed,
+        );
+    };
+    let set = |value: &mut Value, pointer: &str, replacement: Value| {
+        set_with_context(
+            value,
+            pointer,
+            replacement,
+            "delegation_chain",
+            mutation_index,
+            seed,
+        );
+    };
+    let baseline = serialize("delegation_chain", chain, seed);
+    let mut value = baseline.clone();
+    let mutation = match mutation_index {
         0 => {
             remove(&mut value, "", "grants");
             "chain.missing_grants"
@@ -1361,7 +1620,11 @@ fn mutate_delegation(seed: u64, chain: &DelegationChain) -> (&'static str, Value
         7 => {
             value["grants"]
                 .as_array_mut()
-                .expect("grants array")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fixture=delegation_chain mutation=chain.reordered_edges seed={seed} grants_not_array"
+                    )
+                })
                 .reverse();
             "chain.reordered_edges"
         }
@@ -1525,6 +1788,10 @@ fn mutate_delegation(seed: u64, chain: &DelegationChain) -> (&'static str, Value
             "edge.evaluator_external_effect"
         }
     };
+    assert_ne!(
+        value, baseline,
+        "fixture=delegation_chain mutation={mutation} seed={seed} serialized_mutation_equaled_baseline"
+    );
     (mutation, value)
 }
 
@@ -1558,8 +1825,15 @@ fn serialized_mutation_delegation_grants_and_chains_fail_real_issuance() {
             mutation,
             seed,
         };
-        let Ok(chain) = deserialize::<DelegationChain>(case, value) else {
-            continue;
+        let chain = match deserialize::<DelegationChain>(case, value) {
+            Ok(chain) => chain,
+            Err(error) => {
+                assert!(
+                    matches!(seed % 32, 0..=5),
+                    "{case} unexpected_serde_rejection={error}"
+                );
+                continue;
+            }
         };
         assert!(
             validate_serialized_chain(&fixture, chain, case).is_err(),
@@ -1621,7 +1895,18 @@ fn serialized_mutation_nested_metadata_is_non_authorizing_and_redacted() {
             )]),
         }];
         let positive = positive_capability(&fixture, seed);
-        let conditional = validate_local_profile_grant(obligation_grant.clone())
+        let positive_obligation_grant: CapabilityGrant = deserialize(
+            Case {
+                fixture: "obligation_metadata",
+                mutation: "positive_round_trip",
+                seed,
+            },
+            serialize("obligation_grant", &obligation_grant, seed),
+        )
+        .unwrap_or_else(|error| {
+            panic!("fixture=obligation_metadata mutation=positive_round_trip seed={seed} error={error}")
+        });
+        let conditional = validate_local_profile_grant(positive_obligation_grant)
             .unwrap_or_else(|error| panic!("fixture=obligation_metadata mutation=positive_validation seed={seed} error={error:?}"));
         let conditional_decision = evaluate_capability_request(
             std::slice::from_ref(&conditional),
@@ -1655,8 +1940,12 @@ fn serialized_mutation_nested_metadata_is_non_authorizing_and_redacted() {
         };
         match target {
             0 => {
-                let mut value = serialize("capability_grant", &fixture.grant, seed);
-                value["metadata"] = json!({"outer": hostile});
+                let mut serialized = SerializedMutation::new(
+                    case,
+                    serialize("capability_grant", &fixture.grant, seed),
+                );
+                serialized.insert("", "metadata", json!({"outer": hostile}));
+                let value = serialized.finish();
                 let raw: CapabilityGrant = deserialize(case, value)
                     .unwrap_or_else(|error| panic!("{case} serde_error={error}"));
                 assert!(
@@ -1665,10 +1954,21 @@ fn serialized_mutation_nested_metadata_is_non_authorizing_and_redacted() {
                 );
             }
             1 => {
-                let mut value = serialize("capability_request", &fixture.request, seed);
-                value["metadata"] = json!({"outer": hostile});
+                let mut serialized = SerializedMutation::new(
+                    case,
+                    serialize("capability_request", &fixture.request, seed),
+                );
+                serialized.insert("", "metadata", json!({"outer": hostile}));
+                let value = serialized.finish();
                 let request: CapabilityRequest = deserialize(case, value)
                     .unwrap_or_else(|error| panic!("{case} serde_error={error}"));
+                let raw_request = serde_json::to_string(&request)
+                    .unwrap_or_else(|error| panic!("{case} raw_request_serde_error={error}"));
+                let sentinel = format!("auth007b-sensitive-sentinel-{seed}");
+                assert!(
+                    raw_request.contains(&sentinel),
+                    "{case} raw_request_missing_hostile_sentinel"
+                );
                 let decision = evaluate_capability_request(
                     std::slice::from_ref(&positive),
                     &request,
@@ -1690,13 +1990,28 @@ fn serialized_mutation_nested_metadata_is_non_authorizing_and_redacted() {
                 let encoded = serde_json::to_string(&redacted)
                     .unwrap_or_else(|error| panic!("{case} evidence_serde={error}"));
                 assert!(
-                    !encoded.contains(&format!("auth007b-sensitive-sentinel-{seed}")),
+                    !encoded.contains(&sentinel),
                     "{case} leaked_hostile_metadata"
+                );
+                assert_eq!(redacted.decision_id, decision.decision_id, "{case}");
+                assert_eq!(redacted.status, AuthorityDecisionStatus::Denied, "{case}");
+                assert_eq!(
+                    redacted.reason_codes,
+                    vec!["metadata_reserved_authority_key"],
+                    "{case} safe_reason_structure_changed"
+                );
+                assert!(
+                    !redacted.explanation.branches.is_empty(),
+                    "{case} safe_explanation_structure_missing"
                 );
             }
             _ => {
-                let mut value = serialize("obligation_grant", &obligation_grant, seed);
-                value["obligations"][0]["parameters"] = json!({"outer": hostile});
+                let mut serialized = SerializedMutation::new(
+                    case,
+                    serialize("obligation_grant", &obligation_grant, seed),
+                );
+                serialized.set("/obligations/0/parameters", json!({"outer": hostile}));
+                let value = serialized.finish();
                 let raw: CapabilityGrant = deserialize(case, value)
                     .unwrap_or_else(|error| panic!("{case} serde_error={error}"));
                 assert!(
