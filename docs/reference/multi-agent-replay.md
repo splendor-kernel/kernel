@@ -21,6 +21,15 @@ Implemented behavior is local-only:
 Non-goals are no cross-instance replay, no remote transport, and no distributed
 trace sync.
 
+## Local delegation helper
+
+`splendor_kernel::replay_local_delegations` reconstructs local delegation edges,
+task messages, child failures, and `LocalDelegationReplay.rejections`. Each
+rejection record contains the original `LocalDelegationTraceContext` and stable
+`DelegationRejected` reason, including root-binding mismatch and child grant-ID
+collision reasons. This is additive inspect-only evidence; it does not re-run
+binding, authority issuance, routing, or child execution.
+
 ## CLI output
 
 Use the existing replay command:

@@ -60,6 +60,26 @@ pub struct LegacyScopeProfile {
     pub quotas: AuthorityBudgetScope,
 }
 
+/// Explicit bounded multi-agent/run scope for legacy local compatibility paths.
+///
+/// This profile never represents an unbounded wildcard: both identity lists are
+/// required and are validated by the same local-profile checks as single-scope
+/// compatibility grants. `agent_ids` and `run_ids` are independent set-valued
+/// `CapabilityScope` dimensions, so containment permits their Cartesian
+/// combinations; entries at the same vector index are not paired delegation
+/// edges. A typed paired agent/run edge contract is intentionally deferred.
+#[derive(Clone, Debug)]
+pub struct LegacyMultiScopeProfile {
+    /// Single tenant boundary for every listed agent/run.
+    pub tenant_id: TenantId,
+    /// Explicit agent identities covered independently of `run_ids`.
+    pub agent_ids: Vec<AgentId>,
+    /// Explicit run identities covered independently of `agent_ids`.
+    pub run_ids: Vec<RunId>,
+    /// Optional quota/budget narrowing shared by the explicit identities.
+    pub quotas: AuthorityBudgetScope,
+}
+
 /// Locally validated capability grant accepted by the bounded evaluator.
 ///
 /// Raw `CapabilityGrant` remains a behavior-free public contract in
@@ -408,6 +428,41 @@ pub fn grant_from_legacy_allowlists(
     ))
 }
 
+/// Builds one local compatibility grant over explicit bounded agent/run lists.
+///
+/// Empty lists, nil identities, invalid audiences, and otherwise malformed or
+/// unbounded profiles fail through the existing local-profile validator. Agent
+/// and run lists remain independent scope dimensions with Cartesian containment,
+/// not index-paired edges; callers requiring paired-edge semantics must wait for
+/// or separately enforce a future typed contract.
+#[allow(clippy::too_many_arguments)]
+pub fn grant_from_legacy_multi_scope_allowlists(
+    context: CompatibilityGrantContext,
+    scope_profile: LegacyMultiScopeProfile,
+    allowed_actions: &[String],
+    allowed_adapters: &[String],
+    allowed_permissions: &[String],
+    not_before: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    revocation: RevocationStatus,
+    revocation_ref: Option<String>,
+) -> Result<ValidatedCapabilityGrant, AuthorityEvaluationError> {
+    validate_local_profile_grant(raw_grant_from_legacy_scope_allowlists(
+        context,
+        scope_profile.tenant_id,
+        scope_profile.agent_ids,
+        Some(scope_profile.run_ids),
+        scope_profile.quotas,
+        allowed_actions,
+        allowed_adapters,
+        allowed_permissions,
+        not_before,
+        expires_at,
+        revocation,
+        revocation_ref,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn raw_grant_from_legacy_allowlists(
     context: CompatibilityGrantContext,
@@ -420,12 +475,43 @@ fn raw_grant_from_legacy_allowlists(
     revocation: RevocationStatus,
     revocation_ref: Option<String>,
 ) -> CapabilityGrant {
+    raw_grant_from_legacy_scope_allowlists(
+        context,
+        scope_profile.tenant_id,
+        vec![scope_profile.agent_id],
+        scope_profile.run_id.map(|run_id| vec![run_id]),
+        scope_profile.quotas,
+        allowed_actions,
+        allowed_adapters,
+        allowed_permissions,
+        not_before,
+        expires_at,
+        revocation,
+        revocation_ref,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_grant_from_legacy_scope_allowlists(
+    context: CompatibilityGrantContext,
+    tenant_id: TenantId,
+    agent_ids: Vec<AgentId>,
+    run_ids: Option<Vec<RunId>>,
+    quotas: AuthorityBudgetScope,
+    allowed_actions: &[String],
+    allowed_adapters: &[String],
+    allowed_permissions: &[String],
+    not_before: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    revocation: RevocationStatus,
+    revocation_ref: Option<String>,
+) -> CapabilityGrant {
     let scope = CapabilityScope {
-        tenant_ids: Some(vec![scope_profile.tenant_id]),
-        agent_ids: Some(vec![scope_profile.agent_id]),
-        run_ids: scope_profile.run_id.map(|run_id| vec![run_id]),
+        tenant_ids: Some(vec![tenant_id]),
+        agent_ids: Some(agent_ids),
+        run_ids,
         audiences: Some(vec![context.audience]),
-        budget: scope_profile.quotas,
+        budget: quotas,
         ..Default::default()
     };
 

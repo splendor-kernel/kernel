@@ -32,6 +32,11 @@ inheritance.
 - `splendor_types::TraceEventKind` variants for local delegation.
 - `splendor_kernel::LocalDelegationManager` and
   `splendor_kernel::replay_local_delegations`.
+- `LocalDelegationManager::bind_root_run_capability_grant`, exact private
+  validated-grant bindings, and replay-visible rejection records.
+- `splendor_authority::LegacyMultiScopeProfile` and
+  `grant_from_legacy_multi_scope_allowlists` for explicit bounded local child
+  agent/run lists.
 - `AgentContext` now has optional `delegated_authority`.
 
 ## Runtime primitive impact
@@ -64,11 +69,19 @@ Child start/completion/failure events include parent and child run IDs, source a
 target agent IDs, parent causal trace, and request/response message links where
 available.
 
+Trusted root binding remains local run-admission setup and does not add a durable
+trace event. Child-creation binding and collision denials reuse
+`DelegationRejected`; replay preserves their stable reasons and contexts.
+
 ## State behavior
 
 Parent/child metadata is explicit in `LocalRunRecord`. Agent state remains owned
 by each `LoopEngine` and committed through the state graph. 0.02-S4 does not add
 shared mutable state or cross-run state handoff.
+
+The manager privately retains each exact validated root/child grant while the
+public run record exposes only its grant ID as evidence. This private binding is
+manager-local and not cross-instance state.
 
 ## Gateway and verifier behavior
 
@@ -104,6 +117,11 @@ child runs.
   untyped exception.
 - Repeated completion/failure after a child terminal status returns
   `ChildRunAlreadyFinished` and emits no duplicate response or terminal trace.
+- Unbound, same-ID/different-content, mismatched-grant, and child grant-ID
+  collision attempts fail before routing or child/fan-out mutation with stable
+  replay-visible reasons.
+- Recursive local delegation remains unsupported; exact child scope cannot cover
+  a distinct grandchild identity and replacement grants cannot bypass binding.
 
 ## Test evidence
 
@@ -121,6 +139,8 @@ child runs.
 | failure | Repeated child completion is terminal and idempotently rejected | `repeated_child_completion_is_rejected_without_duplicate_response` |
 | failure | Repeated/late child failure emits no duplicate failure trace | `repeated_child_failure_is_rejected_without_duplicate_failure_trace`, `child_failure_after_completion_is_rejected_without_failure_trace` |
 | replay | Causal graph reconstruction | `failed_child_run_returns_structured_task_response_and_replays_causality` |
+| security | Exact grant binding, replay reasons, and root/sibling/cross-tenant ID collision denial | `same_id_different_validated_parent_grant_content_denies_before_effects`, `*child_grant_id_collision*` |
+| compatibility | One manager, one parent, two child scopes | authority multi-scope builder test and daemon `integration_kernel_e2e_0_03` |
 | cancellation | Parent cancellation blocks delegation | `cancelled_parent_prevents_new_child_delegation_and_records_trace` |
 
 ## Example or fixture
