@@ -64,14 +64,17 @@ pub struct LegacyScopeProfile {
 ///
 /// This profile never represents an unbounded wildcard: both identity lists are
 /// required and are validated by the same local-profile checks as single-scope
-/// compatibility grants.
+/// compatibility grants. `agent_ids` and `run_ids` are independent set-valued
+/// `CapabilityScope` dimensions, so containment permits their Cartesian
+/// combinations; entries at the same vector index are not paired delegation
+/// edges. A typed paired agent/run edge contract is intentionally deferred.
 #[derive(Clone, Debug)]
 pub struct LegacyMultiScopeProfile {
     /// Single tenant boundary for every listed agent/run.
     pub tenant_id: TenantId,
-    /// Explicit agent identities covered by the grant.
+    /// Explicit agent identities covered independently of `run_ids`.
     pub agent_ids: Vec<AgentId>,
-    /// Explicit run identities covered by the grant.
+    /// Explicit run identities covered independently of `agent_ids`.
     pub run_ids: Vec<RunId>,
     /// Optional quota/budget narrowing shared by the explicit identities.
     pub quotas: AuthorityBudgetScope,
@@ -428,7 +431,10 @@ pub fn grant_from_legacy_allowlists(
 /// Builds one local compatibility grant over explicit bounded agent/run lists.
 ///
 /// Empty lists, nil identities, invalid audiences, and otherwise malformed or
-/// unbounded profiles fail through the existing local-profile validator.
+/// unbounded profiles fail through the existing local-profile validator. Agent
+/// and run lists remain independent scope dimensions with Cartesian containment,
+/// not index-paired edges; callers requiring paired-edge semantics must wait for
+/// or separately enforce a future typed contract.
 #[allow(clippy::too_many_arguments)]
 pub fn grant_from_legacy_multi_scope_allowlists(
     context: CompatibilityGrantContext,

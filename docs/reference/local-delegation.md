@@ -114,12 +114,13 @@ authority and fails closed before gateway submission.
 5. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
    with an explicit target agent, child run ID, objective, and delegated
    authority.
-6. The manager verifies the supplied trusted grant ID equals the parent-run
-   binding, re-checks the grant subject against the registered principal, and
-   issues an authority-owned child grant at the current decision time. If
-   validation or issuance fails, it emits `DelegationRejected` and does not emit
-   `DelegationRequested`, route a task message, insert a child record, or start a
-   child run.
+6. The manager verifies the complete supplied `ValidatedCapabilityGrant`,
+   including its private trust state, exactly equals the manager-private
+   parent-run binding, re-checks the grant subject against the registered
+   principal, and issues an authority-owned child grant at the current decision
+   time. If validation or issuance fails, it emits `DelegationRejected` and does
+   not emit `DelegationRequested`, route a task message, insert a child record,
+   or start a child run.
 7. On success, the manager records `DelegationRequested`, sends a task request
    message carrying non-authorizing grant refs, emits `ChildRunStarted`, and
    returns a scoped child `AgentContext`. The child record retains the issued
@@ -256,6 +257,14 @@ The additive `LegacyMultiScopeProfile` and
 one parent grant to cover explicit non-empty lists of local child agent and run
 IDs. They use the existing local-profile validator; nil identities, empty lists,
 invalid audiences, and wildcard-like broad audience input fail closed.
+
+The two lists are independent `CapabilityScope` set dimensions. Containment is
+Cartesian: any listed agent may be combined with any listed run, and vector index
+positions do not define paired delegation edges. Authority issuance tests prove
+that listed combinations succeed while an unlisted agent or an unlisted run
+separately denies with `overbroad_scope`. A typed paired agent/run edge contract
+is explicitly deferred; callers that need pairing must enforce a separate
+narrower contract rather than infer pairs from list ordering.
 
 The bounded `AUTH-007c` matrix uses the public manager/authority/router/trace path
 and covers tenant, parent agent/shared-principal, parent principal/run, child
