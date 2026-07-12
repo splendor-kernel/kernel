@@ -104,8 +104,10 @@ sources without changing the policy bundle payload contract.
 4. signature correctness;
 5. tenant compatibility;
 6. optional agent compatibility;
-7. TTL expiry;
-8. revocation marker.
+7. future issuance (`issued_at` must be less than or equal to the receiver's
+   validation clock);
+8. TTL expiry;
+9. revocation marker.
 
 Any failed or unavailable check returns `PolicyBundleValidationError` and denies
 installation. Invalid bundles are rejected before policy invocation.
@@ -116,6 +118,7 @@ Stable sanitized reason codes include:
 unsigned_policy_bundle
 unknown_policy_signature_key
 bad_policy_signature
+future_issued_policy_bundle
 expired_policy_bundle
 revoked_policy_bundle
 malformed_policy_bundle
@@ -197,6 +200,7 @@ This preserves the invariant that no side effect bypasses the action gateway.
 | Unsupported schema | Reject bundle with `malformed_policy_bundle`. |
 | Missing or bad signature | Reject bundle with `unsigned_policy_bundle` or `bad_policy_signature`. |
 | Unknown key | Reject bundle with `unknown_policy_signature_key`. |
+| Future-issued bundle at installation | Reject bundle with `future_issued_policy_bundle`; `issued_at == validation.now` is allowed, any positive skew is denied. |
 | Expired bundle at installation | Reject bundle with `expired_policy_bundle`. |
 | Expired cached bundle at runtime | Deny policy invocation and actions; no action is forwarded to adapters from an expired bundle. |
 | Revoked bundle | Reject installation or deny future policy/action authority with `policy_revoked`. |
@@ -223,7 +227,17 @@ policies, submit actions, or execute adapters.
 
 ## Compatibility notes
 
-This is a 0.04-dev contract and not the 0.1 stable compatibility line. Field
-names are schema-aligned across Rust and TypeScript so later central-manager and
-resident-node work can reuse the same payload without changing local runtime
-semantics.
+This is a 0.04-dev contract and not the 0.1 stable compatibility line. The
+bounded AUTH-007d Rust matrix accepts only the exact
+`splendor.policy_bundle.v1` schema family and rejects exact-family `v0` and `v2`
+with `malformed_policy_bundle`; the free-form operator/audit `version` field does
+not select schema compatibility. Authority operation, scope, grant, request, and
+revocation-record authorizing families follow the same exact-v1 rule through
+their owning validators, and unknown closed validation enums fail serde.
+
+A historical 0.04-shaped `splendor.policy_bundle.v1` payload signed over the old
+one-field degraded-mode serialization is explicitly **not** proven compatible:
+it decodes with current defaults but fails current signature verification with
+`bad_policy_signature` because current normalization adds degraded-mode fields.
+No canonical source-byte verification or migration seam is implemented by this
+slice. TypeScript/OpenAPI parity is also not changed.

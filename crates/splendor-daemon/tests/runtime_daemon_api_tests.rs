@@ -145,14 +145,35 @@ fn signed_policy_bundle(
     revocation: RevocationStatus,
 ) -> PolicyBundleEnvelope {
     let now = OffsetDateTime::now_utc();
-    let bundle = PolicyBundle {
-        schema_version: POLICY_BUNDLE_SCHEMA_VERSION.to_string(),
-        policy_bundle_id: PolicyBundleId::try_new("pol_daemon").expect("policy bundle id"),
-        version: "v1".to_string(),
+    signed_policy_bundle_with_window(
+        "pol_daemon",
+        "v1",
         tenant_id,
         agent_id,
-        issued_at: now - time::Duration::minutes(1),
-        expires_at: now + time::Duration::hours(1),
+        now - time::Duration::minutes(1),
+        now + time::Duration::hours(1),
+        revocation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_policy_bundle_with_window(
+    policy_bundle_id: &str,
+    version: &str,
+    tenant_id: TenantId,
+    agent_id: Option<AgentId>,
+    issued_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    revocation: RevocationStatus,
+) -> PolicyBundleEnvelope {
+    let bundle = PolicyBundle {
+        schema_version: POLICY_BUNDLE_SCHEMA_VERSION.to_string(),
+        policy_bundle_id: PolicyBundleId::try_new(policy_bundle_id).expect("policy bundle id"),
+        version: version.to_string(),
+        tenant_id,
+        agent_id,
+        issued_at,
+        expires_at,
         revocation,
         degraded_mode: PolicyDegradedMode {
             allow_low_risk_cached: true,
@@ -1744,6 +1765,227 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
     let serialized = serde_json::to_string(&traces.records).expect("serialized traces");
     assert!(!serialized.contains("raw-secret"));
     assert!(!serialized.contains("token="));
+}
+
+#[tokio::test]
+async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed() {
+    for scenario in ["unsupported", "future", "expired", "revoked"] {
+        let app = router(DaemonState::local_dev());
+        let tenant_id = TenantId::parse("10000000-0000-4000-8000-000000000001").expect("tenant id");
+        let agent_id = AgentId::parse("20000000-0000-4000-8000-000000000002").expect("agent id");
+        let now = OffsetDateTime::now_utc();
+        let mut create =
+            create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+        create.policy_bundle_required = true;
+        create.policy_bundle = Some(signed_policy_bundle_with_window(
+            "pol_last_trusted",
+            "trusted-v1",
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            now - time::Duration::minutes(5),
+            now + time::Duration::hours(2),
+            RevocationStatus::Active,
+        ));
+        let (status, created): (StatusCode, CreateRunResponse) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(create).expect("create request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+
+        let (issued_at, expires_at, revocation) = match scenario {
+            "future" => (
+                now + time::Duration::hours(1),
+                now + time::Duration::hours(2),
+                RevocationStatus::Active,
+            ),
+            "expired" => (
+                now - time::Duration::hours(2),
+                now - time::Duration::hours(1),
+                RevocationStatus::Active,
+            ),
+            "revoked" => (
+                now - time::Duration::minutes(5),
+                now + time::Duration::hours(2),
+                RevocationStatus::Revoked {
+                    reason: "central_revocation".to_string(),
+                },
+            ),
+            "unsupported" => (
+                now - time::Duration::minutes(5),
+                now + time::Duration::hours(2),
+                RevocationStatus::Active,
+            ),
+            _ => unreachable!("bounded policy sync scenario"),
+        };
+        let candidate_id = if scenario == "revoked" {
+            "pol_last_trusted"
+        } else {
+            "pol_candidate"
+        };
+        let mut candidate = signed_policy_bundle_with_window(
+            candidate_id,
+            "candidate-v1",
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            issued_at,
+            expires_at,
+            revocation,
+        );
+        if scenario == "unsupported" {
+            candidate.bundle.schema_version = "splendor.policy_bundle.v2".to_string();
+        }
+        let expected_reason = match scenario {
+            "unsupported" => "malformed_policy_bundle",
+            "future" => "future_issued_policy_bundle",
+            "expired" => "expired_policy_bundle",
+            "revoked" => "revoked_policy_bundle",
+            _ => unreachable!("bounded policy sync scenario"),
+        };
+        let expected_status = if scenario == "unsupported" {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        let sync = PolicySyncRequest {
+            credential: None,
+            audit_attribution: Some(attribution()),
+            policy_bundle: Some(candidate),
+            sync_error: None,
+            disconnected: (scenario != "revoked").then_some(true),
+        };
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/policies/sync", created.run_id),
+            serde_json::to_value(sync).expect("policy sync request"),
+        )
+        .await;
+        assert_eq!(status, expected_status, "scenario={scenario}");
+        assert_eq!(error.code, expected_reason, "scenario={scenario}");
+
+        let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
+            app.clone(),
+            Method::GET,
+            &format!("/runs/{}", created.run_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+        let cached = inspected
+            .policy_bundle
+            .expect("last trusted cache metadata");
+        assert_eq!(
+            cached.policy_bundle_id.as_str(),
+            "pol_last_trusted",
+            "scenario={scenario}"
+        );
+        assert_eq!(cached.version, "trusted-v1", "scenario={scenario}");
+        assert_eq!(inspected.adapter_executions, 0, "scenario={scenario}");
+
+        let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+            app.clone(),
+            Method::GET,
+            &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+        let events: Vec<TraceEvent> = traces
+            .records
+            .iter()
+            .map(|record| {
+                serde_json::from_value(record.payload.clone()).expect("policy trace event")
+            })
+            .collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.kind,
+                TraceEventKind::PolicyBundleRejected {
+                    policy_bundle_id: Some(policy_bundle_id),
+                    version: Some(version),
+                    reason,
+                } if policy_bundle_id.as_str() == candidate_id
+                    && version == "candidate-v1"
+                    && reason == expected_reason
+            )),
+            "scenario={scenario} missing policy.bundle.rejected"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.kind,
+                TraceEventKind::PolicySyncFailed {
+                    policy_bundle_id: Some(policy_bundle_id),
+                    version: Some(version),
+                    reason,
+                } if policy_bundle_id.as_str() == candidate_id
+                    && version == "candidate-v1"
+                    && reason == expected_reason
+            )),
+            "scenario={scenario} missing policy.sync.failed"
+        );
+        if scenario == "revoked" {
+            assert!(events.iter().any(|event| matches!(
+                &event.kind,
+                TraceEventKind::PolicyRevoked {
+                    policy_bundle_id,
+                    version,
+                    reason,
+                } if policy_bundle_id.as_str() == "pol_last_trusted"
+                    && version == "trusted-v1"
+                    && reason == "central_revocation"
+            )));
+        }
+        let causal_trace_id = events
+            .first()
+            .map(|event| event.trace_event_id.clone())
+            .expect("run trace identity");
+        let submit = SubmitActionRequest {
+            action_id: None,
+            run_id: created.run_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            credential: None,
+            audit_attribution: Some(attribution()),
+            causal_trace_id: Some(causal_trace_id),
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: Some(QuotaUsage::single_action()),
+            satisfied_preconditions: Vec::new(),
+            approval_evidence: None,
+        };
+        let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+            app.clone(),
+            Method::POST,
+            "/actions",
+            serde_json::to_value(submit).expect("submit action request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+        assert_eq!(
+            outcome.status,
+            splendor_gateway::ActionStatus::Denied,
+            "scenario={scenario}"
+        );
+        let expected_action_reason = if scenario == "revoked" {
+            "policy_revoked"
+        } else {
+            "offline_action_not_allowed"
+        };
+        assert_eq!(
+            outcome.verification.reasons,
+            vec![expected_action_reason],
+            "scenario={scenario}"
+        );
+
+        let (status, inspected): (StatusCode, RunInspectResponse) =
+            call_empty(app, Method::GET, &format!("/runs/{}", created.run_id)).await;
+        assert_eq!(status, StatusCode::OK, "scenario={scenario}");
+        assert_eq!(
+            inspected.adapter_executions, 0,
+            "scenario={scenario} adapter must remain uncalled"
+        );
+    }
 }
 
 #[tokio::test]

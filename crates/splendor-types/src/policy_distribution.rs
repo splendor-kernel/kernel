@@ -330,6 +330,9 @@ pub enum PolicyBundleValidationError {
     /// Policy bundle is expired.
     #[error("policy bundle has expired")]
     Expired,
+    /// Policy bundle claims an issuance time after the validation clock.
+    #[error("policy bundle was issued in the future")]
+    FutureIssued,
     /// Policy bundle was revoked.
     #[error("policy bundle has been revoked: {reason}")]
     Revoked { reason: String },
@@ -349,6 +352,7 @@ impl PolicyBundleValidationError {
             Self::UnknownKey { .. } => "unknown_policy_signature_key",
             Self::BadSignature => "bad_policy_signature",
             Self::Expired => "expired_policy_bundle",
+            Self::FutureIssued => "future_issued_policy_bundle",
             Self::Revoked { .. } => "revoked_policy_bundle",
             Self::Malformed { .. } => "malformed_policy_bundle",
             Self::Incompatible { .. } => "incompatible_policy_bundle",
@@ -382,6 +386,9 @@ pub fn validate_policy_bundle(
             });
         }
         _ => {}
+    }
+    if envelope.bundle.issued_at > context.now {
+        return Err(PolicyBundleValidationError::FutureIssued);
     }
     if envelope.bundle.expires_at <= context.now {
         return Err(PolicyBundleValidationError::Expired);

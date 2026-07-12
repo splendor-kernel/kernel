@@ -4655,9 +4655,9 @@ fn lock_error() -> ApiError {
 
 fn policy_bundle_error(error: PolicyBundleValidationError) -> ApiError {
     let status = match &error {
-        PolicyBundleValidationError::Expired | PolicyBundleValidationError::Revoked { .. } => {
-            StatusCode::FORBIDDEN
-        }
+        PolicyBundleValidationError::Expired
+        | PolicyBundleValidationError::FutureIssued
+        | PolicyBundleValidationError::Revoked { .. } => StatusCode::FORBIDDEN,
         PolicyBundleValidationError::Unsigned
         | PolicyBundleValidationError::UnknownKey { .. }
         | PolicyBundleValidationError::BadSignature

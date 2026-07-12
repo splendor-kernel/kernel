@@ -76,6 +76,12 @@ from arbitrary action names or side-effect classes.
 5. Reconnect is marked by `set_disconnected_with_trace(false, time)`; a new valid
    bundle may then update cache status without resetting trace continuity.
 
+Policy validation occurs before installation. Unsupported, future-issued, and
+expired sync candidates record `PolicyBundleRejected` plus `PolicySyncFailed`
+and leave the last trusted cached bundle unchanged. A matching revoked candidate
+uses the existing revocation path to block the current cached bundle. None of
+these failures installs candidate authority or creates an alternate adapter path.
+
 ## Trace behavior
 
 Offline/degraded cache decisions are visible through:
@@ -104,6 +110,7 @@ refresh bundles, invoke policy code, or execute adapters.
 | Disconnected high-risk action | Deny or `NeedsIntervention` according to policy. |
 | Disconnected unspecified action | Deny `offline_action_not_allowed`. |
 | Bundle revoked | Deny with `policy_revoked`. |
+| Signed bundle issued after the receiver clock | Reject with `future_issued_policy_bundle` before cache installation. |
 | Central sync failed | Record failure and keep previous authority. |
 
 ## Security notes

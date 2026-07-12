@@ -137,8 +137,9 @@ directly; `/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
 When `CreateRunRequest.policy_bundle_required` is true, the daemon also requires
-a signed policy bundle and rejects invalid, expired, revoked, malformed, or
-incompatible bundles before policy invocation or adapter execution can occur.
+a signed policy bundle and rejects invalid, future-issued, expired, revoked,
+malformed, or incompatible bundles before policy invocation or adapter execution
+can occur.
 
 ## Run lifecycle
 
