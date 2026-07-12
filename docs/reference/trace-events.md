@@ -395,6 +395,11 @@ signature material, shared secrets, caller credentials, and policy-language
 internals. Replay inspects these events but does not refresh bundles, contact a
 policy distributor, invoke policies, or execute adapters.
 
+These pre-commit events are prepared/non-authorizing evidence. Event presence
+alone is not proof that cache mutation committed; cache snapshot/runtime
+decision is authoritative. No mutation-attempt ID or terminal-status event is
+added in this compatibility slice.
+
 ### Remote Message Events
 
 Remote message event variants correspond to these canonical event classes:

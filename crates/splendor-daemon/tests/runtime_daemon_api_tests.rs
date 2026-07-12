@@ -28,6 +28,9 @@ use tower::ServiceExt;
 enum PolicyTraceFailureTarget {
     Accepted,
     Reconnected,
+    Rejected,
+    SyncFailed,
+    Revoked,
 }
 
 #[derive(Default)]
@@ -60,6 +63,15 @@ impl TraceStore for FailingPolicyTraceStore {
                     disconnected: false,
                     ..
                 })
+            ) | (
+                Some(PolicyTraceFailureTarget::Rejected),
+                Some(TraceEventKind::PolicyBundleRejected { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::SyncFailed),
+                Some(TraceEventKind::PolicySyncFailed { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::Revoked),
+                Some(TraceEventKind::PolicyRevoked { .. })
             )
         );
         if should_fail {
@@ -2507,6 +2519,154 @@ async fn policy_sync_trace_failures_do_not_commit_authority_or_reconnect() {
         inspected.policy_bundle.expect("prior authority").version,
         "active-t10"
     );
+}
+
+#[tokio::test]
+async fn revocation_trace_stage_failures_latch_pending_deny_and_reconcile_on_retry() {
+    for target in [
+        PolicyTraceFailureTarget::Rejected,
+        PolicyTraceFailureTarget::SyncFailed,
+        PolicyTraceFailureTarget::Revoked,
+    ] {
+        let trace_store = Arc::new(FailingPolicyTraceStore::default());
+        let app = router(DaemonState::with_trace_store(
+            DaemonConfig::local_dev(),
+            trace_store.clone(),
+        ));
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + time::Duration::hours(1);
+        let active_t10 = signed_policy_bundle_with_window(
+            "pol_pending_revocation",
+            "active-t10",
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            now - time::Duration::minutes(30),
+            expires_at,
+            RevocationStatus::Active,
+        );
+        let mut create = create_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            Vec::new(),
+            vec![RegisteredAction {
+                name: "allowed_action".to_string(),
+                adapter: "daemon.local".to_string(),
+            }],
+        );
+        create.policy_bundle_required = true;
+        create.policy_bundle = Some(active_t10);
+        let (status, created): (StatusCode, CreateRunResponse) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(create).expect("create request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "target={target:?}");
+
+        let revoked_t20 = signed_policy_bundle_with_window(
+            "pol_pending_revocation",
+            "revoked-t20",
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            now - time::Duration::minutes(10),
+            expires_at,
+            RevocationStatus::Revoked {
+                reason: "revoked_at_t20".to_string(),
+            },
+        );
+        let sync = |bundle| PolicySyncRequest {
+            credential: None,
+            audit_attribution: Some(attribution()),
+            policy_bundle: Some(bundle),
+            sync_error: None,
+            disconnected: None,
+        };
+        trace_store.arm(target);
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/policies/sync", created.run_id),
+            serde_json::to_value(sync(revoked_t20.clone())).expect("failed revocation sync"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "target={target:?}"
+        );
+        assert_eq!(error.code, "trace_error", "target={target:?}");
+
+        let denied = submit_allowed_action(
+            app.clone(),
+            created.run_id.clone(),
+            tenant_id.clone(),
+            agent_id.clone(),
+        )
+        .await;
+        assert_eq!(
+            denied.status,
+            splendor_gateway::ActionStatus::Denied,
+            "target={target:?}"
+        );
+        assert_eq!(
+            denied.verification.reasons,
+            vec!["policy_evidence_unavailable"],
+            "target={target:?}"
+        );
+
+        let active_t15 = signed_policy_bundle_with_window(
+            "pol_pending_revocation",
+            "active-t15",
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            now - time::Duration::minutes(20),
+            expires_at,
+            RevocationStatus::Active,
+        );
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/policies/sync", created.run_id),
+            serde_json::to_value(sync(active_t15)).expect("T15 pending watermark attack"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "target={target:?}");
+        assert_eq!(
+            error.code, "policy_cache_revocation_watermark",
+            "target={target:?}"
+        );
+
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            &format!("/runs/{}/policies/sync", created.run_id),
+            serde_json::to_value(sync(revoked_t20)).expect("revocation reconciliation"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "target={target:?}");
+        assert_eq!(error.code, "revoked_policy_bundle", "target={target:?}");
+
+        let denied =
+            submit_allowed_action(app.clone(), created.run_id.clone(), tenant_id, agent_id).await;
+        assert_eq!(
+            denied.status,
+            splendor_gateway::ActionStatus::Denied,
+            "target={target:?}"
+        );
+        assert_eq!(
+            denied.verification.reasons,
+            vec!["policy_revoked"],
+            "target={target:?}"
+        );
+        let inspected: RunInspectResponse =
+            call_empty(app, Method::GET, &format!("/runs/{}", created.run_id))
+                .await
+                .1;
+        assert_eq!(inspected.adapter_executions, 0, "target={target:?}");
+    }
 }
 
 #[tokio::test]

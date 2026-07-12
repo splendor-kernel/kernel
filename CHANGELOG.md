@@ -18,7 +18,9 @@
   candidates are identity/scope/age-bound, reconnect requires accepted install,
   and clock rollback or latched expiry cannot reactivate policy authority.
 - Added exact signed revocation watermarks, tenant+agent cache ownership,
-  exact-retry reconnect denial, and trace-before-commit mutation plans. Public
+  exact-retry reconnect denial, and trace-before-commit mutation. Public callers
+  now use high-level recorder-bound methods; internal plans/commit are private.
+  Revocation trace failure latches an exact deny-only pending watermark. Public
   Rust cache construction/mutation APIs changed; daemon wire shapes did not.
 - Bound local delegating root runs to one exact trusted validated capability
   grant, including private trust state, within one manager. Cross-run/shared-

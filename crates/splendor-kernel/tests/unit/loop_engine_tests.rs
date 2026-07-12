@@ -15,6 +15,17 @@ use splendor_types::{
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+struct LoopPolicyTraceRecorder;
+
+impl crate::PolicyCacheTraceRecorder for LoopPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), crate::PolicyCacheTraceError> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct CapturingTraceSink {
     events: Arc<Mutex<Vec<TraceEvent>>>,
@@ -1559,11 +1570,8 @@ fn loop_engine_rejects_policy_before_policy_invoked_when_bundle_expired() {
             agent_id: agent.agent_id.clone(),
         },
     );
-    let plan = cache
-        .prepare_install(validated, false)
-        .expect("trusted loop policy prepares");
     cache
-        .commit_install(plan)
+        .install_validated_traced(validated, false, &LoopPolicyTraceRecorder)
         .expect("trusted loop policy installs");
     let mut engine = LoopEngine::with_runtime(
         agent,

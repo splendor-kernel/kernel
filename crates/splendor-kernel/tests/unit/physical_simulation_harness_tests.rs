@@ -22,6 +22,17 @@ use time::{Duration, OffsetDateTime};
 
 const DEVICE_ZONE: &str = "zone:warehouse-a3";
 
+struct PhysicalPolicyTraceRecorder;
+
+impl PolicyCacheTraceRecorder for PhysicalPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        Ok(())
+    }
+}
+
 struct AllowPhysicalTenantAccess;
 
 impl TenantAccess for AllowPhysicalTenantAccess {
@@ -487,17 +498,15 @@ fn physical_harness_offline_interval_syncs_without_duplicates() {
         owner.clone(),
     ));
     let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone(), &owner);
-    let plan = cache
-        .prepare_install(
+    cache
+        .install_validated_traced(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             false,
+            &PhysicalPolicyTraceRecorder,
         )
-        .expect("trusted physical policy prepares");
-    cache
-        .commit_install(plan)
         .expect("trusted physical policy installs");
     let mut scope = TraceSyncScope::new(harness.run_id.to_string());
     scope.node_id = Some("node-sim-drone-01".to_string());
@@ -593,17 +602,15 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
         owner.clone(),
     ));
     let mut harness = PhysicalSimulationHarness::with_policy_cache(cache.clone(), &owner);
-    let plan = cache
-        .prepare_install(
+    cache
+        .install_validated_traced(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             false,
+            &PhysicalPolicyTraceRecorder,
         )
-        .expect("trusted physical policy prepares");
-    cache
-        .commit_install(plan)
         .expect("trusted physical policy installs");
     cache.mark_disconnected();
 
@@ -616,17 +623,15 @@ fn physical_harness_operator_intervention_then_override_request_is_traced() {
     assert_eq!(intervention.status, ActionStatus::NeedsIntervention);
     assert_eq!(harness.adapter.call_count(), 0);
 
-    let plan = cache
-        .prepare_install(
+    cache
+        .install_validated_traced(
             validated_policy_bundle(policy_bundle(
                 harness.tenant_id.clone(),
                 harness.agent_id.clone(),
             )),
             true,
+            &PhysicalPolicyTraceRecorder,
         )
-        .expect("strict newer trusted policy prepares");
-    cache
-        .commit_install(plan)
         .expect("strict newer trusted policy reconnects");
     let override_request = harness.submit_physical_action(
         "request_operator_override",

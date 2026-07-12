@@ -190,10 +190,14 @@ tenant-wide bundle. Cross-owner wrappers fail `policy_cache_owner_mismatch`, and
 cross-owner action requests deny `policy_cache_request_owner_mismatch` before
 gateway forwarding.
 
-Active install/reconnect and revocation use prepare/preview/commit. The daemon
-persists required `PolicyBundleAccepted`, reconnect, or revocation events before
-commit. Trace failure leaves prior authority/connectivity unchanged; a partial
-non-authorizing trace is permitted.
+Public mutation uses only high-level `install_validated_traced` and
+`apply_validated_revocation_traced` methods with a trusted runtime recorder.
+Internal prepare/commit plans are private. Required `PolicyBundleAccepted`,
+reconnect, or revocation events are persisted before commit. Active trace failure
+leaves prior authority/connectivity unchanged. Matching revocation trace failure
+retains the exact candidate as a pending watermark and denies
+`policy_evidence_unavailable` until reconciliation or a successfully traced
+strictly newer active refresh.
 
 `disconnected: true` may be retained before a failed sync because it narrows
 authority. `disconnected: false` takes effect only atomically with an accepted
@@ -218,6 +222,12 @@ reason codes before entering trace or cache snapshots.
 
 `PolicyBundleAccepted` uses `PolicyBundleTraceContext`, which includes only
 bundle identity, version, tenant/agent scope, expiry, and degraded-mode flags.
+
+Pre-commit events mean prepared/non-authorizing, not committed. Replay cannot
+infer commit from these events alone; cache snapshot/runtime decision is
+authoritative. No mutation-attempt ID or terminal-status event is added in this
+slice, so exact partial-attempt replay correlation remains an explicit P2
+non-claim.
 
 ## Gateway behavior
 

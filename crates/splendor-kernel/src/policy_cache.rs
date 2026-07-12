@@ -85,22 +85,14 @@ pub struct PolicyCacheInstallResult {
     pub revocation_preserved: bool,
 }
 
-/// Prepared active policy mutation. It carries no public raw policy insertion
-/// seam and must be committed against the same unchanged cache revision.
+/// Internal prepared active policy mutation bound to one cache revision.
 #[derive(Clone, Debug)]
-pub struct PolicyCacheInstallPlan {
+struct PolicyCacheInstallPlan {
     cache_inner: Arc<Mutex<PolicyCacheState>>,
     expected_revision: u64,
     validated: ValidatedPolicyBundle,
     result: PolicyCacheInstallResult,
     replace: bool,
-}
-
-impl PolicyCacheInstallPlan {
-    /// Returns the trace-safe outcome that must be persisted before commit.
-    pub fn preview(&self) -> &PolicyCacheInstallResult {
-        &self.result
-    }
 }
 
 /// Result class for a trusted revocation plan.
@@ -123,20 +115,45 @@ pub struct PolicyCacheRevocationResult {
     pub reason: String,
 }
 
-/// Prepared revocation mutation that must be traced before commit.
+/// Internal prepared revocation mutation bound to one cache revision.
 #[derive(Clone, Debug)]
-pub struct PolicyCacheRevocationPlan {
+struct PolicyCacheRevocationPlan {
     cache_inner: Arc<Mutex<PolicyCacheState>>,
     expected_revision: u64,
     validated: ValidatedPolicyBundle,
     result: PolicyCacheRevocationResult,
 }
 
-impl PolicyCacheRevocationPlan {
-    /// Returns the trace-safe revocation outcome that must be persisted before
-    /// commit.
-    pub fn preview(&self) -> &PolicyCacheRevocationResult {
-        &self.result
+/// Trusted recorder used by the policy cache mutation boundary.
+pub trait PolicyCacheTraceRecorder: Send + Sync {
+    /// Persists one required policy mutation event before authority changes.
+    fn record_policy_cache_event(&self, event: TraceEventKind)
+        -> Result<(), PolicyCacheTraceError>;
+}
+
+/// Sanitized policy mutation trace failure.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("required policy mutation trace evidence is unavailable")]
+pub struct PolicyCacheTraceError;
+
+/// Combined high-level policy cache mutation failure.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PolicyCacheMutationError {
+    /// Candidate or cache state failed policy mutation validation.
+    #[error(transparent)]
+    Policy(#[from] PolicyCacheInstallError),
+    /// Required trace evidence could not be persisted.
+    #[error(transparent)]
+    Trace(#[from] PolicyCacheTraceError),
+}
+
+impl PolicyCacheMutationError {
+    /// Stable sanitized reason for API and trace boundaries.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Policy(error) => error.reason_code(),
+            Self::Trace(_) => "policy_evidence_unavailable",
+        }
     }
 }
 
@@ -219,6 +236,8 @@ pub enum PolicyOfflineStatus {
     Revoked,
     /// Runtime clock moved behind trusted validation/observation time.
     ClockRollback,
+    /// A trusted matching revocation is pending because required evidence failed.
+    EvidenceUnavailable,
 }
 
 /// Snapshot of local policy cache status for API responses, tests, and telemetry.
@@ -243,6 +262,8 @@ pub struct PolicyCacheSnapshot {
     pub revoked_reason: Option<String>,
     /// Trusted revocation watermark metadata, if a tombstone is active.
     pub revocation: Option<PolicyCacheRevocationMetadata>,
+    /// Trusted revocation awaiting durable evidence before tombstone commit.
+    pub pending_revocation: Option<PolicyCacheRevocationMetadata>,
     /// Most recent sync failure.
     pub last_sync_failure: Option<PolicySyncFailure>,
 }
@@ -250,6 +271,8 @@ pub struct PolicyCacheSnapshot {
 /// Trace-safe metadata for the exact trusted revocation watermark.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyCacheRevocationMetadata {
+    /// Signed issuance time used as the monotonic watermark.
+    pub issued_at: OffsetDateTime,
     /// Signed revoked bundle identity and issuance metadata.
     pub bundle: PolicyBundleTraceContext,
     /// Trusted validation metadata without signature bytes.
@@ -265,6 +288,7 @@ struct PolicyCacheState {
     last_sync_at: Option<OffsetDateTime>,
     revoked_reason: Option<String>,
     revocation: Option<ValidatedPolicyBundle>,
+    pending_revocation: Option<ValidatedPolicyBundle>,
     last_sync_failure: Option<PolicySyncFailure>,
     max_observed_at: Option<OffsetDateTime>,
     expiry_latched: bool,
@@ -290,13 +314,67 @@ impl PolicyCache {
         }
     }
 
+    /// Installs trusted active authority only after this boundary persists every
+    /// required acceptance/connectivity event through `recorder`.
+    pub fn install_validated_traced(
+        &self,
+        validated: ValidatedPolicyBundle,
+        reconnect: bool,
+        recorder: &dyn PolicyCacheTraceRecorder,
+    ) -> Result<PolicyCacheInstallResult, PolicyCacheMutationError> {
+        let plan = self.prepare_install(validated, reconnect)?;
+        recorder.record_policy_cache_event(TraceEventKind::PolicyBundleAccepted {
+            bundle: plan.result.bundle.clone(),
+        })?;
+        if let Some(event) = plan.result.connectivity_event.clone() {
+            recorder.record_policy_cache_event(event)?;
+        }
+        Ok(self.commit_install(plan)?)
+    }
+
+    /// Applies a trusted revocation only after all rejection/sync/revocation
+    /// evidence is durable. Trace failure latches the exact trusted candidate as
+    /// deny-only pending authority evidence.
+    pub fn apply_validated_revocation_traced(
+        &self,
+        validated: ValidatedPolicyBundle,
+        recorder: &dyn PolicyCacheTraceRecorder,
+    ) -> Result<PolicyCacheRevocationResult, PolicyCacheMutationError> {
+        let plan = self.prepare_revocation(validated)?;
+        let candidate = plan.validated.bundle();
+        let events = [
+            TraceEventKind::PolicyBundleRejected {
+                policy_bundle_id: Some(candidate.policy_bundle_id.clone()),
+                version: Some(candidate.version.clone()),
+                reason: "revoked_policy_bundle".to_string(),
+            },
+            TraceEventKind::PolicySyncFailed {
+                policy_bundle_id: Some(candidate.policy_bundle_id.clone()),
+                version: Some(candidate.version.clone()),
+                reason: "revoked_policy_bundle".to_string(),
+            },
+            TraceEventKind::PolicyRevoked {
+                policy_bundle_id: plan.result.bundle.policy_bundle_id.clone(),
+                version: plan.result.bundle.version.clone(),
+                reason: plan.result.reason.clone(),
+            },
+        ];
+        for event in events {
+            if let Err(error) = recorder.record_policy_cache_event(event) {
+                self.latch_pending_revocation(&plan.validated);
+                return Err(error.into());
+            }
+        }
+        Ok(self.commit_revocation(plan)?)
+    }
+
     /// Prepares trusted signed policy authority monotonically without mutation.
     ///
     /// A first or strictly newer bundle replaces authority and clears prior
     /// revocation/expiry tombstones. An exact retry is idempotent and preserves
     /// those tombstones. Older or same-time different-content candidates fail
     /// before mutation. Reconnect is applied atomically only after acceptance.
-    pub fn prepare_install(
+    fn prepare_install(
         &self,
         validated: ValidatedPolicyBundle,
         reconnect: bool,
@@ -330,14 +408,19 @@ impl PolicyCache {
             Some(_) => (PolicyCacheInstallStatus::Installed, true),
         };
         if replace
-            && guard
+            && (guard
                 .revocation
                 .as_ref()
                 .is_some_and(|revocation| bundle.issued_at <= revocation.bundle().issued_at)
+                || guard
+                    .pending_revocation
+                    .as_ref()
+                    .is_some_and(|revocation| bundle.issued_at <= revocation.bundle().issued_at))
         {
             return Err(PolicyCacheInstallError::RevocationWatermark);
         }
-        let revocation_preserved = !replace && guard.revocation.is_some();
+        let revocation_preserved =
+            !replace && (guard.revocation.is_some() || guard.pending_revocation.is_some());
         let connectivity_event = if replace && reconnect && guard.disconnected {
             Some(TraceEventKind::PolicyConnectivityChanged {
                 disconnected: false,
@@ -361,9 +444,9 @@ impl PolicyCache {
         })
     }
 
-    /// Commits a previously prepared active policy mutation. Callers must first
-    /// persist every event returned by [`PolicyCacheInstallPlan::preview`].
-    pub fn commit_install(
+    /// Commits an internal active plan after the high-level boundary recorded
+    /// every required event.
+    fn commit_install(
         &self,
         plan: PolicyCacheInstallPlan,
     ) -> Result<PolicyCacheInstallResult, PolicyCacheInstallError> {
@@ -383,6 +466,7 @@ impl PolicyCache {
             guard.bundle = Some(bundle);
             guard.revoked_reason = None;
             guard.revocation = None;
+            guard.pending_revocation = None;
             guard.expiry_latched = false;
         }
         guard.validation = Some(validation);
@@ -444,7 +528,7 @@ impl PolicyCache {
     }
 
     /// Prepares a trusted revocation tombstone without mutating cache authority.
-    pub fn prepare_revocation(
+    fn prepare_revocation(
         &self,
         validated: ValidatedPolicyBundle,
     ) -> Result<PolicyCacheRevocationPlan, PolicyCacheInstallError> {
@@ -486,6 +570,16 @@ impl PolicyCache {
             }
             _ => PolicyCacheRevocationStatus::Applied,
         };
+        if let Some(pending) = guard.pending_revocation.as_ref() {
+            if candidate.issued_at < pending.bundle().issued_at {
+                return Err(PolicyCacheInstallError::RevocationRollback);
+            }
+            if candidate.issued_at == pending.bundle().issued_at
+                && !same_signed_content(&validated, pending)
+            {
+                return Err(PolicyCacheInstallError::RevocationConflict);
+            }
+        }
         let trace = PolicyBundleTraceContext::from(current);
         let reason = sanitize_policy_reason(reason.clone());
         Ok(PolicyCacheRevocationPlan {
@@ -501,7 +595,7 @@ impl PolicyCache {
     }
 
     /// Commits a prepared revocation after required trace evidence is durable.
-    pub fn commit_revocation(
+    fn commit_revocation(
         &self,
         plan: PolicyCacheRevocationPlan,
     ) -> Result<PolicyCacheRevocationResult, PolicyCacheInstallError> {
@@ -517,6 +611,7 @@ impl PolicyCache {
         if plan.result.status == PolicyCacheRevocationStatus::Applied {
             guard.revoked_reason = Some(plan.result.reason.clone());
             guard.revocation = Some(plan.validated);
+            guard.pending_revocation = None;
         }
         guard.max_observed_at = Some(
             guard
@@ -525,6 +620,47 @@ impl PolicyCache {
         );
         guard.revision = guard.revision.saturating_add(1);
         Ok(plan.result)
+    }
+
+    fn latch_pending_revocation(&self, validated: &ValidatedPolicyBundle) {
+        let candidate = validated.bundle();
+        let mut guard = self.inner.lock().expect("policy cache lock");
+        let Some(current) = guard.bundle.as_ref() else {
+            return;
+        };
+        if candidate.policy_bundle_id != current.policy_bundle_id
+            || candidate.tenant_id != current.tenant_id
+            || candidate.agent_id != current.agent_id
+            || candidate.issued_at < current.issued_at
+        {
+            return;
+        }
+        if guard
+            .revocation
+            .as_ref()
+            .is_some_and(|watermark| same_signed_content(validated, watermark))
+        {
+            return;
+        }
+        let newer_than_committed = guard
+            .revocation
+            .as_ref()
+            .is_none_or(|watermark| candidate.issued_at >= watermark.bundle().issued_at);
+        let newer_than_pending = guard
+            .pending_revocation
+            .as_ref()
+            .is_none_or(|watermark| candidate.issued_at >= watermark.bundle().issued_at);
+        if newer_than_committed && newer_than_pending {
+            guard.pending_revocation = Some(validated.clone());
+            guard.max_observed_at = Some(
+                guard
+                    .max_observed_at
+                    .map_or(validated.validated_at(), |observed| {
+                        observed.max(validated.validated_at())
+                    }),
+            );
+            guard.revision = guard.revision.saturating_add(1);
+        }
     }
 
     /// Returns a stable snapshot of cache status.
@@ -549,9 +685,17 @@ impl PolicyCache {
                 .revocation
                 .as_ref()
                 .map(|revocation| PolicyCacheRevocationMetadata {
+                    issued_at: revocation.bundle().issued_at,
                     bundle: PolicyBundleTraceContext::from(revocation.bundle()),
                     validation: PolicyCacheValidationMetadata::from(revocation),
                 }),
+            pending_revocation: guard.pending_revocation.as_ref().map(|revocation| {
+                PolicyCacheRevocationMetadata {
+                    issued_at: revocation.bundle().issued_at,
+                    bundle: PolicyBundleTraceContext::from(revocation.bundle()),
+                    validation: PolicyCacheValidationMetadata::from(revocation),
+                }
+            }),
             last_sync_failure: guard.last_sync_failure.clone(),
         }
     }
@@ -585,6 +729,9 @@ impl PolicyCacheState {
     fn offline_status(&mut self, now: OffsetDateTime) -> PolicyOfflineStatus {
         if self.bundle.is_none() {
             return PolicyOfflineStatus::MissingPolicy;
+        }
+        if self.pending_revocation.is_some() {
+            return PolicyOfflineStatus::EvidenceUnavailable;
         }
         match self.observe_runtime_time(now) {
             PolicyRuntimeTimeStatus::ClockRollback => return PolicyOfflineStatus::ClockRollback,
@@ -708,6 +855,13 @@ impl PolicyRuntimeAuthority for PolicyCache {
                 trace_event: None,
             };
         }
+        let bundle = guard.bundle.as_ref().expect("bundle checked");
+        if guard.pending_revocation.is_some() {
+            return PolicyRuntimeDecision {
+                verification: policy_evidence_unavailable(bundle, policy_name),
+                trace_event: None,
+            };
+        }
         let runtime_time = guard.observe_runtime_time(now);
         let bundle = guard.bundle.as_ref().expect("bundle checked");
         match runtime_time {
@@ -750,6 +904,10 @@ impl PolicyDistributionStatus for PolicyCache {
         }
         if guard.bundle.is_none() {
             return policy_unavailable(&request.action.name);
+        }
+        let bundle = guard.bundle.as_ref().expect("bundle checked");
+        if guard.pending_revocation.is_some() {
+            return policy_evidence_unavailable(bundle, &request.action.name);
         }
         let runtime_time = guard.observe_runtime_time(now);
         let bundle = guard.bundle.as_ref().expect("bundle checked");
@@ -914,6 +1072,19 @@ fn policy_owner_mismatch(owner: &PolicyCacheOwner, request: &ActionRequest) -> V
             "owner_agent_id": owner.agent_id,
             "request_tenant_id": request.tenant_id,
             "request_agent_id": request.agent_id,
+        }),
+    }
+}
+
+fn policy_evidence_unavailable(bundle: &PolicyBundle, policy_name: &str) -> VerificationResult {
+    VerificationResult {
+        allowed: false,
+        reasons: vec!["policy_evidence_unavailable".to_string()],
+        artifacts: serde_json::json!({
+            "source": "policy_distribution_cache",
+            "policy_bundle_id": bundle.policy_bundle_id.to_string(),
+            "version": bundle.version,
+            "policy": policy_name,
         }),
     }
 }

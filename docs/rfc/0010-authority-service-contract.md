@@ -88,9 +88,10 @@ adds only a local kernel API that consumes an already trusted `RevocationSnapsho
 and existing run-record authority evidence.
 `AUTH-007d` does change the public Rust cache API and daemon-visible behavior:
 `PolicyCache` construction requires an explicit tenant+agent owner, policy
-mutation uses validated-wrapper-only prepare/preview/commit plans, direct
-reconnect/raw insertion seams are removed, revocation watermarks are retained,
-and stable owner/watermark/concurrent-mutation denials are observable. Daemon
+mutation uses validated-wrapper-only high-level traced methods with private
+cache-instance/revision-bound plans, direct reconnect/raw insertion/public
+commit seams are removed, revocation watermarks are retained, and stable
+owner/watermark/concurrent-mutation denials are observable. Daemon
 endpoint/request-response and trace-event wire shapes remain unchanged.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
@@ -635,10 +636,12 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   clears it;
 - caches are tenant+agent owner-bound, including validation context for
   tenant-wide bundles and action-request identity checks;
-- install/reconnect/revocation is planned without mutation, required events are
-  persisted, then the cache-instance/revision-bound plan commits. Trace failure
-  leaves authority/connectivity unchanged; partial non-authorizing trace is
-  permitted;
+- install/reconnect/revocation enters only high-level cache methods that invoke a
+  trusted recorder; internal plans cannot be committed by callers. Active trace
+  failure leaves authority/connectivity unchanged. Matching revocation trace
+  failure latches an exact deny-only pending watermark and returns
+  `policy_evidence_unavailable`; durable retry reconciles it. Partial prepared,
+  non-authorizing trace is permitted and replay does not prove commit;
 - a historical 0.04-shaped `splendor.policy_bundle.v1` payload signed over the
   old one-field degraded-mode serialization decodes with current defaults but
   fails current signature verification with `bad_policy_signature`. This is a

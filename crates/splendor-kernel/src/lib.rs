@@ -66,12 +66,12 @@ pub use node_registry::{
     NodeRegistryError, RegistryHealthStatus,
 };
 pub use policy_cache::{
-    PolicyCache, PolicyCacheConfig, PolicyCacheInstallError, PolicyCacheInstallPlan,
-    PolicyCacheInstallResult, PolicyCacheInstallStatus, PolicyCacheOwner,
-    PolicyCacheRevocationMetadata, PolicyCacheRevocationPlan, PolicyCacheRevocationResult,
-    PolicyCacheRevocationStatus, PolicyCacheSnapshot, PolicyCacheValidationMetadata,
-    PolicyDistributionGateway, PolicyDistributionStatus, PolicyOfflineStatus,
-    PolicyRuntimeAuthority, PolicyRuntimeDecision, PolicySyncFailure,
+    PolicyCache, PolicyCacheConfig, PolicyCacheInstallError, PolicyCacheInstallResult,
+    PolicyCacheInstallStatus, PolicyCacheMutationError, PolicyCacheOwner,
+    PolicyCacheRevocationMetadata, PolicyCacheRevocationResult, PolicyCacheRevocationStatus,
+    PolicyCacheSnapshot, PolicyCacheTraceError, PolicyCacheTraceRecorder,
+    PolicyCacheValidationMetadata, PolicyDistributionGateway, PolicyDistributionStatus,
+    PolicyOfflineStatus, PolicyRuntimeAuthority, PolicyRuntimeDecision, PolicySyncFailure,
 };
 pub use remote_message_transport::{
     send_remote_message, InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault,

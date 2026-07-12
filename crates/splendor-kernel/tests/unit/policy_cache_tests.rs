@@ -13,6 +13,40 @@ struct CountingGateway {
     calls: Arc<Mutex<u32>>,
 }
 
+#[derive(Default)]
+struct CapturingPolicyTraceRecorder {
+    events: Mutex<Vec<TraceEventKind>>,
+}
+
+impl PolicyCacheTraceRecorder for CapturingPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        self.events.lock().expect("policy events lock").push(event);
+        Ok(())
+    }
+}
+
+struct FailingPolicyTraceRecorder {
+    fail_at: usize,
+    calls: Mutex<usize>,
+}
+
+impl PolicyCacheTraceRecorder for FailingPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        let mut calls = self.calls.lock().expect("policy trace call lock");
+        *calls += 1;
+        if *calls == self.fail_at {
+            return Err(PolicyCacheTraceError);
+        }
+        Ok(())
+    }
+}
+
 fn cache_owner() -> PolicyCacheOwner {
     PolicyCacheOwner {
         tenant_id: TenantId::parse("00000000-0000-0000-0000-000000000101").expect("tenant id"),
@@ -134,8 +168,16 @@ fn install_policy(
     validated: ValidatedPolicyBundle,
     reconnect: bool,
 ) -> Result<PolicyCacheInstallResult, PolicyCacheInstallError> {
-    let plan = cache.prepare_install(validated, reconnect)?;
-    cache.commit_install(plan)
+    cache
+        .install_validated_traced(
+            validated,
+            reconnect,
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .map_err(|error| match error {
+            PolicyCacheMutationError::Policy(error) => error,
+            PolicyCacheMutationError::Trace(_) => panic!("capturing recorder cannot fail"),
+        })
 }
 
 fn apply_revocation(
@@ -148,10 +190,9 @@ fn apply_revocation(
         reason: reason.to_string(),
     };
     cache
-        .commit_revocation(
-            cache
-                .prepare_revocation(validated_candidate(bundle, validated_at))
-                .expect("matching trusted revocation prepares"),
+        .apply_validated_revocation_traced(
+            validated_candidate(bundle, validated_at),
+            &CapturingPolicyTraceRecorder::default(),
         )
         .expect("matching trusted revocation applies");
 }
@@ -727,11 +768,7 @@ fn signed_revocation_watermark_blocks_intermediate_active_and_orders_retries() {
     };
     let revocation = validated_candidate(revoked_t20.clone(), t20);
     let applied = cache
-        .commit_revocation(
-            cache
-                .prepare_revocation(revocation)
-                .expect("T20 revocation prepares"),
-        )
+        .apply_validated_revocation_traced(revocation, &CapturingPolicyTraceRecorder::default())
         .expect("T20 revocation commits");
     assert_eq!(applied.status, PolicyCacheRevocationStatus::Applied);
 
@@ -768,13 +805,9 @@ fn signed_revocation_watermark_blocks_intermediate_active_and_orders_retries() {
     assert_eq!(error, PolicyCacheInstallError::RevocationRollback);
 
     let exact = cache
-        .commit_revocation(
-            cache
-                .prepare_revocation(validated_candidate(
-                    revoked_t20.clone(),
-                    OffsetDateTime::now_utc(),
-                ))
-                .expect("exact T20 revocation retry prepares"),
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), OffsetDateTime::now_utc()),
+            &CapturingPolicyTraceRecorder::default(),
         )
         .expect("exact T20 revocation retry commits");
     assert_eq!(exact.status, PolicyCacheRevocationStatus::Idempotent);
@@ -854,6 +887,11 @@ fn cache_owner_rejects_cross_agent_wrapper_and_action_forwarding() {
     assert_eq!(error, PolicyCacheInstallError::ConcurrentMutation);
 
     let cache_a = cache_with_bundle(tenant_wide, now);
+    assert!(
+        cache_a
+            .verify_policy_action(&request(SideEffectClass::External), now)
+            .allowed
+    );
     let calls = Arc::new(Mutex::new(0));
     let gateway = PolicyDistributionGateway::new(
         Arc::new(CountingGateway {
@@ -871,7 +909,97 @@ fn cache_owner_rejects_cross_agent_wrapper_and_action_forwarding() {
         denied.verification.reasons,
         vec!["policy_cache_request_owner_mismatch"]
     );
+    let mut wrong_tenant_request = request(SideEffectClass::External);
+    wrong_tenant_request.tenant_id = TenantId::new();
+    let denied = gateway
+        .submit(wrong_tenant_request)
+        .expect("wrong tenant is a structured denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_cache_request_owner_mismatch"]
+    );
     assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn failed_revocation_evidence_latches_exact_pending_watermark_until_reconciled() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now - Duration::minutes(25));
+    let mut revoked_t20 = active_t10.clone();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), now),
+            &FailingPolicyTraceRecorder {
+                fail_at: 2,
+                calls: Mutex::new(0),
+            },
+        )
+        .expect_err("missing required revocation trace fails closed");
+    assert_eq!(error.reason_code(), "policy_evidence_unavailable");
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(
+        snapshot.offline_status,
+        PolicyOfflineStatus::EvidenceUnavailable
+    );
+    assert_eq!(
+        snapshot
+            .pending_revocation
+            .expect("pending revocation watermark")
+            .issued_at,
+        revoked_t20.issued_at
+    );
+    assert_eq!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("pending revocation denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let mut active_t15 = active_t10;
+    active_t15.issued_at = now - Duration::minutes(20);
+    let error = cache
+        .prepare_install(
+            validated_policy(active_t15, OffsetDateTime::now_utc()),
+            false,
+        )
+        .expect_err("pending T20 watermark blocks T15 active replay");
+    assert_eq!(error, PolicyCacheInstallError::RevocationWatermark);
+
+    let reconciled = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, OffsetDateTime::now_utc()),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("durable retry reconciles pending revocation");
+    assert_eq!(reconciled.status, PolicyCacheRevocationStatus::Applied);
+    let snapshot = cache.snapshot();
+    assert!(snapshot.pending_revocation.is_none());
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Revoked);
 }
 
 #[test]

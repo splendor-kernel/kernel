@@ -23,9 +23,10 @@ use splendor_gateway::{
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
     LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyCacheInstallError,
-    PolicyCacheOwner, PolicyDecision, PolicyDistributionGateway, QuotaPolicy, RunId,
-    RunTraceContext, Scheduler, SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph,
-    TenantContext, TenantPolicy, TenantRegistry, TraceEventKind,
+    PolicyCacheMutationError, PolicyCacheOwner, PolicyCacheTraceError, PolicyCacheTraceRecorder,
+    PolicyDecision, PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler,
+    SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
+    TenantRegistry, TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateNodeId, StateStore, TraceRecord,
@@ -312,6 +313,19 @@ struct RunSlot {
     tick_count: u64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+struct RunPolicyCacheTraceRecorder<'a> {
+    slot: &'a RunSlot,
+}
+
+impl PolicyCacheTraceRecorder for RunPolicyCacheTraceRecorder<'_> {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        record_run_event(self.slot, event).map_err(|_| PolicyCacheTraceError)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1699,7 +1713,7 @@ async fn create_run(
             agent_id: request.agent_id.clone(),
         },
     );
-    let (policy_bundle, initial_policy_plan) = match request.policy_bundle.as_ref() {
+    let (policy_bundle, initial_policy) = match request.policy_bundle.as_ref() {
         Some(envelope) => {
             let validated = validate_policy_bundle(
                 envelope,
@@ -1711,10 +1725,10 @@ async fn create_run(
                 &state.inner.policy_bundle_keyring,
             )
             .map_err(policy_bundle_error)?;
-            let plan = policy_cache
-                .prepare_install(validated, false)
-                .map_err(policy_cache_install_error)?;
-            (Some(plan.preview().bundle.clone()), Some(plan))
+            (
+                Some(PolicyBundleTraceContext::from(validated.bundle())),
+                Some(validated),
+            )
         }
         None => (None, None),
     };
@@ -1801,16 +1815,11 @@ async fn create_run(
         updated_at: OffsetDateTime::now_utc(),
     };
 
-    if let Some(plan) = initial_policy_plan {
-        record_run_event(
-            &slot,
-            TraceEventKind::PolicyBundleAccepted {
-                bundle: plan.preview().bundle.clone(),
-            },
-        )?;
+    if let Some(validated) = initial_policy {
+        let recorder = RunPolicyCacheTraceRecorder { slot: &slot };
         slot.policy_cache
-            .commit_install(plan)
-            .map_err(policy_cache_install_error)?;
+            .install_validated_traced(validated, false, &recorder)
+            .map_err(policy_cache_mutation_error)?;
     }
 
     let mut idempotency = state
@@ -2177,35 +2186,13 @@ async fn sync_policy(
     match validation {
         Ok(candidate) => match candidate.validated().bundle().revocation.clone() {
             RevocationStatus::Active => {
-                match slot
-                    .policy_cache
-                    .prepare_install(candidate.into_validated(), reconnect_requested)
-                {
-                    Ok(plan) => {
-                        let preview = plan.preview().clone();
-                        record_run_event(
-                            slot,
-                            TraceEventKind::PolicyBundleAccepted {
-                                bundle: preview.bundle.clone(),
-                            },
-                        )?;
-                        if let Some(event) = preview.connectivity_event.clone() {
-                            record_run_event(slot, event)?;
-                        }
-                        let installed = match slot.policy_cache.commit_install(plan) {
-                            Ok(installed) => installed,
-                            Err(error) => {
-                                let reason = error.reason_code().to_string();
-                                record_policy_sync_rejection(
-                                    slot,
-                                    policy_bundle_id,
-                                    version,
-                                    reason,
-                                    now,
-                                )?;
-                                return Err(policy_cache_install_error(error));
-                            }
-                        };
+                let recorder = RunPolicyCacheTraceRecorder { slot };
+                match slot.policy_cache.install_validated_traced(
+                    candidate.into_validated(),
+                    reconnect_requested,
+                    &recorder,
+                ) {
+                    Ok(installed) => {
                         slot.updated_at = OffsetDateTime::now_utc();
                         Ok(Json(PolicySyncResponse {
                             run_id,
@@ -2214,47 +2201,31 @@ async fn sync_policy(
                             cache_status: policy_cache_response(&slot.policy_cache),
                         }))
                     }
-                    Err(error) => {
+                    Err(PolicyCacheMutationError::Policy(error)) => {
                         let reason = error.reason_code().to_string();
                         record_policy_sync_rejection(slot, policy_bundle_id, version, reason, now)?;
                         Err(policy_cache_install_error(error))
+                    }
+                    Err(error @ PolicyCacheMutationError::Trace(_)) => {
+                        Err(policy_cache_mutation_error(error))
                     }
                 }
             }
             RevocationStatus::Revoked { reason } => {
                 let revocation_reason = reason;
+                let recorder = RunPolicyCacheTraceRecorder { slot };
                 match slot
                     .policy_cache
-                    .prepare_revocation(candidate.into_validated())
+                    .apply_validated_revocation_traced(candidate.into_validated(), &recorder)
                 {
-                    Ok(plan) => {
-                        let preview = plan.preview().clone();
+                    Ok(_) => {
                         let rejection_reason = "revoked_policy_bundle".to_string();
-                        record_policy_sync_rejection_traces(
-                            slot,
-                            policy_bundle_id,
-                            version,
-                            rejection_reason.clone(),
-                        )?;
-                        record_run_event(
-                            slot,
-                            TraceEventKind::PolicyRevoked {
-                                policy_bundle_id: preview.bundle.policy_bundle_id,
-                                version: preview.bundle.version,
-                                reason: preview.reason,
-                            },
-                        )?;
-                        if let Err(error) = slot.policy_cache.commit_revocation(plan) {
-                            slot.policy_cache
-                                .record_sync_failure(error.reason_code(), now);
-                            return Err(policy_cache_install_error(error));
-                        }
                         slot.policy_cache.record_sync_failure(rejection_reason, now);
                         Err(policy_bundle_error(PolicyBundleValidationError::Revoked {
                             reason: revocation_reason,
                         }))
                     }
-                    Err(error) => {
+                    Err(PolicyCacheMutationError::Policy(error)) => {
                         let rejection_reason = error.reason_code().to_string();
                         record_policy_sync_rejection(
                             slot,
@@ -2264,6 +2235,9 @@ async fn sync_policy(
                             now,
                         )?;
                         Err(policy_cache_install_error(error))
+                    }
+                    Err(error @ PolicyCacheMutationError::Trace(_)) => {
+                        Err(policy_cache_mutation_error(error))
                     }
                 }
             }
@@ -4792,6 +4766,17 @@ fn policy_cache_install_error(error: PolicyCacheInstallError) -> ApiError {
         error.reason_code(),
         error.reason_code(),
     )
+}
+
+fn policy_cache_mutation_error(error: PolicyCacheMutationError) -> ApiError {
+    match error {
+        PolicyCacheMutationError::Policy(error) => policy_cache_install_error(error),
+        PolicyCacheMutationError::Trace(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trace_error",
+            "required policy mutation trace evidence is unavailable",
+        ),
+    }
 }
 
 fn daemon_security_code(error: &DaemonSecurityError) -> &'static str {

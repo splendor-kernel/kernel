@@ -149,8 +149,11 @@ Run caches are bound to the run tenant+agent. Exact active retry cannot
 reconnect, and active refresh must advance both current authority and any trusted
 revocation watermark. The daemon prepares cache mutation, persists required
 acceptance/connectivity/revocation events, then commits. Trace failure leaves
-prior authority/connectivity unchanged; a partial non-authorizing trace may
-remain.
+prior active-install authority/connectivity unchanged. Matching revocation trace
+failure additionally latches the exact pending watermark and denies
+`policy_evidence_unavailable`; durable retry reconciles it. Mutation goes through
+the cache's high-level traced methods, not public plan/commit seams. A partial
+prepared/non-authorizing trace may remain and does not by itself prove commit.
 
 ## Run lifecycle
 
