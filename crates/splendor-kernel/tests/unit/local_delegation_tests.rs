@@ -596,6 +596,7 @@ enum SameIdParentGrantMutationCase {
     Run,
     Audience,
     Budget,
+    NotBefore,
     Expiry,
     Revocation,
     ValidationDigest,
@@ -603,6 +604,7 @@ enum SameIdParentGrantMutationCase {
 
 fn parent_grant_with_same_id_mutation(
     grant_id: CapabilityGrantId,
+    issuer: &PrincipalId,
     parent_principal: &PrincipalId,
     request: &LocalDelegationRequest,
     tenant_id: &TenantId,
@@ -619,7 +621,7 @@ fn parent_grant_with_same_id_mutation(
         max_action_duration_ms: Some(1_000),
         ..AuthorityBudgetScope::default()
     };
-    let not_before = now - time::Duration::minutes(1);
+    let mut not_before = now - time::Duration::minutes(1);
     let mut expires_at = now + time::Duration::minutes(30);
     let mut revocation = RevocationStatus::Active;
     let mut validation_digest = AUTHORITY_DIGEST.to_string();
@@ -637,6 +639,9 @@ fn parent_grant_with_same_id_mutation(
         }
         Some(SameIdParentGrantMutationCase::Budget) => {
             quotas.max_actions_per_tick = Some(3);
+        }
+        Some(SameIdParentGrantMutationCase::NotBefore) => {
+            not_before -= time::Duration::minutes(1);
         }
         Some(SameIdParentGrantMutationCase::Expiry) => {
             expires_at -= time::Duration::minutes(1);
@@ -656,7 +661,7 @@ fn parent_grant_with_same_id_mutation(
     grant_from_legacy_allowlists(
         CompatibilityGrantContext {
             grant_id,
-            issuer: PrincipalId::new(),
+            issuer: issuer.clone(),
             subject: parent_principal.clone(),
             audience,
             validation_digest,
@@ -784,6 +789,7 @@ fn same_id_different_validated_parent_grant_content_denies_before_effects() {
         SameIdParentGrantMutationCase::Run,
         SameIdParentGrantMutationCase::Audience,
         SameIdParentGrantMutationCase::Budget,
+        SameIdParentGrantMutationCase::NotBefore,
         SameIdParentGrantMutationCase::Expiry,
         SameIdParentGrantMutationCase::Revocation,
         SameIdParentGrantMutationCase::ValidationDigest,
@@ -800,9 +806,11 @@ fn same_id_different_validated_parent_grant_content_denies_before_effects() {
         let request =
             delegation_request(&parent, &child, parent_run_id.clone(), child_run_id.clone());
         let grant_id = CapabilityGrantId::new();
+        let issuer = PrincipalId::new();
         let now = OffsetDateTime::now_utc();
         let bound_grant = parent_grant_with_same_id_mutation(
             grant_id.clone(),
+            &issuer,
             &parent_principal,
             &request,
             &parent.tenant_id,
@@ -814,6 +822,7 @@ fn same_id_different_validated_parent_grant_content_denies_before_effects() {
             .expect("exact parent grant bound");
         let mutated_grant = parent_grant_with_same_id_mutation(
             grant_id,
+            &issuer,
             &parent_principal,
             &request,
             &parent.tenant_id,
