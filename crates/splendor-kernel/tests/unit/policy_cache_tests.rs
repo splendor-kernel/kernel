@@ -18,7 +18,7 @@ struct CapturingPolicyTraceRecorder {
     events: Mutex<Vec<TraceEventKind>>,
 }
 
-impl PolicyCacheTraceRecorder for CapturingPolicyTraceRecorder {
+impl PolicyCacheMutationRecorder for CapturingPolicyTraceRecorder {
     fn record_policy_cache_event(
         &self,
         event: TraceEventKind,
@@ -33,7 +33,7 @@ struct FailingPolicyTraceRecorder {
     calls: Mutex<usize>,
 }
 
-impl PolicyCacheTraceRecorder for FailingPolicyTraceRecorder {
+impl PolicyCacheMutationRecorder for FailingPolicyTraceRecorder {
     fn record_policy_cache_event(
         &self,
         _event: TraceEventKind,
@@ -42,6 +42,54 @@ impl PolicyCacheTraceRecorder for FailingPolicyTraceRecorder {
         *calls += 1;
         if *calls == self.fail_at {
             return Err(PolicyCacheTraceError);
+        }
+        Ok(())
+    }
+}
+
+struct SyncFailureRevisionRaceRecorder {
+    cache: PolicyCache,
+    observed_at: OffsetDateTime,
+    mutated: Mutex<bool>,
+}
+
+impl PolicyCacheMutationRecorder for SyncFailureRevisionRaceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        if matches!(event, TraceEventKind::PolicyRevoked { .. }) {
+            let mut mutated = self.mutated.lock().expect("race mutation lock");
+            if !*mutated {
+                self.cache
+                    .record_sync_failure("injected_revision_race", self.observed_at);
+                *mutated = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct NewerActiveRevisionRaceRecorder {
+    cache: PolicyCache,
+    newer: Mutex<Option<ValidatedPolicyBundle>>,
+}
+
+impl PolicyCacheMutationRecorder for NewerActiveRevisionRaceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        if matches!(event, TraceEventKind::PolicyRevoked { .. }) {
+            if let Some(newer) = self.newer.lock().expect("newer policy lock").take() {
+                self.cache
+                    .install_validated_traced(
+                        newer,
+                        false,
+                        &CapturingPolicyTraceRecorder::default(),
+                    )
+                    .expect("strictly newer active race winner installs");
+            }
         }
         Ok(())
     }
@@ -1000,6 +1048,128 @@ fn failed_revocation_evidence_latches_exact_pending_watermark_until_reconciled()
     let snapshot = cache.snapshot();
     assert!(snapshot.pending_revocation.is_none());
     assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Revoked);
+}
+
+#[test]
+fn post_trace_revocation_commit_race_latches_pending_and_exact_retry_reconciles() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.version = "active-t10-race".to_string();
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now);
+    let mut revoked_t20 = active_t10;
+    revoked_t20.version = "revoked-t20-race".to_string();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), now),
+            &SyncFailureRevisionRaceRecorder {
+                cache: cache.clone(),
+                observed_at: now,
+                mutated: Mutex::new(false),
+            },
+        )
+        .expect_err("final-event revision race prevents original commit");
+    assert_eq!(
+        error,
+        PolicyCacheMutationError::Policy(PolicyCacheInstallError::ConcurrentMutation)
+    );
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(
+        snapshot.offline_status,
+        PolicyOfflineStatus::EvidenceUnavailable
+    );
+    assert_eq!(
+        snapshot
+            .pending_revocation
+            .expect("exact pending revocation")
+            .issued_at,
+        revoked_t20.issued_at
+    );
+    assert_eq!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("pending race denial is structured");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let reconciled = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, now),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("exact durable retry reconciles pending race");
+    assert_eq!(reconciled.status, PolicyCacheRevocationStatus::Applied);
+    let snapshot = cache.snapshot_at(now);
+    assert!(snapshot.pending_revocation.is_none());
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Revoked);
+}
+
+#[test]
+fn post_trace_revocation_commit_race_does_not_poison_strictly_newer_active_winner() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.version = "active-t10-inverse".to_string();
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now);
+    let mut revoked_t20 = active_t10.clone();
+    revoked_t20.version = "revoked-t20-inverse".to_string();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let mut active_t30 = active_t10;
+    active_t30.version = "active-t30-inverse".to_string();
+    active_t30.issued_at = now - Duration::minutes(5);
+
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, now),
+            &NewerActiveRevisionRaceRecorder {
+                cache: cache.clone(),
+                newer: Mutex::new(Some(validated_policy(active_t30, now))),
+            },
+        )
+        .expect_err("newer active winner invalidates older revocation plan");
+    assert_eq!(
+        error,
+        PolicyCacheMutationError::Policy(PolicyCacheInstallError::ConcurrentMutation)
+    );
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Connected);
+    assert!(snapshot.pending_revocation.is_none());
+    assert!(snapshot.revocation.is_none());
+    assert_eq!(
+        snapshot.bundle.expect("newer active bundle").version,
+        "active-t30-inverse"
+    );
+    assert!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .allowed
+    );
 }
 
 #[test]

@@ -93,6 +93,9 @@ cache-instance/revision-bound plans, direct reconnect/raw insertion/public
 commit seams are removed, revocation watermarks are retained, and stable
 owner/watermark/concurrent-mutation denials are observable. Daemon
 endpoint/request-response and trace-event wire shapes remain unchanged.
+Post-trace revocation commit races preserve the exact validated candidate and
+atomically latch it as pending deny-only evidence when it remains applicable;
+strictly newer active winners are not poisoned by obsolete revocation.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
 G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
@@ -141,14 +144,17 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   replacement.
 - No new adapter execution path; `AUTH-004b` only verifies local authority
   obligation receipts before the existing gateway adapter invocation.
-- No daemon, OpenAPI, TypeScript, Python, fleet, product, or physical safety
-  behavior.
+- No daemon endpoint/request-response wire, OpenAPI, TypeScript, Python, fleet,
+  product, or physical safety redesign. `AUTH-007d` does change daemon
+  policy-sync behavior and the public Rust cache API as described above.
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, production revocation propagation service, revocation watches,
   external introspection, or incident-controller quarantine workflow.
 - No universal wildcard or metadata/extension-based authority.
-- No daemon/API contract change, TypeScript/Python client workflow update, gold
-  fixture, production revocation watch, external introspection, node/fleet
+- No daemon endpoint/request-response wire contract change. `AUTH-007d` changes
+  public Rust cache APIs and daemon-visible policy-sync outcomes. No
+  TypeScript/Python client workflow update, gold fixture, production revocation
+  watch, external introspection, node/fleet
   propagation acknowledgement, policy-cache consumption, or incident-controller
   quarantine flow for delegated children.
 - No approval workflow engine, MFA provider, gate-engine migration, durable

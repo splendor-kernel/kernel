@@ -22,6 +22,8 @@
   now use high-level recorder-bound methods; internal plans/commit are private.
   Revocation trace failure latches an exact deny-only pending watermark. Public
   Rust cache construction/mutation APIs changed; daemon wire shapes did not.
+  Post-trace commit races now preserve and latch still-applicable exact
+  revocation evidence while leaving strictly newer active winners unpoisoned.
 - Bound local delegating root runs to one exact trusted validated capability
   grant, including private trust state, within one manager. Cross-run/shared-
   principal and same-ID/different-content replay now fail before message routing
@@ -42,8 +44,9 @@
 ### Explicitly not included
 
 - No new authorizing schema version, TypeScript/OpenAPI parity change, policy
-  cache redesign, resident persistence/watch, canonical historical-signature
-  migration seam, or broad rolling-version compatibility claim.
+  cache persistence/fleet redesign, resident persistence/watch, canonical
+  historical-signature migration seam, or broad rolling-version compatibility
+  claim. The in-memory cache state and public Rust mutation API did change.
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 struct LoopPolicyTraceRecorder;
 
-impl crate::PolicyCacheTraceRecorder for LoopPolicyTraceRecorder {
+impl crate::PolicyCacheMutationRecorder for LoopPolicyTraceRecorder {
     fn record_policy_cache_event(
         &self,
         _event: TraceEventKind,

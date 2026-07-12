@@ -24,7 +24,7 @@ const DEVICE_ZONE: &str = "zone:warehouse-a3";
 
 struct PhysicalPolicyTraceRecorder;
 
-impl PolicyCacheTraceRecorder for PhysicalPolicyTraceRecorder {
+impl PolicyCacheMutationRecorder for PhysicalPolicyTraceRecorder {
     fn record_policy_cache_event(
         &self,
         _event: TraceEventKind,

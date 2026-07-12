@@ -67,9 +67,9 @@ pub use node_registry::{
 };
 pub use policy_cache::{
     PolicyCache, PolicyCacheConfig, PolicyCacheInstallError, PolicyCacheInstallResult,
-    PolicyCacheInstallStatus, PolicyCacheMutationError, PolicyCacheOwner,
-    PolicyCacheRevocationMetadata, PolicyCacheRevocationResult, PolicyCacheRevocationStatus,
-    PolicyCacheSnapshot, PolicyCacheTraceError, PolicyCacheTraceRecorder,
+    PolicyCacheInstallStatus, PolicyCacheMutationError, PolicyCacheMutationRecorder,
+    PolicyCacheOwner, PolicyCacheRevocationMetadata, PolicyCacheRevocationResult,
+    PolicyCacheRevocationStatus, PolicyCacheSnapshot, PolicyCacheTraceError,
     PolicyCacheValidationMetadata, PolicyDistributionGateway, PolicyDistributionStatus,
     PolicyOfflineStatus, PolicyRuntimeAuthority, PolicyRuntimeDecision, PolicySyncFailure,
 };

@@ -23,7 +23,7 @@ use splendor_gateway::{
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
     LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyCacheInstallError,
-    PolicyCacheMutationError, PolicyCacheOwner, PolicyCacheTraceError, PolicyCacheTraceRecorder,
+    PolicyCacheMutationError, PolicyCacheMutationRecorder, PolicyCacheOwner, PolicyCacheTraceError,
     PolicyDecision, PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler,
     SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
     TenantRegistry, TraceEventKind,
@@ -315,11 +315,11 @@ struct RunSlot {
     updated_at: OffsetDateTime,
 }
 
-struct RunPolicyCacheTraceRecorder<'a> {
+struct RunPolicyCacheMutationRecorder<'a> {
     slot: &'a RunSlot,
 }
 
-impl PolicyCacheTraceRecorder for RunPolicyCacheTraceRecorder<'_> {
+impl PolicyCacheMutationRecorder for RunPolicyCacheMutationRecorder<'_> {
     fn record_policy_cache_event(
         &self,
         event: TraceEventKind,
@@ -1816,7 +1816,7 @@ async fn create_run(
     };
 
     if let Some(validated) = initial_policy {
-        let recorder = RunPolicyCacheTraceRecorder { slot: &slot };
+        let recorder = RunPolicyCacheMutationRecorder { slot: &slot };
         slot.policy_cache
             .install_validated_traced(validated, false, &recorder)
             .map_err(policy_cache_mutation_error)?;
@@ -2186,7 +2186,7 @@ async fn sync_policy(
     match validation {
         Ok(candidate) => match candidate.validated().bundle().revocation.clone() {
             RevocationStatus::Active => {
-                let recorder = RunPolicyCacheTraceRecorder { slot };
+                let recorder = RunPolicyCacheMutationRecorder { slot };
                 match slot.policy_cache.install_validated_traced(
                     candidate.into_validated(),
                     reconnect_requested,
@@ -2213,7 +2213,7 @@ async fn sync_policy(
             }
             RevocationStatus::Revoked { reason } => {
                 let revocation_reason = reason;
-                let recorder = RunPolicyCacheTraceRecorder { slot };
+                let recorder = RunPolicyCacheMutationRecorder { slot };
                 match slot
                     .policy_cache
                     .apply_validated_revocation_traced(candidate.into_validated(), &recorder)

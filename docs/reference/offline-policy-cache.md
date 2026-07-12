@@ -19,7 +19,7 @@ splendor_kernel::{
     PolicyCacheOwner,
     PolicyCacheInstallResult,
     PolicyCacheRevocationMetadata,
-    PolicyCacheTraceRecorder,
+    PolicyCacheMutationRecorder,
     PolicyCacheMutationError,
     PolicyCacheSnapshot,
     PolicyCacheValidationMetadata,
@@ -80,7 +80,7 @@ from arbitrary action names or side-effect classes.
 
 1. A run is created with a validated policy bundle, or a bundle is synced later.
 2. `PolicyCache::install_validated_traced` consumes only a
-   `ValidatedPolicyBundle` plus a trusted `PolicyCacheTraceRecorder`. The method
+   `ValidatedPolicyBundle` plus a trusted `PolicyCacheMutationRecorder`. The method
    internally plans, persists required acceptance/connectivity events, and only
    then commits. Internal plan/commit methods and plan types are not public.
    There is no raw bundle/envelope production insertion API.
@@ -108,8 +108,8 @@ only for an initial/strictly-newer accepted install, never an exact retry.
 | Removed/changed API | Current API |
 | --- | --- |
 | `PolicyCache::new(config)` | `PolicyCache::new(config, PolicyCacheOwner { tenant_id, agent_id })` |
-| `install_validated(...)`, public prepare/commit, or raw bundle/envelope insertion | `install_validated_traced(ValidatedPolicyBundle, reconnect, &dyn PolicyCacheTraceRecorder)` |
-| `apply_validated_revocation(...)`, public prepare/commit, or raw revocation marker | `apply_validated_revocation_traced(ValidatedPolicyBundle, &dyn PolicyCacheTraceRecorder)` |
+| `install_validated(...)`, public prepare/commit, or raw bundle/envelope insertion | `install_validated_traced(ValidatedPolicyBundle, reconnect, &dyn PolicyCacheMutationRecorder)` |
+| `apply_validated_revocation(...)`, public prepare/commit, or raw revocation marker | `apply_validated_revocation_traced(ValidatedPolicyBundle, &dyn PolicyCacheMutationRecorder)` |
 | Legacy direct disconnection setter | `mark_disconnected_with_trace(at)` |
 | Legacy direct reconnect setter | No direct equivalent; only first/strictly-newer traced install can reconnect. |
 
@@ -119,15 +119,27 @@ but authority/reconnect is not committed unless all required events were
 persisted. If matching revocation tracing fails, the exact candidate is retained
 as a pending watermark and the cache denies `policy_evidence_unavailable` until
 durable retry reconciliation or a successfully traced strictly newer refresh.
+If all revocation events are accepted but internal commit loses a revision race,
+the cache atomically re-evaluates the preserved exact candidate: a still-
+applicable candidate becomes pending deny-only evidence; an already committed or
+pending same/newer revocation remains stricter; and a strictly newer active
+winner is not poisoned by the obsolete candidate. The original race error is
+returned in every case.
 
 `PolicyCacheRevocationMetadata.issued_at` exposes the trace-safe issuance
 watermark; it does not expose policy content, signature bytes, or secrets.
+
+`PolicyCacheMutationRecorder` is a trusted kernel-composition boundary. Its
+implementations must return `Ok(())` only after the required event has been
+durably accepted by the configured runtime trace store. No-op/fake recorders are
+test fixtures only and are not valid daemon or production composition.
 
 ## Trace behavior
 
 Offline/degraded cache decisions are visible through:
 
-- `PolicyBundleAccepted` for installed authority;
+- `PolicyBundleAccepted` for a prepared monotonic candidate before commit; this
+  event alone is non-authorizing and does not prove installation;
 - `PolicyConnectivityChanged` for disconnect/reconnect;
 - `PolicySyncFailed` for failed central sync;
 - `PolicyExpired` for TTL denial;

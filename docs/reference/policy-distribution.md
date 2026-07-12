@@ -199,6 +199,13 @@ retains the exact candidate as a pending watermark and denies
 `policy_evidence_unavailable` until reconciliation or a successfully traced
 strictly newer active refresh.
 
+Post-trace revocation commit races also fail closed. The exact validated
+candidate is preserved across commit. If it remains applicable after the cache
+revision changes, it is latched pending and runtime decisions deny
+`policy_evidence_unavailable`; if a strictly newer traced active policy already
+won, the older revocation is obsolete and is not latched. Same/newer committed or
+pending revocation state is retained.
+
 `disconnected: true` may be retained before a failed sync because it narrows
 authority. `disconnected: false` takes effect only atomically with an accepted
 trusted monotonic install. Invalid, future, expired, bad-signature, revoked,

@@ -124,8 +124,11 @@ struct PolicyCacheRevocationPlan {
     result: PolicyCacheRevocationResult,
 }
 
-/// Trusted recorder used by the policy cache mutation boundary.
-pub trait PolicyCacheTraceRecorder: Send + Sync {
+/// Trusted kernel-composition recorder used by the policy cache mutation boundary.
+///
+/// Returning `Ok(())` means the supplied event was durably accepted by the
+/// runtime trace boundary. Test fakes must not be used in production composition.
+pub trait PolicyCacheMutationRecorder: Send + Sync {
     /// Persists one required policy mutation event before authority changes.
     fn record_policy_cache_event(&self, event: TraceEventKind)
         -> Result<(), PolicyCacheTraceError>;
@@ -320,7 +323,7 @@ impl PolicyCache {
         &self,
         validated: ValidatedPolicyBundle,
         reconnect: bool,
-        recorder: &dyn PolicyCacheTraceRecorder,
+        recorder: &dyn PolicyCacheMutationRecorder,
     ) -> Result<PolicyCacheInstallResult, PolicyCacheMutationError> {
         let plan = self.prepare_install(validated, reconnect)?;
         recorder.record_policy_cache_event(TraceEventKind::PolicyBundleAccepted {
@@ -333,12 +336,13 @@ impl PolicyCache {
     }
 
     /// Applies a trusted revocation only after all rejection/sync/revocation
-    /// evidence is durable. Trace failure latches the exact trusted candidate as
-    /// deny-only pending authority evidence.
+    /// evidence is durable. Trace failure or a post-trace commit race latches a
+    /// still-applicable exact candidate as deny-only pending authority evidence;
+    /// a strictly newer active race winner remains authoritative.
     pub fn apply_validated_revocation_traced(
         &self,
         validated: ValidatedPolicyBundle,
-        recorder: &dyn PolicyCacheTraceRecorder,
+        recorder: &dyn PolicyCacheMutationRecorder,
     ) -> Result<PolicyCacheRevocationResult, PolicyCacheMutationError> {
         let plan = self.prepare_revocation(validated)?;
         let candidate = plan.validated.bundle();
@@ -365,7 +369,14 @@ impl PolicyCache {
                 return Err(error.into());
             }
         }
-        Ok(self.commit_revocation(plan)?)
+        let validated = plan.validated.clone();
+        match self.commit_revocation(plan) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.latch_pending_revocation(&validated);
+                Err(error.into())
+            }
+        }
     }
 
     /// Prepares trusted signed policy authority monotonically without mutation.
@@ -645,11 +656,11 @@ impl PolicyCache {
         let newer_than_committed = guard
             .revocation
             .as_ref()
-            .is_none_or(|watermark| candidate.issued_at >= watermark.bundle().issued_at);
+            .is_none_or(|watermark| candidate.issued_at > watermark.bundle().issued_at);
         let newer_than_pending = guard
             .pending_revocation
             .as_ref()
-            .is_none_or(|watermark| candidate.issued_at >= watermark.bundle().issued_at);
+            .is_none_or(|watermark| candidate.issued_at > watermark.bundle().issued_at);
         if newer_than_committed && newer_than_pending {
             guard.pending_revocation = Some(validated.clone());
             guard.max_observed_at = Some(
