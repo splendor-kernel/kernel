@@ -32,6 +32,7 @@ mod message_router;
 mod node_registry;
 mod policy_cache;
 mod remote_message_transport;
+mod run_authority;
 mod runtime;
 mod scheduler;
 mod state;
@@ -77,6 +78,7 @@ pub use remote_message_transport::{
     send_remote_message, InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault,
     RemoteMessageReceiver, RemoteMessageTransport, RemoteMessageTransportError,
 };
+pub use run_authority::{KernelPreEffectAuthorityRecorder, RunAuthorityHandle};
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
 pub use splendor_types::{

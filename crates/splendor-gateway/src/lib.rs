@@ -31,22 +31,26 @@
 //!     requested_at: OffsetDateTime::now_utc(),
 //!     approval_evidence: None,
 //!     authority_obligation_evidence: None,
+//!     authority_obligation_receipts: vec![],
 //! };
 //! assert!(ActionGateway::submit(&gateway, request).is_err());
 //! ```
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
-    authority_decision_evidence, gateway_action_operation, validate_authority_obligation_receipt,
-    verify_obligation_receipts, AuthorityObligationReceiptValidationContext,
+    authority_decision_evidence, compatibility_permission_operation, gateway_action_operation,
+    gateway_adapter_operation, validate_authority_obligation_receipt, verify_obligation_receipts,
+    AuthorityObligationReceiptValidationContext,
 };
 use splendor_types::{
     is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
     ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, AuthorityDecision,
-    AuthorityDecisionStatus, AuthorityObligationReceipt, CircuitBreaker, CircuitBreakerScope,
-    ContentHash, EffectCertainty, ErrorCategory, ErrorTaxonomy, IdentityValidationError,
-    QuotaUsage, ReasonCode, RetryClass, RunId, RuntimeIdentityContext, SideEffectClass, TenantId,
-    VerificationResult, APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    AuthorityDecisionId, AuthorityDecisionStatus, AuthorityObligationId,
+    AuthorityObligationReceipt, AuthorityOperationNamespace, AuthorityResourceKind, AuthorityVerb,
+    CapabilityGrantId, CircuitBreaker, CircuitBreakerScope, ContentHash, EffectCertainty,
+    ErrorCategory, ErrorTaxonomy, IdentityValidationError, QuotaUsage, ReasonCode, RetryClass,
+    RunId, RuntimeIdentityContext, SideEffectClass, TenantId, VerificationResult,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
     FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::HashMap;
@@ -107,6 +111,11 @@ pub struct ActionRequest {
     /// Optional behavior-free authority obligation evidence for conditional decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_obligation_evidence: Option<GatewayAuthorityObligationEvidence>,
+    /// Raw owning-service receipts presented for a current live conditional
+    /// authority decision. Receipts are non-authorizing until the configured
+    /// local authority verifier validates and matches them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_obligation_receipts: Vec<AuthorityObligationReceipt>,
 }
 
 impl ActionRequest {
@@ -694,6 +703,97 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
     }
 }
 
+/// Redacted typed summary retained as durable pre-effect authority evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GatewayAuthorityDecisionSummary {
+    /// Authority decision identity.
+    pub decision_id: AuthorityDecisionId,
+    /// Current decision status.
+    pub status: AuthorityDecisionStatus,
+    /// Typed operation namespace without its concrete name.
+    pub namespace: AuthorityOperationNamespace,
+    /// Typed resource kind without its concrete name.
+    pub resource_kind: AuthorityResourceKind,
+    /// Typed operation verb.
+    pub verb: AuthorityVerb,
+    /// Deterministic digest of the redacted decision evidence.
+    pub decision_digest: String,
+    /// Bounded normalized reason codes.
+    pub reason_codes: Vec<String>,
+    /// Grants matched by the live evaluation.
+    pub matched_grant_ids: Vec<CapabilityGrantId>,
+    /// Conditional obligation identities, if any.
+    pub obligation_ids: Vec<AuthorityObligationId>,
+}
+
+/// Result of evaluating current run authority for one gateway request.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ActionAuthorityEvaluation {
+    /// This gateway composition has no C02 run-authority requirement.
+    NotRequired,
+    /// Current typed C02 decisions for action, effective adapter, and permissions.
+    Evaluated(Vec<AuthorityDecision>),
+}
+
+/// Evaluates live C02 run authority before existing gateway verifiers and effects.
+pub trait ActionAuthorityEvaluator: Send + Sync {
+    /// Evaluates every typed operation required by this action.
+    fn evaluate_action_authority(
+        &self,
+        action: &ActionRequest,
+        effective_adapter: Option<&str>,
+        now: OffsetDateTime,
+    ) -> ActionAuthorityEvaluation;
+}
+
+/// Compatibility default for gateway compositions that have not adopted C02.
+#[derive(Clone, Debug, Default)]
+pub struct NoActionAuthorityEvaluator;
+
+impl ActionAuthorityEvaluator for NoActionAuthorityEvaluator {
+    fn evaluate_action_authority(
+        &self,
+        _action: &ActionRequest,
+        _effective_adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> ActionAuthorityEvaluation {
+        ActionAuthorityEvaluation::NotRequired
+    }
+}
+
+/// Durable recorder invoked after all pre-effect checks allow and before an adapter runs.
+pub trait PreEffectAuthorityDecisionRecorder: Send + Sync {
+    /// Persists the completed verification including redacted live authority summaries.
+    fn record_pre_effect_authority_allow(
+        &self,
+        action: &ActionRequest,
+        verification: &VerificationResult,
+    ) -> Result<(), String>;
+}
+
+/// Fail-closed recorder used when C02 evaluation is enabled without an evidence sink.
+#[derive(Clone, Debug, Default)]
+pub struct NoPreEffectAuthorityDecisionRecorder;
+
+impl PreEffectAuthorityDecisionRecorder for NoPreEffectAuthorityDecisionRecorder {
+    fn record_pre_effect_authority_allow(
+        &self,
+        _action: &ActionRequest,
+        _verification: &VerificationResult,
+    ) -> Result<(), String> {
+        Err("authority_evidence_recorder_unavailable".to_string())
+    }
+}
+
+/// Returns whether this verification was durably recorded before adapter execution.
+pub fn authority_pre_effect_evidence_recorded(result: &VerificationResult) -> bool {
+    result
+        .artifacts
+        .pointer("/authority/pre_effect_recorded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Result returned by an authority obligation verifier.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AuthorityObligationVerification {
@@ -1181,6 +1281,8 @@ struct AdapterRegistration {
 /// Gateway implementation that runs verifier pipelines before execution.
 pub struct VerifiedActionGateway {
     adapters: HashMap<String, AdapterRegistration>,
+    action_authority_evaluator: Arc<dyn ActionAuthorityEvaluator>,
+    pre_effect_authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
     tenant_access: Arc<dyn TenantAccess>,
     invariant_evaluator: Arc<dyn InvariantEvaluator>,
     resource_boundary_verifier: Arc<dyn ResourceBoundaryVerifier>,
@@ -1196,6 +1298,8 @@ impl VerifiedActionGateway {
     pub fn new(tenant_access: Arc<dyn TenantAccess>) -> Self {
         Self {
             adapters: HashMap::new(),
+            action_authority_evaluator: Arc::new(NoActionAuthorityEvaluator),
+            pre_effect_authority_recorder: Arc::new(NoPreEffectAuthorityDecisionRecorder),
             tenant_access,
             invariant_evaluator: Arc::new(SimpleInvariantEvaluator),
             resource_boundary_verifier: Arc::new(NoopResourceBoundaryVerifier),
@@ -1205,6 +1309,19 @@ impl VerifiedActionGateway {
             circuit_breaker_evaluator: Arc::new(NoopCircuitBreakerEvaluator),
             runtime_identity: RuntimeIdentityContext::default(),
         }
+    }
+
+    /// Installs the live C02 evaluator required by this gateway composition.
+    pub fn set_action_authority_evaluator(&mut self, evaluator: Arc<dyn ActionAuthorityEvaluator>) {
+        self.action_authority_evaluator = evaluator;
+    }
+
+    /// Installs the durable recorder used after all pre-effect checks allow.
+    pub fn set_pre_effect_authority_recorder(
+        &mut self,
+        recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
+    ) {
+        self.pre_effect_authority_recorder = recorder;
     }
 
     /// Registers an adapter for the given action name.
@@ -1279,9 +1396,37 @@ impl ActionGateway for VerifiedActionGateway {
             return Ok(denied_outcome(action.action_id, verification));
         }
 
-        let registration = self
-            .adapters
-            .get(&action.action.name)
+        let registration = self.adapters.get(&action.action.name);
+        let authority_adapter = action
+            .adapter
+            .as_deref()
+            .or_else(|| registration.map(|entry| entry.adapter_id.as_str()));
+        let prepared_authority = match self.action_authority_evaluator.evaluate_action_authority(
+            &action,
+            authority_adapter,
+            OffsetDateTime::now_utc(),
+        ) {
+            ActionAuthorityEvaluation::NotRequired => None,
+            ActionAuthorityEvaluation::Evaluated(decisions) => {
+                match prepare_action_authority(decisions, &action, authority_adapter) {
+                    PreparedActionAuthority::Allowed(prepared) => Some(prepared),
+                    PreparedActionAuthority::Denied(mut result) => {
+                        attach_request_context(&mut result, &action);
+                        return Ok(denied_outcome(action.action_id, result));
+                    }
+                    PreparedActionAuthority::NeedsApproval(mut result) => {
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_approval_outcome(action.action_id, result));
+                    }
+                    PreparedActionAuthority::NeedsIntervention(mut result) => {
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_intervention_outcome(action.action_id, result));
+                    }
+                }
+            }
+        };
+
+        let registration = registration
             .ok_or_else(|| GatewayError::AdapterFailed("adapter not registered".to_string()))?;
         if let Some(adapter) = action.adapter.as_deref() {
             if adapter != registration.adapter_id {
@@ -1376,9 +1521,44 @@ impl ActionGateway for VerifiedActionGateway {
             }
         };
 
-        let authority_obligation_verification = self
-            .authority_obligation_verifier
-            .verify_obligations(&action, Some(adapter_id), OffsetDateTime::now_utc());
+        let current_conditional = prepared_authority
+            .as_ref()
+            .and_then(|prepared| prepared.conditional_decision.as_ref());
+        let obligation_action = match current_conditional {
+            Some(decision) => {
+                match action_with_current_authority_decision(&action, decision.clone()) {
+                    Ok(action) => action,
+                    Err(mut result) => {
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_intervention_outcome(action.action_id, result));
+                    }
+                }
+            }
+            None if prepared_authority.is_some()
+                && (!action.authority_obligation_receipts.is_empty()
+                    || action.authority_obligation_evidence.is_some()) =>
+            {
+                let mut result = VerificationResult::deny(
+                    "authority_obligation_receipts_without_current_conditional_decision",
+                );
+                attach_request_context(&mut result, &action);
+                return Ok(denied_outcome(action.action_id, result));
+            }
+            None if !action.authority_obligation_receipts.is_empty() => {
+                let mut result = VerificationResult::deny(
+                    "authority_obligation_current_decision_evaluator_unavailable",
+                );
+                attach_request_context(&mut result, &action);
+                return Ok(needs_intervention_outcome(action.action_id, result));
+            }
+            None => action.clone(),
+        };
+        let authority_obligation_verification =
+            self.authority_obligation_verifier.verify_obligations(
+                &obligation_action,
+                Some(adapter_id),
+                OffsetDateTime::now_utc(),
+            );
         let authority_obligation_grant = match authority_obligation_verification {
             AuthorityObligationVerification::NotRequired => None,
             AuthorityObligationVerification::Allowed(result) => Some(result),
@@ -1412,6 +1592,13 @@ impl ActionGateway for VerifiedActionGateway {
                 authority_obligation_grant.artifacts,
             );
         }
+        if let Some(authority) = prepared_authority.as_ref() {
+            attach_allowed_artifact(
+                &mut verification,
+                "authority",
+                authority.verification.artifacts.clone(),
+            );
+        }
 
         match verify_safety_pre(&self.safety_verifier, &action, Some(adapter_id)) {
             SafetyVerification::NotRequired => {}
@@ -1425,6 +1612,46 @@ impl ActionGateway for VerifiedActionGateway {
             SafetyVerification::NeedsIntervention(mut safety_result) => {
                 attach_request_context(&mut safety_result, &action);
                 return Ok(needs_intervention_outcome(action.action_id, safety_result));
+            }
+        }
+
+        if prepared_authority.is_some() {
+            {
+                let authority_artifact = verification
+                    .artifacts
+                    .get_mut("authority")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| {
+                        GatewayError::VerificationFailed(
+                            "authority_evidence_projection_unavailable".to_string(),
+                        )
+                    })?;
+                authority_artifact.insert(
+                    "pre_effect_recorded".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            if let Err(reason) = self
+                .pre_effect_authority_recorder
+                .record_pre_effect_authority_allow(&action, &verification)
+            {
+                if let Some(authority_artifact) = verification
+                    .artifacts
+                    .get_mut("authority")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    authority_artifact.insert(
+                        "pre_effect_recorded".to_string(),
+                        serde_json::Value::Bool(false),
+                    );
+                }
+                let mut result = VerificationResult::deny("authority_evidence_append_failed");
+                result.artifacts = serde_json::json!({
+                    "authority": verification.artifacts.get("authority").cloned(),
+                    "recorder_reason": bounded_recorder_reason(&reason),
+                });
+                attach_request_context(&mut result, &action);
+                return Ok(needs_intervention_outcome(action.action_id, result));
             }
         }
 
@@ -1473,6 +1700,257 @@ impl ActionGateway for VerifiedActionGateway {
             error,
             completed_at: OffsetDateTime::now_utc(),
         })
+    }
+}
+
+struct PreparedAuthorityAllow {
+    verification: VerificationResult,
+    conditional_decision: Option<AuthorityDecision>,
+}
+
+enum PreparedActionAuthority {
+    Allowed(Box<PreparedAuthorityAllow>),
+    Denied(VerificationResult),
+    NeedsApproval(VerificationResult),
+    NeedsIntervention(VerificationResult),
+}
+
+fn prepare_action_authority(
+    mut decisions: Vec<AuthorityDecision>,
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> PreparedActionAuthority {
+    if decisions.is_empty() {
+        return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(
+            "authority_decision_unavailable",
+        ));
+    }
+
+    if !authority_decisions_match_request(&decisions, action, effective_adapter) {
+        return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(
+            "authority_decision_request_mismatch",
+        ));
+    }
+
+    if decisions.iter().any(|decision| {
+        matches!(
+            decision.status,
+            AuthorityDecisionStatus::Allowed | AuthorityDecisionStatus::Conditional
+        ) && decision.matched_grant_ids.is_empty()
+    }) {
+        return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(
+            "authority_decision_grant_evidence_missing",
+        ));
+    }
+
+    let denied = decisions
+        .iter()
+        .any(|decision| decision.status == AuthorityDecisionStatus::Denied);
+    let needs_intervention = decisions
+        .iter()
+        .any(|decision| decision.status == AuthorityDecisionStatus::NeedsIntervention);
+    let needs_approval = decisions
+        .iter()
+        .any(|decision| decision.status == AuthorityDecisionStatus::NeedsApproval);
+
+    let conditional_index = decisions.iter().position(|decision| {
+        decision.status == AuthorityDecisionStatus::Conditional
+            && decision.request.operation == gateway_action_operation(action.action.name.clone())
+    });
+    let conditional_decision = if decisions
+        .iter()
+        .any(|decision| decision.status == AuthorityDecisionStatus::Conditional)
+    {
+        let Some(index) = conditional_index else {
+            return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(
+                "authority_conditional_action_decision_unavailable",
+            ));
+        };
+        let representative = decisions[index].clone();
+        if decisions.iter().any(|decision| {
+            decision.status == AuthorityDecisionStatus::Conditional
+                && (decision.matched_grant_ids != representative.matched_grant_ids
+                    || decision.obligations != representative.obligations)
+        }) {
+            return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(
+                "authority_conditional_decisions_inconsistent",
+            ));
+        }
+        match bind_current_gateway_authority_decision(representative, action, effective_adapter) {
+            Ok(bound) => {
+                decisions[index] = bound.clone();
+                Some(bound)
+            }
+            Err(reason) => {
+                return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(reason))
+            }
+        }
+    } else {
+        None
+    };
+
+    let summaries = match decisions
+        .iter()
+        .map(gateway_authority_decision_summary)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(summaries) => summaries,
+        Err(reason) => {
+            return PreparedActionAuthority::NeedsIntervention(VerificationResult::deny(reason))
+        }
+    };
+    let mut reasons = Vec::new();
+    for decision in &decisions {
+        for reason in &decision.reasons {
+            push_unique_string(&mut reasons, reason.clone());
+        }
+        if decision.status == AuthorityDecisionStatus::Denied {
+            let compatibility_reason = match decision.request.operation.resource_kind {
+                AuthorityResourceKind::Action => Some("action_not_allowed"),
+                AuthorityResourceKind::Adapter => Some("adapter_not_allowed"),
+                AuthorityResourceKind::Permission => Some("permission_denied"),
+                _ => None,
+            };
+            if let Some(reason) = compatibility_reason {
+                push_unique_string(&mut reasons, reason.to_string());
+            }
+        }
+    }
+    let result = VerificationResult {
+        allowed: !denied && !needs_intervention && !needs_approval,
+        reasons: if denied || needs_intervention || needs_approval {
+            reasons
+        } else {
+            Vec::new()
+        },
+        artifacts: serde_json::json!({
+            "schema_version": "splendor.gateway.authority_evidence.v1",
+            "decisions": summaries,
+            "pre_effect_recorded": false,
+        }),
+    };
+    if denied {
+        PreparedActionAuthority::Denied(result)
+    } else if needs_intervention {
+        PreparedActionAuthority::NeedsIntervention(result)
+    } else if needs_approval {
+        PreparedActionAuthority::NeedsApproval(result)
+    } else {
+        PreparedActionAuthority::Allowed(Box::new(PreparedAuthorityAllow {
+            verification: result,
+            conditional_decision,
+        }))
+    }
+}
+
+fn authority_decisions_match_request(
+    decisions: &[AuthorityDecision],
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> bool {
+    let mut expected_operations = vec![gateway_action_operation(action.action.name.clone())];
+    if let Some(adapter) = effective_adapter {
+        expected_operations.push(gateway_adapter_operation(adapter));
+    }
+    expected_operations.extend(
+        action
+            .action
+            .required_permissions
+            .iter()
+            .cloned()
+            .map(compatibility_permission_operation),
+    );
+    expected_operations.sort();
+
+    let mut actual_operations = decisions
+        .iter()
+        .map(|decision| decision.request.operation.clone())
+        .collect::<Vec<_>>();
+    actual_operations.sort();
+
+    expected_operations == actual_operations
+        && decisions.iter().all(|decision| {
+            decision.request.scope.tenant_ids.as_deref()
+                == Some(std::slice::from_ref(&action.tenant_id))
+                && decision.request.scope.agent_ids.as_deref()
+                    == Some(std::slice::from_ref(&action.agent_id))
+                && decision.request.scope.run_ids.as_deref()
+                    == Some(std::slice::from_ref(&action.run_id))
+        })
+}
+
+fn gateway_authority_decision_summary(
+    decision: &AuthorityDecision,
+) -> Result<GatewayAuthorityDecisionSummary, &'static str> {
+    let evidence = authority_decision_evidence(decision)
+        .and_then(|evidence| evidence.redacted())
+        .map_err(|_| "authority_decision_evidence_projection_unavailable")?;
+    Ok(GatewayAuthorityDecisionSummary {
+        decision_id: evidence.decision_id,
+        status: evidence.status,
+        namespace: evidence.operation.namespace,
+        resource_kind: evidence.operation.resource_kind,
+        verb: evidence.operation.verb,
+        decision_digest: evidence.decision_digest,
+        reason_codes: evidence.reason_codes,
+        matched_grant_ids: evidence.matched_grant_ids,
+        obligation_ids: evidence
+            .obligations
+            .into_iter()
+            .map(|obligation| obligation.obligation_id)
+            .collect(),
+    })
+}
+
+fn bind_current_gateway_authority_decision(
+    mut decision: AuthorityDecision,
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> Result<AuthorityDecision, String> {
+    let action_digest = canonical_gateway_authority_action_digest(action, effective_adapter)?;
+    decision.request.metadata.insert(
+        GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY.to_string(),
+        serde_json::Value::String(action_digest),
+    );
+    let decision_digest = canonical_gateway_authority_decision_digest(&decision)?;
+    decision.request.metadata.insert(
+        GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY.to_string(),
+        serde_json::Value::String(decision_digest),
+    );
+    Ok(decision)
+}
+
+fn action_with_current_authority_decision(
+    action: &ActionRequest,
+    decision: AuthorityDecision,
+) -> Result<ActionRequest, VerificationResult> {
+    if !action.authority_obligation_receipts.is_empty()
+        && action.authority_obligation_evidence.is_some()
+    {
+        return Err(VerificationResult::deny(
+            "authority_obligation_receipt_sources_ambiguous",
+        ));
+    }
+    let receipts = if action.authority_obligation_receipts.is_empty() {
+        action
+            .authority_obligation_evidence
+            .as_ref()
+            .map(|evidence| evidence.receipts.clone())
+            .unwrap_or_default()
+    } else {
+        action.authority_obligation_receipts.clone()
+    };
+    let mut current = action.clone();
+    current.authority_obligation_evidence =
+        Some(GatewayAuthorityObligationEvidence { decision, receipts });
+    Ok(current)
+}
+
+fn bounded_recorder_reason(reason: &str) -> &'static str {
+    if reason == "authority_evidence_recorder_unavailable" {
+        "authority_evidence_recorder_unavailable"
+    } else {
+        "authority_evidence_store_unavailable"
     }
 }
 

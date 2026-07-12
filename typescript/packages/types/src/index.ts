@@ -929,6 +929,7 @@ export interface ActionRequest {
   requested_at: ISODateTime;
   approval_evidence: ApprovalEvidence | null;
   authority_obligation_evidence: GatewayAuthorityObligationEvidence | null;
+  authority_obligation_receipts?: JsonValue[];
 }
 
 export interface ActionOutcome {
@@ -980,6 +981,7 @@ export interface DaemonActionCandidate {
   adapter: string | null;
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
+  authority_obligation_receipts?: JsonValue[];
 }
 
 export interface RegisteredAction {
@@ -1294,6 +1296,26 @@ export interface ReplayResponse {
   event_count: number;
   action_event_count: number;
   approval_events: ApprovalReplayEvent[];
+  authority_decisions: AuthorityDecisionReplayEvent[];
+}
+
+export interface GatewayAuthorityDecisionSummary {
+  decision_id: string;
+  status: "allowed" | "denied" | "conditional" | "needs_approval" | "needs_intervention";
+  namespace: string;
+  resource_kind: string;
+  verb: string;
+  decision_digest: string;
+  reason_codes: string[];
+  matched_grant_ids: string[];
+  obligation_ids: string[];
+}
+
+export interface AuthorityDecisionReplayEvent {
+  trace_event_id: TraceId;
+  sequence: number;
+  action_id: ActionId | null;
+  decisions: GatewayAuthorityDecisionSummary[];
 }
 
 export interface ApprovalReplayEvent {
@@ -1338,6 +1360,7 @@ export interface SubmitActionRequest {
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
   approval_evidence: ApprovalEvidence | null;
+  authority_obligation_receipts?: JsonValue[];
 }
 
 export interface HealthResponse {
@@ -1407,7 +1430,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "satisfied_preconditions",
     "requested_at",
     "approval_evidence",
-    "authority_obligation_evidence"
+    "authority_obligation_evidence",
+    "authority_obligation_receipts"
   ],
   action_outcome: ["action_id", "status", "verification", "post_verification", "output", "error", "completed_at"],
   external_governance_reference: ["provider", "reference_id", "endpoint"],
@@ -1509,7 +1533,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
   trace_page_response: ["run_id", "records"],
   trace_export_request: ["credential", "audit_attribution", "redaction_policy", "start", "end"],
   trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
-  replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
+  replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events", "authority_decisions"],
   submit_action_request: [
     "action_id",
     "run_id",
@@ -1522,7 +1546,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "adapter",
     "quota_usage",
     "satisfied_preconditions",
-    "approval_evidence"
+    "approval_evidence",
+    "authority_obligation_receipts"
   ],
   health_response: ["status", "local_only", "runtime_available"],
   version_response: ["daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"],

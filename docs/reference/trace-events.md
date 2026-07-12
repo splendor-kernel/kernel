@@ -147,6 +147,16 @@ trace and do not authorize adapter execution outside the gateway.
 - `MessageExpired { message: MessageTraceContext, reason: Option<String> }`
 - `MessageConsumed { message: MessageTraceContext }`
 - `RemoteMessageSent { remote_message: RemoteMessageTraceContext }`
+
+On the production-local C02 daemon path, an allowed
+`ActionVerificationCompleted` is the mandatory pre-effect authority evidence
+record. The gateway appends it after live typed action/adapter/permission
+authority plus existing pre-effect verifiers allow and before adapter execution.
+`result.artifacts.authority` contains redacted decision summaries/digests and
+`pre_effect_recorded: true`. Append failure prevents the adapter call. Outer
+daemon/loop code emits this event only for denied/unrecorded paths, so it does not
+mislabel a post-effect append as pre-effect evidence or duplicate an allowed
+completion event.
 - `RemoteMessageAccepted { remote_message: RemoteMessageTraceContext }`
 - `RemoteMessageRejected { remote_message: RemoteMessageTraceContext, reason: String }`
 - `RemoteMessageDelivered { remote_message: RemoteMessageTraceContext }`

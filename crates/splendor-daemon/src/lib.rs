@@ -15,16 +15,18 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
-    AdapterError, AdapterResult, CircuitBreakerEvaluator, PolicyApprovalVerifier,
+    authority_pre_effect_evidence_recorded, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
+    ActionRequest, ActionStatus, AdapterError, AdapterResult, CircuitBreakerEvaluator,
+    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
     ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
-    Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, LoopEngine,
-    LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig, PolicyCacheInstallError,
-    PolicyCacheMutationError, PolicyCacheMutationRecorder, PolicyCacheOwner, PolicyCacheTraceError,
-    PolicyDecision, PolicyDistributionGateway, QuotaPolicy, RunId, RunTraceContext, Scheduler,
+    Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
+    KernelPreEffectAuthorityRecorder, KernelRuntime, LoopEngine, LoopError, Percept, Perceptor,
+    Policy, PolicyCache, PolicyCacheConfig, PolicyCacheInstallError, PolicyCacheMutationError,
+    PolicyCacheMutationRecorder, PolicyCacheOwner, PolicyCacheTraceError, PolicyDecision,
+    PolicyDistributionGateway, QuotaPolicy, RunAuthorityHandle, RunId, RunTraceContext, Scheduler,
     SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
     TenantRegistry, TraceEventKind,
 };
@@ -35,14 +37,14 @@ use splendor_store::{
 use splendor_types::{
     is_allowed_physical_action, validate_policy_bundle, validate_policy_bundle_candidate,
     AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext, AuditAttribution,
-    CallerCredential, CircuitBreaker, ClientPrincipal, CredentialAudience, CredentialBinding,
-    DaemonEndpoint, DaemonSecurityDecision, DaemonSecurityError, DaemonSecurityRequest,
-    EndpointScope, GatewayVerificationState, InsecureDevMode, LocalTransportBinding, NodeId,
-    PerceptProvenance, PolicyBundleEnvelope, PolicyBundleKeyring, PolicyBundleTraceContext,
-    PolicyBundleValidationContext, PolicyBundleValidationError, RevocationStatus, TenantId,
-    TraceEvent, TraceEventId, TraceId, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, WorkOrderValidationError,
-    FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    AuthorityObligationReceipt, CallerCredential, CircuitBreaker, ClientPrincipal,
+    CredentialAudience, CredentialBinding, DaemonEndpoint, DaemonSecurityDecision,
+    DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
+    InsecureDevMode, LocalTransportBinding, NodeId, PerceptProvenance, PolicyBundleEnvelope,
+    PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
+    PolicyBundleValidationError, RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId,
+    ValidatedWorkOrder, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -138,6 +140,37 @@ impl DaemonState {
         self.inner
             .runtime_available
             .store(available, Ordering::SeqCst);
+    }
+
+    /// Applies a monotonic local run-authority revocation from a trusted process
+    /// composition/control path. This is not an HTTP endpoint or remote watch.
+    /// The caller remains responsible for authenticating the control-plane fact.
+    pub fn revoke_run_authority_for_local_control(
+        &self,
+        run_id: &RunId,
+        trusted_audit: AuditAttribution,
+    ) -> Result<(), ApiError> {
+        let runs = self.inner.runs.lock().map_err(|_| lock_error())?;
+        let slot = runs.get(run_id).ok_or_else(|| invalid_run(run_id))?;
+        let recorded = record_run_event(
+            slot,
+            TraceEventKind::DaemonAudit {
+                endpoint: "splendor.authority.local.revoke".to_string(),
+                audit: trusted_audit,
+            },
+        );
+        // Revocation uncertainty must never leave the previously live grant
+        // usable, even when its audit append fails.
+        slot.run_authority.revoke();
+        recorded
+    }
+
+    /// Returns the live handle's typed-operation evaluation count for local
+    /// diagnostics and deterministic inspect-only replay assertions.
+    pub fn run_authority_evaluation_count(&self, run_id: &RunId) -> Result<u64, ApiError> {
+        let runs = self.inner.runs.lock().map_err(|_| lock_error())?;
+        let slot = runs.get(run_id).ok_or_else(|| invalid_run(run_id))?;
+        Ok(slot.run_authority.evaluation_count())
     }
 
     fn ensure_runtime_available(&self) -> Result<(), ApiError> {
@@ -299,13 +332,14 @@ struct RunSlot {
     state_store: Arc<dyn StateStore>,
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
+    run_authority: RunAuthorityHandle,
+    authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
     tenant_registry: TenantRegistry,
     circuit_breakers: SharedCircuitBreakerEvaluator,
     policy_cache: PolicyCache,
     percept_queue: PerceptQueue,
     allowed_percept_schemas: Vec<String>,
     allowed_percept_sources: Vec<String>,
-    allowed_actions: Vec<String>,
     state_head: Option<StateNodeId>,
     adapter_executions: Arc<AtomicU64>,
     approval_evidence: ApprovalEvidenceSlot,
@@ -796,6 +830,8 @@ pub struct DaemonActionCandidate {
     pub quota_usage: Option<splendor_types::QuotaUsage>,
     #[serde(default)]
     pub satisfied_preconditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_obligation_receipts: Vec<AuthorityObligationReceipt>,
 }
 
 impl DaemonActionCandidate {
@@ -812,6 +848,10 @@ impl DaemonActionCandidate {
         }
         if let Some(action_id) = self.action_id {
             candidate = candidate.with_action_id(action_id);
+        }
+        if !self.authority_obligation_receipts.is_empty() {
+            candidate =
+                candidate.with_authority_obligation_receipts(self.authority_obligation_receipts);
         }
         candidate
     }
@@ -1042,6 +1082,16 @@ pub struct ReplayResponse {
     pub event_count: usize,
     pub action_event_count: usize,
     pub approval_events: Vec<ApprovalReplayEvent>,
+    pub authority_decisions: Vec<AuthorityDecisionReplayEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AuthorityDecisionReplayEvent {
+    pub trace_event_id: TraceId,
+    pub sequence: u64,
+    pub action_id: Option<ActionId>,
+    pub decisions: Vec<GatewayAuthorityDecisionSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1072,6 +1122,8 @@ pub struct SubmitActionRequest {
     pub satisfied_preconditions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_evidence: Option<ApprovalEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_obligation_receipts: Vec<AuthorityObligationReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1353,7 +1405,7 @@ fn validate_daemon_work_order(
     agent_id: &splendor_types::AgentId,
     run_id: Option<RunId>,
     expected_placement_target: Option<String>,
-) -> Result<WorkOrder, ApiError> {
+) -> Result<ValidatedWorkOrder, ApiError> {
     let validated = splendor_types::validate_work_order(
         envelope,
         &WorkOrderValidationContext {
@@ -1366,7 +1418,7 @@ fn validate_daemon_work_order(
         &state.inner.work_order_keyring,
     )
     .map_err(work_order_error)?;
-    Ok(validated.into_work_order())
+    Ok(validated)
 }
 
 fn work_order_authorization_for_endpoint(
@@ -1455,6 +1507,14 @@ fn ensure_optional_subset(
         ensure_member(field, value, allowed)?;
     }
     Ok(())
+}
+
+fn effective_work_order_scope(requested: &[String], work_order: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        work_order.to_vec()
+    } else {
+        requested.to_vec()
+    }
 }
 
 fn ensure_member(field: &str, value: &str, allowed: &[String]) -> Result<(), ApiError> {
@@ -1575,7 +1635,7 @@ async fn create_run(
     state.ensure_runtime_available()?;
     let request_id = require_create_run_token(&request.request_id, "request_id")?;
     let idempotency_key = require_create_run_token(&request.idempotency_key, "idempotency_key")?;
-    let validated_work_order = validate_daemon_work_order(
+    let validated_authority_work_order = validate_daemon_work_order(
         &state,
         &request.work_order,
         &request.tenant_id,
@@ -1583,6 +1643,7 @@ async fn create_run(
         request.work_order.work_order.run_id.clone(),
         None,
     )?;
+    let validated_work_order = validated_authority_work_order.work_order().clone();
     ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
     let work_order_authorization = work_order_authorization_for_endpoint(
         &request.work_order,
@@ -1612,6 +1673,18 @@ async fn create_run(
         .clone()
         .or(existing_run_id_for_scope)
         .unwrap_or_else(RunId::new);
+    let run_authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
+        &validated_authority_work_order,
+        run_id.clone(),
+        format!("splendor.daemon.run:{run_id}"),
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            error.reason_code(),
+            "validated signed work order could not be admitted as run authority",
+        )
+    })?;
     let idempotency_scope =
         create_run_idempotency_scope(&request, &validated_work_order, &security, run_id.clone());
 
@@ -1653,20 +1726,49 @@ async fn create_run(
         .clone()
         .unwrap_or_else(|| Arc::new(InMemoryTraceStore::default()));
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
+    let trace_runtime = Arc::new(
+        KernelRuntime::with_trace_store(Arc::clone(&trace_store), Some(run_id.clone())).map_err(
+            |error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "trace_error",
+                    error.to_string(),
+                )
+            },
+        )?,
+    );
+    let authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder> =
+        Arc::new(KernelPreEffectAuthorityRecorder::new(
+            Arc::clone(&trace_runtime),
+            request.tenant_id.clone(),
+            request.agent_id.clone(),
+        ));
     let tenant_registry = TenantRegistry::new();
+    let effective_allowed_actions = effective_work_order_scope(
+        &request.allowed_actions,
+        &validated_work_order.allowed_actions,
+    );
+    let effective_allowed_adapters = effective_work_order_scope(
+        &request.allowed_adapters,
+        &validated_work_order.allowed_adapters,
+    );
+    let effective_allowed_permissions = effective_work_order_scope(
+        &request.allowed_permissions,
+        &validated_work_order.allowed_permissions,
+    );
     let mut tenant_context = TenantContext::new(
         request.tenant_id.clone(),
         TenantPolicy {
-            allowed_actions: validated_work_order.allowed_actions.clone(),
-            allowed_adapters: validated_work_order.allowed_adapters.clone(),
-            allowed_permissions: validated_work_order.allowed_permissions.clone(),
+            allowed_actions: effective_allowed_actions,
+            allowed_adapters: effective_allowed_adapters,
+            allowed_permissions: effective_allowed_permissions.clone(),
         },
         QuotaPolicy::default().constrain_to_work_order(&validated_work_order),
     );
     tenant_context.register_agent_policy(
         request.agent_id.clone(),
         AgentIsolationPolicy {
-            allowed_permissions: validated_work_order.allowed_permissions.clone(),
+            allowed_permissions: effective_allowed_permissions,
             ..AgentIsolationPolicy::default()
         },
     );
@@ -1674,6 +1776,8 @@ async fn create_run(
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
+    gateway.set_action_authority_evaluator(Arc::new(run_authority.clone()));
+    gateway.set_pre_effect_authority_recorder(Arc::clone(&authority_recorder));
     gateway.set_resource_boundary_verifier(Arc::new(DataArtifactBoundaryVerifier::new(
         request.tenant_id.clone(),
         validated_work_order.data_refs.clone(),
@@ -1766,13 +1870,13 @@ async fn create_run(
     if let Some(policy_bundle) = policy_bundle.clone() {
         run_context = run_context.with_policy_bundle(policy_bundle);
     }
-    let mut engine = LoopEngine::with_trace_store_and_work_order(
+    let mut engine = LoopEngine::with_shared_trace_runtime_and_work_order(
         agent,
         state_graph,
         initial_state,
         policy,
         Arc::clone(&gateway),
-        Arc::clone(&trace_store),
+        trace_runtime,
         run_context,
     )
     .map_err(|error| {
@@ -1799,13 +1903,14 @@ async fn create_run(
         state_store,
         trace_store,
         gateway,
+        run_authority,
+        authority_recorder,
         tenant_registry,
         circuit_breakers,
         policy_cache,
         percept_queue,
         allowed_percept_schemas: request.allowed_percept_schemas,
         allowed_percept_sources: request.allowed_percept_sources,
-        allowed_actions: validated_work_order.allowed_actions.clone(),
         state_head: None,
         adapter_executions,
         approval_evidence,
@@ -2634,6 +2739,14 @@ async fn replay_run(
                 .and_then(approval_replay_event)
         })
         .collect();
+    let authority_decisions = records
+        .iter()
+        .filter_map(|record| {
+            serde_json::from_value::<TraceEvent>(record.payload.clone())
+                .ok()
+                .and_then(authority_decision_replay_event)
+        })
+        .collect();
     Ok(Json(ReplayResponse {
         replay_id: format!("replay-{run_id}"),
         run_id,
@@ -2641,6 +2754,7 @@ async fn replay_run(
         event_count: records.len(),
         action_event_count,
         approval_events,
+        authority_decisions,
     }))
 }
 
@@ -2693,52 +2807,8 @@ async fn submit_action(
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.approval_evidence,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: request.authority_obligation_receipts,
     };
-    if !slot
-        .allowed_actions
-        .iter()
-        .any(|allowed| allowed == &action_request.action.name)
-    {
-        let verification = splendor_types::VerificationResult {
-            allowed: false,
-            reasons: vec!["action_not_allowed".to_string()],
-            artifacts: serde_json::json!({
-                "context": {
-                    "source": "signed_work_order_action_scope",
-                    "tenant_id": action_request.tenant_id,
-                    "agent_id": action_request.agent_id,
-                    "run_id": action_request.run_id,
-                    "action_id": action_request.action_id,
-                    "action": action_request.action.name,
-                    "adapter": action_request.adapter,
-                }
-            }),
-        };
-        let outcome = ActionOutcome {
-            action_id: action_request.action_id,
-            status: ActionStatus::Denied,
-            verification,
-            post_verification: None,
-            output: None,
-            error: Some("action_not_allowed".to_string()),
-            completed_at: OffsetDateTime::now_utc(),
-        };
-        record_run_event(
-            slot,
-            TraceEventKind::ActionVerificationCompleted {
-                action: request.action.clone(),
-                result: outcome.verification.clone(),
-            },
-        )?;
-        record_run_event(
-            slot,
-            TraceEventKind::ActionDenied {
-                action: request.action.clone(),
-                result: outcome.verification.clone(),
-            },
-        )?;
-        return Ok(Json(outcome));
-    }
     let outcome = slot.gateway.submit(action_request).map_err(|error| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2746,13 +2816,15 @@ async fn submit_action(
             error.to_string(),
         )
     })?;
-    record_run_event(
-        slot,
-        TraceEventKind::ActionVerificationCompleted {
-            action: request.action.clone(),
-            result: outcome.verification.clone(),
-        },
-    )?;
+    if !authority_pre_effect_evidence_recorded(&outcome.verification) {
+        record_run_event(
+            slot,
+            TraceEventKind::ActionVerificationCompleted {
+                action: request.action.clone(),
+                result: outcome.verification.clone(),
+            },
+        )?;
+    }
     match outcome.status {
         ActionStatus::Executed => {
             record_approval_event_if_present(slot, &outcome)?;
@@ -3101,8 +3173,11 @@ async fn submit_physical_action(
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.action_request.approval_evidence.clone(),
         authority_obligation_evidence: None,
+        authority_obligation_receipts: request.action_request.authority_obligation_receipts.clone(),
     };
     let mut physical_gateway = VerifiedActionGateway::new(Arc::new(slot.tenant_registry.clone()));
+    physical_gateway.set_action_authority_evaluator(Arc::new(slot.run_authority.clone()));
+    physical_gateway.set_pre_effect_authority_recorder(Arc::clone(&slot.authority_recorder));
     physical_gateway.set_circuit_breaker_evaluator(Arc::new(slot.circuit_breakers.clone()));
     physical_gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
         simulated_safety_snapshot(&request, &profile, &action_name),
@@ -4270,6 +4345,25 @@ fn approval_replay_event(event: TraceEvent) -> Option<ApprovalReplayEvent> {
     })
 }
 
+fn authority_decision_replay_event(event: TraceEvent) -> Option<AuthorityDecisionReplayEvent> {
+    let TraceEventKind::ActionVerificationCompleted { result, .. } = event.kind else {
+        return None;
+    };
+    let decisions_value = result
+        .artifacts
+        .pointer("/authority/decisions")
+        .or_else(|| result.artifacts.pointer("/decisions"))?;
+    let decisions =
+        serde_json::from_value::<Vec<GatewayAuthorityDecisionSummary>>(decisions_value.clone())
+            .ok()?;
+    Some(AuthorityDecisionReplayEvent {
+        trace_event_id: event.trace_event_id,
+        sequence: event.sequence,
+        action_id: event.identity.action_id,
+        decisions,
+    })
+}
+
 fn record_daemon_audit(
     slot: &RunSlot,
     endpoint: &'static str,
@@ -5048,6 +5142,7 @@ mod tests {
                 quota_usage: Some(splendor_types::QuotaUsage::single_action()),
                 satisfied_preconditions: Vec::new(),
                 approval_evidence: None,
+                authority_obligation_receipts: Vec::new(),
             },
             safety_context,
             operator_intervention_evidence: None,
@@ -5067,6 +5162,7 @@ mod tests {
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
             authority_obligation_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         }
     }
 
@@ -5230,6 +5326,7 @@ mod tests {
             requested_at: OffsetDateTime::now_utc(),
             approval_evidence: None,
             authority_obligation_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         }
     }
 
@@ -5750,6 +5847,7 @@ mod tests {
                 adapter: None,
                 quota_usage: None,
                 satisfied_preconditions: Vec::new(),
+                authority_obligation_receipts: Vec::new(),
             }],
             policy_bundle_required: false,
             policy_bundle: None,
@@ -5781,6 +5879,7 @@ mod tests {
             adapter: None,
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }];
         let registrations = registrations_for_request(&direct_registration_request, &work_order);
         assert_eq!(registrations.len(), 2);
@@ -5791,8 +5890,31 @@ mod tests {
         assert_eq!(lock.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(lock.body.code, "runtime_lock_error");
 
+        let run_id = RunId::new();
+        let mut keyring = WorkOrderKeyring::new();
+        keyring
+            .insert_shared_secret("key", b"unit-work-order-secret")
+            .expect("unit work-order key");
+        let validated = splendor_types::validate_work_order(
+            &request.work_order,
+            &WorkOrderValidationContext {
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: None,
+                expected_placement_target: None,
+                now: OffsetDateTime::now_utc(),
+            },
+            &keyring,
+        )
+        .expect("validated unit work order");
+        let run_authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
+            &validated,
+            run_id.clone(),
+            format!("splendor.daemon.run:{run_id}"),
+        )
+        .expect("unit run authority");
         let slot = RunSlot {
-            run_id: RunId::new(),
+            run_id,
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
             status: RunStatus::Pending,
@@ -5800,6 +5922,8 @@ mod tests {
             state_store: Arc::new(InMemoryStateStore::default()),
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
+            run_authority,
+            authority_recorder: Arc::new(splendor_gateway::NoPreEffectAuthorityDecisionRecorder),
             tenant_registry: TenantRegistry::new(),
             circuit_breakers: SharedCircuitBreakerEvaluator::default(),
             policy_cache: PolicyCache::new(
@@ -5812,7 +5936,6 @@ mod tests {
             percept_queue: PerceptQueue::default(),
             allowed_percept_schemas: Vec::new(),
             allowed_percept_sources: Vec::new(),
-            allowed_actions: Vec::new(),
             state_head: None,
             adapter_executions: Arc::new(AtomicU64::new(0)),
             approval_evidence: ApprovalEvidenceSlot::default(),

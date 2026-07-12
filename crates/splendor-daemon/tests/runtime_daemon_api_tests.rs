@@ -398,6 +398,7 @@ async fn submit_allowed_action(
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app,
@@ -825,6 +826,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
+        authority_obligation_receipts: Vec::new(),
     }];
 
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
@@ -1208,6 +1210,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, allowed_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -1237,6 +1240,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -1338,6 +1342,7 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: vec!["ready".to_string()],
+        authority_obligation_receipts: Vec::new(),
     }];
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
@@ -1572,6 +1577,7 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
         adapter: Some("daemon.local".to_string()),
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
+        authority_obligation_receipts: Vec::new(),
     }];
     let mut create = create_request(
         tenant_id.clone(),
@@ -1755,6 +1761,7 @@ async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         Vec::new(),
     );
@@ -2137,6 +2144,7 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
             approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         };
         let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
             app.clone(),
@@ -2738,6 +2746,7 @@ async fn circuit_breaker_sync_updates_live_gateway_and_preserves_action_id() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -2832,6 +2841,7 @@ async fn create_run_circuit_breaker_denies_runtime_admission_fail_closed() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app,
@@ -3004,6 +3014,7 @@ async fn revoked_policy_bundle_blocks_existing_side_effects() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app,
@@ -3046,6 +3057,7 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }];
         let mut create = create_request(
             tenant_id.clone(),
@@ -3611,6 +3623,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         Vec::new(),
     );
@@ -3634,6 +3647,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
             adapter: Some("extra.adapter".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         Vec::new(),
     );
@@ -3659,6 +3673,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         Vec::new(),
     );
@@ -3762,6 +3777,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
@@ -3799,6 +3815,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3827,6 +3844,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3916,6 +3934,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3960,6 +3979,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: Some(grant),
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -4076,6 +4096,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -4208,6 +4229,7 @@ async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
         quota_usage: None,
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
@@ -4269,6 +4291,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
             ..QuotaUsage::default()
         }),
         satisfied_preconditions: vec!["ready".to_string()],
+        authority_obligation_receipts: Vec::new(),
     }];
     let mut create = create_request(
         tenant_id.clone(),
@@ -4338,6 +4361,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -4364,6 +4388,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let failed_run_id = failed_submit.run_id.clone();
     let (status, failed): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
@@ -4717,6 +4742,7 @@ async fn resume_without_signed_work_order_fails_before_tick_execution() {
             adapter: Some("daemon.local".to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         Vec::new(),
     );

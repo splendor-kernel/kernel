@@ -134,6 +134,7 @@ fn accepted_helper_plan_still_executes_only_through_local_gateway() {
             requested_at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(30),
             approval_evidence: None,
             authority_obligation_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         })
         .expect("gateway outcome");
 

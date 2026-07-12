@@ -2510,6 +2510,12 @@ components:
           type: array
           items:
             type: string
+        authority_obligation_receipts:
+          type: array
+          description: Raw non-authorizing receipts validated only against a regenerated live C02 conditional decision.
+          items:
+            type: object
+            additionalProperties: true
     RegisteredAction:
       type: object
       required: [name, adapter]
@@ -2969,7 +2975,7 @@ components:
           description: Must remain false for default inspect-only replay; side-effectful replay modes are not exposed by the local daemon contract.
     ReplayResponse:
       type: object
-      required: [replay_id, run_id, mode, event_count, action_event_count, approval_events]
+      required: [replay_id, run_id, mode, event_count, action_event_count, approval_events, authority_decisions]
       properties:
         replay_id:
           type: string
@@ -2989,6 +2995,59 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ApprovalReplayEvent'
+        authority_decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthorityDecisionReplayEvent'
+    AuthorityDecisionReplayEvent:
+      type: object
+      required: [trace_event_id, sequence, action_id, decisions]
+      properties:
+        trace_event_id:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          minimum: 0
+        action_id:
+          type: [string, 'null']
+          format: uuid
+        decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/GatewayAuthorityDecisionSummary'
+    GatewayAuthorityDecisionSummary:
+      type: object
+      required: [decision_id, status, namespace, resource_kind, verb, decision_digest, reason_codes, matched_grant_ids, obligation_ids]
+      properties:
+        decision_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [allowed, denied, conditional, needs_approval, needs_intervention]
+        namespace:
+          type: string
+        resource_kind:
+          type: string
+        verb:
+          type: string
+        decision_digest:
+          type: string
+        reason_codes:
+          type: array
+          items:
+            type: string
+        matched_grant_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        obligation_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
     ApprovalReplayEvent:
       type: object
       required: [lifecycle, approval, reason, trace_event_id, sequence]
@@ -3049,6 +3108,12 @@ components:
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/ApprovalEvidence'
+        authority_obligation_receipts:
+          type: array
+          description: Raw non-authorizing receipts; requester-supplied authority decisions are ignored by the live C02 path.
+          items:
+            type: object
+            additionalProperties: true
     HealthResponse:
       type: object
       required: [status, local_only, runtime_available]

@@ -5649,6 +5649,7 @@ fn resource_boundary_request(params: serde_json::Value) -> splendor_gateway::Act
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 
@@ -6620,6 +6621,7 @@ fn build_gateway_success() {
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     request.action.name = "write_file".to_string();
     let _ = gateway.submit(request).expect("submit");

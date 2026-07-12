@@ -18,6 +18,7 @@ mod issuance;
 mod obligations;
 mod renewal;
 mod revocation;
+mod run_authority;
 
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
@@ -89,6 +90,7 @@ pub use revocation::{
     REASON_AUTHORITY_REVOCATION_SNAPSHOT_MISSING, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
     REASON_AUTHORITY_SCOPE_MISMATCH,
 };
+pub use run_authority::{LocalRunAuthorityAdmissionError, LocalSignedWorkOrderRunAuthority};
 
 #[cfg(test)]
 #[path = "../tests/unit/adversarial_property_tests.rs"]

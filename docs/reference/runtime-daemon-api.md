@@ -75,7 +75,11 @@ transport security -> caller authentication -> endpoint scopes -> signed work or
 ```
 
 A caller token authenticates the app. A signed work order authorizes run creation
-or resume. The Action Gateway authorizes side effects. No layer replaces the
+or resume. Production-local run admission converts the already validated signed
+work order into one opaque live C02 authority handle through the kernel facade.
+The Action Gateway authorizes side effects only after that handle allows the
+typed action, effective adapter, and every required permission. Existing copied
+allowlists may narrow but cannot independently allow. No layer replaces the
 others.
 
 The runtime daemon API was originally the 0.02-S5 local control boundary for
@@ -166,6 +170,9 @@ prepared/non-authorizing trace may remain and does not by itself prove commit.
 - a queued perceptor for daemon-submitted percepts;
 - a scheduler containing one loop engine;
 - a `VerifiedActionGateway` with explicitly registered local adapters;
+- one opaque live C02 run-authority handle admitted only from
+  `ValidatedWorkOrder` (not a raw request payload);
+- one shared-runtime pre-effect authority evidence recorder;
 - optional `approval_policies` evaluated by the gateway approval verifier.
 
 `CreateRunRequest` also requires non-blank `request_id` and `idempotency_key`.
@@ -283,6 +290,22 @@ ActionNeedsApproval | ActionNeedsIntervention | ActionExecuted | ActionDenied | 
 OutcomeRecorded
 ```
 
+For an allowed C02-protected effect, `ActionVerificationCompleted` is durably
+appended by the gateway after all pre-effect verifiers allow and before the
+adapter is called. Its `result.artifacts.authority` contains only redacted typed
+decision summaries/digests and `pre_effect_recorded: true`. Append failure returns
+`NeedsIntervention` and the adapter count remains unchanged. The loop and daemon
+do not append a second post-effect completion event for that action.
+
+`SubmitActionRequest.authority_obligation_receipts` and daemon policy candidates
+accept raw owning-service receipts only. A requester-supplied authority decision
+is not current authority. When the live C02 evaluation is conditional, the
+gateway regenerates the current action decision and passes it with the raw
+receipts to `LocalAuthorityObligationVerifier`; missing, forged, stale, revoked,
+or mismatched receipts fail closed. Current signed-work-order compatibility
+grants contain no obligations, so receipt issuance/provider workflows remain
+downstream C01/AUTH-004 adoption rather than daemon-owned behavior.
+
 Approval flows may also emit `ApprovalRequested`, `ApprovalGranted`,
 `ApprovalDenied`, `ApprovalExpired`, and `ApprovalRevoked`. These are verifier
 facts only; they do not authorize adapter execution outside the gateway.
@@ -291,8 +314,13 @@ facts only; they do not authorize adapter execution outside the gateway.
 
 `POST /runs/{run_id}/replay` is inspect-only. It reads trace records, validates
 that sequence numbers are contiguous and run-scoped, and returns a replay summary
-with event counts and `approval_events`. It does not invoke perceptors, policies,
-gateways, verifiers, or adapters, and cannot repeat filesystem, network,
+with event counts, `approval_events`, and `authority_decisions` reconstructed from
+durable verification records. Allowed decisions are recorded before the effect;
+denials are recorded without any adapter effect. Authority summaries contain typed operation
+classification, status, normalized reason codes, matched grant/obligation IDs,
+and redacted decision digests; they omit concrete operation names and grant
+payloads. Replay does not invoke perceptors, policies, authority evaluators,
+receipt issuers/validators, gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
 
 Replay request bodies must include non-null `credential` and
@@ -357,6 +385,14 @@ This reference is part of the 0.1 stable compatibility surface for documented
 daemon endpoints and error shapes. It does not stabilize private Rust internals,
 production authentication infrastructure, native Node bindings, browser runtime
 behavior, fleet scheduling, or undocumented API fields.
+
+The additive raw-receipt and replay-authority-summary fields are the bounded v2
+C02 production-local integration. The current compatibility admission uses
+synthetic opaque local principal IDs because daemon admission does not yet receive
+C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
+with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
+watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, or gold completion is
+claimed here. C02 gold targets remain explicitly `not_exercised`.
 
 Run 0.1 conformance validation from the repository root:
 

@@ -7,7 +7,8 @@ Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
 implementation evidence slices plus bounded local `AUTH-006a` decision evidence
 and deterministic `AUTH-007a` adversarial/property plus `AUTH-007b` serialized
 mutation evidence, bounded `AUTH-007c` local-delegation confused-deputy replay
-evidence, and bounded `AUTH-007d` exact-family version/cache-staleness evidence.
+evidence, bounded `AUTH-007d` exact-family version/cache-staleness evidence, and
+a production-local daemon/kernel/gateway C02 integration slice.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -32,6 +33,16 @@ decision evidence, redacted explanation views, explicit completeness/freshness
 facts, and inspect-only comparisons. The existing gateway obligation verifier
 artifact projects only the redacted evidence digest and normalized reason-tree
 summary after trusted receipt validation and exact matching.
+The production-local integration admits one opaque live run-authority handle only
+from `ValidatedWorkOrder`, evaluates typed action, effective-adapter, and
+permission operations for every daemon run effect, and records redacted authority
+decision evidence through the shared runtime cursor after all pre-effect checks
+allow and before adapter execution. Direct `/actions`, scheduler/loop actions,
+and the existing run-bound simulated physical action path use this composition.
+The compatibility admission is explicitly temporary because the daemon does not
+yet receive C01 issuer/subject proof facts; it cannot consume raw or unsigned work
+orders and should be replaced by `issue_work_order_capability_grant` when the
+downstream C01 provider supplies those facts.
 `AUTH-007a` adds a dependency-free, seed-reproducible unit-test corpus over the
 implemented local capability algebra, delegation builder, revocation/cache
 evaluator, and evidence normalization. It runs bounded 256- or 512-case
@@ -68,8 +79,10 @@ unsupported/future/expired candidates, apply the existing revocation block for a
 revoked candidate, record rejection/sync-failure traces, and keep blocked action
 attempts at zero adapter calls.
 
-This slice does not change daemon endpoint or request/response shapes, OpenAPI,
-TypeScript client workflows, Python, fleet behavior, node admission,
+This slice adds only backward-compatible daemon/OpenAPI/TypeScript fields for raw
+obligation receipts and inspect-only replay authority summaries. It does not add
+an authority revocation/watch endpoint, change endpoint names, or change Python,
+fleet behavior, node admission,
 workload-controller wiring, approval
 workflow execution, MFA/provider integration, gate-engine migration, obligation
 receipt storage, production PKI, external revocation introspection, production
@@ -96,7 +109,9 @@ endpoint/request-response and trace-event wire shapes remain unchanged.
 Post-trace revocation commit races preserve the exact validated candidate and
 atomically latch it as pending deny-only evidence when it remains applicable;
 strictly newer active winners are not poisoned by obsolete revocation.
-It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
+It finalizes the production-local C02 effect path for current daemon runs. It
+does not claim all future privileged-plane adoption, full C01-backed issuance,
+full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
 G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
 closure, or gold completion.
@@ -117,7 +132,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
 | Catalog task | `AUTH-007 - Build authority adversarial/property test suites` | Bounded `AUTH-007a` deterministic local algebra/delegation/revocation/evidence properties, `AUTH-007b` deterministic serialized mutations, `AUTH-007c` production local-delegation replay hardening/matrix, and `AUTH-007d` exact-family version/cache-staleness plus daemon policy-sync evidence only; no cargo-fuzz/libFuzzer, all-plane confused-deputy harness, cross-language IAM parity, mutation testing, formal proof, or full task completion. |
-| Component | `splendor.authority-service` | Local capability module evidence. |
+| Component | `splendor.authority-service` | Production-local daemon/kernel/gateway run-authority integration; future privileged planes remain downstream adoption. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G80`, `G83`, `G86`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
 
@@ -144,16 +159,17 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   replacement.
 - No new adapter execution path; `AUTH-004b` only verifies local authority
   obligation receipts before the existing gateway adapter invocation.
-- No daemon endpoint/request-response wire, OpenAPI, TypeScript, Python, fleet,
-  product, or physical safety redesign. `AUTH-007d` does change daemon
-  policy-sync behavior and the public Rust cache API as described above.
+- No daemon endpoint redesign, Python, fleet, product, or physical safety
+  redesign. Additive raw-receipt and replay-summary fields keep daemon/OpenAPI/
+  TypeScript contracts aligned. `AUTH-007d` also changes daemon policy-sync
+  behavior and the public Rust cache API as described above.
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, production revocation propagation service, revocation watches,
   external introspection, or incident-controller quarantine workflow.
 - No universal wildcard or metadata/extension-based authority.
-- No daemon endpoint/request-response wire contract change. `AUTH-007d` changes
-  public Rust cache APIs and daemon-visible policy-sync outcomes. No
-  TypeScript/Python client workflow update, gold fixture, production revocation
+- No new daemon authority-control endpoint. The local process composition exposes
+  only a bounded trusted revocation command for deterministic local control and
+  tests. No Python client workflow update, gold fixture, production revocation
   watch, external introspection, node/fleet
   propagation acknowledgement, policy-cache consumption, or incident-controller
   quarantine flow for delegated children.
@@ -654,6 +670,47 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   characterization, not a compatibility claim; canonical source-byte or explicit
   migration/version handling remains absent.
 
+### Production-local daemon/kernel/gateway integration
+
+- `splendor-authority::LocalSignedWorkOrderRunAuthority` accepts only the opaque
+  `ValidatedWorkOrder` produced by signature, expiry, revocation, tenant, agent,
+  run, and placement validation. Its explicitly named compatibility admission
+  binds an unbound work order to the resolved local run and cannot self-mint from
+  a raw request body.
+- The compatibility grant uses synthetic opaque local principal IDs because the
+  current daemon has no C01 issuer/subject proof provider. This is not an identity
+  claim. Downstream C01 adoption must supply active principals, signing-key proof
+  binding, and issuer workload-admission authority to
+  `issue_work_order_capability_grant`, then preserve the same kernel handle.
+- `splendor-kernel::RunAuthorityHandle` is the daemon-facing composition facade;
+  the daemon does not depend on `splendor-authority`. Every effect evaluates one
+  typed gateway-action operation, one effective-adapter operation, and each
+  required-permission operation against the live grant. Existing tenant/agent
+  allowlists can narrow the result but cannot create an allow without C02.
+- Grant expiry and the monotonic local revocation latch are checked on every
+  effect. The bounded local revocation command is process-composition only; no
+  remote watch, introspection transport, or authority-control HTTP endpoint is
+  introduced.
+- `VerifiedActionGateway` records `ActionVerificationCompleted` through
+  `KernelPreEffectAuthorityRecorder` after C02, existing policy/invariant,
+  resource, approval/obligation, quota, and safety checks allow, but before
+  `ActionAdapter::execute`. The recorder shares the loop runtime cursor. Missing
+  or failed durable append returns `NeedsIntervention` with zero adapter calls;
+  outer daemon/loop code does not append a duplicate post-effect completion event.
+- Conditional live decisions regenerate the current decision in the gateway.
+  Requesters may submit only raw receipts; requester-supplied decision envelopes
+  are not the current authority. `LocalAuthorityObligationVerifier` validates the
+  raw owning-service receipts against the regenerated action decision before the
+  pre-effect evidence append. Current signed-work-order compatibility grants have
+  no obligations; the conditional path is retained in production gateway code and
+  exercised by the real gateway verifier/adapter test.
+- Inspect-only replay reads durable verification records, including effect-free
+  denials, and returns redacted typed decision summaries and digests. Allowed
+  decisions are durably recorded before the effect. Replay does not call authority evaluators,
+  receipt issuers/validators, the gateway, or adapters.
+- Gold cases remain `not_exercised`. The retained non-gold router integration is
+  component evidence only and is not a G01/G03/G60/G83 pass claim.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -762,7 +819,7 @@ broader AUTH-004/AUTH-005 completion.
 | Scope time | Authority tests cover expired grant scope time, broader request scope time, missing request time when grant time is constrained, request time present when grant time is unconstrained, and narrowed child scope time expiry. | `G01/G18` remain `not_exercised`. |
 | Signed grants | Authority tests cover signed dummy grants denying with `signed_grant_verifier_unavailable`. | Full AUTH-002 remains future work. |
 | Trusted local profile wrapper | Authority tests cover compatibility builder `Result` success and fail-closed invalid generated profile denial. | Raw external grants remain non-authorizing contracts. |
-| Composite effects | Authority tests cover action-only work-order compatibility grants not authorizing adapter or permission operations. | Not gateway integration evidence. |
+| Composite effects | Authority tests cover action-only work-order compatibility grants not authorizing adapter or permission operations; production-local daemon gateway tests evaluate all three typed operation classes. | Current daemon-run integration only; future planes remain downstream. |
 | Non-authorizing metadata | Authority tests cover safe metadata not granting authority and reserved metadata denial. | `G01` remains `not_exercised`. |
 | Compatibility profiles | Authority tests cover local `WorkOrder` allowlist profile mapping without broadening. | Not a full work-order issuance integration claim. |
 | Bounded AUTH-002a issuance | Authority tests cover valid signed work-order grant issuance, raw signed grant denial, unsigned/bad-signature/expired/revoked work-order failures, inactive/revoked principal failures, binding mismatch failures, issuer-authority denial, quota/locality non-broadening, and secret/signature-safe errors. | `G60/G83` remain `not_exercised`; no workload-controller, node, fleet, or gateway integration claim. |
@@ -778,6 +835,7 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-007b deterministic serialized mutation corpus | `cargo test -p splendor-authority serialized_mutation --locked` runs five 128-case families (640 serialized mutations total) over capability grants/requests, signed work-order issuance, obligation receipt collections, delegation grants/chains, and nested metadata/extensions. Every baseline is serialized and round-tripped as a positive control; every mutation is asserted byte-structurally different as `serde_json::Value`, then checked through serde and the real trusted local boundary. Corpus assertions and fixture/mutation setup failures identify fixture, mutation, and seed. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no cargo-fuzz/libFuzzer, unbounded/random fuzzing, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02/#244 claim. |
 | Bounded AUTH-007c local delegation replay matrix | Kernel tests use real validated grants and the public manager path. They cover intended context; exact manager-local binding; same-ID operation/tenant/agent/run/audience/budget/expiry/revocation/validation-digest mutations; binding subject/idempotence/uniqueness; root/sibling/cross-tenant child-ID collisions; missing/mismatched bindings; tenant, parent, child, audience, unrelated evidence/grant cases; concurrent bind serialization; exact replay rejection context/reason; and zero downstream effects. Private equality tests pin obligation and trust-state sensitivity. Authority issuance tests prove listed Cartesian multi-scope combinations succeed and unlisted child agents/runs deny separately with `overbroad_scope`. Daemon E2E uses one manager, one parent grant, and two specialists through the bounded multi-scope builder. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; paired agent/run edge semantics, obligation/trust mutation through the public legacy builder, recursive local delegation, durable binding events, typed instance/cross-instance binding, independent response-recipient input, Driver/Artifact/helper-plan/remote paths, all-plane mutation testing, and full AUTH-007/C02/#244 remain incomplete. |
 | Bounded AUTH-007d version/cache-staleness matrix | `cargo test -p splendor-types policy_distribution --locked`, `cargo test -p splendor-authority trusted_v1 --locked`, `cargo test -p splendor-kernel policy_cache --locked`, and `cargo test -p splendor-daemon policy_sync --locked` cover exact current-v1 positive controls; v0/v2 authority operation/scope/grant/request/revocation/policy rejection; unknown closed enums; raw-grant trust/cache exclusion; fixed-clock future-issued policy boundary; historical 0.04-shaped v1 signature characterization; trusted connected/offline cache positives; cache/snapshot stale/future/expired/revoked/offline-TTL denials; daemon cache preservation/blocking; trace reasons; and zero adapter calls for blocked action attempts. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no new schema, TypeScript/OpenAPI parity, canonical historical migration seam, resident persistence/watch, Driver/Artifact/helper/remote path, mutation framework, or full AUTH-007/C02/#244 claim. |
+| Production-local C02 daemon integration | The public-router non-gold test covers verified signed admission, scheduler and direct allowed effects, action/adapter/permission denial, admitted-then-expired denial, local revocation denial, pre-effect trace append failure with zero adapter calls, and replay summaries with unchanged adapter/evaluator counts. Gateway tests exercise a current conditional decision with raw trusted receipts and recorder-before-adapter ordering. | All C02 gold targets remain `not_exercised`; no C01 issuer provider, remote watch, future privileged-plane adoption, or gold pass claim. |
 
 ## Future Implementation Requirements
 
@@ -785,10 +843,10 @@ Future PRs that claim more of C02/AUTH-001/AUTH-002/AUTH-003/AUTH-004/AUTH-005/A
 must add executable integration evidence before changing gold status or closing
 issues:
 
-- durable gateway/driver evidence integration beyond the bounded local AUTH-004b
-  verifier, including first-class evidence-store records and trace-schema
-  assertions for pre-effect authority decisions;
-- full work-order issuance/signature validation integration (`AUTH-002`),
+- first-class Evidence Service bundles/access controls beyond the current durable
+  shared-runtime pre-effect trace record;
+- C01-backed work-order issuance integration (`AUTH-002`), replacing the
+  explicitly named validated-signed-work-order compatibility admission,
   including workload-controller admission wiring, node-side validation, renewal
   semantics, one-time/non-renewable grant lifetimes, and executable `G60/G83`
   fixtures;

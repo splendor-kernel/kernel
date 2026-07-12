@@ -796,6 +796,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
@@ -876,6 +877,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, unlinked_error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
@@ -902,6 +904,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -928,6 +931,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, failed_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3027,6 +3031,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
@@ -3118,6 +3123,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3726,6 +3732,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             adapter: Some("fixture".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
@@ -3776,6 +3783,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             "event_count",
             "action_event_count",
             "approval_events",
+            "authority_decisions",
         ],
     )?;
     let replay_shape = serde_json::to_value(ReplayResponse {
@@ -3785,6 +3793,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         event_count: 1,
         action_event_count: 0,
         approval_events: Vec::new(),
+        authority_decisions: Vec::new(),
     })?;
     assert_json_has_keys(&replay_shape, &replay_response_required, "ReplayResponse");
     let package_json: Value =

@@ -4,6 +4,12 @@
 
 ### Added
 
+- Integrated current daemon run admission/effects with one opaque live C02 grant
+  admitted only from the verified signed-work-order wrapper. Scheduler, direct,
+  and run-bound physical gateway paths now evaluate typed action/adapter/
+  permission operations, fail closed on live expiry/revocation, persist redacted
+  authority allow evidence before adapter execution, and expose inspect-only
+  replay summaries. Gold evidence remains `not_exercised`.
 - Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
   matrices for authority operation/scope/grant/request/revocation/policy
   contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and

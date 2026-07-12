@@ -106,6 +106,7 @@ fn build_action(name: &str, params: serde_json::Value) -> ActionRequest {
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 
