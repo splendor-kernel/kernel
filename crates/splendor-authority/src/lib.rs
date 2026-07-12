@@ -92,3 +92,7 @@ pub use revocation::{
 #[cfg(test)]
 #[path = "../tests/unit/adversarial_property_tests.rs"]
 mod adversarial_property_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/serialized_mutation_tests.rs"]
+mod serialized_mutation_tests;
