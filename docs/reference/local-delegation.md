@@ -19,6 +19,10 @@ after the manager calls `splendor_authority::issue_delegation_child_grant` with 
 trusted parent `ValidatedCapabilityGrant`; task messages and metadata alone do
 not confer authority.
 
+Delegating root runs require a separate trusted manager binding. Registration by
+itself remains valid for non-delegating compatibility, but it does not authorize
+child creation.
+
 ## Public contracts
 
 ### TaskRequest (`splendor.message.task_request.v1`)
@@ -97,27 +101,37 @@ authority and fails closed before gateway submission.
 
 1. Register local agents, principal bindings, and maximum delegation authority.
 2. Register an active parent run for the orchestrator agent; the run snapshots the
-   registered parent principal for later grant-subject binding.
+   registered parent principal. The root is intentionally unbound at this point.
 3. Build `LocalDelegationAuthority` from a trusted parent
    `ValidatedCapabilityGrant`, target child principal, audience, and child grant
    refs.
-4. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
+4. Call
+   `bind_root_run_capability_grant(&parent_run_id, &authority.parent_capability_grant)`.
+   The subject must match the root principal snapshot. The manager privately
+   retains the exact `ValidatedCapabilityGrant`, including its trust marker.
+   Same-run retry is idempotent only for exact equality; the binding cannot be
+   replaced or reused for another run in that manager.
+5. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
    with an explicit target agent, child run ID, objective, and delegated
    authority.
-5. The manager binds the parent grant subject to the registered parent principal
-   and issues an authority-owned child grant at the current decision time. If
-   binding or issuance fails, it emits `DelegationRejected` and does not emit
-   `DelegationRequested`, route a task message, insert a child record, or start a
-   child run.
-6. On success, the manager records `DelegationRequested`, sends a task request
+6. The manager verifies the complete supplied `ValidatedCapabilityGrant`,
+   including its private trust state, exactly equals the manager-private
+   parent-run binding, re-checks the grant subject against the registered
+   principal, and issues an authority-owned child grant at the current decision
+   time. If validation or issuance fails, it emits `DelegationRejected` and does
+   not emit `DelegationRequested`, route a task message, insert a child record,
+   or start a child run.
+7. On success, the manager records `DelegationRequested`, sends a task request
    message carrying non-authorizing grant refs, emits `ChildRunStarted`, and
-   returns a scoped child `AgentContext`.
-7. The child loop uses that scoped context. Actions outside delegated authority
+   returns a scoped child `AgentContext`. The child record retains the issued
+   child grant ID for evidence and revocation checks; it does not expose the
+   validated child grant as recursive delegation authority.
+8. The child loop uses that scoped context. Actions outside delegated authority
    are denied and do not reach adapter execution.
-8. The child completes or fails through `complete_child_run` or `fail_child_run`,
+9. The child completes or fails through `complete_child_run` or `fail_child_run`,
    which sends a structured task response and emits parent/child completion or
    failure trace events.
-9. Completion, failure, denial, and cancellation are terminal for the child run;
+10. Completion, failure, denial, and cancellation are terminal for the child run;
    repeated finish attempts fail closed without emitting duplicate responses or
    duplicate completion/failure trace events.
 
@@ -140,7 +154,13 @@ IDs, source/target agent IDs, objective, parent causal trace, task
 request/response message IDs when available, and optional non-authorizing
 `LocalDelegationAuthorityEvidence` refs. Denied authority issuance may record a
 stable `authority_reason` such as `overbroad_operation` or
-`missing_authority_evidence`.
+`missing_authority_evidence`. Root binding denials use the exact stable reasons
+`missing_parent_run_grant_binding` and `parent_run_grant_mismatch`. Proposed
+child grant-ID reuse records `child_capability_grant_id_collision`.
+
+`LocalDelegationReplay.rejections` preserves each `DelegationRejected` context
+and stable reason. Replay remains inspect-only and introduces no authority or
+side effects.
 
 ## State behavior
 
@@ -149,6 +169,20 @@ the run-bound principal, issued child `CapabilityGrantId`, and parent/child gran
 refs for successful children. It does not add hidden shared state between parent
 and child agents. Agent state remains committed through normal state graph nodes
 by each loop engine.
+
+For a delegating root, `capability_grant_id` is populated only by the explicit
+trusted binding API and remains evidence only. The manager separately retains the
+exact validated grant privately. Binding denials and child-creation denials leave
+the full run record unchanged, including child fan-out and delegated authority.
+The manager has no separate mutable budget/depth consumption ledger; those
+limits remain immutable fields on validated grants and issued child grants.
+
+Successful child records are automatically bound to the issued child grant ID
+for evidence and revocation. This is not an authorizing grant retrieval surface.
+Recursive local delegation is unsupported: the exact issued child grant is
+scoped to the existing child agent/run, so a distinct grandchild agent/run fails
+authority narrowing with `overbroad_scope`. Callers must not inject a different,
+broader grant to bypass that scope; its ID will not match the child record.
 
 ## Gateway and verifier behavior
 
@@ -168,6 +202,26 @@ gateways, adapters, child runs, authority evaluation, or side effects.
 
 ## Failure behavior
 
+- Unbound registered root attempts delegation: exactly one `DelegationRejected`
+  with `missing_parent_run_grant_binding`; no request, routing, child start,
+  insertion, or fan-out mutation.
+- Supplied trusted parent grant ID differs from the immutable root binding:
+  exactly one `DelegationRejected` with `parent_run_grant_mismatch` and the same
+  zero-effect behavior.
+- Supplied trusted parent grant reuses the bound ID but differs in any validated
+  content or trust state: `parent_run_grant_mismatch` with the same zero effects.
+- Root binding with a grant subject different from the run principal:
+  `ParentRunGrantSubjectMismatch`.
+- Different grant for an already-bound root:
+  `ParentRunGrantBindingConflict`.
+- Same grant ID for another root in the same manager:
+  `CapabilityGrantRunBindingConflict`.
+- Proposed child grant ID collides with any root or child exact binding in the
+  same manager: exactly one `DelegationRejected` with
+  `child_capability_grant_id_collision` before request/routing/start/insertion or
+  fan-out effects.
+- Explicit binding of an existing child record:
+  `ParentGrantBindingRequiresRootRun`; successful children are already bound.
 - Missing or mismatched target/objective: structured message validation failure.
 - Delegated authority exceeds parent or target scope: `DelegationRejected` and no
   child run.
@@ -192,9 +246,48 @@ gateways, adapters, child runs, authority evaluation, or side effects.
 
 ## Compatibility notes
 
-The implementation is local-only `AUTH-003b` wiring. It deliberately does not
-introduce signed work orders, remote dispatch, fleet placement, child revocation
-propagation, gateway authority verification, or long-lived child services. Later
+`register_root_run` remains source-compatible and supports non-delegating roots,
+but delegating callers must now explicitly bind a trusted grant before
+`create_child_run`. This is an intentional fail-closed local Rust API/security
+tightening. It adds no serialized grant/message/trace schema and no daemon,
+Python, or TypeScript contract.
+
+The additive `LegacyMultiScopeProfile` and
+`grant_from_legacy_multi_scope_allowlists` authority compatibility builder allow
+one parent grant to cover explicit non-empty lists of local child agent and run
+IDs. They use the existing local-profile validator; nil identities, empty lists,
+invalid audiences, and wildcard-like broad audience input fail closed.
+
+The two lists are independent `CapabilityScope` set dimensions. Containment is
+Cartesian: any listed agent may be combined with any listed run, and vector index
+positions do not define paired delegation edges. Authority issuance tests prove
+that listed combinations succeed while an unlisted agent or an unlisted run
+separately denies with `overbroad_scope`. A typed paired agent/run edge contract
+is explicitly deferred; callers that need pairing must enforce a separate
+narrower contract rather than infer pairs from list ordering.
+
+The bounded `AUTH-007c` matrix uses the public manager/authority/router/trace path
+and covers tenant, parent agent/shared-principal, parent principal/run, child
+agent/run, audience, and unrelated grant/evidence replay. The message target is
+the request target and is therefore covered with child-agent mismatch. The API
+does not independently accept a response recipient, and it has no typed instance
+authority coordinate beyond the audience string; those gaps are recorded rather
+than bypassed.
+
+Grant-ID uniqueness is local to one `LocalDelegationManager`. The different-
+tenant matrix case uses an isolated manager only to exercise the validated
+grant's tenant scope; it is not cross-manager, cross-instance, or typed audience
+binding evidence.
+
+`bind_root_run_capability_grant` is trusted local run-admission setup. It does not
+currently emit a durable binding trace event because adding an event variant
+would expand the public trace schema. Child-creation denials remain durably
+represented by the existing `DelegationRejected` event when recording succeeds.
+
+The implementation remains local-only `AUTH-003b`/`AUTH-007c` wiring. It
+deliberately does not introduce signed work orders, remote dispatch, fleet
+placement, child revocation propagation, gateway authority verification, or
+long-lived child services. Later
 cross-instance work orders can map onto the same explicit fields without changing
 the local no-ambient-authority rule. G18/G70/G71 remain `not_exercised` unless
 their executable gold fixtures are added and pass.

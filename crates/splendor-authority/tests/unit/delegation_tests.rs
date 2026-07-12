@@ -1,6 +1,9 @@
 use super::*;
 use crate::capability::unchecked_validated_grant_for_tests;
-use crate::{evaluate_capability_request, gateway_action_operation};
+use crate::{
+    evaluate_capability_request, gateway_action_operation,
+    grant_from_legacy_multi_scope_allowlists, CompatibilityGrantContext, LegacyMultiScopeProfile,
+};
 use splendor_types::{
     AuthorityBudgetScope, AuthorityDecisionStatus, AuthorityObligation, AuthorityObligationId,
     AuthorityObligationKind, AuthorityOperationNamespace, AuthorityResourceKind,
@@ -144,6 +147,57 @@ fn parent_grant(fixture: &Fixture) -> ValidatedCapabilityGrant {
     )
 }
 
+fn multi_scope_parent_grant(
+    fixture: &Fixture,
+    agent_ids: Vec<AgentId>,
+    run_ids: Vec<RunId>,
+) -> ValidatedCapabilityGrant {
+    grant_from_legacy_multi_scope_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: fixture.root_issuer.clone(),
+            subject: fixture.parent_subject.clone(),
+            audience: fixture.audience.clone(),
+            validation_digest: DIGEST.to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyMultiScopeProfile {
+            tenant_id: fixture.tenant_id.clone(),
+            agent_ids,
+            run_ids,
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(5),
+                max_action_duration_ms: Some(1_000),
+                ..Default::default()
+            },
+        },
+        &["artifact.create".to_string()],
+        &[],
+        &[],
+        fixture.now - time::Duration::minutes(5),
+        fixture.now + time::Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("revocation:multi-scope-parent".to_string()),
+    )
+    .expect("bounded multi-scope parent grant")
+}
+
+fn request_for_agent_run(
+    fixture: &Fixture,
+    parent: &ValidatedCapabilityGrant,
+    child_agent_id: AgentId,
+    child_run_id: RunId,
+) -> DelegationChildGrantRequest {
+    let mut request = request_for(fixture, parent);
+    request.child_agent_id = child_agent_id.clone();
+    request.child_run_id = child_run_id.clone();
+    request.scope.agent_ids = Some(vec![child_agent_id]);
+    request.scope.run_ids = Some(vec![child_run_id]);
+    request.scope.time = AuthorityTimeScope::default();
+    request
+}
+
 fn result_contract() -> DelegationResultContract {
     DelegationResultContract {
         schema_version: DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION.to_string(),
@@ -251,6 +305,71 @@ fn delegation_builds_narrow_child_capability_grant() {
     assert_eq!(
         consumed_child_grant.grant().grant_id,
         result.child_grant().grant().grant_id
+    );
+}
+
+#[test]
+fn delegation_multi_scope_parent_denies_unlisted_child_agent() {
+    let fixture = Fixture::new();
+    let listed_agent = AgentId::new();
+    let listed_run = RunId::new();
+    let parent = multi_scope_parent_grant(
+        &fixture,
+        vec![fixture.child_agent_id.clone(), listed_agent.clone()],
+        vec![fixture.child_run_id.clone(), listed_run],
+    );
+
+    let listed_control = request_for_agent_run(
+        &fixture,
+        &parent,
+        listed_agent,
+        fixture.child_run_id.clone(),
+    );
+    issue_delegation_child_grant(&parent, listed_control, context_for(&fixture))
+        .expect("listed agent and listed run Cartesian combination succeeds");
+
+    let unlisted_agent = AgentId::new();
+    let denied = request_for_agent_run(
+        &fixture,
+        &parent,
+        unlisted_agent,
+        fixture.child_run_id.clone(),
+    );
+    assert_eq!(
+        reason_for(&parent, denied, context_for(&fixture)),
+        "overbroad_scope"
+    );
+}
+
+#[test]
+fn delegation_multi_scope_parent_denies_unlisted_child_run() {
+    let fixture = Fixture::new();
+    let listed_agent = AgentId::new();
+    let listed_run = RunId::new();
+    let parent = multi_scope_parent_grant(
+        &fixture,
+        vec![fixture.child_agent_id.clone(), listed_agent],
+        vec![fixture.child_run_id.clone(), listed_run.clone()],
+    );
+
+    let listed_control = request_for_agent_run(
+        &fixture,
+        &parent,
+        fixture.child_agent_id.clone(),
+        listed_run,
+    );
+    issue_delegation_child_grant(&parent, listed_control, context_for(&fixture))
+        .expect("listed agent and listed run Cartesian combination succeeds");
+
+    let denied = request_for_agent_run(
+        &fixture,
+        &parent,
+        fixture.child_agent_id.clone(),
+        RunId::new(),
+    );
+    assert_eq!(
+        reason_for(&parent, denied, context_for(&fixture)),
+        "overbroad_scope"
     );
 }
 

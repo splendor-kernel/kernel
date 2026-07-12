@@ -4,6 +4,13 @@
 
 ### Added
 
+- Bound local delegating root runs to one exact trusted validated capability
+  grant, including private trust state, within one manager. Cross-run/shared-
+  principal and same-ID/different-content replay now fail before message routing
+  or child effects. Unbound roots remain compatible for non-delegating use.
+- Enforced manager-local root/child grant-ID uniqueness, added replay-visible
+  delegation rejection reasons, and added an explicit bounded multi-agent/run
+  legacy grant profile for one-parent/two-specialist local delegation.
 - Added a partial FND-012 performance budget contract in `splendor-types`, a
   machine-readable 0.2 fixture, and conformance validation for mandatory
   latency/throughput metrics, benchmark environment capture, regression
@@ -16,6 +23,13 @@
 
 ### Explicitly not included
 
+- No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
+  Registry, physical helper-plan, remote/fleet, typed-instance, and independent
+  response-recipient confused-deputy paths remain deferred or unexpressible.
+- No recursive local delegation: child records retain issued grant IDs only for
+  evidence/revocation, and broader replacement grants fail the immutable binding.
+- No cross-manager or cross-instance grant binding and no durable trace event for
+  trusted local root-binding setup; the binding API remains local run admission.
 - No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7
   soak, 1,000-node, GPU/training, robotics, live fleet, or physical hardware
   benchmark was executed by this slice.

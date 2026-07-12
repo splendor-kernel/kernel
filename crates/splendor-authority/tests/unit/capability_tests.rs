@@ -342,6 +342,41 @@ fn authority_returns_conditional_matching_grant_with_obligations() {
 }
 
 #[test]
+fn validated_grant_exact_equality_includes_obligations_and_private_trust() {
+    let now = OffsetDateTime::now_utc();
+    let raw = grant(
+        PrincipalId::new(),
+        PrincipalId::new(),
+        gateway_action_operation("query"),
+        base_scope(TenantId::new(), AgentId::new(), RunId::new()),
+        now,
+    );
+    let local = ValidatedCapabilityGrant {
+        grant: raw.clone(),
+        trust: ValidatedGrantTrust::LocalProfile,
+    };
+    let mut obligated_raw = raw.clone();
+    obligated_raw.obligations.push(AuthorityObligation {
+        schema_version: AUTHORITY_OBLIGATION_SCHEMA_VERSION.to_string(),
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::EvidenceRequired,
+        description: "record evidence".to_string(),
+        parameters: Default::default(),
+    });
+    let obligated = ValidatedCapabilityGrant {
+        grant: obligated_raw,
+        trust: ValidatedGrantTrust::LocalProfile,
+    };
+    let signed_trust = ValidatedCapabilityGrant {
+        grant: raw,
+        trust: ValidatedGrantTrust::VerifiedSigned,
+    };
+
+    assert_ne!(local, obligated);
+    assert_ne!(local, signed_trust);
+}
+
+#[test]
 fn authority_missing_expired_revoked_wrong_audience_and_unvalidated_grants_deny() {
     let now = OffsetDateTime::now_utc();
     let issuer = PrincipalId::new();
@@ -2220,6 +2255,98 @@ fn authority_compatibility_builder_fails_closed_for_invalid_generated_profile() 
             ..
         })
     ));
+}
+
+#[test]
+fn authority_multi_scope_compatibility_builder_is_explicit_bounded_and_fail_closed() {
+    let now = OffsetDateTime::now_utc();
+    let tenant_id = TenantId::new();
+    let agent_ids = vec![AgentId::new(), AgentId::new()];
+    let run_ids = vec![RunId::new(), RunId::new()];
+    let context = CompatibilityGrantContext {
+        grant_id: CapabilityGrantId::new(),
+        issuer: PrincipalId::new(),
+        subject: PrincipalId::new(),
+        audience: "daemon:local".to_string(),
+        validation_digest: DIGEST.to_string(),
+        max_delegation_depth: 2,
+        parent_grant_ids: Vec::new(),
+    };
+    let profile = LegacyMultiScopeProfile {
+        tenant_id: tenant_id.clone(),
+        agent_ids: agent_ids.clone(),
+        run_ids: run_ids.clone(),
+        quotas: AuthorityBudgetScope {
+            max_actions_per_tick: Some(4),
+            ..Default::default()
+        },
+    };
+    let actions = vec!["query".to_string(), "summarize".to_string()];
+    let adapters = vec!["fixture".to_string()];
+    let permissions = vec!["document.read".to_string()];
+
+    let built = grant_from_legacy_multi_scope_allowlists(
+        context.clone(),
+        profile.clone(),
+        &actions,
+        &adapters,
+        &permissions,
+        now - time::Duration::minutes(1),
+        now + time::Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("local:multi-scope".to_string()),
+    )
+    .expect("explicit multi-scope profile validates");
+    assert_eq!(built.grant().scope.tenant_ids, Some(vec![tenant_id]));
+    assert_eq!(built.grant().scope.agent_ids, Some(agent_ids));
+    assert_eq!(built.grant().scope.run_ids, Some(run_ids));
+
+    for invalid_profile in [
+        LegacyMultiScopeProfile {
+            agent_ids: Vec::new(),
+            ..profile.clone()
+        },
+        LegacyMultiScopeProfile {
+            run_ids: Vec::new(),
+            ..profile.clone()
+        },
+        LegacyMultiScopeProfile {
+            agent_ids: vec![AgentId::parse("00000000-0000-0000-0000-000000000000").unwrap()],
+            ..profile.clone()
+        },
+        LegacyMultiScopeProfile {
+            run_ids: vec![RunId::parse("00000000-0000-0000-0000-000000000000").unwrap()],
+            ..profile.clone()
+        },
+    ] {
+        assert!(grant_from_legacy_multi_scope_allowlists(
+            context.clone(),
+            invalid_profile,
+            &actions,
+            &adapters,
+            &permissions,
+            now - time::Duration::minutes(1),
+            now + time::Duration::minutes(30),
+            RevocationStatus::Active,
+            None,
+        )
+        .is_err());
+    }
+
+    let mut broad_context = context;
+    broad_context.audience = "daemon:*".to_string();
+    assert!(grant_from_legacy_multi_scope_allowlists(
+        broad_context,
+        profile,
+        &actions,
+        &adapters,
+        &permissions,
+        now - time::Duration::minutes(1),
+        now + time::Duration::minutes(30),
+        RevocationStatus::Active,
+        None,
+    )
+    .is_err());
 }
 
 #[test]

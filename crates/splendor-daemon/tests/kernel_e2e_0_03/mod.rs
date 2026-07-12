@@ -6,7 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use splendor_authority::{
-    grant_from_legacy_allowlists, CompatibilityGrantContext, LegacyScopeProfile,
+    grant_from_legacy_allowlists, grant_from_legacy_multi_scope_allowlists,
+    CompatibilityGrantContext, LegacyMultiScopeProfile, LegacyScopeProfile,
 };
 use splendor_daemon::{
     router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
@@ -1306,6 +1307,39 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
 
     let (parent_runtime, parent_events) = runtime_for(parent_run.clone());
     let child_a_run = RunId::parse("00000000-0000-0000-0000-000000000306")?;
+    let child_b_run = RunId::parse("00000000-0000-0000-0000-000000000307")?;
+    let parent_grant = grant_from_legacy_multi_scope_allowlists(
+        CompatibilityGrantContext {
+            grant_id: CapabilityGrantId::new(),
+            issuer: PrincipalId::new(),
+            subject: orchestrator_principal.clone(),
+            audience: "daemon:local".to_string(),
+            validation_digest:
+                "blake3:5555555555555555555555555555555555555555555555555555555555555555"
+                    .to_string(),
+            max_delegation_depth: 2,
+            parent_grant_ids: Vec::new(),
+        },
+        LegacyMultiScopeProfile {
+            tenant_id: tenant_id.clone(),
+            agent_ids: vec![specialist_a.clone(), specialist_b.clone()],
+            run_ids: vec![child_a_run.clone(), child_b_run.clone()],
+            quotas: AuthorityBudgetScope {
+                max_actions_per_tick: Some(4),
+                max_action_duration_ms: Some(1_000),
+                ..AuthorityBudgetScope::default()
+            },
+        },
+        &parent_authority.allowed_actions,
+        &parent_authority.allowed_adapters,
+        &parent_authority.allowed_permissions,
+        OffsetDateTime::now_utc() - Duration::minutes(1),
+        OffsetDateTime::now_utc() + Duration::minutes(30),
+        RevocationStatus::Active,
+        Some("local_delegation:e2e-multi-scope".to_string()),
+    )?;
+    manager.bind_root_run_capability_grant(&parent_run, &parent_grant)?;
+
     let (child_a_runtime, child_a_events) = runtime_for(child_a_run.clone());
     let child_a_request = LocalDelegationRequest {
         parent_run_id: parent_run.clone(),
@@ -1316,12 +1350,13 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
     };
-    let child_a_authority = local_delegation_authority(
-        orchestrator_principal.clone(),
+    let mut child_a_authority = LocalDelegationAuthority::new(
+        parent_grant.clone(),
         specialist_a_principal.clone(),
-        &tenant_id,
-        &child_a_request,
-    )?;
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
+    child_a_authority.max_fan_out = 4;
     let child_a = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -1339,7 +1374,6 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         vec!["parse.document".to_string()]
     );
 
-    let child_b_run = RunId::parse("00000000-0000-0000-0000-000000000307")?;
     let (child_b_runtime, child_b_events) = runtime_for(child_b_run.clone());
     let child_b_request = LocalDelegationRequest {
         parent_run_id: parent_run.clone(),
@@ -1350,12 +1384,13 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
     };
-    let child_b_authority = local_delegation_authority(
-        orchestrator_principal.clone(),
+    let mut child_b_authority = LocalDelegationAuthority::new(
+        parent_grant,
         specialist_b_principal,
-        &tenant_id,
-        &child_b_request,
-    )?;
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
+    child_b_authority.max_fan_out = 4;
     let child_b = manager.create_child_run(
         &parent_runtime,
         &child_b_runtime,
@@ -2512,6 +2547,10 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         &tenant_a,
         &tenant_mismatch_request,
     )?;
+    manager.bind_root_run_capability_grant(
+        &run_id,
+        &tenant_mismatch_authority.parent_capability_grant,
+    )?;
     let tenant_mismatch = manager
         .create_child_run(
             &parent_runtime,
@@ -3139,6 +3178,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         &tenant_id,
         &child_request,
     )?;
+    delegation.bind_root_run_capability_grant(&run_id, &child_authority.parent_capability_grant)?;
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,

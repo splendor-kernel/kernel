@@ -13,7 +13,8 @@ service is involved.
 
 1. Register an orchestrator agent with authority to `query` and `publish`.
 2. Register a specialist agent with narrower authority to `query` only.
-3. Register a parent run for the orchestrator.
+3. Register a parent run for the orchestrator and explicitly bind that root run
+   to the trusted parent capability grant.
 4. Create a child run with:
    - explicit target specialist agent;
    - objective `summarize receivables`;
@@ -92,6 +93,10 @@ request.child_run_id = child_run_id;
 // issued by the authority/work-order path. The TaskRequest grant refs are
 // replay evidence only and do not authorize the child by themselves.
 let authority = build_local_delegation_authority(&request)?;
+manager.bind_root_run_capability_grant(
+    &request.parent_run_id,
+    &authority.parent_capability_grant,
+)?;
 let child = manager.create_child_run(&parent_runtime, &child_runtime, request, authority)?;
 assert!(child.child_agent.delegated_authority.is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -127,5 +132,12 @@ policies, gateways, adapters, child runs, or live authority evaluation.
   rejected before a second task request is routed.
 - Child completion/failure is terminal; repeated finish attempts are rejected
   without duplicate response messages or terminal traces.
+- Recursive local delegation is unsupported. Child records retain issued grant
+  IDs for evidence/revocation only; a broader replacement grant fails the
+  immutable run binding, and the exact child scope cannot cover a distinct
+  grandchild agent/run.
+- Root binding retains the exact validated grant privately in one local manager;
+  the public run-record grant ID is evidence only. Binding setup itself has no
+  durable trace event in this bounded local example.
 - Remote dispatch, signed work orders, fleet placement, and long-lived child
   services are out of scope for this example.

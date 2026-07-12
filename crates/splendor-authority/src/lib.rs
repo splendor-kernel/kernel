@@ -22,9 +22,10 @@ mod revocation;
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
     gateway_action_operation, gateway_adapter_operation, grant_from_delegated_authority,
-    grant_from_legacy_allowlists, grant_from_work_order, intersect_capability_scopes,
-    workload_admit_operation, AuthorityEvaluationError, CompatibilityGrantContext,
-    LegacyScopeProfile, ValidatedCapabilityGrant,
+    grant_from_legacy_allowlists, grant_from_legacy_multi_scope_allowlists, grant_from_work_order,
+    intersect_capability_scopes, workload_admit_operation, AuthorityEvaluationError,
+    CompatibilityGrantContext, LegacyMultiScopeProfile, LegacyScopeProfile,
+    ValidatedCapabilityGrant,
 };
 pub use delegation::{
     issue_delegation_child_grant, DelegationChildGrant, DelegationChildGrantRequest,
