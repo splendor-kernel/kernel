@@ -1,8 +1,17 @@
 use super::*;
+use serde::Serialize;
 use time::{Duration, OffsetDateTime};
 
 const KEY_ID: &str = "policy-test-key";
 const SECRET: &[u8] = b"policy-test-secret";
+
+fn fixed_now() -> OffsetDateTime {
+    OffsetDateTime::parse(
+        "2026-07-12T12:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed policy validation time")
+}
 
 fn keyring() -> PolicyBundleKeyring {
     let mut keyring = PolicyBundleKeyring::new();
@@ -13,12 +22,13 @@ fn keyring() -> PolicyBundleKeyring {
 }
 
 fn bundle() -> PolicyBundle {
-    let now = OffsetDateTime::now_utc();
+    let now = fixed_now();
     PolicyBundle {
         schema_version: POLICY_BUNDLE_SCHEMA_VERSION.to_string(),
         policy_bundle_id: PolicyBundleId::try_new("pol_test").expect("policy bundle id"),
         version: "2026.05.29".to_string(),
-        tenant_id: TenantId::new(),
+        tenant_id: TenantId::parse("10000000-0000-4000-8000-000000000001")
+            .expect("fixed tenant id"),
         agent_id: None,
         issued_at: now - Duration::minutes(1),
         expires_at: now + Duration::hours(1),
@@ -36,7 +46,7 @@ fn context(bundle: &PolicyBundle) -> PolicyBundleValidationContext {
     PolicyBundleValidationContext {
         tenant_id: bundle.tenant_id.clone(),
         agent_id: bundle.agent_id.clone(),
-        now: OffsetDateTime::now_utc(),
+        now: fixed_now(),
     }
 }
 
@@ -50,6 +60,14 @@ fn signed_policy_bundle_validates_and_preserves_trace_metadata() {
         .expect("validated policy bundle");
 
     assert_eq!(validated.bundle().policy_bundle_id.as_str(), "pol_test");
+    assert_eq!(validated.validated_at(), fixed_now());
+    assert_eq!(
+        validated.signature_algorithm(),
+        POLICY_BUNDLE_SIGNATURE_ALGORITHM
+    );
+    assert_eq!(validated.signature_key_id(), KEY_ID);
+    assert_eq!(validated.validation_tenant_id(), &bundle.tenant_id);
+    assert_eq!(validated.validation_agent_id(), bundle.agent_id.as_ref());
     let trace = PolicyBundleTraceContext::from(validated.bundle());
     assert_eq!(trace.policy_bundle_id.as_str(), "pol_test");
     assert_eq!(trace.version, "2026.05.29");
@@ -182,8 +200,8 @@ fn malformed_policy_bundle_shape_branches_fail_closed() {
 #[test]
 fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     let mut expired = bundle();
-    expired.issued_at = OffsetDateTime::now_utc() - Duration::hours(2);
-    expired.expires_at = OffsetDateTime::now_utc() - Duration::hours(1);
+    expired.issued_at = fixed_now() - Duration::hours(2);
+    expired.expires_at = fixed_now() - Duration::hours(1);
     let envelope = PolicyBundleEnvelope::signed_with_shared_secret(expired.clone(), KEY_ID, SECRET)
         .expect("signed expired policy bundle");
     let error = validate_policy_bundle(&envelope, &context(&expired), &keyring())
@@ -201,9 +219,10 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     assert_eq!(error.reason_code(), "revoked_policy_bundle");
 
     let wrong_context = PolicyBundleValidationContext {
-        tenant_id: TenantId::new(),
+        tenant_id: TenantId::parse("10000000-0000-4000-8000-000000000009")
+            .expect("fixed wrong tenant id"),
         agent_id: None,
-        now: OffsetDateTime::now_utc(),
+        now: fixed_now(),
     };
     let good = bundle();
     let envelope = PolicyBundleEnvelope::signed_with_shared_secret(good.clone(), KEY_ID, SECRET)
@@ -213,13 +232,13 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     assert_eq!(error.reason_code(), "incompatible_policy_bundle");
 
     let mut agent_scoped = bundle();
-    let agent_id = AgentId::new();
+    let agent_id = AgentId::parse("20000000-0000-4000-8000-000000000002").expect("fixed agent id");
     agent_scoped.agent_id = Some(agent_id.clone());
 
     let tenant_only_context = PolicyBundleValidationContext {
         tenant_id: agent_scoped.tenant_id.clone(),
         agent_id: None,
-        now: OffsetDateTime::now_utc(),
+        now: fixed_now(),
     };
     let envelope =
         PolicyBundleEnvelope::signed_with_shared_secret(agent_scoped.clone(), KEY_ID, SECRET)
@@ -230,8 +249,10 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
 
     let wrong_agent_context = PolicyBundleValidationContext {
         tenant_id: agent_scoped.tenant_id.clone(),
-        agent_id: Some(AgentId::new()),
-        now: OffsetDateTime::now_utc(),
+        agent_id: Some(
+            AgentId::parse("20000000-0000-4000-8000-000000000009").expect("fixed wrong agent id"),
+        ),
+        now: fixed_now(),
     };
     let envelope =
         PolicyBundleEnvelope::signed_with_shared_secret(agent_scoped.clone(), KEY_ID, SECRET)
@@ -243,7 +264,7 @@ fn expired_revoked_and_wrong_scope_policy_bundles_fail_closed() {
     let matching_agent_context = PolicyBundleValidationContext {
         tenant_id: agent_scoped.tenant_id.clone(),
         agent_id: Some(agent_id),
-        now: OffsetDateTime::now_utc(),
+        now: fixed_now(),
     };
     validate_policy_bundle(&envelope, &matching_agent_context, &keyring())
         .expect("matching agent-scoped bundle is accepted");
@@ -282,4 +303,140 @@ fn policy_bundle_serde_defaults_are_stable_and_trace_safe() {
     let validated = validate_policy_bundle(&envelope, &context(&decoded), &keyring())
         .expect("validated defaulted bundle");
     assert_eq!(validated.into_policy_bundle(), decoded);
+}
+
+#[test]
+fn policy_distribution_exact_family_versions_fail_closed_independent_of_audit_version() {
+    let current = bundle();
+    let current_envelope =
+        PolicyBundleEnvelope::signed_with_shared_secret(current.clone(), KEY_ID, SECRET)
+            .expect("current v1 policy signs");
+    validate_policy_bundle(&current_envelope, &context(&current), &keyring())
+        .expect("current exact-family v1 policy validates");
+
+    for unsupported in ["splendor.policy_bundle.v0", "splendor.policy_bundle.v2"] {
+        let mut raw = serde_json::to_value(&current_envelope).expect("policy envelope json");
+        raw["schema_version"] = serde_json::json!(unsupported);
+        let envelope: PolicyBundleEnvelope =
+            serde_json::from_value(raw).expect("unsupported raw policy remains parseable");
+        let error = validate_policy_bundle(&envelope, &context(&envelope.bundle), &keyring())
+            .expect_err("unsupported exact-family policy must not validate");
+        assert_eq!(error.reason_code(), "malformed_policy_bundle");
+        assert_eq!(
+            error,
+            PolicyBundleValidationError::Malformed {
+                reason: format!("unsupported_schema_version:{unsupported}"),
+            }
+        );
+    }
+
+    let mut audit_label_only = current;
+    audit_label_only.version = "splendor.policy_bundle.v0".to_string();
+    let envelope =
+        PolicyBundleEnvelope::signed_with_shared_secret(audit_label_only.clone(), KEY_ID, SECRET)
+            .expect("audit version label does not select a schema");
+    validate_policy_bundle(&envelope, &context(&audit_label_only), &keyring())
+        .expect("schema compatibility uses schema_version, not version audit text");
+}
+
+#[test]
+fn policy_distribution_future_issued_policy_uses_strict_fixed_clock_boundary() {
+    let now = fixed_now();
+    let mut boundary = bundle();
+    boundary.issued_at = now;
+    boundary.expires_at = now + Duration::hours(1);
+    let envelope =
+        PolicyBundleEnvelope::signed_with_shared_secret(boundary.clone(), KEY_ID, SECRET)
+            .expect("boundary policy signs");
+    validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: boundary.tenant_id.clone(),
+            agent_id: boundary.agent_id.clone(),
+            now,
+        },
+        &keyring(),
+    )
+    .expect("issued_at equal to validation time is allowed");
+
+    let mut future = boundary;
+    future.issued_at = now + Duration::nanoseconds(1);
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(future.clone(), KEY_ID, SECRET)
+        .expect("future policy signs before receiver validation");
+    let error = validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: future.tenant_id.clone(),
+            agent_id: future.agent_id.clone(),
+            now,
+        },
+        &keyring(),
+    )
+    .expect_err("any positive issuance skew must fail closed");
+    assert_eq!(error, PolicyBundleValidationError::FutureIssued);
+    assert_eq!(error.reason_code(), "future_issued_policy_bundle");
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct HistoricalPolicyDegradedModeV004 {
+    allow_low_risk_cached: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct HistoricalPolicyBundleV004<'a> {
+    schema_version: &'a str,
+    policy_bundle_id: &'a PolicyBundleId,
+    version: &'a str,
+    tenant_id: &'a TenantId,
+    agent_id: &'a Option<AgentId>,
+    #[serde(with = "time::serde::rfc3339")]
+    issued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+    revocation: &'a RevocationStatus,
+    degraded_mode: HistoricalPolicyDegradedModeV004,
+}
+
+#[test]
+fn policy_distribution_historical_v004_shaped_v1_signature_is_not_currently_compatible() {
+    let bundle = bundle();
+    let historical = HistoricalPolicyBundleV004 {
+        schema_version: POLICY_BUNDLE_SCHEMA_VERSION,
+        policy_bundle_id: &bundle.policy_bundle_id,
+        version: &bundle.version,
+        tenant_id: &bundle.tenant_id,
+        agent_id: &bundle.agent_id,
+        issued_at: bundle.issued_at,
+        expires_at: bundle.expires_at,
+        revocation: &bundle.revocation,
+        degraded_mode: HistoricalPolicyDegradedModeV004 {
+            allow_low_risk_cached: bundle.degraded_mode.allow_low_risk_cached,
+        },
+    };
+    let historical_payload = serde_json::to_vec(&historical).expect("historical payload");
+    let key = blake3::hash(SECRET);
+    let signature = blake3::keyed_hash(key.as_bytes(), &historical_payload)
+        .to_hex()
+        .to_string();
+    let mut raw = serde_json::to_value(&historical).expect("historical policy json");
+    raw.as_object_mut()
+        .expect("historical policy object")
+        .insert(
+            "signature".to_string(),
+            serde_json::json!({"key_id": KEY_ID, "signature": signature}),
+        );
+    let envelope: PolicyBundleEnvelope =
+        serde_json::from_value(raw).expect("historical v1 shape decodes with current defaults");
+
+    assert!(envelope
+        .bundle
+        .degraded_mode
+        .disconnected_low_risk_actions
+        .is_empty());
+    let error = validate_policy_bundle(&envelope, &context(&envelope.bundle), &keyring())
+        .expect_err("current normalization changes the historical signed payload");
+    assert_eq!(error, PolicyBundleValidationError::BadSignature);
+    assert_eq!(error.reason_code(), "bad_policy_signature");
 }

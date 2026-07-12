@@ -180,10 +180,11 @@ pub use placement::{
     PLACEMENT_DECISION_SCHEMA,
 };
 pub use policy_distribution::{
-    validate_policy_bundle, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope,
-    PolicyBundleId, PolicyBundleIdError, PolicyBundleKeyring, PolicyBundleTraceContext,
-    PolicyBundleValidationContext, PolicyBundleValidationError, PolicyDegradedMode,
-    ValidatedPolicyBundle, POLICY_BUNDLE_SCHEMA_VERSION, POLICY_BUNDLE_SIGNATURE_ALGORITHM,
+    validate_policy_bundle, validate_policy_bundle_candidate, OfflineHighRiskBehavior,
+    PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleIdError, PolicyBundleKeyring,
+    PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyBundleValidationError,
+    PolicyDegradedMode, ValidatedPolicyBundle, ValidatedPolicyBundleCandidate,
+    POLICY_BUNDLE_SCHEMA_VERSION, POLICY_BUNDLE_SIGNATURE_ALGORITHM,
 };
 pub use primitives::{
     Action, Constraint, ConstraintKind, ConstraintScope, CostEstimate, Feedback, Percept,

@@ -6,8 +6,8 @@ Status: Draft, with bounded local `AUTH-001`, `AUTH-002a`, `AUTH-003a`,
 `AUTH-003b`, `AUTH-004a`, `AUTH-004b`, `AUTH-005a`, `AUTH-005b`, and `AUTH-005c`
 implementation evidence slices plus bounded local `AUTH-006a` decision evidence
 and deterministic `AUTH-007a` adversarial/property plus `AUTH-007b` serialized
-mutation evidence and bounded `AUTH-007c` local-delegation confused-deputy
-replay evidence.
+mutation evidence, bounded `AUTH-007c` local-delegation confused-deputy replay
+evidence, and bounded `AUTH-007d` exact-family version/cache-staleness evidence.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
 `splendor.authority-service`. This RFC remains a Draft contract. This repository
@@ -55,9 +55,22 @@ missing, content-mismatched, or colliding binding before request, routing,
 child-start, insertion, or fan-out effects. Successful child records retain the
 issued grant privately for exact binding plus its ID for evidence/revocation;
 recursive local delegation remains unsupported.
+`AUTH-007d` adds an exact-family current-v1 versus v0/v2 rejection matrix for
+authority operations, scopes, grants, requests, revocation records, and policy
+bundles. It also closes the policy-distribution gap that previously accepted a
+validly signed bundle whose `issued_at` was after the receiver's validation
+clock. Equality is accepted, while any positive skew returns
+`future_issued_policy_bundle` before cache installation. Trusted-wrapper cache
+tests cover connected and explicit low-risk offline allows plus stale,
+future-dated, expired, revoked, stale-snapshot, future-snapshot, and offline-TTL
+denials. Daemon sync tests retain the last trusted cache after
+unsupported/future/expired candidates, apply the existing revocation block for a
+revoked candidate, record rejection/sync-failure traces, and keep blocked action
+attempts at zero adapter calls.
 
-This slice does not change daemon APIs, OpenAPI, TypeScript client workflows,
-Python, fleet behavior, node admission, workload-controller wiring, approval
+This slice does not change daemon endpoint or request/response shapes, OpenAPI,
+TypeScript client workflows, Python, fleet behavior, node admission,
+workload-controller wiring, approval
 workflow execution, MFA/provider integration, gate-engine migration, obligation
 receipt storage, production PKI, external revocation introspection, production
 lease renewal, revocation watches, incident-controller integration, or introduce
@@ -73,6 +86,16 @@ types/functions for local renewal preflight with explicit nonce/current digest,
 renewable policy, and lifetime caps. `AUTH-005c` adds no public schema churn; it
 adds only a local kernel API that consumes an already trusted `RevocationSnapshot`
 and existing run-record authority evidence.
+`AUTH-007d` does change the public Rust cache API and daemon-visible behavior:
+`PolicyCache` construction requires an explicit tenant+agent owner, policy
+mutation uses validated-wrapper-only high-level traced methods with private
+cache-instance/revision-bound plans, direct reconnect/raw insertion/public
+commit seams are removed, revocation watermarks are retained, and stable
+owner/watermark/concurrent-mutation denials are observable. Daemon
+endpoint/request-response and trace-event wire shapes remain unchanged.
+Post-trace revocation commit races preserve the exact validated candidate and
+atomically latch it as pending deny-only evidence when it remains applicable;
+strictly newer active winners are not poisoned by obsolete revocation.
 It does not claim full C02, full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
 G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
@@ -93,7 +116,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
-| Catalog task | `AUTH-007 - Build authority adversarial/property test suites` | Bounded `AUTH-007a` deterministic local algebra/delegation/revocation/evidence properties, `AUTH-007b` deterministic serialized mutations, and `AUTH-007c` production local-delegation replay hardening/matrix only; no cargo-fuzz/libFuzzer, all-plane confused-deputy harness, cross-version IAM parity, mutation testing, formal proof, or full task completion. |
+| Catalog task | `AUTH-007 - Build authority adversarial/property test suites` | Bounded `AUTH-007a` deterministic local algebra/delegation/revocation/evidence properties, `AUTH-007b` deterministic serialized mutations, `AUTH-007c` production local-delegation replay hardening/matrix, and `AUTH-007d` exact-family version/cache-staleness plus daemon policy-sync evidence only; no cargo-fuzz/libFuzzer, all-plane confused-deputy harness, cross-language IAM parity, mutation testing, formal proof, or full task completion. |
 | Component | `splendor.authority-service` | Local capability module evidence. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G80`, `G83`, `G86`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
@@ -121,14 +144,17 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
   replacement.
 - No new adapter execution path; `AUTH-004b` only verifies local authority
   obligation receipts before the existing gateway adapter invocation.
-- No daemon, OpenAPI, TypeScript, Python, fleet, product, or physical safety
-  behavior.
+- No daemon endpoint/request-response wire, OpenAPI, TypeScript, Python, fleet,
+  product, or physical safety redesign. `AUTH-007d` does change daemon
+  policy-sync behavior and the public Rust cache API as described above.
 - No full data-use controller, secret broker, approval workflow, offline lease
   renewal, production revocation propagation service, revocation watches,
   external introspection, or incident-controller quarantine workflow.
 - No universal wildcard or metadata/extension-based authority.
-- No daemon/API contract change, TypeScript/Python client workflow update, gold
-  fixture, production revocation watch, external introspection, node/fleet
+- No daemon endpoint/request-response wire contract change. `AUTH-007d` changes
+  public Rust cache APIs and daemon-visible policy-sync outcomes. No
+  TypeScript/Python client workflow update, gold fixture, production revocation
+  watch, external introspection, node/fleet
   propagation acknowledgement, policy-cache consumption, or incident-controller
   quarantine flow for delegated children.
 - No approval workflow engine, MFA provider, gate-engine migration, durable
@@ -145,11 +171,12 @@ work-order, gateway, delegation, data-use, offline, and evidence slices can call
 - No claim that `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`,
   `G79`, `G80`, `G83`, `G86`, or `G88` passed.
 - No cargo-fuzz/libFuzzer or unbounded/random fuzz harness, all-plane
-  confused-deputy coverage, cross-version IAM/cache parity matrix, mutation
+  confused-deputy coverage, cross-language IAM/cache parity matrix, mutation
   testing, formal proof, external fixture publication, or full `AUTH-007` claim.
-  `AUTH-007a`, `AUTH-007b`, and `AUTH-007c` are bounded deterministic local
-  corpora/integration evidence only. `AUTH-007c` does not cover Driver, Artifact
-  Registry, physical helper-plan, or remote/fleet confused-deputy paths.
+  `AUTH-007a` through `AUTH-007d` are bounded deterministic local
+  corpora/integration evidence only. They do not cover Driver, Artifact Registry,
+  physical helper-plan, remote/fleet confused-deputy paths, a canonical
+  historical policy-signature migration seam, or TypeScript/OpenAPI parity.
 - No closure claim for #182, #238, #239, #240, #241, #242, #243, or #244.
 
 ## Contract Overview
@@ -565,6 +592,68 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   trace event in this bounded slice. Adding such an event would expand the public
   trace schema; no durable binding-mutation trace claim is made.
 
+The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
+
+- current `v1` authority operation, capability scope, capability grant,
+  capability request, revocation record, and policy bundle families have positive
+  controls; exact-family `v0` and `v2` values deny with stable existing schema
+  reasons rather than being interpreted as adjacent-compatible versions;
+- closed validation/operation enums reject unknown serialized values through
+  serde, and raw unsupported grants fail production local-profile validation
+  before a trusted wrapper or authority cache can be constructed;
+- policy compatibility uses `PolicyBundle.schema_version`; the free-form
+  operator/audit `PolicyBundle.version` label never selects a schema family;
+- a signed current-v1 policy with `issued_at > validation.now` returns the new
+  structured `FutureIssued` validation error and stable reason
+  `future_issued_policy_bundle`; `issued_at == validation.now` remains valid when
+  every other check passes;
+- trusted authority cache fixtures start from `grant_from_legacy_allowlists` and
+  pass the production local-profile validator; no unchecked validated-grant test
+  helper is used. The matrix proves connected/live-snapshot and explicit
+  disconnected low-risk read allows, then exact stale/future/expired cache,
+  stale/future snapshot, live revocation, and offline-TTL denials;
+- daemon policy sync rejects unsupported, future-issued, expired, and revoked
+  candidates, emits existing `PolicyBundleRejected` and `PolicySyncFailed`
+  events, preserves the last trusted cache for unsupported/future/expired
+  candidates, and applies the existing current-cache revocation block for the
+  matching revoked candidate. Blocked action attempts execute no adapter;
+- correction hardening makes policy installation consume only
+  `ValidatedPolicyBundle` with trusted validation time, signature algorithm, and
+  key ID metadata; raw bundle/envelope cache insertion APIs are removed;
+- signed installation is monotonic by `issued_at` and exact signed bundle
+  content, never by the free-form audit `version`: older candidates deny with
+  `policy_cache_install_rollback`, equal-time different-content candidates deny
+  with `policy_cache_install_conflict`, and exact retries are idempotent without
+  clearing revocation or expiry tombstones. A strictly newer validated candidate
+  may explicitly refresh authority and clear those tombstones;
+- a signed revoked candidate blocks current authority only when bundle identity,
+  tenant/agent scope, and non-older issuance match. Older or unrelated revocations
+  produce stable sync failures and cannot mutate current authority;
+- disconnection may be recorded before a failed sync, but reconnect is atomic
+  with an accepted trusted monotonic install. Validation, revocation, rollback,
+  or signature failure cannot reconnect the cache;
+- runtime observation tracks trusted validation/maximum time and latches expiry.
+  Clock rollback denies policy invocation and action verification with
+  `policy_clock_rollback`; observed expiry cannot become active after time moves
+  backwards;
+- the exact trusted revoked candidate is retained as a watermark. Intermediate
+  active replay and older/equal-conflicting revocations cannot supersede it;
+  only an active candidate strictly newer than current authority and watermark
+  clears it;
+- caches are tenant+agent owner-bound, including validation context for
+  tenant-wide bundles and action-request identity checks;
+- install/reconnect/revocation enters only high-level cache methods that invoke a
+  trusted recorder; internal plans cannot be committed by callers. Active trace
+  failure leaves authority/connectivity unchanged. Matching revocation trace
+  failure latches an exact deny-only pending watermark and returns
+  `policy_evidence_unavailable`; durable retry reconciles it. Partial prepared,
+  non-authorizing trace is permitted and replay does not prove commit;
+- a historical 0.04-shaped `splendor.policy_bundle.v1` payload signed over the
+  old one-field degraded-mode serialization decodes with current defaults but
+  fails current signature verification with `bad_policy_signature`. This is a
+  characterization, not a compatibility claim; canonical source-byte or explicit
+  migration/version handling remains absent.
+
 ## Guardrails
 
 | Rule | Required behavior in this slice |
@@ -604,6 +693,7 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
 | Property evidence is bounded and reproducible | Local `AUTH-007a` uses deterministic IDs, fixed timestamps, explicit seeded generation, real local grant validation/evaluation/delegation/revocation paths, and seed/case-labelled failures. It does not substitute for fuzz, gold, mutation, cross-version, or distributed confused-deputy evidence. |
 | Serialized mutation evidence is bounded and trusted-path checked | Local `AUTH-007b` serializes canonical positive fixtures, round-trips every baseline fixture, asserts every mutation differs from its serialized baseline, and requires serde rejection or denial by existing validation/issuance/evaluation. Receipt semantic mutations are recomputed with the test-only trusted fixture key before exact denial checks; forged-signature mutations remain separate. It never constructs unchecked trusted wrappers, mocks signatures/audience/expiry/revocation, or treats deserialization as authority. |
 | Parent grant replay is run-bound | Local `AUTH-007c` requires an explicit exact trusted root-run/validated-grant binding, including private trust state. Grant IDs are unique across root/child bindings within one manager; unbound, exact-content-mismatched, or child-ID-colliding creation denies before request/routing/start/child/fan-out effects with stable reasons. This is not cross-instance binding or durable binding-event evidence. |
+| Version/cache uncertainty fails closed | Local `AUTH-007d` accepts only exact current-v1 authorizing families, rejects v0/v2 and unknown closed enums, rejects future-issued signed policies before install, installs only owner-bound `ValidatedPolicyBundle`, enforces current-authority plus exact revocation-watermark monotonicity, denies exact-retry reconnect, persists required trace before cache broadening, rejects runtime clock rollback, and preserves or blocks the last trusted daemon cache according to scoped revocation semantics. Historical same-label signatures are not called compatible when current normalization changes signed bytes. |
 | Compatibility is additive | Current work-order and delegation fields map into typed profiles; they do not replace existing runtime checks. |
 
 ## Composite Effects
@@ -644,12 +734,17 @@ inspect-only over supplied records and its gateway projection reuses the existin
 authority-obligation verification artifact without re-running authority. The
 projection is emitted only after trusted receipt validation/exact matching; a
 projection failure fails closed before adapter execution.
-`AUTH-007a` and `AUTH-007b` are test and documentation evidence only.
+`AUTH-007a`, `AUTH-007b`, and the authority/type portions of `AUTH-007d` are test
+and documentation evidence only.
 `AUTH-007c` adds a local Rust manager security/API tightening, an additive local
 multi-scope compatibility profile, and replay rejection records, but no
 serialized schema, new event kind, gateway, adapter, or remote authority
 semantic. Its denials reuse `DelegationRejected`, and replay remains inspect-only.
 The matrix does not execute gateway or adapter side effects.
+The `AUTH-007d` production correction changes policy validation/cache mutation
+semantics and daemon-visible reason behavior without changing endpoint,
+request/response, event, or wire schema shapes. Daemon tests exercise existing
+rejection/sync-failure/revocation traces and gateway denial semantics.
 Future durable evidence-store and trace-schema work must persist authority
 decisions, cache freshness, revocation-snapshot identity,
 renewal nonce/current-revision evidence, child cancellation evidence, and
@@ -682,6 +777,7 @@ broader AUTH-004/AUTH-005 completion.
 | Bounded AUTH-007a deterministic adversarial/property suite | `cargo test -p splendor-authority adversarial_property --locked` runs eight dependency-free properties: 256 cases each for scope algebra, empty/disjoint rejection, fixed-time/audience/subject behavior, delegation restrictions, and revocation/cache monotonicity; 512 cases each for budget accumulation and deterministic denial/evidence normalization. Inputs use fixed time and deterministic IDs; failures identify seed/case. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no serialized fuzz, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02 claim. |
 | Bounded AUTH-007b deterministic serialized mutation corpus | `cargo test -p splendor-authority serialized_mutation --locked` runs five 128-case families (640 serialized mutations total) over capability grants/requests, signed work-order issuance, obligation receipt collections, delegation grants/chains, and nested metadata/extensions. Every baseline is serialized and round-tripped as a positive control; every mutation is asserted byte-structurally different as `serde_json::Value`, then checked through serde and the real trusted local boundary. Corpus assertions and fixture/mutation setup failures identify fixture, mutation, and seed. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no cargo-fuzz/libFuzzer, unbounded/random fuzzing, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02/#244 claim. |
 | Bounded AUTH-007c local delegation replay matrix | Kernel tests use real validated grants and the public manager path. They cover intended context; exact manager-local binding; same-ID operation/tenant/agent/run/audience/budget/expiry/revocation/validation-digest mutations; binding subject/idempotence/uniqueness; root/sibling/cross-tenant child-ID collisions; missing/mismatched bindings; tenant, parent, child, audience, unrelated evidence/grant cases; concurrent bind serialization; exact replay rejection context/reason; and zero downstream effects. Private equality tests pin obligation and trust-state sensitivity. Authority issuance tests prove listed Cartesian multi-scope combinations succeed and unlisted child agents/runs deny separately with `overbroad_scope`. Daemon E2E uses one manager, one parent grant, and two specialists through the bounded multi-scope builder. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; paired agent/run edge semantics, obligation/trust mutation through the public legacy builder, recursive local delegation, durable binding events, typed instance/cross-instance binding, independent response-recipient input, Driver/Artifact/helper-plan/remote paths, all-plane mutation testing, and full AUTH-007/C02/#244 remain incomplete. |
+| Bounded AUTH-007d version/cache-staleness matrix | `cargo test -p splendor-types policy_distribution --locked`, `cargo test -p splendor-authority trusted_v1 --locked`, `cargo test -p splendor-kernel policy_cache --locked`, and `cargo test -p splendor-daemon policy_sync --locked` cover exact current-v1 positive controls; v0/v2 authority operation/scope/grant/request/revocation/policy rejection; unknown closed enums; raw-grant trust/cache exclusion; fixed-clock future-issued policy boundary; historical 0.04-shaped v1 signature characterization; trusted connected/offline cache positives; cache/snapshot stale/future/expired/revoked/offline-TTL denials; daemon cache preservation/blocking; trace reasons; and zero adapter calls for blocked action attempts. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no new schema, TypeScript/OpenAPI parity, canonical historical migration seam, resident persistence/watch, Driver/Artifact/helper/remote path, mutation framework, or full AUTH-007/C02/#244 claim. |
 
 ## Future Implementation Requirements
 
@@ -717,11 +813,12 @@ issues:
   serializable restricted/redacted records intentionally make no exact-binding,
   request-digest, or protected-operation-digest claim;
 - remaining `AUTH-007` evidence: cargo-fuzz/unbounded serialized fuzzing,
-  Driver/Artifact/physical-helper/remote confused-deputy paths, cross-version
-  policy/cache scenarios,
+  Driver/Artifact/physical-helper/remote confused-deputy paths, cross-language
+  and distributed rolling-version policy/cache scenarios,
   external capability-algebra fixtures, mutation testing, and executable gold
   harnesses beyond bounded local `AUTH-007a` properties, `AUTH-007b`
-  deterministic serialized mutations, and `AUTH-007c` local delegation replay.
+  deterministic serialized mutations, `AUTH-007c` local delegation replay, and
+  `AUTH-007d` exact-family local version/cache-staleness evidence.
 
 ## Summary
 
@@ -735,4 +832,5 @@ laundering, no message/metadata/evidence authority, identity separation, offline
 cache and renewal are not ambient authority, inspect-only comparison has no live
 effects, deterministic local adversarial/property failures are reproducible by
 seed/case, local parent grants cannot be replayed across manager-owned root-run
-bindings, and no gold completion claim exists without executable evidence.
+bindings, future-issued policies and unsupported authorizing families fail
+closed, and no gold completion claim exists without executable evidence.

@@ -1,14 +1,105 @@
 use super::*;
 use splendor_gateway::{ActionGateway, ActionId, ActionOutcome, ActionRequest, GatewayError};
 use splendor_types::{
-    Action, AgentId, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyDegradedMode, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId,
+    validate_policy_bundle, validate_policy_bundle_candidate, Action, AgentId,
+    OfflineHighRiskBehavior, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
+    PolicyBundleKeyring, PolicyBundleValidationContext, PolicyDegradedMode, QuotaUsage,
+    RevocationStatus, RunId, SideEffectClass, TenantId, ValidatedPolicyBundle,
 };
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
 struct CountingGateway {
     calls: Arc<Mutex<u32>>,
+}
+
+#[derive(Default)]
+struct CapturingPolicyTraceRecorder {
+    events: Mutex<Vec<TraceEventKind>>,
+}
+
+impl PolicyCacheMutationRecorder for CapturingPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        self.events.lock().expect("policy events lock").push(event);
+        Ok(())
+    }
+}
+
+struct FailingPolicyTraceRecorder {
+    fail_at: usize,
+    calls: Mutex<usize>,
+}
+
+impl PolicyCacheMutationRecorder for FailingPolicyTraceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        _event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        let mut calls = self.calls.lock().expect("policy trace call lock");
+        *calls += 1;
+        if *calls == self.fail_at {
+            return Err(PolicyCacheTraceError);
+        }
+        Ok(())
+    }
+}
+
+struct SyncFailureRevisionRaceRecorder {
+    cache: PolicyCache,
+    observed_at: OffsetDateTime,
+    mutated: Mutex<bool>,
+}
+
+impl PolicyCacheMutationRecorder for SyncFailureRevisionRaceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        if matches!(event, TraceEventKind::PolicyRevoked { .. }) {
+            let mut mutated = self.mutated.lock().expect("race mutation lock");
+            if !*mutated {
+                self.cache
+                    .record_sync_failure("injected_revision_race", self.observed_at);
+                *mutated = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct NewerActiveRevisionRaceRecorder {
+    cache: PolicyCache,
+    newer: Mutex<Option<ValidatedPolicyBundle>>,
+}
+
+impl PolicyCacheMutationRecorder for NewerActiveRevisionRaceRecorder {
+    fn record_policy_cache_event(
+        &self,
+        event: TraceEventKind,
+    ) -> Result<(), PolicyCacheTraceError> {
+        if matches!(event, TraceEventKind::PolicyRevoked { .. }) {
+            if let Some(newer) = self.newer.lock().expect("newer policy lock").take() {
+                self.cache
+                    .install_validated_traced(
+                        newer,
+                        false,
+                        &CapturingPolicyTraceRecorder::default(),
+                    )
+                    .expect("strictly newer active race winner installs");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cache_owner() -> PolicyCacheOwner {
+    PolicyCacheOwner {
+        tenant_id: TenantId::parse("00000000-0000-0000-0000-000000000101").expect("tenant id"),
+        agent_id: AgentId::parse("00000000-0000-0000-0000-000000000102").expect("agent id"),
+    }
 }
 
 impl ActionGateway for CountingGateway {
@@ -31,7 +122,7 @@ fn bundle(expires_at: OffsetDateTime, allow_low_risk_cached: bool) -> PolicyBund
         schema_version: splendor_types::POLICY_BUNDLE_SCHEMA_VERSION.to_string(),
         policy_bundle_id: PolicyBundleId::try_new("pol_cache").expect("policy id"),
         version: "v1".to_string(),
-        tenant_id: TenantId::new(),
+        tenant_id: cache_owner().tenant_id,
         agent_id: None,
         issued_at: expires_at - Duration::hours(1),
         expires_at,
@@ -45,11 +136,120 @@ fn bundle(expires_at: OffsetDateTime, allow_low_risk_cached: bool) -> PolicyBund
     }
 }
 
+fn policy_keyring() -> PolicyBundleKeyring {
+    let mut keyring = PolicyBundleKeyring::new();
+    keyring
+        .insert_shared_secret("policy-key-a", b"policy-cache-test-secret")
+        .expect("policy cache test key");
+    keyring
+}
+
+fn validated_policy(bundle: PolicyBundle, validated_at: OffsetDateTime) -> ValidatedPolicyBundle {
+    validated_policy_for_owner(bundle, validated_at, &cache_owner())
+}
+
+fn validated_policy_for_owner(
+    bundle: PolicyBundle,
+    validated_at: OffsetDateTime,
+    owner: &PolicyCacheOwner,
+) -> ValidatedPolicyBundle {
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        bundle.clone(),
+        "policy-key-a",
+        b"policy-cache-test-secret",
+    )
+    .expect("signed policy cache fixture");
+    validate_policy_bundle(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: owner.tenant_id.clone(),
+            agent_id: Some(owner.agent_id.clone()),
+            now: validated_at,
+        },
+        &policy_keyring(),
+    )
+    .expect("validated policy cache fixture")
+}
+
+fn validated_candidate(
+    bundle: PolicyBundle,
+    validated_at: OffsetDateTime,
+) -> ValidatedPolicyBundle {
+    let envelope = PolicyBundleEnvelope::signed_with_shared_secret(
+        bundle.clone(),
+        "policy-key-a",
+        b"policy-cache-test-secret",
+    )
+    .expect("signed policy cache candidate");
+    validate_policy_bundle_candidate(
+        &envelope,
+        &PolicyBundleValidationContext {
+            tenant_id: cache_owner().tenant_id,
+            agent_id: Some(cache_owner().agent_id),
+            now: validated_at,
+        },
+        &policy_keyring(),
+    )
+    .expect("trusted policy cache candidate")
+    .into_validated()
+}
+
+fn cache_with_bundle(bundle: PolicyBundle, observed_at: OffsetDateTime) -> PolicyCache {
+    let validated_at = if bundle.expires_at <= observed_at {
+        bundle.expires_at - Duration::minutes(1)
+    } else {
+        observed_at
+    };
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    install_policy(&cache, validated_policy(bundle, validated_at), false)
+        .expect("trusted policy installs");
+    cache
+}
+
+fn install_policy(
+    cache: &PolicyCache,
+    validated: ValidatedPolicyBundle,
+    reconnect: bool,
+) -> Result<PolicyCacheInstallResult, PolicyCacheInstallError> {
+    cache
+        .install_validated_traced(
+            validated,
+            reconnect,
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .map_err(|error| match error {
+            PolicyCacheMutationError::Policy(error) => error,
+            PolicyCacheMutationError::Trace(_) => panic!("capturing recorder cannot fail"),
+        })
+}
+
+fn apply_revocation(
+    cache: &PolicyCache,
+    mut bundle: PolicyBundle,
+    validated_at: OffsetDateTime,
+    reason: &str,
+) {
+    bundle.revocation = RevocationStatus::Revoked {
+        reason: reason.to_string(),
+    };
+    cache
+        .apply_validated_revocation_traced(
+            validated_candidate(bundle, validated_at),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("matching trusted revocation applies");
+}
+
 fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionRequest {
     ActionRequest {
         action_id: ActionId::new(),
-        tenant_id: TenantId::new(),
-        agent_id: AgentId::new(),
+        tenant_id: cache_owner().tenant_id,
+        agent_id: cache_owner().agent_id,
         run_id: RunId::new(),
         action: Action {
             name: name.to_string(),
@@ -75,9 +275,12 @@ fn request(side_effect_class: SideEffectClass) -> ActionRequest {
 
 #[test]
 fn non_enforced_empty_cache_allows_policy_and_gateway_forwarding() {
-    let cache = PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: false,
-    });
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: false,
+        },
+        cache_owner(),
+    );
 
     let decision = cache.verify_policy_invocation("legacy", OffsetDateTime::now_utc());
     assert!(decision.verification.allowed);
@@ -101,9 +304,12 @@ fn non_enforced_empty_cache_allows_policy_and_gateway_forwarding() {
 
 #[test]
 fn missing_required_policy_fails_closed_before_policy_invocation() {
-    let cache = PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: true,
-    });
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
 
     let decision = cache.verify_policy_invocation("static", OffsetDateTime::now_utc());
 
@@ -114,9 +320,12 @@ fn missing_required_policy_fails_closed_before_policy_invocation() {
 
 #[test]
 fn missing_required_policy_fails_closed_before_inner_gateway() {
-    let cache = PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: true,
-    });
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
     let calls = Arc::new(Mutex::new(0));
     let gateway = PolicyDistributionGateway::new(
         Arc::new(CountingGateway {
@@ -137,8 +346,8 @@ fn missing_required_policy_fails_closed_before_inner_gateway() {
 #[test]
 fn expired_policy_denies_even_disconnected_explicit_low_risk_actions() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(bundle(now - Duration::minutes(1), true), now);
+    cache.mark_disconnected();
 
     let denied = cache.verify_policy_action(&request(SideEffectClass::Network), now);
     assert!(!denied.allowed);
@@ -155,8 +364,8 @@ fn expired_policy_denies_even_disconnected_explicit_low_risk_actions() {
 #[test]
 fn disconnected_within_ttl_allows_only_explicit_low_risk_actions() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(bundle(now + Duration::hours(1), true), now);
+    cache.mark_disconnected();
 
     let allowed = cache.verify_policy_action(
         &named_request("read_battery", SideEffectClass::ReadOnly),
@@ -173,8 +382,8 @@ fn disconnected_within_ttl_allows_only_explicit_low_risk_actions() {
 #[test]
 fn disconnected_high_risk_action_fails_closed_before_inner_gateway() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(bundle(now + Duration::hours(1), true), now);
+    cache.mark_disconnected();
     let calls = Arc::new(Mutex::new(0));
     let gateway = PolicyDistributionGateway::new(
         Arc::new(CountingGateway {
@@ -202,8 +411,8 @@ fn disconnected_high_risk_can_require_local_intervention() {
     high_risk_intervention
         .degraded_mode
         .high_risk_disconnected_behavior = OfflineHighRiskBehavior::NeedsLocalIntervention;
-    let cache = PolicyCache::with_bundle(high_risk_intervention, now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(high_risk_intervention, now);
+    cache.mark_disconnected();
     let calls = Arc::new(Mutex::new(0));
     let gateway = PolicyDistributionGateway::new(
         Arc::new(CountingGateway {
@@ -227,8 +436,8 @@ fn disconnected_high_risk_can_require_local_intervention() {
 #[test]
 fn expired_disconnected_low_risk_action_does_not_reach_inner_gateway() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(bundle(now - Duration::minutes(1), true), now);
+    cache.mark_disconnected();
     let calls = Arc::new(Mutex::new(0));
     let gateway = PolicyDistributionGateway::new(
         Arc::new(CountingGateway {
@@ -249,7 +458,7 @@ fn expired_disconnected_low_risk_action_does_not_reach_inner_gateway() {
 #[test]
 fn expired_policy_blocks_policy_invocation_when_not_in_degraded_offline_mode() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), false), now);
+    let cache = cache_with_bundle(bundle(now - Duration::minutes(1), false), now);
 
     let decision = cache.verify_policy_invocation("static", now);
 
@@ -264,8 +473,8 @@ fn expired_policy_blocks_policy_invocation_when_not_in_degraded_offline_mode() {
 #[test]
 fn expired_policy_blocks_policy_invocation_even_in_disconnected_degraded_mode() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
-    cache.set_disconnected(true);
+    let cache = cache_with_bundle(bundle(now - Duration::minutes(1), true), now);
+    cache.mark_disconnected();
 
     let decision = cache.verify_policy_invocation("static", now);
 
@@ -280,18 +489,14 @@ fn expired_policy_blocks_policy_invocation_even_in_disconnected_degraded_mode() 
 #[test]
 fn cache_snapshot_records_ttl_scope_validation_and_last_sync() {
     let now = OffsetDateTime::now_utc();
-    let mut envelope = PolicyBundleEnvelope {
-        bundle: bundle(now + Duration::hours(1), true),
-        signature: None,
-    };
-    envelope.signature = Some(splendor_types::WorkOrderSignature {
-        key_id: "policy-key-a".to_string(),
-        signature: "trace-redacted".to_string(),
-    });
-    let cache = PolicyCache::new(PolicyCacheConfig {
-        enforcement_required: true,
-    });
-    cache.install_validated_envelope(envelope, now);
+    let policy = bundle(now + Duration::hours(1), true);
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    install_policy(&cache, validated_policy(policy, now), false).expect("trusted policy installs");
 
     let snapshot = cache.snapshot();
 
@@ -309,13 +514,13 @@ fn cache_snapshot_records_ttl_scope_validation_and_last_sync() {
 #[test]
 fn expired_policy_snapshot_reports_expired_or_degraded_status() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now - Duration::minutes(1), true), now);
+    let cache = cache_with_bundle(bundle(now - Duration::minutes(1), true), now);
 
     assert_eq!(
         cache.snapshot().offline_status,
         PolicyOfflineStatus::Expired
     );
-    cache.set_disconnected(true);
+    cache.mark_disconnected();
     assert_eq!(
         cache.snapshot().offline_status,
         PolicyOfflineStatus::DegradedExpired
@@ -323,12 +528,13 @@ fn expired_policy_snapshot_reports_expired_or_degraded_status() {
 }
 
 #[test]
-fn disconnected_reconnect_transition_is_trace_visible() {
+fn exact_retry_cannot_reconnect_but_strict_newer_transition_is_trace_visible() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+    let policy = bundle(now + Duration::hours(1), true);
+    let cache = cache_with_bundle(policy.clone(), now);
 
     let offline = cache
-        .set_disconnected_with_trace(true, now)
+        .mark_disconnected_with_trace(now)
         .expect("offline transition");
     assert!(matches!(
         offline,
@@ -343,9 +549,44 @@ fn disconnected_reconnect_transition_is_trace_visible() {
         PolicyOfflineStatus::DisconnectedWithinTtl
     );
 
-    let reconnected = cache
-        .set_disconnected_with_trace(false, now + Duration::minutes(1))
-        .expect("reconnect transition");
+    let exact = install_policy(
+        &cache,
+        validated_policy(policy.clone(), OffsetDateTime::now_utc()),
+        true,
+    )
+    .expect("trusted exact retry remains idempotent");
+    assert_eq!(exact.status, PolicyCacheInstallStatus::Idempotent);
+    assert_eq!(exact.connectivity_event, None);
+    assert!(cache.snapshot().disconnected);
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(named_request("file.read", SideEffectClass::ReadOnly))
+        .expect("offline-disallowed action returns denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["offline_action_not_allowed"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let mut refresh = policy;
+    refresh.version = "strict-newer-reconnect".to_string();
+    refresh.issued_at = now + Duration::minutes(2);
+    let reconnected = install_policy(
+        &cache,
+        validated_policy(refresh, now + Duration::minutes(2)),
+        true,
+    )
+    .expect("strict newer trusted policy reconnects")
+    .connectivity_event
+    .expect("reconnect transition");
     assert!(matches!(
         reconnected,
         TraceEventKind::PolicyConnectivityChanged {
@@ -359,8 +600,9 @@ fn disconnected_reconnect_transition_is_trace_visible() {
 #[test]
 fn revocation_blocks_policy_invocation_and_side_effects() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
-    cache.revoke_current("central_revocation");
+    let policy = bundle(now + Duration::hours(1), true);
+    let cache = cache_with_bundle(policy.clone(), now);
+    apply_revocation(&cache, policy, now, "central_revocation");
 
     let decision = cache.verify_policy_invocation("static", now);
     assert!(!decision.verification.allowed);
@@ -378,7 +620,7 @@ fn revocation_blocks_policy_invocation_and_side_effects() {
 #[test]
 fn sync_failure_is_recorded_without_replacing_cached_bundle() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+    let cache = cache_with_bundle(bundle(now + Duration::hours(1), true), now);
 
     let failure = cache.record_sync_failure("central_unavailable", now);
     let snapshot = cache.snapshot();
@@ -397,12 +639,13 @@ fn sync_failure_is_recorded_without_replacing_cached_bundle() {
 #[test]
 fn policy_cache_sanitizes_trace_visible_reasons() {
     let now = OffsetDateTime::now_utc();
-    let cache = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
+    let policy = bundle(now + Duration::hours(1), true);
+    let cache = cache_with_bundle(policy.clone(), now);
 
     let failure = cache.record_sync_failure("central failed token=super-secret", now);
     assert_eq!(failure.reason, "policy_reason_redacted");
 
-    cache.revoke_current("operator revoked signature=raw-secret");
+    apply_revocation(&cache, policy, now, "operator revoked signature=raw-secret");
     let decision = cache.verify_policy_invocation("static", now);
     let Some(TraceEventKind::PolicyRevoked { reason, .. }) = decision.trace_event else {
         panic!("revocation should emit sanitized trace event");
@@ -415,11 +658,595 @@ fn policy_cache_sanitizes_trace_visible_reasons() {
         Some("policy_reason_redacted")
     );
 
-    let unspecified = PolicyCache::with_bundle(bundle(now + Duration::hours(1), true), now);
-    unspecified.revoke_current("   ");
+    let policy = bundle(now + Duration::hours(1), true);
+    let unspecified = cache_with_bundle(policy.clone(), now);
+    apply_revocation(&unspecified, policy, now, "   ");
     let decision = unspecified.verify_policy_invocation("static", now);
     let Some(TraceEventKind::PolicyRevoked { reason, .. }) = decision.trace_event else {
         panic!("empty revocation should emit sanitized trace event");
     };
     assert_eq!(reason, "policy_reason_unspecified");
+}
+
+#[test]
+fn monotonic_signed_install_rejects_rollback_conflict_and_preserves_tombstone() {
+    let now = OffsetDateTime::now_utc();
+    let mut older_broader = bundle(now + Duration::hours(2), true);
+    older_broader.version = "older-broader".to_string();
+    older_broader.issued_at = now - Duration::minutes(20);
+    older_broader
+        .degraded_mode
+        .disconnected_low_risk_actions
+        .push("file.read".to_string());
+    let mut newer_narrower = older_broader.clone();
+    newer_narrower.version = "newer-narrower".to_string();
+    newer_narrower.issued_at = now - Duration::minutes(10);
+    newer_narrower.degraded_mode.disconnected_low_risk_actions = vec!["read_battery".to_string()];
+
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    install_policy(&cache, validated_policy(older_broader.clone(), now), false)
+        .expect("initial trusted authority installs");
+    let newer = install_policy(&cache, validated_policy(newer_narrower.clone(), now), false)
+        .expect("strictly newer signed authority installs");
+    assert_eq!(newer.status, PolicyCacheInstallStatus::Installed);
+    assert_eq!(newer.bundle.version, "newer-narrower");
+
+    let rollback = install_policy(&cache, validated_policy(older_broader, now), false)
+        .expect_err("older broader replay must fail before mutation");
+    assert_eq!(rollback, PolicyCacheInstallError::Rollback);
+    assert_eq!(rollback.reason_code(), "policy_cache_install_rollback");
+    assert_eq!(
+        cache
+            .snapshot_at(now)
+            .bundle
+            .expect("current bundle")
+            .version,
+        "newer-narrower"
+    );
+
+    let mut conflict = newer_narrower.clone();
+    conflict.version = "same-time-different-content".to_string();
+    let conflict = install_policy(&cache, validated_policy(conflict, now), false)
+        .expect_err("same-issued-at different signed content must fail");
+    assert_eq!(conflict, PolicyCacheInstallError::SameIssuedAtConflict);
+    assert_eq!(conflict.reason_code(), "policy_cache_install_conflict");
+
+    let exact = install_policy(&cache, validated_policy(newer_narrower.clone(), now), false)
+        .expect("exact signed retry is idempotent");
+    assert_eq!(exact.status, PolicyCacheInstallStatus::Idempotent);
+    assert!(!exact.revocation_preserved);
+
+    apply_revocation(&cache, newer_narrower.clone(), now, "central_revocation");
+    let mut earlier_active = newer_narrower.clone();
+    earlier_active.version = "earlier-active-replay".to_string();
+    earlier_active.issued_at = now - Duration::minutes(15);
+    let earlier_replay = install_policy(&cache, validated_policy(earlier_active, now), false)
+        .expect_err("earlier active replay cannot clear revocation tombstone");
+    assert_eq!(earlier_replay, PolicyCacheInstallError::Rollback);
+    let exact_after_revocation =
+        install_policy(&cache, validated_policy(newer_narrower.clone(), now), false)
+            .expect("exact active retry remains idempotent");
+    assert_eq!(
+        exact_after_revocation.status,
+        PolicyCacheInstallStatus::Idempotent
+    );
+    assert!(exact_after_revocation.revocation_preserved);
+    assert_eq!(
+        cache
+            .verify_policy_action(&request(SideEffectClass::External), now)
+            .reasons,
+        vec!["policy_revoked"]
+    );
+
+    let mut refresh = newer_narrower;
+    refresh.version = "strict-newer-refresh".to_string();
+    refresh.issued_at = now - Duration::minutes(5);
+    let refreshed = install_policy(&cache, validated_policy(refresh, now), false)
+        .expect("strictly newer signed refresh clears tombstone");
+    assert_eq!(refreshed.status, PolicyCacheInstallStatus::Installed);
+    assert!(
+        cache
+            .verify_policy_action(
+                &request(SideEffectClass::External),
+                OffsetDateTime::now_utc(),
+            )
+            .allowed
+    );
+}
+
+#[test]
+fn unrelated_or_older_signed_revocation_cannot_block_current_authority() {
+    let now = OffsetDateTime::now_utc();
+    let mut current = bundle(now + Duration::hours(2), true);
+    current.issued_at = now - Duration::minutes(10);
+    let cache = cache_with_bundle(current.clone(), now);
+
+    let mut older = current.clone();
+    older.issued_at = now - Duration::minutes(20);
+    older.revocation = RevocationStatus::Revoked {
+        reason: "stale_revoke".to_string(),
+    };
+    let error = cache
+        .prepare_revocation(validated_candidate(older, now))
+        .expect_err("older revocation cannot block newer authority");
+    assert_eq!(error, PolicyCacheInstallError::RevocationRollback);
+
+    let mut unrelated = current;
+    unrelated.policy_bundle_id =
+        PolicyBundleId::try_new("pol_unrelated").expect("unrelated policy id");
+    unrelated.issued_at = now - Duration::minutes(5);
+    unrelated.revocation = RevocationStatus::Revoked {
+        reason: "unrelated_revoke".to_string(),
+    };
+    let error = cache
+        .prepare_revocation(validated_candidate(unrelated, now))
+        .expect_err("unrelated revocation cannot block current authority");
+    assert_eq!(error, PolicyCacheInstallError::RevocationUnrelated);
+    assert!(
+        cache
+            .verify_policy_action(
+                &request(SideEffectClass::External),
+                OffsetDateTime::now_utc(),
+            )
+            .allowed
+    );
+}
+
+#[test]
+fn signed_revocation_watermark_blocks_intermediate_active_and_orders_retries() {
+    let now = OffsetDateTime::now_utc();
+    let t10 = now - Duration::minutes(20);
+    let t15 = now - Duration::minutes(15);
+    let t19 = now - Duration::minutes(11);
+    let t20 = now - Duration::minutes(10);
+    let t21 = now - Duration::minutes(9);
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.issued_at = t10;
+    let cache = cache_with_bundle(active_t10.clone(), t10);
+
+    let mut revoked_t20 = active_t10.clone();
+    revoked_t20.issued_at = t20;
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let revocation = validated_candidate(revoked_t20.clone(), t20);
+    let applied = cache
+        .apply_validated_revocation_traced(revocation, &CapturingPolicyTraceRecorder::default())
+        .expect("T20 revocation commits");
+    assert_eq!(applied.status, PolicyCacheRevocationStatus::Applied);
+
+    let mut active_t15 = active_t10.clone();
+    active_t15.version = "active-t15".to_string();
+    active_t15.issued_at = t15;
+    let error = cache
+        .prepare_install(validated_policy(active_t15, now), false)
+        .expect_err("T15 active cannot clear T20 tombstone");
+    assert_eq!(error, PolicyCacheInstallError::RevocationWatermark);
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("revocation denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(denied.verification.reasons, vec!["policy_revoked"]);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let mut older_revocation = revoked_t20.clone();
+    older_revocation.issued_at = t19;
+    let error = cache
+        .prepare_revocation(validated_candidate(
+            older_revocation,
+            OffsetDateTime::now_utc(),
+        ))
+        .expect_err("older revocation cannot replace T20 watermark");
+    assert_eq!(error, PolicyCacheInstallError::RevocationRollback);
+
+    let exact = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), OffsetDateTime::now_utc()),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("exact T20 revocation retry commits");
+    assert_eq!(exact.status, PolicyCacheRevocationStatus::Idempotent);
+
+    let mut conflicting = revoked_t20;
+    conflicting.revocation = RevocationStatus::Revoked {
+        reason: "different_t20_content".to_string(),
+    };
+    let error = cache
+        .prepare_revocation(validated_candidate(conflicting, OffsetDateTime::now_utc()))
+        .expect_err("different T20 revocation content conflicts");
+    assert_eq!(error, PolicyCacheInstallError::RevocationConflict);
+
+    let mut active_t21 = active_t10;
+    active_t21.version = "active-t21-refresh".to_string();
+    active_t21.issued_at = t21;
+    let refreshed = install_policy(
+        &cache,
+        validated_policy(active_t21, OffsetDateTime::now_utc()),
+        false,
+    )
+    .expect("T21 active refresh clears T20 tombstone");
+    assert_eq!(refreshed.status, PolicyCacheInstallStatus::Installed);
+    assert!(
+        cache
+            .verify_policy_action(
+                &request(SideEffectClass::External),
+                OffsetDateTime::now_utc(),
+            )
+            .allowed
+    );
+}
+
+#[test]
+fn cache_owner_rejects_cross_agent_wrapper_and_action_forwarding() {
+    let now = OffsetDateTime::now_utc();
+    let owner_a = cache_owner();
+    let owner_b = PolicyCacheOwner {
+        tenant_id: owner_a.tenant_id.clone(),
+        agent_id: AgentId::parse("00000000-0000-0000-0000-000000000103").expect("other agent"),
+    };
+    let tenant_wide = bundle(now + Duration::hours(1), true);
+    let validated_for_a = validated_policy_for_owner(tenant_wide.clone(), now, &owner_a);
+    let cache_b = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        owner_b,
+    );
+    let error = cache_b
+        .prepare_install(validated_for_a, false)
+        .expect_err("tenant-wide wrapper validated for another agent is rejected");
+    assert_eq!(error, PolicyCacheInstallError::OwnerMismatch);
+    assert_eq!(error.reason_code(), "policy_cache_owner_mismatch");
+
+    let source_cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        owner_a.clone(),
+    );
+    let target_cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        owner_a.clone(),
+    );
+    let foreign_plan = source_cache
+        .prepare_install(
+            validated_policy_for_owner(tenant_wide.clone(), now, &owner_a),
+            false,
+        )
+        .expect("source cache plan");
+    let error = target_cache
+        .commit_install(foreign_plan)
+        .expect_err("plan cannot commit through another cache instance");
+    assert_eq!(error, PolicyCacheInstallError::ConcurrentMutation);
+
+    let cache_a = cache_with_bundle(tenant_wide, now);
+    assert!(
+        cache_a
+            .verify_policy_action(&request(SideEffectClass::External), now)
+            .allowed
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache_a),
+    );
+    let mut wrong_owner_request = request(SideEffectClass::External);
+    wrong_owner_request.agent_id = AgentId::new();
+    let denied = gateway
+        .submit(wrong_owner_request)
+        .expect("owner mismatch is a structured denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_cache_request_owner_mismatch"]
+    );
+    let mut wrong_tenant_request = request(SideEffectClass::External);
+    wrong_tenant_request.tenant_id = TenantId::new();
+    let denied = gateway
+        .submit(wrong_tenant_request)
+        .expect("wrong tenant is a structured denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_cache_request_owner_mismatch"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn failed_revocation_evidence_latches_exact_pending_watermark_until_reconciled() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now - Duration::minutes(25));
+    let mut revoked_t20 = active_t10.clone();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), now),
+            &FailingPolicyTraceRecorder {
+                fail_at: 2,
+                calls: Mutex::new(0),
+            },
+        )
+        .expect_err("missing required revocation trace fails closed");
+    assert_eq!(error.reason_code(), "policy_evidence_unavailable");
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(
+        snapshot.offline_status,
+        PolicyOfflineStatus::EvidenceUnavailable
+    );
+    assert_eq!(
+        snapshot
+            .pending_revocation
+            .expect("pending revocation watermark")
+            .issued_at,
+        revoked_t20.issued_at
+    );
+    assert_eq!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("pending revocation denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let mut active_t15 = active_t10;
+    active_t15.issued_at = now - Duration::minutes(20);
+    let error = cache
+        .prepare_install(
+            validated_policy(active_t15, OffsetDateTime::now_utc()),
+            false,
+        )
+        .expect_err("pending T20 watermark blocks T15 active replay");
+    assert_eq!(error, PolicyCacheInstallError::RevocationWatermark);
+
+    let reconciled = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, OffsetDateTime::now_utc()),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("durable retry reconciles pending revocation");
+    assert_eq!(reconciled.status, PolicyCacheRevocationStatus::Applied);
+    let snapshot = cache.snapshot();
+    assert!(snapshot.pending_revocation.is_none());
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Revoked);
+}
+
+#[test]
+fn post_trace_revocation_commit_race_latches_pending_and_exact_retry_reconciles() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.version = "active-t10-race".to_string();
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now);
+    let mut revoked_t20 = active_t10;
+    revoked_t20.version = "revoked-t20-race".to_string();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20.clone(), now),
+            &SyncFailureRevisionRaceRecorder {
+                cache: cache.clone(),
+                observed_at: now,
+                mutated: Mutex::new(false),
+            },
+        )
+        .expect_err("final-event revision race prevents original commit");
+    assert_eq!(
+        error,
+        PolicyCacheMutationError::Policy(PolicyCacheInstallError::ConcurrentMutation)
+    );
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(
+        snapshot.offline_status,
+        PolicyOfflineStatus::EvidenceUnavailable
+    );
+    assert_eq!(
+        snapshot
+            .pending_revocation
+            .expect("exact pending revocation")
+            .issued_at,
+        revoked_t20.issued_at
+    );
+    assert_eq!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache.clone()),
+    );
+    let denied = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("pending race denial is structured");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec!["policy_evidence_unavailable"]
+    );
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let reconciled = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, now),
+            &CapturingPolicyTraceRecorder::default(),
+        )
+        .expect("exact durable retry reconciles pending race");
+    assert_eq!(reconciled.status, PolicyCacheRevocationStatus::Applied);
+    let snapshot = cache.snapshot_at(now);
+    assert!(snapshot.pending_revocation.is_none());
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Revoked);
+}
+
+#[test]
+fn post_trace_revocation_commit_race_does_not_poison_strictly_newer_active_winner() {
+    let now = OffsetDateTime::now_utc();
+    let mut active_t10 = bundle(now + Duration::hours(1), true);
+    active_t10.version = "active-t10-inverse".to_string();
+    active_t10.issued_at = now - Duration::minutes(30);
+    let cache = cache_with_bundle(active_t10.clone(), now);
+    let mut revoked_t20 = active_t10.clone();
+    revoked_t20.version = "revoked-t20-inverse".to_string();
+    revoked_t20.issued_at = now - Duration::minutes(10);
+    revoked_t20.revocation = RevocationStatus::Revoked {
+        reason: "revoked_at_t20".to_string(),
+    };
+    let mut active_t30 = active_t10;
+    active_t30.version = "active-t30-inverse".to_string();
+    active_t30.issued_at = now - Duration::minutes(5);
+
+    let error = cache
+        .apply_validated_revocation_traced(
+            validated_candidate(revoked_t20, now),
+            &NewerActiveRevisionRaceRecorder {
+                cache: cache.clone(),
+                newer: Mutex::new(Some(validated_policy(active_t30, now))),
+            },
+        )
+        .expect_err("newer active winner invalidates older revocation plan");
+    assert_eq!(
+        error,
+        PolicyCacheMutationError::Policy(PolicyCacheInstallError::ConcurrentMutation)
+    );
+    let snapshot = cache.snapshot_at(now);
+    assert_eq!(snapshot.offline_status, PolicyOfflineStatus::Connected);
+    assert!(snapshot.pending_revocation.is_none());
+    assert!(snapshot.revocation.is_none());
+    assert_eq!(
+        snapshot.bundle.expect("newer active bundle").version,
+        "active-t30-inverse"
+    );
+    assert!(
+        cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .allowed
+    );
+}
+
+#[test]
+fn policy_clock_rollback_and_latched_expiry_deny_policy_action_and_gateway() {
+    let now = OffsetDateTime::now_utc();
+    let future_validation = now + Duration::minutes(10);
+    let future_cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    let mut future_observed_policy = bundle(now + Duration::hours(2), true);
+    future_observed_policy.issued_at = now;
+    install_policy(
+        &future_cache,
+        validated_policy(future_observed_policy, future_validation),
+        false,
+    )
+    .expect("trusted future observation installs");
+    assert_eq!(
+        future_cache
+            .verify_policy_invocation("static", now)
+            .verification
+            .reasons,
+        vec!["policy_clock_rollback"]
+    );
+    assert_eq!(
+        future_cache
+            .verify_policy_action(&request(SideEffectClass::External), now)
+            .reasons,
+        vec!["policy_clock_rollback"]
+    );
+    assert_eq!(
+        future_cache.snapshot_at(now).offline_status,
+        PolicyOfflineStatus::ClockRollback
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(future_cache),
+    );
+    let outcome = gateway
+        .submit(request(SideEffectClass::External))
+        .expect("clock rollback gateway denial");
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(outcome.verification.reasons, vec!["policy_clock_rollback"]);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+
+    let expiry = now + Duration::minutes(10);
+    let expiring_cache = cache_with_bundle(bundle(expiry, true), now);
+    let policy_expired = expiring_cache.verify_policy_invocation("static", expiry);
+    assert_eq!(policy_expired.verification.reasons, vec!["policy_expired"]);
+    let action_expired = expiring_cache.verify_policy_action(
+        &request(SideEffectClass::External),
+        expiry + Duration::seconds(1),
+    );
+    assert_eq!(action_expired.reasons, vec!["policy_expired"]);
+
+    let rolled_back = now + Duration::minutes(5);
+    assert_eq!(
+        expiring_cache
+            .verify_policy_invocation("static", rolled_back)
+            .verification
+            .reasons,
+        vec!["policy_clock_rollback"]
+    );
+    assert_eq!(
+        expiring_cache
+            .verify_policy_action(&request(SideEffectClass::External), rolled_back)
+            .reasons,
+        vec!["policy_clock_rollback"]
+    );
+    assert_eq!(
+        expiring_cache.snapshot_at(rolled_back).offline_status,
+        PolicyOfflineStatus::ClockRollback
+    );
 }

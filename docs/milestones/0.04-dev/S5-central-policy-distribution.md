@@ -85,9 +85,12 @@ New event variants:
 - `PolicyExpired { policy_bundle_id, version, action }`
 - `PolicyRevoked { policy_bundle_id, version, reason }`
 
-`PolicyBundleAccepted` is emitted after a validated bundle is attached to a run.
-`PolicySyncFailed` is emitted when sync failure is reported and the existing cache
-is preserved. `PolicyExpired` / `PolicyRevoked` explain fail-closed runtime
+`PolicyBundleAccepted` is persisted after validation/monotonic preparation and
+before cache commit. It is required evidence for authority mutation; if a later
+trace or commit step fails, it remains partial non-authorizing evidence.
+`PolicySyncFailed` is emitted when candidate authority is not installed. The
+prior bundle remains installed; a matching trusted revocation may additionally
+tombstone/block it. `PolicyExpired` / `PolicyRevoked` explain fail-closed runtime
 policy decisions.
 
 ## State behavior
@@ -120,8 +123,9 @@ gateways, or execute adapters.
 - Invalid signature/schema rejects run creation or sync.
 - Expired bundle rejects installation and blocks runtime authority.
 - Revoked bundle rejects installation or marks current cached authority revoked.
-- Central sync failure records `PolicySyncFailed` and keeps cached authority
-  unchanged. Raw sync/revocation reasons are sanitized before trace/cache output.
+- Central sync failure records `PolicySyncFailed`; prior cached authority remains
+  installed, while a matching trusted revocation may additionally block it. Raw
+  sync/revocation reasons are sanitized before trace/cache output.
 - Daemon run creation rejects `policy_bundle_required` requests that omit a
   signed bundle. Kernel-level caches still fail closed on missing required policy
   for direct/runtime use.
