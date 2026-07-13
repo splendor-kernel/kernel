@@ -19,7 +19,8 @@ service is involved.
    - explicit target specialist agent;
    - objective `summarize receivables`;
    - delegated authority limited to `query`/`sql`/`finance.read`;
-   - trusted `LocalDelegationAuthority` from a parent `ValidatedCapabilityGrant`.
+   - manager-derived `LocalDelegationAuthority` from the sealed root-run grant
+     binding.
 5. Pass the returned scoped child `AgentContext` to the child loop engine.
 6. If the child proposes `publish`, or proposes `query` without explicitly naming
    the delegated `sql` adapter, the loop engine records an action denial and does
@@ -89,16 +90,22 @@ let mut request = LocalDelegationRequest::new(
 );
 request.child_run_id = child_run_id;
 
-// Build LocalDelegationAuthority from a trusted parent ValidatedCapabilityGrant
-// issued by the authority/work-order path. The TaskRequest grant refs are
-// replay evidence only and do not authorize the child by themselves.
-let authority = build_local_delegation_authority(&request)?;
+// Obtain a trusted parent ValidatedCapabilityGrant from the authority/work-order
+// path. The TaskRequest grant refs are replay evidence only and do not authorize
+// the child by themselves.
+let parent_grant = issue_parent_capability_grant(&request)?;
 manager.bind_root_run_capability_grant(
     &request.parent_run_id,
-    &authority.parent_capability_grant,
+    &parent_grant,
+)?;
+let authority = manager.child_authority_for_run(
+    &request.parent_run_id,
+    specialist_principal,
+    "daemon:local",
+    time::OffsetDateTime::now_utc(),
 )?;
 let child = manager.create_child_run(&parent_runtime, &child_runtime, request, authority)?;
-assert!(child.child_agent.delegated_authority.is_some());
+assert!(child.child_agent.delegated_authority().is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -107,7 +114,7 @@ assert!(child.child_agent.delegated_authority.is_some());
 Parent run trace includes:
 
 - `DelegationRequested`
-- `MessageQueued` / `MessageDelivered` for `task_request.v1` with authority refs
+- `MessageQueued` / `MessageDelivered` for `task_request.v2` with authority refs
 - `ChildRunCompleted` or `ChildRunFailed` after response
 
 Child run trace includes:
@@ -135,8 +142,13 @@ routing, starting children, executing adapters, or live authority evaluation.
 - Child completion/failure is terminal; repeated finish attempts are rejected
   without duplicate response messages or terminal traces.
 - Recursive local delegation is allowed only through the exact issued child grant,
-  remaining depth, trusted descendant scope, and authority-owned aggregate
-  fan-out/budget. A broader replacement or nested escalation fails closed.
+  remaining depth, an explicit parent-to-child runtime edge, and authority-owned
+  aggregate fan-out/budget. A child cannot delegate to a direct root sibling; a
+  broader replacement or nested escalation fails closed.
+- Delegated action liveness and HTTP minute quotas use authority-owned service
+  time. Clock rollback and latched expiry deny; old minute buckets do not reopen.
+- Cleanup and revocation close admission first and wait only for the bounded local
+  quiescence interval. A timeout remains fail-closed for new effects.
 - Root binding retains the exact validated grant privately in one local manager;
   the public run-record grant ID is evidence only. Binding setup itself has no
   durable trace event in this bounded local example.

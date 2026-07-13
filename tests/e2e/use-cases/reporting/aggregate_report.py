@@ -76,7 +76,7 @@ S3_REQUIRED_EVENTS = {
 S3_REQUIRED_NEGATIVES = {
     "specialist_external_artifact_publish_denied",
     "unauthorized_recipient_message_denied",
-    "unsupported_message_schema_rejected_before_delivery",
+    "invalid_v2_task_request_payload_rejected_before_delivery",
     "broad_permission_data_ref_smuggling_denied",
     "cross_tenant_message_attempt_rejected",
     "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger",
@@ -1665,13 +1665,16 @@ def load_s3_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     expected_negative_kinds = {
         "specialist_external_artifact_publish_denied": "action.denied",
         "unauthorized_recipient_message_denied": "message.rejected",
-        "unsupported_message_schema_rejected_before_delivery": "message.rejected",
+        "invalid_v2_task_request_payload_rejected_before_delivery": "message.rejected",
         "broad_permission_data_ref_smuggling_denied": "delegation.rejected",
         "cross_tenant_message_attempt_rejected": "delegation.rejected",
         "specialist_quota_exhaustion_does_not_mutate_orchestrator_ledger": "action.denied",
     }
     expected_reason_text = {
-        "unsupported_message_schema_rejected_before_delivery": ["unsupported"],
+        "invalid_v2_task_request_payload_rejected_before_delivery": [
+            "missing field",
+            "parent_run_id",
+        ],
     }
     for case, item in negatives.items():
         expected_kind = expected_negative_kinds.get(case)

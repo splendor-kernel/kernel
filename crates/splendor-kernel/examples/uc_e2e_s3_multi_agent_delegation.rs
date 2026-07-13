@@ -440,7 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_id: &parent_run_id,
         schema: TASK_RESPONSE_SCHEMA,
     })?);
-    negatives.push(invalid_schema_negative(
+    negatives.push(invalid_v2_payload_negative(
         &parent_runtime,
         manager.router(),
         trace_store.as_ref(),
@@ -963,7 +963,7 @@ fn router_negative(
     })
 }
 
-fn invalid_schema_negative(
+fn invalid_v2_payload_negative(
     runtime: &KernelRuntime,
     router: &splendor_kernel::LocalMessageRouter,
     trace_store: &SqliteTraceStore,
@@ -984,24 +984,31 @@ fn invalid_schema_negative(
             requires_response: true,
             created_at: OffsetDateTime::now_utc(),
         },
-        schema_version: MessageSchemaVersion::V1,
+        schema_version: MessageSchemaVersion::V2,
         delivery_status: MessageDeliveryStatus::Pending,
         trace_links: MessageTraceLinks::default(),
     };
     let err = router
         .send(runtime, envelope)
         .expect_err("invalid schema denied");
-    let trace_id =
-        find_message_rejection_trace_id(trace_store, run_id, &message_id, "unsupported")?;
+    let trace_id = find_message_rejection_trace_id(
+        trace_store,
+        run_id,
+        &message_id,
+        "message payload validation failed for `splendor.message.task_request.v2`: missing field `parent_run_id`",
+    )?;
     Ok(NegativeEvidence {
-        case: "unsupported_message_schema_rejected_before_delivery".to_string(),
+        case: "invalid_v2_task_request_payload_rejected_before_delivery".to_string(),
         status: format!("{err}"),
-        reason_codes: vec!["unsupported_schema_version".to_string()],
+        reason_codes: vec!["task_request_v2_payload_validation_failed".to_string()],
         trace_event_ids: vec![trace_id.to_string()],
         message_id: Some(message_id.to_string()),
         adapter_executions_before: 0,
         adapter_executions_after: 0,
-        artifacts: serde_json::json!({"delivery_status": "rejected"}),
+        artifacts: serde_json::json!({
+            "delivery_status": "rejected",
+            "router_error": err.to_string()
+        }),
     })
 }
 

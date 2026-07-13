@@ -22,9 +22,9 @@ use splendor_kernel::{
     replay_local_delegations, ActionCandidate, AgentContext, AgentIsolationPolicy,
     AgentRuntimeConfig, FleetTelemetryCollector, InMemoryNodeRegistry,
     InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault, KernelRuntime,
-    KernelRuntimeConfig, LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest,
-    LocalRunStatus, LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision,
-    QuotaPolicy, RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
+    KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest, LocalRunStatus,
+    LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision, QuotaPolicy,
+    RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
     StateHandoffScope, TelemetryThresholds, TenantContext, TenantPolicy, TenantRegistry,
     TraceError, TraceEvent, TraceEventKind, TraceSink,
 };
@@ -1492,6 +1492,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         splendor_types::TaskResponseStatus::Failed
     );
 
+    let cancelled_authority = manager.child_authority_for_run(
+        &parent_run,
+        specialist_a_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    )?;
     manager.cancel_parent_run(&parent_runtime, &parent_run, "done")?;
     let cancelled_request = LocalDelegationRequest::new(
         parent_run.clone(),
@@ -1501,12 +1507,6 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority(&["parse.document"], &["doc.read"]),
         None,
     );
-    let cancelled_authority = manager.child_authority_for_run(
-        &parent_run,
-        specialist_a_principal,
-        "daemon:local",
-        OffsetDateTime::now_utc(),
-    )?;
     let cancelled_attempt = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,

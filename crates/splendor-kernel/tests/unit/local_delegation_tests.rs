@@ -572,7 +572,24 @@ fn create_nested_delegation() -> CreatedNestedDelegation {
         &[&first_request, &second_request],
     );
     manager
-        .bind_root_run_capability_grant(&parent_run_id, &root_grant)
+        .bind_root_run_capability_grant_with_edges(
+            &parent_run_id,
+            &root_grant,
+            vec![
+                LocalDelegationRuntimeEdge::new(
+                    parent.agent_id.clone(),
+                    parent_run_id.clone(),
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                ),
+                LocalDelegationRuntimeEdge::new(
+                    child.agent_id.clone(),
+                    child_run_id.clone(),
+                    grandchild.agent_id.clone(),
+                    grandchild_run_id.clone(),
+                ),
+            ],
+        )
         .expect("nested root authority bound");
 
     let (parent_runtime, parent_events) = runtime_for(parent_run_id);
@@ -3845,6 +3862,154 @@ fn nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref()
         retained_after_cleanup.verification.reasons,
         vec!["delegated_authority_inactive".to_string()]
     );
+}
+
+#[test]
+fn direct_child_cannot_delegate_to_root_sibling_before_traces_routing_or_mutation() {
+    let (
+        manager,
+        mut root,
+        mut first_child,
+        root_principal,
+        first_child_principal,
+        root_run_id,
+        first_child_run_id,
+    ) = setup_manager();
+    let sibling_principal = PrincipalId::new();
+    let sibling_run_id = RunId::new();
+    let sibling = AgentContext::new(
+        AgentId::new(),
+        root.tenant_id.clone(),
+        AgentRuntimeConfig {
+            isolation: AgentIsolationPolicy {
+                allowed_message_schemas: vec![TASK_RESPONSE_SCHEMA.to_string()],
+                allowed_message_recipients: vec![root.agent_id.clone()],
+                ..AgentIsolationPolicy::default()
+            },
+            ..AgentRuntimeConfig::default()
+        },
+    );
+    root.config
+        .isolation
+        .allowed_message_recipients
+        .push(sibling.agent_id.clone());
+    first_child
+        .config
+        .isolation
+        .allowed_message_schemas
+        .push(TASK_REQUEST_SCHEMA.to_string());
+    first_child
+        .config
+        .isolation
+        .allowed_message_recipients
+        .push(sibling.agent_id.clone());
+    manager
+        .register_agent_with_principal(
+            root.clone(),
+            root_principal.clone(),
+            authority(
+                &["query", "publish"],
+                &["sql", "artifact"],
+                &["finance.read", "artifact.publish"],
+            ),
+        )
+        .expect("root isolation updated");
+    manager
+        .register_agent_with_principal(
+            first_child.clone(),
+            first_child_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("child isolation updated");
+    manager
+        .register_agent_with_principal(
+            sibling.clone(),
+            sibling_principal.clone(),
+            authority(&["query"], &["sql"], &["finance.read"]),
+        )
+        .expect("sibling registered");
+
+    let first_request = delegation_request(
+        &root,
+        &first_child,
+        root_run_id.clone(),
+        first_child_run_id.clone(),
+    );
+    let sibling_request =
+        delegation_request(&root, &sibling, root_run_id.clone(), sibling_run_id.clone());
+    let root_grant = parent_grant_for_requests(
+        &root_principal,
+        &root.tenant_id,
+        &[&first_request, &sibling_request],
+    );
+    manager
+        .bind_root_run_capability_grant(&root_run_id, &root_grant)
+        .expect("direct sibling edges bound to root");
+    let (root_runtime, _) = runtime_for(root_run_id.clone());
+    let (first_runtime, _) = runtime_for(first_child_run_id.clone());
+    let mut first_authority = manager
+        .child_authority_for_run(
+            &root_run_id,
+            first_child_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("first child authority");
+    first_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
+    manager
+        .create_child_run(
+            &root_runtime,
+            &first_runtime,
+            first_request,
+            first_authority,
+        )
+        .expect("first direct child created");
+
+    let nested_sibling_request = delegation_request(
+        &first_child,
+        &sibling,
+        first_child_run_id.clone(),
+        sibling_run_id.clone(),
+    );
+    let nested_sibling_authority = manager
+        .child_authority_for_run(
+            &first_child_run_id,
+            sibling_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("child authority configuration");
+    let parent_before = manager.run(&first_child_run_id).expect("child run");
+    let (denial_runtime, denial_events) = runtime_for(first_child_run_id.clone());
+    let (sibling_runtime, sibling_events) = runtime_for(sibling_run_id.clone());
+    let error = manager
+        .create_child_run(
+            &denial_runtime,
+            &sibling_runtime,
+            nested_sibling_request,
+            nested_sibling_authority,
+        )
+        .expect_err("root sibling cannot become a child descendant");
+    assert!(matches!(
+        error,
+        LocalDelegationError::AuthorityDenied { ref reason }
+            if reason == "delegation_child_runtime_binding_denied"
+    ));
+    assert_delegation_rejected_without_effects(DeniedDelegationEffects {
+        manager: &manager,
+        parent: &first_child,
+        child: &sibling,
+        parent_run_id: &first_child_run_id,
+        child_run_id: &sibling_run_id,
+        parent_before: &parent_before,
+        parent_events: &denial_events,
+        child_events: &sibling_events,
+        expected_reason: "delegation_child_runtime_binding_denied",
+    });
 }
 
 #[test]

@@ -109,45 +109,57 @@ authority and fails closed before gateway submission.
 1. Register local agents, principal bindings, and maximum delegation authority.
 2. Register an active parent run for the orchestrator agent; the run snapshots the
    registered parent principal. The root is intentionally unbound at this point.
-3. Build `LocalDelegationAuthority` from a trusted parent
-   `ValidatedCapabilityGrant`, target child principal, audience, and child grant
-   refs.
-4. Call
-   `bind_root_run_capability_grant(&parent_run_id, &authority.parent_capability_grant)`.
+3. Obtain a trusted parent `ValidatedCapabilityGrant` from authority/work-order
+   admission and call
+   `bind_root_run_capability_grant(&parent_run_id, &parent_grant)`.
    The subject must match the root principal snapshot. The manager privately
    retains the exact `ValidatedCapabilityGrant`, including its trust marker.
    Same-run retry is idempotent only for exact equality; the binding cannot be
    replaced or reused for another run in that manager.
-5. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
+4. For a recursive topology, use
+   `bind_root_run_capability_grant_with_edges` instead and supply every explicit
+   parent-agent/run to child-agent/run edge. The default binding API treats each
+   paired scope entry as a direct root child; it never gives one child the root's
+   remaining sibling bindings.
+5. Ask the manager for `child_authority_for_run(...)`. This returns bounded
+   request configuration from the manager-owned opaque caller handle; it does not
+   expose or copy the validated parent grant.
+6. Call `create_child_run(parent_recorder, child_recorder, request, authority)`
    with an explicit target agent, child run ID, objective, and delegated
    authority.
-6. The manager verifies the complete supplied `ValidatedCapabilityGrant`,
-   including its private trust state, exactly equals the manager-private
-   parent-run binding, re-checks the grant subject against the registered
-   principal, and issues an authority-owned child grant at the current decision
-   time. If validation or issuance fails, it emits `DelegationRejected` and does
-   not emit `DelegationRequested`, route a task message, insert a child record,
-   or start a child run.
-7. The authority ledger atomically reserves immutable fan-out and every bounded
+7. The manager resolves the sealed caller handle for the exact parent run and
+   issues an authority-owned child grant at the current decision time. Test-only
+   compatibility constructors may also supply a parent grant, which must exactly
+   match the private binding. If validation or issuance fails, the manager emits
+   `DelegationRejected` and does not emit `DelegationRequested`, route a task
+   message, insert a child record, or start a child run.
+8. The authority ledger atomically reserves immutable fan-out and every bounded
    budget component. Root and child fan-out caps are authority-owned (currently
    16 locally); caller values do not set or change that cap. Direct sibling
-   reservations must fit component-wise inside their parent allocation.
-8. On success, the manager records `DelegationRequested`, sends a task request
+   reservations must fit component-wise inside their parent allocation. A child
+   may reserve only an explicitly assigned descendant edge; attempts to use a
+   direct root sibling deny before routing, traces, or run mutation.
+9. On success, the manager records `DelegationRequested`, sends a task request
    message carrying non-authorizing grant refs, emits `ChildRunStarted`, and
    returns a scoped child `AgentContext`. The child record retains the issued
     complete ordered `DelegationChain`, issued child grant, cleanup obligations,
     and budget reservation evidence inside the authority owner. Runtime callers
     receive only opaque handles and redacted refs. The issued grant may
     recursively create a narrower local child while remaining depth is non-zero.
-9. Every child action must carry the exact issued child grant ID. Missing, wrong,
+10. Every child action must carry the exact issued child grant ID. Missing, wrong,
    expired, revoked, over-budget, or out-of-scope evaluation denies before the
-   gateway; the legacy projection can only narrow an authority allow.
-10. The child completes or fails through `complete_child_run` or `fail_child_run`,
+   gateway; the legacy projection can only narrow an authority allow. Action
+   liveness and HTTP minute accounting use authority-owned service time. Clock
+   rollback denies, observed expiry stays latched, and an old minute bucket cannot
+   reopen authority.
+11. The child completes or fails through `complete_child_run` or `fail_child_run`,
    which sends a structured task response and emits parent/child completion or
    failure trace events.
-11. Terminal completion performs explicit ledger cleanup. Parent cancellation and
+12. Terminal completion performs explicit ledger cleanup. Parent cancellation and
     parent/child grant revocation invalidate and cancel active descendants.
-12. Completion, failure, denial, and cancellation are terminal for the child run;
+    Cleanup and revocation close new admission before a bounded quiescence wait;
+    timeout is a typed result and cannot reactivate authority.
+13. Completion, failure, denial, and cancellation are terminal for the child run;
    repeated finish attempts fail closed without emitting duplicate responses or
    duplicate completion/failure trace events.
 
@@ -201,8 +213,10 @@ or independently authorize it.
 
 Successful child records are automatically bound to the issued validated child
 grant and full chain. Recursive local delegation is supported only through that
-exact grant, for descendant identities already in trusted parent scope, and while
-depth, time, role, fan-out, and aggregate subtree budget remain narrower.
+exact grant, for descendants assigned by an explicit parent-to-child runtime edge,
+and while depth, time, role, fan-out, and aggregate subtree budget remain
+narrower. Merely appearing later in a root scope list does not make an identity a
+descendant of every earlier child.
 
 ## Gateway and verifier behavior
 
@@ -258,6 +272,8 @@ execute adapters.
   insertion.
 - Aggregate budget overflow: `aggregate_budget_exceeded_<dimension>` before
   routing. Concurrent excess fan-out receives `fan_out_exceeded` atomically.
+- Child-to-root-sibling delegation: `delegation_child_runtime_binding_denied`
+  before request/routing/start/insertion or parent/child run mutation.
 - Pre-routing failure releases the reservation; start uncertainty after routing
   consumes it fail-safe. Both transitions are replay-visible.
 - Nested widening identifies the first failing edge as
@@ -300,6 +316,10 @@ a listed agent with another listed run; that denies with
 `delegation_child_runtime_binding_denied` before routing. This indexed legacy
 bridge is intentionally narrower than the raw scope and should migrate to a
 future typed paired-binding contract rather than restore Cartesian execution.
+The default root-binding method assigns every zipped pair directly to the root.
+`bind_root_run_capability_grant_with_edges` additionally accepts a complete,
+rooted, acyclic local edge tree whose depth is bounded by the grant. Each scoped
+pair has exactly one parent, so sibling scope cannot be laundered through a child.
 
 The bounded `AUTH-007c` matrix uses the public manager/authority/router/trace path
 and covers tenant, parent agent/shared-principal, parent principal/run, child
@@ -319,11 +339,13 @@ currently emit a durable binding trace event because adding an event variant
 would expand the public trace schema. Child-creation denials remain durably
 represented by the existing `DelegationRejected` event when recording succeeds.
 
-The implementation completes the authority-owned non-gold local AUTH-003 chain,
-accounting, recursive delegation, action binding, cleanup, revocation, and replay
-path. It deliberately does not introduce Message Service/Agent Controller
-adoption, remote dispatch, fleet placement, durable/cross-instance ledger
-storage, or long-lived child services. Later
+The implementation provides a bounded authority-owned non-gold local AUTH-003
+chain, accounting, explicit recursive delegation, action binding, cleanup,
+revocation, and replay path, exercised by the local kernel E2E and runnable
+example. This is component evidence, not completion of the catalog-wide AUTH-003
+task or its Message Service/Agent Controller adoption. It deliberately does not
+introduce remote dispatch, fleet placement, durable/cross-instance ledger storage,
+or long-lived child services. Later
 cross-instance work orders can map onto the same explicit fields without changing
 the local no-ambient-authority rule. G18/G70/G71 remain `not_exercised` unless
 their executable gold fixtures are added and pass. No gold command was run.

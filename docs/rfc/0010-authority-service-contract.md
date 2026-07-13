@@ -141,7 +141,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Aggregate issue | #182, `0.2/v2 component: C02 splendor.authority-service - Authority Service` | Aggregate target only; not complete. |
 | Child issue | #238, `AUTH-001 - Define a composable capability and scope model` | Bounded local evidence only; not complete. |
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
-| Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | C02-owned non-gold local authority chain/accounting/runtime path complete; remote Message Service/Agent Controller adoption and gold remain downstream/not exercised. |
+| Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded C02-owned non-gold local authority chain/accounting/runtime evidence only; catalog-wide completion, remote Message Service/Agent Controller adoption, and gold remain downstream/not exercised. |
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
@@ -323,11 +323,14 @@ local delegation manager:
   across direct subtrees, cumulatively accounts action usage by tick, and records
   reservation lifecycle;
 - issued child grants may recursively narrow only through their exact run binding
-  and remaining trusted depth/scope/role/time/budget;
+  and an explicit authority-owned parent-to-child runtime edge, never merely
+  because another child binding appears in the same root scope;
 - every delegated action carries the exact issued child grant ID, evaluates the
-  live ledger-owned handle, and retains a final permit through gateway entry;
-- cancellation/revocation propagates through descendants. Message payload grant
-  refs remain evidence only.
+  live ledger-owned handle against maximum-observed trusted service time, latches
+  observed expiry, and retains a final permit through gateway entry;
+- cancellation/revocation propagates through descendants, closes admission before
+  a bounded typed quiescence wait, and stays closed after timeout. Message payload
+  grant refs and caller-supplied timestamps remain evidence/input data only.
 
 The bounded `AUTH-004a` slice adds conditional authority decisions and obligation
 receipt matching:
@@ -619,8 +622,9 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   coordinate remain unexpressible in this local API. The audience string and
   request target are covered without inventing a bypass.
 - recursive local delegation uses the exact issued child grant and complete chain.
-  It succeeds only for trusted descendant scope and remaining depth; a broader
-  replacement or nested escalation identifies and denies the exact failing edge.
+  It succeeds only for an explicitly assigned parent-to-child runtime edge and
+  remaining depth; a broader replacement, root-sibling substitution, or nested
+  escalation denies before effects and identifies the applicable stable reason.
 - grant-ID uniqueness is local to one `LocalDelegationManager`. The different-
   tenant matrix case uses a separate manager only to exercise grant tenant-scope
   denial and makes no cross-manager, cross-instance, or typed-audience claim.
@@ -631,9 +635,10 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   empty/nil lists and invalid or wildcard-like audiences fail closed. Raw
   capability containment still treats agent and run lists as independent set
   dimensions, but trusted root admission zips equal-length lists into exact,
-  immutable child bindings. Empty, unequal, duplicate, nil, or recombined pairs
-  deny with `delegation_child_runtime_binding_denied`; a typed paired edge remains
-  future migration work.
+  immutable direct-root child bindings. Empty, unequal, duplicate, nil, or
+  recombined pairs deny with `delegation_child_runtime_binding_denied`. The
+  additive explicit-edge root-binding API defines nested local topology without
+  changing the behavior-free `CapabilityScope` schema.
 - live delegated messages use `splendor.message.task_request.v2` and require the
   authority-owned child grant reference. v1 is retained only for non-authorizing
   replay/migration data. Delegation edge and chain schemas are v2 and each edge
@@ -817,7 +822,9 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
 | Delegation narrows | Child grant operations, scopes, time, budgets, obligations, and delegation depth cannot broaden parent authority. |
 | Messages are not authority | Delegation contracts can list allowed message schemas and recipients, and task payloads can carry grant refs for replay, but message payloads, sources, metadata, task text, and forged grant refs do not authorize child grants. |
 | Fan-out is authority-owned | Local `AUTH-003a` rejects requested fan-out caps that exceed the authority-owned parent-edge limit before issuing a child grant. |
-| Delegation accounting is atomic | The local authority ledger ignores caller fan-out as authority and atomically reserves immutable fan-out plus every bounded budget component across siblings and nested direct subtrees. |
+| Delegation accounting is atomic | The local authority ledger ignores caller fan-out as authority and atomically reserves immutable fan-out plus every bounded budget component across siblings and nested direct subtrees. Explicit rooted runtime edges prevent a child from treating a root sibling as its descendant. |
+| Delegation time is monotonic | The local authority ledger uses authority-owned service time, remembers the maximum observation, latches expiry, rejects rollback, and cannot reopen a pruned HTTP minute bucket. |
+| Delegation quiescence is bounded | Cleanup and subtree revocation close admission first, return a typed quiesced/timed-out result after a bounded wait, and never reactivate new permits after timeout. |
 | Every edge is complete | Full ordered chains preserve exact grant/run/agent refs, monotonic depth, role, time, scope, budget, and cleanup requirements; the first failing edge is deterministic. |
 | Critic/evaluator roles are non-actuating | Local `AUTH-003a` denial tests reject critic/evaluator delegations carrying actuation, external-effect, or delegation-control operations. |
 | Local delegation fails closed | Local `AUTH-003b` denies before task routing and child insertion when authority evidence is missing/invalid, parent principal binding fails, grant liveness fails, or child-grant issuance fails. |

@@ -132,8 +132,12 @@ failures. Replay is inspect-only and does not route, start, or execute anything.
   collision attempts fail before routing or child/fan-out mutation with stable
   replay-visible reasons.
 - Recursive local delegation succeeds through exact issued child grants while
-  remaining depth and trusted descendant scope permit it. Nested widening reports
-  the first failing chain edge deterministically.
+  remaining depth and an explicit parent-to-child runtime edge permit it. A child
+  cannot substitute a direct root sibling; nested widening reports the first
+  failing chain edge deterministically.
+- Delegated action liveness and HTTP minute quotas use maximum-observed authority
+  service time. Rollback and latched expiry fail closed, and cleanup/revocation
+  return after a bounded typed quiescence wait with admission still closed.
 - Aggregate sibling budget and concurrent fan-out are atomically enforced by the
   authority owner. Routing failure releases before effect; post-routing start
   uncertainty consumes fail-safe, with replay-visible evidence.
@@ -150,6 +154,8 @@ failures. Replay is inspect-only and does not route, start, or execute anything.
 | negative | Child action outside delegated scope skips gateway | `loop_engine_denies_child_action_outside_delegated_scope_and_skips_gateway` |
 | negative | Child action without explicit adapter skips gateway | `loop_engine_denies_delegated_action_without_explicit_adapter_and_skips_gateway` |
 | concurrency | Create/cancel lifecycle is serialized | `delegation_creation_and_parent_cancellation_are_serialized` |
+| concurrency | Cleanup/revocation timeout remains fail-closed | `cleanup_and_revocation_time_out_bounded_while_admission_stays_closed` |
+| negative | Direct child cannot delegate to a root sibling | `direct_child_cannot_delegate_to_root_sibling_before_traces_routing_or_mutation` |
 | failure | Structured child failure response | `failed_child_run_returns_structured_task_response_and_replays_causality` |
 | failure | Repeated child completion is terminal and idempotently rejected | `repeated_child_completion_is_rejected_without_duplicate_response` |
 | failure | Repeated/late child failure emits no duplicate failure trace | `repeated_child_failure_is_rejected_without_duplicate_failure_trace`, `child_failure_after_completion_is_rejected_without_failure_trace` |
