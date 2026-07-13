@@ -48,8 +48,9 @@ pub use fleet_telemetry::{FleetTelemetryCollector, TelemetryThresholds};
 pub use local_delegation::{
     replay_local_delegations, LocalAgentRegistration, LocalChildRun, LocalDelegationAuthority,
     LocalDelegationError, LocalDelegationManager, LocalDelegationRejection, LocalDelegationReplay,
-    LocalDelegationRequest, LocalRunRecord, LocalRunStatus, LocalTaskResponse,
-    REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION, REASON_MISSING_PARENT_RUN_GRANT_BINDING,
+    LocalDelegationRequest, LocalDelegationRuntimeEdge, LocalRunRecord, LocalRunStatus,
+    LocalTaskResponse, REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION,
+    REASON_DELEGATION_QUIESCENCE_TIMEOUT, REASON_MISSING_PARENT_RUN_GRANT_BINDING,
     REASON_PARENT_RUN_GRANT_MISMATCH,
 };
 pub use loop_engine::{

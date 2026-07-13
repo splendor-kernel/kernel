@@ -37,8 +37,9 @@ pub use delegation_ledger::{
     validate_delegation_chain, CommittedDelegation, DelegatedActionAuthorizationError,
     DelegatedActionAuthorizationRequest, DelegatedActionPermit, DelegatedRuntimeAuthorityHandle,
     DelegationCallerHandle, DelegationChainValidationError, DelegationChildRequestDefaults,
-    DelegationLedgerError, DelegationReservation, InMemoryDelegationAuthorityLedger,
-    LOCAL_DELEGATION_FAN_OUT_LIMIT,
+    DelegationCleanupOutcome, DelegationLedgerError, DelegationQuiescence, DelegationReservation,
+    DelegationRevocationOutcome, DelegationRuntimeEdge, InMemoryDelegationAuthorityLedger,
+    LOCAL_DELEGATION_FAN_OUT_LIMIT, LOCAL_DELEGATION_QUIESCENCE_TIMEOUT,
 };
 pub use evidence::{
     authority_decision_evidence, authority_reason_category, compare_authority_evidence,

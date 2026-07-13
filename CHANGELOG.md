@@ -4,7 +4,7 @@
 
 ### Added
 
-- Completed remaining non-gold, production-local AUTH-003 delegation ownership:
+- Hardened the bounded non-gold, production-local AUTH-003 delegation slice:
   the Authority Service now stores and validates immutable ordered chains,
   atomically reserves authority-owned fan-out and component-wise subtree budgets,
   supports exact-grant nested children, binds every child action to its issued
@@ -14,7 +14,17 @@
   validated grants; child actions recheck lifecycle, exact grant/run/agent
   binding, and cumulative per-tick budget, then retain a final permit through
   gateway entry. Exact semantic edge digests reject chain mutation, and exact
-  agent/run bindings reject Cartesian identity recombination. Legacy
+  agent/run bindings reject Cartesian identity recombination. Explicit rooted
+  runtime edges prevent a direct child from delegating to a root sibling while
+  preserving assigned nested descendants. Delegated action expiry and HTTP
+  minute windows use maximum-observed authority service time, so rollback cannot
+  reactivate a grant or old quota bucket. Cleanup and subtree revocation close
+  admission before a bounded typed quiescence wait rather than waiting forever.
+  A child cleanup timeout now terminally fails the manager-owned child lifecycle,
+  emits structured parent/child replay evidence, and rejects completion retry
+  after the earlier permit drops. Trusted runtime trees reject root identity reuse
+  in descendant scope, and nested role escalation names the exact failing edge.
+  Legacy
   `DelegatedAuthority` is narrowing-only. Live task requests, delegation
   edge/chain contracts, and redacted ledger trace summaries are v2; task v1 is
   replay/migration-only and full authority parameters remain ledger-owned.
@@ -93,7 +103,8 @@
   response-recipient confused-deputy paths remain deferred or unexpressible.
 - No remote/cross-instance delegation ledger, Message Service or Agent Controller
   adoption, or durable authority reservation store; recursive support is local
-  and only through exact authority-issued child grants.
+  and only through exact authority-issued child grants plus explicit runtime
+  edges. This bounded slice is not a catalog-wide AUTH-003 completion claim.
 - No cross-manager or cross-instance grant binding and no durable trace event for
   trusted local root-binding setup; the binding API remains local run admission.
 - No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7
