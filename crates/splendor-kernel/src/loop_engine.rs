@@ -541,6 +541,47 @@ impl LoopEngine {
         Ok(engine)
     }
 
+    /// Resumes a persisted loop while sharing the exact trace runtime used by a
+    /// gateway pre-effect evidence recorder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_from_shared_trace_runtime_and_work_order(
+        agent: AgentContext,
+        state_graph: StateGraph,
+        policy: Box<dyn Policy>,
+        gateway: Arc<dyn ActionGateway>,
+        trace_store: Arc<dyn TraceStore>,
+        runtime: Arc<KernelRuntime>,
+        run_id: RunId,
+        work_order: Option<&WorkOrder>,
+    ) -> Result<Self, LoopError> {
+        if runtime.run_id() != &run_id {
+            return Err(LoopError::Resume(
+                "shared trace runtime run_id does not match resumed run".to_string(),
+            ));
+        }
+        let context = RunTraceContext::new(Some(run_id.clone()));
+        let context = match work_order {
+            Some(work_order) => context.with_work_order(work_order.clone()),
+            None => context,
+        };
+        let resume = Self::resume_info(trace_store.as_ref(), &run_id)?;
+        let mut engine = Self::with_shared_trace_runtime_and_work_order(
+            agent,
+            state_graph,
+            StateData {
+                bytes: Vec::new(),
+                content_type: None,
+            },
+            policy,
+            gateway,
+            runtime,
+            context,
+        )?;
+        engine.restore_snapshot(&resume.snapshot_id)?;
+        engine.state_graph.set_tick(resume.tick_id);
+        Ok(engine)
+    }
+
     /// Returns the agent identifier for this loop.
     pub fn agent_id(&self) -> &splendor_types::AgentId {
         &self.agent.agent_id

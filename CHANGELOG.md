@@ -36,6 +36,19 @@
   permission operations, fail closed on live expiry/revocation, persist redacted
   authority allow evidence before adapter execution, and expose inspect-only
   replay summaries. Gold evidence remains `not_exercised`.
+- Integrated `splendorctl run` with the same signed-work-order C02 enforcement:
+  the CLI now preserves `ValidatedWorkOrder`, privately derives a live per-run
+  authority handle, enforces exact action/adapter/permission and identity scope,
+  rechecks expiry/revocation, and durably records authority allow evidence before
+  filesystem or HTTP adapter calls. Evidence failure blocks the effect, replay
+  remains inspect-only, and configured work orders never fall back to explicit
+  unsigned-local compatibility mode. Ambiguous multi-adapter profiles fail
+  closed because the current work-order schema does not bind actions to adapters.
+- Corrected CLI run-level trace composition so agents sharing one configured
+  `run_id` also share one runtime cursor, producing a contiguous sequence/hash
+  chain with distinct agent identities. Signed resume retains that cursor and
+  live pre-effect authority. Authority-profile admission rejection now records
+  bounded sanitized audit evidence before state or adapter effects.
 - Completed the non-gold production-local C02 service path for current local and
   resident-mode daemon run effects: immutable action/adapter/exact-
   permission profiles prevent permission omission and adapter recombination;
