@@ -8,7 +8,7 @@ implementation evidence slices plus bounded local `AUTH-006a` decision evidence
 and deterministic `AUTH-007a` adversarial/property plus `AUTH-007b` serialized
 mutation evidence, bounded `AUTH-007c` local-delegation confused-deputy replay
 evidence, bounded `AUTH-007d` exact-family version/cache-staleness evidence, and
-a completed non-gold production-local daemon/kernel/gateway C02 service
+a completed non-gold production-local daemon/CLI/kernel/gateway C02 service
 integration for the current run-effect surfaces.
 
 Scope: 0.2/v2 Authority Service child RFC for C02,
@@ -34,12 +34,13 @@ decision evidence, redacted explanation views, explicit completeness/freshness
 facts, and inspect-only comparisons. The existing gateway obligation verifier
 artifact projects only the redacted evidence digest and normalized reason-tree
 summary after trusted receipt validation and exact matching.
-The production-local integration admits one opaque live run-authority handle only
-from `ValidatedWorkOrder`, evaluates typed action, effective-adapter, and
-permission operations for every daemon run effect, and records redacted authority
-decision evidence through the shared runtime cursor after all pre-effect checks
-allow and before adapter execution. Direct `/actions`, scheduler/loop actions,
-and the existing run-bound simulated physical action path use this composition.
+The production-local daemon and CLI integrations admit one opaque live
+run-authority handle only from `ValidatedWorkOrder`. They evaluate typed action,
+effective-adapter, and permission operations for every covered run effect and
+record redacted authority decision evidence through the shared runtime cursor
+after all pre-effect checks allow and before adapter execution. Direct
+`/actions`, scheduler/loop actions, the CLI loop, and the existing run-bound
+simulated physical action path use this composition.
 The compatibility admission is explicitly temporary because the daemon does not
 yet receive C01 issuer/subject proof facts; it cannot consume raw or unsigned work
 orders and should be replaced by `issue_work_order_capability_grant` when the
@@ -121,9 +122,10 @@ Post-trace revocation commit races preserve the exact validated candidate and
 atomically latch it as pending deny-only evidence when it remains applicable;
 strictly newer active winners are not poisoned by obsolete revocation.
 It finalizes the non-gold production-local C02 service effect path for current
-daemon runs. This completion statement is limited to current local/resident
-daemon run effects; future Artifact, Driver, Data-Use, Evidence, Fleet, and
-physical helper-plan consumers remain explicit downstream adoption work. It
+daemon and `splendorctl run` effects. This completion statement is limited to
+current local/resident daemon and local CLI run effects; future Artifact, Driver,
+Data-Use, Evidence, Fleet, and physical helper-plan consumers remain explicit
+downstream adoption work. It
 does not claim all future privileged-plane adoption, full C01-backed issuance,
 full `AUTH-001`, full `AUTH-002`, remote/controller AUTH-003 adoption,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
@@ -146,7 +148,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
 | Catalog task | `AUTH-007 - Build authority adversarial/property test suites` | Bounded `AUTH-007a` deterministic local algebra/delegation/revocation/evidence properties, `AUTH-007b` deterministic serialized mutations, `AUTH-007c` production local-delegation replay hardening/matrix, and `AUTH-007d` exact-family version/cache-staleness plus daemon policy-sync evidence only; no cargo-fuzz/libFuzzer, all-plane confused-deputy harness, cross-language IAM parity, mutation testing, formal proof, or full task completion. |
-| Component | `splendor.authority-service` | Production-local daemon/kernel/gateway run-authority integration; future privileged planes remain downstream adoption. |
+| Component | `splendor.authority-service` | Production-local daemon/CLI/kernel/gateway run-authority integration; future privileged planes remain downstream adoption. |
 | Owner packages | `splendor-types` for behavior-free contracts; `splendor-authority` for evaluation/narrowing decisions | Current slice follows this ownership. |
 | Gold targets | `G01`, `G03`, `G11`, `G18`, `G43`, `G60`, `G70`, `G71`, `G73`, `G75`, `G79`, `G80`, `G83`, `G86`, `G88` | `not_exercised` until executable fixtures/harnesses pass. |
 
@@ -707,7 +709,7 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   characterization, not a compatibility claim; canonical source-byte or explicit
   migration/version handling remains absent.
 
-### Production-local daemon/kernel/gateway integration
+### Production-local daemon/CLI/kernel/gateway integration
 
 - `splendor-authority::LocalSignedWorkOrderRunAuthority` accepts only the opaque
   `ValidatedWorkOrder` produced by signature, expiry, revocation, tenant, agent,
@@ -715,13 +717,13 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   binds an unbound work order to the resolved local run and cannot self-mint from
   a raw request body.
 - The compatibility grant uses synthetic opaque local principal IDs because the
-  current daemon has no C01 issuer/subject proof provider. This is not an identity
-  claim. Downstream C01 adoption must supply active principals, signing-key proof
-  binding, and issuer workload-admission authority to
+  current daemon and CLI compositions have no C01 issuer/subject proof provider.
+  This is not an identity claim. Downstream C01 adoption must supply active
+  principals, signing-key proof binding, and issuer workload-admission authority to
   `issue_work_order_capability_grant`, then preserve the same kernel handle.
-- `splendor-kernel::RunAuthorityHandle` is the daemon-facing composition facade;
-  the daemon does not depend on `splendor-authority`. Every effect evaluates one
-  typed gateway-action operation, one effective-adapter operation, and each
+- `splendor-kernel::RunAuthorityHandle` is the runtime-facing composition facade;
+  the daemon and CLI do not depend on `splendor-authority`. Every effect evaluates
+  one typed gateway-action operation, one effective-adapter operation, and each
   required-permission operation against the live grant. Existing tenant/agent
   allowlists can narrow the result but cannot create an allow without C02.
 - Grant expiry, maximum observed trusted time, and the monotonic local revocation
@@ -794,6 +796,19 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   behind the existing C01 boundary; C02 does not cryptographically authenticate
   resident credentials. Production caller authentication and principal proof
   binding remain deferred to C01.
+- `splendorctl run` preserves the exact `ValidatedWorkOrder` returned by local
+  signature/expiry/revocation/identity/placement admission and derives the same
+  opaque run handle privately. Its per-run gateway uses immutable action,
+  adapter, and exact-permission profiles plus the shared loop trace runtime.
+  Profile ambiguity, live expiry/revocation, or mandatory pre-effect evidence
+  failure stops filesystem/HTTP invocation. A configured signed run never
+  downgrades to the compatibility evaluator used by explicit unsigned local
+  development mode.
+- The CLI accepts one adapter in the current signed work-order profile because
+  the wire contract has independent action and adapter lists and cannot express
+  a trusted pairing. This is fail-closed compatibility behavior, not a new
+  work-order schema. Resume requires the same run-bound work order and restores
+  state while retaining the shared evidence cursor.
 - Inspect-only replay reads durable verification records, including effect-free
   denials, and returns redacted typed decision summaries and digests. Allowed
   decisions are durably recorded before the effect. Replay does not call authority evaluators,

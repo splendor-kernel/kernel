@@ -1253,6 +1253,43 @@ fn loop_engine_resumes_from_trace_store() {
 }
 
 #[test]
+fn shared_trace_runtime_resume_rejects_mismatched_run() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let runtime_run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(runtime_run_id))
+            .expect("runtime"),
+    );
+    let requested_run_id = RunId::new();
+    let graph = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let agent = AgentContext::new(
+        splendor_types::AgentId::new(),
+        splendor_types::TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+
+    let result = LoopEngine::resume_from_shared_trace_runtime_and_work_order(
+        agent,
+        graph,
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store,
+        runtime,
+        requested_run_id,
+        None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Resume(message))
+            if message == "shared trace runtime run_id does not match resumed run"
+    ));
+}
+
+#[test]
 fn action_candidate_builder_methods() {
     let action = Action {
         name: "build".to_string(),

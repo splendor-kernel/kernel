@@ -87,9 +87,27 @@ Signature validation failures emit a sanitized `WorkOrderRejected` audit trace
 event without signature material or the verification secret. Valid work orders
 emit `WorkOrderAccepted` and attach `work_order_id` to agent runtime metadata.
 
+For a validated signed work order, `splendorctl run` retains the validated
+wrapper and privately derives one opaque live run-authority handle. Every
+filesystem or HTTP action must match the signed action, effective adapter, and
+exact permission profile; live authority is checked again before adapter
+execution. An allowed decision is durably appended to the run trace before the
+effect. Expiry, local revocation, a profile mismatch, or failure to append that
+evidence denies or requests intervention with no adapter call.
+
+The current work-order contract lists actions and adapters independently, so the
+CLI accepts exactly one allowed adapter for an executable signed run rather than
+guessing action/adapter pairings. Each action profile requires the complete
+signed `allowed_permissions` set. Ambiguous multi-adapter or duplicate/oversized
+permission profiles fail closed after work-order validation; they never fall
+back to unsigned execution.
+
 `allow_unsigned_local_run: true` exists only so older local quickstarts remain
-runnable. It prints a warning and should not be used for resident, fleet,
-remote, or production operation.
+runnable. It prints a warning and uses the legacy local gateway without a signed
+run-authority grant. It is considered only when `work_order` is absent; a
+configured work order that fails validation or authority-profile construction
+never falls back to it. This mode should not be used for resident, fleet, remote,
+or production operation.
 
 ### Percepts
 
