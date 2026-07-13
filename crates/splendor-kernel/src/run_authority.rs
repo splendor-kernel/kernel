@@ -38,6 +38,17 @@ impl RunAuthorityHandle {
         self.authority.revoke();
     }
 
+    /// Closes admission for new effects without waiting for prior permits.
+    pub fn close_effect_admission(&self) {
+        self.authority.close_effect_admission();
+    }
+
+    /// Waits for effects permitted before admission closed to quiesce.
+    /// Callers must not hold broad runtime locks while waiting.
+    pub fn wait_for_effect_quiescence(&self) {
+        self.authority.wait_for_effect_quiescence();
+    }
+
     /// Returns the number of typed C02 operation evaluations.
     pub fn evaluation_count(&self) -> u64 {
         self.authority.evaluation_count()

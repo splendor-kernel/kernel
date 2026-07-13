@@ -110,6 +110,37 @@ fn final_effect_permit_linearizes_before_revocation_and_closes_new_admission() {
 }
 
 #[test]
+fn effect_admission_closure_is_separate_from_quiescence_waiting() {
+    let now = OffsetDateTime::now_utc();
+    let authority = admitted(now);
+    let permit = authority
+        .acquire_effect_permit(vec![gateway_action_operation("fixture.write")], now)
+        .permit
+        .expect("final effect permit");
+
+    authority.close_effect_admission();
+    let denied =
+        authority.acquire_effect_permit(vec![gateway_action_operation("fixture.write")], now);
+    assert!(denied.permit.is_none());
+    assert_eq!(denied.decisions[0].status, AuthorityDecisionStatus::Denied);
+
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let waiting = authority.clone();
+    let thread = std::thread::spawn(move || {
+        waiting.wait_for_effect_quiescence();
+        completed_tx.send(()).expect("quiescence completion");
+    });
+    assert!(completed_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    drop(permit);
+    completed_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("quiescence follows permit release");
+    thread.join().expect("quiescence thread");
+}
+
+#[test]
 fn final_effect_permit_rechecks_expiry_after_early_allow() {
     let now = OffsetDateTime::now_utc();
     let authority = admitted(now);

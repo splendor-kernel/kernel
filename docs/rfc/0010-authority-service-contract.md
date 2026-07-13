@@ -759,6 +759,23 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   Existing custom evaluator implementations inherit a `NotRequired` final-permit
   default for source compatibility; if they return an early live evaluation but
   do not implement the final permit, the gateway returns `NeedsIntervention`.
+- The daemon separates monotonic effect-admission closure from quiescence waiting.
+  Terminal run transitions close the live handle before terminal status is
+  published. The global registry owns only shared per-run references; direct and
+  physical handlers release per-run state before gateway/evidence/adapter work,
+  while stop/cancel release per-run state before waiting for earlier final
+  permits. The authority permit therefore linearizes terminal closure without a
+  hung effect blocking lifecycle access or unrelated-run inspection. Completion
+  of an earlier effect cannot overwrite a concurrently published terminal state.
+  Direct and run-bound physical action endpoints enter the gateway only for
+  `pending` or `running`; suspended, resuming, and terminal run states fail closed
+  first.
+- Until a production renewal service can atomically prove equal-or-narrower
+  replacement authority, daemon resume requires the original `work_order_id` and
+  a domain-separated digest of the exact canonical admitted payload normalized to
+  the resolved run binding. Signature validation of a different work order does
+  not replace the live handle or authorize resume, and `start` cannot resume a
+  paused run.
 - Conditional live decisions regenerate the current decision in the gateway.
   Requesters may submit only raw receipts; requester-supplied decision envelopes
   are not the current authority. `LocalAuthorityObligationVerifier` validates the

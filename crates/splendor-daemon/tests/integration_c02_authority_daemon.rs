@@ -4,26 +4,111 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use splendor_daemon::{
     router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonActionCandidate, DaemonConfig,
-    DaemonState, LifecycleRequest, RegisteredAction, ReplayResponse, RunInspectResponse,
-    SubmitActionRequest, TickResponse, TracePageResponse,
+    DaemonState, DevicePolicyCacheStatus, DeviceRuntimeProfile, DeviceTraceBufferStatus,
+    LifecycleRequest, RegisterDeviceProfileRequest, RegisteredAction, ReplayResponse,
+    RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest, SubmitPhysicalActionRequest,
+    TickResponse, TracePageResponse,
 };
 use splendor_gateway::{ActionOutcome, ActionStatus};
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, AgentId, AuditAttribution, AuthorityDecisionStatus, CallerCredential, ClientPrincipal,
-    CredentialAudience, CredentialBinding, EndpointScope, InstanceId, QuotaUsage, RevocationStatus,
-    RunId, SideEffectClass, TenantId, TickId, TraceEvent, TraceEventKind, TraceId, WorkOrder,
-    WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    WORK_ORDER_SCHEMA_VERSION,
+    CredentialAudience, CredentialBinding, EndpointScope, InstanceId, NodeId, QuotaUsage,
+    RevocationStatus, RunId, SideEffectClass, TenantId, TickId, TraceEvent, TraceEventKind,
+    TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    FORBIDDEN_PHYSICAL_ACTION_PATTERNS, WORK_ORDER_SCHEMA_VERSION,
 };
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
 const ACTION: &str = "fixture.write";
 const ADAPTER: &str = "fixture.local";
 const PERMISSION: &str = "fixture.write";
+
+static DEVICE_SIM_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct DeviceSimEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl DeviceSimEnvGuard {
+    fn disabled() -> Self {
+        let lock = DEVICE_SIM_ENV_LOCK
+            .lock()
+            .expect("device simulator env lock");
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+        Self { _lock: lock }
+    }
+
+    fn enabled(url: &str) -> Self {
+        let lock = DEVICE_SIM_ENV_LOCK
+            .lock()
+            .expect("device simulator env lock");
+        std::env::set_var("SPLENDOR_DEVICE_SIM_URL", url);
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for DeviceSimEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+    }
+}
+
+fn spawn_blocking_device_sim() -> (
+    String,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind blocking device simulator");
+    let address = listener.local_addr().expect("device simulator address");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept adapter request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set adapter request timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).expect("read adapter request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        entered_tx.send(()).expect("adapter entered signal");
+        release_rx.recv().expect("adapter release signal");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .expect("write simulator response");
+    });
+    (format!("http://{address}"), entered_rx, release_tx, server)
+}
 
 #[derive(Default)]
 struct FailingAuthorityEvidenceStore {
@@ -37,21 +122,26 @@ impl FailingAuthorityEvidenceStore {
     }
 }
 
+fn is_authority_allow(payload: &Value) -> bool {
+    serde_json::from_value::<TraceEvent>(payload.clone())
+        .ok()
+        .is_some_and(|event| match event.kind {
+            TraceEventKind::ActionVerificationCompleted { result, .. } => {
+                result
+                    .artifacts
+                    .pointer("/authority/pre_effect_recorded")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            }
+            _ => false,
+        })
+}
+
 impl TraceStore for FailingAuthorityEvidenceStore {
     fn append(&self, run_id: &str, payload: Value) -> Result<u64, TraceStoreError> {
-        let is_authority_allow = serde_json::from_value::<TraceEvent>(payload.clone())
-            .ok()
-            .is_some_and(|event| match event.kind {
-                TraceEventKind::ActionVerificationCompleted { result, .. } => {
-                    result
-                        .artifacts
-                        .pointer("/authority/pre_effect_recorded")
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                }
-                _ => false,
-            });
-        if is_authority_allow && self.fail_next_authority_allow.swap(false, Ordering::SeqCst) {
+        if is_authority_allow(&payload)
+            && self.fail_next_authority_allow.swap(false, Ordering::SeqCst)
+        {
             return Err(TraceStoreError::Poisoned);
         }
         self.inner.append(run_id, payload)
@@ -216,6 +306,142 @@ fn create_request(
     }
 }
 
+fn physical_action() -> Action {
+    Action {
+        name: "move_to_waypoint".to_string(),
+        params: json!({"zone_ref": "zone_a"}),
+        side_effect_class: SideEffectClass::Custom("physical.high_level".to_string()),
+        cost_estimate: None,
+        required_permissions: vec!["device.motion".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    }
+}
+
+fn physical_create_request(id: &str, tenant_id: TenantId, agent_id: AgentId) -> CreateRunRequest {
+    let work_order = WorkOrderEnvelope::signed_with_shared_secret(
+        WorkOrder {
+            schema_version: WORK_ORDER_SCHEMA_VERSION.to_string(),
+            work_order_id: WorkOrderId::try_new(id).expect("physical work order id"),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: None,
+            objective: "C02 physical lifecycle concurrency".to_string(),
+            allowed_actions: vec!["move_to_waypoint".to_string()],
+            allowed_adapters: vec!["device-sim".to_string()],
+            allowed_permissions: vec!["device.motion".to_string()],
+            data_refs: vec!["device:c02".to_string()],
+            quotas: WorkOrderQuotaPolicy::default(),
+            placement: WorkOrderPlacement::default(),
+            issued_at: OffsetDateTime::now_utc() - Duration::minutes(1),
+            expires_at: OffsetDateTime::now_utc() + Duration::minutes(5),
+            revocation: RevocationStatus::Active,
+        },
+        "work-order-local-key",
+        b"splendor-local-work-order-secret",
+    )
+    .expect("signed physical work order");
+    CreateRunRequest {
+        request_id: format!("req_{id}"),
+        idempotency_key: format!("idem_{id}"),
+        tenant_id,
+        agent_id,
+        work_order,
+        credential: None,
+        audit_attribution: Some(audit()),
+        allowed_actions: vec!["move_to_waypoint".to_string()],
+        allowed_adapters: vec!["device-sim".to_string()],
+        allowed_permissions: vec!["device.motion".to_string()],
+        policy_actions: Vec::new(),
+        policy_bundle_required: false,
+        policy_bundle: None,
+        registered_actions: vec![RegisteredAction {
+            name: "move_to_waypoint".to_string(),
+            adapter: "device-sim".to_string(),
+            required_permissions: Some(vec!["device.motion".to_string()]),
+        }],
+        approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
+        allowed_percept_schemas: Vec::new(),
+        allowed_percept_sources: Vec::new(),
+        initial_state: None,
+        snapshot_interval: None,
+    }
+}
+
+fn device_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile {
+    DeviceRuntimeProfile {
+        node_id,
+        tenant_id,
+        device_kind: "drone_sim".to_string(),
+        capabilities: vec!["motion.waypoint".to_string()],
+        allowed_physical_actions: vec!["move_to_waypoint".to_string()],
+        forbidden_action_classes: FORBIDDEN_PHYSICAL_ACTION_PATTERNS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        safety_constraints: json!({"min_battery_percent": 0.25}),
+        runtime_mode: "resident".to_string(),
+        safety_status: json!({"emergency_stop_clear": true}),
+        policy_cache: DevicePolicyCacheStatus {
+            policy_id: "policy_c02_concurrency".to_string(),
+            loaded: true,
+            ttl_seconds: 300,
+            expires_at: (OffsetDateTime::now_utc() + Duration::minutes(5))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("policy cache expiry"),
+            expired: false,
+        },
+        trace_buffer: DeviceTraceBufferStatus {
+            enabled: true,
+            buffered_records: 0,
+            integrity: "hash_chain_v1".to_string(),
+        },
+        registered_at: "pending".to_string(),
+    }
+}
+
+fn physical_submit_request(
+    created: &CreateRunResponse,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    causal_trace_id: splendor_types::TraceEventId,
+) -> SubmitPhysicalActionRequest {
+    SubmitPhysicalActionRequest {
+        action_request: SubmitActionRequest {
+            action_id: None,
+            run_id: created.run_id.clone(),
+            tenant_id,
+            agent_id,
+            credential: None,
+            audit_attribution: Some(audit()),
+            causal_trace_id: Some(causal_trace_id),
+            action: physical_action(),
+            adapter: Some("device-sim".to_string()),
+            quota_usage: Some(QuotaUsage::single_action()),
+            satisfied_preconditions: Vec::new(),
+            approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
+        },
+        safety_context: SafetyContext {
+            allowed_zone_refs: vec!["zone_a".to_string()],
+            zone_ref: Some("zone_a".to_string()),
+            altitude_m: Some(10.0),
+            max_altitude_m: Some(30.0),
+            battery_percent: Some(0.80),
+            privacy_clear: true,
+            human_proximity_clear: true,
+            emergency_stop_clear: true,
+            offline: false,
+            policy_cache_expired: false,
+            high_risk: false,
+            cloud_helper_direct_authority: false,
+            cloud_helper_proposal_id: None,
+        },
+        operator_intervention_evidence: None,
+    }
+}
+
 async fn call_json<T: DeserializeOwned>(
     app: axum::Router,
     method: Method,
@@ -297,6 +523,28 @@ async fn submit(
     requested_action: Action,
     adapter: &str,
 ) -> ActionOutcome {
+    let request = submit_request(
+        app.clone(),
+        created,
+        tenant_id,
+        agent_id,
+        requested_action,
+        adapter,
+    )
+    .await;
+    let (status, outcome) = call_json(app, Method::POST, "/actions", request).await;
+    assert_eq!(status, StatusCode::OK);
+    outcome
+}
+
+async fn submit_request(
+    app: axum::Router,
+    created: &CreateRunResponse,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    requested_action: Action,
+    adapter: &str,
+) -> SubmitActionRequest {
     let causal = traces(app.clone(), &created.run_id)
         .await
         .records
@@ -304,29 +552,21 @@ async fn submit(
         .and_then(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
         .map(|event| event.trace_event_id)
         .unwrap_or_else(|| TraceId::from_run_sequence(&created.run_id, 0));
-    let (status, outcome) = call_json(
-        app,
-        Method::POST,
-        "/actions",
-        SubmitActionRequest {
-            action_id: None,
-            run_id: created.run_id.clone(),
-            tenant_id,
-            agent_id,
-            credential: None,
-            audit_attribution: Some(audit()),
-            causal_trace_id: Some(causal),
-            action: requested_action,
-            adapter: Some(adapter.to_string()),
-            quota_usage: Some(QuotaUsage::single_action()),
-            satisfied_preconditions: Vec::new(),
-            approval_evidence: None,
-            authority_obligation_receipts: Vec::new(),
-        },
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    outcome
+    SubmitActionRequest {
+        action_id: None,
+        run_id: created.run_id.clone(),
+        tenant_id,
+        agent_id,
+        credential: None,
+        audit_attribution: Some(audit()),
+        causal_trace_id: Some(causal),
+        action: requested_action,
+        adapter: Some(adapter.to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    }
 }
 
 async fn inspect(app: axum::Router, run_id: &RunId) -> RunInspectResponse {
@@ -409,6 +649,7 @@ async fn assert_direct_action_trace(
 
 #[tokio::test]
 async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
+    let _device_sim_env = DeviceSimEnvGuard::disabled();
     let state = DaemonState::local_dev();
     let app = router(state.clone());
     let tenant_id = TenantId::new();
@@ -768,6 +1009,7 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
 
 #[tokio::test]
 async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
+    let _device_sim_env = DeviceSimEnvGuard::disabled();
     let app = router(DaemonState::local_dev());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -837,6 +1079,7 @@ async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
 
 #[tokio::test]
 async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
+    let _device_sim_env = DeviceSimEnvGuard::disabled();
     let instance_id = InstanceId::new();
     let state = DaemonState::new(DaemonConfig::resident(instance_id.clone()));
     let app = router(state.clone());
@@ -882,11 +1125,18 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let causal_trace_id = trace_page
+    let resident_events = trace_page
         .records
         .iter()
         .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
-        .map(|event| event.trace_event_id)
+        .collect::<Vec<_>>();
+    assert!(!resident_events.is_empty());
+    assert!(resident_events
+        .iter()
+        .all(|event| event.identity.instance_id.as_ref() == Some(&instance_id)));
+    let causal_trace_id = resident_events
+        .iter()
+        .map(|event| event.trace_event_id.clone())
         .next()
         .expect("resident run causal trace");
 
@@ -983,4 +1233,180 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
         assert_eq!(error.code, expected_code, "{label}");
     }
+}
+
+async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: bool) {
+    let (simulator_url, entered, release, simulator) = spawn_blocking_device_sim();
+    let _device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
+    let state = DaemonState::local_dev();
+    let app = router(state);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let other_tenant_id = TenantId::new();
+    let other_agent_id = AgentId::new();
+
+    let primary_create = if physical {
+        physical_create_request(
+            "wo_c02_physical_concurrency",
+            tenant_id.clone(),
+            agent_id.clone(),
+        )
+    } else {
+        create_request(
+            "wo_c02_direct_concurrency",
+            tenant_id.clone(),
+            agent_id.clone(),
+            OffsetDateTime::now_utc() + Duration::minutes(5),
+            false,
+        )
+    };
+    let other_create = create_request(
+        if physical {
+            "wo_c02_physical_other_run"
+        } else {
+            "wo_c02_direct_other_run"
+        },
+        other_tenant_id,
+        other_agent_id,
+        OffsetDateTime::now_utc() + Duration::minutes(5),
+        false,
+    );
+    let (status, primary): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", primary_create).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, other): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", other_create).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let node_id = NodeId::new();
+    if physical {
+        let (status, _registered): (StatusCode, Value) = call_json(
+            app.clone(),
+            Method::POST,
+            "/devices/profiles",
+            RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(audit()),
+                profile: device_profile(node_id.clone(), tenant_id.clone()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let causal_trace_id = traces(app.clone(), &primary.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("primary causal trace");
+    let (action_uri, action_body) = if physical {
+        (
+            format!("/devices/{node_id}/actions"),
+            serde_json::to_value(physical_submit_request(
+                &primary,
+                tenant_id.clone(),
+                agent_id.clone(),
+                causal_trace_id,
+            ))
+            .expect("physical action request"),
+        )
+    } else {
+        (
+            "/actions".to_string(),
+            serde_json::to_value(SubmitActionRequest {
+                action_id: None,
+                run_id: primary.run_id.clone(),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                credential: None,
+                audit_attribution: Some(audit()),
+                causal_trace_id: Some(causal_trace_id),
+                action: action(ACTION, PERMISSION),
+                adapter: Some(ADAPTER.to_string()),
+                quota_usage: Some(QuotaUsage::single_action()),
+                satisfied_preconditions: Vec::new(),
+                approval_evidence: None,
+                authority_obligation_receipts: Vec::new(),
+            })
+            .expect("direct action request"),
+        )
+    };
+    let post_close_body = action_body.clone();
+    let action_app = app.clone();
+    let action_uri_for_task = action_uri.clone();
+    let action_task = tokio::spawn(async move {
+        call_json::<ActionOutcome>(action_app, Method::POST, &action_uri_for_task, action_body)
+            .await
+    });
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("adapter entered after final permit");
+
+    let lifecycle_uri = format!(
+        "/runs/{}/{}",
+        primary.run_id,
+        if cancel { "cancel" } else { "stop" }
+    );
+    let lifecycle_app = app.clone();
+    let lifecycle_task = tokio::spawn(async move {
+        call_json::<RunInspectResponse>(
+            lifecycle_app,
+            Method::POST,
+            &lifecycle_uri,
+            LifecycleRequest {
+                credential: None,
+                work_order: None,
+                audit_attribution: Some(audit()),
+                reason: Some("blocked adapter lifecycle closure".to_string()),
+                approval_evidence: None,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if inspect(app.clone(), &primary.run_id).await.status == RunStatus::Cancelled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal status becomes inspectable while adapter is blocked");
+    assert!(
+        !lifecycle_task.is_finished(),
+        "stop/cancel must wait for the earlier final permit"
+    );
+    assert_eq!(
+        inspect(app.clone(), &other.run_id).await.status,
+        RunStatus::Pending,
+        "unrelated run inspection must not wait for blocked effect"
+    );
+
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, &action_uri, post_close_body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "run_not_effect_capable");
+
+    release.send(()).expect("release blocking adapter");
+    simulator.join().expect("blocking simulator");
+    let (status, outcome) = action_task.await.expect("action task");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome.status, ActionStatus::Executed, "{outcome:?}");
+    let (status, stopped) = lifecycle_task.await.expect("lifecycle task");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stopped.status, RunStatus::Cancelled);
+    let final_inspect = inspect(app, &primary.run_id).await;
+    assert_eq!(final_inspect.status, RunStatus::Cancelled);
+    assert_eq!(final_inspect.adapter_executions, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_action_handlers_release_run_ownership_during_blocked_effects() {
+    assert_blocked_handler_lifecycle_linearization(false, false).await;
+    assert_blocked_handler_lifecycle_linearization(true, true).await;
 }

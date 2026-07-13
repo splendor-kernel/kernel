@@ -254,21 +254,38 @@ impl LocalSignedWorkOrderRunAuthority {
         }
     }
 
-    /// Monotonically revokes this live local run grant and waits for effects that
-    /// acquired an earlier permit to leave the adapter boundary. New permits are
-    /// denied as soon as revocation takes the authority-state lock.
-    pub fn revoke(&self) {
+    /// Monotonically closes admission for new effects without waiting for
+    /// already-permitted effects to leave the adapter boundary.
+    pub fn close_effect_admission(&self) {
         let Ok(mut state) = self.inner.state.lock() else {
             return;
         };
-        state.revoked = true;
-        state.generation = state.generation.saturating_add(1);
+        if !state.revoked {
+            state.revoked = true;
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    /// Waits for effects permitted before admission closed to leave the adapter
+    /// boundary. Callers must not retain broad runtime locks while waiting.
+    pub fn wait_for_effect_quiescence(&self) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
         while state.in_flight_effects > 0 {
             let Ok(next) = self.inner.quiesced.wait(state) else {
                 return;
             };
             state = next;
         }
+    }
+
+    /// Monotonically revokes this live local run grant and waits for effects that
+    /// acquired an earlier permit to leave the adapter boundary. New permits are
+    /// denied as soon as revocation takes the authority-state lock.
+    pub fn revoke(&self) {
+        self.close_effect_admission();
+        self.wait_for_effect_quiescence();
     }
 
     /// Current monotonic authority generation.
