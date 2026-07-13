@@ -2,8 +2,8 @@
 
 ## Status and binding
 
-**Status:** Accepted  
-**Accepted:** 2026-07-13  
+**Status:** Accepted
+**Accepted:** 2026-07-13
 **Compatibility line:** additive 0.1 transport/security correction on the active
 0.2/v2 line
 
