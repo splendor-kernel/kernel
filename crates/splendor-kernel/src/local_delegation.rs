@@ -8,20 +8,22 @@
 //! execute.
 
 use crate::{
-    AgentContext, LocalMessageRouter, MessageRouter, MessageRouterError, MessageTraceRecorder,
+    AgentContext, LocalMessageRouter, MessageRouter, MessageRouterConfig, MessageRouterError,
+    MessageTraceRecorder,
 };
 use splendor_authority::{
     compatibility_permission_operation, gateway_action_operation, gateway_adapter_operation,
-    issue_delegation_child_grant, DelegationChildGrantRequest, DelegationValidationContext,
-    RevocationSnapshot, ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
+    DelegationChildGrantRequest, InMemoryDelegationAuthorityLedger, RevocationSnapshot,
+    ValidatedCapabilityGrant, REASON_AUTHORITY_GRANT_REVOKED,
 };
 use splendor_types::{
     AgentId, AuthorityBudgetScope, AuthorityOperation, CapabilityGrantId, CapabilityScope,
-    DelegatedAuthority, DelegationResultContract, DelegationRoleProfile,
-    LocalDelegationAuthorityEvidence, LocalDelegationTraceContext, Message, MessageEnvelope,
-    MessageId, MessageTraceContext, MessageValidationError, PrincipalId, RunId, TaskFailure,
-    TaskRequest, TaskResponse, TaskResponseStatus, TenantId, TraceEvent, TraceEventKind, TraceId,
-    DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    DelegatedAuthority, DelegationChain, DelegationLedgerEvidence, DelegationResultContract,
+    DelegationRoleProfile, LocalDelegationAuthorityEvidence, LocalDelegationTraceContext, Message,
+    MessageEnvelope, MessageId, MessageTraceContext, MessageValidationError, PrincipalId, RunId,
+    TaskFailure, TaskRequest, TaskResponse, TaskResponseStatus, TenantId, TraceEvent,
+    TraceEventKind, TraceId, DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    TASK_RESPONSE_SCHEMA,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -91,6 +93,8 @@ pub struct LocalRunRecord {
     pub capability_grant_id: Option<CapabilityGrantId>,
     /// Non-authorizing parent/child authority evidence refs for child runs.
     pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
+    /// Complete immutable authority-owned chain through this run.
+    pub delegation_chain: Option<DelegationChain>,
     /// Scoped objective for child runs.
     pub objective: Option<String>,
     /// Parent trace event that recorded the delegation request.
@@ -124,11 +128,11 @@ pub struct LocalDelegationAuthority {
     pub expires_at: OffsetDateTime,
     /// Child role/profile for authority checks.
     pub role_profile: DelegationRoleProfile,
-    /// Child budget cap mirrored into the child capability scope.
+    /// Desired child budget; authority ledger validation/reservation is authoritative.
     pub budget: AuthorityBudgetScope,
     /// Remaining child delegation depth requested for the child grant.
     pub max_delegation_depth: u32,
-    /// Authority-owned fan-out limit for this parent edge.
+    /// Legacy requested fan-out projection; the authority ledger ignores it as authority.
     pub max_fan_out: u32,
     /// Local validation digest for child-grant evidence.
     pub validation_digest: String,
@@ -230,6 +234,7 @@ impl LocalDelegationRequest {
             target_agent_id: self.target_agent_id.clone(),
             objective: self.objective.clone(),
             authority_evidence: None,
+            delegation_ledger: None,
         }
     }
 }
@@ -245,6 +250,8 @@ pub struct LocalChildRun {
     pub request_message: MessageEnvelope,
     /// Child-run start trace ID.
     pub child_started_trace_id: TraceId,
+    /// Exact authority-issued validated grant required by nested delegation and actions.
+    pub child_capability_grant: ValidatedCapabilityGrant,
 }
 
 /// Result of completing or failing a child run.
@@ -370,6 +377,7 @@ pub enum LocalDelegationError {
 /// Local-only delegation manager for parent/child run admission and trace links.
 pub struct LocalDelegationManager {
     router: LocalMessageRouter,
+    authority_ledger: InMemoryDelegationAuthorityLedger,
     lifecycle: Mutex<()>,
     state: Mutex<LocalDelegationState>,
 }
@@ -386,6 +394,7 @@ impl std::fmt::Debug for LocalDelegationManager {
         formatter
             .debug_struct("LocalDelegationManager")
             .field("router", &self.router)
+            .field("authority_ledger", &self.authority_ledger)
             .field("lifecycle", &"<mutex>")
             .field("state", &"<redacted trusted grant bindings>")
             .finish()
@@ -395,8 +404,14 @@ impl std::fmt::Debug for LocalDelegationManager {
 impl LocalDelegationManager {
     /// Creates a manager backed by an in-memory local router.
     pub fn new() -> Self {
+        Self::with_router_config(MessageRouterConfig::default())
+    }
+
+    /// Creates a manager with explicit local routing limits for deterministic failures.
+    pub fn with_router_config(config: MessageRouterConfig) -> Self {
         Self {
-            router: LocalMessageRouter::new(),
+            router: LocalMessageRouter::with_config(config),
+            authority_ledger: InMemoryDelegationAuthorityLedger::new(),
             lifecycle: Mutex::new(()),
             state: Mutex::new(LocalDelegationState::default()),
         }
@@ -461,6 +476,7 @@ impl LocalDelegationManager {
             authority: agent.authority.clone(),
             capability_grant_id: None,
             authority_evidence: None,
+            delegation_chain: None,
             objective: None,
             parent_trace_id: None,
             status: LocalRunStatus::Running,
@@ -527,6 +543,12 @@ impl LocalDelegationManager {
                 requested_run_id: run_id.clone(),
             });
         }
+
+        self.authority_ledger
+            .register_root(grant)
+            .map_err(|error| LocalDelegationError::AuthorityDenied {
+                reason: error.reason_code(),
+            })?;
 
         let run = state
             .runs
@@ -681,7 +703,7 @@ impl LocalDelegationManager {
 
         let decision_time = OffsetDateTime::now_utc();
 
-        let issued_child_grant = match issue_delegation_child_grant(
+        let reservation = match self.authority_ledger.reserve_child(
             &authority.parent_capability_grant,
             delegation_child_grant_request(
                 &parent_run,
@@ -690,17 +712,13 @@ impl LocalDelegationManager {
                 &authority,
                 &authority_evidence,
             ),
-            DelegationValidationContext {
-                now: decision_time,
-                audience: authority.audience.clone(),
-                expected_child_subject: target_agent.principal_id.clone(),
-                parent_fan_out_limit: authority.max_fan_out,
-                current_parent_fan_out: parent_run.child_run_ids.len() as u32,
-            },
+            decision_time,
+            authority.audience.clone(),
+            target_agent.principal_id.clone(),
         ) {
-            Ok(issued_child_grant) => issued_child_grant,
+            Ok(reservation) => reservation,
             Err(error) => {
-                let reason = error.reason_code().to_string();
+                let reason = error.reason_code();
                 parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
                     delegation: trace_context
                         .clone()
@@ -710,6 +728,7 @@ impl LocalDelegationManager {
                 return Err(LocalDelegationError::AuthorityDenied { reason });
             }
         };
+        let issued_child_grant = reservation.issued();
         if let Some(reason) =
             child_grant_liveness_denial(issued_child_grant.child_grant(), decision_time)
         {
@@ -730,7 +749,9 @@ impl LocalDelegationManager {
             issued_child_grant.child_grant().grant().grant_id.clone(),
         );
         let child_capability_grant = issued_child_grant.child_grant().clone();
-        trace_context = trace_context.with_authority_evidence(issued_evidence.clone());
+        trace_context = trace_context
+            .with_authority_evidence(issued_evidence.clone())
+            .with_delegation_ledger(reservation.evidence().clone());
 
         let requested_trace =
             parent_recorder.record_message_event(TraceEventKind::DelegationRequested {
@@ -764,16 +785,58 @@ impl LocalDelegationManager {
         )?;
         let request_message_id = request_message.message_id.clone();
         let request_envelope = MessageEnvelope::new(request_message)?;
-        let routed_request = self.router.send(parent_recorder, request_envelope)?;
+        let routed_request = match self.router.send(parent_recorder, request_envelope) {
+            Ok(routed) => routed,
+            Err(error) => {
+                let reason = format!("routing_failed:{error}");
+                let released = self
+                    .authority_ledger
+                    .release(&reservation, reason.clone())
+                    .map_err(|ledger_error| LocalDelegationError::AuthorityDenied {
+                        reason: ledger_error.reason_code(),
+                    })?;
+                parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                    delegation: trace_context.clone().with_delegation_ledger(released),
+                    reason,
+                })?;
+                return Err(LocalDelegationError::Router(error));
+            }
+        };
         trace_context = trace_context.with_request_message(request_message_id.clone());
 
-        let child_started_trace =
-            child_recorder.record_message_event(TraceEventKind::ChildRunStarted {
-                delegation: trace_context.clone(),
+        let committed = self
+            .authority_ledger
+            .commit(&reservation)
+            .map_err(|error| LocalDelegationError::AuthorityDenied {
+                reason: error.reason_code(),
             })?;
+        trace_context = trace_context.with_delegation_ledger(committed);
+        let child_started_trace =
+            match child_recorder.record_message_event(TraceEventKind::ChildRunStarted {
+                delegation: trace_context.clone(),
+            }) {
+                Ok(trace_id) => trace_id,
+                Err(error) => {
+                    let reason = format!("child_start_trace_failed:{error}");
+                    let consumed = self
+                        .authority_ledger
+                        .consume_after_routing_failure(&reservation, reason.clone())
+                        .map_err(|ledger_error| LocalDelegationError::AuthorityDenied {
+                            reason: ledger_error.reason_code(),
+                        })?;
+                    parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                        delegation: trace_context.clone().with_delegation_ledger(consumed),
+                        reason,
+                    })?;
+                    return Err(LocalDelegationError::Router(error));
+                }
+            };
 
         let mut child_agent = target_agent.agent.clone();
-        child_agent.set_delegated_authority(request.delegated_authority.clone());
+        child_agent.set_delegated_capability_grant(
+            child_capability_grant.clone(),
+            request.delegated_authority.clone(),
+        );
         let child_record = LocalRunRecord {
             run_id: request.child_run_id.clone(),
             agent_id: request.target_agent_id.clone(),
@@ -784,6 +847,7 @@ impl LocalDelegationManager {
             authority: request.delegated_authority,
             capability_grant_id: Some(issued_evidence.child_capability_grant_id.clone()),
             authority_evidence: Some(issued_evidence),
+            delegation_chain: Some(reservation.evidence().chain.clone()),
             objective: Some(request.objective),
             parent_trace_id: Some(requested_trace),
             status: LocalRunStatus::Running,
@@ -803,13 +867,14 @@ impl LocalDelegationManager {
             .insert(request.child_run_id, child_record.clone());
         state
             .run_grants
-            .insert(child_record.run_id.clone(), child_capability_grant);
+            .insert(child_record.run_id.clone(), child_capability_grant.clone());
 
         Ok(LocalChildRun {
             run: child_record,
             child_agent,
             request_message: routed_request,
             child_started_trace_id: child_started_trace,
+            child_capability_grant,
         })
     }
 
@@ -868,7 +933,7 @@ impl LocalDelegationManager {
     ) -> Result<Option<LocalTaskResponse>, LocalDelegationError> {
         let _lifecycle = self.lock_lifecycle()?;
         let now = OffsetDateTime::now_utc();
-        let cancellation_reason = {
+        let cancellation = {
             let state = self.lock_state()?;
             let child = state
                 .runs
@@ -879,31 +944,96 @@ impl LocalDelegationManager {
             }
             if let Some(evidence) = child.authority_evidence.as_ref() {
                 match revocations.revokes_grant_id_at(&evidence.parent_capability_grant_id, now) {
-                    Err(error) => Some(error.reason_code().to_string()),
-                    Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
+                    Err(error) => Some((
+                        error.reason_code().to_string(),
+                        evidence.child_capability_grant_id.clone(),
+                    )),
+                    Ok(true) => Some((
+                        REASON_AUTHORITY_GRANT_REVOKED.to_string(),
+                        evidence.parent_capability_grant_id.clone(),
+                    )),
                     Ok(false) => match revocations
                         .revokes_grant_id_at(&evidence.child_capability_grant_id, now)
                     {
-                        Err(error) => Some(error.reason_code().to_string()),
-                        Ok(true) => Some(REASON_AUTHORITY_GRANT_REVOKED.to_string()),
+                        Err(error) => Some((
+                            error.reason_code().to_string(),
+                            evidence.child_capability_grant_id.clone(),
+                        )),
+                        Ok(true) => Some((
+                            REASON_AUTHORITY_GRANT_REVOKED.to_string(),
+                            evidence.child_capability_grant_id.clone(),
+                        )),
                         Ok(false) => None,
                     },
                 }
             } else if child.parent_run_id.is_some() {
-                Some(REASON_MISSING_AUTHORITY_EVIDENCE.to_string())
+                child
+                    .capability_grant_id
+                    .clone()
+                    .map(|grant_id| (REASON_MISSING_AUTHORITY_EVIDENCE.to_string(), grant_id))
             } else {
                 None
             }
         };
-        let Some(cancellation_reason) = cancellation_reason else {
+        let Some((cancellation_reason, revoked_grant_id)) = cancellation else {
             return Ok(None);
         };
+
+        let revoked = self
+            .authority_ledger
+            .revoke_subtree(&revoked_grant_id, cancellation_reason.clone())
+            .map_err(|error| LocalDelegationError::AuthorityDenied {
+                reason: error.reason_code(),
+            })?;
+
+        let mut descendant_events = Vec::new();
+        {
+            let mut state = self.lock_state()?;
+            for evidence in &revoked {
+                if let Some(edge) = evidence.chain.grants.last() {
+                    if let Some(run) = state.runs.get_mut(&edge.child_run_id) {
+                        if edge.child_run_id != *child_run_id && !run.status.is_terminal() {
+                            run.status = LocalRunStatus::Cancelled;
+                            descendant_events.push((run.clone(), evidence.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (descendant, evidence) in descendant_events {
+            let parent = self.run(descendant.parent_run_id.as_ref().ok_or_else(|| {
+                LocalDelegationError::UnknownParentRun(descendant.run_id.clone())
+            })?)?;
+            parent_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                delegation: LocalDelegationTraceContext {
+                    parent_run_id: parent.run_id,
+                    child_run_id: descendant.run_id,
+                    parent_trace_id: descendant.parent_trace_id,
+                    request_message_id: descendant.request_message_id,
+                    response_message_id: None,
+                    source_agent_id: parent.agent_id,
+                    target_agent_id: descendant.agent_id,
+                    objective: descendant.objective.unwrap_or_default(),
+                    authority_evidence: descendant.authority_evidence,
+                    delegation_ledger: Some(evidence),
+                },
+                failure: revocation_cancellation_failure(cancellation_reason.clone()),
+            })?;
+        }
 
         self.cancel_child_run_for_revocation_with_lifecycle(
             parent_recorder,
             child_recorder,
             child_run_id,
             revocation_cancellation_failure(cancellation_reason),
+            revoked.into_iter().find(|evidence| {
+                evidence
+                    .chain
+                    .grants
+                    .last()
+                    .is_some_and(|edge| edge.child_run_id == *child_run_id)
+            }),
         )
         .map(Some)
     }
@@ -925,14 +1055,58 @@ impl LocalDelegationManager {
             .ok_or_else(|| LocalDelegationError::UnknownParentRun(parent_run_id.clone()))?;
         parent.status = LocalRunStatus::Cancelled;
         let agent_id = parent.agent_id.clone();
+        let root_grant_id = parent.capability_grant_id.clone();
+        let revoked = if let Some(grant_id) = root_grant_id.as_ref() {
+            self.authority_ledger
+                .revoke_subtree(grant_id, reason.clone())
+                .map_err(|error| LocalDelegationError::AuthorityDenied {
+                    reason: error.reason_code(),
+                })?
+        } else {
+            Vec::new()
+        };
+        let mut descendant_events = Vec::new();
+        for evidence in revoked {
+            let Some(edge) = evidence.chain.grants.last() else {
+                continue;
+            };
+            if let Some(child) = state.runs.get_mut(&edge.child_run_id) {
+                if child.status.is_terminal() {
+                    continue;
+                }
+                child.status = LocalRunStatus::Cancelled;
+                descendant_events.push((child.clone(), evidence));
+            }
+        }
         drop(state);
-        Ok(
+        let cancellation_trace =
             parent_recorder.record_message_event(TraceEventKind::ParentRunCancelled {
                 parent_run_id: parent_run_id.clone(),
                 agent_id,
-                reason,
-            })?,
-        )
+                reason: reason.clone(),
+            })?;
+        for (child, evidence) in descendant_events {
+            let parent =
+                self.run(child.parent_run_id.as_ref().ok_or_else(|| {
+                    LocalDelegationError::UnknownParentRun(child.run_id.clone())
+                })?)?;
+            parent_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                delegation: LocalDelegationTraceContext {
+                    parent_run_id: parent.run_id,
+                    child_run_id: child.run_id,
+                    parent_trace_id: Some(cancellation_trace.clone()),
+                    request_message_id: child.request_message_id,
+                    response_message_id: None,
+                    source_agent_id: parent.agent_id,
+                    target_agent_id: child.agent_id,
+                    objective: child.objective.unwrap_or_default(),
+                    authority_evidence: child.authority_evidence,
+                    delegation_ledger: Some(evidence),
+                },
+                failure: TaskFailure::new("parent_run_cancelled", reason.clone(), false),
+            })?;
+        }
+        Ok(cancellation_trace)
     }
 
     /// Returns a run record snapshot.
@@ -1008,14 +1182,24 @@ impl LocalDelegationManager {
             target_agent_id: child.agent_id.clone(),
             objective: child.objective.clone().unwrap_or_default(),
             authority_evidence: child.authority_evidence.clone(),
+            delegation_ledger: None,
         };
         context.parent_trace_id = child.parent_trace_id.clone();
+        if let Some(grant_id) = child.capability_grant_id.as_ref() {
+            let cleanup = self
+                .authority_ledger
+                .cleanup(grant_id, format!("child_{status:?}").to_lowercase())
+                .map_err(|error| LocalDelegationError::AuthorityDenied {
+                    reason: error.reason_code(),
+                })?;
+            context = context.with_delegation_ledger(cleanup);
+        }
 
-        let child_trace_id = match status {
+        let child_trace_result = match status {
             TaskResponseStatus::Completed => {
                 child_recorder.record_message_event(TraceEventKind::ChildRunCompleted {
                     delegation: context.clone(),
-                })?
+                })
             }
             TaskResponseStatus::Failed
             | TaskResponseStatus::Denied
@@ -1026,9 +1210,43 @@ impl LocalDelegationManager {
                 child_recorder.record_message_event(TraceEventKind::ChildRunFailed {
                     delegation: context.clone(),
                     failure: failure_for_trace,
-                })?
+                })
             }
         };
+        let child_trace_id = match child_trace_result {
+            Ok(trace_id) => trace_id,
+            Err(error) => {
+                let reason = format!("child_cleanup_trace_failed:{error}");
+                if let Some(grant_id) = child.capability_grant_id.as_ref() {
+                    let retained = self
+                        .authority_ledger
+                        .retain_after_cleanup_trace_failure(grant_id, reason.clone())
+                        .map_err(|ledger_error| LocalDelegationError::AuthorityDenied {
+                            reason: ledger_error.reason_code(),
+                        })?;
+                    context = context.with_delegation_ledger(retained);
+                }
+                if let Some(child_record) = self.lock_state()?.runs.get_mut(child_run_id) {
+                    child_record.status = LocalRunStatus::Cancelled;
+                }
+                parent_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                    delegation: context,
+                    failure: TaskFailure::new("child_cleanup_trace_failed", reason, false),
+                })?;
+                return Err(LocalDelegationError::Router(error));
+            }
+        };
+
+        // Cleanup and its child-side trace are durable before response routing.
+        // A routing/parent-trace failure therefore cannot leave the child active.
+        if let Some(child_record) = self.lock_state()?.runs.get_mut(child_run_id) {
+            child_record.status = match status {
+                TaskResponseStatus::Completed => LocalRunStatus::Completed,
+                TaskResponseStatus::Failed => LocalRunStatus::Failed,
+                TaskResponseStatus::Denied => LocalRunStatus::Denied,
+                TaskResponseStatus::Cancelled => LocalRunStatus::Cancelled,
+            };
+        }
 
         let failure = failure.map(|failure| failure.with_trace_id(child_trace_id.clone()));
         let response = TaskResponse::new(
@@ -1080,12 +1298,6 @@ impl LocalDelegationManager {
 
         let mut state = self.lock_state()?;
         if let Some(child_record) = state.runs.get_mut(child_run_id) {
-            child_record.status = match status {
-                TaskResponseStatus::Completed => LocalRunStatus::Completed,
-                TaskResponseStatus::Failed => LocalRunStatus::Failed,
-                TaskResponseStatus::Denied => LocalRunStatus::Denied,
-                TaskResponseStatus::Cancelled => LocalRunStatus::Cancelled,
-            };
             child_record.response_message_id = Some(response_message_id);
         }
 
@@ -1103,6 +1315,7 @@ impl LocalDelegationManager {
         child_recorder: &dyn MessageTraceRecorder,
         child_run_id: &RunId,
         failure: TaskFailure,
+        ledger_evidence: Option<DelegationLedgerEvidence>,
     ) -> Result<LocalTaskResponse, LocalDelegationError> {
         let (child, parent) =
             {
@@ -1143,7 +1356,11 @@ impl LocalDelegationManager {
             target_agent_id: child.agent_id.clone(),
             objective: child.objective.clone().unwrap_or_default(),
             authority_evidence: child.authority_evidence.clone(),
+            delegation_ledger: None,
         };
+        if let Some(ledger_evidence) = ledger_evidence {
+            context = context.with_delegation_ledger(ledger_evidence);
+        }
 
         let child_trace_id =
             child_recorder.record_message_event(TraceEventKind::ChildRunFailed {
@@ -1223,7 +1440,7 @@ impl Default for LocalDelegationManager {
 }
 
 /// Replay summary for local delegation relationships and task messages.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LocalDelegationReplay {
     /// Parent/child edges reconstructed from delegation trace events.
     pub delegations: Vec<LocalDelegationTraceContext>,
@@ -1233,10 +1450,12 @@ pub struct LocalDelegationReplay {
     pub failures: Vec<TaskFailure>,
     /// Rejected delegation contexts with their stable denial reasons.
     pub rejections: Vec<LocalDelegationRejection>,
+    /// Ordered authority chain/reservation/cleanup/revocation ledger transitions.
+    pub ledger_events: Vec<DelegationLedgerEvidence>,
 }
 
 /// Inspect-only replay evidence for one rejected local delegation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalDelegationRejection {
     /// Parent/child and authority-evidence context recorded with the rejection.
     pub delegation: LocalDelegationTraceContext,
@@ -1255,6 +1474,9 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
             TraceEventKind::DelegationRequested { delegation }
             | TraceEventKind::ChildRunStarted { delegation }
             | TraceEventKind::ChildRunCompleted { delegation } => {
+                if let Some(evidence) = delegation.delegation_ledger.clone() {
+                    replay.ledger_events.push(evidence);
+                }
                 let key = (
                     delegation.parent_run_id.clone(),
                     delegation.child_run_id.clone(),
@@ -1262,9 +1484,17 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                 if !seen_delegations.contains(&key) {
                     seen_delegations.push(key);
                     replay.delegations.push(delegation.clone());
+                } else if let Some(existing) = replay.delegations.iter_mut().find(|existing| {
+                    existing.parent_run_id == delegation.parent_run_id
+                        && existing.child_run_id == delegation.child_run_id
+                }) {
+                    *existing = delegation.clone();
                 }
             }
             TraceEventKind::DelegationRejected { delegation, reason } => {
+                if let Some(evidence) = delegation.delegation_ledger.clone() {
+                    replay.ledger_events.push(evidence);
+                }
                 let key = (
                     delegation.parent_run_id.clone(),
                     delegation.child_run_id.clone(),
@@ -1272,6 +1502,11 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                 if !seen_delegations.contains(&key) {
                     seen_delegations.push(key);
                     replay.delegations.push(delegation.clone());
+                } else if let Some(existing) = replay.delegations.iter_mut().find(|existing| {
+                    existing.parent_run_id == delegation.parent_run_id
+                        && existing.child_run_id == delegation.child_run_id
+                }) {
+                    *existing = delegation.clone();
                 }
                 replay.rejections.push(LocalDelegationRejection {
                     delegation: delegation.clone(),
@@ -1282,6 +1517,9 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                 delegation,
                 failure,
             } => {
+                if let Some(evidence) = delegation.delegation_ledger.clone() {
+                    replay.ledger_events.push(evidence);
+                }
                 let key = (
                     delegation.parent_run_id.clone(),
                     delegation.child_run_id.clone(),
@@ -1289,6 +1527,11 @@ pub fn replay_local_delegations(events: &[TraceEvent]) -> LocalDelegationReplay 
                 if !seen_delegations.contains(&key) {
                     seen_delegations.push(key);
                     replay.delegations.push(delegation.clone());
+                } else if let Some(existing) = replay.delegations.iter_mut().find(|existing| {
+                    existing.parent_run_id == delegation.parent_run_id
+                        && existing.child_run_id == delegation.child_run_id
+                }) {
+                    *existing = delegation.clone();
                 }
                 replay.failures.push(failure.clone());
             }
@@ -1423,17 +1666,17 @@ fn authority_operations(authority: &DelegatedAuthority) -> Vec<AuthorityOperatio
 
 fn child_capability_scope(
     parent_run: &LocalRunRecord,
-    request: &LocalDelegationRequest,
+    _request: &LocalDelegationRequest,
     authority: &LocalDelegationAuthority,
 ) -> CapabilityScope {
-    CapabilityScope {
-        tenant_ids: Some(vec![parent_run.tenant_id.clone()]),
-        agent_ids: Some(vec![request.target_agent_id.clone()]),
-        run_ids: Some(vec![request.child_run_id.clone()]),
-        audiences: Some(vec![authority.audience.clone()]),
-        budget: authority.budget,
-        ..CapabilityScope::default()
-    }
+    // Preserve the authority-owned descendant identity dimensions from the
+    // validated parent grant so an issued child can recursively narrow them.
+    // The requested budget remains a desired reservation and is atomically
+    // validated/accounted by the authority ledger before it becomes authority.
+    let mut scope = authority.parent_capability_grant.grant().scope.clone();
+    scope.tenant_ids = Some(vec![parent_run.tenant_id.clone()]);
+    scope.budget = authority.budget;
+    scope
 }
 
 fn ensure_recorder_run(

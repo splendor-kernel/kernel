@@ -546,6 +546,37 @@ pub struct DelegationResultContract {
     pub max_result_bytes: Option<u64>,
 }
 
+/// Authority-owned cleanup requirements attached to every delegated child.
+///
+/// The strict default is also used when reading older v1 delegation records
+/// that predate this additive field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DelegationCleanupObligations {
+    /// Cancelling or revoking an ancestor must cancel all active descendants.
+    pub cancel_descendants: bool,
+    /// Descendant grant authority must be invalidated with the ancestor.
+    pub revoke_descendant_grants: bool,
+    /// A reservation may be released only before routing has produced effects.
+    pub release_before_routing_failure: bool,
+    /// Routing/start uncertainty consumes the reservation fail-safe.
+    pub consume_after_routing_uncertainty: bool,
+}
+
+impl Default for DelegationCleanupObligations {
+    fn default() -> Self {
+        Self {
+            cancel_descendants: true,
+            revoke_descendant_grants: true,
+            release_before_routing_failure: true,
+            consume_after_routing_uncertainty: true,
+        }
+    }
+}
+
+fn cleanup_obligations_are_default(value: &DelegationCleanupObligations) -> bool {
+    value == &DelegationCleanupObligations::default()
+}
+
 /// Behavior-free delegation edge that embeds the narrowed child capability grant.
 ///
 /// This record is a serializable contract only. Authority validation, parent-edge
@@ -587,6 +618,9 @@ pub struct DelegationGrant {
     pub remaining_delegation_depth: u32,
     /// Maximum children this parent edge may fan out to.
     pub max_fan_out: u32,
+    /// Mandatory child cleanup and descendant propagation requirements.
+    #[serde(default, skip_serializing_if = "cleanup_obligations_are_default")]
+    pub cleanup_obligations: DelegationCleanupObligations,
     /// Embedded behavior-free child capability grant.
     pub child_capability_grant: CapabilityGrant,
 }
@@ -602,6 +636,40 @@ pub struct DelegationChain {
     pub grants: Vec<DelegationGrant>,
     /// Maximum allowed chain depth for the recorded chain evidence.
     pub max_depth: u32,
+}
+
+/// Lifecycle state of one atomic authority-owned delegation budget reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationReservationStatus {
+    /// Budget/fan-out was atomically reserved before routing.
+    Reserved,
+    /// Routing and child start succeeded and the immutable edge is active.
+    Committed,
+    /// A pre-routing failure released budget and fan-out.
+    Released,
+    /// Routing may have occurred, so budget/fan-out was consumed fail-safe.
+    ConsumedAfterRoutingFailure,
+    /// The child reached terminal cleanup and released its active reservation.
+    Cleaned,
+    /// Revocation/cancellation invalidated the edge and descendants.
+    Revoked,
+}
+
+/// Replay-safe evidence for an authority-owned delegation ledger transition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationLedgerEvidence {
+    /// Complete immutable ordered chain through the affected child edge.
+    pub chain: DelegationChain,
+    /// Budget reserved component-wise for this edge.
+    pub budget: AuthorityBudgetScope,
+    /// Immutable authority-owned fan-out cap of the parent edge.
+    pub parent_fan_out_limit: u32,
+    /// Reservation lifecycle state represented by this trace transition.
+    pub status: DelegationReservationStatus,
+    /// Stable reason for release, fail-safe consumption, cleanup, or revocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Authority evaluation request.

@@ -434,6 +434,14 @@ export interface LocalDelegationTraceContext {
   source_agent_id: AgentId;
   target_agent_id: AgentId;
   objective: string;
+  authority_evidence?: {
+    schema_version: "splendor.message.local_delegation_authority_evidence.v1";
+    parent_capability_grant_id: string;
+    child_capability_grant_id: string;
+    authority_reason?: string;
+  };
+  /** Additive v1 complete-chain and authority reservation lifecycle evidence. */
+  delegation_ledger?: JsonValue;
 }
 
 export interface TaskFailure {

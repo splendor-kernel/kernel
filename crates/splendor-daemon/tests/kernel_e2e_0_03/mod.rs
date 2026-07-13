@@ -1403,6 +1403,11 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         OffsetDateTime::now_utc(),
     );
     child_a_authority.max_fan_out = 4;
+    child_a_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
     let child_a = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -1437,6 +1442,11 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         OffsetDateTime::now_utc(),
     );
     child_b_authority.max_fan_out = 4;
+    child_b_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
     let child_b = manager.create_child_run(
         &parent_runtime,
         &child_b_runtime,
@@ -1472,16 +1482,20 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
 
     let laundering_denial = child_a
         .child_agent
-        .verify_delegated_action(
+        .verify_delegated_action_with_grant(
             &action(
                 "summarize.document",
                 SideEffectClass::External,
                 &["doc.read"],
             ),
             Some("fixture"),
+            &child_a_run,
+            child_a.run.capability_grant_id.as_ref(),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
         )
         .reasons;
-    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
+    assert!(laundering_denial.contains(&"operation_not_granted".to_string()));
     manager.cancel_parent_run(&parent_runtime, &parent_run, "done")?;
     let cancelled_request = LocalDelegationRequest::new(
         parent_run.clone(),
@@ -3234,9 +3248,16 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     )?;
     let laundering_denial = child
         .child_agent
-        .verify_delegated_action(&daemon_action("denied_action"), Some("daemon.local"))
+        .verify_delegated_action_with_grant(
+            &daemon_action("denied_action"),
+            Some("daemon.local"),
+            &child_run_id,
+            child.run.capability_grant_id.as_ref(),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+        )
         .reasons;
-    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
+    assert!(laundering_denial.contains(&"operation_not_granted".to_string()));
 
     let (source_runtime, source_events) = runtime_for(run_id.clone());
     let (target_runtime, target_events) = runtime_for(run_id.clone());

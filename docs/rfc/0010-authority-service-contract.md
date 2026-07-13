@@ -65,8 +65,9 @@ Grant IDs are unique across root and child bindings within one manager, grant
 subjects must match the run principal snapshot, and child creation rejects a
 missing, content-mismatched, or colliding binding before request, routing,
 child-start, insertion, or fan-out effects. Successful child records retain the
-issued grant privately for exact binding plus its ID for evidence/revocation;
-recursive local delegation remains unsupported.
+issued grant privately for exact binding plus its complete chain. The local
+authority ledger supports recursive narrowing, atomic aggregate budget/fan-out
+reservations, cleanup, and descendant revocation while depth remains.
 `AUTH-007d` adds an exact-family current-v1 versus v0/v2 rejection matrix for
 authority operations, scopes, grants, requests, revocation records, and policy
 bundles. It also closes the policy-distribution gap that previously accepted a
@@ -89,7 +90,9 @@ workflow execution, MFA/provider integration, gate-engine migration, obligation
 receipt storage, production PKI, external revocation introspection, production
 lease renewal, revocation watches, incident-controller integration, or introduce
 a new adapter execution path. It adds optional local
-trace/message/run-record authority reference fields for `AUTH-003b`, optional
+trace/message/run-record authority reference fields for `AUTH-003b`, additive
+`DelegationGrant.cleanup_obligations` and optional delegation-ledger trace
+evidence (older v1 payloads use strict defaults/absence), optional
 gateway action obligation evidence for `AUTH-004b`, and a matching optional
 `@splendor/types` primitive field for schema parity. `AUTH-005a` adds no public
 schema churn; it exposes authority-crate Rust types/functions that cache only
@@ -115,7 +118,7 @@ daemon runs. This completion statement is limited to current local/resident
 daemon run effects; future Artifact, Driver, Data-Use, Evidence, Fleet, and
 physical helper-plan consumers remain explicit downstream adoption work. It
 does not claim all future privileged-plane adoption, full C01-backed issuance,
-full `AUTH-001`, full `AUTH-002`, full `AUTH-003`,
+full `AUTH-001`, full `AUTH-002`, remote/controller AUTH-003 adoption,
 full `AUTH-004`, full `AUTH-005`, full `AUTH-006`, G01, G03, G11, G18, G43,
 G60, G70, G71, G73, G75, G79, G80, G83, G86, G88, full `AUTH-007`, issue
 closure, or gold completion.
@@ -131,7 +134,7 @@ Until exact executable fixtures pass, gold targets `G01`, `G03`, `G11`, `G18`, `
 | Aggregate issue | #182, `0.2/v2 component: C02 splendor.authority-service - Authority Service` | Aggregate target only; not complete. |
 | Child issue | #238, `AUTH-001 - Define a composable capability and scope model` | Bounded local evidence only; not complete. |
 | Catalog task | `AUTH-002 - Implement issuance and signed work-order integration` | Bounded `AUTH-002a` Rust bridge evidence only; not complete. |
-| Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | Bounded `AUTH-003a` local child-grant contract/builder plus `AUTH-003b` runtime-local manager wiring evidence only; not complete. |
+| Catalog task | `AUTH-003 - Implement delegation chains and sub-agent authority narrowing` | C02-owned non-gold local authority chain/accounting/runtime path complete; remote Message Service/Agent Controller adoption and gold remain downstream/not exercised. |
 | Catalog task | `AUTH-004 - Implement obligations and approval requirements as authority results` | Bounded `AUTH-004a` conditional decision/receipt matching plus `AUTH-004b` local gateway receipt verification evidence only; not complete. |
 | Catalog task | `AUTH-005 - Implement revocation, lease renewal, and offline authority behavior` | Bounded `AUTH-005a` local revocation snapshot/offline validated-grant cache, `AUTH-005b` local renewal preflight, and `AUTH-005c` local delegated child revocation propagation evidence only; no production lease renewal or production revocation service. |
 | Catalog task | `AUTH-006 - Implement authority decision evidence and explainability` | Bounded `AUTH-006a` deterministic local records/redacted views/wrappers/inspect-only comparison and gateway artifact projection only; no Evidence Service, durable bundle/store, policy archive, or historical re-evaluation. |
@@ -305,7 +308,16 @@ local delegation manager:
   and replay output carry `LocalDelegationAuthorityEvidence` with parent and
   child `CapabilityGrantId` values;
 - `DelegatedAuthority` remains a legacy compatibility restriction checked before
-  gateway submission and is not standalone capability authority.
+  gateway submission and is not standalone capability authority;
+- `InMemoryDelegationAuthorityLedger` is the sole local validity/accounting owner:
+  it stores exact roots and complete immutable ordered chains, validates each
+  edge with deterministic index/reason, owns fan-out, atomically reserves every
+  budget component across direct subtrees, and records reservation lifecycle;
+- issued child grants may recursively narrow only through their exact run binding
+  and remaining trusted depth/scope/role/time/budget;
+- every delegated action carries and evaluates the exact issued child grant ID;
+- cancellation/revocation propagates through descendants. Message payload grant
+  refs remain evidence only.
 
 The bounded `AUTH-004a` slice adds conditional authority decisions and obligation
 receipt matching:
@@ -445,9 +457,9 @@ The bounded `AUTH-005c` slice wires local child revocation propagation into
 - stale or future-dated trusted snapshots cancel active child runs fail-closed
   with `TaskFailure` codes `authority_revocation_snapshot_stale` or
   `authority_revocation_snapshot_future_dated`, `retryable=false`;
-- revocation cancellation marks the child run terminal/cancelled before fallible
-  trace recording or response routing. If trace or router work fails, the method
-  returns the error but does not leave the child run active;
+- revocation cancellation invalidates the authority-ledger subtree and marks
+  active descendants terminal/cancelled before fallible response routing. Existing
+  trace failure behavior returns the error without leaving authority active;
 - root-run registration participates in the same local lifecycle lock and
   returns the local `DuplicateRun` error for every existing root or child run ID;
   it never replaces active or terminal run records, authority evidence, or
@@ -462,10 +474,12 @@ The bounded `AUTH-005c` slice wires local child revocation propagation into
   not emit duplicate responses or trace events;
 - message payload grant refs remain non-authorizing and are not inspected for
   revocation authority;
+- cleanup/revocation obligations and complete subtree evidence are retained in
+  the local ledger and replay;
 - this remains local snapshot consumption only: no production revocation watch,
   external introspection, daemon/API/client workflow, gateway verifier, node/fleet
-  policy-cache integration, incident-controller quarantine, cleanup obligations,
-  durable evidence store, or gold fixture is added.
+  policy-cache integration, incident-controller quarantine, durable evidence
+  store, or gold fixture is added.
 
 The bounded `AUTH-006a` slice adds local decision evidence in
 `splendor-authority::evidence` and a redacted gateway artifact projection:
@@ -577,8 +591,8 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   `DelegationRequested`, task message routing, `ChildRunStarted`, child insertion,
   or parent fan-out mutation;
 - successful child records remain automatically bound to their authority-issued
-  exact validated grant privately and grant ID publicly for evidence/revocation,
-  but `LocalChildRun` does not expose the grant as recursive authority;
+  exact validated grant and complete immutable chain; `LocalChildRun` exposes the
+  trusted grant only for exact local action/nested composition;
 - proposed child grant IDs colliding with any existing root or child private
   binding deny with `child_capability_grant_id_collision` before request, routing,
   child-start, insertion, or fan-out mutation;
@@ -589,15 +603,14 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   child agent, child run, audience, unrelated authority evidence, and unrelated
   trusted grant. It asserts exact reasons, one rejection, unchanged run record,
   empty inbox/outbox, no child insertion/start/request trace, and no gateway or
-  adapter path. Parent fan-out remains unchanged, and the manager has no separate
-  mutable budget/depth ledger to consume on denial;
+  adapter path. Authority-owned fan-out/budget reservations remain unchanged on
+  pre-reservation denial;
 - typed instance binding and an independently supplied response-recipient
   coordinate remain unexpressible in this local API. The audience string and
   request target are covered without inventing a bypass.
-- recursive local delegation is explicitly deferred. The exact issued child
-  grant is scoped to the existing child agent/run, so a distinct grandchild
-  agent/run fails narrowing with `overbroad_scope`; a different broad grant must
-  not be injected because it cannot match the child's recorded grant ID.
+- recursive local delegation uses the exact issued child grant and complete chain.
+  It succeeds only for trusted descendant scope and remaining depth; a broader
+  replacement or nested escalation identifies and denies the exact failing edge.
 - grant-ID uniqueness is local to one `LocalDelegationManager`. The different-
   tenant matrix case uses a separate manager only to exercise grant tenant-scope
   denial and makes no cross-manager, cross-instance, or typed-audience claim.
@@ -786,6 +799,8 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
 | Delegation narrows | Child grant operations, scopes, time, budgets, obligations, and delegation depth cannot broaden parent authority. |
 | Messages are not authority | Delegation contracts can list allowed message schemas and recipients, and task payloads can carry grant refs for replay, but message payloads, sources, metadata, task text, and forged grant refs do not authorize child grants. |
 | Fan-out is authority-owned | Local `AUTH-003a` rejects requested fan-out caps that exceed the authority-owned parent-edge limit before issuing a child grant. |
+| Delegation accounting is atomic | The local authority ledger ignores caller fan-out as authority and atomically reserves immutable fan-out plus every bounded budget component across siblings and nested direct subtrees. |
+| Every edge is complete | Full ordered chains preserve exact grant/run/agent refs, monotonic depth, role, time, scope, budget, and cleanup requirements; the first failing edge is deterministic. |
 | Critic/evaluator roles are non-actuating | Local `AUTH-003a` denial tests reject critic/evaluator delegations carrying actuation, external-effect, or delegation-control operations. |
 | Local delegation fails closed | Local `AUTH-003b` denies before task routing and child insertion when authority evidence is missing/invalid, parent principal binding fails, grant liveness fails, or child-grant issuance fails. |
 | Obligations are conditional authority | Local `AUTH-004a` returns `Conditional` for matching grants with obligations instead of unconditional allow. |
@@ -824,9 +839,10 @@ those operation decisions explicitly.
 
 ## Event, Trace, State, and Replay Expectations
 
-This RFC does not add event or trace variants. `AUTH-003b` adds optional
-authority-reference fields to existing local delegation message payloads, trace
-contexts, run records, and replay summaries. `AUTH-004a` adds behavior-free
+This RFC does not add event names. `AUTH-003b` adds optional authority-reference
+fields to existing local delegation message payloads, trace contexts, run records,
+and replay summaries. The additive optional delegation-ledger trace field carries
+complete chain and reservation lifecycle evidence. `AUTH-004a` adds behavior-free
 receipt contracts and local verification helpers. `AUTH-004b` records bounded
 pre-effect obligation verification results, action digests, and decision-integrity
 digests in existing `ActionOutcome.verification` artifacts so current trace events
@@ -883,16 +899,16 @@ broader AUTH-004/AUTH-005 completion.
 | Compatibility profiles | Authority tests cover local `WorkOrder` allowlist profile mapping without broadening. | Not a full work-order issuance integration claim. |
 | Bounded AUTH-002a issuance | Authority tests cover valid signed work-order grant issuance, raw signed grant denial, unsigned/bad-signature/expired/revoked work-order failures, inactive/revoked principal failures, binding mismatch failures, issuer-authority denial, quota/locality non-broadening, and secret/signature-safe errors. | `G60/G83` remain `not_exercised`; no workload-controller, node, fleet, or gateway integration claim. |
 | Bounded AUTH-003a delegation | Authority tests cover local delegation contract round-trip, positive child grant issuance, parent-obligation preservation, missing/wrong parent edge, issuer mismatch, child subject missing/wrong, overbroad operation/scope/audience/time/budget/depth/fan-out, exhausted depth, fan-out exceeded, bad message schema/recipient, revoked/expired/not-yet-valid parent, and critic/evaluator external-effect/control-plane delegation denial. | `G18/G70/G71` remain `not_exercised`; no local-delegation manager, message routing, gateway, trace, revocation propagation, or gold fixture integration claim. |
-| Bounded AUTH-003b local delegation wiring | Kernel tests cover positive local child-run creation with run-bound principal plus parent/child grant refs in run record, `TaskRequest`, trace context, and replay; authority denial before `DelegationRequested`/routing/child insertion; parent principal mismatch denial, including agent re-registration after root-run creation; expired/not-yet-valid parent grant denial at actual decision time; future child grant window denial before routing; missing runtime authority evidence despite forged message payload evidence; and unchanged delegated action denial before gateway/adapter execution. | `G18/G70/G71` remain `not_exercised`; no daemon/API, gateway verifier, revocation propagation, or gold fixture integration claim. |
+| Local AUTH-003 delegation wiring | Kernel tests cover complete nested chains, exact child action grant refs, deterministic nested-edge denial, N-child aggregate overflow, concurrent authority-owned fan-out, routing release/start fail-safe consumption, cleanup, descendant cancellation/revocation, and inspect-only replay. | `G18/G70/G71` remain `not_exercised`; remote Message Service/Agent Controller adoption, durable/cross-instance ledger, and gold integration remain deferred. |
 | Bounded AUTH-004a obligations | Types tests cover conditional decision and obligation receipt serialization with receipt ID, issuer, audience, revocation source, and validation material. Authority tests cover grants without obligations still returning `Allowed`, grants with obligations returning `Conditional`, raw/forged receipt denial before validation, wrong issuer/audience/key/signature denial, exact validated receipt success, duplicate receipt ID denial, duplicate obligation ID denial, extra receipt denial, changed request/scope/params digest mismatch, missing/wrong obligation ID, wrong decision, wrong subject, wrong kind, expired, revoked, malformed evidence digest, unsupported schema, non-conditional decision denial, and conditional parent delegation denial before child grant creation. | `G11/G43/G75/G79` remain `not_exercised`; no gateway verifier, approval workflow, gate-engine, MFA, data-use, quota, safety, daemon/API, TS/Python, adapter execution, production PKI, or external revocation-introspection claim. |
 | Bounded AUTH-004b gateway obligation verification | Gateway tests cover valid exact trusted receipts allowing adapter execution when required, globally unique complete-current-decision matching that rejects unrelated/forged/replayed extras, final-boundary expiry after a blocking verifier, monotonic expiry latching, concurrent one-use claim with at most one adapter call, claim permit retention through delayed evidence append, trace-failure burn, shared-ledger verifier recreation, unavailable-ledger denial, missing evidence requiring intervention, raw/forged receipt denial, changed gateway action digest denial, tampered full-decision digest denial, operation/tenant/agent/run scope mismatch, expired/revoked/wrong/extra/duplicate receipts, and legacy `ApprovalEvidence` not satisfying authority obligations. Existing gateway policy/resource/approval/quota/safety/postcondition tests continue to run. TypeScript/OpenAPI parity tests cover the exact receipt schema literal and nullable optional fields without exposing a daemon/client workflow. | `G11/G43/G75/G79` remain `not_exercised`; no approval workflow engine, MFA provider, gate engine, restart-durable receipt ledger, production PKI, external revocation introspection, daemon receipt-issuance/client workflow, Python, or full AUTH-004/C02 completion claim. |
 | Bounded AUTH-005a local revocation/cache | Authority tests cover revoked `RevocationRecord` denial over a cached active grant, missing/stale/expired/future-dated cache denial, missing/stale/future-dated revocation snapshot denial, disconnected explicit low-risk data and device-sensing read allow within cached scope/TTL, disconnected scope mismatch denial, unsupported offline read denial, disconnected high-risk device/change/agent-delegation denial or intervention only after matching cached authority, offline TTL expiry denial, and cache APIs that accept validated grants without extending grant expiry. | `G73/G88` remain `not_exercised`; no production revocation service, revocation watches, external introspection, lease renewal, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
 | Bounded AUTH-005b local renewal preflight | Authority tests cover positive renewal from a fresh cached validated grant and active snapshot with matching nonce/current digest, nonce missing/mismatch denial, current digest mismatch denial, missing/non-renewable policy denial, revoked grant/snapshot denial, missing/stale/future-dated snapshot denial, stale/expired/future-dated cached grant denial, changed grant identity/issuer/subject/operations/scope/audience/revocation/obligation/parent/validation-kind/delegation-depth/start-time denial, maximum renewal/offline lifetime denial, and renewed cache expiry not outliving renewed grant expiry. | `G73/G88` remain `not_exercised`; no durable nonce/replay store, production lease service, revocation watches, external introspection, node/fleet/policy-cache consumption, incident-controller integration, delegated child revocation propagation, daemon/API/client workflow, or full AUTH-005/C02 completion claim. |
-| Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child grant cancellation, revoked parent grant cancellation, stale/future-dated trusted snapshot fail-closed child cancellation, missing authority evidence on a known child, trace recorder failure after revocation, response-routing failure after revocation, active/cancelled child and duplicate-root registration rejection without mutation, concurrent root-registration/revocation lifecycle serialization, unrelated revocation no-op, terminal child no-op without duplicate response/trace, and replay reconstruction through existing `ChildRunFailed` events. Authority tests cover live snapshot revoked-grant-ID lookup and stale/future lookup denial reason codes. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation service/watch, external introspection, daemon/API/client workflow, gateway/node/fleet/policy-cache/incident integration, cleanup obligations, durable evidence store, or full AUTH-003/AUTH-005/C02 completion claim. |
+| Bounded AUTH-005c delegated child revocation | Kernel tests cover revoked child/parent cancellation, stale/future fail-closed cancellation, descendant propagation, cleanup evidence, trace/router failures, concurrency, unrelated/terminal no-op, and inspect-only replay. | `G18/G70/G71/G73/G88` remain `not_exercised`; no production revocation watch/service, external introspection, remote controller, or durable evidence store. |
 | Bounded AUTH-006a decision evidence | Authority tests cover deterministic safe decision/restricted revision digests, domain separation, set/hash canonicalization, normalized evaluator reason-category trees, explicit missing exact-request binding, decision/grant/cache completeness, cache versus offline-TTL freshness, restricted/redacted leak absence, inspect-only comparisons, and explicit evidence-unavailable errors. Gateway tests cover trusted-only normalized projection, safe typed denial coordinates, hostile reason/schema/metadata-digest omission on no-verifier/early-denial paths, and zero adapter execution on malformed evidence. | `G01/G03` remain `not_exercised`; no exact request/operation digest claim, keyed evidence binding, durable Evidence Service, bundle/store/access controls, trace schema, policy archive/re-evaluation engine, daemon/API/client workflow, full FND-009, or full AUTH-006/C02 completion claim. |
 | Bounded AUTH-007a deterministic adversarial/property suite | `cargo test -p splendor-authority adversarial_property --locked` runs eight dependency-free properties: 256 cases each for scope algebra, empty/disjoint rejection, fixed-time/audience/subject behavior, delegation restrictions, and revocation/cache monotonicity; 512 cases each for budget accumulation and deterministic denial/evidence normalization. Inputs use fixed time and deterministic IDs; failures identify seed/case. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no serialized fuzz, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02 claim. |
 | Bounded AUTH-007b deterministic serialized mutation corpus | `cargo test -p splendor-authority serialized_mutation --locked` runs five 128-case families (640 serialized mutations total) over capability grants/requests, signed work-order issuance, obligation receipt collections, delegation grants/chains, and nested metadata/extensions. Every baseline is serialized and round-tripped as a positive control; every mutation is asserted byte-structurally different as `serde_json::Value`, then checked through serde and the real trusted local boundary. Corpus assertions and fixture/mutation setup failures identify fixture, mutation, and seed. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no cargo-fuzz/libFuzzer, unbounded/random fuzzing, all-plane confused-deputy, cross-version IAM/cache parity, mutation testing, formal proof, external fixture publication, or full AUTH-007/C02/#244 claim. |
-| Bounded AUTH-007c local delegation replay matrix | Kernel tests use real validated grants and the public manager path. They cover intended context; exact manager-local binding; same-ID operation/tenant/agent/run/audience/budget/expiry/revocation/validation-digest mutations; binding subject/idempotence/uniqueness; root/sibling/cross-tenant child-ID collisions; missing/mismatched bindings; tenant, parent, child, audience, unrelated evidence/grant cases; concurrent bind serialization; exact replay rejection context/reason; and zero downstream effects. Private equality tests pin obligation and trust-state sensitivity. Authority issuance tests prove listed Cartesian multi-scope combinations succeed and unlisted child agents/runs deny separately with `overbroad_scope`. Daemon E2E uses one manager, one parent grant, and two specialists through the bounded multi-scope builder. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; paired agent/run edge semantics, obligation/trust mutation through the public legacy builder, recursive local delegation, durable binding events, typed instance/cross-instance binding, independent response-recipient input, Driver/Artifact/helper-plan/remote paths, all-plane mutation testing, and full AUTH-007/C02/#244 remain incomplete. |
+| Bounded AUTH-007c local delegation replay matrix | Kernel tests use real validated grants and the public manager path for exact binding/replay mutations plus complete nested chain and reservation lifecycle replay. Authority issuance proves multi-scope containment and unlisted identity denial. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; durable binding events, typed cross-instance binding, Driver/Artifact/helper/remote paths, all-plane mutation, and full AUTH-007/#244 remain incomplete. |
 | Bounded AUTH-007d version/cache-staleness matrix | `cargo test -p splendor-types policy_distribution --locked`, `cargo test -p splendor-authority trusted_v1 --locked`, `cargo test -p splendor-kernel policy_cache --locked`, and `cargo test -p splendor-daemon policy_sync --locked` cover exact current-v1 positive controls; v0/v2 authority operation/scope/grant/request/revocation/policy rejection; unknown closed enums; raw-grant trust/cache exclusion; fixed-clock future-issued policy boundary; historical 0.04-shaped v1 signature characterization; trusted connected/offline cache positives; cache/snapshot stale/future/expired/revoked/offline-TTL denials; daemon cache preservation/blocking; trace reasons; and zero adapter calls for blocked action attempts. | `G01/G18/G70/G79/G80/G86/G88` remain `not_exercised`; no new schema, TypeScript/OpenAPI parity, canonical historical migration seam, resident persistence/watch, Driver/Artifact/helper/remote path, mutation framework, or full AUTH-007/C02/#244 claim. |
 | Production-local C02 daemon integration | The public-router non-gold test covers verified signed work-order admission, scheduler and direct allowed effects, exact full-permission profiles, ambiguous multi-adapter admission denial, invalid registered-permission denial, action/adapter/permission denial, admitted-then-expired denial, local revocation denial, pre-effect trace append failure with zero adapter calls, and replay summaries with unchanged adapter/evaluator counts. The resident-mode test covers caller credential metadata/scope checks behind the C01 boundary, not cryptographic resident authentication. Gateway tests exercise current conditional decisions with raw trusted receipts and recorder-before-adapter ordering. | All C02 gold targets remain `not_exercised`; no C01 issuer/authentication provider, remote watch, future privileged-plane adoption, or gold pass claim. |
 

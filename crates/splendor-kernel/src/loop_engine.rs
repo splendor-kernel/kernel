@@ -15,10 +15,10 @@ use splendor_gateway::{
 };
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
-    Action, ApprovalTraceContext, Constraint, ContentHash, EscalationContext, EscalationPolicy,
-    EscalationPolicyError, Feedback, Percept, PolicyBundleId, PolicyBundleTraceContext, QuotaUsage,
-    Reward, RunId, SnapshotId, TickId, TraceEvent, TraceEventId, TraceEventKind,
-    TraceIdentityContext, VerificationResult, WorkOrder,
+    Action, ApprovalTraceContext, CapabilityGrantId, Constraint, ContentHash, EscalationContext,
+    EscalationPolicy, EscalationPolicyError, Feedback, Percept, PolicyBundleId,
+    PolicyBundleTraceContext, QuotaUsage, Reward, RunId, SnapshotId, TickId, TraceEvent,
+    TraceEventId, TraceEventKind, TraceIdentityContext, VerificationResult, WorkOrder,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -126,6 +126,8 @@ pub struct ActionCandidate {
     pub approval_evidence: Option<splendor_types::ApprovalEvidence>,
     /// Raw owning-service receipts for live authority obligations.
     pub authority_obligation_receipts: Vec<splendor_types::AuthorityObligationReceipt>,
+    /// Exact issued child grant reference required for delegated actions.
+    pub delegated_capability_grant_id: Option<CapabilityGrantId>,
 }
 
 impl ActionCandidate {
@@ -140,6 +142,7 @@ impl ActionCandidate {
             satisfied_preconditions,
             approval_evidence: None,
             authority_obligation_receipts: Vec::new(),
+            delegated_capability_grant_id: None,
         }
     }
 
@@ -180,6 +183,12 @@ impl ActionCandidate {
     /// Sets a stable action identity for repeated evaluations of this candidate.
     pub fn with_action_id(mut self, action_id: ActionId) -> Self {
         self.action_id = Some(action_id);
+        self
+    }
+
+    /// Carries the exact issued child grant reference for delegated evaluation.
+    pub fn with_delegated_capability_grant_id(mut self, grant_id: CapabilityGrantId) -> Self {
+        self.delegated_capability_grant_id = Some(grant_id);
         self
     }
 }
@@ -718,9 +727,14 @@ impl LoopEngine {
                 },
             )?;
 
-            let delegated_scope = self
-                .agent
-                .verify_delegated_action(&action, candidate.adapter.as_deref());
+            let delegated_scope = self.agent.verify_delegated_action_with_grant(
+                &action,
+                candidate.adapter.as_deref(),
+                self.runtime.run_id(),
+                candidate.delegated_capability_grant_id.as_ref(),
+                candidate.usage,
+                OffsetDateTime::now_utc(),
+            );
             let mut outcome = if !constraint_evaluation.result.allowed {
                 ActionOutcome {
                     action_id: action_id.clone(),

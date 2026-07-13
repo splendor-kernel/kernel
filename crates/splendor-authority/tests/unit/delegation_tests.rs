@@ -15,21 +15,21 @@ use splendor_types::{
 const DIGEST: &str = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
 
 #[derive(Clone)]
-struct Fixture {
-    now: OffsetDateTime,
-    root_issuer: PrincipalId,
-    parent_subject: PrincipalId,
-    child_subject: PrincipalId,
-    tenant_id: TenantId,
-    parent_agent_id: AgentId,
-    child_agent_id: AgentId,
-    parent_run_id: RunId,
-    child_run_id: RunId,
-    audience: String,
+pub(crate) struct Fixture {
+    pub(crate) now: OffsetDateTime,
+    pub(crate) root_issuer: PrincipalId,
+    pub(crate) parent_subject: PrincipalId,
+    pub(crate) child_subject: PrincipalId,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) parent_agent_id: AgentId,
+    pub(crate) child_agent_id: AgentId,
+    pub(crate) parent_run_id: RunId,
+    pub(crate) child_run_id: RunId,
+    pub(crate) audience: String,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             now: OffsetDateTime::now_utc(),
             root_issuer: PrincipalId::new(),
@@ -138,7 +138,7 @@ fn parent_grant_with(
     })
 }
 
-fn parent_grant(fixture: &Fixture) -> ValidatedCapabilityGrant {
+pub(crate) fn parent_grant(fixture: &Fixture) -> ValidatedCapabilityGrant {
     parent_grant_with(
         fixture,
         vec![gateway_action_operation("artifact.create")],
@@ -207,7 +207,7 @@ fn result_contract() -> DelegationResultContract {
     }
 }
 
-fn request_for(
+pub(crate) fn request_for(
     fixture: &Fixture,
     parent: &ValidatedCapabilityGrant,
 ) -> DelegationChildGrantRequest {

@@ -1531,6 +1531,7 @@ fn test_delegation_context(parent_run_id: RunId) -> LocalDelegationTraceContext 
         target_agent_id: fixed_agent_id(0x115),
         objective: "scoped specialist work".to_string(),
         authority_evidence: None,
+        delegation_ledger: None,
     }
 }
 

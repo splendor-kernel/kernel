@@ -4,6 +4,15 @@
 
 ### Added
 
+- Completed remaining non-gold, production-local AUTH-003 delegation ownership:
+  the Authority Service now stores and validates immutable ordered chains,
+  atomically reserves authority-owned fan-out and component-wise subtree budgets,
+  supports exact-grant nested children, binds every child action to its issued
+  grant, propagates cancellation/revocation, enforces cleanup obligations, and
+  records reservation release/fail-safe consumption for inspect-only replay.
+  Legacy `DelegatedAuthority` is narrowing-only. The additive v1 cleanup/trace
+  fields preserve older deserialization. Remote Message Service/Agent Controller
+  adoption and G18/G70/G71 remain deferred/not exercised; no gold was run.
 - Integrated current daemon run admission/effects with one opaque live C02 grant
   admitted only from the verified signed-work-order wrapper. Scheduler, direct,
   and run-bound physical gateway paths now evaluate typed action/adapter/
@@ -73,8 +82,9 @@
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.
-- No recursive local delegation: child records retain issued grant IDs only for
-  evidence/revocation, and broader replacement grants fail the immutable binding.
+- No remote/cross-instance delegation ledger, Message Service or Agent Controller
+  adoption, or durable authority reservation store; recursive support is local
+  and only through exact authority-issued child grants.
 - No cross-manager or cross-instance grant binding and no durable trace event for
   trusted local root-binding setup; the binding API remains local run admission.
 - No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7

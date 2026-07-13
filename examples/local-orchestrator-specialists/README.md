@@ -116,9 +116,9 @@ Child run trace includes:
 - normal tick/action/state events for the child loop
 - `ChildRunCompleted` or `ChildRunFailed`
 
-Replay through `replay_local_delegations(events)` reconstructs the parent/child
-edge, authority grant refs, and task request/response messages without executing
-policies, gateways, adapters, child runs, or live authority evaluation.
+Replay through `replay_local_delegations(events)` reconstructs complete chains,
+authority reservation/cleanup/revocation transitions, and task messages without
+routing, starting children, executing adapters, or live authority evaluation.
 
 ## What is intentionally not allowed
 
@@ -126,16 +126,17 @@ policies, gateways, adapters, child runs, or live authority evaluation.
   explicitly delegated and allowed by the specialist's own authority.
 - The child must name an explicitly delegated adapter for proposed actions;
   adapter omission fails closed before gateway submission.
+- Every child action carries the exact issued child capability grant ID. The
+  legacy `DelegatedAuthority` value can narrow an allow but cannot create one.
 - Parent cancellation rejects new child delegation and records
   `DelegationRejected`.
 - Child run IDs are single-use within the local manager; duplicate child IDs are
   rejected before a second task request is routed.
 - Child completion/failure is terminal; repeated finish attempts are rejected
   without duplicate response messages or terminal traces.
-- Recursive local delegation is unsupported. Child records retain issued grant
-  IDs for evidence/revocation only; a broader replacement grant fails the
-  immutable run binding, and the exact child scope cannot cover a distinct
-  grandchild agent/run.
+- Recursive local delegation is allowed only through the exact issued child grant,
+  remaining depth, trusted descendant scope, and authority-owned aggregate
+  fan-out/budget. A broader replacement or nested escalation fails closed.
 - Root binding retains the exact validated grant privately in one local manager;
   the public run-record grant ID is evidence only. Binding setup itself has no
   durable trace event in this bounded local example.

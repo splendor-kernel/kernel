@@ -2,8 +2,8 @@
 
 Sprint 0.02-S4 implements a local-only delegation primitive: a parent run may
 create a child run for a named local specialist agent with a scoped objective,
-legacy `DelegatedAuthority` restrictions, and `AUTH-003b` authority-backed child
-grant issuance. It is implemented in Rust as
+legacy `DelegatedAuthority` narrowing projections, and authority-owned AUTH-003
+chain validation, child issuance, and accounting. It is implemented in Rust as
 `splendor_kernel::LocalDelegationManager` with canonical task message payloads in
 `splendor_types`.
 
@@ -13,8 +13,9 @@ Local delegation lets an orchestrator coordinate named agents inside one
 Splendor instance without permission laundering. A child run does not inherit the
 parent run's tenant, agent, adapter, or action authority. The child agent context
 returned by `LocalDelegationManager::create_child_run` carries a
-`DelegatedAuthority`; the loop engine denies actions outside that legacy
-compatibility scope before an adapter can execute. The child run is created only
+an exact validated child grant plus `DelegatedAuthority`; the loop engine requires
+the issued grant reference and applies the legacy projection only as a further
+restriction before an adapter can execute. The child run is created only
 after the manager calls `splendor_authority::issue_delegation_child_grant` with a
 trusted parent `ValidatedCapabilityGrant`; task messages and metadata alone do
 not confer authority.
@@ -121,17 +122,25 @@ authority and fails closed before gateway submission.
    time. If validation or issuance fails, it emits `DelegationRejected` and does
    not emit `DelegationRequested`, route a task message, insert a child record,
    or start a child run.
-7. On success, the manager records `DelegationRequested`, sends a task request
+7. The authority ledger atomically reserves immutable fan-out and every bounded
+   budget component. Root and child fan-out caps are authority-owned (currently
+   16 locally); caller values do not set or change that cap. Direct sibling
+   reservations must fit component-wise inside their parent allocation.
+8. On success, the manager records `DelegationRequested`, sends a task request
    message carrying non-authorizing grant refs, emits `ChildRunStarted`, and
    returns a scoped child `AgentContext`. The child record retains the issued
-   child grant ID for evidence and revocation checks; it does not expose the
-   validated child grant as recursive delegation authority.
-8. The child loop uses that scoped context. Actions outside delegated authority
-   are denied and do not reach adapter execution.
-9. The child completes or fails through `complete_child_run` or `fail_child_run`,
+    complete ordered `DelegationChain`, issued child grant, cleanup obligations,
+    and budget reservation evidence. The issued grant may recursively create a
+    narrower local child while remaining depth is non-zero.
+9. Every child action must carry the exact issued child grant ID. Missing, wrong,
+   expired, revoked, over-budget, or out-of-scope evaluation denies before the
+   gateway; the legacy projection can only narrow an authority allow.
+10. The child completes or fails through `complete_child_run` or `fail_child_run`,
    which sends a structured task response and emits parent/child completion or
    failure trace events.
-10. Completion, failure, denial, and cancellation are terminal for the child run;
+11. Terminal completion performs explicit ledger cleanup. Parent cancellation and
+    parent/child grant revocation invalidate and cancel active descendants.
+12. Completion, failure, denial, and cancellation are terminal for the child run;
    repeated finish attempts fail closed without emitting duplicate responses or
    duplicate completion/failure trace events.
 
@@ -152,7 +161,9 @@ events:
 All delegation events carry `LocalDelegationTraceContext` with parent/child run
 IDs, source/target agent IDs, objective, parent causal trace, task
 request/response message IDs when available, and optional non-authorizing
-`LocalDelegationAuthorityEvidence` refs. Denied authority issuance may record a
+`LocalDelegationAuthorityEvidence` refs. The additive optional
+`delegation_ledger` field carries the complete ordered chain, reserved budget,
+authority-owned fan-out cap, lifecycle status, and stable reason. Denied authority issuance may record a
 stable `authority_reason` such as `overbroad_operation` or
 `missing_authority_evidence`. Root binding denials use the exact stable reasons
 `missing_parent_run_grant_binding` and `parent_run_grant_mismatch`. Proposed
@@ -174,21 +185,22 @@ For a delegating root, `capability_grant_id` is populated only by the explicit
 trusted binding API and remains evidence only. The manager separately retains the
 exact validated grant privately. Binding denials and child-creation denials leave
 the full run record unchanged, including child fan-out and delegated authority.
-The manager has no separate mutable budget/depth consumption ledger; those
-limits remain immutable fields on validated grants and issued child grants.
+The authority crate owns the only mutable local delegation ledger. It stores exact
+validated roots and immutable ordered child edges and atomically accounts direct
+subtree fan-out and budget. Kernel run records project this state but do not own
+or independently authorize it.
 
-Successful child records are automatically bound to the issued child grant ID
-for evidence and revocation. This is not an authorizing grant retrieval surface.
-Recursive local delegation is unsupported: the exact issued child grant is
-scoped to the existing child agent/run, so a distinct grandchild agent/run fails
-authority narrowing with `overbroad_scope`. Callers must not inject a different,
-broader grant to bypass that scope; its ID will not match the child record.
+Successful child records are automatically bound to the issued validated child
+grant and full chain. Recursive local delegation is supported only through that
+exact grant, for descendant identities already in trusted parent scope, and while
+depth, time, role, fan-out, and aggregate subtree budget remain narrower.
 
 ## Gateway and verifier behavior
 
-The child run's scoped `AgentContext` acts as a local authority constraint before
-gateway submission. If a child policy proposes an action outside
-`DelegatedAuthority`, or omits the adapter needed to evaluate that authority, the
+The child run's scoped `AgentContext` evaluates the exact issued grant before
+gateway submission. If a child policy omits or changes the grant reference,
+proposes an action outside that grant or its `DelegatedAuthority` projection, or
+omits the adapter needed to evaluate that authority, the
 loop engine records normal verification/denial trace events and does not call the
 gateway adapter path. Allowed child actions still go through the Action Gateway
 and its verifier chain.
@@ -196,9 +208,10 @@ and its verifier chain.
 ## Replay behavior
 
 `splendor_kernel::replay_local_delegations(events)` reconstructs parent/child
-relationships and task request/response message exchange from trace events. It
-also reconstructs recorded authority grant refs. It does not invoke policies,
-gateways, adapters, child runs, authority evaluation, or side effects.
+relationships, task messages, complete chains, reservation/commit/release/
+fail-safe-consume transitions, cleanup, failures, and revocation. It does not
+route messages, start children, invoke authority, submit gateway actions, or
+execute adapters.
 
 ## Failure behavior
 
@@ -233,6 +246,13 @@ gateways, adapters, child runs, authority evaluation, or side effects.
   budget, fan-out, expiry, not-yet-valid grant window, or role restriction):
   `DelegationRejected` before `DelegationRequested`, task routing, and child
   insertion.
+- Aggregate budget overflow: `aggregate_budget_exceeded_<dimension>` before
+  routing. Concurrent excess fan-out receives `fan_out_exceeded` atomically.
+- Pre-routing failure releases the reservation; start uncertainty after routing
+  consumes it fail-safe. Both transitions are replay-visible.
+- Nested widening identifies the first failing edge as
+  `delegation_chain_edge_<index>_<reason>`.
+- Missing/wrong child action grant references deny before the gateway.
 - Duplicate `child_run_id`: `DelegationRejected` with
   `duplicate_child_run_id`; no second task request, child state, or child-start
   trace.
@@ -284,10 +304,11 @@ currently emit a durable binding trace event because adding an event variant
 would expand the public trace schema. Child-creation denials remain durably
 represented by the existing `DelegationRejected` event when recording succeeds.
 
-The implementation remains local-only `AUTH-003b`/`AUTH-007c` wiring. It
-deliberately does not introduce signed work orders, remote dispatch, fleet
-placement, child revocation propagation, gateway authority verification, or
-long-lived child services. Later
+The implementation completes the authority-owned non-gold local AUTH-003 chain,
+accounting, recursive delegation, action binding, cleanup, revocation, and replay
+path. It deliberately does not introduce Message Service/Agent Controller
+adoption, remote dispatch, fleet placement, durable/cross-instance ledger
+storage, or long-lived child services. Later
 cross-instance work orders can map onto the same explicit fields without changing
 the local no-ambient-authority rule. G18/G70/G71 remain `not_exercised` unless
-their executable gold fixtures are added and pass.
+their executable gold fixtures are added and pass. No gold command was run.

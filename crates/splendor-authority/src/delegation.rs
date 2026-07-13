@@ -287,6 +287,7 @@ pub fn issue_delegation_child_grant(
         expires_at: raw_child_grant.expires_at,
         remaining_delegation_depth: raw_child_grant.max_delegation_depth,
         max_fan_out: request.max_fan_out,
+        cleanup_obligations: splendor_types::DelegationCleanupObligations::default(),
         child_capability_grant: raw_child_grant,
     };
 
@@ -459,7 +460,7 @@ fn validate_result_contract(
     Ok(())
 }
 
-fn validate_role_operations(
+pub(crate) fn validate_role_operations(
     role: DelegationRoleProfile,
     operations: &[AuthorityOperation],
 ) -> Result<(), DelegationGrantError> {
@@ -665,4 +666,4 @@ fn is_external_effect_operation(operation: &AuthorityOperation) -> bool {
 
 #[cfg(test)]
 #[path = "../tests/unit/delegation_tests.rs"]
-mod tests;
+pub(crate) mod tests;

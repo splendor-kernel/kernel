@@ -176,6 +176,10 @@ daemon action submissions do not invent a scheduler tick identity.
 - `ChildRunStarted { delegation: LocalDelegationTraceContext }`
 - `ChildRunCompleted { delegation: LocalDelegationTraceContext }`
 - `ChildRunFailed { delegation: LocalDelegationTraceContext, failure: TaskFailure }`
+- Local delegation contexts may include additive `delegation_ledger` evidence:
+  the complete ordered chain, reserved component budget, authority-owned parent
+  fan-out limit, lifecycle status, and stable reason. Replay uses this to rebuild
+  reservation, release/fail-safe consume, cleanup, and revocation without effects.
 - `ChildRunLinked { parent_run_id, child_run_id, parent_agent_id, child_agent_id, causal_parent, source_message_id }`
 - `GovernanceApprovalRequested { transition: GovernanceTransition }`
 - `GovernanceApprovalGranted { transition: GovernanceTransition }`

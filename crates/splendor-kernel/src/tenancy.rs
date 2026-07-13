@@ -4,10 +4,15 @@
 //! The quota ledger tracks per-tick usage per agent and ensures one agent cannot
 //! spend another agent's local runtime budget before actions are executed.
 
+use splendor_authority::{
+    compatibility_permission_operation, evaluate_capability_request, gateway_action_operation,
+    gateway_adapter_operation, ValidatedCapabilityGrant,
+};
 use splendor_gateway::TenantAccess;
 use splendor_types::{
-    Action, AgentId, DelegatedAuthority, QuotaUsage, StateNodeId, TenantId, VerificationResult,
-    WorkOrder,
+    Action, AgentId, AuthorityBudgetScope, CapabilityGrantId, CapabilityRequest,
+    DelegatedAuthority, QuotaUsage, RunId, StateNodeId, TenantId, VerificationResult, WorkOrder,
+    CAPABILITY_REQUEST_SCHEMA_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -321,6 +326,8 @@ pub struct AgentContext {
     /// Optional local child-run authority. When present, the loop engine denies
     /// actions outside this explicit delegated scope before gateway submission.
     pub delegated_authority: Option<DelegatedAuthority>,
+    /// Exact authority-issued grant backing the compatibility projection.
+    pub delegated_capability_grant: Option<ValidatedCapabilityGrant>,
 }
 
 impl AgentContext {
@@ -333,6 +340,7 @@ impl AgentContext {
             state_head: None,
             config,
             delegated_authority: None,
+            delegated_capability_grant: None,
         }
     }
 
@@ -349,6 +357,17 @@ impl AgentContext {
     /// Restricts this agent context to an explicit local delegated authority.
     pub fn set_delegated_authority(&mut self, authority: DelegatedAuthority) {
         self.delegated_authority = Some(authority);
+        self.delegated_capability_grant = None;
+    }
+
+    /// Installs an authority-issued child grant plus a narrowing legacy projection.
+    pub fn set_delegated_capability_grant(
+        &mut self,
+        grant: ValidatedCapabilityGrant,
+        projection: DelegatedAuthority,
+    ) {
+        self.delegated_capability_grant = Some(grant);
+        self.delegated_authority = Some(projection);
     }
 
     /// Returns a cloned agent context restricted to the provided delegated scope.
@@ -360,15 +379,107 @@ impl AgentContext {
     /// Verifies a proposed action against child-run delegated authority.
     pub fn verify_delegated_action(
         &self,
+        _action: &Action,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        if self.delegated_authority.is_some() {
+            VerificationResult::deny("delegated_capability_grant_ref_required")
+        } else {
+            VerificationResult::allow()
+        }
+    }
+
+    /// Verifies a delegated action against the exact authority-issued grant.
+    pub fn verify_delegated_action_with_grant(
+        &self,
         action: &Action,
         adapter: Option<&str>,
+        run_id: &RunId,
+        supplied_grant_id: Option<&CapabilityGrantId>,
+        usage: QuotaUsage,
+        now: OffsetDateTime,
     ) -> VerificationResult {
-        self.delegated_authority
-            .as_ref()
-            .map(|authority| {
-                authority.verify_action(&action.name, adapter, &action.required_permissions)
-            })
-            .unwrap_or_else(VerificationResult::allow)
+        let Some(projection) = self.delegated_authority.as_ref() else {
+            return VerificationResult::allow();
+        };
+        let Some(grant) = self.delegated_capability_grant.as_ref() else {
+            return VerificationResult::deny("delegated_capability_grant_missing");
+        };
+        if supplied_grant_id != Some(&grant.grant().grant_id) {
+            return VerificationResult::deny("delegated_capability_grant_ref_mismatch");
+        }
+
+        let mut scope = grant.grant().scope.clone();
+        scope.tenant_ids = Some(vec![self.tenant_id.clone()]);
+        scope.agent_ids = Some(vec![self.agent_id.clone()]);
+        scope.run_ids = Some(vec![run_id.clone()]);
+        let limits = grant.grant().scope.budget;
+        scope.budget = AuthorityBudgetScope {
+            max_actions_per_tick: limits.max_actions_per_tick.map(|_| usage.actions),
+            max_action_duration_ms: limits
+                .max_action_duration_ms
+                .map(|_| usage.action_duration_ms),
+            max_filesystem_read_bytes: limits
+                .max_filesystem_read_bytes
+                .map(|_| usage.filesystem_read_bytes),
+            max_filesystem_write_bytes: limits
+                .max_filesystem_write_bytes
+                .map(|_| usage.filesystem_write_bytes),
+            max_network_read_bytes: limits
+                .max_network_read_bytes
+                .map(|_| usage.network_read_bytes),
+            max_network_write_bytes: limits
+                .max_network_write_bytes
+                .map(|_| usage.network_write_bytes),
+            max_http_requests_per_minute: limits
+                .max_http_requests_per_minute
+                .map(|_| usage.http_requests),
+        };
+        let mut operations = vec![gateway_action_operation(action.name.clone())];
+        if let Some(adapter) = adapter {
+            operations.push(gateway_adapter_operation(adapter.to_string()));
+        }
+        operations.extend(
+            action
+                .required_permissions
+                .iter()
+                .cloned()
+                .map(compatibility_permission_operation),
+        );
+        let mut reasons = Vec::new();
+        for operation in operations {
+            let decision = evaluate_capability_request(
+                std::slice::from_ref(grant),
+                &CapabilityRequest {
+                    schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+                    subject: grant.grant().subject.clone(),
+                    operation,
+                    scope: scope.clone(),
+                    requested_at: now,
+                    metadata: Default::default(),
+                },
+                now,
+            );
+            if decision.status != splendor_types::AuthorityDecisionStatus::Allowed {
+                reasons.extend(decision.reasons);
+            }
+        }
+        if !reasons.is_empty() {
+            reasons.sort();
+            reasons.dedup();
+            return VerificationResult {
+                allowed: false,
+                reasons,
+                artifacts: serde_json::json!({
+                    "source": "delegation_authority_ledger",
+                    "grant_id": grant.grant().grant_id,
+                }),
+            };
+        }
+
+        // Legacy allowlists are a final narrowing projection only. They can
+        // deny an authority-allowed action but never independently allow one.
+        projection.verify_action(&action.name, adapter, &action.required_permissions)
     }
 }
 

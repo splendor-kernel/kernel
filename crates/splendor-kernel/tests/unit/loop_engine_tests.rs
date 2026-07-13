@@ -986,7 +986,7 @@ fn loop_engine_denies_child_action_outside_delegated_scope_and_skips_gateway() {
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_action_not_allowed".to_string()));
+            .contains(&"delegated_capability_grant_missing".to_string()));
     }
 }
 
@@ -1045,12 +1045,12 @@ fn loop_engine_denies_delegated_action_without_explicit_adapter_and_skips_gatewa
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_adapter_unspecified".to_string()));
+            .contains(&"delegated_capability_grant_missing".to_string()));
     }
 }
 
 #[test]
-fn loop_engine_allows_delegated_action_with_explicit_adapter() {
+fn loop_engine_legacy_delegated_projection_cannot_independently_allow_action() {
     let runtime = KernelRuntime::new(KernelRuntimeConfig::default());
     let store = Arc::new(InMemoryStateStore::default());
     let graph = StateGraph::new(store, SnapshotPolicy::default());
@@ -1084,9 +1084,9 @@ fn loop_engine_allows_delegated_action_with_explicit_adapter() {
     let outcome = engine.tick(1).expect("tick");
     assert!(matches!(
         outcome.action_outcomes[0].status,
-        ActionStatus::Executed
+        ActionStatus::Denied
     ));
-    assert_eq!(*calls.lock().expect("calls lock"), 1);
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
 }
 
 #[test]

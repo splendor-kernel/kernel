@@ -453,7 +453,11 @@ fn agent_context_delegated_authority_allows_only_explicit_scope() {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
     };
-    assert!(agent.verify_delegated_action(&allowed, Some("sql")).allowed);
+    let legacy_result = agent.verify_delegated_action(&allowed, Some("sql"));
+    assert!(!legacy_result.allowed);
+    assert!(legacy_result
+        .reasons
+        .contains(&"delegated_capability_grant_ref_required".to_string()));
 
     let denied = Action {
         name: "publish".to_string(),
@@ -468,5 +472,5 @@ fn agent_context_delegated_authority_allows_only_explicit_scope() {
     assert!(!result.allowed);
     assert!(result
         .reasons
-        .contains(&"delegated_action_not_allowed".to_string()));
+        .contains(&"delegated_capability_grant_ref_required".to_string()));
 }

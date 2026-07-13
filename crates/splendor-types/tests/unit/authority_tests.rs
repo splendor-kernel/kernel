@@ -331,6 +331,7 @@ fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
         expires_at: now + time::Duration::minutes(10),
         remaining_delegation_depth: 0,
         max_fan_out: 1,
+        cleanup_obligations: DelegationCleanupObligations::default(),
         child_capability_grant,
     };
     let chain = DelegationChain {
