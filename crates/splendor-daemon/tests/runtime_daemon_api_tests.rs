@@ -158,6 +158,15 @@ fn resign_work_order(envelope: &mut WorkOrderEnvelope) {
         .expect("resigned work order");
 }
 
+fn bind_original_work_order_for_resume(
+    mut envelope: WorkOrderEnvelope,
+    run_id: RunId,
+) -> WorkOrderEnvelope {
+    envelope.work_order.run_id = Some(run_id);
+    resign_work_order(&mut envelope);
+    envelope
+}
+
 fn action(name: &str) -> Action {
     Action {
         name: name.to_string(),
@@ -833,17 +842,18 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         authority_obligation_receipts: Vec::new(),
     }];
 
+    let create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        policy_actions,
+        Vec::new(),
+    );
+    let original_work_order = create.work_order.clone();
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
         Method::POST,
         "/runs",
-        serde_json::to_value(create_request(
-            tenant_id.clone(),
-            agent_id.clone(),
-            policy_actions,
-            Vec::new(),
-        ))
-        .expect("create request"),
+        serde_json::to_value(create).expect("create request"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -891,6 +901,16 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(paused.status, RunStatus::Paused);
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(&lifecycle).expect("paused restart request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "invalid_run_state");
 
     let mut bad_signature_work_order = signed_work_order(
         tenant_id.clone(),
@@ -964,13 +984,54 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(error.code, "incompatible_work_order");
 
+    let mut identity_mismatch =
+        bind_original_work_order_for_resume(original_work_order.clone(), created.run_id.clone());
+    identity_mismatch.work_order.work_order_id =
+        WorkOrderId::try_new("wo_resume_identity_mismatch").expect("work order id");
+    resign_work_order(&mut identity_mismatch);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(LifecycleRequest {
+            credential: None,
+            work_order: Some(identity_mismatch),
+            audit_attribution: Some(attribution()),
+            reason: Some("identity-mismatch".to_string()),
+            approval_evidence: None,
+        })
+        .expect("identity mismatch resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "resume_work_order_identity_mismatch");
+
+    let mut payload_mismatch =
+        bind_original_work_order_for_resume(original_work_order.clone(), created.run_id.clone());
+    payload_mismatch.work_order.objective = "broader replacement objective".to_string();
+    resign_work_order(&mut payload_mismatch);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(LifecycleRequest {
+            credential: None,
+            work_order: Some(payload_mismatch),
+            audit_attribution: Some(attribution()),
+            reason: Some("payload-mismatch".to_string()),
+            approval_evidence: None,
+        })
+        .expect("payload mismatch resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "resume_work_order_payload_mismatch");
+
     let resume = LifecycleRequest {
         credential: None,
-        work_order: Some(signed_work_order(
-            tenant_id.clone(),
-            agent_id.clone(),
-            Some(created.run_id.clone()),
-            vec![EndpointScope::RunsResume],
+        work_order: Some(bind_original_work_order_for_resume(
+            original_work_order,
+            created.run_id.clone(),
         )),
         audit_attribution: Some(attribution()),
         reason: Some("resume".to_string()),
@@ -1591,6 +1652,7 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
         Vec::new(),
     );
     create.approval_policies = vec![approval_policy(&tenant_id, &agent_id, "allowed_action")];
+    let original_work_order = create.work_order.clone();
 
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
@@ -1634,11 +1696,9 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
 
     let missing_approval_resume = LifecycleRequest {
         credential: None,
-        work_order: Some(signed_work_order(
-            tenant_id.clone(),
-            agent_id.clone(),
-            Some(created.run_id.clone()),
-            vec![EndpointScope::RunsResume],
+        work_order: Some(bind_original_work_order_for_resume(
+            original_work_order.clone(),
+            created.run_id.clone(),
         )),
         audit_attribution: Some(attribution()),
         reason: Some("missing approval".to_string()),
@@ -1663,11 +1723,9 @@ async fn approval_required_run_pauses_and_valid_grant_resumes_execution() {
     );
     let resume = LifecycleRequest {
         credential: None,
-        work_order: Some(signed_work_order(
-            tenant_id.clone(),
-            agent_id.clone(),
-            Some(created.run_id.clone()),
-            vec![EndpointScope::RunsResume],
+        work_order: Some(bind_original_work_order_for_resume(
+            original_work_order,
+            created.run_id.clone(),
         )),
         audit_attribution: Some(attribution()),
         reason: Some("approval granted".to_string()),
@@ -3074,6 +3132,7 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
             Vec::new(),
         );
         create.approval_policies = vec![approval_policy(&tenant_id, &agent_id, "allowed_action")];
+        let original_work_order = create.work_order.clone();
         let (status, created): (StatusCode, CreateRunResponse) = call_json(
             app.clone(),
             Method::POST,
@@ -3136,11 +3195,9 @@ async fn approval_denial_expiry_and_wrong_scope_do_not_execute_adapter() {
 
         let resume = LifecycleRequest {
             credential: None,
-            work_order: Some(signed_work_order(
-                tenant_id.clone(),
-                agent_id.clone(),
-                Some(created.run_id.clone()),
-                vec![EndpointScope::RunsResume],
+            work_order: Some(bind_original_work_order_for_resume(
+                original_work_order,
+                created.run_id.clone(),
             )),
             audit_attribution: Some(attribution()),
             reason: Some(format!("approval {scenario}")),
@@ -3910,6 +3967,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         }],
     );
     create.approval_policies = vec![approval_policy(&tenant_id, &agent_id, "allowed_action")];
+    let original_work_order = create.work_order.clone();
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app.clone(),
         Method::POST,
@@ -3977,6 +4035,51 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
         "allowed_action",
         ApprovalDecision::Granted,
     );
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(SubmitActionRequest {
+            action_id: None,
+            run_id: created.run_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            credential: None,
+            audit_attribution: Some(attribution()),
+            causal_trace_id: causal_trace_id.clone(),
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+            approval_evidence: Some(grant.clone()),
+            authority_obligation_receipts: Vec::new(),
+        })
+        .expect("waiting direct approval request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "run_not_effect_capable");
+
+    let (status, resumed): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/resume", created.run_id),
+        serde_json::to_value(LifecycleRequest {
+            credential: None,
+            work_order: Some(bind_original_work_order_for_resume(
+                original_work_order,
+                created.run_id.clone(),
+            )),
+            audit_attribution: Some(attribution()),
+            reason: Some("approval granted".to_string()),
+            approval_evidence: Some(grant.clone()),
+        })
+        .expect("approval resume request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed.status, RunStatus::Running);
+
     let approval_granted = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),

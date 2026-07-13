@@ -882,11 +882,18 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let causal_trace_id = trace_page
+    let resident_events = trace_page
         .records
         .iter()
         .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
-        .map(|event| event.trace_event_id)
+        .collect::<Vec<_>>();
+    assert!(!resident_events.is_empty());
+    assert!(resident_events
+        .iter()
+        .all(|event| event.identity.instance_id.as_ref() == Some(&instance_id)));
+    let causal_trace_id = resident_events
+        .iter()
+        .map(|event| event.trace_event_id.clone())
         .next()
         .expect("resident run causal trace");
 

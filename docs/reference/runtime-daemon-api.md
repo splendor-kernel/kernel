@@ -147,8 +147,11 @@ and mutating-call audit attribution.
 
 Run creation and run resume require signed, unexpired, unrevoked, scoped work
 orders. The daemon checks work-order tenant, run scope where applicable, and
-agent compatibility for run creation. Caller credentials never authorize actions
-directly; `/actions` always submits to the `VerifiedActionGateway` path with
+agent compatibility for run creation. Resume additionally requires the original
+`work_order_id` and the exact canonical work-order payload admitted at creation,
+normalized to the resolved `run_id`; a newly signed broader or otherwise changed
+work order is rejected. Caller credentials never authorize actions directly;
+`/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
 When `CreateRunRequest.policy_bundle_required` is true, the daemon also requires
@@ -185,6 +188,9 @@ prepared/non-authorizing trace may remain and does not by itself prove commit.
   work order and explicit registrations;
 - one opaque live C02 run-authority handle admitted only from
   `ValidatedWorkOrder` (not a raw request payload);
+- the admitted work-order identity and a domain-separated digest of its canonical
+  payload bound to the resolved run, used only to prevent authority substitution
+  on resume;
 - one shared-runtime pre-effect authority evidence recorder;
 - optional `approval_policies` evaluated by the gateway approval verifier.
 
@@ -206,7 +212,10 @@ as direct action authority.
 
 `start` and `resume` execute exactly one scheduler tick. This keeps the local
 daemon deterministic while proving the daemon boundary. Continuous/background
-scheduling is not introduced here.
+scheduling is not introduced here. `start` accepts only `pending` or `running`;
+it cannot be used to bypass signed-work-order checks for a paused run. `resume`
+accepts only `paused` or `waiting_for_approval` and requires the original bound
+work-order payload described above.
 
 Run statuses are:
 
@@ -227,6 +236,15 @@ context for inspection/replay, and returns `waiting_for_approval`. Resume from
 that state requires a signed resume work order and
 `LifecycleRequest.approval_evidence`; missing evidence returns
 `403 approval_required` before a tick is run.
+
+Direct `/actions` and run-bound physical action submissions admit gateway work
+only while the run is `pending` or `running`. Paused,
+`waiting_for_approval`, interrupted, resuming, completed, failed, cancelled,
+denied, and expired runs return `409 run_not_effect_capable` before gateway
+verification or adapter execution. Terminal transitions close live authority
+admission before publishing terminal status. A final permit acquired before that
+closure may complete, but no later permit can be acquired; stop/cancel release
+the daemon run-map lock before waiting for those earlier permits to quiesce.
 
 ## Percept ingestion
 
@@ -260,6 +278,8 @@ are returned in monotonic sequence order. Range reads use `start` inclusive and
 and `POST /runs/{run_id}/traces/export` both require an explicit
 `redaction_policy`; the export response also includes a deterministic
 `integrity_hash` summary over the returned trace chain.
+For resident daemon configuration, run trace identities carry the configured
+`instance_id`; local development retains the existing unset placement identity.
 
 Lifecycle and daemon-specific events added for 0.02-S5:
 
@@ -322,6 +342,9 @@ remain outside a scheduler tick and do not fabricate a tick ID. Direct and
 run-bound physical requests allocate the effective action ID before verification;
 their started, single completed, terminal, and outcome records share the exact
 run/tenant/agent/action identity through the run's common trace cursor.
+Their caller-supplied quota estimate is untrusted: the daemon normalizes it to at
+least one action and one millisecond before quota verification. See
+[`quotas.md`](quotas.md) for the current reconciliation limitation.
 
 `SubmitActionRequest.authority_obligation_receipts` and daemon policy candidates
 accept raw owning-service receipts only. A requester-supplied authority decision
@@ -397,6 +420,10 @@ Required 0.02-S5 failures include:
 | Unauthorized or missing scope/action trace link | `403` | daemon security error code |
 | Runtime unavailable | `503` | `runtime_unavailable` |
 | Resume from `waiting_for_approval` without evidence | `403` | `approval_required` |
+| Direct/physical effect while run is not `pending` or `running` | `409` | `run_not_effect_capable` |
+| Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
+| Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
+| Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |
 | Gateway denial | `200` with `ActionOutcome.status = Denied` | action outcome |
 | Governance intervention required | `200` with `ActionOutcome.status = NeedsIntervention` | action outcome |
 | Multiple unsigned action/adapter pairings | `400` | `ambiguous_work_order_action_adapter_profile` |
@@ -442,8 +469,9 @@ C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
 with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
 watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, physical helper-plan
 adoption, or gold completion is claimed here. The current local run-effect path
-and resident-mode metadata/scope composition are complete as non-gold component
-evidence. C02 does not cryptographically authenticate resident caller credentials;
+and resident-mode metadata/scope/trace-identity composition are complete as
+non-gold component evidence. C02 does not cryptographically authenticate
+resident caller credentials;
 production caller authentication and principal proof binding remain deferred to
 C01. C02 gold targets remain explicitly `not_exercised`.
 

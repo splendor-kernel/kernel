@@ -41,6 +41,12 @@
   TypeScript authority unions have parity tests. Resident credential tests cover
   metadata/scope checks only; production authentication remains deferred to C01.
   Future privileged planes and all gold cases remain downstream/not exercised.
+- Hardened the daemon C02 lifecycle boundary: only pending/running runs admit
+  direct or run-bound physical gateway work; terminal transitions close new
+  effect permits before status publication and wait outside the broad run lock;
+  resume requires the original work-order identity and canonical bound payload;
+  untrusted direct/physical quota estimates have server-owned action/duration
+  minima; and resident run traces retain the configured `instance_id`.
 - Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
   matrices for authority operation/scope/grant/request/revocation/policy
   contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and

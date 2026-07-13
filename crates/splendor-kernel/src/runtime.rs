@@ -92,6 +92,15 @@ impl KernelRuntime {
         store: Arc<dyn TraceStore>,
         run_id: Option<RunId>,
     ) -> Result<Self, TraceError> {
+        Self::with_trace_store_and_identity(store, run_id, RuntimeIdentityContext::default())
+    }
+
+    /// Creates a trace-store-backed runtime with explicit placement identity.
+    pub fn with_trace_store_and_identity(
+        store: Arc<dyn TraceStore>,
+        run_id: Option<RunId>,
+        identity: RuntimeIdentityContext,
+    ) -> Result<Self, TraceError> {
         let run_id = run_id.unwrap_or_default();
         let sink = TraceStoreSink::new(run_id.clone(), store);
         let initial_sequence = match sink.latest_sequence()? {
@@ -104,7 +113,7 @@ impl KernelRuntime {
         Ok(Self::new(KernelRuntimeConfig {
             trace_sink: Arc::new(sink),
             run_id: Some(run_id),
-            identity: RuntimeIdentityContext::default(),
+            identity,
             initial_sequence,
             initial_prev_hash,
         }))

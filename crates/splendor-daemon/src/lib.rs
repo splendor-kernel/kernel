@@ -37,14 +37,15 @@ use splendor_store::{
 use splendor_types::{
     is_allowed_physical_action, validate_policy_bundle, validate_policy_bundle_candidate,
     AppPrincipal, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext, AuditAttribution,
-    AuthorityObligationReceipt, CallerCredential, CircuitBreaker, ClientPrincipal,
+    AuthorityObligationReceipt, CallerCredential, CircuitBreaker, ClientPrincipal, ContentHash,
     CredentialAudience, CredentialBinding, DaemonEndpoint, DaemonSecurityDecision,
     DaemonSecurityError, DaemonSecurityRequest, EndpointScope, GatewayVerificationState,
     InsecureDevMode, LocalTransportBinding, NodeId, PerceptProvenance, PolicyBundleEnvelope,
     PolicyBundleKeyring, PolicyBundleTraceContext, PolicyBundleValidationContext,
-    PolicyBundleValidationError, RevocationStatus, TenantId, TraceEvent, TraceEventId, TraceId,
-    ValidatedWorkOrder, WorkOrder, WorkOrderAuthorization, WorkOrderEnvelope, WorkOrderKeyring,
-    WorkOrderValidationContext, WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    PolicyBundleValidationError, RevocationStatus, RuntimeIdentityContext, TenantId, TraceEvent,
+    TraceEventId, TraceId, ValidatedWorkOrder, WorkOrder, WorkOrderAuthorization,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderValidationContext,
+    WorkOrderValidationError, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -67,6 +68,7 @@ struct DaemonInner {
     insecure_dev_mode: Option<InsecureDevMode>,
     policy_bundle_keyring: PolicyBundleKeyring,
     work_order_keyring: WorkOrderKeyring,
+    runtime_identity: RuntimeIdentityContext,
     trace_store_override: Option<Arc<dyn TraceStore>>,
     runtime_available: AtomicBool,
     device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
@@ -118,6 +120,13 @@ impl DaemonState {
         config: DaemonConfig,
         trace_store_override: Option<Arc<dyn TraceStore>>,
     ) -> Self {
+        let runtime_identity = match &config.expected_audience {
+            CredentialAudience::Instance { instance_id } => RuntimeIdentityContext {
+                instance_id: Some(instance_id.clone()),
+                ..RuntimeIdentityContext::default()
+            },
+            _ => RuntimeIdentityContext::default(),
+        };
         Self {
             inner: Arc::new(DaemonInner {
                 runs: Mutex::new(HashMap::new()),
@@ -126,6 +135,7 @@ impl DaemonState {
                 insecure_dev_mode: config.insecure_dev_mode,
                 policy_bundle_keyring: config.policy_bundle_keyring,
                 work_order_keyring: config.work_order_keyring,
+                runtime_identity,
                 trace_store_override,
                 runtime_available: AtomicBool::new(true),
                 device_profiles: Mutex::new(HashMap::new()),
@@ -161,7 +171,10 @@ impl DaemonState {
         );
         // Revocation uncertainty must never leave the previously live grant
         // usable, even when its audit append fails.
-        slot.run_authority.revoke();
+        let authority = slot.run_authority.clone();
+        authority.close_effect_admission();
+        drop(runs);
+        authority.wait_for_effect_quiescence();
         recorded
     }
 
@@ -334,6 +347,8 @@ struct RunSlot {
     trace_store: Arc<dyn TraceStore>,
     gateway: Arc<dyn ActionGateway>,
     run_authority: RunAuthorityHandle,
+    work_order_id: WorkOrderId,
+    bound_work_order_payload_digest: String,
     authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
     action_profiles: Vec<splendor_gateway::TrustedActionProfile>,
     tenant_registry: TenantRegistry,
@@ -1630,6 +1645,42 @@ fn create_run_request_fingerprint(request: &CreateRunRequest, work_order: &WorkO
     }))
 }
 
+fn bound_work_order_payload_digest(
+    work_order: &WorkOrder,
+    run_id: &RunId,
+) -> Result<String, ApiError> {
+    let mut bound = work_order.clone();
+    bound.run_id = Some(run_id.clone());
+    let payload = bound.signing_payload_bytes().map_err(work_order_error)?;
+    let mut digest_input = b"splendor.daemon.resume-work-order.v1\0".to_vec();
+    digest_input.extend_from_slice(&payload);
+    Ok(ContentHash::blake3(digest_input).to_string())
+}
+
+fn ensure_resume_work_order_matches_original(
+    slot: &RunSlot,
+    validated: &ValidatedWorkOrder,
+) -> Result<(), ApiError> {
+    let work_order = validated.work_order();
+    if work_order.work_order_id != slot.work_order_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "resume_work_order_identity_mismatch",
+            "resume work order does not match the originally admitted work order",
+        ));
+    }
+    if bound_work_order_payload_digest(work_order, &slot.run_id)?
+        != slot.bound_work_order_payload_digest
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "resume_work_order_payload_mismatch",
+            "resume work order payload does not match the originally admitted authority",
+        ));
+    }
+    Ok(())
+}
+
 fn create_run_idempotency_scope(
     request: &CreateRunRequest,
     work_order: &WorkOrder,
@@ -1767,16 +1818,22 @@ async fn create_run(
         .clone()
         .unwrap_or_else(|| Arc::new(InMemoryTraceStore::default()));
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::default());
+    let mut runtime_identity = state.inner.runtime_identity.clone();
+    runtime_identity.tenant_id = Some(request.tenant_id.clone());
+    runtime_identity.agent_id = Some(request.agent_id.clone());
     let trace_runtime = Arc::new(
-        KernelRuntime::with_trace_store(Arc::clone(&trace_store), Some(run_id.clone())).map_err(
-            |error| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "trace_error",
-                    error.to_string(),
-                )
-            },
-        )?,
+        KernelRuntime::with_trace_store_and_identity(
+            Arc::clone(&trace_store),
+            Some(run_id.clone()),
+            runtime_identity,
+        )
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "trace_error",
+                error.to_string(),
+            )
+        })?,
     );
     let authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder> =
         Arc::new(KernelPreEffectAuthorityRecorder::new(
@@ -1938,6 +1995,8 @@ async fn create_run(
         Scheduler::with_registry(SchedulerConfig::default(), tenant_registry.clone());
     scheduler.add_agent(engine);
 
+    let bound_work_order_payload_digest =
+        bound_work_order_payload_digest(&validated_work_order, &run_id)?;
     let slot = RunSlot {
         run_id: run_id.clone(),
         tenant_id: request.tenant_id,
@@ -1948,6 +2007,8 @@ async fn create_run(
         trace_store,
         gateway,
         run_authority,
+        work_order_id: validated_work_order.work_order_id.clone(),
+        bound_work_order_payload_digest,
         authority_recorder,
         action_profiles,
         tenant_registry,
@@ -2128,6 +2189,12 @@ async fn pause_run(
         request.audit_attribution,
     )?;
     record_daemon_audit(slot, "splendor.runs.pause", security.audit_attribution)?;
+    if !matches!(slot.status, RunStatus::Pending | RunStatus::Running) {
+        return Err(invalid_lifecycle_transition(
+            &slot.status,
+            "run must be pending or running before pause",
+        ));
+    }
     record_run_event(
         slot,
         TraceEventKind::RunPaused {
@@ -2160,27 +2227,33 @@ async fn stop_run(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<RunInspectResponse>, ApiError> {
     state.ensure_runtime_available()?;
-    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
-    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
-    let security = state.validate_security(
-        DaemonEndpoint::RunStop {
-            tenant_id: slot.tenant_id.clone(),
-            run_id: run_id.clone(),
-        },
-        request.credential,
-        None,
-        request.audit_attribution,
-    )?;
-    record_daemon_audit(slot, "splendor.runs.stop", security.audit_attribution)?;
-    record_run_event(
-        slot,
-        TraceEventKind::RunStopped {
-            reason: request.reason,
-        },
-    )?;
-    slot.status = RunStatus::Cancelled;
-    slot.updated_at = OffsetDateTime::now_utc();
-    Ok(Json(inspect_response(slot)))
+    let (authority, response) = {
+        let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+        let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+        let security = state.validate_security(
+            DaemonEndpoint::RunStop {
+                tenant_id: slot.tenant_id.clone(),
+                run_id: run_id.clone(),
+            },
+            request.credential,
+            None,
+            request.audit_attribution,
+        )?;
+        record_daemon_audit(slot, "splendor.runs.stop", security.audit_attribution)?;
+        let authority = slot.run_authority.clone();
+        authority.close_effect_admission();
+        record_run_event(
+            slot,
+            TraceEventKind::RunStopped {
+                reason: request.reason,
+            },
+        )?;
+        slot.status = RunStatus::Cancelled;
+        slot.updated_at = OffsetDateTime::now_utc();
+        (authority, inspect_response(slot))
+    };
+    wait_for_run_authority_quiescence(authority).await?;
+    Ok(Json(response))
 }
 
 async fn cancel_run(
@@ -2189,27 +2262,33 @@ async fn cancel_run(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<RunInspectResponse>, ApiError> {
     state.ensure_runtime_available()?;
-    let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
-    let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
-    let security = state.validate_security(
-        DaemonEndpoint::RunStop {
-            tenant_id: slot.tenant_id.clone(),
-            run_id: run_id.clone(),
-        },
-        request.credential,
-        None,
-        request.audit_attribution,
-    )?;
-    record_daemon_audit(slot, "splendor.runs.cancel", security.audit_attribution)?;
-    record_run_event(
-        slot,
-        TraceEventKind::RunStopped {
-            reason: request.reason,
-        },
-    )?;
-    slot.status = RunStatus::Cancelled;
-    slot.updated_at = OffsetDateTime::now_utc();
-    Ok(Json(inspect_response(slot)))
+    let (authority, response) = {
+        let mut runs = state.inner.runs.lock().map_err(|_| lock_error())?;
+        let slot = runs.get_mut(&run_id).ok_or_else(|| invalid_run(&run_id))?;
+        let security = state.validate_security(
+            DaemonEndpoint::RunStop {
+                tenant_id: slot.tenant_id.clone(),
+                run_id: run_id.clone(),
+            },
+            request.credential,
+            None,
+            request.audit_attribution,
+        )?;
+        record_daemon_audit(slot, "splendor.runs.cancel", security.audit_attribution)?;
+        let authority = slot.run_authority.clone();
+        authority.close_effect_admission();
+        record_run_event(
+            slot,
+            TraceEventKind::RunStopped {
+                reason: request.reason,
+            },
+        )?;
+        slot.status = RunStatus::Cancelled;
+        slot.updated_at = OffsetDateTime::now_utc();
+        (authority, inspect_response(slot))
+    };
+    wait_for_run_authority_quiescence(authority).await?;
+    Ok(Json(response))
 }
 
 async fn append_percept(
@@ -2831,6 +2910,7 @@ async fn submit_action(
         request.audit_attribution,
     )?;
     record_daemon_audit(slot, "splendor.actions.submit", security.audit_attribution)?;
+    ensure_run_allows_external_effects(slot)?;
 
     let effective_action_id = request.action_id.clone().unwrap_or_else(ActionId::new);
     record_run_action_event(
@@ -2848,9 +2928,7 @@ async fn submit_action(
         tick_id: None,
         action: request.action.clone(),
         adapter: request.adapter,
-        quota_usage: request
-            .quota_usage
-            .unwrap_or_else(splendor_types::QuotaUsage::single_action),
+        quota_usage: normalize_untrusted_quota_usage(request.quota_usage),
         satisfied_preconditions: request.satisfied_preconditions,
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.approval_evidence,
@@ -2924,7 +3002,7 @@ async fn submit_action(
         }
         ActionStatus::NeedsIntervention => {
             record_approval_event_if_present(slot, &outcome)?;
-            slot.status = RunStatus::Failed;
+            transition_run_status(slot, RunStatus::Failed);
             record_run_action_event(
                 slot,
                 &effective_action_id,
@@ -2934,21 +3012,24 @@ async fn submit_action(
                 },
             )
         }
-        ActionStatus::Failed => record_run_action_event(
-            slot,
-            &effective_action_id,
-            TraceEventKind::ActionFailed {
-                action: request.action.clone(),
-                error: outcome
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "action_failed".to_string()),
-                result: outcome
-                    .post_verification
-                    .clone()
-                    .unwrap_or_else(|| outcome.verification.clone()),
-            },
-        ),
+        ActionStatus::Failed => {
+            transition_run_status(slot, RunStatus::Failed);
+            record_run_action_event(
+                slot,
+                &effective_action_id,
+                TraceEventKind::ActionFailed {
+                    action: request.action.clone(),
+                    error: outcome
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "action_failed".to_string()),
+                    result: outcome
+                        .post_verification
+                        .clone()
+                        .unwrap_or_else(|| outcome.verification.clone()),
+                },
+            )
+        }
     }?;
     record_run_action_event(
         slot,
@@ -3144,6 +3225,7 @@ async fn submit_physical_action(
         "splendor.devices.actions.submit",
         security.audit_attribution.clone(),
     )?;
+    ensure_run_allows_external_effects(slot)?;
     let effective_action_id = request
         .action_request
         .action_id
@@ -3233,10 +3315,7 @@ async fn submit_physical_action(
         tick_id: None,
         action: request.action_request.action.clone(),
         adapter: request.action_request.adapter.clone(),
-        quota_usage: request
-            .action_request
-            .quota_usage
-            .unwrap_or_else(splendor_types::QuotaUsage::single_action),
+        quota_usage: normalize_untrusted_quota_usage(request.action_request.quota_usage),
         satisfied_preconditions: request.action_request.satisfied_preconditions.clone(),
         requested_at: OffsetDateTime::now_utc(),
         approval_evidence: request.action_request.approval_evidence.clone(),
@@ -4079,6 +4158,70 @@ enum LifecycleKind {
     Resume,
 }
 
+fn run_status_allows_external_effects(status: &RunStatus) -> bool {
+    // Pending remains effect-capable for the stable direct `/actions`
+    // compatibility path; all suspended, resuming, and terminal states deny.
+    matches!(status, RunStatus::Pending | RunStatus::Running)
+}
+
+fn run_status_is_terminal(status: &RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Cancelled
+            | RunStatus::Denied
+            | RunStatus::Expired
+    )
+}
+
+fn ensure_run_allows_external_effects(slot: &RunSlot) -> Result<(), ApiError> {
+    if run_status_allows_external_effects(&slot.status) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "run_not_effect_capable",
+        "run lifecycle state does not admit external effects",
+    )
+    .details(serde_json::json!({"status": slot.status})))
+}
+
+fn invalid_lifecycle_transition(status: &RunStatus, message: &str) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "invalid_run_state", message)
+        .details(serde_json::json!({"status": status}))
+}
+
+fn transition_run_status(slot: &mut RunSlot, next: RunStatus) {
+    if run_status_is_terminal(&next) {
+        slot.run_authority.close_effect_admission();
+    }
+    slot.status = next;
+}
+
+async fn wait_for_run_authority_quiescence(authority: RunAuthorityHandle) -> Result<(), ApiError> {
+    tokio::task::spawn_blocking(move || authority.wait_for_effect_quiescence())
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authority_quiescence_error",
+                format!("run authority quiescence wait failed: {error}"),
+            )
+        })
+}
+
+fn normalize_untrusted_quota_usage(
+    usage: Option<splendor_types::QuotaUsage>,
+) -> splendor_types::QuotaUsage {
+    let mut normalized = usage.unwrap_or_default();
+    normalized.actions = normalized.actions.max(1);
+    // A completed gateway invocation necessarily consumes non-zero runtime even
+    // though this compatibility adapter has no trusted receipt reconciliation.
+    normalized.action_duration_ms = normalized.action_duration_ms.max(1);
+    normalized
+}
+
 async fn run_lifecycle_tick(
     state: DaemonState,
     run_id: RunId,
@@ -4099,7 +4242,7 @@ async fn run_lifecycle_tick(
             run_id: run_id.clone(),
         },
     };
-    let security_work_order = if matches!(kind, LifecycleKind::Resume) {
+    let validated_resume_work_order = if matches!(kind, LifecycleKind::Resume) {
         let envelope = request.work_order.as_ref().ok_or_else(|| {
             ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -4107,7 +4250,7 @@ async fn run_lifecycle_tick(
                 "resume requires a signed work order envelope",
             )
         })?;
-        validate_daemon_work_order(
+        let validated = validate_daemon_work_order(
             &state,
             envelope,
             &slot.tenant_id,
@@ -4115,30 +4258,43 @@ async fn run_lifecycle_tick(
             Some(run_id.clone()),
             None,
         )?;
-        Some(work_order_authorization_for_endpoint(
-            envelope,
-            vec![splendor_types::EndpointScope::RunsResume],
-        ))
+        Some(validated)
     } else {
         None
     };
+    let security_work_order = request.work_order.as_ref().and_then(|envelope| {
+        matches!(kind, LifecycleKind::Resume).then(|| {
+            work_order_authorization_for_endpoint(
+                envelope,
+                vec![splendor_types::EndpointScope::RunsResume],
+            )
+        })
+    });
     let security = state.validate_security(
         endpoint,
         request.credential,
         security_work_order,
         request.audit_attribution,
     )?;
-    if matches!(kind, LifecycleKind::Resume)
-        && !matches!(
-            slot.status,
-            RunStatus::Paused | RunStatus::WaitingForApproval
-        )
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "invalid_run_state",
-            "run must be paused or waiting for approval before resume",
-        ));
+    match kind {
+        LifecycleKind::Start if !matches!(slot.status, RunStatus::Pending | RunStatus::Running) => {
+            return Err(invalid_lifecycle_transition(
+                &slot.status,
+                "run must be pending or running before start",
+            ));
+        }
+        LifecycleKind::Resume
+            if !matches!(
+                slot.status,
+                RunStatus::Paused | RunStatus::WaitingForApproval
+            ) =>
+        {
+            return Err(invalid_lifecycle_transition(
+                &slot.status,
+                "run must be paused or waiting for approval before resume",
+            ));
+        }
+        _ => {}
     }
     if matches!(kind, LifecycleKind::Resume)
         && slot.status == RunStatus::WaitingForApproval
@@ -4150,19 +4306,8 @@ async fn run_lifecycle_tick(
             "resume from waiting_for_approval requires approval evidence",
         ));
     }
-    if matches!(
-        slot.status,
-        RunStatus::Completed
-            | RunStatus::Cancelled
-            | RunStatus::Failed
-            | RunStatus::Denied
-            | RunStatus::Expired
-    ) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "invalid_run_state",
-            "terminal runs cannot be started",
-        ));
+    if let Some(validated) = validated_resume_work_order.as_ref() {
+        ensure_resume_work_order_matches_original(slot, validated)?;
     }
     let endpoint = match kind {
         LifecycleKind::Start => "splendor.runs.start",
@@ -4185,7 +4330,7 @@ async fn run_lifecycle_tick(
     let step = match slot.scheduler.run_once() {
         Ok(step) => step,
         Err(error) => {
-            slot.status = RunStatus::Failed;
+            transition_run_status(slot, RunStatus::Failed);
             slot.updated_at = OffsetDateTime::now_utc();
             return Err(ApiError::from(error));
         }
@@ -4212,7 +4357,7 @@ async fn run_lifecycle_tick(
     }) {
         update_status_for_approval_denial(slot, outcome);
     } else if step.outcome.needs_intervention {
-        slot.status = RunStatus::Failed;
+        transition_run_status(slot, RunStatus::Failed);
     } else {
         slot.pending_approval = None;
         slot.status = success_status;
@@ -4426,11 +4571,14 @@ fn update_status_for_approval_denial(slot: &mut RunSlot, outcome: &ActionOutcome
     let Some((status, _approval)) = approval_artifact(&outcome.verification) else {
         return;
     };
-    slot.status = match status.as_str() {
-        "expired" => RunStatus::Expired,
-        "denied" | "revoked" | "schema_unsupported" => RunStatus::Denied,
-        _ => slot.status.clone(),
+    let next = match status.as_str() {
+        "expired" => Some(RunStatus::Expired),
+        "denied" | "revoked" | "schema_unsupported" => Some(RunStatus::Denied),
+        _ => None,
     };
+    if let Some(next) = next {
+        transition_run_status(slot, next);
+    }
 }
 
 fn approval_artifact(
@@ -5190,6 +5338,7 @@ mod tests {
         tenant_id: TenantId,
         agent_id: splendor_types::AgentId,
         run_id: RunId,
+        max_actions_per_tick: u32,
     ) {
         let work_order = WorkOrder {
             schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
@@ -5204,12 +5353,13 @@ mod tests {
                 "return_to_base".to_string(),
                 "dock".to_string(),
                 "read_battery".to_string(),
+                "fixture.write".to_string(),
             ],
             allowed_adapters: vec!["device-sim".to_string()],
             allowed_permissions: vec!["device.motion".to_string()],
             data_refs: vec!["device:unit".to_string()],
             quotas: splendor_types::WorkOrderQuotaPolicy {
-                max_actions_per_tick: Some(10),
+                max_actions_per_tick: Some(max_actions_per_tick),
                 ..splendor_types::WorkOrderQuotaPolicy::default()
             },
             placement: splendor_types::WorkOrderPlacement::default(),
@@ -5329,6 +5479,43 @@ mod tests {
             },
             safety_context,
             operator_intervention_evidence: None,
+        }
+    }
+
+    fn direct_physical_request(
+        run_id: RunId,
+        tenant_id: TenantId,
+        agent_id: splendor_types::AgentId,
+        action_name: &str,
+        quota_usage: splendor_types::QuotaUsage,
+    ) -> SubmitActionRequest {
+        let mut request =
+            physical_request(run_id, tenant_id, agent_id, action_name, safe_context())
+                .action_request;
+        request.action.side_effect_class = splendor_types::SideEffectClass::External;
+        request.quota_usage = Some(quota_usage);
+        request
+    }
+
+    fn authority_physical_request(
+        run_id: RunId,
+        tenant_id: TenantId,
+        agent_id: splendor_types::AgentId,
+    ) -> ActionRequest {
+        ActionRequest {
+            action_id: ActionId::new(),
+            tenant_id,
+            agent_id,
+            run_id,
+            tick_id: None,
+            action: physical_action("move_to_waypoint"),
+            adapter: Some("device-sim".to_string()),
+            quota_usage: splendor_types::QuotaUsage::single_action(),
+            satisfied_preconditions: Vec::new(),
+            requested_at: OffsetDateTime::now_utc(),
+            approval_evidence: None,
+            authority_obligation_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         }
     }
 
@@ -6229,6 +6416,8 @@ mod tests {
             format!("splendor.daemon.run:{run_id}"),
         )
         .expect("unit run authority");
+        let bound_work_order_payload_digest =
+            bound_work_order_payload_digest(&work_order, &run_id).expect("bound work-order digest");
         let slot = RunSlot {
             run_id,
             tenant_id: tenant_id.clone(),
@@ -6239,6 +6428,8 @@ mod tests {
             trace_store: Arc::new(InMemoryTraceStore::default()),
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
             run_authority,
+            work_order_id: work_order.work_order_id.clone(),
+            bound_work_order_payload_digest,
             authority_recorder: Arc::new(splendor_gateway::NoPreEffectAuthorityDecisionRecorder),
             action_profiles: Vec::new(),
             tenant_registry: TenantRegistry::new(),
@@ -6583,7 +6774,14 @@ mod tests {
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
         let node_id = NodeId::new();
-        create_unit_run(&state, tenant_id.clone(), agent_id.clone(), run_id.clone()).await;
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            10,
+        )
+        .await;
         let _ = register_device_profile(
             State(state.clone()),
             Json(RegisterDeviceProfileRequest {
@@ -6793,6 +6991,323 @@ mod tests {
         assert_eq!(wrong_scope.body.code, "wrong_scope");
     }
 
+    #[tokio::test]
+    async fn direct_and_physical_effects_require_explicitly_capable_run_status() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            10,
+        )
+        .await;
+        let _ = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+            }),
+        )
+        .await
+        .expect("register profile");
+
+        let pending = submit_action(
+            State(state.clone()),
+            Json(direct_physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "fixture.write",
+                splendor_types::QuotaUsage::single_action(),
+            )),
+        )
+        .await
+        .expect("pending direct action")
+        .0;
+        assert_eq!(pending.status, ActionStatus::Executed, "{pending:?}");
+
+        state
+            .inner
+            .runs
+            .lock()
+            .expect("runs")
+            .get_mut(&run_id)
+            .expect("run")
+            .status = RunStatus::Running;
+        let running = submit_physical_action(
+            Path(node_id.clone()),
+            State(state.clone()),
+            Json(physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "move_to_waypoint",
+                safe_context(),
+            )),
+        )
+        .await
+        .expect("running physical action")
+        .0;
+        assert_eq!(running.status, ActionStatus::Executed);
+
+        for denied_status in [
+            RunStatus::Paused,
+            RunStatus::WaitingForApproval,
+            RunStatus::Interrupted,
+            RunStatus::Resuming,
+            RunStatus::Cancelled,
+            RunStatus::Failed,
+            RunStatus::Denied,
+            RunStatus::Expired,
+            RunStatus::Completed,
+        ] {
+            let (evaluations_before, executions_before) = {
+                let mut runs = state.inner.runs.lock().expect("runs");
+                let slot = runs.get_mut(&run_id).expect("run");
+                slot.status = denied_status.clone();
+                (
+                    slot.run_authority.evaluation_count(),
+                    slot.adapter_executions.load(Ordering::SeqCst),
+                )
+            };
+            let direct = submit_action(
+                State(state.clone()),
+                Json(direct_physical_request(
+                    run_id.clone(),
+                    tenant_id.clone(),
+                    agent_id.clone(),
+                    "fixture.write",
+                    splendor_types::QuotaUsage::single_action(),
+                )),
+            )
+            .await
+            .expect_err("direct action lifecycle denied");
+            assert_eq!(direct.status, StatusCode::CONFLICT, "{denied_status:?}");
+            assert_eq!(
+                direct.body.code, "run_not_effect_capable",
+                "{denied_status:?}"
+            );
+
+            let physical = submit_physical_action(
+                Path(node_id.clone()),
+                State(state.clone()),
+                Json(physical_request(
+                    run_id.clone(),
+                    tenant_id.clone(),
+                    agent_id.clone(),
+                    "move_to_waypoint",
+                    safe_context(),
+                )),
+            )
+            .await
+            .expect_err("physical action lifecycle denied");
+            assert_eq!(physical.status, StatusCode::CONFLICT, "{denied_status:?}");
+            assert_eq!(
+                physical.body.code, "run_not_effect_capable",
+                "{denied_status:?}"
+            );
+
+            let runs = state.inner.runs.lock().expect("runs");
+            let slot = runs.get(&run_id).expect("run");
+            assert_eq!(
+                slot.run_authority.evaluation_count(),
+                evaluations_before,
+                "gateway authority evaluation must not run for {denied_status:?}"
+            );
+            assert_eq!(
+                slot.adapter_executions.load(Ordering::SeqCst),
+                executions_before,
+                "adapter must not run for {denied_status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_zero_quota_is_normalized_for_direct_and_physical_actions() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            0,
+        )
+        .await;
+        let _ = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+            }),
+        )
+        .await
+        .expect("register profile");
+
+        let direct = submit_action(
+            State(state.clone()),
+            Json(direct_physical_request(
+                run_id.clone(),
+                tenant_id.clone(),
+                agent_id.clone(),
+                "fixture.write",
+                splendor_types::QuotaUsage::default(),
+            )),
+        )
+        .await
+        .expect("direct quota outcome")
+        .0;
+        assert_eq!(direct.status, ActionStatus::Denied);
+        assert!(direct
+            .verification
+            .reasons
+            .contains(&"max_actions_per_tick".to_string()));
+
+        let mut physical_request = physical_request(
+            run_id.clone(),
+            tenant_id,
+            agent_id,
+            "move_to_waypoint",
+            safe_context(),
+        );
+        physical_request.action_request.quota_usage = Some(splendor_types::QuotaUsage::default());
+        let physical =
+            submit_physical_action(Path(node_id), State(state.clone()), Json(physical_request))
+                .await
+                .expect("physical quota outcome")
+                .0;
+        assert_eq!(physical.status, ActionStatus::Denied);
+        assert!(physical
+            .verification
+            .reasons
+            .contains(&"max_actions_per_tick".to_string()));
+
+        assert_eq!(
+            state
+                .inner
+                .runs
+                .lock()
+                .expect("runs")
+                .get(&run_id)
+                .expect("run")
+                .adapter_executions
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_and_cancel_close_admission_before_terminal_visibility_and_wait_without_run_lock()
+    {
+        for cancel in [false, true] {
+            let state = DaemonState::local_dev();
+            let tenant_id = TenantId::new();
+            let agent_id = splendor_types::AgentId::new();
+            let run_id = RunId::new();
+            create_unit_run(
+                &state,
+                tenant_id.clone(),
+                agent_id.clone(),
+                run_id.clone(),
+                10,
+            )
+            .await;
+            let authority = state
+                .inner
+                .runs
+                .lock()
+                .expect("runs")
+                .get(&run_id)
+                .expect("run")
+                .run_authority
+                .clone();
+            let authority_request = authority_physical_request(run_id.clone(), tenant_id, agent_id);
+            let held_permit =
+                match splendor_gateway::ActionAuthorityEvaluator::acquire_final_effect_permit(
+                    &authority,
+                    &authority_request,
+                    Some("device-sim"),
+                    &[],
+                    OffsetDateTime::now_utc(),
+                ) {
+                    splendor_gateway::FinalEffectAuthorityEvaluation::Permitted {
+                        permit, ..
+                    } => permit,
+                    splendor_gateway::FinalEffectAuthorityEvaluation::Denied(decisions) => {
+                        panic!("initial final permit denied: {decisions:?}")
+                    }
+                    splendor_gateway::FinalEffectAuthorityEvaluation::NotRequired => {
+                        panic!("run authority unexpectedly did not require a final permit")
+                    }
+                };
+
+            let lifecycle_state = state.clone();
+            let lifecycle_run_id = run_id.clone();
+            let lifecycle = tokio::spawn(async move {
+                let request = Json(LifecycleRequest {
+                    credential: None,
+                    work_order: None,
+                    audit_attribution: Some(unit_audit()),
+                    reason: Some(if cancel { "cancel" } else { "stop" }.to_string()),
+                    approval_evidence: None,
+                });
+                if cancel {
+                    cancel_run(Path(lifecycle_run_id), State(lifecycle_state), request).await
+                } else {
+                    stop_run(Path(lifecycle_run_id), State(lifecycle_state), request).await
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let inspected =
+                        inspect_run(Path(run_id.clone()), State(state.clone()), HeaderMap::new())
+                            .await
+                            .expect("inspect remains available during quiescence wait")
+                            .0;
+                    if inspected.status == RunStatus::Cancelled {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal status visible while final permit is held");
+            assert!(!lifecycle.is_finished(), "lifecycle waits for held permit");
+
+            let denied = splendor_gateway::ActionAuthorityEvaluator::acquire_final_effect_permit(
+                &authority,
+                &authority_request,
+                Some("device-sim"),
+                &[],
+                OffsetDateTime::now_utc(),
+            );
+            assert!(matches!(
+                denied,
+                splendor_gateway::FinalEffectAuthorityEvaluation::Denied(_)
+            ));
+
+            drop(held_permit);
+            let response = tokio::time::timeout(Duration::from_secs(1), lifecycle)
+                .await
+                .expect("lifecycle quiesces")
+                .expect("lifecycle task")
+                .expect("lifecycle response")
+                .0;
+            assert_eq!(response.status, RunStatus::Cancelled);
+        }
+    }
+
     #[test]
     fn physical_helper_boundaries_fail_closed_and_preserve_safety_snapshot() {
         let tenant_id = TenantId::new();
@@ -6916,7 +7431,14 @@ mod tests {
         assert_eq!(unregistered.status, StatusCode::NOT_FOUND);
         assert_eq!(unregistered.body.code, "device_not_registered");
 
-        create_unit_run(&state, tenant_id.clone(), agent_id.clone(), run_id.clone()).await;
+        create_unit_run(
+            &state,
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            10,
+        )
+        .await;
         let _ = register_device_profile(
             State(state.clone()),
             Json(RegisterDeviceProfileRequest {
