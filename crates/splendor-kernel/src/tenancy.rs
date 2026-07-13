@@ -322,11 +322,12 @@ pub struct AgentContext {
     pub state_head: Option<StateNodeId>,
     /// Runtime configuration for the agent.
     pub config: AgentRuntimeConfig,
-    /// Optional local child-run authority. When present, the loop engine denies
-    /// actions outside this explicit delegated scope before gateway submission.
-    pub delegated_authority: Option<DelegatedAuthority>,
-    /// Opaque authority-owned live runtime handle backing the compatibility projection.
-    pub delegated_runtime_authority: Option<DelegatedRuntimeAuthorityHandle>,
+    /// Manager-installed local child-run authority projection. This state is
+    /// private so application/parent code cannot clear it and fall back to the
+    /// broader tenant policy.
+    delegated_authority: Option<DelegatedAuthority>,
+    /// Manager-installed opaque live authority backing the projection.
+    delegated_runtime_authority: Option<DelegatedRuntimeAuthorityHandle>,
 }
 
 impl AgentContext {
@@ -354,13 +355,14 @@ impl AgentContext {
     }
 
     /// Restricts this agent context to an explicit local delegated authority.
-    pub fn set_delegated_authority(&mut self, authority: DelegatedAuthority) {
+    #[cfg(test)]
+    pub(crate) fn set_delegated_authority(&mut self, authority: DelegatedAuthority) {
         self.delegated_authority = Some(authority);
         self.delegated_runtime_authority = None;
     }
 
     /// Installs opaque live child authority plus a narrowing legacy projection.
-    pub fn set_delegated_runtime_authority(
+    pub(crate) fn set_delegated_runtime_authority(
         &mut self,
         authority: DelegatedRuntimeAuthorityHandle,
         projection: DelegatedAuthority,
@@ -369,10 +371,10 @@ impl AgentContext {
         self.delegated_authority = Some(projection);
     }
 
-    /// Returns a cloned agent context restricted to the provided delegated scope.
-    pub fn with_delegated_authority(mut self, authority: DelegatedAuthority) -> Self {
-        self.set_delegated_authority(authority);
-        self
+    /// Returns the non-authorizing compatibility projection, when this context
+    /// is manager-bound to a delegated run.
+    pub fn delegated_authority(&self) -> Option<&DelegatedAuthority> {
+        self.delegated_authority.as_ref()
     }
 
     /// Verifies a proposed action against child-run delegated authority.

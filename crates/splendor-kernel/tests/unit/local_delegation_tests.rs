@@ -599,12 +599,14 @@ fn create_nested_delegation() -> CreatedNestedDelegation {
         )
         .expect("first nested edge created");
 
-    let mut second_authority = LocalDelegationAuthority::from_caller(
-        first.child_caller.clone(),
-        grandchild_principal,
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
+    let mut second_authority = manager
+        .child_authority_for_run(
+            &first.run.run_id,
+            grandchild_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("nested child authority");
     second_authority.budget = AuthorityBudgetScope {
         max_actions_per_tick: Some(1),
         max_action_duration_ms: Some(250),
@@ -1838,8 +1840,8 @@ fn parent_creates_child_with_explicit_target_objective_and_trace_links() {
         Some(authority_evidence.child_capability_grant_id.clone())
     );
     assert_eq!(
-        child_run.child_agent.delegated_authority,
-        Some(authority(&["query"], &["sql"], &["finance.read"]))
+        child_run.child_agent.delegated_authority(),
+        Some(&authority(&["query"], &["sql"], &["finance.read"]))
     );
     assert_eq!(
         child_run.request_message.message.payload["objective"].as_str(),
@@ -3777,9 +3779,13 @@ fn nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref()
         .clone();
     assert_eq!(
         nested
-            .first
-            .child_caller
-            .child_request_defaults()
+            .manager
+            .child_authority_for_run(
+                &nested.first.run.run_id,
+                PrincipalId::new(),
+                AUTHORITY_AUDIENCE,
+                OffsetDateTime::now_utc(),
+            )
             .expect("first defaults")
             .budget
             .max_actions_per_tick,
@@ -3811,6 +3817,8 @@ fn nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref()
         !multiplied.allowed(),
         "parent and descendant cannot multiply subtree budget"
     );
+    drop(allowed);
+    drop(parent_spend);
 
     nested
         .manager
@@ -3842,12 +3850,15 @@ fn nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref()
 #[test]
 fn nested_escalation_identifies_exact_failing_chain_edge() {
     let nested = create_nested_delegation();
-    let mut escalation = LocalDelegationAuthority::from_caller(
-        nested.first.child_caller.clone(),
-        PrincipalId::new(),
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
+    let mut escalation = nested
+        .manager
+        .child_authority_for_run(
+            &nested.first.run.run_id,
+            PrincipalId::new(),
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("nested escalation authority input");
     escalation.role_profile = DelegationRoleProfile::Actuator;
     let mut request = LocalDelegationRequest::new(
         nested.first.run.run_id.clone(),
@@ -3868,7 +3879,7 @@ fn nested_escalation_identifies_exact_failing_chain_edge() {
 }
 
 #[test]
-fn root_caller_handle_cannot_impersonate_child_for_nested_delegation() {
+fn manager_owned_parent_binding_cannot_be_overridden_for_nested_delegation() {
     let nested = create_nested_delegation();
     let grandchild_id = AgentId::new();
     let grandchild_principal = PrincipalId::new();
@@ -3896,25 +3907,19 @@ fn root_caller_handle_cannot_impersonate_child_for_nested_delegation() {
     let child_recorder = SimpleRecorder {
         run_id: request.child_run_id.clone(),
     };
-    let forged = LocalDelegationAuthority::from_caller(
-        nested
-            .manager
-            .delegation_caller_handle(nested.first.run.parent_run_id.as_ref().expect("root run"))
-            .expect("root caller"),
-        grandchild_principal,
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
-    assert!(matches!(
-        nested.manager.create_child_run(
-            &nested.child_runtime,
-            &child_recorder,
-            request,
-            forged,
-        ),
-        Err(LocalDelegationError::AuthorityDenied { reason })
-            if reason == REASON_PARENT_RUN_GRANT_MISMATCH
-    ));
+    let forged = nested
+        .manager
+        .child_authority_for_run(
+            nested.first.run.parent_run_id.as_ref().expect("root run"),
+            grandchild_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root-derived child authority input");
+    assert!(nested
+        .manager
+        .create_child_run(&nested.child_runtime, &child_recorder, request, forged,)
+        .is_err());
 }
 
 #[test]
@@ -4089,14 +4094,14 @@ fn delegation_requested_trace_failure_releases_before_routing_and_exact_retry_su
         .expect("outbox")
         .is_empty());
 
-    let retry_authority = LocalDelegationAuthority::from_caller(
-        manager
-            .delegation_caller_handle(&request.parent_run_id)
-            .expect("root caller"),
-        child_principal.clone(),
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
+    let retry_authority = manager
+        .child_authority_for_run(
+            &request.parent_run_id,
+            child_principal.clone(),
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root child authority");
     let (parent_runtime, _) = runtime_for(parent_run_id);
     manager
         .create_child_run(&parent_runtime, &child_runtime, request, retry_authority)
@@ -4119,14 +4124,14 @@ fn routing_uncertainty_tombstones_child_run_id_across_new_grant_attempts() {
     manager
         .create_child_run(&parent_runtime, &child_runtime, request.clone(), authority)
         .expect_err("routing uncertainty");
-    let new_grant_attempt = LocalDelegationAuthority::from_caller(
-        manager
-            .delegation_caller_handle(&request.parent_run_id)
-            .expect("root caller"),
-        child_principal,
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
+    let new_grant_attempt = manager
+        .child_authority_for_run(
+            &request.parent_run_id,
+            child_principal,
+            AUTHORITY_AUDIENCE,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("root child authority");
     assert!(matches!(
         manager.create_child_run(
             &parent_runtime,

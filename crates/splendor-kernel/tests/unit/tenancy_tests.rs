@@ -434,12 +434,12 @@ fn agent_context_tracks_interpreter_and_head() {
 
 #[test]
 fn agent_context_delegated_authority_allows_only_explicit_scope() {
-    let agent = AgentContext::new(
+    let mut agent = AgentContext::new(
         AgentId::new(),
         TenantId::new(),
         AgentRuntimeConfig::default(),
-    )
-    .with_delegated_authority(splendor_types::DelegatedAuthority {
+    );
+    agent.set_delegated_authority(splendor_types::DelegatedAuthority {
         allowed_actions: vec!["query".to_string()],
         allowed_adapters: vec!["sql".to_string()],
         allowed_permissions: vec!["finance.read".to_string()],

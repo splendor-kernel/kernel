@@ -1390,12 +1390,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
     };
-    let mut child_a_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run)?,
+    let mut child_a_authority = manager.child_authority_for_run(
+        &parent_run,
         specialist_a_principal.clone(),
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     child_a_authority.max_fan_out = 4;
     child_a_authority.budget = AuthorityBudgetScope {
         max_actions_per_tick: Some(2),
@@ -1412,8 +1412,7 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
     assert_eq!(
         child_a
             .child_agent
-            .delegated_authority
-            .as_ref()
+            .delegated_authority()
             .unwrap()
             .allowed_actions,
         vec!["parse.document".to_string()]
@@ -1429,12 +1428,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
     };
-    let mut child_b_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run)?,
+    let mut child_b_authority = manager.child_authority_for_run(
+        &parent_run,
         specialist_b_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     child_b_authority.max_fan_out = 4;
     child_b_authority.budget = AuthorityBudgetScope {
         max_actions_per_tick: Some(2),
@@ -1502,12 +1501,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority(&["parse.document"], &["doc.read"]),
         None,
     );
-    let cancelled_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run)?,
+    let cancelled_authority = manager.child_authority_for_run(
+        &parent_run,
         specialist_a_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     let cancelled_attempt = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -2605,12 +2604,12 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         &tenant_mismatch_request,
     )?;
     manager.bind_root_run_capability_grant(&run_id, &tenant_mismatch_parent_grant)?;
-    let tenant_mismatch_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&run_id)?,
+    let tenant_mismatch_authority = manager.child_authority_for_run(
+        &run_id,
         shared_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     let tenant_mismatch = manager
         .create_child_run(
             &parent_runtime,
@@ -2654,15 +2653,11 @@ fn run_remote_helper_non_authority(
     let tenant_id = TenantId::parse("00000000-0000-0000-0000-000000001101")?;
     let helper_agent = AgentId::parse("00000000-0000-0000-0000-000000001102")?;
     let run_id = RunId::parse("00000000-0000-0000-0000-000000001103")?;
-    let helper = AgentContext::new(helper_agent, tenant_id, AgentRuntimeConfig::default())
-        .with_delegated_authority(DelegatedAuthority::empty());
-    let escalation = helper.verify_delegated_action(
-        &action(
-            "origin.adapter.execute",
-            SideEffectClass::External,
-            &["origin.write"],
-        ),
+    let _helper = AgentContext::new(helper_agent, tenant_id, AgentRuntimeConfig::default());
+    let escalation = DelegatedAuthority::empty().verify_action(
+        "origin.adapter.execute",
         Some("fixture"),
+        &["origin.write".to_string()],
     );
     assert!(!escalation.allowed);
     let state_store = Arc::new(InMemoryStateStore::default());
@@ -3240,12 +3235,12 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         &child_request,
     )?;
     delegation.bind_root_run_capability_grant(&run_id, &child_parent_grant)?;
-    let child_authority = LocalDelegationAuthority::from_caller(
-        delegation.delegation_caller_handle(&run_id)?,
+    let child_authority = delegation.child_authority_for_run(
+        &run_id,
         local_specialist_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,

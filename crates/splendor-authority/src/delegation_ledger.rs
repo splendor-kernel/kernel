@@ -16,7 +16,7 @@ use splendor_types::{
     CAPABILITY_REQUEST_SCHEMA_VERSION, DELEGATION_CHAIN_SCHEMA_VERSION,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -53,6 +53,9 @@ struct LedgerNode {
     handle_token: CapabilityGrantId,
     own_tick_usage: HashMap<u64, QuotaUsage>,
     subtree_tick_usage: HashMap<u64, QuotaUsage>,
+    own_http_usage: HashMap<i64, u32>,
+    subtree_http_usage: HashMap<i64, u32>,
+    in_flight_effects: u64,
     allowed_child_bindings: Vec<(AgentId, RunId)>,
 }
 
@@ -66,6 +69,12 @@ struct RuntimeBinding {
 #[derive(Default)]
 struct LedgerState {
     nodes: HashMap<CapabilityGrantId, LedgerNode>,
+}
+
+#[derive(Default)]
+struct LedgerShared {
+    state: Mutex<LedgerState>,
+    quiescent: Condvar,
 }
 
 /// Opaque atomic reservation returned before the kernel attempts routing.
@@ -98,7 +107,7 @@ impl DelegationReservation {
 /// node lifecycle before delegation is reserved.
 #[derive(Clone)]
 pub struct DelegationCallerHandle {
-    state: Arc<Mutex<LedgerState>>,
+    state: Arc<LedgerShared>,
     grant_id: CapabilityGrantId,
     token: CapabilityGrantId,
 }
@@ -138,7 +147,7 @@ impl DelegationCallerHandle {
     /// Trusted admission compatibility check. The supplied wrapper never
     /// becomes live authority; it must equal the ledger-owned binding exactly.
     pub fn matches_validated_grant(&self, grant: &ValidatedCapabilityGrant) -> bool {
-        self.state.lock().ok().is_some_and(|state| {
+        self.state.state.lock().ok().is_some_and(|state| {
             state
                 .nodes
                 .get(&self.grant_id)
@@ -152,6 +161,7 @@ impl DelegationCallerHandle {
         &self,
     ) -> Result<DelegationChildRequestDefaults, DelegationLedgerError> {
         let state = self
+            .state
             .state
             .lock()
             .map_err(|_| DelegationLedgerError::StorageUnavailable)?;
@@ -183,7 +193,7 @@ pub struct DelegationChildRequestDefaults {
 /// Opaque authority-owned live child runtime authority.
 #[derive(Clone)]
 pub struct DelegatedRuntimeAuthorityHandle {
-    state: Arc<Mutex<LedgerState>>,
+    state: Arc<LedgerShared>,
     grant_id: CapabilityGrantId,
     token: CapabilityGrantId,
 }
@@ -212,12 +222,22 @@ impl DelegatedRuntimeAuthorityHandle {
     ) -> Result<DelegatedActionPermit, DelegatedActionAuthorizationError> {
         let mut state = self
             .state
+            .state
             .lock()
             .map_err(|_| DelegatedActionAuthorizationError::AuthorityUnavailable)?;
         authorize_live_action(&mut state, &self.grant_id, &self.token, request)?;
+        let lineage = grant_lineage(&state, &self.grant_id)?;
+        for id in &lineage {
+            let node = state
+                .nodes
+                .get_mut(id)
+                .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+            node.in_flight_effects = node.in_flight_effects.saturating_add(1);
+        }
         Ok(DelegatedActionPermit {
-            _state: Arc::clone(&self.state),
+            state: Arc::clone(&self.state),
             grant_id: self.grant_id.clone(),
+            lineage,
         })
     }
 }
@@ -237,8 +257,9 @@ pub struct DelegatedActionAuthorizationRequest {
 
 /// Linearization permit proving final live delegated authorization occurred.
 pub struct DelegatedActionPermit {
-    _state: Arc<Mutex<LedgerState>>,
+    state: Arc<LedgerShared>,
     grant_id: CapabilityGrantId,
+    lineage: Vec<CapabilityGrantId>,
 }
 
 impl std::fmt::Debug for DelegatedActionPermit {
@@ -254,6 +275,20 @@ impl std::fmt::Debug for DelegatedActionPermit {
 impl DelegatedActionPermit {
     pub fn grant_id(&self) -> &CapabilityGrantId {
         &self.grant_id
+    }
+}
+
+impl Drop for DelegatedActionPermit {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.state.lock() else {
+            return;
+        };
+        for id in &self.lineage {
+            if let Some(node) = state.nodes.get_mut(id) {
+                node.in_flight_effects = node.in_flight_effects.saturating_sub(1);
+            }
+        }
+        self.state.quiescent.notify_all();
     }
 }
 
@@ -395,13 +430,13 @@ impl DelegationLedgerError {
 
 /// In-memory authority owner for local delegation validity and accounting.
 pub struct InMemoryDelegationAuthorityLedger {
-    state: Arc<Mutex<LedgerState>>,
+    state: Arc<LedgerShared>,
 }
 
 impl Default for InMemoryDelegationAuthorityLedger {
     fn default() -> Self {
         Self {
-            state: Arc::new(Mutex::new(LedgerState::default())),
+            state: Arc::new(LedgerShared::default()),
         }
     }
 }
@@ -512,6 +547,9 @@ impl InMemoryDelegationAuthorityLedger {
                 handle_token: handle_token.clone(),
                 own_tick_usage: HashMap::new(),
                 subtree_tick_usage: HashMap::new(),
+                own_http_usage: HashMap::new(),
+                subtree_http_usage: HashMap::new(),
+                in_flight_effects: 0,
                 allowed_child_bindings,
             },
         );
@@ -649,6 +687,9 @@ impl InMemoryDelegationAuthorityLedger {
                 handle_token,
                 own_tick_usage: HashMap::new(),
                 subtree_tick_usage: HashMap::new(),
+                own_http_usage: HashMap::new(),
+                subtree_http_usage: HashMap::new(),
+                in_flight_effects: 0,
                 allowed_child_bindings,
             },
         );
@@ -735,18 +776,37 @@ impl InMemoryDelegationAuthorityLedger {
         }) {
             return Err(DelegationLedgerError::ActiveDescendants);
         }
-        let node = state
-            .nodes
-            .get_mut(grant_id)
-            .ok_or(DelegationLedgerError::ParentGrantMissing)?;
-        if !matches!(
-            node.status,
-            EdgeStatus::Active | EdgeStatus::ConsumedAfterRoutingFailure
-        ) {
-            return Err(DelegationLedgerError::ReservationNotActive);
+        {
+            let node = state
+                .nodes
+                .get_mut(grant_id)
+                .ok_or(DelegationLedgerError::ParentGrantMissing)?;
+            if !matches!(
+                node.status,
+                EdgeStatus::Active | EdgeStatus::ConsumedAfterRoutingFailure
+            ) {
+                return Err(DelegationLedgerError::ReservationNotActive);
+            }
+            // Closing admission is the linearization point. Existing permits
+            // remain valid until their gateway/adapter call leaves the boundary.
+            node.status = EdgeStatus::Cleaned;
         }
-        node.status = EdgeStatus::Cleaned;
-        Ok(node.evidence(DelegationReservationStatus::Cleaned, Some(reason.into())))
+        while state
+            .nodes
+            .get(grant_id)
+            .is_some_and(|node| node.in_flight_effects != 0)
+        {
+            state = self
+                .state
+                .quiescent
+                .wait(state)
+                .map_err(|_| DelegationLedgerError::StorageUnavailable)?;
+        }
+        Ok(state
+            .nodes
+            .get(grant_id)
+            .ok_or(DelegationLedgerError::ParentGrantMissing)?
+            .evidence(DelegationReservationStatus::Cleaned, Some(reason.into())))
     }
 
     /// Reclaims a just-cleaned edge fail-safe when cleanup trace persistence fails.
@@ -781,21 +841,16 @@ impl InMemoryDelegationAuthorityLedger {
         if !state.nodes.contains_key(grant_id) {
             return Err(DelegationLedgerError::ParentGrantMissing);
         }
-        let root_revoked = state
-            .nodes
-            .get(grant_id)
-            .is_some_and(|node| node.parent_grant_id.is_none());
         let mut ids = state
             .nodes
             .iter()
-            .filter(|(_, node)| {
-                node.parent_grant_id.is_some()
-                    && (root_revoked
-                        || node
-                            .chain
-                            .grants
-                            .iter()
-                            .any(|edge| &edge.child_capability_grant.grant_id == grant_id))
+            .filter(|(id, node)| {
+                *id == grant_id
+                    || node
+                        .chain
+                        .grants
+                        .iter()
+                        .any(|edge| &edge.parent_grant_id == grant_id)
             })
             .map(|(id, node)| (node.chain.grants.len(), id.clone()))
             .collect::<Vec<_>>();
@@ -804,15 +859,28 @@ impl InMemoryDelegationAuthorityLedger {
                 .cmp(&right.0)
                 .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
         });
-        let mut evidence = Vec::new();
-        for (_, id) in ids {
-            if let Some(node) = state.nodes.get_mut(&id) {
+        for (_, id) in &ids {
+            if let Some(node) = state.nodes.get_mut(id) {
                 node.status = EdgeStatus::Revoked;
-                evidence.push(
-                    node.evidence(DelegationReservationStatus::Revoked, Some(reason.clone())),
-                );
             }
         }
+        while ids.iter().any(|(_, id)| {
+            state
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.in_flight_effects != 0)
+        }) {
+            state = self
+                .state
+                .quiescent
+                .wait(state)
+                .map_err(|_| DelegationLedgerError::StorageUnavailable)?;
+        }
+        let evidence = ids
+            .into_iter()
+            .filter_map(|(_, id)| state.nodes.get(&id))
+            .map(|node| node.evidence(DelegationReservationStatus::Revoked, Some(reason.clone())))
+            .collect();
         Ok(evidence)
     }
 
@@ -849,6 +917,7 @@ impl InMemoryDelegationAuthorityLedger {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, LedgerState>, DelegationLedgerError> {
         self.state
+            .state
             .lock()
             .map_err(|_| DelegationLedgerError::StorageUnavailable)
     }
@@ -895,7 +964,7 @@ impl LedgerNode {
 }
 
 fn handle_for_node(
-    state: &Arc<Mutex<LedgerState>>,
+    state: &Arc<LedgerShared>,
     grant_id: &CapabilityGrantId,
     node: &LedgerNode,
 ) -> DelegationCallerHandle {
@@ -1063,28 +1132,38 @@ fn authorize_live_action(
 
     let retained = retained_executable_budget(state, grant_id, node.budget)?;
     let usage = conservative_usage(retained, request.usage_estimate);
+    let mut tick_usage = usage;
+    tick_usage.http_requests = 0;
+    let minute_bucket = request.now.unix_timestamp().div_euclid(60);
     let own_current = node
         .own_tick_usage
         .get(&request.tick_id)
         .copied()
         .unwrap_or_default();
-    ensure_usage_fits(own_current, usage, retained).map_err(|error| match error {
+    ensure_usage_fits(own_current, tick_usage, without_http_limit(retained)).map_err(|error| {
+        match error {
+            DelegatedActionAuthorizationError::BudgetExceeded { dimension } => {
+                DelegatedActionAuthorizationError::RetainedBudgetExceeded { dimension }
+            }
+            other => other,
+        }
+    })?;
+    ensure_http_fits(
+        node.own_http_usage
+            .get(&minute_bucket)
+            .copied()
+            .unwrap_or_default(),
+        usage.http_requests,
+        retained.max_http_requests_per_minute,
+    )
+    .map_err(|error| match error {
         DelegatedActionAuthorizationError::BudgetExceeded { dimension } => {
             DelegatedActionAuthorizationError::RetainedBudgetExceeded { dimension }
         }
         other => other,
     })?;
 
-    let mut lineage = vec![grant_id.clone()];
-    let mut cursor = node.parent_grant_id.clone();
-    while let Some(parent_id) = cursor {
-        let parent = state
-            .nodes
-            .get(&parent_id)
-            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
-        lineage.push(parent_id.clone());
-        cursor = parent.parent_grant_id.clone();
-    }
+    let lineage = grant_lineage(state, grant_id)?;
     for ancestor_id in &lineage {
         let ancestor = state
             .nodes
@@ -1098,7 +1177,20 @@ fn authorize_live_action(
             .get(&request.tick_id)
             .copied()
             .unwrap_or_default();
-        ensure_usage_fits(subtree_current, usage, ancestor.budget)?;
+        ensure_usage_fits(
+            subtree_current,
+            tick_usage,
+            without_http_limit(ancestor.budget),
+        )?;
+        ensure_http_fits(
+            ancestor
+                .subtree_http_usage
+                .get(&minute_bucket)
+                .copied()
+                .unwrap_or_default(),
+            usage.http_requests,
+            ancestor.budget.max_http_requests_per_minute,
+        )?;
     }
 
     let node = state
@@ -1108,18 +1200,59 @@ fn authorize_live_action(
     node.own_tick_usage
         .entry(request.tick_id)
         .or_default()
-        .accumulate(usage);
+        .accumulate(tick_usage);
+    prune_http_windows(&mut node.own_http_usage, minute_bucket);
+    let own_http = node
+        .own_http_usage
+        .get(&minute_bucket)
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(usage.http_requests);
+    node.own_http_usage.insert(minute_bucket, own_http);
     for ancestor_id in lineage {
-        state
+        let ancestor = state
             .nodes
             .get_mut(&ancestor_id)
-            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?
+            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+        ancestor
             .subtree_tick_usage
             .entry(request.tick_id)
             .or_default()
-            .accumulate(usage);
+            .accumulate(tick_usage);
+        prune_http_windows(&mut ancestor.subtree_http_usage, minute_bucket);
+        let subtree_http = ancestor
+            .subtree_http_usage
+            .get(&minute_bucket)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(usage.http_requests);
+        ancestor
+            .subtree_http_usage
+            .insert(minute_bucket, subtree_http);
     }
     Ok(())
+}
+
+fn grant_lineage(
+    state: &LedgerState,
+    grant_id: &CapabilityGrantId,
+) -> Result<Vec<CapabilityGrantId>, DelegatedActionAuthorizationError> {
+    let mut lineage = vec![grant_id.clone()];
+    let mut cursor = state
+        .nodes
+        .get(grant_id)
+        .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?
+        .parent_grant_id
+        .clone();
+    while let Some(parent_id) = cursor {
+        let parent = state
+            .nodes
+            .get(&parent_id)
+            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+        lineage.push(parent_id.clone());
+        cursor = parent.parent_grant_id.clone();
+    }
+    Ok(lineage)
 }
 
 fn retained_executable_budget(
@@ -1211,7 +1344,10 @@ fn subtract_budget(
 
 fn conservative_usage(limits: AuthorityBudgetScope, estimate: QuotaUsage) -> QuotaUsage {
     QuotaUsage {
-        actions: estimate.actions.max(1),
+        // One admitted proposal is always one action. Every other unmeasured
+        // dimension reserves the trusted grant maximum, never a smaller value
+        // supplied by policy/user space.
+        actions: 1,
         action_duration_ms: conservative_u64(
             estimate.action_duration_ms,
             limits.max_action_duration_ms,
@@ -1240,19 +1376,37 @@ fn conservative_usage(limits: AuthorityBudgetScope, estimate: QuotaUsage) -> Quo
 }
 
 fn conservative_u64(estimate: u64, limit: Option<u64>) -> u64 {
-    if estimate == 0 {
-        limit.unwrap_or(0)
-    } else {
-        estimate
-    }
+    limit.unwrap_or(estimate)
 }
 
 fn conservative_u32(estimate: u32, limit: Option<u32>) -> u32 {
-    if estimate == 0 {
-        limit.unwrap_or(0)
-    } else {
-        estimate
+    limit.unwrap_or(estimate)
+}
+
+fn without_http_limit(mut limit: AuthorityBudgetScope) -> AuthorityBudgetScope {
+    limit.max_http_requests_per_minute = None;
+    limit
+}
+
+fn ensure_http_fits(
+    current: u32,
+    additional: u32,
+    limit: Option<u32>,
+) -> Result<(), DelegatedActionAuthorizationError> {
+    if limit.is_some_and(|limit| {
+        current
+            .checked_add(additional)
+            .is_none_or(|value| value > limit)
+    }) {
+        return Err(DelegatedActionAuthorizationError::BudgetExceeded {
+            dimension: "max_http_requests_per_minute",
+        });
     }
+    Ok(())
+}
+
+fn prune_http_windows(windows: &mut HashMap<i64, u32>, current: i64) {
+    windows.retain(|bucket, _| *bucket >= current);
 }
 
 fn ensure_usage_fits(
@@ -1688,7 +1842,7 @@ mod tests {
         let revoked = ledger
             .revoke_subtree(&root.grant().grant_id, "root_revoked")
             .expect("root subtree revoked");
-        assert_eq!(revoked.len(), 2);
+        assert_eq!(revoked.len(), 3);
         assert!(revoked
             .iter()
             .all(|evidence| evidence.status == DelegationReservationStatus::Revoked));
@@ -2146,8 +2300,8 @@ mod tests {
                 .authorize_action(request(fixture.now, 8)),
             Err(DelegatedActionAuthorizationError::AuthorityInactive)
         ));
-        assert_eq!(conservative_u64(3, Some(10)), 3);
-        assert_eq!(conservative_u32(2, Some(10)), 2);
+        assert_eq!(conservative_u64(3, Some(10)), 10);
+        assert_eq!(conservative_u32(2, Some(10)), 10);
 
         let reason_codes = [
             DelegatedActionAuthorizationError::AuthorityUnavailable.reason_code(),

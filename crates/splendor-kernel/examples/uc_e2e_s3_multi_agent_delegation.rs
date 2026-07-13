@@ -7,9 +7,8 @@ use splendor_gateway::{
 };
 use splendor_kernel::{
     AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, KernelRuntime, KernelRuntimeConfig,
-    LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest, MessageRouter,
-    QuotaPolicy, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
-    TraceStoreSink,
+    LocalDelegationManager, LocalDelegationRequest, MessageRouter, QuotaPolicy, SnapshotPolicy,
+    StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceStoreSink,
 };
 use splendor_store::{
     SqliteStateStore, SqliteTraceStore, StateData, StateMetadata, StateStore, TraceStore,
@@ -297,12 +296,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &request,
     )?;
     manager.bind_root_run_capability_grant(&parent_run_id, &parent_grant)?;
-    let mut child_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run_id)?,
+    let mut child_authority = manager.child_authority_for_run(
+        &parent_run_id,
         specialist_principal.clone(),
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     child_authority.max_fan_out = 3;
     let child_run =
         manager.create_child_run(&parent_runtime, &child_runtime, request, child_authority)?;
@@ -465,12 +464,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
     let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut overbroad_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run_id)?,
+    let mut overbroad_authority = manager.child_authority_for_run(
+        &parent_run_id,
         specialist_principal.clone(),
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     overbroad_authority.max_fan_out = 4;
     let before_events = manager
         .router()
@@ -514,12 +513,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
     let cross_child_run_id = cross_tenant.child_run_id.clone();
     let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut cross_authority = LocalDelegationAuthority::from_caller(
-        manager.delegation_caller_handle(&parent_run_id)?,
+    let mut cross_authority = manager.child_authority_for_run(
+        &parent_run_id,
         other_specialist_principal,
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     cross_authority.max_fan_out = 4;
     let cross_result = manager.create_child_run(
         &parent_runtime,

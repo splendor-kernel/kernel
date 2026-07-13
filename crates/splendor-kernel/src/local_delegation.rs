@@ -114,9 +114,6 @@ pub struct LocalRunRecord {
 /// message, run-record, and replay surfaces as non-authorizing audit data.
 #[derive(Clone, Debug)]
 pub struct LocalDelegationAuthority {
-    /// Opaque manager/authority-issued parent caller. Raw child grants are never
-    /// returned to or accepted from nested callers.
-    pub parent_caller: Option<DelegationCallerHandle>,
     #[cfg(test)]
     pub parent_capability_grant: Option<ValidatedCapabilityGrant>,
     #[cfg(test)]
@@ -140,37 +137,6 @@ pub struct LocalDelegationAuthority {
 }
 
 impl LocalDelegationAuthority {
-    /// Builds authority input with conservative defaults derived from the parent grant.
-    pub fn from_caller(
-        parent_caller: DelegationCallerHandle,
-        child_subject: PrincipalId,
-        audience: impl Into<String>,
-        not_before: OffsetDateTime,
-    ) -> Self {
-        let defaults = parent_caller.child_request_defaults().ok();
-        let parent_not_before = defaults.map(|value| value.not_before).unwrap_or(not_before);
-        let not_before = not_before.max(parent_not_before);
-        Self {
-            parent_caller: Some(parent_caller),
-            #[cfg(test)]
-            parent_capability_grant: None,
-            #[cfg(test)]
-            authority_evidence: None,
-            child_subject,
-            audience: audience.into(),
-            not_before,
-            expires_at: defaults
-                .map(|value| value.expires_at)
-                .unwrap_or(not_before + time::Duration::minutes(30)),
-            role_profile: DelegationRoleProfile::Specialist,
-            budget: defaults.map(|value| value.budget).unwrap_or_default(),
-            max_delegation_depth: defaults
-                .map(|value| value.max_delegation_depth)
-                .unwrap_or_default(),
-            max_fan_out: 16,
-        }
-    }
-
     #[cfg(test)]
     pub fn new(
         parent_capability_grant: ValidatedCapabilityGrant,
@@ -181,7 +147,6 @@ impl LocalDelegationAuthority {
         let parent = parent_capability_grant.grant();
         let child_grant_id = CapabilityGrantId::new();
         Self {
-            parent_caller: None,
             parent_capability_grant: Some(parent_capability_grant.clone()),
             authority_evidence: Some(LocalDelegationAuthorityEvidence::issued(
                 parent.grant_id.clone(),
@@ -256,7 +221,7 @@ impl LocalDelegationRequest {
 }
 
 /// Result of creating a local child run.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LocalChildRun {
     /// Child run metadata.
     pub run: LocalRunRecord,
@@ -266,8 +231,6 @@ pub struct LocalChildRun {
     pub request_message: MessageEnvelope,
     /// Child-run start trace ID.
     pub child_started_trace_id: TraceId,
-    /// Opaque manager-issued caller required for nested delegation.
-    pub child_caller: DelegationCallerHandle,
 }
 
 /// Result of completing or failing a child run.
@@ -587,18 +550,42 @@ impl LocalDelegationManager {
         Ok(run)
     }
 
-    /// Returns the opaque manager-issued caller for one bound active run.
-    pub fn delegation_caller_handle(
+    /// Builds a child-authority request from manager-owned run state. The
+    /// sealed caller handle never crosses the parent-facing API.
+    pub fn child_authority_for_run(
         &self,
         run_id: &RunId,
-    ) -> Result<DelegationCallerHandle, LocalDelegationError> {
-        self.lock_state()?
+        child_subject: PrincipalId,
+        audience: impl Into<String>,
+        not_before: OffsetDateTime,
+    ) -> Result<LocalDelegationAuthority, LocalDelegationError> {
+        let caller = self
+            .lock_state()?
             .run_callers
             .get(run_id)
             .cloned()
             .ok_or_else(|| LocalDelegationError::AuthorityDenied {
                 reason: REASON_MISSING_PARENT_RUN_GRANT_BINDING.to_string(),
-            })
+            })?;
+        let defaults = caller.child_request_defaults().map_err(|error| {
+            LocalDelegationError::AuthorityDenied {
+                reason: error.reason_code(),
+            }
+        })?;
+        Ok(LocalDelegationAuthority {
+            #[cfg(test)]
+            parent_capability_grant: None,
+            #[cfg(test)]
+            authority_evidence: None,
+            child_subject,
+            audience: audience.into(),
+            not_before: not_before.max(defaults.not_before),
+            expires_at: defaults.expires_at,
+            role_profile: DelegationRoleProfile::Specialist,
+            budget: defaults.budget,
+            max_delegation_depth: defaults.max_delegation_depth,
+            max_fan_out: 16,
+        })
     }
 
     /// Creates a child run from an explicit target, objective, and delegated scope.
@@ -670,18 +657,30 @@ impl LocalDelegationManager {
             })?;
             return Err(LocalDelegationError::TenantMismatch);
         }
-        let effective_parent_caller =
-            match resolve_parent_caller(parent_bound_caller.as_ref(), &parent_run, &authority) {
-                Ok(caller) => caller,
-                Err(reason) => {
-                    let reason = reason.to_string();
-                    parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
-                        delegation: trace_context,
-                        reason: reason.clone(),
-                    })?;
-                    return Err(LocalDelegationError::AuthorityDenied { reason });
-                }
-            };
+        let effective_parent_caller = match parent_bound_caller {
+            Some(caller) => caller,
+            None => {
+                let reason = REASON_MISSING_PARENT_RUN_GRANT_BINDING.to_string();
+                parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                    delegation: trace_context,
+                    reason: reason.clone(),
+                })?;
+                return Err(LocalDelegationError::AuthorityDenied { reason });
+            }
+        };
+        #[cfg(test)]
+        if authority
+            .parent_capability_grant
+            .as_ref()
+            .is_some_and(|grant| !effective_parent_caller.matches_validated_grant(grant))
+        {
+            let reason = REASON_PARENT_RUN_GRANT_MISMATCH.to_string();
+            parent_recorder.record_message_event(TraceEventKind::DelegationRejected {
+                delegation: trace_context,
+                reason: reason.clone(),
+            })?;
+            return Err(LocalDelegationError::AuthorityDenied { reason });
+        }
         if !request
             .delegated_authority
             .is_subset_of(&parent_run.authority)
@@ -915,7 +914,6 @@ impl LocalDelegationManager {
             child_agent,
             request_message: routed_request,
             child_started_trace_id: child_started_trace,
-            child_caller: committed.caller,
         })
     }
 
@@ -1649,49 +1647,6 @@ fn child_grant_liveness_denial_raw(
         return Some("child_grant_expired");
     }
     None
-}
-
-fn resolve_parent_caller(
-    bound: Option<&DelegationCallerHandle>,
-    parent_run: &LocalRunRecord,
-    authority: &LocalDelegationAuthority,
-) -> Result<DelegationCallerHandle, &'static str> {
-    let bound = bound.ok_or(REASON_MISSING_PARENT_RUN_GRANT_BINDING)?;
-    if let Some(supplied) = authority.parent_caller.as_ref() {
-        return if bound.is_same_authority(supplied) {
-            Ok(bound.clone())
-        } else {
-            Err(REASON_PARENT_RUN_GRANT_MISMATCH)
-        };
-    }
-    resolve_test_legacy_parent_caller(bound, parent_run, authority)
-}
-
-#[cfg(test)]
-fn resolve_test_legacy_parent_caller(
-    bound: &DelegationCallerHandle,
-    parent_run: &LocalRunRecord,
-    authority: &LocalDelegationAuthority,
-) -> Result<DelegationCallerHandle, &'static str> {
-    if parent_run.parent_run_id.is_some()
-        || !authority
-            .parent_capability_grant
-            .as_ref()
-            .is_some_and(|grant| bound.matches_validated_grant(grant))
-    {
-        Err(REASON_PARENT_RUN_GRANT_MISMATCH)
-    } else {
-        Ok(bound.clone())
-    }
-}
-
-#[cfg(not(test))]
-fn resolve_test_legacy_parent_caller(
-    _bound: &DelegationCallerHandle,
-    _parent_run: &LocalRunRecord,
-    _authority: &LocalDelegationAuthority,
-) -> Result<DelegationCallerHandle, &'static str> {
-    Err(REASON_PARENT_RUN_GRANT_MISMATCH)
 }
 
 fn revocation_cancellation_failure(reason_code: String) -> TaskFailure {
