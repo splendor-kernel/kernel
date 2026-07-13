@@ -102,6 +102,10 @@ and explicitly sets `allow_unsigned_local_run: true`. The CLI warns when this
 development-only compatibility mode is active and never uses it as fallback for
 a configured work order.
 
+When multiple configured agents resolve to the same `run_id`, the CLI reuses one
+shared runtime cursor for all of them. Their events retain separate agent
+identities but form one contiguous sequence and integrity chain.
+
 ## Example
 
 ```

@@ -8,6 +8,8 @@ agents, policies, and adapter settings.
 - `trace_db` (string, required): SQLite path for trace events.
 - `state_db` (string, required): SQLite path for state snapshots.
 - `run_id` (string, optional): UUID to use for all agents unless overridden.
+  Agents resolving to the same run share one ordered trace cursor while retaining
+  distinct agent identities on their tick/action/state events.
 - `tick_budget_ms` (number, optional): tick budget in milliseconds.
 - `tick_interval_ms` (number, optional): pacing interval per scheduler cycle.
 - `cycles` (number, optional): default cycles to run when `--cycles` is omitted.
@@ -100,7 +102,9 @@ CLI accepts exactly one allowed adapter for an executable signed run rather than
 guessing action/adapter pairings. Each action profile requires the complete
 signed `allowed_permissions` set. Ambiguous multi-adapter or duplicate/oversized
 permission profiles fail closed after work-order validation; they never fall
-back to unsigned execution.
+back to unsigned execution. The CLI records a sanitized `WorkOrderRejected`
+event with the bounded profile reason and work-order/tenant/agent/run IDs; it does
+not include signatures, verification secrets, or raw profile material.
 
 `allow_unsigned_local_run: true` exists only so older local quickstarts remain
 runnable. It prints a warning and uses the legacy local gateway without a signed

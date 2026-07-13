@@ -33,7 +33,7 @@ use splendor_types::{
     WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderValidationContext,
     WorkOrderValidationError,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -4089,6 +4089,21 @@ fn run_loaded_config(
     let work_order = validated_work_order
         .as_ref()
         .map(ValidatedWorkOrder::work_order);
+    let signed_action_profiles = match work_order {
+        Some(work_order) => match trusted_action_profiles(work_order) {
+            Ok(profiles) => Some(profiles),
+            Err(error) => {
+                record_authority_profile_rejection(
+                    &config,
+                    trace_store.as_ref(),
+                    work_order,
+                    error.reason_code(),
+                )?;
+                return Err(error.reason_code().to_string());
+            }
+        },
+        None => None,
+    };
 
     if let Some(parent) = config.state_db.parent() {
         if !parent.as_os_str().is_empty() {
@@ -4136,15 +4151,23 @@ fn run_loaded_config(
     } else {
         None
     };
+    let mut trace_runtimes = HashMap::<RunId, Arc<KernelRuntime>>::new();
 
     for agent_config in &config.agents {
         let tenant_id = parse_tenant_id(&agent_config.tenant_id)?;
         let agent_id = resolve_agent_id(agent_config, work_order)?;
         let run_id = resolve_run_id(&config, agent_config, work_order)?;
-        let trace_runtime = Arc::new(
-            KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
-                .map_err(|error| format!("Failed to create trace runtime: {error}"))?,
-        );
+        let trace_runtime = match trace_runtimes.get(&run_id) {
+            Some(runtime) => Arc::clone(runtime),
+            None => {
+                let runtime = Arc::new(
+                    KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+                        .map_err(|error| format!("Failed to create trace runtime: {error}"))?,
+                );
+                trace_runtimes.insert(run_id.clone(), Arc::clone(&runtime));
+                runtime
+            }
+        };
         let gateway = match validated_work_order.as_ref() {
             Some(validated) => {
                 let configured = build_authorized_run_gateway(
@@ -4156,6 +4179,9 @@ fn run_loaded_config(
                     tenant_id.clone(),
                     agent_id.clone(),
                     Arc::clone(&trace_runtime),
+                    signed_action_profiles
+                        .as_deref()
+                        .ok_or_else(|| "signed action profiles are not configured".to_string())?,
                 )?;
                 #[cfg(test)]
                 if let Some(transition) =
@@ -4440,6 +4466,28 @@ fn record_work_order_rejection(
     )
 }
 
+fn record_authority_profile_rejection(
+    config: &RunConfig,
+    trace_store: &dyn TraceStore,
+    work_order: &WorkOrder,
+    reason: &str,
+) -> Result<(), String> {
+    let agent = config
+        .agents
+        .first()
+        .ok_or_else(|| "config must include at least one agent".to_string())?;
+    let run_id = resolve_run_id(config, agent, Some(work_order))?;
+    append_work_order_rejection(
+        trace_store,
+        run_id.clone(),
+        Some(work_order.work_order_id.clone()),
+        Some(work_order.tenant_id.clone()),
+        Some(work_order.agent_id.clone()),
+        Some(run_id),
+        reason.to_string(),
+    )
+}
+
 fn append_work_order_rejection(
     trace_store: &dyn TraceStore,
     trace_run_id: RunId,
@@ -4637,6 +4685,7 @@ fn build_authorized_run_gateway(
     tenant_id: TenantId,
     agent_id: AgentId,
     trace_runtime: Arc<KernelRuntime>,
+    trusted_action_profiles: &[TrustedActionProfile],
 ) -> Result<AuthorizedRunGateway, String> {
     let run_authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
         validated_work_order,
@@ -4651,8 +4700,7 @@ fn build_authorized_run_gateway(
         tenant_id,
         agent_id,
     )));
-    gateway
-        .set_trusted_action_profiles(trusted_action_profiles(validated_work_order.work_order())?)?;
+    gateway.set_trusted_action_profiles(trusted_action_profiles.to_vec())?;
     Ok(AuthorizedRunGateway {
         gateway: Arc::new(gateway),
         #[cfg(test)]
@@ -4660,15 +4708,37 @@ fn build_authorized_run_gateway(
     })
 }
 
-fn trusted_action_profiles(work_order: &WorkOrder) -> Result<Vec<TrustedActionProfile>, String> {
-    let adapter = match work_order.allowed_adapters.as_slice() {
-        [adapter] => adapter.clone(),
-        _ => {
-            return Err("ambiguous_work_order_action_adapter_profile".to_string());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustedActionProfileAdmissionError {
+    AmbiguousAdapter,
+    Invalid,
+    PermissionLimitExceeded,
+    DuplicatePermission,
+    DuplicateAction,
+}
+
+impl TrustedActionProfileAdmissionError {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::AmbiguousAdapter => "ambiguous_work_order_action_adapter_profile",
+            Self::Invalid => "trusted_action_profile_invalid",
+            Self::PermissionLimitExceeded => "trusted_action_profile_permission_limit_exceeded",
+            Self::DuplicatePermission => "trusted_action_profile_permission_duplicate",
+            Self::DuplicateAction => "trusted_action_profile_duplicate",
         }
+    }
+}
+
+fn trusted_action_profiles(
+    work_order: &WorkOrder,
+) -> Result<Vec<TrustedActionProfile>, TrustedActionProfileAdmissionError> {
+    let adapter = match work_order.allowed_adapters.as_slice() {
+        [adapter] if !adapter.trim().is_empty() => adapter.clone(),
+        [_] => return Err(TrustedActionProfileAdmissionError::Invalid),
+        _ => return Err(TrustedActionProfileAdmissionError::AmbiguousAdapter),
     };
     if work_order.allowed_permissions.len() > 64 {
-        return Err("trusted_action_profile_permission_limit_exceeded".to_string());
+        return Err(TrustedActionProfileAdmissionError::PermissionLimitExceeded);
     }
     let required_permissions = work_order
         .allowed_permissions
@@ -4676,14 +4746,24 @@ fn trusted_action_profiles(work_order: &WorkOrder) -> Result<Vec<TrustedActionPr
         .cloned()
         .collect::<BTreeSet<_>>();
     if required_permissions.len() != work_order.allowed_permissions.len() {
-        return Err("trusted_action_profile_permission_duplicate".to_string());
+        return Err(TrustedActionProfileAdmissionError::DuplicatePermission);
     }
     let required_permissions = required_permissions.into_iter().collect::<Vec<_>>();
-    let profiles = work_order
+    let action_names = work_order
         .allowed_actions
         .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if action_names.len() != work_order.allowed_actions.len() {
+        return Err(TrustedActionProfileAdmissionError::DuplicateAction);
+    }
+    if action_names.is_empty() || action_names.iter().any(|action| action.trim().is_empty()) {
+        return Err(TrustedActionProfileAdmissionError::Invalid);
+    }
+    let profiles = action_names
+        .into_iter()
         .map(|action_name| TrustedActionProfile {
-            action_name: action_name.clone(),
+            action_name,
             adapter: adapter.clone(),
             required_permissions: required_permissions.clone(),
         })

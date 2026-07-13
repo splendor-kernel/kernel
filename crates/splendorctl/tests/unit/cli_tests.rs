@@ -5185,6 +5185,100 @@ fn run_from_config_validates_signed_work_order_and_records_metadata() {
 }
 
 #[test]
+fn run_from_config_two_agents_share_one_contiguous_run_trace_cursor() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let fs_base = dir.path().join("fs");
+    let tenant_id = TenantId::new();
+    let first_agent_id = AgentId::new();
+    let second_agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nallow_unsigned_local_run: true\ntenants:\n  - id: {}\n    allowed_actions: [\"write_file\"]\n    allowed_adapters: [\"filesystem\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    policy:\n      type: static\n      next_state: first-state\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          params:\n            path: \"first-agent.txt\"\n            contents: \"first\"\n  - id: {}\n    tenant_id: {}\n    policy:\n      type: static\n      next_state: second-state\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          params:\n            path: \"second-agent.txt\"\n            contents: \"second\"\nadapters:\n  filesystem:\n    base_dir: {}\n",
+        trace_path.display(),
+        state_path.display(),
+        run_id,
+        tenant_id,
+        first_agent_id,
+        tenant_id,
+        second_agent_id,
+        tenant_id,
+        fs_base.display(),
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    run_from_config(&config_path, Some(1), false).expect("two-agent run");
+
+    let tenant_root = fs_base.join(tenant_id.to_string());
+    assert_eq!(
+        std::fs::read_to_string(tenant_root.join("first-agent.txt")).expect("first effect"),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tenant_root.join("second-agent.txt")).expect("second effect"),
+        "second"
+    );
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let events = decode_and_validate_trace_records(&records, &run_id.to_string())
+        .expect("contiguous shared-run trace");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::RunStarted))
+            .count(),
+        1
+    );
+
+    for agent_id in [&first_agent_id, &second_agent_id] {
+        let verification_indices = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (event.identity.agent_id.as_ref() == Some(agent_id)
+                    && matches!(
+                        &event.kind,
+                        TraceEventKind::ActionVerificationCompleted { action, .. }
+                            if action.name == "write_file"
+                    ))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let effect_indices = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (event.identity.agent_id.as_ref() == Some(agent_id)
+                    && matches!(
+                        &event.kind,
+                        TraceEventKind::ActionExecuted { action, .. }
+                            if action.name == "write_file"
+                    ))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            verification_indices.len(),
+            1,
+            "one evidence record per agent"
+        );
+        assert_eq!(effect_indices.len(), 1, "one configured effect per agent");
+        assert!(verification_indices[0] < effect_indices[0]);
+        assert_eq!(
+            events[verification_indices[0]].identity.action_id,
+            events[effect_indices[0]].identity.action_id
+        );
+        assert!(events.iter().any(|event| {
+            event.identity.agent_id.as_ref() == Some(agent_id)
+                && matches!(event.kind, TraceEventKind::LoopTickCompleted { .. })
+        }));
+    }
+}
+
+#[test]
 fn signed_run_authority_allows_counted_filesystem_and_http_effects_with_pre_effect_evidence() {
     for (action_name, adapter, permission) in [
         ("write_file", "filesystem", "fs.write"),
@@ -5259,6 +5353,164 @@ fn signed_run_authority_allows_counted_filesystem_and_http_effects_with_pre_effe
             .expect("inspect-only replay");
         assert_eq!(counter.total_calls(), before_replay);
     }
+}
+
+#[test]
+fn signed_run_authority_resume_keeps_live_evidence_and_contiguous_trace() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let work_order = signed_work_order_block_with_authority(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec!["write_file".to_string()],
+        vec!["filesystem".to_string()],
+        vec!["fs.write".to_string()],
+        OffsetDateTime::now_utc() + time::Duration::hours(1),
+        splendor_types::RevocationStatus::Active,
+    );
+    let config_path = write_counted_run_config(
+        &dir,
+        &tenant_id,
+        &agent_id,
+        &run_id,
+        &work_order,
+        "write_file",
+        "filesystem",
+        &["fs.write"],
+        &["fs.write"],
+        None,
+    );
+    let config = std::fs::read_to_string(&config_path).expect("config");
+    let config = config
+        .replace(
+            "    policy:\n",
+            "    snapshot_interval: 1\n    resume: false\n    policy:\n",
+        )
+        .replace(
+            "      type: static\n",
+            "      type: static\n      next_state: first\n",
+        );
+    std::fs::write(&config_path, config).expect("initial config");
+    let (counter, overrides) = counting_run_overrides(&["filesystem"], None);
+
+    run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+        .expect("initial signed run");
+    assert_eq!(counter.total_calls(), 1);
+
+    let config = std::fs::read_to_string(&config_path)
+        .expect("config")
+        .replace("resume: false", "resume: true")
+        .replace("next_state: first", "next_state: second");
+    std::fs::write(&config_path, config).expect("resume config");
+    run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+        .expect("resumed signed run");
+    assert_eq!(counter.total_calls(), 2);
+
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let events = decode_and_validate_trace_records(&records, &run_id.to_string())
+        .expect("signed resume trace");
+    let evidence_indices = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(
+                &event.kind,
+                TraceEventKind::ActionVerificationCompleted { result, .. }
+                    if result.artifacts["authority"]["pre_effect_recorded"]
+                        == serde_json::json!(true)
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let effect_indices = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event.kind, TraceEventKind::ActionExecuted { .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(evidence_indices.len(), 2);
+    assert_eq!(effect_indices.len(), 2);
+    for (evidence, effect) in evidence_indices.iter().zip(&effect_indices) {
+        assert!(evidence < effect);
+        assert_eq!(
+            events[*evidence].identity.action_id,
+            events[*effect].identity.action_id
+        );
+        assert_eq!(events[*effect].identity.agent_id.as_ref(), Some(&agent_id));
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::WorkOrderAccepted { .. }))
+            .count(),
+        2
+    );
+
+    let before_replay = counter.total_calls();
+    replay_outputs_from_stores(&trace_path, &state_path, &run_id.to_string(), None, false)
+        .expect("inspect-only resumed replay");
+    assert_eq!(counter.total_calls(), before_replay);
+}
+
+#[test]
+fn invalid_configured_work_order_never_falls_back_to_explicit_unsigned_mode() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let work_order = corrupt_work_order_signature(signed_work_order_block_with_authority(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec!["write_file".to_string()],
+        vec!["filesystem".to_string()],
+        vec!["fs.write".to_string()],
+        OffsetDateTime::now_utc() + time::Duration::hours(1),
+        splendor_types::RevocationStatus::Active,
+    ));
+    let config_path = write_counted_run_config(
+        &dir,
+        &tenant_id,
+        &agent_id,
+        &run_id,
+        &work_order,
+        "write_file",
+        "filesystem",
+        &["fs.write"],
+        &["fs.write"],
+        None,
+    );
+    let config = std::fs::read_to_string(&config_path).expect("config");
+    let config = config.replace("state_db:", "allow_unsigned_local_run: true\nstate_db:");
+    std::fs::write(&config_path, config).expect("config with explicit unsigned mode");
+    let (counter, overrides) = counting_run_overrides(&["filesystem"], None);
+
+    let error = run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+        .expect_err("invalid configured work order must fail");
+    assert_eq!(error, "Work order rejected: bad_signature");
+    assert_eq!(counter.total_calls(), 0);
+    assert!(!dir.path().join("state.db").exists());
+
+    let store = SqliteTraceStore::open(dir.path().join("trace.db")).expect("trace store");
+    let events = decode_and_validate_trace_records(
+        &TraceStore::read(&store, &run_id.to_string()).expect("records"),
+        &run_id.to_string(),
+    )
+    .expect("rejection trace");
+    assert!(matches!(
+        &events.as_slice(),
+        [TraceEvent {
+            kind: TraceEventKind::WorkOrderRejected { reason, .. },
+            ..
+        }] if reason == "bad_signature"
+    ));
 }
 
 #[test]
@@ -5486,6 +5738,32 @@ fn signed_run_authority_rejects_action_adapter_permission_and_identity_mismatche
         .expect_err("ambiguous configured authority must not fall back to unsigned execution");
     assert_eq!(error, "ambiguous_work_order_action_adapter_profile");
     assert_eq!(counter.total_calls(), 0);
+    assert!(!dir.path().join("state.db").exists());
+    let store = SqliteTraceStore::open(dir.path().join("trace.db")).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let events = decode_and_validate_trace_records(&records, &run_id.to_string())
+        .expect("profile rejection trace");
+    assert!(matches!(
+        &events.as_slice(),
+        [TraceEvent {
+            kind:
+                TraceEventKind::WorkOrderRejected {
+                    work_order_id: Some(work_order_id),
+                    tenant_id: Some(event_tenant_id),
+                    agent_id: Some(event_agent_id),
+                    run_id: Some(event_run_id),
+                    reason,
+                },
+            ..
+        }] if work_order_id.as_str() == "wo_cli"
+            && event_tenant_id == &tenant_id
+            && event_agent_id == &agent_id
+            && event_run_id == &run_id
+            && reason == "ambiguous_work_order_action_adapter_profile"
+    ));
+    let encoded = serde_json::to_string(&events).expect("encoded audit evidence");
+    assert!(!encoded.contains("cli-secret"));
+    assert!(!encoded.contains("signature"));
 }
 
 #[test]

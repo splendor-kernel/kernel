@@ -809,6 +809,11 @@ The bounded `AUTH-007d` slice adds exact-family version and staleness evidence:
   a trusted pairing. This is fail-closed compatibility behavior, not a new
   work-order schema. Resume requires the same run-bound work order and restores
   state while retaining the shared evidence cursor.
+- CLI composition owns one shared `KernelRuntime` per resolved `RunId`, including
+  explicit unsigned multi-agent local compatibility runs. Loop and gateway
+  emitters therefore retain distinct agent/action identities while serializing
+  one durable sequence/hash chain. Authority-profile admission failures append a
+  bounded sanitized `WorkOrderRejected` reason before state or adapter effects.
 - Inspect-only replay reads durable verification records, including effect-free
   denials, and returns redacted typed decision summaries and digests. Allowed
   decisions are durably recorded before the effect. Replay does not call authority evaluators,
