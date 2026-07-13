@@ -22,9 +22,9 @@ use splendor_kernel::{
     replay_local_delegations, ActionCandidate, AgentContext, AgentIsolationPolicy,
     AgentRuntimeConfig, FleetTelemetryCollector, InMemoryNodeRegistry,
     InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault, KernelRuntime,
-    KernelRuntimeConfig, LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest,
-    LocalRunStatus, LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision,
-    QuotaPolicy, RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
+    KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest, LocalRunStatus,
+    LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision, QuotaPolicy,
+    RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
     StateHandoffScope, TelemetryThresholds, TenantContext, TenantPolicy, TenantRegistry,
     TraceError, TraceEvent, TraceEventKind, TraceSink,
 };

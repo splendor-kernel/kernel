@@ -145,6 +145,11 @@ the daemon security contract from
 identity, endpoint scope, tenant binding, audience binding, expiry, revocation,
 and mutating-call audit attribution.
 
+Resident startup is explicit: `SPLENDOR_DAEMON_MODE=resident` also requires
+`SPLENDOR_INSTANCE_ID` to contain a valid non-nil UUID. Missing, blank, malformed,
+or nil instance identity aborts startup instead of generating a random identity.
+Local-development startup does not require this variable.
+
 Run creation and run resume require signed, unexpired, unrevoked, scoped work
 orders. The daemon checks work-order tenant, run scope where applicable, and
 agent compatibility for run creation. Resume additionally requires the original
@@ -193,6 +198,13 @@ prepared/non-authorizing trace may remain and does not by itself prove commit.
   on resume;
 - one shared-runtime pre-effect authority evidence recorder;
 - optional `approval_policies` evaluated by the gateway approval verifier.
+
+The global run registry stores only shared references to per-run synchronized
+state. Request handlers clone the reference and release the registry lock before
+inspecting or mutating a run. Direct and physical action handlers also release
+the per-run state lock before gateway verification, pre-effect evidence, and
+adapter execution; the live final authority permit, not a broad daemon lock,
+linearizes an effect against terminal closure.
 
 `CreateRunRequest` also requires non-blank `request_id` and `idempotency_key`.
 The request ID is correlation only and remains distinct from `run_id` and
@@ -244,7 +256,10 @@ denied, and expired runs return `409 run_not_effect_capable` before gateway
 verification or adapter execution. Terminal transitions close live authority
 admission before publishing terminal status. A final permit acquired before that
 closure may complete, but no later permit can be acquired; stop/cancel release
-the daemon run-map lock before waiting for those earlier permits to quiesce.
+per-run state before waiting for those earlier permits to quiesce. Unrelated runs
+remain inspectable while an earlier effect or lifecycle wait is blocked. Action
+completion records cannot overwrite a terminal lifecycle status published while
+the effect was in flight.
 
 ## Percept ingestion
 
