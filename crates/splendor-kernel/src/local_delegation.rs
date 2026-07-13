@@ -404,6 +404,18 @@ impl LocalDelegationManager {
         }
     }
 
+    #[cfg(test)]
+    fn with_quiescence_timeout(quiescence_timeout: std::time::Duration) -> Self {
+        Self {
+            router: LocalMessageRouter::with_config(MessageRouterConfig::default()),
+            authority_ledger: InMemoryDelegationAuthorityLedger::with_quiescence_timeout(
+                quiescence_timeout,
+            ),
+            lifecycle: Mutex::new(()),
+            state: Mutex::new(LocalDelegationState::default()),
+        }
+    }
+
     /// Returns the local router used for task request/response messages.
     pub fn router(&self) -> &LocalMessageRouter {
         &self.router
@@ -1279,13 +1291,34 @@ impl LocalDelegationManager {
         };
         context.parent_trace_id = child.parent_trace_id.clone();
         if let Some(grant_id) = child.capability_grant_id.as_ref() {
-            let cleanup = self
+            let mut cleanup = self
                 .authority_ledger
                 .cleanup_bounded(grant_id, format!("child_{status:?}").to_lowercase())
                 .map_err(|error| LocalDelegationError::AuthorityDenied {
                     reason: error.reason_code(),
                 })?;
-            if let DelegationQuiescence::TimedOut { .. } = cleanup.quiescence {
+            if let DelegationQuiescence::TimedOut { in_flight_effects } = cleanup.quiescence {
+                cleanup.evidence.reason = Some(REASON_DELEGATION_QUIESCENCE_TIMEOUT.to_string());
+                context = context.with_delegation_ledger(cleanup.evidence.redacted_trace_summary());
+                if let Some(child_record) = self.lock_state()?.runs.get_mut(child_run_id) {
+                    child_record.status = LocalRunStatus::Failed;
+                }
+                let failure = TaskFailure::new(
+                    REASON_DELEGATION_QUIESCENCE_TIMEOUT,
+                    format!(
+                        "delegated child cleanup timed out with {in_flight_effects} effect(s) still in flight"
+                    ),
+                    false,
+                );
+                let child_trace_id =
+                    child_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                        delegation: context.clone(),
+                        failure: failure.clone(),
+                    })?;
+                parent_recorder.record_message_event(TraceEventKind::ChildRunFailed {
+                    delegation: context,
+                    failure: failure.with_trace_id(child_trace_id),
+                })?;
                 return Err(LocalDelegationError::AuthorityDenied {
                     reason: REASON_DELEGATION_QUIESCENCE_TIMEOUT.to_string(),
                 });

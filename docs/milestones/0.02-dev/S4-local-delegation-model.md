@@ -137,7 +137,9 @@ failures. Replay is inspect-only and does not route, start, or execute anything.
   failing chain edge deterministically.
 - Delegated action liveness and HTTP minute quotas use maximum-observed authority
   service time. Rollback and latched expiry fail closed, and cleanup/revocation
-  return after a bounded typed quiescence wait with admission still closed.
+  return after a bounded typed quiescence wait with admission still closed. A
+  child cleanup timeout terminally fails the manager child and records structured
+  parent/child replay evidence; retry cannot reinterpret it as completion.
 - Aggregate sibling budget and concurrent fan-out are atomically enforced by the
   authority owner. Routing failure releases before effect; post-routing start
   uncertainty consumes fail-safe, with replay-visible evidence.
@@ -155,7 +157,9 @@ failures. Replay is inspect-only and does not route, start, or execute anything.
 | negative | Child action without explicit adapter skips gateway | `loop_engine_denies_delegated_action_without_explicit_adapter_and_skips_gateway` |
 | concurrency | Create/cancel lifecycle is serialized | `delegation_creation_and_parent_cancellation_are_serialized` |
 | concurrency | Cleanup/revocation timeout remains fail-closed | `cleanup_and_revocation_time_out_bounded_while_admission_stays_closed` |
+| failure/replay | Manager cleanup timeout is terminal and retry-stable | `cleanup_timeout_terminally_fails_child_and_retry_is_replay_stable` |
 | negative | Direct child cannot delegate to a root sibling | `direct_child_cannot_delegate_to_root_sibling_before_traces_routing_or_mutation` |
+| negative | Registered assigned descendant role escalation identifies edge 1 | `nested_escalation_identifies_exact_failing_chain_edge` |
 | failure | Structured child failure response | `failed_child_run_returns_structured_task_response_and_replays_causality` |
 | failure | Repeated child completion is terminal and idempotently rejected | `repeated_child_completion_is_rejected_without_duplicate_response` |
 | failure | Repeated/late child failure emits no duplicate failure trace | `repeated_child_failure_is_rejected_without_duplicate_failure_trace`, `child_failure_after_completion_is_rejected_without_failure_trace` |
@@ -166,6 +170,7 @@ failures. Replay is inspect-only and does not route, start, or execute anything.
 | positive/nested | Complete two-edge chain and exact action grant | `nested_delegation_stores_complete_chain_and_requires_exact_action_grant_ref` |
 | budget | Nth sibling aggregate overflow | `aggregate_sibling_budget_overflow_denies_nth_child_component_wise` |
 | concurrency | Authority-owned fan-out race | `authority_owned_fan_out_is_atomic_under_concurrent_callers` |
+| concurrency | Direct authority-ledger fan-out reservation race | `authority_ledger_reserves_concurrent_fan_out_atomically` |
 | failure accounting | Routing release/start consume | `routing_and_start_failures_record_release_or_fail_safe_consumption` |
 | revocation/replay | Descendant propagation and no-effect replay | `root_revocation_cancels_nested_descendants_and_replay_has_no_effects` |
 

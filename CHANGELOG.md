@@ -20,6 +20,10 @@
   minute windows use maximum-observed authority service time, so rollback cannot
   reactivate a grant or old quota bucket. Cleanup and subtree revocation close
   admission before a bounded typed quiescence wait rather than waiting forever.
+  A child cleanup timeout now terminally fails the manager-owned child lifecycle,
+  emits structured parent/child replay evidence, and rejects completion retry
+  after the earlier permit drops. Trusted runtime trees reject root identity reuse
+  in descendant scope, and nested role escalation names the exact failing edge.
   Legacy
   `DelegatedAuthority` is narrowing-only. Live task requests, delegation
   edge/chain contracts, and redacted ledger trace summaries are v2; task v1 is

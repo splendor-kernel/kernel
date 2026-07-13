@@ -158,7 +158,10 @@ authority and fails closed before gateway submission.
 12. Terminal completion performs explicit ledger cleanup. Parent cancellation and
     parent/child grant revocation invalidate and cancel active descendants.
     Cleanup and revocation close new admission before a bounded quiescence wait;
-    timeout is a typed result and cannot reactivate authority.
+    timeout is a typed result and cannot reactivate authority. A child cleanup
+    timeout marks the manager-owned child run failed and emits replay-visible
+    `ChildRunFailed` evidence to both child and parent traces before returning the
+    stable timeout denial.
 13. Completion, failure, denial, and cancellation are terminal for the child run;
    repeated finish attempts fail closed without emitting duplicate responses or
    duplicate completion/failure trace events.
@@ -278,6 +281,8 @@ execute adapters.
   consumes it fail-safe. Both transitions are replay-visible.
 - Nested widening identifies the first failing edge as
   `delegation_chain_edge_<index>_<reason>`.
+- Root agent or run identity cannot appear in descendant scope, and explicit
+  runtime trees containing a root-involving cycle fail trusted admission.
 - Missing/wrong child action grant references deny before the gateway.
 - Duplicate `child_run_id`: `DelegationRejected` with
   `duplicate_child_run_id`; no second task request, child state, or child-start
@@ -289,6 +294,10 @@ execute adapters.
   `ChildRunFailed` trace events.
 - Repeated completion/failure after a terminal child status:
   `ChildRunAlreadyFinished`; no duplicate response message or terminal trace.
+- Child cleanup quiescence timeout: the child transitions to `Failed`, parent and
+  child traces record `ChildRunFailed` with `delegation_quiescence_timeout` and a
+  redacted `Cleaned` ledger transition, no success response is routed, and retry
+  remains `ChildRunAlreadyFinished` after the earlier permit drops.
 
 ## Compatibility notes
 

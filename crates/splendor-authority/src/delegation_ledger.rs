@@ -84,6 +84,7 @@ struct LedgerShared {
     state: Mutex<LedgerState>,
     quiescent: Condvar,
     time_source: Arc<dyn DelegationTimeSource>,
+    quiescence_timeout: StdDuration,
 }
 
 impl Default for LedgerShared {
@@ -92,6 +93,7 @@ impl Default for LedgerShared {
             state: Mutex::new(LedgerState::default()),
             quiescent: Condvar::new(),
             time_source: Arc::new(SystemDelegationTimeSource),
+            quiescence_timeout: LOCAL_DELEGATION_QUIESCENCE_TIMEOUT,
         }
     }
 }
@@ -549,6 +551,20 @@ impl InMemoryDelegationAuthorityLedger {
         Self::default()
     }
 
+    /// Creates an empty local authority ledger with an explicit bounded
+    /// quiescence timeout. Production callers normally use [`Self::new`]; the
+    /// explicit constructor also permits deterministic timeout testing.
+    pub fn with_quiescence_timeout(quiescence_timeout: StdDuration) -> Self {
+        Self {
+            state: Arc::new(LedgerShared {
+                state: Mutex::new(LedgerState::default()),
+                quiescent: Condvar::new(),
+                time_source: Arc::new(SystemDelegationTimeSource),
+                quiescence_timeout,
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn with_time_source(time_source: Arc<dyn DelegationTimeSource>) -> Self {
         Self {
@@ -556,6 +572,7 @@ impl InMemoryDelegationAuthorityLedger {
                 state: Mutex::new(LedgerState::default()),
                 quiescent: Condvar::new(),
                 time_source,
+                quiescence_timeout: LOCAL_DELEGATION_QUIESCENCE_TIMEOUT,
             }),
         }
     }
@@ -584,6 +601,7 @@ impl InMemoryDelegationAuthorityLedger {
         run_id: RunId,
     ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
         let bindings = exact_scope_bindings(root.grant())?;
+        validate_root_distinct_child_bindings(&agent_id, &run_id, &bindings)?;
         self.register_root_with_binding(
             root,
             Some(RuntimeBinding {
@@ -608,6 +626,7 @@ impl InMemoryDelegationAuthorityLedger {
         child_bindings: Vec<(AgentId, RunId)>,
     ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
         validate_explicit_child_bindings(root.grant(), &child_bindings)?;
+        validate_root_distinct_child_bindings(&agent_id, &run_id, &child_bindings)?;
         self.register_root_with_binding(
             root,
             Some(RuntimeBinding {
@@ -727,7 +746,11 @@ impl InMemoryDelegationAuthorityLedger {
         }
         if let Some(parent_edge) = parent_node.chain.grants.last() {
             if !role_narrows(parent_edge.role_profile, request.role_profile) {
-                return Err(DelegationLedgerError::RoleEscalation);
+                return Err(DelegationChainValidationError {
+                    edge_index: parent_node.chain.grants.len(),
+                    reason: "role_escalation".to_string(),
+                }
+                .into());
             }
         }
 
@@ -948,6 +971,7 @@ impl InMemoryDelegationAuthorityLedger {
             // remain valid until their gateway/adapter call leaves the boundary.
             node.status = EdgeStatus::Cleaned;
         }
+        self.state.quiescent.notify_all();
         let ids = [grant_id.clone()];
         let (state, quiescence) = self.wait_for_quiescence(state, &ids)?;
         let evidence = state
@@ -1032,6 +1056,7 @@ impl InMemoryDelegationAuthorityLedger {
                 node.status = EdgeStatus::Revoked;
             }
         }
+        self.state.quiescent.notify_all();
         let quiescence_ids = ids.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
         let (state, quiescence) = self.wait_for_quiescence(state, &quiescence_ids)?;
         let evidence = ids
@@ -1099,7 +1124,10 @@ impl InMemoryDelegationAuthorityLedger {
             if in_flight_effects == 0 {
                 return Ok((state, DelegationQuiescence::Quiesced));
             }
-            let remaining = LOCAL_DELEGATION_QUIESCENCE_TIMEOUT.saturating_sub(started.elapsed());
+            let remaining = self
+                .state
+                .quiescence_timeout
+                .saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Ok((state, DelegationQuiescence::TimedOut { in_flight_effects }));
             }
@@ -1257,6 +1285,7 @@ fn validate_runtime_edges(
     }
     let scoped = scoped_bindings.iter().cloned().collect::<HashSet<_>>();
     let root = (root_agent_id.clone(), root_run_id.clone());
+    validate_root_distinct_child_bindings(root_agent_id, root_run_id, &scoped_bindings)?;
     let mut parents = HashMap::new();
     let mut children_by_parent: DescendantChildBindings = HashMap::new();
     for edge in edges {
@@ -1307,6 +1336,20 @@ fn validate_runtime_edges(
         return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
     }
     Ok((direct, children_by_parent))
+}
+
+fn validate_root_distinct_child_bindings(
+    root_agent_id: &AgentId,
+    root_run_id: &RunId,
+    bindings: &[AgentRunBinding],
+) -> Result<(), DelegationLedgerError> {
+    if bindings
+        .iter()
+        .any(|(agent_id, run_id)| agent_id == root_agent_id || run_id == root_run_id)
+    {
+        return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
+    }
+    Ok(())
 }
 
 fn sort_agent_run_bindings(bindings: &mut [AgentRunBinding]) {
@@ -2235,7 +2278,10 @@ mod tests {
                 fixture.audience.clone(),
                 fixture.child_subject.clone(),
             ),
-            Err(DelegationLedgerError::RoleEscalation)
+            Err(DelegationLedgerError::Chain(DelegationChainValidationError {
+                edge_index: 1,
+                ref reason,
+            })) if reason == "role_escalation"
         ));
         assert!(matches!(
             ledger.cleanup(&root.grant().grant_id, "invalid_root_cleanup"),
@@ -2792,7 +2838,8 @@ mod tests {
         for revoke in [false, true] {
             let fixture = Fixture::new();
             let root = parent_grant(&fixture);
-            let ledger = InMemoryDelegationAuthorityLedger::new();
+            let ledger =
+                InMemoryDelegationAuthorityLedger::with_quiescence_timeout(StdDuration::ZERO);
             let root_caller = ledger
                 .register_root_runtime(
                     &root,
@@ -2831,7 +2878,6 @@ mod tests {
                 .runtime_authority
                 .authorize_action(request())
                 .expect("effect admitted");
-            let started = Instant::now();
             let quiescence = if revoke {
                 ledger
                     .revoke_subtree_bounded(&grant_id, "test revoke")
@@ -2849,7 +2895,6 @@ mod tests {
                     in_flight_effects: 1
                 }
             ));
-            assert!(started.elapsed() < StdDuration::from_secs(2));
             assert!(matches!(
                 committed.runtime_authority.authorize_action(request()),
                 Err(DelegatedActionAuthorizationError::AuthorityInactive)
@@ -2862,7 +2907,9 @@ mod tests {
     fn cleanup_quiesces_when_concurrent_effect_permit_drops_within_bound() {
         let fixture = Fixture::new();
         let root = parent_grant(&fixture);
-        let ledger = InMemoryDelegationAuthorityLedger::new();
+        let ledger = Arc::new(InMemoryDelegationAuthorityLedger::with_quiescence_timeout(
+            StdDuration::from_secs(2),
+        ));
         let root_caller = ledger
             .register_root_runtime(
                 &root,
@@ -2901,15 +2948,186 @@ mod tests {
             .runtime_authority
             .authorize_action(request)
             .expect("effect admitted");
-        let dropper = std::thread::spawn(move || {
-            std::thread::sleep(StdDuration::from_millis(25));
-            drop(permit);
+        let cleanup_ledger = Arc::clone(&ledger);
+        let cleanup_grant_id = grant_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_ledger.cleanup_bounded(&cleanup_grant_id, "concurrent effect completed")
         });
-        let outcome = ledger
-            .cleanup_bounded(&grant_id, "concurrent effect completed")
+
+        let mut state = ledger.lock().expect("ledger state");
+        while state
+            .nodes
+            .get(&grant_id)
+            .is_some_and(|node| node.status != EdgeStatus::Cleaned)
+        {
+            let (next, wait) = ledger
+                .state
+                .quiescent
+                .wait_timeout(state, StdDuration::from_secs(1))
+                .expect("cleanup admission wait");
+            assert!(!wait.timed_out(), "cleanup did not close admission");
+            state = next;
+        }
+        drop(state);
+        drop(permit);
+        let outcome = cleanup
+            .join()
+            .expect("cleanup thread")
             .expect("cleanup result");
         assert_eq!(outcome.quiescence, DelegationQuiescence::Quiesced);
-        dropper.join().expect("permit dropper");
+    }
+
+    #[test]
+    fn runtime_edge_validation_rejects_root_identity_reuse_and_root_cycles() {
+        let fixture = Fixture::new();
+        let base = parent_grant(&fixture);
+        let child = (AgentId::new(), RunId::new());
+        let root_agent_child = (fixture.parent_agent_id.clone(), RunId::new());
+        let root_run_child = (AgentId::new(), fixture.parent_run_id.clone());
+
+        for binding in [root_agent_child.clone(), root_run_child.clone()] {
+            let mut raw = base.grant().clone();
+            raw.scope.agent_ids = Some(vec![binding.0]);
+            raw.scope.run_ids = Some(vec![binding.1]);
+            let root = unchecked_validated_grant_for_tests(raw);
+            let ledger = InMemoryDelegationAuthorityLedger::new();
+            assert!(matches!(
+                ledger.register_root_runtime(
+                    &root,
+                    fixture.tenant_id.clone(),
+                    fixture.parent_agent_id.clone(),
+                    fixture.parent_run_id.clone(),
+                ),
+                Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+            ));
+        }
+
+        let cases = vec![
+            (
+                vec![root_agent_child.clone()],
+                vec![DelegationRuntimeEdge::new(
+                    fixture.parent_agent_id.clone(),
+                    fixture.parent_run_id.clone(),
+                    root_agent_child.0.clone(),
+                    root_agent_child.1.clone(),
+                )],
+            ),
+            (
+                vec![root_run_child.clone()],
+                vec![DelegationRuntimeEdge::new(
+                    fixture.parent_agent_id.clone(),
+                    fixture.parent_run_id.clone(),
+                    root_run_child.0.clone(),
+                    root_run_child.1.clone(),
+                )],
+            ),
+            (
+                vec![
+                    child.clone(),
+                    (
+                        fixture.parent_agent_id.clone(),
+                        fixture.parent_run_id.clone(),
+                    ),
+                ],
+                vec![
+                    DelegationRuntimeEdge::new(
+                        fixture.parent_agent_id.clone(),
+                        fixture.parent_run_id.clone(),
+                        child.0.clone(),
+                        child.1.clone(),
+                    ),
+                    DelegationRuntimeEdge::new(
+                        child.0.clone(),
+                        child.1.clone(),
+                        fixture.parent_agent_id.clone(),
+                        fixture.parent_run_id.clone(),
+                    ),
+                ],
+            ),
+        ];
+
+        for (bindings, edges) in cases {
+            let mut raw = base.grant().clone();
+            raw.scope.agent_ids = Some(bindings.iter().map(|binding| binding.0.clone()).collect());
+            raw.scope.run_ids = Some(bindings.iter().map(|binding| binding.1.clone()).collect());
+            let root = unchecked_validated_grant_for_tests(raw);
+            let ledger = InMemoryDelegationAuthorityLedger::new();
+            assert!(matches!(
+                ledger.register_root_runtime_with_edges(
+                    &root,
+                    fixture.tenant_id.clone(),
+                    fixture.parent_agent_id.clone(),
+                    fixture.parent_run_id.clone(),
+                    edges,
+                ),
+                Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+            ));
+        }
+    }
+
+    #[test]
+    fn authority_ledger_reserves_concurrent_fan_out_atomically() {
+        let fixture = Fixture::new();
+        let bindings = (0..17)
+            .map(|_| (fixture.child_agent_id.clone(), RunId::new()))
+            .collect::<Vec<_>>();
+        let mut raw = parent_grant(&fixture).grant().clone();
+        raw.scope.agent_ids = Some(bindings.iter().map(|binding| binding.0.clone()).collect());
+        raw.scope.run_ids = Some(bindings.iter().map(|binding| binding.1.clone()).collect());
+        let root = unchecked_validated_grant_for_tests(raw);
+        let ledger = Arc::new(InMemoryDelegationAuthorityLedger::new());
+        let caller = ledger
+            .register_root_runtime_with_child_bindings(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+                bindings.clone(),
+            )
+            .expect("root bindings");
+        let barrier = Arc::new(std::sync::Barrier::new(bindings.len()));
+        let handles = bindings
+            .into_iter()
+            .map(|(child_agent_id, child_run_id)| {
+                let ledger = Arc::clone(&ledger);
+                let caller = caller.clone();
+                let barrier = Arc::clone(&barrier);
+                let mut request = request_for(&fixture, &root);
+                request.child_grant_id = CapabilityGrantId::new();
+                request.child_agent_id = child_agent_id;
+                request.child_run_id = child_run_id;
+                request.scope.budget = AuthorityBudgetScope {
+                    max_actions_per_tick: Some(0),
+                    max_action_duration_ms: Some(0),
+                    ..AuthorityBudgetScope::default()
+                };
+                let now = fixture.now;
+                let audience = fixture.audience.clone();
+                let child_subject = fixture.child_subject.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ledger.reserve_child(&caller, request, now, audience, child_subject)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("fan-out thread"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 16);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(DelegationLedgerError::Issuance(
+                        DelegationGrantError::FanOutExceeded
+                    ))
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]

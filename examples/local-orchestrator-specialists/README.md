@@ -52,12 +52,12 @@ let specialist = AgentContext::new(
     AgentRuntimeConfig::default(),
 );
 
-manager.register_agent_with_principal(orchestrator.clone(), orchestrator_principal, DelegatedAuthority {
+manager.register_agent_with_principal(orchestrator.clone(), orchestrator_principal.clone(), DelegatedAuthority {
     allowed_actions: vec!["query".into(), "publish".into()],
     allowed_adapters: vec!["sql".into(), "artifact".into()],
     allowed_permissions: vec!["finance.read".into(), "artifact.publish".into()],
 })?;
-manager.register_agent_with_principal(specialist.clone(), specialist_principal, DelegatedAuthority {
+manager.register_agent_with_principal(specialist.clone(), specialist_principal.clone(), DelegatedAuthority {
     allowed_actions: vec!["query".into()],
     allowed_adapters: vec!["sql".into()],
     allowed_permissions: vec!["finance.read".into()],
@@ -148,7 +148,10 @@ routing, starting children, executing adapters, or live authority evaluation.
 - Delegated action liveness and HTTP minute quotas use authority-owned service
   time. Clock rollback and latched expiry deny; old minute buckets do not reopen.
 - Cleanup and revocation close admission first and wait only for the bounded local
-  quiescence interval. A timeout remains fail-closed for new effects.
+  quiescence interval. A child cleanup timeout terminally fails the manager-owned
+  child lifecycle, emits parent/child failure evidence, and remains fail-closed
+  after the in-flight permit drops; a completion retry is rejected as already
+  finished.
 - Root binding retains the exact validated grant privately in one local manager;
   the public run-record grant ID is evidence only. Binding setup itself has no
   durable trace event in this bounded local example.
