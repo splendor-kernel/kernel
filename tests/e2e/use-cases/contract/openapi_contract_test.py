@@ -144,6 +144,8 @@ S6_PHYSICAL_REQUEST_REFS = {
     "syncDeviceTraceBuffer": "DeviceTraceBufferSyncRequest",
 }
 
+RESIDENT_DAEMON_OPERATIONS = CORE_LOCAL_REQUIRED | LOCAL_CONTRACT_NOT_YET_COVERED | FUTURE_GROUPS["physical_edge"]
+
 
 def parse_operation_ids(text: str) -> set[str]:
     return set(re.findall(r"^\s*operationId:\s*([A-Za-z0-9_]+)\s*$", text, re.MULTILINE))
@@ -288,6 +290,25 @@ def main() -> int:
         block = blocks.get(op_id, "")
         if "'401':" not in block and "401:" not in block:
             failures.append(f"{op_id} must declare missing-caller/local-dev auth response semantics")
+
+    for op_id in sorted(RESIDENT_DAEMON_OPERATIONS & operation_ids):
+        block = blocks.get(op_id, "")
+        if "ResidentCallerBearer" not in block:
+            failures.append(f"{op_id} must declare the resident caller bearer security scheme")
+        if "'401':" not in block and "401:" not in block:
+            failures.append(f"{op_id} must declare resident authentication failure semantics")
+    for op_id in sorted(FUTURE_GROUPS["fleet"] & operation_ids):
+        if "ResidentCallerBearer" in blocks.get(op_id, ""):
+            failures.append(f"{op_id} must not claim resident bearer authentication for manager inbound traffic")
+    for marker in [
+        "type: http",
+        "scheme: bearer",
+        "splendor-caller+jwt (Ed25519)",
+        "WWW-Authenticate",
+        "non-authoritative compatibility mirror",
+    ]:
+        if marker not in text:
+            failures.append(f"resident authentication contract missing marker: {marker}")
 
     schema_failures: list[str] = []
     schema_failures.extend(
@@ -568,6 +589,7 @@ def main() -> int:
         "structural_checks": {
             "mutating_operations_checked": sorted(mutating_core & operation_ids),
             "health_capabilities_auth_semantics_checked": sorted({"getHealth", "getCapabilities"} & operation_ids),
+            "resident_bearer_operations_checked": sorted(RESIDENT_DAEMON_OPERATIONS & operation_ids),
             "schema_fields_checked": ["CallerCredential", "WorkOrderEnvelope", "ReplayRequest"],
             "s4_response_refs_checked": sorted(op for op in S4_MANAGER_RESPONSE_REFS if op in operation_ids),
             "s6_physical_response_refs_checked": sorted(op for op in S6_PHYSICAL_RESPONSE_REFS if op in operation_ids),

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -24,8 +26,8 @@ CLOUD_INSTANCE_ID = "00000000-0000-4000-8000-000000000304"
 EDGE_NODE_ID = "00000000-0000-4000-8000-000000000604"
 EDGE_INSTANCE_ID = "00000000-0000-4000-8000-000000000306"
 WORK_ORDER_ID = "wo_uc_e2e_s4_fleet_dispatch"
-KEY_ID = "work-order-local-key"
-SECRET = "splendor-local-work-order-secret"
+MESSAGE_WORK_ORDER_ID = "wo_uc_e2e_s4_remote_message"
+KEY_ID = "work-order-acceptance-key"
 RUNTIME_IMAGE_IDENTITY = "splendor-kernel-runtime:acceptance-target-runtime"
 
 
@@ -64,7 +66,7 @@ def splendorctl(root: Path) -> list[str]:
     return ["cargo", "run", "-q", "-p", "splendorctl", "--"]
 
 
-def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None, context: ssl.SSLContext | None = None) -> tuple[int, dict[str, Any]]:
     payload = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(base_url.rstrip("/") + path, data=payload, method=method)
     if payload is not None:
@@ -72,7 +74,7 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
     for name, value in (headers or {}).items():
         req.add_header(name, value)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=context) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
@@ -82,6 +84,8 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
         except json.JSONDecodeError:
             parsed = {"raw": raw}
         return exc.code, parsed
+    except urllib.error.URLError:
+        return 599, {"code": "transport_unavailable"}
 
 
 def manager_credential(scopes: list[str] | None = None, *, expired: bool = False, wrong_audience: bool = False, wrong_tenant: bool = False, revoked: bool = False) -> dict[str, Any]:
@@ -96,16 +100,24 @@ def manager_credential(scopes: list[str] | None = None, *, expired: bool = False
     }
 
 
-def resident_credential(instance_id: str, scopes: list[str] | None = None) -> dict[str, Any]:
-    return {
-        "credential_id": f"cred_uc_e2e_s4_resident_{instance_id[-3:]}",
-        "principal": manager_credential()["principal"],
-        "scopes": scopes or ["runs_create", "runs_start", "runs_read", "state_read", "state_handoff", "traces_read", "replay_create"],
-        "binding": {"tenant": {"tenant_id": TENANT_ID}},
-        "audience": {"instance": {"instance_id": instance_id}},
-        "expires_at": utc(60),
-        "revocation": "active",
-    }
+def resident_auth(root: Path, auth_dir: Path, instance_id: str, scopes: list[str]) -> dict[str, Any]:
+    command = [
+        "python3",
+        str(root / "tests/e2e/use-cases/fixtures/resident_auth_fixture.py"),
+        "token",
+        "--auth-dir",
+        str(auth_dir),
+        "--tenant-id",
+        TENANT_ID,
+        "--instance-id",
+        instance_id,
+    ]
+    for scope in scopes:
+        command.extend(["--scope", scope])
+    proc = subprocess.run(command, text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise SystemExit("resident caller token fixture failed")
+    return json.loads(proc.stdout)
 
 
 def audit(credential: dict[str, Any]) -> dict[str, Any]:
@@ -121,8 +133,11 @@ def message_scope(credential: dict[str, Any], run_id: str, agent_id: str, tenant
     return {**sec(credential), "tenant_id": tenant_id, "run_id": run_id, "agent_id": agent_id}
 
 
-def credential_header(credential: dict[str, Any]) -> dict[str, str]:
-    return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
+def credential_header(auth: dict[str, Any]) -> dict[str, str]:
+    return {
+        "authorization": f"Bearer {auth['token']}",
+        "x-splendor-caller-credential": json.dumps(auth["credential"], sort_keys=True),
+    }
 
 
 def node_registration(node_id: str, kind: str, target: str, locality: str, url: str, capabilities: list[str]) -> dict[str, Any]:
@@ -184,23 +199,52 @@ def work_order(expires: int = 60, revoked: bool = False, target: str = "customer
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "run_id": RUN_ID,
-        "objective": "UC-E2E-S4 fleet work-order dispatch with VPC data locality and cloud proposal message",
-        "allowed_actions": ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal"],
-        "allowed_adapters": ["fixture-sql", "artifact-store", "remote-message"],
-        "allowed_permissions": ["fixture.sql.read", "artifact.create_internal", f"message.remote.proposal:{HELPER_AGENT_ID}"],
+        "objective": "UC-E2E-S4 single-adapter resident dispatch with VPC data locality",
+        "allowed_actions": ["sql.read_fixture"],
+        "allowed_adapters": ["fixture-sql"],
+        "allowed_permissions": ["fixture.sql.read"],
         "data_refs": ["dataset:eu-west.fixture.v1"],
         "quotas": {"max_actions_per_tick": 5, "max_action_duration_ms": 30000},
-        "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal"]},
+        "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["sql.read_fixture"]},
         "issued_at": utc(-2),
         "expires_at": utc(expires),
         "revocation": {"revoked": {"reason": "operator_revoked"}} if revoked else "active",
     }
 
 
-def sign_work_order(root: Path, artifact_dir: Path, commands: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def message_work_order(expires: int = 60) -> dict[str, Any]:
+    return {
+        "schema_version": "splendor.work_order.v1",
+        "work_order_id": MESSAGE_WORK_ORDER_ID,
+        "tenant_id": TENANT_ID,
+        "agent_id": AGENT_ID,
+        "run_id": RUN_ID,
+        "objective": "UC-E2E-S4 proposal-only remote message delegation",
+        "allowed_actions": ["message.remote.proposal"],
+        "allowed_adapters": ["remote-message"],
+        "allowed_permissions": [f"message.remote.proposal:{HELPER_AGENT_ID}"],
+        "data_refs": [],
+        "quotas": {"max_actions_per_tick": 1, "max_action_duration_ms": 30000},
+        "placement": {"target": "customer_vpc", "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["message.remote.proposal"]},
+        "issued_at": utc(-2),
+        "expires_at": utc(expires),
+        "revocation": "active",
+    }
+
+
+def sign_work_order(root: Path, artifact_dir: Path, commands: Path, auth_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     unsigned = artifact_dir / f"{payload['work_order_id']}.unsigned.json"
     write_json(unsigned, payload)
-    proc = run_cmd(splendorctl(root) + ["work-order", "sign", "--input", str(unsigned), "--key-id", KEY_ID, "--secret", SECRET], root, commands)
+    secret = (auth_dir / "work-order-signing.secret").read_text(encoding="ascii")
+    command = splendorctl(root) + ["work-order", "sign", "--input", str(unsigned), "--key-id", KEY_ID, "--secret", secret]
+    with commands.open("a", encoding="utf-8") as fh:
+        fh.write("$ " + " ".join(command[:-1] + ["[REDACTED]"]) + "\n")
+    proc = subprocess.run(command, cwd=root, text=True, capture_output=True)
+    with commands.open("a", encoding="utf-8") as fh:
+        fh.write(proc.stderr)
+        fh.write(f"exit={proc.returncode}\n")
+    if proc.returncode != 0:
+        raise SystemExit("work-order signing failed")
     return json.loads(proc.stdout)
 
 
@@ -225,10 +269,14 @@ def main() -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--manager-url", default="http://central-manager:8081")
-    parser.add_argument("--vpc-url", default="http://resident-vpc-node:8092")
-    parser.add_argument("--cloud-url", default="http://resident-cloud-node:8091")
+    parser.add_argument("--vpc-url", default="https://resident-vpc-node:8092")
+    parser.add_argument("--cloud-url", default="https://resident-cloud-node:8091")
+    parser.add_argument("--resident-auth-dir", default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"))
+    parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-tls-cert.pem"))
     args = parser.parse_args()
     root = Path(args.root)
+    auth_dir = Path(args.resident_auth_dir)
+    resident_ssl = ssl.create_default_context(cafile=args.resident_ca_file)
     report_dir = Path(args.report_dir)
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S4"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -236,7 +284,8 @@ def main() -> int:
     api_rows: list[dict[str, Any]] = []
 
     def call(operation: str, method: str, base: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
-        status, data = request_json(method, base, path, body, headers)
+        context = resident_ssl if base.lower().startswith("https://") else None
+        status, data = request_json(method, base, path, body, headers, context)
         api_rows.append({"operation_id": operation, "method": method, "url": base.rstrip("/") + path, "status": status, "request": body, "response": data})
         return {"status": status, "body": data}
 
@@ -245,11 +294,21 @@ def main() -> int:
             break
         time.sleep(0.25)
 
+    for label, base, instance_id in [
+        ("vpc", args.vpc_url, VPC_INSTANCE_ID),
+        ("cloud", args.cloud_url, CLOUD_INSTANCE_ID),
+    ]:
+        for _ in range(40):
+            health_auth = resident_auth(root, auth_dir, instance_id, ["health_read"])
+            if call(f"residentHealth-{label}", "GET", base, "/health", headers=credential_header(health_auth))["status"] == 200:
+                break
+            time.sleep(0.25)
+
     cred = manager_credential()
     nodes = [
         node_registration(VPC_NODE_ID, "vpc.worker", "customer_vpc", "vpc", args.vpc_url, ["sql.read_fixture", "data.read_fixture", "artifact.create_internal", "artifact.publish_external", "message.remote.proposal", "runtime.resident"]),
         node_registration(CLOUD_NODE_ID, "cloud.worker", "resident_cloud_pool", "cloud", args.cloud_url, ["message.remote.proposal", "runtime.resident"]),
-        node_registration(EDGE_NODE_ID, "edge.appliance", "edge_device", "device", "http://resident-edge-node:8093", ["runtime.resident", "trace.buffer.local"]),
+        node_registration(EDGE_NODE_ID, "edge.appliance", "edge_device", "device", "https://resident-edge-node:8093", ["runtime.resident", "trace.buffer.local"]),
     ]
     instances = [instance_registration(VPC_NODE_ID, VPC_INSTANCE_ID), instance_registration(CLOUD_NODE_ID, CLOUD_INSTANCE_ID), instance_registration(EDGE_NODE_ID, EDGE_INSTANCE_ID)]
     for node in nodes:
@@ -261,49 +320,66 @@ def main() -> int:
         call("heartbeatNode", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/heartbeat", {**sec(cred), "heartbeat": {"node_id": node["node_id"], "health": node["health"], "recorded_at": utc(0)}})
         call("advertiseCapabilities", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/capabilities", {**sec(cred), "capability_document": node["capability_document"]})
 
-    envelope = sign_work_order(root, artifact_dir, commands, work_order())
+    envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order())
+    message_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, message_work_order())
     validation = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": envelope, "expected_audience": "central-manager"})
-    placement_request = {"target": "customer_vpc", "required_capabilities": ["sql.read_fixture", "artifact.create_internal", "message.remote.proposal"], "data_locality": "vpc", "dedicated_instance": False, "required_runtime_version": None, "max_runtime_ms": 30000, "execution_mode": "live"}
+    message_validation = call("submitMessageWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": message_envelope, "expected_audience": "central-manager"})
+    placement_request = {"target": "customer_vpc", "required_capabilities": ["sql.read_fixture"], "data_locality": "vpc", "dedicated_instance": False, "required_runtime_version": None, "max_runtime_ms": 30000, "execution_mode": "live"}
     placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": WORK_ORDER_ID, "request": placement_request})
     dispatch = call("dispatchWorkOrder", "POST", args.manager_url, f"/work-orders/{WORK_ORDER_ID}/dispatch", {**sec(cred), "target_node_id": VPC_NODE_ID})
     run_id = dispatch["body"].get("run_id", RUN_ID)
 
     message = {"message": {"message_id": "55555555-5555-4555-8555-555555555554", "source_agent_id": AGENT_ID, "target_agent_id": HELPER_AGENT_ID, "run_id": run_id, "schema": "splendor.message.proposal_request.v1", "payload": {"request": "proposal_only", "mutation_authority": False}, "causal_parent": None, "requires_response": True, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
-    remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
+    remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
     duplicate_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555556"}}
-    duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
+    duplicate = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-once", "simulate_failure": None})
     received = call("getMessage", "POST", args.manager_url, f"/messages/{message['message']['message_id']}/read", message_scope(cred, run_id, HELPER_AGENT_ID))
     failed_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555555"}}
-    failed_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-fail", "simulate_failure": "toxiproxy_transport_failure"})
+    failed_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": failed_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-fail", "simulate_failure": "toxiproxy_transport_failure"})
     unsupported_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555557", "schema": "splendor.message.unsupported.v1"}}
-    unsupported_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": unsupported_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unsupported", "simulate_failure": None})
+    unsupported_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": unsupported_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unsupported", "simulate_failure": None})
     unauthorized_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555558", "target_agent_id": AGENT_ID}}
-    unauthorized_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": WORK_ORDER_ID, "message_envelope": unauthorized_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unauthorized", "simulate_failure": None})
+    unauthorized_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": unauthorized_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unauthorized", "simulate_failure": None})
 
-    vpc_cred = resident_credential(VPC_INSTANCE_ID)
-    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID})
-    cloud_cred = resident_credential(CLOUD_INSTANCE_ID)
+    vpc_export_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["state_handoff"])
+    vpc_export_cred = vpc_export_auth["credential"]
+    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_export_cred, "audit_attribution": audit(vpc_export_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID}, credential_header(vpc_export_auth))
+    cloud_create_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_create"])
+    cloud_create_cred = cloud_create_auth["credential"]
     cloud_work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", WORK_ORDER_ID)
-    cloud_create = {"request_id": f"req-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "idempotency_key": f"idem-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "work_order": envelope, "credential": cloud_cred, "audit_attribution": audit(cloud_cred), "allowed_actions": ["sql.read_fixture"], "allowed_adapters": ["fixture-sql"], "allowed_permissions": ["fixture.sql.read"], "policy_actions": [], "policy_bundle_required": False, "policy_bundle": None, "registered_actions": [{"name": "sql.read_fixture", "adapter": "fixture-sql"}], "approval_policies": [], "allowed_percept_schemas": [], "allowed_percept_sources": [], "initial_state": {"resume_target": "cloud"}, "snapshot_interval": 1}
-    call("createRun", "POST", args.cloud_url, "/runs", cloud_create)
-    imported = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
-    state_before_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_cred))
+    cloud_create = {"request_id": f"req-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "idempotency_key": f"idem-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "work_order": envelope, "credential": cloud_create_cred, "audit_attribution": audit(cloud_create_cred), "allowed_actions": ["sql.read_fixture"], "allowed_adapters": ["fixture-sql"], "allowed_permissions": ["fixture.sql.read"], "policy_actions": [], "policy_bundle_required": False, "policy_bundle": None, "registered_actions": [{"name": "sql.read_fixture", "adapter": "fixture-sql"}], "approval_policies": [], "allowed_percept_schemas": [], "allowed_percept_sources": [], "initial_state": {"resume_target": "cloud"}, "snapshot_interval": 1}
+    call("createRun", "POST", args.cloud_url, "/runs", cloud_create, credential_header(cloud_create_auth))
+    cloud_import_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
+    cloud_import_cred = cloud_import_auth["credential"]
+    imported = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "credential": cloud_import_cred, "audit_attribution": audit(cloud_import_cred)}, credential_header(cloud_import_auth))
+    cloud_state_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_read"])
+    state_before_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
     bad_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if bad_handoff:
         bad_handoff["authority"]["tenant_id"] = "99999999-9999-4999-8999-999999999999"
-    wrong_handoff = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
+    wrong_handoff_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
+    wrong_handoff_cred = wrong_handoff_auth["credential"]
+    wrong_handoff = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "credential": wrong_handoff_cred, "audit_attribution": audit(wrong_handoff_cred)}, credential_header(wrong_handoff_auth))
     wrong_hash_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if wrong_hash_handoff:
         wrong_hash_handoff["snapshot"]["state_hash"]["value"] = "0" * 64
-    wrong_hash = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_hash_handoff, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
+    wrong_hash_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
+    wrong_hash_cred = wrong_hash_auth["credential"]
+    wrong_hash = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_hash_handoff, "credential": wrong_hash_cred, "audit_attribution": audit(wrong_hash_cred)}, credential_header(wrong_hash_auth))
     wrong_run_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if wrong_run_handoff:
         wrong_run_handoff["authority"]["run_id"] = "77777777-7777-4777-8777-777777777777"
-    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
-    state_after_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_cred))
+    wrong_run_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
+    wrong_run_cred = wrong_run_auth["credential"]
+    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "credential": wrong_run_cred, "audit_attribution": audit(wrong_run_cred)}, credential_header(wrong_run_auth))
+    state_after_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
 
-    traces = call("exportTraces", "POST", args.vpc_url, f"/runs/{run_id}/traces/export", {"credential": vpc_cred, "audit_attribution": audit(vpc_cred), "redaction_policy": "uc-e2e-s4-redacted", "start": None, "end": None})
-    replay = call("replayRun", "POST", args.vpc_url, f"/runs/{run_id}/replay", {"credential": vpc_cred, "audit_attribution": audit(vpc_cred), "mode": "inspect_only", "side_effects_allowed": False})
+    vpc_trace_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["traces_read"])
+    vpc_trace_cred = vpc_trace_auth["credential"]
+    traces = call("exportTraces", "POST", args.vpc_url, f"/runs/{run_id}/traces/export", {"credential": vpc_trace_cred, "audit_attribution": audit(vpc_trace_cred), "redaction_policy": "uc-e2e-s4-redacted", "start": None, "end": None}, credential_header(vpc_trace_auth))
+    vpc_replay_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["replay_create"])
+    vpc_replay_cred = vpc_replay_auth["credential"]
+    replay = call("replayRun", "POST", args.vpc_url, f"/runs/{run_id}/replay", {"credential": vpc_replay_cred, "audit_attribution": audit(vpc_replay_cred), "mode": "inspect_only", "side_effects_allowed": False}, credential_header(vpc_replay_auth))
     records = traces["body"].get("records", [])
     trace_batch = {"scope": {"fleet_id": FLEET_ID, "node_id": VPC_NODE_ID, "instance_id": VPC_INSTANCE_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "run_id": run_id, "work_order_id": WORK_ORDER_ID}, "records": records}
     sync = call("syncTraceBuffer", "POST", args.manager_url, "/fleet/traces/sync", {**sec(cred), "batch": trace_batch})
@@ -331,8 +407,8 @@ def main() -> int:
     wrong_audience = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager_credential(wrong_audience=True)), "work_order_id": WORK_ORDER_ID, "request": placement_request})
     capability_mismatch = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "missing-capability", "request": {**placement_request, "required_capabilities": ["gpu.unavailable"]}})
     unsigned = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": {k: v for k, v in envelope.items() if k != "signature"}, "expected_audience": "central-manager"})
-    expired = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, work_order(expires=-1)), "expected_audience": "central-manager"})
-    revoked = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, work_order(revoked=True)), "expected_audience": "central-manager"})
+    expired = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(expires=-1)), "expected_audience": "central-manager"})
+    revoked = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(revoked=True)), "expected_audience": "central-manager"})
     wrong_wo_audience = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": envelope, "expected_audience": "wrong-manager"})
     receiver_unchanged = state_before_failed_import["body"].get("state_node_id") == state_after_failed_import["body"].get("state_node_id")
     negatives = [
@@ -364,6 +440,7 @@ def main() -> int:
     required_positive_checks = {
         "node_list_authenticated": node_list["status"] == 200,
         "work_order_accepted": validation["status"] == 200 and validation["body"].get("accepted") is True,
+        "message_work_order_accepted": message_validation["status"] == 200 and message_validation["body"].get("accepted") is True,
         "placement_selected": placement["body"].get("status") == "selected" and placement["body"].get("candidate_id") == VPC_NODE_ID,
         "dispatch_started_resident_run": dispatch["body"].get("create_run_status") in {200, 201} and dispatch["body"].get("start_run_status") in {200, 201},
         "remote_message_delivered": remote["body"].get("delivery_status") == "delivered" and remote["body"].get("recipient_validated") is True and remote["body"].get("work_order_authority_validated") is True and remote["body"].get("route_permission") == f"message.remote.proposal:{HELPER_AGENT_ID}" and remote["body"].get("remote_state_mutated") is False,
@@ -381,19 +458,19 @@ def main() -> int:
         "status": "passed" if not scenario_failures else "failed",
         "fr_coverage": ["FR-0.03-02", "FR-0.03-04", "FR-0.03-05", "FR-0.03-08", "FR-0.03-09", "FR-0.03-10", "FR-0.03-11"],
         "components": ["central-manager", "resident-daemon", "fleet", "work-order", "placement", "remote-message", "state-handoff", "trace-sync", "fleet-telemetry", "replay/audit"],
-        "positive_evidence": ["registered VPC and cloud nodes", "signed work order accepted", "VPC placement selected", "manager dispatched to resident daemon over HTTP", "remote proposal message delivered", "state snapshot exported/imported", "trace buffer synced", "telemetry reported observational-only"],
+        "positive_evidence": ["registered VPC and cloud nodes", "narrow signed dispatch and message work orders accepted", "VPC placement selected", "manager dispatched to resident daemon over verified TLS", "remote proposal message delivered", "state snapshot exported/imported", "trace buffer synced", "telemetry reported observational-only"],
         "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True],
         "replay_evidence": ["resident replayRun public API returned inspect_only replay over exported trace evidence without side effects"],
         "replay_mode": "inspect_only",
         "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "remote_messages_resent": False},
         "replay_artifacts": [str(artifact_dir / "replay-report.json")],
-        "anti_drift_checks": ["same_runtime_image_for_splendor_instances", "public_manager_and_resident_http_used", "telemetry_non_authoritative", "no_per_node_custom_images", "no_private_rust_helper_only_demo"],
+        "anti_drift_checks": ["same_runtime_image_for_splendor_instances", "public_manager_and_resident_https_used", "ephemeral_acceptance_keys_only", "telemetry_non_authoritative", "no_per_node_custom_images", "no_private_rust_helper_only_demo"],
         "run_ids": [run_id],
         "trace_event_ids": sorted({tid for ids in event_ids.values() for tid in ids if tid}),
         "state_node_ids": [exported["body"].get("state_node_id", ""), imported["body"].get("state_node_id", "")],
         "state_hashes": [exported["body"].get("handoff", {}).get("snapshot", {}).get("state_hash", {}).get("value", "")],
         "message_ids": [message["message"]["message_id"], duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]],
-        "work_order_ids": [WORK_ORDER_ID],
+        "work_order_ids": [WORK_ORDER_ID, MESSAGE_WORK_ORDER_ID],
         "approval_ids": [],
         "node_ids": [VPC_NODE_ID, CLOUD_NODE_ID, EDGE_NODE_ID],
         "api_operations": sorted({row["operation_id"] for row in api_rows}),
@@ -408,7 +485,7 @@ def main() -> int:
         "scenario-report.json": scenario,
         "registry.json": {"nodes": nodes, "instances": instances},
         "capabilities.json": {node["node_id"]: node["capability_document"] for node in nodes},
-        "work-order-validation.json": validation["body"],
+        "work-order-validation.json": {"dispatch": validation["body"], "remote_message": message_validation["body"]},
         "placement-decision.json": placement["body"],
         "dispatch-report.json": dispatch["body"],
         "remote-message-report.json": {"delivered": remote["body"], "received": received["body"], "duplicate": duplicate["body"], "failed": failed_remote["body"], "unsupported_schema": unsupported_remote, "unauthorized_recipient": unauthorized_remote},
@@ -418,7 +495,7 @@ def main() -> int:
         "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "remote_messages_resent": False, "derived_from_public_replay_api": True, "reconstructed": ["run.dispatched", "remote_message.delivered", "remote_message.duplicate", "remote_message.failed", "state.exported", "state.imported", "state.rejected", "trace.sync.completed"], "denial_reasons": [item["case"] for item in negatives if item.get("passed") is True]},
         "audit-report.json": {"events": audit_events, "negative_cases": negatives},
         "anti-drift-results.json": {"status": "passed" if not scenario_failures else "failed", "same_image_fleet": same_image_evidence.get("all_same") is True, "private_helper_only_e2e": False, "telemetry_authorizes_dispatch": False, "gateway_bypass": False, "replay_side_effects_allowed_default": False},
-        "stdout.log": "UC-E2E-S4 fleet dispatch scenario completed through public manager/resident HTTP APIs\n",
+        "stdout.log": "UC-E2E-S4 fleet dispatch scenario completed through public manager and verified-TLS resident APIs\n",
         "stderr.log": "",
     }
     for name, data in artifacts.items():

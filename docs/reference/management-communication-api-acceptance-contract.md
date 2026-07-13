@@ -33,6 +33,14 @@ Every non-dev request to a daemon, sidecar, resident node, or central manager mu
 
 Local development mode is valid only when explicitly enabled, loopback/Unix-socket bound, warning-logged, and excluded from fleet/remote/resident/production operation.
 
+Accepted RFC 0011 supplies one concrete manager→resident reference path. The
+manager mints a fresh closed-profile Ed25519 bearer for each create/start call;
+the resident verifies it over TLS and derives the caller projection. Body/header
+credential objects are non-authoritative mirrors. This does **not** authenticate
+calls into the current manager API itself: the `splendor-manager` binary remains
+explicit local acceptance/dev infrastructure and must not be exposed or claimed
+as a production-authenticated central manager.
+
 ---
 
 ## 2. Required scopes
@@ -106,7 +114,7 @@ Scopes should be stable string values so clients and generated tests can reason 
 | `evaluatePlacement` | `/fleet/placement/evaluate` | `POST` | `splendor.fleet.read` | Explains valid target or rejection based on explicit capability/work-order rules. |
 | `submitWorkOrder` | `/work-orders` | `POST` | `splendor.work_orders.submit` | Validates signature, tenant, expiry, revocation, allowed actions/adapters/permissions/data refs/quotas/audience. |
 | `revokeWorkOrder` | `/work-orders/{work_order_id}/revoke` | `POST` | `splendor.work_orders.revoke` | Prevents create/resume/authorize for revoked work order. |
-| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. Resident daemon create-run payloads carry deterministic request and idempotency keys derived from dispatch scope. |
+| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. Requires a signed run-bound work order and one unambiguous work-order-v1 adapter profile. Manager transport validates TLS CA/hostname, disables redirects, bounds time/response bytes, sends fresh one-scope caller tokens, checks exact typed create/start identities, records partial/unknown-effect failure, never reports non-2xx as running, and never auto-retries an unknown-effect start. Exact duplicates reuse stored terminal results. |
 | `getFleetTelemetry` | `/fleet/telemetry` | `GET` | `splendor.fleet.read` | Reports health/run/quota/trace-sync status; non-authoritative. |
 | `syncTraceBuffer` | `/fleet/traces/sync` | `POST` | `splendor.traces.read` or node sync credential | Aggregates trace buffers with ordering/integrity validation. |
 
@@ -198,6 +206,12 @@ hard_real_time_stabilization
 Every schema below must be exposed in the OpenAPI contract or referenced from canonical schema files with generated/parity-checked Rust, Python, and TypeScript models.
 
 ### `CallerCredential`
+
+On the resident daemon this object is a deprecated compatibility projection of
+verified bearer claims, not proof. If supplied in a body/header it must exactly
+match the verified projection and cannot add identity, scope, binding, lifetime,
+audience, or revocation facts. The accepted proof contract is documented in RFC
+0011 and OpenAPI `ResidentCallerBearer`.
 
 Required fields:
 
@@ -428,3 +442,8 @@ Block acceptance if any of these occur:
 - A physical endpoint accepts low-level actuator commands.
 - The API schema allows replay side effects by default.
 - Generated Rust/Python/TypeScript schema parity fails.
+- Manager dispatch follows a redirect, accepts an untrusted TLS chain/hostname,
+  accepts malformed/oversized success, reports non-2xx as running, retries an
+  unknown-effect start, or allows duplicate dispatch to start a second tick.
+- Documentation implies the current manager inbound metadata is production
+  caller authentication.

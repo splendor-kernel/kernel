@@ -4606,6 +4606,7 @@ async fn health_and_capabilities_remain_local_dev_only_without_credentials() {
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: splendor_types::WorkOrderKeyring::new(),
@@ -4652,6 +4653,7 @@ async fn health_and_capabilities_accept_canonical_and_public_header_credentials(
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: splendor_types::WorkOrderKeyring::new(),
@@ -4746,6 +4748,7 @@ async fn credential_header_rejections_fail_closed_for_malformed_and_invalid_auth
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: splendor_types::WorkOrderKeyring::new(),
@@ -4808,6 +4811,7 @@ async fn public_credential_header_rejections_cover_revocation_and_scope_branches
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: splendor_types::WorkOrderKeyring::new(),

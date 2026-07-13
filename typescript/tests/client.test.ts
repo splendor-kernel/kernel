@@ -520,6 +520,92 @@ test("network and malformed daemon responses become structured client errors", a
   );
 });
 
+test("client errors never expose bearer token bytes", async () => {
+  const token = "resident-secret-token-material";
+  const networkClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: async () => {
+      throw new Error(`transport rejected Authorization: Bearer ${token}`);
+    }
+  });
+  await assert.rejects(
+    () => networkClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      assert.doesNotMatch(JSON.stringify(error.details), new RegExp(token));
+      assert.match(JSON.stringify(error.details), /\[REDACTED\]/);
+      return true;
+    }
+  );
+
+  const reflectedClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: makeRawFetch(
+      JSON.stringify({
+        code: "invalid_token",
+        message: `rejected ${token}`,
+        details: { authorization: `Bearer ${token}` }
+      }),
+      401
+    )
+  });
+  await assert.rejects(
+    () => reflectedClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      const rendered = JSON.stringify({
+        message: error.message,
+        details: error.details,
+        responseBody: error.responseBody
+      });
+      assert.doesNotMatch(rendered, new RegExp(token));
+      assert.match(rendered, /\[REDACTED\]/);
+      return true;
+    }
+  );
+
+  const malformedClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: makeRawFetch(`not-json:${token}`, 200)
+  });
+  await assert.rejects(
+    () => malformedClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      assert.doesNotMatch(JSON.stringify(error.responseBody), new RegExp(token));
+      return true;
+    }
+  );
+
+  const reflectedTextClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: async () => new Response(`plain:${token}`, {
+      status: 500,
+      statusText: `failure:${token}`,
+      headers: { "x-request-id": `request:${token}` }
+    })
+  });
+  await assert.rejects(
+    () => reflectedTextClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      const rendered = JSON.stringify({
+        message: error.message,
+        requestId: error.requestId,
+        details: error.details,
+        responseBody: error.responseBody
+      });
+      assert.doesNotMatch(rendered, new RegExp(token));
+      assert.match(rendered, /\[REDACTED\]/);
+      return true;
+    }
+  );
+});
+
 test("empty success responses and text error responses remain explicit", async () => {
   const noContentClient = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: makeRawFetch(undefined, 204) });
   assert.equal(await noContentClient.getStateHead(runId), undefined);

@@ -44,6 +44,14 @@
   remains inspect-only, and configured work orders never fall back to explicit
   unsigned-local compatibility mode. Ambiguous multi-adapter profiles fail
   closed because the current work-order schema does not bind actions to adapters.
+- Added the accepted RFC 0011 resident security correction: resident mode now
+  requires Rustls TLS, a closed Ed25519 caller bearer verified against explicit
+  trust/revocation state, explicit owner-only work-order/policy keyrings, and
+  exact non-authoritative credential mirrors. Manager→resident dispatch now uses
+  bounded no-redirect/no-proxy HTTPS, fresh one-scope caller tokens, strict typed
+  responses, terminal partial/unknown-effect outcomes, duplicate suppression,
+  and real resident-router integration evidence. The UC-E2E-S4 composition
+  generates acceptance-only key/TLS material in an untracked volume.
 - Corrected CLI run-level trace composition so agents sharing one configured
   `run_id` also share one runtime cursor, producing a contiguous sequence/hash
   chain with distinct agent identities. Signed resume retains that cursor and
@@ -61,9 +69,9 @@
   The shared receipt ledger is process-local and does not claim restart durability.
   Registered and non-empty request profiles require the complete signed permission set and ambiguous
   multi-adapter work orders fail admission. Closed Rust/OpenAPI objects and exact
-  TypeScript authority unions have parity tests. Resident credential tests cover
-  metadata/scope checks only; production authentication remains deferred to C01.
-  Future privileged planes and all gold cases remain downstream/not exercised.
+  TypeScript authority unions have parity tests. The bounded resident caller
+  verifier is the accepted RFC 0011 compatibility adapter; full C01/IDR-002,
+  future privileged planes, and all gold cases remain downstream/not exercised.
 - Hardened the daemon C02 lifecycle boundary: only pending/running runs admit
   direct or run-bound physical gateway work; terminal transitions close new
   effect permits before status publication and wait outside the broad run lock;
@@ -127,6 +135,10 @@
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.
+- No generic OAuth/OIDC/PKI provider, full Principal Registry, manager inbound
+  production authentication, hot trust watch/refresh, mTLS enrollment, or
+  request proof-of-possession. `splendor-manager` remains explicit acceptance
+  infrastructure even though its outbound resident dispatch is authenticated.
 - No remote/cross-instance delegation ledger, Message Service or Agent Controller
   adoption, or durable authority reservation store; recursive support is local
   and only through exact authority-issued child grants plus explicit runtime

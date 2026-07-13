@@ -1049,6 +1049,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: daemon_work_order_keyring(),

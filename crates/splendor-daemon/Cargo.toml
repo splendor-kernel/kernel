@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 axum = "0.7"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
 splendor-gateway = { path = "../splendor-gateway" }
@@ -13,10 +17,11 @@ splendor-store = { path = "../splendor-store" }
 splendor-types = { path = "../splendor-types" }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 serde_yaml = "0.9"
 splendor-authority = { path = "../splendor-authority" }
 tower = { version = "0.5", features = ["util"] }

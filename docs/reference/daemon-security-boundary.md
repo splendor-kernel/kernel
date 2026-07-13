@@ -1,9 +1,10 @@
 # Daemon Security Boundary Reference
 
-The daemon security boundary is the 0.02-S0 contract for communication between
-external apps and Splendor daemon/client surfaces. It is a Rust reference
-validator and documentation contract, not a daemon server, OAuth provider, PKI
-stack, or production transport implementation.
+The daemon security boundary began as the 0.02-S0 reference validator. Accepted
+[RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md) now adds one
+production-real resident reference profile: TLS plus a closed Ed25519 caller
+bearer verifier. This is not an OAuth provider, general PKI stack, full Principal
+Registry, or proof that the central-manager inbound API is production-secure.
 
 ## Layered authorization
 
@@ -47,12 +48,35 @@ Every non-dev daemon request must include a `CallerCredential` with:
 
 Anonymous non-dev daemon calls fail closed.
 
+### Resident caller proof
+
+Resident requests require `Authorization: Bearer <token>` using the accepted
+`typ=splendor-caller+jwt`, `alg=Ed25519` profile. Verification is bound to an
+explicit trust snapshot, exact issuer, exact `urn:splendor:instance:<instance_id>`
+audience, tenant, endpoint scopes, 300-second maximum lifetime, active key, JTI
+revocation, and fresh trust state. Unknown fields/algorithms/keys, bad signatures,
+stale trust, clock rollback, and malformed or oversized tokens fail closed.
+The current file-backed verifier loads trust at resident startup. Operators apply
+an atomically replaced trust/revocation snapshot with a controlled restart; hot
+reload/watch propagation is not implemented, and an expired loaded snapshot
+denies requests.
+
+The daemon derives the authoritative `CallerCredential` from verified claims.
+Request-body credential/audit fields and `X-Splendor-Caller-Credential` remain
+deprecated compatibility mirrors. They cannot authenticate and must exactly match
+the verified principal, credential ID, binding, audience, scopes, expiry, and
+revocation projection. Missing or invalid proof returns `401` with
+`WWW-Authenticate: Bearer realm="splendor-resident", error="invalid_token"`;
+authenticated scope/binding/mirror failures return `403`. Tokens, signatures,
+and key bytes are never copied into errors or traces.
+
 ## Transport modes
 
-Secure production communication should use authenticated transports or caller
-tokens appropriate to the deployment, such as mTLS, workload identity, signed
-service tokens, or OIDC/JWT access tokens. Transport security authenticates the
-channel; it does not authorize runs or actions.
+The implemented resident reference path uses Rustls TLS with an explicit
+certificate/private-key file and the accepted Ed25519 service token. Future mTLS,
+workload identity, OIDC, and hardware proof providers remain adapter work.
+Transport security authenticates the channel; it does not authorize runs or
+actions.
 
 The daemon must not expose unauthenticated TCP by default.
 
@@ -122,8 +146,9 @@ operations still require caller scope validation for non-dev calls and mutating
 operations still require audit attribution, but they do not replace the signed
 work-order requirement for create/resume.
 
-0.02-S0 checks signature metadata presence and scope. Cryptographic verification
-and remote work-order ingestion are future daemon/work-order implementation work.
+The current daemon cryptographically validates configured signed work orders.
+Resident caller proof remains a separate prerequisite and does not replace that
+work-order validation.
 
 ## Percept append
 
@@ -208,12 +233,13 @@ orders to re-execute actions.
 
 ## Non-goals
 
-- No production daemon transport or auth server is implemented by this security
-  validator. The 0.02-S5 local HTTP daemon calls this validator.
+- No generic production auth server, OAuth/OIDC issuer, dynamic key discovery,
+  fleet PKI manager, or full Principal Registry is implemented.
 - No OAuth/OIDC server.
 - No PKI or fleet mTLS rollout.
 - No node bootstrap protocol.
-- No remote fleet auth.
+- No production authentication claim for the current central-manager inbound
+  acceptance API. RFC 0011 secures manager outbound resident dispatch only.
 - No governance approval workflow is implemented by this S0 security-boundary
   validator; approval enforcement is documented separately for 0.04-S2.
 - No broad runtime permission engine.

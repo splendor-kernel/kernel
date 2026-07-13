@@ -25,7 +25,7 @@ import type {
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export interface SplendorClientOptions {
-  /** Runtime daemon base URL, for example `http://127.0.0.1:8077`. */
+  /** Runtime daemon base URL. Resident/non-dev callers use HTTPS; loopback HTTP is explicit local development only. */
   baseUrl: string;
   /** Caller bearer token. The client never silently falls back to anonymous calls. */
   token: string;
@@ -35,7 +35,11 @@ export interface SplendorClientOptions {
   apiVersion?: string;
   /** Optional default audit attribution for mutating calls. */
   defaultAudit?: AuditAttribution;
-  /** Optional default caller credential serialized into daemon request bodies. */
+  /**
+   * Optional compatibility mirror serialized into daemon headers/request bodies.
+   * It is never authentication proof; the daemon derives authority only from the
+   * verified bearer token and requires any supplied mirror to match it exactly.
+   */
   defaultCredential?: CallerCredential | null;
 }
 
@@ -352,11 +356,12 @@ export class SplendorClient {
     try {
       response = await this.fetcher(url, { method, headers, body });
     } catch (error) {
+      const cause = this.redactText(error instanceof Error ? error.message : String(error));
       throw new SplendorClientError({
         status: 0,
         code: "network_error",
         message: "Daemon request failed before a response was received",
-        details: { cause: error instanceof Error ? error.message : String(error) }
+        details: { cause }
       });
     }
 
@@ -378,15 +383,18 @@ export class SplendorClient {
         status: response.status,
         code: "invalid_json",
         message: "Daemon returned a non-JSON response",
-        details: { cause: error instanceof Error ? error.message : String(error), body: text },
-        requestId: response.headers.get("x-request-id") ?? response.headers.get("x-correlation-id") ?? undefined,
-        responseBody: text
+        details: {
+          cause: this.redactText(error instanceof Error ? error.message : String(error)),
+          body: this.redactText(text)
+        },
+        requestId: this.redactOptionalText(response.headers.get("x-request-id") ?? response.headers.get("x-correlation-id")),
+        responseBody: this.redactText(text)
       });
     }
   }
 
   private async toClientError(response: Response): Promise<SplendorClientError> {
-    const requestId = response.headers.get("x-request-id") ?? response.headers.get("x-correlation-id") ?? undefined;
+    const requestId = this.redactOptionalText(response.headers.get("x-request-id") ?? response.headers.get("x-correlation-id"));
     const text = await response.text();
     let payload: DaemonErrorPayload | string = text;
     if (text.trim()) {
@@ -398,27 +406,52 @@ export class SplendorClient {
     }
 
     if (typeof payload === "object" && payload !== null) {
-      const nested = payload.error;
-      const code = nested?.code ?? payload.code ?? `http_${response.status}`;
-      const message = nested?.message ?? payload.message ?? response.statusText;
-      const details = nested?.details ?? payload.details ?? payload;
+      const redactedPayload = this.redactUnknown(payload) as DaemonErrorPayload;
+      const nested = redactedPayload.error;
+      const code = nested?.code ?? redactedPayload.code ?? `http_${response.status}`;
+      const message = nested?.message ?? redactedPayload.message ?? response.statusText;
+      const details = nested?.details ?? redactedPayload.details ?? redactedPayload;
       return new SplendorClientError({
         status: response.status,
         code,
-        message,
+        message: this.redactText(message),
         details,
         requestId,
-        responseBody: payload
+        responseBody: redactedPayload
       });
     }
 
+    const redactedPayload = this.redactText(payload);
     return new SplendorClientError({
       status: response.status,
       code: `http_${response.status}`,
-      message: response.statusText || "Daemon request failed",
-      details: { body: payload },
+      message: this.redactText(response.statusText || "Daemon request failed"),
+      details: { body: redactedPayload },
       requestId,
-      responseBody: payload
+      responseBody: redactedPayload
     });
+  }
+
+  private redactText(value: string): string {
+    return value.split(this.token).join("[REDACTED]");
+  }
+
+  private redactOptionalText(value: string | null): string | undefined {
+    return value === null ? undefined : this.redactText(value);
+  }
+
+  private redactUnknown(value: unknown): unknown {
+    if (typeof value === "string") {
+      return this.redactText(value);
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => this.redactUnknown(item));
+    }
+    if (typeof value === "object" && value !== null) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, item]) => [key, this.redactUnknown(item)])
+      );
+    }
+    return value;
   }
 }

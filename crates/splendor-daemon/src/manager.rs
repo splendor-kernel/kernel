@@ -1,5 +1,7 @@
 //! Minimal central manager API for UC-E2E-S4 acceptance.
 
+use crate::caller_auth::CallerTokenSigner;
+use crate::{ActionOutcome, ApiErrorBody};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -24,9 +26,8 @@ use splendor_types::{
     WorkOrderKeyring, WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
@@ -44,6 +45,9 @@ struct ManagerInner {
     revoked_work_orders: Mutex<HashSet<String>>,
     placements: Mutex<HashMap<String, PlacementDecision>>,
     dispatches: Mutex<HashMap<String, DispatchReport>>,
+    terminal_dispatch_failures: Mutex<HashMap<String, ManagerApiError>>,
+    dispatches_in_flight: Mutex<HashSet<String>>,
+    resident_dispatch: ResidentDispatchClient,
     messages: Mutex<HashMap<String, MessageStatusReport>>,
     message_idempotency: Mutex<HashMap<String, String>>,
     trace_index: InMemoryCentralTraceIndex,
@@ -53,6 +57,73 @@ struct ManagerInner {
     approvals: Mutex<HashMap<String, GovernanceApprovalRecord>>,
     circuit_breakers: Mutex<HashMap<String, GovernanceCircuitBreakerRecord>>,
     kill_switches: Mutex<HashMap<String, KillSwitchReport>>,
+}
+
+#[derive(Clone)]
+struct ResidentDispatchClient {
+    http: reqwest::Client,
+    signer: CallerTokenSigner,
+    allow_loopback_http: bool,
+    create_timeout: StdDuration,
+    start_timeout: StdDuration,
+    maximum_response_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ResidentCreateRunResponse {
+    request_id: String,
+    idempotency_key: String,
+    #[serde(rename = "idempotency_receipt_id")]
+    _idempotency_receipt_id: String,
+    #[serde(rename = "duplicate")]
+    _duplicate: bool,
+    run_id: RunId,
+    #[serde(rename = "status")]
+    _status: crate::RunStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ResidentTickResponse {
+    run_id: RunId,
+    status: crate::RunStatus,
+    #[serde(rename = "tick_id")]
+    _tick_id: u64,
+    #[serde(rename = "state_node_id")]
+    _state_node_id: String,
+    #[serde(rename = "action_outcomes")]
+    _action_outcomes: Vec<ActionOutcome>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidentDispatchOptions {
+    pub allow_loopback_http: bool,
+    pub connect_timeout: StdDuration,
+    pub create_timeout: StdDuration,
+    pub start_timeout: StdDuration,
+    pub maximum_response_bytes: usize,
+    pub root_ca_pem: Option<Vec<u8>>,
+}
+
+impl ResidentDispatchOptions {
+    pub fn production() -> Self {
+        Self {
+            allow_loopback_http: false,
+            connect_timeout: StdDuration::from_secs(2),
+            create_timeout: StdDuration::from_secs(10),
+            start_timeout: StdDuration::from_secs(35),
+            maximum_response_bytes: 1024 * 1024,
+            root_ca_pem: None,
+        }
+    }
+
+    pub fn loopback_test() -> Self {
+        Self {
+            allow_loopback_http: true,
+            ..Self::production()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +141,21 @@ struct MessageIdempotencyScope {
 
 impl ManagerState {
     pub fn local_acceptance() -> Self {
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "resident-dispatch-client",
+            "manager-resident-local-acceptance",
+        )
+        .expect("local acceptance caller signer");
+        Self::local_acceptance_with_dispatch(signer, ResidentDispatchOptions::loopback_test())
+            .expect("local acceptance dispatch client")
+    }
+
+    pub fn local_acceptance_with_dispatch(
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+    ) -> Result<Self, String> {
         let fleet_id = std::env::var("SPLENDOR_FLEET_ID")
             .ok()
             .and_then(|raw| FleetId::parse(&raw).ok())
@@ -78,10 +164,57 @@ impl ManagerState {
         work_order_keyring
             .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
             .expect("local work-order keyring");
-        Self {
+        Self::acceptance_with_dispatch_config(
+            std::env::var("SPLENDOR_MANAGER_ID").unwrap_or_else(|_| "central-manager".to_string()),
+            fleet_id,
+            work_order_keyring,
+            signer,
+            options,
+        )
+    }
+
+    /// Builds the acceptance manager with explicit outbound resident trust.
+    ///
+    /// This makes manager-to-resident dispatch production-real, but does not
+    /// authenticate callers of the manager's own inbound acceptance API.
+    pub fn acceptance_with_dispatch_config(
+        manager_id: impl Into<String>,
+        fleet_id: FleetId,
+        work_order_keyring: WorkOrderKeyring,
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+    ) -> Result<Self, String> {
+        let manager_id = manager_id.into();
+        if manager_id.trim().is_empty()
+            || options.connect_timeout.is_zero()
+            || options.create_timeout.is_zero()
+            || options.start_timeout.is_zero()
+            || options.maximum_response_bytes == 0
+        {
+            return Err("resident dispatch configuration is invalid".to_string());
+        }
+        let mut client = reqwest::Client::builder()
+            .connect_timeout(options.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if let Some(root_ca_pem) = options.root_ca_pem.as_ref() {
+            let certificate = reqwest::Certificate::from_pem(root_ca_pem)
+                .map_err(|_| "resident root CA PEM is invalid".to_string())?;
+            client = client.add_root_certificate(certificate);
+        }
+        let resident_dispatch = ResidentDispatchClient {
+            http: client
+                .build()
+                .map_err(|_| "resident HTTP client could not be built".to_string())?,
+            signer,
+            allow_loopback_http: options.allow_loopback_http,
+            create_timeout: options.create_timeout,
+            start_timeout: options.start_timeout,
+            maximum_response_bytes: options.maximum_response_bytes,
+        };
+        Ok(Self {
             inner: Arc::new(ManagerInner {
-                manager_id: std::env::var("SPLENDOR_MANAGER_ID")
-                    .unwrap_or_else(|_| "central-manager".to_string()),
+                manager_id,
                 fleet_id: fleet_id.clone(),
                 registry: InMemoryNodeRegistry::new(),
                 work_order_keyring,
@@ -89,6 +222,9 @@ impl ManagerState {
                 revoked_work_orders: Mutex::new(HashSet::new()),
                 placements: Mutex::new(HashMap::new()),
                 dispatches: Mutex::new(HashMap::new()),
+                terminal_dispatch_failures: Mutex::new(HashMap::new()),
+                dispatches_in_flight: Mutex::new(HashSet::new()),
+                resident_dispatch,
                 messages: Mutex::new(HashMap::new()),
                 message_idempotency: Mutex::new(HashMap::new()),
                 trace_index: InMemoryCentralTraceIndex::default(),
@@ -99,7 +235,7 @@ impl ManagerState {
                 circuit_breakers: Mutex::new(HashMap::new()),
                 kill_switches: Mutex::new(HashMap::new()),
             }),
-        }
+        })
     }
 
     fn validate_security(
@@ -706,6 +842,33 @@ impl ManagerApiError {
             },
         }
     }
+    fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
+    fn bad_gateway(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
+    fn gateway_timeout(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
     fn internal(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1100,11 +1263,12 @@ async fn dispatch_work_order(
         .ok_or_else(|| {
             ManagerApiError::not_found("work_order_not_found", "work order not submitted")
         })?;
-    let run_id = work_order
-        .work_order
-        .run_id
-        .clone()
-        .unwrap_or_else(RunId::new);
+    let run_id = work_order.work_order.run_id.clone().ok_or_else(|| {
+        ManagerApiError::bad_request(
+            "resident_dispatch_run_id_required",
+            "resident dispatch requires a signed work order bound to a run id",
+        )
+    })?;
     let placement = state
         .inner
         .placements
@@ -1214,21 +1378,191 @@ async fn dispatch_work_order(
             )
         })?
         .to_string();
-    let resident_credential = resident_credential(
-        &request.security.credential,
-        &work_order_id,
+    if work_order.work_order.allowed_adapters.len() != 1 {
+        return Err(ManagerApiError::bad_request(
+            "resident_dispatch_profile_unsupported",
+            "work-order v1 resident dispatch requires exactly one allowed adapter",
+        ));
+    }
+    if let Some(existing) = state
+        .inner
+        .dispatches
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+    {
+        return Ok(Json(existing));
+    }
+    if let Some(existing) = state
+        .inner
+        .terminal_dispatch_failures
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+    {
+        return Err(existing);
+    }
+    let mut reservation = reserve_dispatch(&state, &work_order_id)?;
+    // A dispatch may have completed between the optimistic lookup above and
+    // reservation acquisition. Recheck while this caller owns the reservation
+    // so a delayed concurrent duplicate cannot start a second tick.
+    if let Some(existing) = state
+        .inner
+        .dispatches
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+    {
+        return Ok(Json(existing));
+    }
+    if let Some(existing) = state
+        .inner
+        .terminal_dispatch_failures
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+    {
+        return Err(existing);
+    }
+    let create_auth = resident_credential(
+        &state.inner.resident_dispatch,
         &instance.registration.instance_id,
         &work_order.work_order.tenant_id,
-    );
-    let resident_audit = resident_audit(&resident_credential);
-    let create =
-        resident_create_run_payload(&work_order, &run_id, resident_credential, resident_audit)?;
-    let create_response = post_json(&daemon_url, "/runs", &create)
-        .map_err(|e| ManagerApiError::internal("resident_http_error", e))?;
-    let start = serde_json::json!({"credential": create["credential"], "audit_attribution": create["audit_attribution"], "reason":"uc_e2e_s4_dispatch"});
-    let start_response = post_json(&daemon_url, &format!("/runs/{run_id}/start"), &start)
-        .map_err(|e| ManagerApiError::internal("resident_http_error", e))?;
-    let trace_event_id = state.audit("run.dispatched", serde_json::json!({"work_order_id": work_order_id, "node_id": selected_node_id, "instance_id": instance_id, "run_id": run_id}))?;
+    )?;
+    let create_audit = resident_audit(&create_auth.credential);
+    let create = resident_create_run_payload(
+        &work_order,
+        &run_id,
+        serde_json::to_value(&create_auth.credential).map_err(|_| {
+            ManagerApiError::internal(
+                "resident_caller_projection_unavailable",
+                "resident caller projection could not be serialized",
+            )
+        })?,
+        create_audit,
+    )?;
+    let create_response: ResidentHttpResponse<ResidentCreateRunResponse> = state
+        .inner
+        .resident_dispatch
+        .post_json(
+            &daemon_url,
+            "/runs",
+            &create_auth.encoded,
+            &create,
+            state.inner.resident_dispatch.create_timeout,
+            reqwest::StatusCode::OK,
+        )
+        .await
+        .map_err(|error| {
+            let _ = state.audit(
+                "dispatch.failed",
+                serde_json::json!({
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "phase": "create",
+                    "reason": resident_http_error_reason(&error),
+                    "effect_certainty": "not_started_or_idempotently_reconcilable",
+                }),
+            );
+            resident_http_error("create", error, false)
+        })?;
+    if create_response.value.run_id != run_id
+        || create_response.value.request_id != create["request_id"].as_str().unwrap_or_default()
+        || create_response.value.idempotency_key
+            != create["idempotency_key"].as_str().unwrap_or_default()
+    {
+        state.audit(
+            "dispatch.failed",
+            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "create", "reason": "resident_identity_mismatch"}),
+        )?;
+        return Err(ManagerApiError::bad_gateway(
+            "resident_create_identity_mismatch",
+            "resident create response did not match dispatched identities",
+        ));
+    }
+
+    let start_auth = state.inner.resident_dispatch.signed_caller(
+        &work_order.work_order.tenant_id,
+        &instance.registration.instance_id,
+        EndpointScope::RunsStart,
+    )?;
+    let start_audit = resident_audit(&start_auth.credential);
+    let start = serde_json::json!({
+        "credential": &start_auth.credential,
+        "audit_attribution": start_audit,
+        "reason":"manager_resident_dispatch"
+    });
+    let start_result: Result<ResidentHttpResponse<ResidentTickResponse>, ResidentHttpError> = state
+        .inner
+        .resident_dispatch
+        .post_json(
+            &daemon_url,
+            &format!("/runs/{run_id}/start"),
+            &start_auth.encoded,
+            &start,
+            state.inner.resident_dispatch.start_timeout,
+            reqwest::StatusCode::OK,
+        )
+        .await;
+    let start_response = match start_result {
+        Ok(response) => response,
+        Err(error) => {
+            let effect_unknown = matches!(&error, ResidentHttpError::Transport { timeout: true });
+            let _ = state.audit(
+                if effect_unknown {
+                    "dispatch.effect_unknown"
+                } else {
+                    "dispatch.partial_failure"
+                },
+                serde_json::json!({
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "phase": "start",
+                    "reason": resident_http_error_reason(&error),
+                    "effect_certainty": if effect_unknown { "unknown" } else { "not_confirmed" },
+                    "automatic_retry": false,
+                }),
+            );
+            let api_error = resident_http_error("start", error, effect_unknown);
+            return Err(persist_terminal_dispatch_failure(
+                &state,
+                &work_order_id,
+                api_error,
+                &mut reservation,
+            ));
+        }
+    };
+    if start_response.value.run_id != run_id {
+        let _ = state.audit(
+            "dispatch.partial_failure",
+            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "start", "reason": "resident_identity_mismatch"}),
+        );
+        let error = ManagerApiError::bad_gateway(
+            "resident_start_identity_mismatch",
+            "resident start response did not match dispatched run identity",
+        );
+        return Err(persist_terminal_dispatch_failure(
+            &state,
+            &work_order_id,
+            error,
+            &mut reservation,
+        ));
+    }
+    let trace_event_id = match state.audit("run.dispatched", serde_json::json!({"work_order_id": work_order_id, "node_id": selected_node_id, "instance_id": instance_id, "run_id": run_id})) {
+        Ok(trace_event_id) => trace_event_id,
+        Err(error) => {
+            return Err(persist_terminal_dispatch_failure(
+                &state,
+                &work_order_id,
+                error,
+                &mut reservation,
+            ))
+        }
+    };
     let report = DispatchReport {
         work_order_id: work_order_id.clone(),
         selected_node_id: selected_node_id.clone(),
@@ -1236,35 +1570,39 @@ async fn dispatch_work_order(
         run_id: run_id.clone(),
         create_run_status: create_response.status,
         start_run_status: start_response.status,
-        create_run_body: create_response.body,
-        start_run_body: start_response.body,
+        create_run_body: Some(create_response.body),
+        start_run_body: Some(start_response.body),
         trace_event_id,
         resident_daemon_url: daemon_url,
     };
-    state
-        .inner
-        .dispatches
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .insert(work_order_id, report.clone());
+    match state.inner.dispatches.lock() {
+        Ok(mut dispatches) => {
+            dispatches.insert(work_order_id.clone(), report.clone());
+        }
+        Err(_) => {
+            return Err(persist_terminal_dispatch_failure(
+                &state,
+                &work_order_id,
+                ManagerApiError::internal(
+                    "dispatch_lock",
+                    "completed resident dispatch could not be persisted",
+                ),
+                &mut reservation,
+            ))
+        }
+    }
     state
         .inner
         .telemetry
         .lock()
         .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
         .upsert_run(RunTelemetry {
-            tenant_id: create["tenant_id"]
-                .as_str()
-                .and_then(|raw| TenantId::parse(raw).ok())
-                .unwrap_or_default(),
-            agent_id: create["agent_id"]
-                .as_str()
-                .and_then(|raw| splendor_types::AgentId::parse(raw).ok())
-                .unwrap_or_default(),
+            tenant_id: work_order.work_order.tenant_id,
+            agent_id: work_order.work_order.agent_id,
             run_id,
             node_id: selected_node_id,
             instance_id,
-            status: RunStatus::Running,
+            status: telemetry_run_status(&start_response.value.status),
             updated_at: OffsetDateTime::now_utc(),
         });
     Ok(Json(report))
@@ -1279,94 +1617,26 @@ fn resident_create_run_payload(
     let allowed_actions = &work_order.work_order.allowed_actions;
     let allowed_adapters = &work_order.work_order.allowed_adapters;
     let allowed_permissions = &work_order.work_order.allowed_permissions;
-    let mut registered_actions = Vec::new();
-    let mut policy_actions = Vec::new();
-    let mut approval_policies = Vec::new();
-    for (action, adapter, permission, side_effect_class, params) in [
-        (
-            "data.read_fixture",
-            "fixture-data-store",
-            "data.read_fixture",
-            "ReadOnly",
-            serde_json::json!({"data_ref": work_order.work_order.data_refs.first().cloned().unwrap_or_else(|| "dataset:missing".to_string())}),
-        ),
-        (
-            "sql.read_fixture",
-            "fixture-sql",
-            "fixture.sql.read",
-            "ReadOnly",
-            serde_json::json!({"dataset":"fixture.eu_west"}),
-        ),
-        (
-            "artifact.create_internal",
-            "artifact-store",
-            "artifact.create_internal",
-            "External",
-            serde_json::json!({"artifact":"internal-proposal", "artifact_path": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
-        ),
-        (
-            "artifact.publish_external",
-            "artifact-store",
-            "artifact.publish_external",
-            "External",
-            serde_json::json!({"publish_ref": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
-        ),
-    ] {
-        let action_allowed = allowed_actions.iter().any(|item| item == action);
-        let adapter_allowed = allowed_adapters.iter().any(|item| item == adapter);
-        let permission_allowed = allowed_permissions.iter().any(|item| item == permission);
-        if action_allowed || permission_allowed {
-            if !(action_allowed && adapter_allowed && permission_allowed) {
-                return Err(ManagerApiError::forbidden(
-                    "work_order_authority_incomplete",
-                    format!(
-                        "work order must explicitly authorize action `{action}`, adapter `{adapter}`, and permission `{permission}`"
-                    ),
-                ));
-            }
-            registered_actions.push(serde_json::json!({"name": action, "adapter": adapter}));
-            policy_actions.push(serde_json::json!({
-                "action": {"name": action, "params": params, "side_effect_class": side_effect_class, "cost_estimate": null, "required_permissions": [permission], "preconditions": [], "postconditions": []},
-                "adapter": adapter,
-                "quota_usage": {"actions": 1, "action_duration_ms": 0, "filesystem_read_bytes": 0, "filesystem_write_bytes": 0, "network_read_bytes": 0, "network_write_bytes": 0, "http_requests": 0},
-                "satisfied_preconditions": []
-            }));
-            if action == "artifact.publish_external" {
-                approval_policies.push(serde_json::json!({
-                    "schema_version": "splendor.approval_policy.v1",
-                    "policy_id": format!("policy_{work_order_id}_artifact_publish_external", work_order_id = work_order.work_order.work_order_id),
-                    "tenant_id": work_order.work_order.tenant_id,
-                    "agent_id": work_order.work_order.agent_id,
-                    "action_name": "artifact.publish_external",
-                    "adapter": "artifact-store",
-                    "required_permission": "artifact.publish_external",
-                    "side_effect_class": "External",
-                    "risk_level": "high",
-                    "reason": "external artifact publication requires scoped approval",
-                    "expires_at": null
-                }));
-            }
+    let adapter = match allowed_adapters.as_slice() {
+        [adapter] if !adapter.trim().is_empty() => adapter,
+        _ => {
+            return Err(ManagerApiError::bad_request(
+                "resident_dispatch_profile_unsupported",
+                "work-order v1 resident dispatch requires exactly one allowed adapter",
+            ))
         }
-    }
-    if allowed_actions
+    };
+    let registered_actions = allowed_actions
         .iter()
-        .any(|item| item == "message.remote.proposal")
-    {
-        if !allowed_adapters.iter().any(|item| item == "remote-message")
-            || !allowed_permissions
-                .iter()
-                .any(|item| item.starts_with("message.remote.proposal"))
-        {
-            return Err(ManagerApiError::forbidden(
-                "work_order_authority_incomplete",
-                "remote proposal action requires remote-message adapter and route permission",
-            ));
-        }
-        registered_actions.push(
-            serde_json::json!({"name": "message.remote.proposal", "adapter": "remote-message"}),
-        );
-    }
-    let mut create = serde_json::json!({
+        .map(|action| {
+            serde_json::json!({
+                "name": action,
+                "adapter": adapter,
+                "required_permissions": allowed_permissions,
+            })
+        })
+        .collect::<Vec<_>>();
+    let create = serde_json::json!({
         "request_id": format!("req-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
         "idempotency_key": format!("idem-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
         "tenant_id": work_order.work_order.tenant_id,
@@ -1378,14 +1648,19 @@ fn resident_create_run_payload(
         "allowed_adapters": allowed_adapters,
         "allowed_permissions": allowed_permissions,
         "registered_actions": registered_actions,
-        "policy_actions": policy_actions,
-        "approval_policies": approval_policies,
+        "policy_actions": [],
+        "approval_policies": [],
         "allowed_percept_schemas": [],
         "allowed_percept_sources": [],
         "initial_state": {"dispatch":"uc-e2e-s4"},
         "snapshot_interval": 1
     });
-    create["work_order"]["run_id"] = serde_json::json!(run_id);
+    if work_order.work_order.run_id.as_ref() != Some(run_id) {
+        return Err(ManagerApiError::bad_request(
+            "resident_dispatch_run_id_required",
+            "resident dispatch requires a signed work order bound to the run id",
+        ));
+    }
     Ok(create)
 }
 
@@ -2952,26 +3227,33 @@ async fn activate_kill_switch(
     if let (Some(target), Some(run_id), Some(tenant_id)) =
         (&target, &request.run_id, &request.tenant_id)
     {
-        let credential = kill_switch_credential(
-            &request.security.credential,
-            &request.kill_switch_id,
-            &target.instance_id,
+        let caller = state.inner.resident_dispatch.signed_caller(
             tenant_id,
-        );
+            &target.instance_id,
+            EndpointScope::RunsStop,
+        )?;
+        let audit = resident_audit(&caller.credential);
         let payload = serde_json::json!({
-            "credential": credential,
-            "audit_attribution": resident_audit(&credential),
+            "credential": caller.credential,
+            "audit_attribution": audit,
             "reason": request.reason,
         });
         cancel_payload_schema = Some("splendor.daemon.lifecycle_request.v1".to_string());
-        let response = post_json(
-            &target.daemon_url,
-            &format!("/runs/{run_id}/cancel"),
-            &payload,
-        )
-        .map_err(|e| ManagerApiError::internal("kill_switch_http_error", e))?;
+        let response: ResidentHttpResponse<crate::RunInspectResponse> = state
+            .inner
+            .resident_dispatch
+            .post_json(
+                &target.daemon_url,
+                &format!("/runs/{run_id}/cancel"),
+                &caller.encoded,
+                &payload,
+                state.inner.resident_dispatch.create_timeout,
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .map_err(|error| resident_http_error("cancel", error, false))?;
         cancel_status = Some(response.status);
-        acknowledged = (200..300).contains(&response.status);
+        acknowledged = response.value.run_id == *run_id;
     }
     let fail_closed = request.propagation_ack_required && !acknowledged;
     let trace_event_id = state.audit(
@@ -3244,92 +3526,322 @@ fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>,
 }
 
 #[derive(Debug)]
-struct HttpResponse {
+struct ResidentHttpResponse<T> {
     status: u16,
-    body: Option<String>,
+    body: String,
+    value: T,
 }
 
-fn post_json(base_url: &str, path: &str, body: &serde_json::Value) -> Result<HttpResponse, String> {
-    let base = base_url
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// URLs are supported in local acceptance".to_string())?;
-    let (host_port, prefix) = base.split_once('/').unwrap_or((base, ""));
-    let full_path = if prefix.is_empty() {
-        path.to_string()
+struct DispatchReservation {
+    inner: Arc<ManagerInner>,
+    work_order_id: String,
+    release_on_drop: bool,
+}
+
+impl DispatchReservation {
+    fn retain_fail_closed(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        if let Ok(mut in_flight) = self.inner.dispatches_in_flight.lock() {
+            in_flight.remove(&self.work_order_id);
+        }
+    }
+}
+
+fn reserve_dispatch(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<DispatchReservation, ManagerApiError> {
+    let mut in_flight = state
+        .inner
+        .dispatches_in_flight
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?;
+    if !in_flight.insert(work_order_id.to_string()) {
+        return Err(ManagerApiError::conflict(
+            "dispatch_in_progress",
+            "a resident dispatch is already in progress for this work order",
+        ));
+    }
+    Ok(DispatchReservation {
+        inner: Arc::clone(&state.inner),
+        work_order_id: work_order_id.to_string(),
+        release_on_drop: true,
+    })
+}
+
+fn persist_terminal_dispatch_failure(
+    state: &ManagerState,
+    work_order_id: &str,
+    error: ManagerApiError,
+    reservation: &mut DispatchReservation,
+) -> ManagerApiError {
+    match state.inner.terminal_dispatch_failures.lock() {
+        Ok(mut failures) => {
+            failures.insert(work_order_id.to_string(), error.clone());
+            error
+        }
+        Err(_) => {
+            reservation.retain_fail_closed();
+            ManagerApiError::internal(
+                "dispatch_terminal_state_unavailable",
+                "resident dispatch result could not be persisted; dispatch remains quarantined",
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResidentHttpError {
+    InvalidUrl,
+    Transport {
+        timeout: bool,
+    },
+    ResponseTooLarge,
+    UnexpectedStatus {
+        status: u16,
+        upstream_code: Option<String>,
+    },
+    InvalidResponse,
+}
+
+impl ResidentDispatchClient {
+    async fn post_json<T: for<'de> Deserialize<'de> + Serialize>(
+        &self,
+        base_url: &str,
+        path: &str,
+        token: &str,
+        body: &serde_json::Value,
+        timeout: StdDuration,
+        expected_status: reqwest::StatusCode,
+    ) -> Result<ResidentHttpResponse<T>, ResidentHttpError> {
+        let mut url = reqwest::Url::parse(base_url).map_err(|_| ResidentHttpError::InvalidUrl)?;
+        validate_resident_url(&url, self.allow_loopback_http)?;
+        let base_path = url.path().trim_end_matches('/');
+        url.set_path(&format!("{base_path}{path}"));
+        url.set_query(None);
+        url.set_fragment(None);
+        tokio::time::timeout(timeout, async {
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .header("x-splendor-api-version", "0.1")
+                .header("x-splendor-client", "splendor-manager")
+                .json(body)
+                .send()
+                .await
+                .map_err(|error| ResidentHttpError::Transport {
+                    timeout: error.is_timeout(),
+                })?;
+            let status = response.status();
+            let bytes = read_bounded_response(response, self.maximum_response_bytes).await?;
+            if status != expected_status {
+                let upstream_code = serde_json::from_slice::<ApiErrorBody>(&bytes)
+                    .ok()
+                    .and_then(|error| bounded_upstream_code(error.code));
+                return Err(ResidentHttpError::UnexpectedStatus {
+                    status: status.as_u16(),
+                    upstream_code,
+                });
+            }
+            let value =
+                serde_json::from_slice(&bytes).map_err(|_| ResidentHttpError::InvalidResponse)?;
+            let body =
+                serde_json::to_string(&value).map_err(|_| ResidentHttpError::InvalidResponse)?;
+            Ok(ResidentHttpResponse {
+                status: status.as_u16(),
+                body,
+                value,
+            })
+        })
+        .await
+        .map_err(|_| ResidentHttpError::Transport { timeout: true })?
+    }
+
+    fn signed_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+        scope: EndpointScope,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signer
+            .sign(
+                tenant_id,
+                instance_id,
+                vec![scope],
+                OffsetDateTime::now_utc(),
+                Duration::seconds(60),
+            )
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "resident_caller_token_unavailable",
+                    "resident caller token could not be issued",
+                )
+            })
+    }
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    maximum_response_bytes: usize,
+) -> Result<Vec<u8>, ResidentHttpError> {
+    if maximum_response_bytes == 0
+        || response
+            .content_length()
+            .is_some_and(|length| length > maximum_response_bytes as u64)
+    {
+        return Err(ResidentHttpError::ResponseTooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| ResidentHttpError::Transport {
+                timeout: error.is_timeout(),
+            })?
+    {
+        if body.len().saturating_add(chunk.len()) > maximum_response_bytes {
+            return Err(ResidentHttpError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn validate_resident_url(
+    url: &reqwest::Url,
+    allow_loopback_http: bool,
+) -> Result<(), ResidentHttpError> {
+    if !url.username().is_empty() || url.password().is_some() || url.host_str().is_none() {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() != "http" || !allow_loopback_http {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    let is_loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if !is_loopback {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    Ok(())
+}
+
+fn bounded_upstream_code(code: String) -> Option<String> {
+    if !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Some(code)
     } else {
-        format!("/{prefix}{path}")
-    };
-    let payload = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-    let mut stream = TcpStream::connect(host_port).map_err(|e| e.to_string())?;
-    write!(stream, "POST {full_path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).map_err(|e| e.to_string())?;
-    stream.write_all(&payload).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    let status = response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|raw| raw.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .filter(|body| !body.trim().is_empty())
-        .map(ToString::to_string);
-    Ok(HttpResponse { status, body })
+        None
+    }
+}
+
+fn resident_http_error_reason(error: &ResidentHttpError) -> &'static str {
+    match error {
+        ResidentHttpError::InvalidUrl => "invalid_resident_url",
+        ResidentHttpError::Transport { timeout: true } => "resident_timeout",
+        ResidentHttpError::Transport { timeout: false } => "resident_transport_failure",
+        ResidentHttpError::ResponseTooLarge => "resident_response_too_large",
+        ResidentHttpError::UnexpectedStatus { .. } => "resident_rejected_request",
+        ResidentHttpError::InvalidResponse => "resident_invalid_response",
+    }
+}
+
+fn resident_http_error(
+    phase: &str,
+    error: ResidentHttpError,
+    effect_unknown: bool,
+) -> ManagerApiError {
+    if effect_unknown {
+        return ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start timed out; effect certainty is unknown and automatic retry is forbidden",
+        );
+    }
+    match error {
+        ResidentHttpError::InvalidUrl => ManagerApiError::bad_request(
+            "invalid_resident_daemon_url",
+            "resident daemon URL must use HTTPS, except explicit loopback tests",
+        ),
+        ResidentHttpError::Transport { timeout: true } => ManagerApiError::gateway_timeout(
+            format!("resident_{phase}_timeout"),
+            format!("resident {phase} request timed out"),
+        ),
+        ResidentHttpError::Transport { timeout: false } => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_transport_error"),
+            format!("resident {phase} request failed before a valid response"),
+        ),
+        ResidentHttpError::ResponseTooLarge => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_response_too_large"),
+            format!("resident {phase} response exceeded the configured limit"),
+        ),
+        ResidentHttpError::UnexpectedStatus {
+            status,
+            upstream_code,
+        } => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_rejected"),
+            format!(
+                "resident {phase} rejected the request with status {status} and code {}",
+                upstream_code.as_deref().unwrap_or("unknown")
+            ),
+        ),
+        ResidentHttpError::InvalidResponse => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_invalid_response"),
+            format!("resident {phase} returned an invalid success response"),
+        ),
+    }
+}
+
+fn telemetry_run_status(status: &crate::RunStatus) -> RunStatus {
+    match status {
+        crate::RunStatus::Pending => RunStatus::Pending,
+        crate::RunStatus::Running => RunStatus::Running,
+        crate::RunStatus::Paused => RunStatus::Paused,
+        crate::RunStatus::WaitingForApproval => RunStatus::WaitingForApproval,
+        crate::RunStatus::Interrupted => RunStatus::Interrupted,
+        crate::RunStatus::Resuming => RunStatus::Resuming,
+        crate::RunStatus::Completed => RunStatus::Completed,
+        crate::RunStatus::Failed => RunStatus::Failed,
+        crate::RunStatus::Cancelled => RunStatus::Cancelled,
+        crate::RunStatus::Denied => RunStatus::Denied,
+        crate::RunStatus::Expired => RunStatus::Expired,
+    }
 }
 
 fn resident_credential(
-    manager_credential: &CallerCredential,
-    work_order_id: &str,
+    signer: &ResidentDispatchClient,
     instance_id: &InstanceId,
     tenant_id: &TenantId,
-) -> serde_json::Value {
-    let mut credential = manager_credential.clone();
-    credential.credential_id = format!("resident-dispatch-{work_order_id}");
-    credential.audience = CredentialAudience::Instance {
-        instance_id: instance_id.clone(),
-    };
-    credential.binding = CredentialBinding::Tenant {
-        tenant_id: tenant_id.clone(),
-    };
-    credential.scopes = vec![
-        EndpointScope::RunsCreate,
-        EndpointScope::RunsStart,
-        EndpointScope::RunsRead,
-        EndpointScope::StateRead,
-        EndpointScope::TracesRead,
-        EndpointScope::ReplayCreate,
-    ];
-    serde_json::to_value(credential).expect("credential serializes")
+) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+    signer.signed_caller(tenant_id, instance_id, EndpointScope::RunsCreate)
 }
 
-fn kill_switch_credential(
-    manager_credential: &CallerCredential,
-    kill_switch_id: &str,
-    instance_id: &InstanceId,
-    tenant_id: &TenantId,
-) -> serde_json::Value {
-    let mut credential = manager_credential.clone();
-    credential.credential_id = format!("kill-switch-{kill_switch_id}");
-    credential.audience = CredentialAudience::Instance {
-        instance_id: instance_id.clone(),
-    };
-    credential.binding = CredentialBinding::Tenant {
-        tenant_id: tenant_id.clone(),
-    };
-    credential.scopes = vec![EndpointScope::RunsStop];
-    serde_json::to_value(credential).expect("credential serializes")
-}
-
-fn resident_audit(credential: &serde_json::Value) -> serde_json::Value {
+fn resident_audit(credential: &CallerCredential) -> serde_json::Value {
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current timestamp formats as RFC3339");
     serde_json::json!({
-        "principal": credential.get("principal").cloned().unwrap_or(serde_json::Value::Null),
-        "credential_id": credential.get("credential_id").and_then(serde_json::Value::as_str),
+        "principal": &credential.principal,
+        "credential_id": &credential.credential_id,
         "requested_at": requested_at,
     })
 }
@@ -3344,6 +3856,7 @@ mod tests {
         AgentId, ClientPrincipal, FleetId, TelemetryAuthority, WorkOrder, WorkOrderId,
         WorkOrderPlacement, WorkOrderQuotaPolicy,
     };
+    use std::io::{Read, Write};
     use tower::ServiceExt;
 
     fn credential(fleet_id: FleetId, scopes: Vec<EndpointScope>) -> CallerCredential {
@@ -3381,6 +3894,40 @@ mod tests {
             RunId::parse("44444444-4444-4444-8444-444444444444").expect("run"),
             OffsetDateTime::now_utc() + Duration::minutes(10),
         )
+    }
+
+    fn dispatch_test_work_order() -> WorkOrderEnvelope {
+        let now = OffsetDateTime::now_utc();
+        WorkOrderEnvelope::signed_with_shared_secret(
+            WorkOrder {
+                schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+                work_order_id: WorkOrderId::try_new("wo_test_dispatch").expect("work order id"),
+                tenant_id: TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant"),
+                agent_id: AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent"),
+                run_id: Some(RunId::parse("44444444-4444-4444-8444-444444444445").expect("run")),
+                objective: "admit a resident run without synthesizing policy actions".to_string(),
+                allowed_actions: vec!["daemon.record".to_string()],
+                allowed_adapters: vec!["daemon.recording".to_string()],
+                allowed_permissions: vec!["fixture.execute".to_string()],
+                data_refs: Vec::new(),
+                quotas: WorkOrderQuotaPolicy::default(),
+                placement: WorkOrderPlacement {
+                    target: "customer_vpc".to_string(),
+                    data_locality: Some("eu-west".to_string()),
+                    requires_gpu: Some(false),
+                    dedicated_instance: Some(false),
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+                issued_at: now - Duration::minutes(1),
+                expires_at: now + Duration::minutes(10),
+                revocation: RevocationStatus::Active,
+            },
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("signed dispatch work order")
     }
 
     fn test_work_order_with(
@@ -3613,21 +4160,45 @@ mod tests {
         assert!(after.payload_preserved);
     }
 
-    fn spawn_resident_mock() -> String {
+    fn spawn_fixed_status_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind resident mock");
         let addr = listener.local_addr().expect("resident mock addr");
         std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..1 {
                 let (mut stream, _) = listener.accept().expect("accept resident request");
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_millis(200)))
                     .expect("set resident read timeout");
                 let mut request = Vec::new();
                 let _ = stream.read_to_end(&mut request);
-                let body = r#"{"accepted":true}"#;
+                let request_text = String::from_utf8_lossy(&request);
+                let run_id = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|path| path.strip_prefix("/runs/"))
+                    .and_then(|path| path.strip_suffix("/cancel"))
+                    .unwrap_or("00000000-0000-4000-8000-000000000001");
+                let observed_at = OffsetDateTime::from_unix_timestamp(1_783_900_800)
+                    .expect("fixed resident timestamp");
+                let body = serde_json::to_string(&crate::RunInspectResponse {
+                    run_id: RunId::parse(run_id).expect("cancel request run id"),
+                    tenant_id: TenantId::parse("11111111-1111-4111-8111-111111111111")
+                        .expect("fixed tenant"),
+                    agent_id: AgentId::parse("22222222-2222-4222-8222-222222222222")
+                        .expect("fixed agent"),
+                    status: crate::RunStatus::Cancelled,
+                    state_head: None,
+                    ticks: 0,
+                    adapter_executions: 0,
+                    policy_bundle: None,
+                    created_at: observed_at,
+                    updated_at: observed_at,
+                })
+                .expect("fixed resident response serializes");
                 write!(
                     stream,
-                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -4424,7 +4995,7 @@ mod tests {
 
         let target_node_id = "00000000-0000-4000-8000-000000000905";
         let target_instance_id = "00000000-0000-4000-8000-000000000906";
-        let resident_url = spawn_resident_mock();
+        let resident_url = spawn_fixed_status_server();
         let registered_node = register_node(
             State(state.clone()),
             Json(RegisterNodeRequest {
@@ -4471,7 +5042,7 @@ mod tests {
         assert_eq!(propagated_kill.status, "activated");
         assert!(propagated_kill.propagation_acknowledged);
         assert!(!propagated_kill.fail_closed);
-        assert_eq!(propagated_kill.cancel_status, Some(201));
+        assert_eq!(propagated_kill.cancel_status, Some(200));
         assert_eq!(
             propagated_kill.target_daemon_url.as_deref(),
             Some(resident_url.as_str())
@@ -4648,73 +5219,11 @@ mod tests {
         .await
         .expect_err("missing governance scope rejected");
         assert_eq!(missing_scope.body.code, "missing_scope");
-
-        let bad_url = post_json(
-            "https://example.invalid",
-            "/runs/x/cancel",
-            &serde_json::json!({}),
-        )
-        .expect_err("non-local test post_json rejects unsupported URL schemes");
-        assert!(bad_url.contains("only http://"));
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind post_json mock");
-        let addr = listener.local_addr().expect("mock addr");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept post_json request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .expect("set post_json read timeout");
-            let mut request = Vec::new();
-            let _ = stream.read_to_end(&mut request);
-            let body = r#"{"cancelled":true}"#;
-            write!(
-                stream,
-                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write post_json response");
-        });
-        let response = post_json(
-            &format!("http://{addr}"),
-            "/runs/unit/cancel",
-            &serde_json::json!({"reason":"unit"}),
-        )
-        .expect("post_json success");
-        assert_eq!(response.status, 202);
-        assert!(response.body.expect("response body").contains("cancelled"));
-        handle.join().expect("post_json mock joined");
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind prefixed mock");
-        let addr = listener.local_addr().expect("prefixed mock addr");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept prefixed request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .expect("set prefixed read timeout");
-            let mut request = Vec::new();
-            let _ = stream.read_to_end(&mut request);
-            write!(
-                stream,
-                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .expect("write prefixed response");
-        });
-        let response = post_json(
-            &format!("http://{addr}/daemon"),
-            "/runs/unit/cancel",
-            &serde_json::json!({"reason":"unit"}),
-        )
-        .expect("post_json prefixed success");
-        assert_eq!(response.status, 204);
-        assert!(response.body.is_none());
-        handle.join().expect("prefixed mock joined");
     }
 
     #[test]
     fn resident_dispatch_payload_is_derived_from_signed_work_order_authority() {
-        let target_agent = "33333333-3333-4333-8333-333333333333";
-        let work_order = test_work_order(target_agent);
+        let work_order = dispatch_test_work_order();
         let run_id = work_order.work_order.run_id.clone().expect("run id");
         let credential = serde_json::json!({"credential_id":"resident-test"});
         let audit = serde_json::json!({"credential_id":"resident-test"});
@@ -4757,39 +5266,34 @@ mod tests {
         assert_eq!(repeated["request_id"], payload["request_id"]);
         assert_eq!(repeated["idempotency_key"], payload["idempotency_key"]);
         let distinct_run = RunId::new();
-        let distinct = resident_create_run_payload(
+        let error = resident_create_run_payload(
             &work_order,
             &distinct_run,
             serde_json::json!({"credential_id":"resident-test"}),
             serde_json::json!({"credential_id":"resident-test"}),
         )
-        .expect("distinct run payload derives from distinct run id");
-        assert_ne!(distinct["request_id"], payload["request_id"]);
-        assert_ne!(distinct["idempotency_key"], payload["idempotency_key"]);
-        assert!(payload["registered_actions"]
+        .expect_err("unsigned run substitution is rejected");
+        assert_eq!(error.body.code, "resident_dispatch_run_id_required");
+        let profile = payload["registered_actions"]
             .as_array()
             .expect("registered actions")
-            .iter()
-            .any(|entry| entry["name"] == "message.remote.proposal"));
+            .first()
+            .expect("profile");
+        assert_eq!(profile["name"], "daemon.record");
+        assert_eq!(profile["adapter"], "daemon.recording");
+        assert_eq!(
+            profile["required_permissions"],
+            serde_json::json!(["fixture.execute"])
+        );
         assert!(payload["policy_actions"]
             .as_array()
             .expect("policy actions")
-            .iter()
-            .all(|entry| work_order.work_order.allowed_actions.contains(
-                &entry["action"]["name"]
-                    .as_str()
-                    .expect("action name")
-                    .to_string()
-            )));
+            .is_empty());
     }
 
     #[test]
-    fn resident_dispatch_payload_rejects_incomplete_internal_authority() {
-        let mut work_order = test_work_order("33333333-3333-4333-8333-333333333333");
-        work_order
-            .work_order
-            .allowed_permissions
-            .retain(|permission| permission != "artifact.create_internal");
+    fn resident_dispatch_payload_rejects_ambiguous_work_order_v1_profiles() {
+        let work_order = test_work_order("33333333-3333-4333-8333-333333333333");
         let run_id = work_order.work_order.run_id.clone().expect("run id");
         let error = resident_create_run_payload(
             &work_order,
@@ -4797,23 +5301,19 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({}),
         )
-        .expect_err("incomplete authority rejected");
-        assert_eq!(error.body.code, "work_order_authority_incomplete");
+        .expect_err("multi-adapter work-order v1 profile rejected");
+        assert_eq!(error.body.code, "resident_dispatch_profile_unsupported");
 
-        let mut remote_incomplete = test_work_order("33333333-3333-4333-8333-333333333333");
-        remote_incomplete
-            .work_order
-            .allowed_adapters
-            .retain(|adapter| adapter != "remote-message");
-        let run_id = remote_incomplete.work_order.run_id.clone().expect("run id");
+        let mut missing_run = dispatch_test_work_order();
+        let run_id = missing_run.work_order.run_id.take().expect("run id");
         let error = resident_create_run_payload(
-            &remote_incomplete,
+            &missing_run,
             &run_id,
             serde_json::json!({}),
             serde_json::json!({}),
         )
-        .expect_err("incomplete remote authority rejected");
-        assert_eq!(error.body.code, "work_order_authority_incomplete");
+        .expect_err("run binding required");
+        assert_eq!(error.body.code, "resident_dispatch_run_id_required");
     }
 
     #[test]
@@ -5410,7 +5910,7 @@ mod tests {
         ];
         let security = manager_security(&state, all_scopes);
         let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
-        let resident_url = spawn_resident_mock();
+        let resident_url = spawn_fixed_status_server();
         let vpc_node = node(
             &state.inner.fleet_id,
             "00000000-0000-4000-8000-000000000204",
@@ -5545,7 +6045,7 @@ mod tests {
         )
         .await
         .expect("placement evaluated");
-        let dispatch = dispatch_work_order(
+        let dispatch_error = dispatch_work_order(
             Path("wo_test_remote".to_string()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
@@ -5554,9 +6054,11 @@ mod tests {
             }),
         )
         .await
-        .expect("dispatch accepted");
-        assert_eq!(dispatch.0.create_run_status, 201);
-        assert_eq!(dispatch.0.start_run_status, 201);
+        .expect_err("multi-adapter work-order v1 dispatch is rejected before network I/O");
+        assert_eq!(
+            dispatch_error.body.code,
+            "resident_dispatch_profile_unsupported"
+        );
 
         let credential = security.credential.clone();
         let run_id = work_order.work_order.run_id.clone().expect("run id");
@@ -6202,9 +6704,6 @@ mod tests {
         .await
         .expect_err("missing message rejected");
         assert_eq!(missing_message.body.code, "message_not_found");
-
-        assert!(post_json("https://example.test", "/runs", &serde_json::json!({})).is_err());
-        assert!(post_json("http://127.0.0.1:1", "/runs", &serde_json::json!({})).is_err());
     }
 
     #[tokio::test]
@@ -6678,7 +7177,15 @@ mod tests {
         .expect_err("tampered dispatch work order rejected");
         assert_eq!(bad_signature.body.code, "bad_signature");
 
-        let refreshed = test_work_order("33333333-3333-4333-8333-333333333333");
+        let mut refreshed_work_order =
+            test_work_order("33333333-3333-4333-8333-333333333333").work_order;
+        refreshed_work_order.allowed_adapters = vec!["fixture-sql".to_string()];
+        let refreshed = WorkOrderEnvelope::signed_with_shared_secret(
+            refreshed_work_order,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("refreshed work order signed");
         state
             .inner
             .work_orders
@@ -6695,6 +7202,180 @@ mod tests {
         )
         .await
         .expect_err("unavailable resident daemon rejected");
-        assert_eq!(resident_http.body.code, "resident_http_error");
+        assert_eq!(resident_http.body.code, "resident_create_transport_error");
+    }
+
+    #[tokio::test]
+    async fn resident_transport_disables_redirects_and_bounds_response_bodies() {
+        assert_eq!(
+            bounded_upstream_code("resident_scope_denied".to_string()).as_deref(),
+            Some("resident_scope_denied")
+        );
+        assert!(bounded_upstream_code("x".repeat(129)).is_none());
+        assert!(bounded_upstream_code("unsafe code\n".to_string()).is_none());
+        let app = Router::new()
+            .route(
+                "/redirect",
+                post(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "http://127.0.0.1:1/never")],
+                        Json(serde_json::json!({"redirect": true})),
+                    )
+                }),
+            )
+            .route(
+                "/large",
+                post(|| async { (StatusCode::OK, "x".repeat(1024)) }),
+            )
+            .route(
+                "/malformed",
+                post(|| async { (StatusCode::OK, "not-json") }),
+            )
+            .route(
+                "/extra",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "request_id": "request",
+                        "idempotency_key": "idempotency",
+                        "idempotency_receipt_id": "receipt",
+                        "duplicate": false,
+                        "run_id": "44444444-4444-4444-8444-444444444444",
+                        "status": "pending",
+                        "reflected_authorization": "must-not-be-retained"
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("transport listener");
+        let address = listener.local_addr().expect("transport address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("transport server remains available");
+        });
+
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:transport-test",
+            "transport-manager",
+            "transport-client",
+            "transport-key",
+        )
+        .expect("transport signer");
+        let state = ManagerState::local_acceptance_with_dispatch(
+            signer,
+            ResidentDispatchOptions {
+                maximum_response_bytes: 512,
+                ..ResidentDispatchOptions::loopback_test()
+            },
+        )
+        .expect("transport manager");
+        let tenant_id = TenantId::new();
+        let instance_id = InstanceId::new();
+        let caller = state
+            .inner
+            .resident_dispatch
+            .signed_caller(&tenant_id, &instance_id, EndpointScope::RunsCreate)
+            .expect("transport caller");
+        let base_url = format!("http://{address}");
+        let redirected = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/redirect",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("redirect is returned, never followed");
+        assert!(matches!(
+            redirected,
+            ResidentHttpError::UnexpectedStatus { status: 307, .. }
+        ));
+
+        let oversized = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/large",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("large response rejected before decoding");
+        assert!(matches!(oversized, ResidentHttpError::ResponseTooLarge));
+        let malformed = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/malformed",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("malformed success is never accepted");
+        assert!(matches!(malformed, ResidentHttpError::InvalidResponse));
+        let unknown_field = state
+            .inner
+            .resident_dispatch
+            .post_json::<ResidentCreateRunResponse>(
+                &base_url,
+                "/extra",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("unknown success fields are never accepted or retained");
+        assert!(matches!(unknown_field, ResidentHttpError::InvalidResponse));
+        assert!(matches!(
+            validate_resident_url(
+                &reqwest::Url::parse("http://192.0.2.1:8077").expect("url"),
+                true,
+            ),
+            Err(ResidentHttpError::InvalidUrl)
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn terminal_dispatch_storage_failure_quarantines_duplicate_execution() {
+        let state = ManagerState::local_acceptance();
+        let poison_state = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_state
+                .inner
+                .terminal_dispatch_failures
+                .lock()
+                .expect("terminal failure lock");
+            panic!("poison terminal dispatch storage for fail-closed test");
+        })
+        .join();
+
+        let mut reservation = reserve_dispatch(&state, "wo_quarantined").expect("reservation");
+        let error = persist_terminal_dispatch_failure(
+            &state,
+            "wo_quarantined",
+            ManagerApiError::bad_gateway("resident_start_rejected", "start rejected"),
+            &mut reservation,
+        );
+        assert_eq!(error.body.code, "dispatch_terminal_state_unavailable");
+        drop(reservation);
+        let duplicate = match reserve_dispatch(&state, "wo_quarantined") {
+            Err(error) => error,
+            Ok(_) => panic!("quarantined dispatch must remain in flight"),
+        };
+        assert_eq!(duplicate.body.code, "dispatch_in_progress");
     }
 }

@@ -4,8 +4,9 @@ The runtime daemon API is the local control boundary for Splendor runs. In the
 0.1 compatibility line, the stable endpoint names and request/response shapes are
 documented here. The OpenAPI document remains versioned to the current runtime
 daemon API metadata and carries a separate 0.1 compatibility note.
-The implementation remains local/foundation-oriented; it is not a fleet manager
-or production auth provider.
+The implementation remains foundation-oriented and is not a fleet manager or
+generic auth provider. Accepted RFC 0011 adds one production-real resident caller
+profile; explicit local development remains a separate loopback-only mode.
 
 Historically this surface was introduced in 0.02-S5. 0.1 stabilizes the public
 daemon boundary without promising private handler internals.
@@ -145,10 +146,20 @@ the daemon security contract from
 identity, endpoint scope, tenant binding, audience binding, expiry, revocation,
 and mutating-call audit attribution.
 
-Resident startup is explicit: `SPLENDOR_DAEMON_MODE=resident` also requires
-`SPLENDOR_INSTANCE_ID` to contain a valid non-nil UUID. Missing, blank, malformed,
-or nil instance identity aborts startup instead of generating a random identity.
-Local-development startup does not require this variable.
+Resident startup is explicit. `SPLENDOR_DAEMON_MODE=resident` requires a valid
+non-nil `SPLENDOR_INSTANCE_ID`, `SPLENDOR_CALLER_TRUST_FILE`, owner-only
+`SPLENDOR_WORK_ORDER_KEYRING_FILE` and `SPLENDOR_POLICY_KEYRING_FILE`, plus
+`SPLENDOR_TLS_CERT_FILE` and owner-only `SPLENDOR_TLS_KEY_FILE`. It serves TLS and
+does not inherit local-development caller, work-order, or policy trust. Missing,
+empty, malformed, stale, or unsafe inputs abort/fail closed. `local_dev` is
+explicit, warning-logged, and loopback-only; unknown mode values fail startup.
+
+Resident requests use `Authorization: Bearer` with the accepted closed Ed25519
+profile from [RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md). The
+body/header `CallerCredential` and `AuditAttribution` objects are compatibility
+mirrors only. They must exactly match the verified projection and cannot supply
+proof. `401` responses include the bounded `WWW-Authenticate` Bearer challenge;
+scope, tenant, and mirror mismatches return `403`.
 
 Run creation and run resume require signed, unexpired, unrevoked, scoped work
 orders. The daemon checks work-order tenant, run scope where applicable, and
@@ -429,6 +440,8 @@ Required 0.02-S5 failures include:
 
 | Condition | HTTP | Code |
 | --- | --- | --- |
+| Missing/invalid resident bearer, key/JTI revocation, stale trust, or clock rollback | `401` | bounded caller-auth reason code plus `WWW-Authenticate` |
+| Verified bearer has wrong endpoint scope/tenant or mismatched metadata mirror | `403` | daemon security or mirror mismatch code |
 | Invalid run | `404` | `invalid_run` |
 | Malformed percept body | `400` | `malformed_percept` |
 | Invalid policy bundle | `400` or `403` | policy validation reason code |
@@ -453,6 +466,8 @@ Stable client handling rules:
 - parse `code` as the programmatic daemon error discriminator;
 - treat `message` as human-readable diagnostics, not an authorization fact;
 - treat `details` as structured diagnostics whose exact keys may vary by code;
+- never include bearer bytes in logs or client errors; `@splendor/client` redacts
+  the exact configured token even if a transport or hostile response reflects it;
 - handle HTTP `503 runtime_unavailable` as fail-closed runtime unavailability;
 - handle gateway `Denied`, `NeedsApproval`, and `NeedsIntervention` as action
   outcomes where adapter execution did not occur;
@@ -471,8 +486,9 @@ Conformance failures use the report shape documented in
 
 This reference is part of the 0.1 stable compatibility surface for documented
 daemon endpoints and error shapes. It does not stabilize private Rust internals,
-production authentication infrastructure, native Node bindings, browser runtime
-behavior, fleet scheduling, or undocumented API fields.
+generic production authentication infrastructure, native Node bindings, browser
+runtime behavior, fleet scheduling, or undocumented API fields. The closed
+resident caller profile and mirror migration are governed by accepted RFC 0011.
 
 The additive exact raw-receipt, registered-action permission profile, optional
 gateway `tick_id`, and replay-authority-summary fields are the bounded v2 C02
@@ -484,11 +500,11 @@ C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
 with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
 watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, physical helper-plan
 adoption, or gold completion is claimed here. The current local run-effect path
-and resident-mode metadata/scope/trace-identity composition are complete as
-non-gold component evidence. C02 does not cryptographically authenticate
-resident caller credentials;
-production caller authentication and principal proof binding remain deferred to
-C01. C02 gold targets remain explicitly `not_exercised`.
+and resident-mode cryptographic caller, TLS, scope/trace-identity, and
+manager-dispatch composition are bounded non-gold component evidence under
+accepted RFC 0011. This is an `IDR-002a` compatibility profile, not full
+C01/IDR-002 or production manager inbound authentication. C02 and C01 gold
+targets remain explicitly `not_exercised`.
 
 Run 0.1 conformance validation from the repository root:
 

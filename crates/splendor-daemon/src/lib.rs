@@ -5,10 +5,13 @@
 //! gateway-mediated action submission. It is intentionally local/foundation-only:
 //! no fleet registry, remote scheduler, or production auth provider is included.
 
+pub mod caller_auth;
 pub mod manager;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{to_bytes, Body};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -55,6 +58,8 @@ use std::sync::{Arc, Mutex};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use caller_auth::{CallerAuthError, CallerTokenVerifier};
+
 /// Local daemon state shared by the HTTP router.
 #[derive(Clone)]
 pub struct DaemonState {
@@ -65,6 +70,7 @@ struct DaemonInner {
     runs: Mutex<HashMap<RunId, SharedRunSlot>>,
     create_run_idempotency: Mutex<HashMap<String, CreateRunIdempotencyEntry>>,
     expected_audience: CredentialAudience,
+    caller_token_verifier: Option<CallerTokenVerifier>,
     insecure_dev_mode: Option<InsecureDevMode>,
     policy_bundle_keyring: PolicyBundleKeyring,
     work_order_keyring: WorkOrderKeyring,
@@ -134,6 +140,7 @@ impl DaemonState {
                 runs: Mutex::new(HashMap::new()),
                 create_run_idempotency: Mutex::new(HashMap::new()),
                 expected_audience: config.expected_audience,
+                caller_token_verifier: config.caller_token_verifier,
                 insecure_dev_mode: config.insecure_dev_mode,
                 policy_bundle_keyring: config.policy_bundle_keyring,
                 work_order_keyring: config.work_order_keyring,
@@ -237,6 +244,8 @@ impl DaemonState {
 pub struct DaemonConfig {
     /// Expected audience binding for caller credentials.
     pub expected_audience: CredentialAudience,
+    /// Closed-profile caller-token verifier. Required for resident mode.
+    pub caller_token_verifier: Option<CallerTokenVerifier>,
     /// Explicit local-only insecure development mode, if enabled.
     pub insecure_dev_mode: Option<InsecureDevMode>,
     /// Verification keys for centrally distributed policy bundles.
@@ -260,6 +269,7 @@ impl DaemonConfig {
             expected_audience: CredentialAudience::Daemon {
                 daemon_id: "daemon_local".to_string(),
             },
+            caller_token_verifier: None,
             insecure_dev_mode: Some(InsecureDevMode {
                 enabled: true,
                 transport: LocalTransportBinding::Tcp {
@@ -273,13 +283,23 @@ impl DaemonConfig {
         }
     }
 
-    /// Resident-mode daemon configuration for metadata/scope boundary tests.
-    /// Caller credential cryptographic authentication remains a C01 concern.
-    pub fn resident(instance_id: splendor_types::InstanceId) -> Self {
-        let mut config = Self::local_dev();
-        config.expected_audience = CredentialAudience::Instance { instance_id };
-        config.insecure_dev_mode = None;
-        config
+    /// Resident-mode daemon configuration with explicit trust material.
+    ///
+    /// This constructor deliberately cannot inherit local-development signing
+    /// keys or insecure transport settings.
+    pub fn resident(
+        instance_id: splendor_types::InstanceId,
+        caller_token_verifier: CallerTokenVerifier,
+        work_order_keyring: WorkOrderKeyring,
+        policy_bundle_keyring: PolicyBundleKeyring,
+    ) -> Self {
+        Self {
+            expected_audience: CredentialAudience::Instance { instance_id },
+            caller_token_verifier: Some(caller_token_verifier),
+            insecure_dev_mode: None,
+            policy_bundle_keyring,
+            work_order_keyring,
+        }
     }
 }
 
@@ -332,7 +352,190 @@ pub fn router(state: DaemonState) -> Router {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/capabilities", get(capabilities))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            resident_caller_authentication,
+        ))
         .with_state(state)
+}
+
+const MAX_DAEMON_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+async fn resident_caller_authentication(
+    State(state): State<DaemonState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(verifier) = state.inner.caller_token_verifier.as_ref() else {
+        return Ok(next.run(request).await);
+    };
+
+    let token = bearer_token(request.headers())?;
+    let credential = verifier
+        .verify(token, OffsetDateTime::now_utc())
+        .map_err(caller_auth_api_error)?;
+    validate_header_credential_mirror(request.headers(), &credential)?;
+
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        let body = std::mem::replace(request.body_mut(), Body::empty());
+        let bytes = to_bytes(body, MAX_DAEMON_REQUEST_BODY_BYTES)
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_body_too_large",
+                    "daemon request body exceeded the configured limit",
+                )
+            })?;
+        validate_body_credential_mirror(&bytes, &credential)?;
+        *request.body_mut() = Body::from(bytes);
+    }
+
+    let encoded = serde_json::to_string(&credential).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "caller_projection_unavailable",
+            "verified caller projection could not be prepared",
+        )
+    })?;
+    request.headers_mut().insert(
+        "x-splendor-caller-credential",
+        HeaderValue::from_str(&encoded).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "caller_projection_unavailable",
+                "verified caller projection could not be prepared",
+            )
+        })?,
+    );
+    Ok(next.run(request).await)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values
+        .next()
+        .ok_or_else(|| caller_auth_api_error(CallerAuthError::MissingToken))?;
+    if values.next().is_some() {
+        return Err(caller_auth_api_error(CallerAuthError::MalformedToken));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| caller_auth_api_error(CallerAuthError::MalformedToken))?;
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| caller_auth_api_error(CallerAuthError::MalformedToken))?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return Err(caller_auth_api_error(CallerAuthError::MalformedToken));
+    }
+    Ok(token)
+}
+
+fn validate_header_credential_mirror(
+    headers: &HeaderMap,
+    credential: &CallerCredential,
+) -> Result<(), ApiError> {
+    if headers.contains_key("x-splendor-caller-credential") {
+        let mirror = caller_credential_from_headers(headers)?.ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_credential_mirror_mismatch",
+                "caller credential mirror did not match the authenticated caller",
+            )
+        })?;
+        if &mirror != credential {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_credential_mirror_mismatch",
+                "caller credential mirror did not match the authenticated caller",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_body_credential_mirror(
+    body: &[u8],
+    credential: &CallerCredential,
+) -> Result<(), ApiError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(raw) = object.get("credential").filter(|value| !value.is_null()) {
+        let mirror: CallerCredential = serde_json::from_value(raw.clone()).map_err(|_| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_credential_mirror_mismatch",
+                "caller credential mirror did not match the authenticated caller",
+            )
+        })?;
+        if &mirror != credential {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_credential_mirror_mismatch",
+                "caller credential mirror did not match the authenticated caller",
+            ));
+        }
+    }
+    if let Some(raw) = object
+        .get("audit_attribution")
+        .filter(|value| !value.is_null())
+    {
+        let audit: AuditAttribution = serde_json::from_value(raw.clone()).map_err(|_| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_audit_mirror_mismatch",
+                "audit attribution did not match the authenticated caller",
+            )
+        })?;
+        if audit.principal != credential.principal
+            || audit.credential_id.as_deref() != Some(credential.credential_id.as_str())
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "caller_audit_mirror_mismatch",
+                "audit attribution did not match the authenticated caller",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn caller_auth_api_error(error: CallerAuthError) -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        caller_auth_error_code(&error),
+        "resident caller authentication failed",
+    )
+}
+
+fn caller_auth_error_code(error: &CallerAuthError) -> &'static str {
+    match error {
+        CallerAuthError::MissingToken => "missing_caller_token",
+        CallerAuthError::MalformedToken => "invalid_caller_token",
+        CallerAuthError::UnsupportedProfile => "unsupported_caller_token_profile",
+        CallerAuthError::UntrustedKey => "untrusted_caller_token_key",
+        CallerAuthError::InvalidSignature => "invalid_caller_token_signature",
+        CallerAuthError::WrongIssuer => "wrong_caller_token_issuer",
+        CallerAuthError::WrongAudience => "wrong_caller_token_audience",
+        CallerAuthError::WrongSubject => "wrong_caller_token_subject",
+        CallerAuthError::InvalidLifetime => "invalid_caller_token_lifetime",
+        CallerAuthError::InvalidScope => "invalid_caller_token_scope",
+        CallerAuthError::InvalidTenant => "invalid_caller_token_tenant",
+        CallerAuthError::RevokedToken => "revoked_caller_token",
+        CallerAuthError::InvalidTrustSnapshot => "caller_trust_unavailable",
+        CallerAuthError::ClockRollback => "caller_auth_clock_rollback",
+        CallerAuthError::InvalidSigner | CallerAuthError::KeyLoad => "caller_auth_unavailable",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1427,7 +1630,16 @@ impl From<LoopError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let mut response = (self.status, Json(self.body)).into_response();
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(
+                    "Bearer realm=\"splendor-resident\", error=\"invalid_token\"",
+                ),
+            );
+        }
+        response
     }
 }
 
@@ -5908,7 +6120,36 @@ mod tests {
     #[test]
     fn resident_daemon_config_requires_authenticated_caller() {
         let instance_id = splendor_types::InstanceId::new();
-        let config = DaemonConfig::resident(instance_id.clone());
+        let signer = crate::caller_auth::CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:test",
+            "manager-test",
+            "resident-test",
+            "resident-test-key",
+        )
+        .expect("signer");
+        let trust = crate::caller_auth::CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            vec![EndpointScope::HealthRead],
+            OffsetDateTime::now_utc(),
+        );
+        let verifier = CallerTokenVerifier::new(trust, instance_id.clone()).expect("verifier");
+        let mut work_order_keyring = WorkOrderKeyring::new();
+        work_order_keyring
+            .insert_shared_secret("test-work-order", [7_u8; 32])
+            .expect("work order key");
+        let mut policy_bundle_keyring = PolicyBundleKeyring::new();
+        policy_bundle_keyring
+            .insert_shared_secret("test-policy", [9_u8; 32])
+            .expect("policy key");
+        let config = DaemonConfig::resident(
+            instance_id.clone(),
+            verifier,
+            work_order_keyring,
+            policy_bundle_keyring,
+        );
         assert!(config.insecure_dev_mode.is_none());
         assert_eq!(
             config.expected_audience,

@@ -26,6 +26,12 @@ contracts, storage seams, lifecycle decisions, query snapshots, and local tests
 as experimental evidence only. Until exact executable gold fixtures pass, all
 C01 gold targets remain `not_exercised`.
 
+Accepted RFC 0011 is one explicit narrow exception: it authorizes a closed
+resident Ed25519 caller verifier as an additive daemon compatibility adapter
+(`IDR-002a`). It does not provide registry lookup, principal lifecycle, generic
+proof-provider contracts, cache/watch propagation, manager inbound
+authentication, full C01/IDR-002 completion, or gold evidence.
+
 This RFC preserves the non-claims in
 `docs/rules/v2/foundation-readiness.md`. It does not claim full C01
 implementation, full `IDR-001` completion, issue closure, a stable production
@@ -519,8 +525,8 @@ Rules:
 Compatibility with existing daemon security:
 
 - `AppPrincipal` and `ClientPrincipal` remain caller-auth contracts until future
-  `IDR-002` work replaces daemon-specific parsing with an authentication adapter
-  and registry lookup.
+  full `IDR-002` work replaces the accepted RFC 0011 closed resident verifier
+  with provider-neutral authentication adapters plus registry lookup.
 - Caller authentication remains distinct from work-order authorization and gateway
   verification.
 - Local dev insecure mode restrictions remain unchanged and explicit.

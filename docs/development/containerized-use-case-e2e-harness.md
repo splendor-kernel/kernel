@@ -81,7 +81,14 @@ Every mode must still run in containers unless it is explicitly a static reposit
 
 ## 3. Docker Compose topology skeleton
 
-The exact image names may change, but the service roles must remain stable.
+The exact image names may change, but the service roles must remain stable. The
+following is an architectural sketch, not a runnable copy. The executable source
+is `tests/e2e/use-cases/docker-compose.acceptance.yml`. In that composition the
+local daemon sets explicit `local_dev`, the manager sets explicit
+`local_acceptance` plus outbound signer/keyring/CA file paths, and resident nodes
+set explicit instance/trust/work-order/policy/TLS files. An initializer generates
+test-only material into an untracked volume before those services start; resident
+URLs use HTTPS and no resident inherits local development keys.
 
 ```yaml
 services:

@@ -2,6 +2,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use splendor_daemon::caller_auth::{
+    CallerTokenSigner, CallerTokenTrustSnapshot, CallerTokenVerifier,
+};
 use splendor_daemon::{
     router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonActionCandidate, DaemonConfig,
     DaemonState, DevicePolicyCacheStatus, DeviceRuntimeProfile, DeviceTraceBufferStatus,
@@ -178,25 +181,6 @@ fn replay_credential(tenant_id: TenantId) -> CallerCredential {
         audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
-        expires_at: OffsetDateTime::now_utc() + Duration::minutes(5),
-        revocation: RevocationStatus::Active,
-    }
-}
-
-fn resident_credential_metadata(instance_id: InstanceId, tenant_id: TenantId) -> CallerCredential {
-    CallerCredential {
-        credential_id: format!("cred_c02_resident_{}", TraceId::new()),
-        principal: ClientPrincipal::new("app_c02_resident", "client_c02_resident"),
-        scopes: vec![
-            EndpointScope::RunsCreate,
-            EndpointScope::RunsStart,
-            EndpointScope::RunsRead,
-            EndpointScope::ActionsSubmit,
-            EndpointScope::TracesRead,
-            EndpointScope::ReplayCreate,
-        ],
-        binding: CredentialBinding::Tenant { tenant_id },
-        audience: CredentialAudience::Instance { instance_id },
         expires_at: OffsetDateTime::now_utc() + Duration::minutes(5),
         revocation: RevocationStatus::Active,
     }
@@ -470,15 +454,47 @@ async fn call_json<T: DeserializeOwned>(
     (status, parsed)
 }
 
-async fn call_empty_with_credential<T: DeserializeOwned>(
+async fn call_json_with_token<T: DeserializeOwned>(
     app: axum::Router,
     method: Method,
     uri: &str,
-    credential: &CallerCredential,
+    value: impl serde::Serialize,
+    token: &str,
 ) -> (StatusCode, T) {
     let request = Request::builder()
         .method(method)
         .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&value).expect("request JSON"),
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("router response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response bytes");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "response JSON failed ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, parsed)
+}
+
+async fn call_empty_with_token<T: DeserializeOwned>(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    credential: &CallerCredential,
+    token: &str,
+) -> (StatusCode, T) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
         .header(
             "x-splendor-caller-credential",
             serde_json::to_string(credential).expect("credential JSON"),
@@ -1078,14 +1094,156 @@ async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
 }
 
 #[tokio::test]
-async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
+async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
     let _device_sim_env = DeviceSimEnvGuard::disabled();
     let instance_id = InstanceId::new();
-    let state = DaemonState::new(DaemonConfig::resident(instance_id.clone()));
-    let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
-    let credential = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
+    let scopes = vec![
+        EndpointScope::RunsCreate,
+        EndpointScope::RunsStart,
+        EndpointScope::RunsRead,
+        EndpointScope::ActionsSubmit,
+        EndpointScope::TracesRead,
+        EndpointScope::ReplayCreate,
+    ];
+    let signer = CallerTokenSigner::generate_for_test(
+        "urn:splendor:manager:c02-test",
+        "app_c02_resident",
+        "client_c02_resident",
+        "c02-resident-key",
+    )
+    .expect("signer");
+    let trust = CallerTokenTrustSnapshot::single_key(
+        signer.issuer(),
+        signer.app_principal_id(),
+        signer.kid(),
+        &signer.public_key_bytes(),
+        scopes.clone(),
+        OffsetDateTime::now_utc(),
+    );
+    let verifier = CallerTokenVerifier::new(trust, instance_id.clone()).expect("verifier");
+    let local = DaemonConfig::local_dev();
+    let state = DaemonState::new(DaemonConfig::resident(
+        instance_id.clone(),
+        verifier,
+        local.work_order_keyring,
+        local.policy_bundle_keyring,
+    ));
+    let app = router(state.clone());
+    let signed = signer
+        .sign(
+            &tenant_id,
+            &instance_id,
+            scopes,
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("caller token");
+    let credential = signed.credential.clone();
+    let unauthenticated_body = serde_json::to_vec(&json!({
+        "credential": credential,
+        "audit_attribution": credential_audit(&signed.credential),
+    }))
+    .expect("unauthenticated body");
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(unauthenticated_body))
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauthenticated
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"splendor-resident\", error=\"invalid_token\"")
+    );
+    let unauthenticated_body = to_bytes(unauthenticated.into_body(), usize::MAX)
+        .await
+        .expect("unauthenticated response body");
+    let unauthenticated_error: ApiErrorBody =
+        serde_json::from_slice(&unauthenticated_body).expect("api error");
+    assert_eq!(unauthenticated_error.code, "missing_caller_token");
+
+    for (label, token) in [
+        ("malformed", "not-a-jws".to_string()),
+        (
+            "oversized",
+            "a".repeat(splendor_daemon::caller_auth::MAX_CALLER_TOKEN_BYTES + 1),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 response");
+        assert!(!text.contains(&token), "{label} token leaked in response");
+        assert!(
+            !text.contains(&signed.encoded),
+            "valid token leaked in response"
+        );
+    }
+
+    let wrong_tenant_token = signer
+        .sign(
+            &TenantId::new(),
+            &instance_id,
+            vec![EndpointScope::RunsCreate],
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("wrong-tenant token remains cryptographically valid");
+    let wrong_scope_token = signer
+        .sign(
+            &tenant_id,
+            &instance_id,
+            vec![EndpointScope::RunsRead],
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("wrong-scope token remains cryptographically valid");
+    for (label, token, expected_code) in [
+        (
+            "wrong_tenant_proof",
+            wrong_tenant_token,
+            "wrong_credential_binding",
+        ),
+        ("wrong_scope_proof", wrong_scope_token, "missing_scope"),
+    ] {
+        let mut denied = create_request(
+            &format!("wo_c02_resident_{label}"),
+            tenant_id.clone(),
+            agent_id.clone(),
+            OffsetDateTime::now_utc() + Duration::minutes(10),
+            false,
+        );
+        denied.credential = Some(token.credential.clone());
+        denied.audit_attribution = Some(credential_audit(&token.credential));
+        let (status, error): (StatusCode, ApiErrorBody) =
+            call_json_with_token(app.clone(), Method::POST, "/runs", denied, &token.encoded).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+        assert_eq!(error.code, expected_code, "{label}");
+    }
     let mut create = create_request(
         "wo_c02_resident",
         tenant_id.clone(),
@@ -1096,7 +1254,7 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
     create.credential = Some(credential.clone());
     create.audit_attribution = Some(credential_audit(&credential));
     let (status, created): (StatusCode, CreateRunResponse) =
-        call_json(app.clone(), Method::POST, "/runs", create).await;
+        call_json_with_token(app.clone(), Method::POST, "/runs", create, &signed.encoded).await;
     assert_eq!(status, StatusCode::OK);
 
     let lifecycle = LifecycleRequest {
@@ -1106,22 +1264,24 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
         reason: None,
         approval_evidence: None,
     };
-    let (status, tick): (StatusCode, TickResponse) = call_json(
+    let (status, tick): (StatusCode, TickResponse) = call_json_with_token(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/start", created.run_id),
         lifecycle,
+        &signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(tick.action_outcomes.len(), 1);
     assert_eq!(tick.action_outcomes[0].status, ActionStatus::Executed);
 
-    let (status, trace_page): (StatusCode, TracePageResponse) = call_empty_with_credential(
+    let (status, trace_page): (StatusCode, TracePageResponse) = call_empty_with_token(
         app.clone(),
         Method::GET,
         &format!("/runs/{}/traces?redaction_policy=redacted", created.run_id),
         &credential,
+        &signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1155,8 +1315,14 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
-    let (status, direct): (StatusCode, ActionOutcome) =
-        call_json(app.clone(), Method::POST, "/actions", submit_request).await;
+    let (status, direct): (StatusCode, ActionOutcome) = call_json_with_token(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        submit_request,
+        &signed.encoded,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(direct.status, ActionStatus::Executed);
     let evaluations_before_replay = state
@@ -1164,7 +1330,7 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
         .expect("resident authority count");
 
     let replay_audit = credential_audit(&credential);
-    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+    let (status, replay): (StatusCode, ReplayResponse) = call_json_with_token(
         app.clone(),
         Method::POST,
         &format!("/runs/{}/replay", created.run_id),
@@ -1174,6 +1340,7 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
             "credential": credential.clone(),
             "audit_attribution": replay_audit,
         }),
+        &signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1184,19 +1351,19 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
             .expect("resident replay authority count"),
         evaluations_before_replay
     );
-    let read_credential = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
-    let (status, inspected): (StatusCode, RunInspectResponse) = call_empty_with_credential(
+    let (status, inspected): (StatusCode, RunInspectResponse) = call_empty_with_token(
         app.clone(),
         Method::GET,
         &format!("/runs/{}", created.run_id),
-        &read_credential,
+        &credential,
+        &signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inspected.adapter_executions, 2);
 
     let invalid_cases = {
-        let valid = resident_credential_metadata(instance_id.clone(), tenant_id.clone());
+        let valid = credential.clone();
         let mut wrong_tenant = valid.clone();
         wrong_tenant.binding = CredentialBinding::Tenant {
             tenant_id: TenantId::new(),
@@ -1212,13 +1379,13 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
             reason: "resident credential revoked".to_string(),
         };
         vec![
-            ("wrong_tenant", wrong_tenant, "wrong_credential_binding"),
-            ("wrong_audience", wrong_audience, "wrong_audience"),
-            ("expired", expired, "credential_expired"),
-            ("revoked", revoked, "credential_revoked"),
+            ("wrong_tenant", wrong_tenant),
+            ("wrong_audience", wrong_audience),
+            ("expired", expired),
+            ("revoked", revoked),
         ]
     };
-    for (label, invalid, expected_code) in invalid_cases {
+    for (label, invalid) in invalid_cases {
         let mut request = create_request(
             &format!("wo_c02_resident_{label}"),
             tenant_id.clone(),
@@ -1229,9 +1396,10 @@ async fn resident_daemon_metadata_scope_checks_preserve_c02_effect_authority() {
         request.credential = Some(invalid.clone());
         request.audit_attribution = Some(credential_audit(&invalid));
         let (status, error): (StatusCode, ApiErrorBody) =
-            call_json(app.clone(), Method::POST, "/runs", request).await;
+            call_json_with_token(app.clone(), Method::POST, "/runs", request, &signed.encoded)
+                .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
-        assert_eq!(error.code, expected_code, "{label}");
+        assert_eq!(error.code, "caller_credential_mirror_mismatch", "{label}");
     }
 }
 

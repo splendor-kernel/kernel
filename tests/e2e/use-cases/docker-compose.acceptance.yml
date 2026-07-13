@@ -19,6 +19,11 @@ services:
       SPLENDOR_E2E_SOURCE_REV: ${SPLENDOR_E2E_SOURCE_REV:-unknown-source-revision}
       SPLENDOR_DAEMON_URL: http://127.0.0.1:8077
       SPLENDOR_MANAGER_URL: http://central-manager:8081
+      SPLENDOR_RESIDENT_AUTH_DIR: /run/splendor-auth
+      SPLENDOR_RESIDENT_CA_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_VPC_NODE_URL: https://resident-vpc-node:8092
+      SPLENDOR_CLOUD_NODE_URL: https://resident-cloud-node:8091
+      SPLENDOR_EDGE_NODE_URL: https://resident-edge-node:8093
       SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
       SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
       SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
@@ -48,6 +53,24 @@ services:
     network_mode: service:splendor-daemon-local
     volumes:
       - ../../..:/workspace
+      - e2e-auth:/run/splendor-auth:ro
+
+  resident-auth-fixture:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: acceptance-runner
+    working_dir: /workspace
+    user: root
+    command:
+      - bash
+      - -lc
+      - |
+        python3 tests/e2e/use-cases/fixtures/resident_auth_fixture.py init --out /run/splendor-auth
+        chown -R splendor:splendor /run/splendor-auth
+    volumes:
+      - ../../..:/workspace:ro
+      - e2e-auth:/run/splendor-auth
 
   fake-http-service:
     image: python:3.12-slim
@@ -90,6 +113,8 @@ services:
       dockerfile: Dockerfile
       target: runtime
     working_dir: /workspace
+    environment:
+      SPLENDOR_DAEMON_MODE: local_dev
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
@@ -102,14 +127,26 @@ services:
       target: runtime
     working_dir: /workspace
     environment:
+      SPLENDOR_MANAGER_MODE: local_acceptance
       SPLENDOR_MANAGER_BIND_ADDR: 0.0.0.0:8081
       SPLENDOR_MANAGER_ALLOW_NON_LOOPBACK_DEV: "1"
       SPLENDOR_MANAGER_ID: central-manager
       SPLENDOR_FLEET_ID: 00000000-0000-4000-8000-000000000104
+      SPLENDOR_MANAGER_CALLER_ISSUER: urn:splendor:manager:central-manager
+      SPLENDOR_MANAGER_CALLER_APP_PRINCIPAL_ID: central-manager
+      SPLENDOR_MANAGER_CALLER_CLIENT_PRINCIPAL_ID: resident-dispatch-client
+      SPLENDOR_MANAGER_CALLER_KEY_ID: manager-resident-acceptance
+      SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE: /run/splendor-auth/caller-signing-key.pk8
+      SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
+      SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE: /run/splendor-auth/resident-tls-cert.pem
     command: ["splendor-manager"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
+      - e2e-auth:/run/splendor-auth:ro
+    depends_on:
+      resident-auth-fixture:
+        condition: service_completed_successfully
 
   resident-cloud-node:
     build:
@@ -121,10 +158,19 @@ services:
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8091
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000304
+      SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
+      SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
+      SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
+      - e2e-auth:/run/splendor-auth:ro
+    depends_on:
+      resident-auth-fixture:
+        condition: service_completed_successfully
 
   resident-vpc-node:
     build:
@@ -136,10 +182,19 @@ services:
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8092
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000302
+      SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
+      SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
+      SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
+      - e2e-auth:/run/splendor-auth:ro
+    depends_on:
+      resident-auth-fixture:
+        condition: service_completed_successfully
 
   resident-edge-node:
     build:
@@ -152,13 +207,23 @@ services:
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8093
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000306
       SPLENDOR_DEVICE_SIM_URL: http://device-sim:8086
+      SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
+      SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
+      SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
+      - e2e-auth:/run/splendor-auth:ro
+    depends_on:
+      resident-auth-fixture:
+        condition: service_completed_successfully
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest
 
 volumes:
+  e2e-auth:
   e2e-state:

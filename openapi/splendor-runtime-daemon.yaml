@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
   version: 0.03-dev
-  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
+  description: Runtime daemon API with explicit local-development and TLS resident profiles. Resident/non-dev requests require the accepted Ed25519 caller bearer profile; caller metadata fields remain non-authoritative compatibility mirrors. Signed work orders authorize runs, while C02 and the gateway separately authorize effects. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
   x-splendor-compatibility:
     stable_docs: docs/spec/0.1/api-stability.md
     compatibility_line: '0.1'
@@ -10,11 +10,15 @@ info:
 servers:
   - url: http://127.0.0.1:8077
     description: Explicit local development listener only.
+  - url: https://resident.example.invalid
+    description: Resident TLS listener; deployments replace this example with the exact instance endpoint and trust chain.
 paths:
   /runs:
     post:
       summary: Create a local run from a signed work order.
       operationId: createRun
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -30,6 +34,8 @@ paths:
                 $ref: '#/components/schemas/CreateRunResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
@@ -40,6 +46,8 @@ paths:
     get:
       summary: Inspect a local run.
       operationId: inspectRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -50,6 +58,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -58,6 +68,8 @@ paths:
     post:
       summary: Execute one local scheduler tick.
       operationId: startRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -73,6 +85,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TickResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -85,6 +99,8 @@ paths:
     post:
       summary: Pause a local run.
       operationId: pauseRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -100,6 +116,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -108,6 +126,8 @@ paths:
     post:
       summary: Resume a paused run and execute one tick.
       operationId: resumeRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -123,6 +143,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TickResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -133,6 +155,8 @@ paths:
     post:
       summary: Stop a local run.
       operationId: stopRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -148,6 +172,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -158,6 +184,8 @@ paths:
     post:
       summary: Cancel a local run without deleting trace or state evidence.
       operationId: cancelRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -173,6 +201,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -183,6 +213,8 @@ paths:
     post:
       summary: Append a percept to the daemon queue for the next tick.
       operationId: appendPercept
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -200,6 +232,8 @@ paths:
                 $ref: '#/components/schemas/AppendPerceptResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -208,6 +242,8 @@ paths:
     post:
       summary: Sync or record failure for a run policy bundle cache.
       operationId: syncPolicy
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -223,6 +259,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PolicySyncResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
@@ -233,6 +271,8 @@ paths:
     post:
       summary: Sync manager-issued circuit breakers into one run gateway evaluator.
       operationId: syncCircuitBreakers
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -248,6 +288,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CircuitBreakerSyncResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -256,6 +298,8 @@ paths:
     get:
       summary: Read the latest committed state node metadata.
       operationId: getStateHead
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -266,6 +310,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StateHeadResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -274,6 +320,8 @@ paths:
     get:
       summary: Read ordered trace records.
       operationId: getRunTraces
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -299,6 +347,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TracePageResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -307,6 +357,8 @@ paths:
     post:
       summary: Export ordered trace records with explicit redaction policy and integrity metadata.
       operationId: exportTraces
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -324,6 +376,8 @@ paths:
                 $ref: '#/components/schemas/TraceExportResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -332,6 +386,8 @@ paths:
     post:
       summary: Start inspect-only replay.
       operationId: replayRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -347,6 +403,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReplayResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -357,6 +415,8 @@ paths:
     post:
       summary: Submit an action through the local run gateway.
       operationId: submitAction
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -370,6 +430,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ActionOutcome'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -380,6 +442,8 @@ paths:
     get:
       summary: Read daemon health.
       operationId: getHealth
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -395,6 +459,8 @@ paths:
     get:
       summary: Read daemon/runtime/schema compatibility metadata.
       operationId: getVersion
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -412,6 +478,8 @@ paths:
     get:
       summary: Read local daemon capabilities.
       operationId: getCapabilities
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -427,6 +495,8 @@ paths:
     post:
       summary: Export an explicit state handoff snapshot.
       operationId: exportStateSnapshot
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -440,12 +510,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExportStateSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
   /state-snapshots/import:
     post:
       summary: Import an explicit state handoff snapshot.
       operationId: importStateSnapshot
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -459,6 +533,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportStateSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
   /fleet/nodes:
@@ -806,57 +882,74 @@ paths:
     post:
       summary: Register a resident physical/edge device profile.
       operationId: registerDeviceProfile
+      security:
+        - ResidentCallerBearer: []
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileRequest' } } } }
       responses:
         '200': { description: Device profile registered., content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /devices/{node_id}/status:
     get:
       summary: Read device safety and runtime status; never authorizes actions.
       operationId: getDeviceStatus
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200': { description: Device status., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceRuntimeProfile' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/policy-cache:
     get:
       summary: Read local policy cache status; expired high-risk offline actions fail closed.
       operationId: getPolicyCacheStatus
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200': { description: Policy cache status., content: { application/json: { schema: { $ref: '#/components/schemas/DevicePolicyCacheStatus' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/actions:
     post:
       summary: Submit a high-level bounded physical action through gateway and safety verification.
       operationId: submitPhysicalAction
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitPhysicalActionRequest' } } } }
       responses:
         '200': { description: Physical action outcome., content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /operator/interventions:
     post:
       summary: Request local operator intervention for an ambiguous physical action.
       operationId: requestOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRequest' } } } }
       responses:
         '200': { description: Operator intervention requested., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /operator/interventions/{intervention_id}/grant:
     post:
       summary: Grant scoped expiring local operator intervention.
       operationId: grantOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - name: intervention_id
           in: path
@@ -865,12 +958,15 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
       responses:
         '200': { description: Operator intervention granted., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /operator/interventions/{intervention_id}/deny:
     post:
       summary: Deny scoped local operator intervention.
       operationId: denyOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - name: intervention_id
           in: path
@@ -879,20 +975,36 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
       responses:
         '200': { description: Operator intervention denied., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/trace-buffer/sync:
     post:
       summary: Sync an offline device trace buffer with ordering and tamper checks.
       operationId: syncDeviceTraceBuffer
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncRequest' } } } }
       responses:
         '200': { description: Device trace sync result., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 components:
+  securitySchemes:
+    ResidentCallerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: splendor-caller+jwt (Ed25519)
+      description: >-
+        Authoritative resident caller proof defined by accepted RFC 0011. The
+        daemon verifies the fixed Ed25519 profile, exact issuer and instance
+        audience, tenant binding, endpoint scope, lifetime, trust freshness,
+        key status, and JTI revocation before consulting compatibility mirrors.
+        This bearer authenticates the app only; it does not replace a signed
+        work order, C02 run authority, verifiers, or gateway authorization.
   parameters:
     RunId:
       name: run_id
@@ -905,7 +1017,13 @@ components:
       name: X-Splendor-Caller-Credential
       in: header
       required: false
-      description: JSON-encoded CallerCredential for non-dev health/capability reads. Explicit local-dev mode may omit it only on loopback or Unix-socket transports.
+      deprecated: true
+      description: >-
+        Non-authoritative JSON compatibility mirror of the caller identity
+        projected from a verified bearer. In resident mode it cannot authenticate
+        a caller and, when supplied, must exactly match the verified projection.
+        Explicit local-dev mode may omit it only on loopback or Unix-socket
+        transports.
       schema:
         type: string
     NodeId:
@@ -923,7 +1041,14 @@ components:
           schema:
             $ref: '#/components/schemas/ApiError'
     Unauthorized:
-      description: Missing authenticated caller outside explicit local dev mode.
+      description: Missing or invalid authenticated caller outside explicit local dev mode. The response includes a bounded RFC 6750 challenge and never echoes token or key bytes.
+      headers:
+        WWW-Authenticate:
+          description: Bounded bearer challenge for missing or invalid resident caller proof.
+          required: true
+          schema:
+            type: string
+            example: 'Bearer realm="splendor-resident", error="invalid_token"'
       content:
         application/json:
           schema:
@@ -1194,6 +1319,10 @@ components:
                 reason:
                   type: string
     CallerCredential:
+      description: >-
+        Caller identity projection. On the resident daemon this object is a
+        deprecated/non-authoritative mirror derived from the verified bearer and
+        cannot supply proof or widen token facts.
       type: object
       required: [credential_id, principal, scopes, binding, audience, expires_at, revocation]
       properties:
@@ -1366,6 +1495,7 @@ components:
             - type: 'null'
             - $ref: '#/components/schemas/WorkOrderSignature'
     AuditAttribution:
+      description: Attribution mirror that must name the authenticated principal and credential ID; it is not authentication proof.
       type: object
       required: [principal, credential_id, requested_at]
       properties:
@@ -1377,6 +1507,10 @@ components:
           type: string
           format: date-time
     ManagerSecurityFields:
+      description: >-
+        Acceptance-manager metadata checks only. The current manager inbound API
+        has no production caller proof verifier and is not covered by
+        ResidentCallerBearer; it must not be exposed as a production remote API.
       type: object
       required: [credential, audit_attribution]
       properties:
