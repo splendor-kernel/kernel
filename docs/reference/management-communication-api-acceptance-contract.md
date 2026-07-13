@@ -36,7 +36,10 @@ Local development mode is valid only when explicitly enabled, loopback/Unix-sock
 Accepted RFC 0011 supplies one concrete manager→resident reference path. The
 manager mints a fresh closed-profile Ed25519 bearer for each create/start call;
 the resident verifies it over TLS and derives the caller projection. Body/header
-credential objects are non-authoritative mirrors. This does **not** authenticate
+credential objects are non-authoritative mirrors. Mutating JTIs are one-use,
+raw JTI is reduced to a domain-separated correlation digest, and resident audit
+time is server-owned. Manager egress requires a configured exact-origin
+allowlist and immutable work-order/placement/node/instance binding. This does **not** authenticate
 calls into the current manager API itself: the `splendor-manager` binary remains
 explicit local acceptance/dev infrastructure and must not be exposed or claimed
 as a production-authenticated central manager.
@@ -211,7 +214,8 @@ On the resident daemon this object is a deprecated compatibility projection of
 verified bearer claims, not proof. If supplied in a body/header it must exactly
 match the verified projection and cannot add identity, scope, binding, lifetime,
 audience, or revocation facts. The accepted proof contract is documented in RFC
-0011 and OpenAPI `ResidentCallerBearer`.
+0011 and OpenAPI `ResidentCallerBearer`. Its resident `credential_id` value is a
+bounded `sha256:` correlation digest, not the raw bearer JTI.
 
 Required fields:
 

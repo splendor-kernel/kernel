@@ -47,11 +47,17 @@
 - Added the accepted RFC 0011 resident security correction: resident mode now
   requires Rustls TLS, a closed Ed25519 caller bearer verified against explicit
   trust/revocation state, explicit owner-only work-order/policy keyrings, and
-  exact non-authoritative credential mirrors. Manager→resident dispatch now uses
-  bounded no-redirect/no-proxy HTTPS, fresh one-scope caller tokens, strict typed
-  responses, terminal partial/unknown-effect outcomes, duplicate suppression,
-  and real resident-router integration evidence. The UC-E2E-S4 composition
-  generates acceptance-only key/TLS material in an untracked volume.
+  exact non-authoritative credential mirrors. Mutating bearer JTIs are now
+  atomically one-use, audit correlation is a bounded domain-separated digest,
+  audit time is server-owned, and safe create idempotency remains stable across
+  fresh JTIs. Manager→resident dispatch now uses bounded no-redirect/no-proxy
+  HTTPS, an exact-origin allowlist, immutable work-order/placement/node/instance
+  binding, eligible-instance checks, strict typed responses, terminal
+  unknown-effect outcomes without automatic retry, and real resident-router plus
+  adversarial fault evidence. The UC-E2E-S4 composition generates acceptance-only
+  key/TLS material in separate role volumes with per-instance work-order v1
+  secrets; v1 remains a scoped shared-secret residual rather than asymmetric
+  verifier separation.
 - Corrected CLI run-level trace composition so agents sharing one configured
   `run_id` also share one runtime cursor, producing a contiguous sequence/hash
   chain with distinct agent identities. Signed resume retains that cursor and

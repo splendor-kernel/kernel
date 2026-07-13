@@ -80,6 +80,7 @@ struct DaemonInner {
     device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
     operator_interventions: Mutex<HashMap<String, OperatorInterventionRecord>>,
     device_audit: Mutex<Vec<DeviceAuditEvent>>,
+    resident_security_audit: Mutex<Vec<ResidentSecurityAuditEvent>>,
 }
 
 type SharedRunSlot = Arc<Mutex<RunSlot>>;
@@ -150,6 +151,7 @@ impl DaemonState {
                 device_profiles: Mutex::new(HashMap::new()),
                 operator_interventions: Mutex::new(HashMap::new()),
                 device_audit: Mutex::new(Vec::new()),
+                resident_security_audit: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -219,6 +221,35 @@ impl DaemonState {
         }
     }
 
+    fn record_resident_security_audit(
+        &self,
+        event_type: &str,
+        method: &Method,
+        path: &str,
+        credential_correlation: &str,
+        recorded_at: OffsetDateTime,
+    ) {
+        if let Ok(mut events) = self.inner.resident_security_audit.lock() {
+            events.push(ResidentSecurityAuditEvent {
+                event_type: event_type.to_string(),
+                method: method.to_string(),
+                path: path.to_string(),
+                credential_correlation: credential_correlation.to_string(),
+                recorded_at,
+            });
+        }
+    }
+
+    /// Returns resident-boundary security audit facts for local diagnostics and
+    /// acceptance tests. Raw bearer tokens and JTIs are never retained here.
+    pub fn resident_security_audit_events(&self) -> Vec<ResidentSecurityAuditEvent> {
+        self.inner
+            .resident_security_audit
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+
     fn validate_security(
         &self,
         endpoint: DaemonEndpoint,
@@ -237,6 +268,24 @@ impl DaemonState {
         splendor_types::validate_daemon_request(&request, OffsetDateTime::now_utc())
             .map_err(ApiError::from)
     }
+}
+
+/// Redacted resident authentication audit fact recorded before daemon effects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ResidentSecurityAuditEvent {
+    pub event_type: String,
+    pub method: String,
+    pub path: String,
+    pub credential_correlation: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub recorded_at: OffsetDateTime,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct VerifiedCallerContext {
+    credential: CallerCredential,
+    server_audit: AuditAttribution,
 }
 
 /// Daemon construction options.
@@ -370,13 +419,16 @@ async fn resident_caller_authentication(
         return Ok(next.run(request).await);
     };
 
-    let token = bearer_token(request.headers())?;
-    let credential = verifier
-        .verify(token, OffsetDateTime::now_utc())
+    let token = bearer_token(request.headers())?.to_string();
+    let authenticated_at = OffsetDateTime::now_utc();
+    let mut credential = verifier
+        .verify(&token, authenticated_at)
         .map_err(caller_auth_api_error)?;
     validate_header_credential_mirror(request.headers(), &credential)?;
 
-    if request.method() != Method::GET && request.method() != Method::HEAD {
+    let mut body_bytes = None;
+    let mutating = request.method() != Method::GET && request.method() != Method::HEAD;
+    if mutating {
         let body = std::mem::replace(request.body_mut(), Body::empty());
         let bytes = to_bytes(body, MAX_DAEMON_REQUEST_BODY_BYTES)
             .await
@@ -388,8 +440,42 @@ async fn resident_caller_authentication(
                 )
             })?;
         validate_body_credential_mirror(&bytes, &credential)?;
-        *request.body_mut() = Body::from(bytes);
+        body_bytes = Some(bytes);
     }
+
+    if mutating {
+        credential = match verifier.verify_and_consume_mutation(&token, authenticated_at) {
+            Ok(credential) => credential,
+            Err(CallerAuthError::ReplayedToken) => {
+                state.record_resident_security_audit(
+                    "caller_token.replay_denied",
+                    request.method(),
+                    request.uri().path(),
+                    &credential.credential_id,
+                    OffsetDateTime::now_utc(),
+                );
+                return Err(caller_auth_api_error(CallerAuthError::ReplayedToken));
+            }
+            Err(error) => return Err(caller_auth_api_error(error)),
+        };
+    }
+
+    let server_audit = AuditAttribution {
+        principal: credential.principal.clone(),
+        credential_id: Some(credential.credential_id.clone()),
+        requested_at: OffsetDateTime::now_utc(),
+    };
+    if let Some(bytes) = body_bytes {
+        *request.body_mut() = Body::from(rewrite_verified_body_mirrors(
+            &bytes,
+            &credential,
+            &server_audit,
+        )?);
+    }
+    request.extensions_mut().insert(VerifiedCallerContext {
+        credential: credential.clone(),
+        server_audit,
+    });
 
     let encoded = serde_json::to_string(&credential).map_err(|_| {
         ApiError::new(
@@ -510,6 +596,49 @@ fn validate_body_credential_mirror(
     Ok(())
 }
 
+fn rewrite_verified_body_mirrors(
+    body: &[u8],
+    credential: &CallerCredential,
+    server_audit: &AuditAttribution,
+) -> Result<Vec<u8>, ApiError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(body.to_vec());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(body.to_vec());
+    };
+    object.insert(
+        "credential".to_string(),
+        serde_json::to_value(credential).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "caller_projection_unavailable",
+                "verified caller projection could not be prepared",
+            )
+        })?,
+    );
+    object.insert(
+        "audit_attribution".to_string(),
+        serde_json::to_value(server_audit).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "caller_projection_unavailable",
+                "verified caller audit projection could not be prepared",
+            )
+        })?,
+    );
+    serde_json::to_vec(&value).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "caller_projection_unavailable",
+            "verified caller projection could not be prepared",
+        )
+    })
+}
+
 fn caller_auth_api_error(error: CallerAuthError) -> ApiError {
     ApiError::new(
         StatusCode::UNAUTHORIZED,
@@ -532,6 +661,7 @@ fn caller_auth_error_code(error: &CallerAuthError) -> &'static str {
         CallerAuthError::InvalidScope => "invalid_caller_token_scope",
         CallerAuthError::InvalidTenant => "invalid_caller_token_tenant",
         CallerAuthError::RevokedToken => "revoked_caller_token",
+        CallerAuthError::ReplayedToken => "caller_token_replayed",
         CallerAuthError::InvalidTrustSnapshot => "caller_trust_unavailable",
         CallerAuthError::ClockRollback => "caller_auth_clock_rollback",
         CallerAuthError::InvalidSigner | CallerAuthError::KeyLoad => "caller_auth_unavailable",
@@ -1830,10 +1960,7 @@ fn require_create_run_token(value: &str, field: &'static str) -> Result<String, 
     Ok(trimmed.to_string())
 }
 
-fn create_run_caller_scope(
-    credential: Option<&CallerCredential>,
-    security: &DaemonSecurityDecision,
-) -> serde_json::Value {
+fn create_run_caller_scope(security: &DaemonSecurityDecision) -> serde_json::Value {
     let principal = security.principal.as_ref().or_else(|| {
         security
             .audit_attribution
@@ -1845,9 +1972,6 @@ fn create_run_caller_scope(
             "app_principal_id": &principal.app.app_principal_id,
             "client_principal_id": &principal.client_principal_id,
         })),
-        "credential_id": credential
-            .map(|credential| credential.credential_id.clone())
-            .or_else(|| security.audit_attribution.as_ref().and_then(|audit| audit.credential_id.clone())),
         "insecure_dev_mode": security.insecure_dev_mode,
     })
 }
@@ -1918,7 +2042,7 @@ fn create_run_idempotency_scope(
         agent_id: request.agent_id.clone(),
         work_order_id: work_order.work_order_id.clone(),
         resolved_run_id: run_id,
-        caller: create_run_caller_scope(request.credential.as_ref(), security),
+        caller: create_run_caller_scope(security),
         request_fingerprint: create_run_request_fingerprint(request, work_order),
     }
 }
@@ -5484,10 +5608,12 @@ pub fn local_percept(schema: impl Into<String>, payload: serde_json::Value) -> P
 mod tests {
     use super::*;
     use axum::extract::Path;
+    use base64::Engine as _;
     use splendor_store::{InMemoryTraceStore, TraceStore};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+    use tower::ServiceExt as _;
 
     fn unit_audit() -> AuditAttribution {
         AuditAttribution {
@@ -6162,6 +6288,190 @@ mod tests {
             .expect_err("resident daemon must not accept anonymous requests");
         assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
         assert_eq!(denied.body.code, "anonymous_non_dev_call");
+    }
+
+    #[tokio::test]
+    async fn resident_mutating_jti_is_one_use_reads_are_reusable_and_create_is_stable_across_jtis()
+    {
+        let now = OffsetDateTime::now_utc();
+        let instance_id = splendor_types::InstanceId::new();
+        let signer = crate::caller_auth::CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:test",
+            "manager-test",
+            "resident-test",
+            "resident-test-key",
+        )
+        .expect("signer");
+        let trust = crate::caller_auth::CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            vec![EndpointScope::RunsCreate, EndpointScope::HealthRead],
+            now,
+        );
+        let verifier = CallerTokenVerifier::new(trust, instance_id.clone()).expect("verifier");
+        let mut work_order_keyring = WorkOrderKeyring::new();
+        work_order_keyring
+            .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
+            .expect("work-order key");
+        let mut policy_bundle_keyring = PolicyBundleKeyring::new();
+        policy_bundle_keyring
+            .insert_shared_secret("policy-local-key", b"splendor-local-policy-secret")
+            .expect("policy key");
+        let state = DaemonState::new(DaemonConfig::resident(
+            instance_id.clone(),
+            verifier,
+            work_order_keyring,
+            policy_bundle_keyring,
+        ));
+        let app = router(state.clone());
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let mut create = unit_create_run_request(
+            tenant_id.clone(),
+            agent_id,
+            Some(run_id.clone()),
+            "wo_resident_replay",
+            "req-resident-replay",
+            "idem-resident-replay",
+        );
+        let first = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                now,
+                time::Duration::seconds(60),
+            )
+            .expect("first token");
+        let encoded_claims = first.encoded.split('.').nth(1).expect("claims segment");
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded_claims)
+                .expect("claims encoding"),
+        )
+        .expect("claims JSON");
+        let raw_jti = claims["jti"].as_str().expect("raw JTI").to_string();
+        let caller_supplied_time = OffsetDateTime::UNIX_EPOCH;
+        create.credential = Some(first.credential.clone());
+        create.audit_attribution = Some(AuditAttribution {
+            principal: first.credential.principal.clone(),
+            credential_id: Some(first.credential.credential_id.clone()),
+            requested_at: caller_supplied_time,
+        });
+        let create_body = serde_json::to_vec(&create).expect("create body");
+        let request = || {
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {}", first.encoded))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(create_body.clone()))
+                .expect("request")
+        };
+        let first_response = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = to_bytes(first_response.into_body(), 1024 * 1024)
+            .await
+            .expect("first body");
+        let first_created: CreateRunResponse =
+            serde_json::from_slice(&first_body).expect("first response");
+        assert!(!first_created.duplicate);
+
+        let replayed = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+        let replayed_body = to_bytes(replayed.into_body(), 1024 * 1024)
+            .await
+            .expect("replay body");
+        let replayed_error: ApiErrorBody =
+            serde_json::from_slice(&replayed_body).expect("replay error");
+        assert_eq!(replayed_error.code, "caller_token_replayed");
+
+        let second = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                OffsetDateTime::now_utc(),
+                time::Duration::seconds(60),
+            )
+            .expect("fresh token");
+        create.credential = None;
+        create.audit_attribution = None;
+        let fresh_request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/runs")
+            .header(header::AUTHORIZATION, format!("Bearer {}", second.encoded))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&create).expect("fresh create body"),
+            ))
+            .expect("fresh request");
+        let duplicate = app.clone().oneshot(fresh_request).await.expect("response");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = to_bytes(duplicate.into_body(), 1024 * 1024)
+            .await
+            .expect("duplicate body");
+        let duplicate: CreateRunResponse =
+            serde_json::from_slice(&duplicate_body).expect("duplicate response");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.run_id, first_created.run_id);
+        assert_eq!(
+            duplicate.idempotency_receipt_id,
+            first_created.idempotency_receipt_id
+        );
+
+        let read = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::HealthRead],
+                OffsetDateTime::now_utc(),
+                time::Duration::seconds(60),
+            )
+            .expect("read token");
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri("/health")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", read.encoded))
+                        .body(Body::empty())
+                        .expect("read request"),
+                )
+                .await
+                .expect("read response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let events = state.resident_security_audit_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "caller_token.replay_denied");
+        assert_eq!(
+            events[0].credential_correlation,
+            first.credential.credential_id
+        );
+        assert!(events[0].credential_correlation.starts_with("sha256:"));
+        let event_json = serde_json::to_string(&events).expect("security audit JSON");
+        assert!(!event_json.contains(&raw_jti));
+        let slot = state.run_slot(&run_id).expect("created run");
+        let records = slot
+            .lock()
+            .expect("run slot")
+            .trace_store
+            .read(&run_id.to_string())
+            .expect("trace records");
+        let trace_json = serde_json::to_string(&records).expect("trace JSON");
+        let caller_time = caller_supplied_time
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("caller time");
+        assert!(!trace_json.contains(&caller_time));
+        assert!(!trace_json.contains(&first.encoded));
+        assert!(!trace_json.contains(&raw_jti));
     }
 
     #[test]

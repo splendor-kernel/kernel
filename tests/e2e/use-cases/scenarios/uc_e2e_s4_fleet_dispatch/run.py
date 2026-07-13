@@ -27,7 +27,11 @@ EDGE_NODE_ID = "00000000-0000-4000-8000-000000000604"
 EDGE_INSTANCE_ID = "00000000-0000-4000-8000-000000000306"
 WORK_ORDER_ID = "wo_uc_e2e_s4_fleet_dispatch"
 MESSAGE_WORK_ORDER_ID = "wo_uc_e2e_s4_remote_message"
-KEY_ID = "work-order-acceptance-key"
+WORK_ORDER_KEY_IDS = {
+    VPC_INSTANCE_ID: "work-order-acceptance-vpc",
+    CLOUD_INSTANCE_ID: "work-order-acceptance-cloud",
+    EDGE_INSTANCE_ID: "work-order-acceptance-edge",
+}
 RUNTIME_IMAGE_IDENTITY = "splendor-kernel-runtime:acceptance-target-runtime"
 
 
@@ -157,7 +161,7 @@ def node_registration(node_id: str, kind: str, target: str, locality: str, url: 
 
 
 def instance_registration(node_id: str, instance_id: str) -> dict[str, Any]:
-    return {"instance_id": instance_id, "node_id": node_id, "runtime_mode": "resident", "hosted_tenants": [TENANT_ID], "supported_features": ["trace.buffer.local", "state.handoff", "message.remote", "gateway.verified"], "runtime_version": "0.1-acceptance", "health": {"status": "healthy", "observed_at": utc(0), "metadata": {"runtime_image_identity": RUNTIME_IMAGE_IDENTITY}}, "registered_at": utc(0)}
+    return {"instance_id": instance_id, "node_id": node_id, "runtime_mode": "resident", "hosted_tenants": [TENANT_ID], "supported_features": ["runtime.resident", "gateway.verified", "trace.buffer.local", "state.handoff", "message.remote", "message.remote.proposal", "sql.read_fixture"], "runtime_version": "0.1-acceptance", "health": {"status": "healthy", "observed_at": utc(0), "metadata": {"runtime_image_identity": RUNTIME_IMAGE_IDENTITY}}, "registered_at": utc(0)}
 
 
 def compose_same_image_evidence(root: Path) -> dict[str, Any]:
@@ -192,10 +196,10 @@ def compose_same_image_evidence(root: Path) -> dict[str, Any]:
     }
 
 
-def work_order(expires: int = 60, revoked: bool = False, target: str = "customer_vpc") -> dict[str, Any]:
+def work_order(expires: int = 60, revoked: bool = False, target: str = "customer_vpc", *, work_order_id: str = WORK_ORDER_ID, required_capability: str = "sql.read_fixture") -> dict[str, Any]:
     return {
         "schema_version": "splendor.work_order.v1",
-        "work_order_id": WORK_ORDER_ID,
+        "work_order_id": work_order_id,
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "run_id": RUN_ID,
@@ -205,7 +209,7 @@ def work_order(expires: int = 60, revoked: bool = False, target: str = "customer
         "allowed_permissions": ["fixture.sql.read"],
         "data_refs": ["dataset:eu-west.fixture.v1"],
         "quotas": {"max_actions_per_tick": 5, "max_action_duration_ms": 30000},
-        "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["sql.read_fixture"]},
+        "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": [required_capability]},
         "issued_at": utc(-2),
         "expires_at": utc(expires),
         "revocation": {"revoked": {"reason": "operator_revoked"}} if revoked else "active",
@@ -232,11 +236,11 @@ def message_work_order(expires: int = 60) -> dict[str, Any]:
     }
 
 
-def sign_work_order(root: Path, artifact_dir: Path, commands: Path, auth_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def sign_work_order(root: Path, artifact_dir: Path, commands: Path, auth_dir: Path, payload: dict[str, Any], instance_id: str = VPC_INSTANCE_ID) -> dict[str, Any]:
     unsigned = artifact_dir / f"{payload['work_order_id']}.unsigned.json"
     write_json(unsigned, payload)
-    secret = (auth_dir / "work-order-signing.secret").read_text(encoding="ascii")
-    command = splendorctl(root) + ["work-order", "sign", "--input", str(unsigned), "--key-id", KEY_ID, "--secret", secret]
+    secret = (auth_dir / f"work-order-signing-{instance_id}.secret").read_text(encoding="ascii")
+    command = splendorctl(root) + ["work-order", "sign", "--input", str(unsigned), "--key-id", WORK_ORDER_KEY_IDS[instance_id], "--secret", secret]
     with commands.open("a", encoding="utf-8") as fh:
         fh.write("$ " + " ".join(command[:-1] + ["[REDACTED]"]) + "\n")
     proc = subprocess.run(command, cwd=root, text=True, capture_output=True)
@@ -320,7 +324,9 @@ def main() -> int:
         call("heartbeatNode", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/heartbeat", {**sec(cred), "heartbeat": {"node_id": node["node_id"], "health": node["health"], "recorded_at": utc(0)}})
         call("advertiseCapabilities", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/capabilities", {**sec(cred), "capability_document": node["capability_document"]})
 
-    envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order())
+    dispatch_payload = work_order()
+    envelope = sign_work_order(root, artifact_dir, commands, auth_dir, dispatch_payload)
+    cloud_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, dispatch_payload, CLOUD_INSTANCE_ID)
     message_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, message_work_order())
     validation = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": envelope, "expected_audience": "central-manager"})
     message_validation = call("submitMessageWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": message_envelope, "expected_audience": "central-manager"})
@@ -348,6 +354,10 @@ def main() -> int:
     cloud_create_cred = cloud_create_auth["credential"]
     cloud_work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", WORK_ORDER_ID)
     cloud_create = {"request_id": f"req-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "idempotency_key": f"idem-uc-e2e-s4-{cloud_work_order_id}-{run_id}", "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "work_order": envelope, "credential": cloud_create_cred, "audit_attribution": audit(cloud_create_cred), "allowed_actions": ["sql.read_fixture"], "allowed_adapters": ["fixture-sql"], "allowed_permissions": ["fixture.sql.read"], "policy_actions": [], "policy_bundle_required": False, "policy_bundle": None, "registered_actions": [{"name": "sql.read_fixture", "adapter": "fixture-sql"}], "approval_policies": [], "allowed_percept_schemas": [], "allowed_percept_sources": [], "initial_state": {"resume_target": "cloud"}, "snapshot_interval": 1}
+    sibling_key_denied = call("createRunSiblingKeyDenied", "POST", args.cloud_url, "/runs", cloud_create, credential_header(cloud_create_auth))
+    cloud_create_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_create"])
+    cloud_create_cred = cloud_create_auth["credential"]
+    cloud_create = {**cloud_create, "work_order": cloud_envelope, "credential": cloud_create_cred, "audit_attribution": audit(cloud_create_cred)}
     call("createRun", "POST", args.cloud_url, "/runs", cloud_create, credential_header(cloud_create_auth))
     cloud_import_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     cloud_import_cred = cloud_import_auth["credential"]
@@ -398,17 +408,21 @@ def main() -> int:
     stale_node["health"]["observed_at"] = utc(-120)
     stale_node["registered_at"] = utc(-120)
     call("registerNode", "POST", args.manager_url, "/fleet/nodes", {**sec(cred), "registration": stale_node})
-    stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "stale-placement", "request": {**placement_request, "required_capabilities": ["stale.only"]}})
+    stale_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order(work_order_id="wo_uc_e2e_s4_stale", required_capability="stale.only"))
+    call("submitStaleWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": stale_envelope, "expected_audience": "central-manager"})
+    stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "wo_uc_e2e_s4_stale", "request": {**placement_request, "required_capabilities": ["stale.only"]}})
 
     def neg(case: str, passed: bool, **details: Any) -> dict[str, Any]:
         return {"case": case, "passed": passed, **details}
 
     wrong_tenant = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager_credential(wrong_tenant=True)), "work_order_id": WORK_ORDER_ID, "request": placement_request})
     wrong_audience = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager_credential(wrong_audience=True)), "work_order_id": WORK_ORDER_ID, "request": placement_request})
-    capability_mismatch = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "missing-capability", "request": {**placement_request, "required_capabilities": ["gpu.unavailable"]}})
+    missing_capability_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order(work_order_id="wo_uc_e2e_s4_missing_capability", required_capability="gpu.unavailable"))
+    call("submitMissingCapabilityWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": missing_capability_envelope, "expected_audience": "central-manager"})
+    capability_mismatch = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "wo_uc_e2e_s4_missing_capability", "request": {**placement_request, "required_capabilities": ["gpu.unavailable"]}})
     unsigned = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": {k: v for k, v in envelope.items() if k != "signature"}, "expected_audience": "central-manager"})
-    expired = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(expires=-1)), "expected_audience": "central-manager"})
-    revoked = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(revoked=True)), "expected_audience": "central-manager"})
+    expired = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(expires=-1, work_order_id="wo_uc_e2e_s4_expired")), "expected_audience": "central-manager"})
+    revoked = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": sign_work_order(root, artifact_dir, commands, auth_dir, work_order(revoked=True, work_order_id="wo_uc_e2e_s4_revoked")), "expected_audience": "central-manager"})
     wrong_wo_audience = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": envelope, "expected_audience": "wrong-manager"})
     receiver_unchanged = state_before_failed_import["body"].get("state_node_id") == state_after_failed_import["body"].get("state_node_id")
     negatives = [
@@ -422,6 +436,7 @@ def main() -> int:
         neg("stale_heartbeat_placement_rejection", stale_placement["body"].get("status") == "rejected", status=stale_placement["body"].get("status"), reasons=stale_placement["body"].get("reasons")),
         neg("dispatch_target_mismatch", dispatch_target_mismatch["status"] == 403 and dispatch_target_mismatch["body"].get("code") == "dispatch_target_mismatch", status=dispatch_target_mismatch["status"], code=dispatch_target_mismatch["body"].get("code")),
         neg("dispatch_revoked_work_order", revoke_dispatch["status"] == 200 and revoked_dispatch["status"] == 403 and revoked_dispatch["body"].get("code") == "revoked_work_order", revoke_status=revoke_dispatch["status"], status=revoked_dispatch["status"], code=revoked_dispatch["body"].get("code")),
+        neg("sibling_work_order_key_rejected", sibling_key_denied["status"] == 403 and sibling_key_denied["body"].get("code") in {"unknown_signature_key", "bad_signature"}, status=sibling_key_denied["status"], code=sibling_key_denied["body"].get("code")),
         neg("duplicate_remote_message", duplicate["body"].get("duplicate") is True and duplicate["body"].get("idempotency_key") == "proposal-once", duplicate=duplicate["body"].get("duplicate"), idempotency_key=duplicate["body"].get("idempotency_key")),
         neg("remote_message_delivery_failure", failed_remote["body"].get("delivery_status") == "failed", status=failed_remote["body"].get("delivery_status")),
         neg("unsupported_remote_message_schema", unsupported_remote["status"] == 400 and unsupported_remote["body"].get("code") == "unsupported_message_schema", status=unsupported_remote["status"], code=unsupported_remote["body"].get("code")),
@@ -458,7 +473,7 @@ def main() -> int:
         "status": "passed" if not scenario_failures else "failed",
         "fr_coverage": ["FR-0.03-02", "FR-0.03-04", "FR-0.03-05", "FR-0.03-08", "FR-0.03-09", "FR-0.03-10", "FR-0.03-11"],
         "components": ["central-manager", "resident-daemon", "fleet", "work-order", "placement", "remote-message", "state-handoff", "trace-sync", "fleet-telemetry", "replay/audit"],
-        "positive_evidence": ["registered VPC and cloud nodes", "narrow signed dispatch and message work orders accepted", "VPC placement selected", "manager dispatched to resident daemon over verified TLS", "remote proposal message delivered", "state snapshot exported/imported", "trace buffer synced", "telemetry reported observational-only"],
+        "positive_evidence": ["registered VPC and cloud nodes", "narrow signed dispatch and message work orders accepted", "VPC placement selected", "manager dispatched to resident daemon over verified TLS", "per-instance work-order key isolation rejected VPC authority at the cloud sibling", "remote proposal message delivered", "state snapshot exported/imported", "trace buffer synced", "telemetry reported observational-only"],
         "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True],
         "replay_evidence": ["resident replayRun public API returned inspect_only replay over exported trace evidence without side effects"],
         "replay_mode": "inspect_only",
@@ -471,6 +486,7 @@ def main() -> int:
         "state_hashes": [exported["body"].get("handoff", {}).get("snapshot", {}).get("state_hash", {}).get("value", "")],
         "message_ids": [message["message"]["message_id"], duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]],
         "work_order_ids": [WORK_ORDER_ID, MESSAGE_WORK_ORDER_ID],
+        "work_order_key_ids": WORK_ORDER_KEY_IDS,
         "approval_ids": [],
         "node_ids": [VPC_NODE_ID, CLOUD_NODE_ID, EDGE_NODE_ID],
         "api_operations": sorted({row["operation_id"] for row in api_rows}),
@@ -485,7 +501,7 @@ def main() -> int:
         "scenario-report.json": scenario,
         "registry.json": {"nodes": nodes, "instances": instances},
         "capabilities.json": {node["node_id"]: node["capability_document"] for node in nodes},
-        "work-order-validation.json": {"dispatch": validation["body"], "remote_message": message_validation["body"]},
+        "work-order-validation.json": {"dispatch": validation["body"], "remote_message": message_validation["body"], "sibling_key_denied": sibling_key_denied, "per_instance_key_ids": WORK_ORDER_KEY_IDS},
         "placement-decision.json": placement["body"],
         "dispatch-report.json": dispatch["body"],
         "remote-message-report.json": {"delivered": remote["body"], "received": received["body"], "duplicate": duplicate["body"], "failed": failed_remote["body"], "unsupported_schema": unsupported_remote, "unauthorized_recipient": unauthorized_remote},

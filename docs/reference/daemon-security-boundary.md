@@ -61,14 +61,24 @@ an atomically replaced trust/revocation snapshot with a controlled restart; hot
 reload/watch propagation is not implemented, and an expired loaded snapshot
 denies requests.
 
+Mutating resident requests atomically consume the verified canonical JTI before
+handler mutation. Concurrent or subsequent reuse is denied with
+`caller_token_replayed`; read-only requests may reuse a token until expiry. The
+live consumed-JTI set is expiry-pruned and bounded; inability to consult it fails
+closed.
+
 The daemon derives the authoritative `CallerCredential` from verified claims.
 Request-body credential/audit fields and `X-Splendor-Caller-Credential` remain
 deprecated compatibility mirrors. They cannot authenticate and must exactly match
 the verified principal, credential ID, binding, audience, scopes, expiry, and
-revocation projection. Missing or invalid proof returns `401` with
+revocation projection when supplied. Resident middleware passes verified context
+through request extensions and supplies internal compatibility fields if they
+are absent. Missing or invalid proof returns `401` with
 `WWW-Authenticate: Bearer realm="splendor-resident", error="invalid_token"`;
 authenticated scope/binding/mirror failures return `403`. Tokens, signatures,
-and key bytes are never copied into errors or traces.
+and key bytes are never copied into errors or traces. The projected credential
+ID is a `sha256:`-prefixed domain-separated correlation digest rather than raw
+JTI.
 
 ## Transport modes
 
@@ -216,6 +226,8 @@ Mutating calls must record caller attribution in trace/audit metadata. The
 reference validator requires `AuditAttribution` for run creation, run resume,
 percept append, and action submit. Attribution must match the authenticated
 credential when a credential is present.
+Resident middleware treats mirror timestamps as non-authoritative and rewrites
+them with a server-owned authentication timestamp before trace/audit recording.
 
 ## SDK/client fallback behavior
 
@@ -223,6 +235,9 @@ SDKs and clients must not silently fall back to insecure unauthenticated
 communication. `validate_client_connection_policy()` rejects
 `allow_unauthenticated_fallback = true` and accepts unauthenticated access only
 when explicit local dev mode passes its local-only warning checks.
+The TypeScript client also rejects remote HTTP, relative/unsupported schemes,
+URL credentials, query, and fragment. Plain HTTP is accepted only for exact
+loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
 
 ## Replay behavior
 

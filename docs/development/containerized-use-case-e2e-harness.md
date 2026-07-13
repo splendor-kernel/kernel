@@ -87,8 +87,13 @@ is `tests/e2e/use-cases/docker-compose.acceptance.yml`. In that composition the
 local daemon sets explicit `local_dev`, the manager sets explicit
 `local_acceptance` plus outbound signer/keyring/CA file paths, and resident nodes
 set explicit instance/trust/work-order/policy/TLS files. An initializer generates
-test-only material into an untracked volume before those services start; resident
-URLs use HTTPS and no resident inherits local development keys.
+test-only material into separate untracked role volumes before those services
+start. Residents never mount the caller private key; each resident mounts only
+its own work-order v1 verifier secret, while the manager receives all issuer
+secrets and the runner receives only the fixture signing inputs it exercises.
+Resident URLs use HTTPS and no resident inherits local development keys. Because
+work-order v1 uses keyed-BLAKE3 shared secrets, this fixture proves scoped sibling
+isolation, not asymmetric issuer/verifier separation.
 
 ```yaml
 services:

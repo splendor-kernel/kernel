@@ -114,7 +114,31 @@ export class SplendorClient {
     if (!options.token.trim()) {
       throw new TypeError("SplendorClient requires an authenticated caller token; unauthenticated fallback is not allowed");
     }
-    this.baseUrl = options.baseUrl.endsWith("/") ? options.baseUrl : `${options.baseUrl}/`;
+    let parsedBaseUrl: URL;
+    try {
+      parsedBaseUrl = new URL(options.baseUrl);
+    } catch {
+      throw new TypeError("SplendorClient bearer transport requires HTTPS or explicit loopback HTTP without URL credentials, query, or fragment");
+    }
+    const hostname = parsedBaseUrl.hostname.toLowerCase();
+    const hasQueryOrFragment = parsedBaseUrl.href.includes("?") || parsedBaseUrl.href.includes("#");
+    const loopbackHttp = parsedBaseUrl.protocol === "http:" && (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    );
+    if (
+      (parsedBaseUrl.protocol !== "https:" && !loopbackHttp) ||
+      parsedBaseUrl.username !== "" ||
+      parsedBaseUrl.password !== "" ||
+      hasQueryOrFragment
+    ) {
+      throw new TypeError("SplendorClient bearer transport requires HTTPS or explicit loopback HTTP without URL credentials, query, or fragment");
+    }
+    parsedBaseUrl.pathname = parsedBaseUrl.pathname.endsWith("/")
+      ? parsedBaseUrl.pathname
+      : `${parsedBaseUrl.pathname}/`;
+    this.baseUrl = parsedBaseUrl.toString();
     this.token = options.token;
     this.fetcher = options.fetch ?? globalThis.fetch?.bind(globalThis);
     if (!this.fetcher) {

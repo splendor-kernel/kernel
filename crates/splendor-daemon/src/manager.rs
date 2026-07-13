@@ -16,14 +16,15 @@ use splendor_store::{
 };
 use splendor_types::{
     select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
-    CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CredentialAudience,
-    CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus,
-    InstanceId, InstanceRegistration, InstanceTelemetry, Message, MessageEnvelope, MessageId,
-    NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
-    PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
-    PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus, RunTelemetry,
-    TaskRequest, TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
+    CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, ContentHash,
+    CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
+    FleetTelemetrySnapshot, HealthStatus, InstanceId, InstanceRegistration, InstanceTelemetry,
+    Message, MessageEnvelope, MessageId, NodeHeartbeat, NodeId, NodeRegistration,
+    PlacementCandidate, PlacementDecision, PlacementDecisionStatus, PlacementExecutionMode,
+    PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId,
+    RunStatus, RunTelemetry, RuntimeMode, TaskRequest, TelemetryRuntimeMode, TenantId,
+    TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -42,8 +43,11 @@ struct ManagerInner {
     registry: InMemoryNodeRegistry,
     work_order_keyring: WorkOrderKeyring,
     work_orders: Mutex<HashMap<String, WorkOrderEnvelope>>,
+    accepted_work_order_bindings: Mutex<HashMap<String, AcceptedWorkOrderBinding>>,
     revoked_work_orders: Mutex<HashSet<String>>,
     placements: Mutex<HashMap<String, PlacementDecision>>,
+    placement_bindings: Mutex<HashMap<String, BoundPlacementBinding>>,
+    dispatch_bindings: Mutex<HashMap<String, DispatchBinding>>,
     dispatches: Mutex<HashMap<String, DispatchReport>>,
     terminal_dispatch_failures: Mutex<HashMap<String, ManagerApiError>>,
     dispatches_in_flight: Mutex<HashSet<String>>,
@@ -67,6 +71,44 @@ struct ResidentDispatchClient {
     create_timeout: StdDuration,
     start_timeout: StdDuration,
     maximum_response_bytes: usize,
+    allowed_origins: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct AcceptedWorkOrder {
+    envelope: WorkOrderEnvelope,
+    payload_digest: String,
+    envelope_digest: String,
+}
+
+#[derive(Clone)]
+struct AcceptedWorkOrderBinding {
+    payload_digest: String,
+    envelope_digest: String,
+}
+
+#[derive(Clone)]
+struct BoundPlacement {
+    request: PlacementRequest,
+    decision: PlacementDecision,
+    decision_digest: String,
+}
+
+#[derive(Clone)]
+struct BoundPlacementBinding {
+    work_order_payload_digest: String,
+    request: PlacementRequest,
+    decision_digest: String,
+}
+
+#[derive(Clone)]
+struct DispatchBinding {
+    work_order_payload_digest: String,
+    placement_decision_digest: String,
+    node_id: NodeId,
+    instance_id: InstanceId,
+    resident_daemon_url: String,
+    resident_origin: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -104,6 +146,9 @@ pub struct ResidentDispatchOptions {
     pub start_timeout: StdDuration,
     pub maximum_response_bytes: usize,
     pub root_ca_pem: Option<Vec<u8>>,
+    /// Exact resident origins allowed to receive manager bearer credentials.
+    /// Values must be origin-only URLs such as `https://resident.example:8443`.
+    pub allowed_origins: Vec<String>,
 }
 
 impl ResidentDispatchOptions {
@@ -115,6 +160,7 @@ impl ResidentDispatchOptions {
             start_timeout: StdDuration::from_secs(35),
             maximum_response_bytes: 1024 * 1024,
             root_ca_pem: None,
+            allowed_origins: Vec::new(),
         }
     }
 
@@ -211,6 +257,10 @@ impl ManagerState {
             create_timeout: options.create_timeout,
             start_timeout: options.start_timeout,
             maximum_response_bytes: options.maximum_response_bytes,
+            allowed_origins: canonical_allowed_origins(
+                &options.allowed_origins,
+                options.allow_loopback_http,
+            )?,
         };
         Ok(Self {
             inner: Arc::new(ManagerInner {
@@ -219,8 +269,11 @@ impl ManagerState {
                 registry: InMemoryNodeRegistry::new(),
                 work_order_keyring,
                 work_orders: Mutex::new(HashMap::new()),
+                accepted_work_order_bindings: Mutex::new(HashMap::new()),
                 revoked_work_orders: Mutex::new(HashSet::new()),
                 placements: Mutex::new(HashMap::new()),
+                placement_bindings: Mutex::new(HashMap::new()),
+                dispatch_bindings: Mutex::new(HashMap::new()),
                 dispatches: Mutex::new(HashMap::new()),
                 terminal_dispatch_failures: Mutex::new(HashMap::new()),
                 dispatches_in_flight: Mutex::new(HashSet::new()),
@@ -1118,6 +1171,12 @@ async fn submit_work_order(
         true,
     )?;
     let work_order_id = request.work_order.work_order.work_order_id.to_string();
+    let accepted = accepted_work_order(request.work_order.clone()).map_err(|_| {
+        ManagerApiError::bad_request(
+            "work_order_digest_unavailable",
+            "work order could not be bound to immutable canonical bytes",
+        )
+    })?;
     if request.expected_audience != state.inner.manager_id {
         state.audit(
             "work_order.rejected",
@@ -1141,18 +1200,55 @@ async fn submit_work_order(
     );
     match validation {
         Ok(_) => {
-            let trace_event_id = state.audit(
-                "work_order.accepted",
-                serde_json::json!({"work_order_id": work_order_id}),
-            )?;
-            state
-                .inner
-                .work_orders
-                .lock()
-                .map_err(|_| {
+            let idempotent = {
+                let mut work_orders = state.inner.work_orders.lock().map_err(|_| {
                     ManagerApiError::internal("work_order_lock", "work order lock unavailable")
-                })?
-                .insert(work_order_id.clone(), request.work_order);
+                })?;
+                let mut bindings =
+                    state
+                        .inner
+                        .accepted_work_order_bindings
+                        .lock()
+                        .map_err(|_| {
+                            ManagerApiError::internal(
+                                "work_order_lock",
+                                "work order binding unavailable",
+                            )
+                        })?;
+                if let Some(existing) = bindings.get(&work_order_id) {
+                    if existing.envelope_digest != accepted.envelope_digest
+                        || existing.payload_digest != accepted.payload_digest
+                    {
+                        state.audit(
+                            "work_order.rejected",
+                            serde_json::json!({"work_order_id": work_order_id, "reason": "work_order_payload_replacement"}),
+                        )?;
+                        return Err(ManagerApiError::conflict(
+                            "work_order_payload_replacement",
+                            "an accepted work-order ID cannot be replaced with different signed bytes",
+                        ));
+                    }
+                    true
+                } else {
+                    work_orders.insert(work_order_id.clone(), accepted.envelope.clone());
+                    bindings.insert(
+                        work_order_id.clone(),
+                        AcceptedWorkOrderBinding {
+                            payload_digest: accepted.payload_digest.clone(),
+                            envelope_digest: accepted.envelope_digest.clone(),
+                        },
+                    );
+                    false
+                }
+            };
+            let trace_event_id = state.audit(
+                if idempotent {
+                    "work_order.acceptance_idempotent"
+                } else {
+                    "work_order.accepted"
+                },
+                serde_json::json!({"work_order_id": work_order_id, "payload_digest": accepted.payload_digest}),
+            )?;
             Ok(Json(WorkOrderValidationReport {
                 work_order_id,
                 accepted: true,
@@ -1211,16 +1307,182 @@ async fn evaluate_placement(
         EndpointScope::FleetRead,
         false,
     )?;
-    let candidates = placement_candidates(&state)?;
+    let bound_work_order = if let Some(work_order_id) = request.work_order_id.as_ref() {
+        let envelope = state
+            .inner
+            .work_orders
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal("work_order_lock", "work order lock unavailable")
+            })?
+            .get(work_order_id)
+            .cloned()
+            .ok_or_else(|| {
+                ManagerApiError::not_found(
+                    "work_order_not_found",
+                    "placement cannot bind an unknown work order",
+                )
+            })?;
+        let accepted = accepted_work_order(envelope).map_err(|_| {
+            ManagerApiError::internal(
+                "work_order_digest_unavailable",
+                "accepted work-order binding could not be reconstructed",
+            )
+        })?;
+        let binding = state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal("work_order_lock", "work order binding unavailable")
+            })?
+            .get(work_order_id)
+            .cloned()
+            .ok_or_else(|| {
+                ManagerApiError::conflict(
+                    "work_order_binding_missing",
+                    "accepted work order is missing its immutable binding",
+                )
+            })?;
+        if binding.payload_digest != accepted.payload_digest
+            || binding.envelope_digest != accepted.envelope_digest
+        {
+            return Err(ManagerApiError::conflict(
+                "work_order_binding_mismatch",
+                "accepted work order no longer matches its immutable binding",
+            ));
+        }
+        Some(accepted)
+    } else {
+        None
+    };
+    if let Some(work_order) = bound_work_order.as_ref() {
+        validate_placement_request_against_work_order(&request.request, &work_order.envelope)?;
+        if let Some(existing) = state
+            .inner
+            .placement_bindings
+            .lock()
+            .map_err(|_| ManagerApiError::internal("placement_lock", "placement lock unavailable"))?
+            .get(
+                request
+                    .work_order_id
+                    .as_deref()
+                    .expect("bound work-order ID"),
+            )
+            .cloned()
+        {
+            if existing.work_order_payload_digest != work_order.payload_digest
+                || existing.request != request.request
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_replacement",
+                    "an accepted work order already has a different immutable placement binding",
+                ));
+            }
+            let decision = state
+                .inner
+                .placements
+                .lock()
+                .map_err(|_| {
+                    ManagerApiError::internal("placement_lock", "placement decision unavailable")
+                })?
+                .get(
+                    request
+                        .work_order_id
+                        .as_deref()
+                        .expect("bound work-order ID"),
+                )
+                .cloned()
+                .ok_or_else(|| {
+                    ManagerApiError::conflict(
+                        "placement_binding_incomplete",
+                        "placement binding is missing its immutable decision",
+                    )
+                })?;
+            if stable_manager_digest(b"splendor.manager.placement-decision.v1\0", &decision)
+                .map_err(|_| {
+                    ManagerApiError::internal(
+                        "placement_digest_unavailable",
+                        "placement decision could not be bound to immutable bytes",
+                    )
+                })?
+                != existing.decision_digest
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_mismatch",
+                    "stored placement decision no longer matches its immutable binding",
+                ));
+            }
+            return Ok(Json(decision));
+        }
+    }
+    let candidates = placement_candidates(
+        &state,
+        bound_work_order
+            .as_ref()
+            .map(|work_order| &work_order.envelope.work_order.tenant_id),
+    )?;
     let decision = select_placement(&request.request, &candidates);
     let work_order_id = request.work_order_id.clone();
     if let Some(work_order_id) = work_order_id.clone() {
-        state
-            .inner
-            .placements
-            .lock()
-            .map_err(|_| ManagerApiError::internal("placement_lock", "placement lock unavailable"))?
-            .insert(work_order_id, decision.clone());
+        let work_order = bound_work_order.as_ref().expect("bound work order");
+        let decision_digest =
+            stable_manager_digest(b"splendor.manager.placement-decision.v1\0", &decision).map_err(
+                |_| {
+                    ManagerApiError::internal(
+                        "placement_digest_unavailable",
+                        "placement decision could not be bound to immutable bytes",
+                    )
+                },
+            )?;
+        let mut placements = state.inner.placements.lock().map_err(|_| {
+            ManagerApiError::internal("placement_lock", "placement decision unavailable")
+        })?;
+        let mut bindings = state.inner.placement_bindings.lock().map_err(|_| {
+            ManagerApiError::internal("placement_lock", "placement binding unavailable")
+        })?;
+        if let Some(existing) = bindings.get(&work_order_id) {
+            if existing.work_order_payload_digest != work_order.payload_digest
+                || existing.request != request.request
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_replacement",
+                    "an accepted work order was concurrently bound to a different immutable placement",
+                ));
+            }
+            let existing_decision = placements.get(&work_order_id).cloned().ok_or_else(|| {
+                ManagerApiError::conflict(
+                    "placement_binding_incomplete",
+                    "placement binding is missing its immutable decision",
+                )
+            })?;
+            if stable_manager_digest(
+                b"splendor.manager.placement-decision.v1\0",
+                &existing_decision,
+            )
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "placement_digest_unavailable",
+                    "placement decision could not be bound to immutable bytes",
+                )
+            })? != existing.decision_digest
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_mismatch",
+                    "stored placement decision no longer matches its immutable binding",
+                ));
+            }
+            return Ok(Json(existing_decision));
+        }
+        placements.insert(work_order_id.clone(), decision.clone());
+        bindings.insert(
+            work_order_id,
+            BoundPlacementBinding {
+                work_order_payload_digest: work_order.payload_digest.clone(),
+                request: request.request.clone(),
+                decision_digest,
+            },
+        );
     }
     state.audit("placement.evaluated", serde_json::json!({"work_order_id": work_order_id, "status": decision.status, "candidate_id": decision.candidate_id, "reasons": decision.reasons}))?;
     Ok(Json(decision))
@@ -1253,7 +1515,7 @@ async fn dispatch_work_order(
             "work order was revoked",
         ));
     }
-    let work_order = state
+    let work_order_envelope = state
         .inner
         .work_orders
         .lock()
@@ -1263,13 +1525,47 @@ async fn dispatch_work_order(
         .ok_or_else(|| {
             ManagerApiError::not_found("work_order_not_found", "work order not submitted")
         })?;
-    let run_id = work_order.work_order.run_id.clone().ok_or_else(|| {
-        ManagerApiError::bad_request(
-            "resident_dispatch_run_id_required",
-            "resident dispatch requires a signed work order bound to a run id",
+    let work_order = accepted_work_order(work_order_envelope).map_err(|_| {
+        ManagerApiError::internal(
+            "work_order_digest_unavailable",
+            "accepted work-order binding could not be reconstructed",
         )
     })?;
-    let placement = state
+    let accepted_binding = state
+        .inner
+        .accepted_work_order_bindings
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal("work_order_lock", "work order binding unavailable")
+        })?
+        .get(&work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::conflict(
+                "work_order_binding_missing",
+                "accepted work order is missing its immutable binding",
+            )
+        })?;
+    if accepted_binding.payload_digest != work_order.payload_digest
+        || accepted_binding.envelope_digest != work_order.envelope_digest
+    {
+        return Err(ManagerApiError::conflict(
+            "work_order_binding_mismatch",
+            "accepted work order no longer matches its immutable binding",
+        ));
+    }
+    let run_id = work_order
+        .envelope
+        .work_order
+        .run_id
+        .clone()
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "resident_dispatch_run_id_required",
+                "resident dispatch requires a signed work order bound to a run id",
+            )
+        })?;
+    let placement_decision = state
         .inner
         .placements
         .lock()
@@ -1282,18 +1578,53 @@ async fn dispatch_work_order(
                 "placement must be evaluated before dispatch",
             )
         })?;
-    if placement.status != PlacementDecisionStatus::Selected {
+    let placement_binding = state
+        .inner
+        .placement_bindings
+        .lock()
+        .map_err(|_| ManagerApiError::internal("placement_lock", "placement binding unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::conflict(
+                "placement_binding_missing",
+                "placement is missing its immutable work-order binding",
+            )
+        })?;
+    if placement_binding.work_order_payload_digest != work_order.payload_digest
+        || stable_manager_digest(
+            b"splendor.manager.placement-decision.v1\0",
+            &placement_decision,
+        )
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "placement_digest_unavailable",
+                "placement decision could not be bound to immutable bytes",
+            )
+        })? != placement_binding.decision_digest
+    {
+        return Err(ManagerApiError::conflict(
+            "dispatch_work_order_binding_mismatch",
+            "placement is not bound to the accepted signed work-order payload",
+        ));
+    }
+    let placement = BoundPlacement {
+        request: placement_binding.request,
+        decision: placement_decision,
+        decision_digest: placement_binding.decision_digest,
+    };
+    if placement.decision.status != PlacementDecisionStatus::Selected {
         return Err(ManagerApiError::forbidden(
             "placement_rejected",
             "cannot dispatch rejected placement",
         ));
     }
-    let expected_target = work_order.work_order.placement.target.clone();
+    let expected_target = work_order.envelope.work_order.placement.target.clone();
     let dispatch_validation = splendor_types::validate_work_order(
-        &work_order,
+        &work_order.envelope,
         &WorkOrderValidationContext {
-            tenant_id: work_order.work_order.tenant_id.clone(),
-            agent_id: work_order.work_order.agent_id.clone(),
+            tenant_id: work_order.envelope.work_order.tenant_id.clone(),
+            agent_id: work_order.envelope.work_order.agent_id.clone(),
             run_id: Some(run_id.clone()),
             expected_placement_target: Some(expected_target.clone()),
             now: OffsetDateTime::now_utc(),
@@ -1314,6 +1645,7 @@ async fn dispatch_work_order(
         .target_node_id
         .or_else(|| {
             placement
+                .decision
                 .candidate_id
                 .as_deref()
                 .and_then(|raw| NodeId::parse(raw).ok())
@@ -1322,6 +1654,7 @@ async fn dispatch_work_order(
             ManagerApiError::bad_request("missing_target_node", "dispatch requires selected node")
         })?;
     let placement_node_id = placement
+        .decision
         .candidate_id
         .as_deref()
         .and_then(|raw| NodeId::parse(raw).ok())
@@ -1341,44 +1674,7 @@ async fn dispatch_work_order(
             "dispatch target does not match evaluated placement",
         ));
     }
-    let node = state
-        .inner
-        .registry
-        .node(&selected_node_id)
-        .map_err(|e| ManagerApiError::not_found("node_not_found", e.to_string()))?;
-    let instance_id = node.instances.first().cloned().ok_or_else(|| {
-        ManagerApiError::bad_request(
-            "node_has_no_instance",
-            "selected node has no registered instance",
-        )
-    })?;
-    let instance = state
-        .inner
-        .registry
-        .instance(&instance_id)
-        .map_err(|e| ManagerApiError::not_found("instance_not_found", e.to_string()))?;
-    if node.health.status != HealthStatus::Healthy
-        || node.last_heartbeat_at + Duration::seconds(60) <= OffsetDateTime::now_utc()
-    {
-        return Err(ManagerApiError::forbidden(
-            "stale_or_unhealthy_node",
-            "selected node heartbeat is stale or unhealthy",
-        ));
-    }
-    let daemon_url = node
-        .registration
-        .capability_document
-        .constraints
-        .get("resident_daemon_url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            ManagerApiError::bad_request(
-                "missing_resident_daemon_url",
-                "node capability constraints must include resident_daemon_url",
-            )
-        })?
-        .to_string();
-    if work_order.work_order.allowed_adapters.len() != 1 {
+    if work_order.envelope.work_order.allowed_adapters.len() != 1 {
         return Err(ManagerApiError::bad_request(
             "resident_dispatch_profile_unsupported",
             "work-order v1 resident dispatch requires exactly one allowed adapter",
@@ -1428,14 +1724,27 @@ async fn dispatch_work_order(
     {
         return Err(existing);
     }
+    let dispatch_binding = resolve_dispatch_binding(
+        &state,
+        &work_order_id,
+        &work_order,
+        &placement,
+        &selected_node_id,
+    )?;
+    state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&dispatch_binding.resident_daemon_url)?;
+    let instance_id = dispatch_binding.instance_id.clone();
+    let daemon_url = dispatch_binding.resident_daemon_url.clone();
     let create_auth = resident_credential(
         &state.inner.resident_dispatch,
-        &instance.registration.instance_id,
-        &work_order.work_order.tenant_id,
+        &instance_id,
+        &work_order.envelope.work_order.tenant_id,
     )?;
     let create_audit = resident_audit(&create_auth.credential);
     let create = resident_create_run_payload(
-        &work_order,
+        &work_order.envelope,
         &run_id,
         serde_json::to_value(&create_auth.credential).map_err(|_| {
             ManagerApiError::internal(
@@ -1486,8 +1795,8 @@ async fn dispatch_work_order(
     }
 
     let start_auth = state.inner.resident_dispatch.signed_caller(
-        &work_order.work_order.tenant_id,
-        &instance.registration.instance_id,
+        &work_order.envelope.work_order.tenant_id,
+        &instance_id,
         EndpointScope::RunsStart,
     )?;
     let start_audit = resident_audit(&start_auth.credential);
@@ -1511,7 +1820,7 @@ async fn dispatch_work_order(
     let start_response = match start_result {
         Ok(response) => response,
         Err(error) => {
-            let effect_unknown = matches!(&error, ResidentHttpError::Transport { timeout: true });
+            let effect_unknown = error.effect_may_have_occurred();
             let _ = state.audit(
                 if effect_unknown {
                     "dispatch.effect_unknown"
@@ -1523,7 +1832,7 @@ async fn dispatch_work_order(
                     "run_id": run_id,
                     "phase": "start",
                     "reason": resident_http_error_reason(&error),
-                    "effect_certainty": if effect_unknown { "unknown" } else { "not_confirmed" },
+                    "effect_certainty": if effect_unknown { "unknown" } else { "not_started" },
                     "automatic_retry": false,
                 }),
             );
@@ -1538,12 +1847,12 @@ async fn dispatch_work_order(
     };
     if start_response.value.run_id != run_id {
         let _ = state.audit(
-            "dispatch.partial_failure",
-            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "start", "reason": "resident_identity_mismatch"}),
+            "dispatch.effect_unknown",
+            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "start", "reason": "resident_identity_mismatch", "effect_certainty": "unknown", "automatic_retry": false}),
         );
-        let error = ManagerApiError::bad_gateway(
-            "resident_start_identity_mismatch",
-            "resident start response did not match dispatched run identity",
+        let error = ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start returned a mismatched run identity after request send; effect certainty is unknown and automatic retry is forbidden",
         );
         return Err(persist_terminal_dispatch_failure(
             &state,
@@ -1597,8 +1906,8 @@ async fn dispatch_work_order(
         .lock()
         .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
         .upsert_run(RunTelemetry {
-            tenant_id: work_order.work_order.tenant_id,
-            agent_id: work_order.work_order.agent_id,
+            tenant_id: work_order.envelope.work_order.tenant_id,
+            agent_id: work_order.envelope.work_order.agent_id,
             run_id,
             node_id: selected_node_id,
             instance_id,
@@ -3227,6 +3536,10 @@ async fn activate_kill_switch(
     if let (Some(target), Some(run_id), Some(tenant_id)) =
         (&target, &request.run_id, &request.tenant_id)
     {
+        state
+            .inner
+            .resident_dispatch
+            .validate_base_url(&target.daemon_url)?;
         let caller = state.inner.resident_dispatch.signed_caller(
             tenant_id,
             &target.instance_id,
@@ -3454,7 +3767,77 @@ async fn audit_events(
     ))
 }
 
-fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>, ManagerApiError> {
+fn accepted_work_order(envelope: WorkOrderEnvelope) -> Result<AcceptedWorkOrder, ()> {
+    let payload = envelope
+        .work_order
+        .signing_payload_bytes()
+        .map_err(|_| ())?;
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|_| ())?;
+    let mut payload_input = b"splendor.manager.accepted-work-order-payload.v1\0".to_vec();
+    payload_input.extend_from_slice(&payload);
+    let mut envelope_input = b"splendor.manager.accepted-work-order-envelope.v1\0".to_vec();
+    envelope_input.extend_from_slice(&envelope_bytes);
+    Ok(AcceptedWorkOrder {
+        envelope,
+        payload_digest: ContentHash::blake3(payload_input).to_string(),
+        envelope_digest: ContentHash::blake3(envelope_input).to_string(),
+    })
+}
+
+fn stable_manager_digest(
+    domain: &[u8],
+    value: &impl Serialize,
+) -> Result<String, serde_json::Error> {
+    let mut input = domain.to_vec();
+    input.extend_from_slice(&serde_json::to_vec(value)?);
+    Ok(ContentHash::blake3(input).to_string())
+}
+
+fn validate_placement_request_against_work_order(
+    request: &PlacementRequest,
+    work_order: &WorkOrderEnvelope,
+) -> Result<(), ManagerApiError> {
+    let signed = &work_order.work_order.placement;
+    let mut requested_capabilities = request.required_capabilities.clone();
+    requested_capabilities.sort();
+    requested_capabilities.dedup();
+    let mut signed_capabilities = signed.required_capabilities.clone();
+    signed_capabilities.sort();
+    signed_capabilities.dedup();
+    let signed_locality = signed
+        .data_locality
+        .as_deref()
+        .and_then(|value| match value {
+            "cloud" => Some(DataLocality::Cloud),
+            "vpc" => Some(DataLocality::Vpc),
+            "on_prem" => Some(DataLocality::OnPrem),
+            "device" => Some(DataLocality::Device),
+            _ => None,
+        });
+    let gpu_requirement_satisfied = !signed.requires_gpu.unwrap_or(false)
+        || requested_capabilities
+            .iter()
+            .any(|capability| capability == "gpu" || capability.starts_with("gpu."));
+    if request.target.as_str() != signed.target
+        || requested_capabilities != signed_capabilities
+        || signed_locality.is_some_and(|locality| request.data_locality != Some(locality))
+        || request.dedicated_instance != signed.dedicated_instance.unwrap_or(false)
+        || request.max_runtime_ms != signed.max_runtime_ms
+        || request.execution_mode != signed.execution_mode
+        || !gpu_requirement_satisfied
+    {
+        return Err(ManagerApiError::forbidden(
+            "placement_request_work_order_mismatch",
+            "placement request does not exactly preserve the signed work-order placement constraints",
+        ));
+    }
+    Ok(())
+}
+
+fn placement_candidates(
+    state: &ManagerState,
+    tenant_id: Option<&TenantId>,
+) -> Result<Vec<PlacementCandidate>, ManagerApiError> {
     let audit = state
         .inner
         .audit
@@ -3482,6 +3865,22 @@ fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>,
             .registry
             .node(&node_id)
             .map_err(|e| ManagerApiError::not_found("node_not_found", e.to_string()))?;
+        if node
+            .registration
+            .scope
+            .fleet_id
+            .as_ref()
+            .is_some_and(|fleet_id| fleet_id != &state.inner.fleet_id)
+            || tenant_id.is_some_and(|tenant_id| {
+                node.registration
+                    .scope
+                    .tenant_id
+                    .as_ref()
+                    .is_some_and(|node_tenant| node_tenant != tenant_id)
+            })
+        {
+            continue;
+        }
         let target = match node
             .registration
             .capability_document
@@ -3523,6 +3922,226 @@ fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>,
         candidates.push(candidate);
     }
     Ok(candidates)
+}
+
+fn resolve_dispatch_binding(
+    state: &ManagerState,
+    work_order_id: &str,
+    work_order: &AcceptedWorkOrder,
+    placement: &BoundPlacement,
+    selected_node_id: &NodeId,
+) -> Result<DispatchBinding, ManagerApiError> {
+    if let Some(existing) = state
+        .inner
+        .dispatch_bindings
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal("dispatch_binding_lock", "dispatch binding unavailable")
+        })?
+        .get(work_order_id)
+        .cloned()
+    {
+        if existing.work_order_payload_digest != work_order.payload_digest
+            || existing.placement_decision_digest != placement.decision_digest
+            || &existing.node_id != selected_node_id
+        {
+            return Err(ManagerApiError::conflict(
+                "dispatch_binding_replacement",
+                "resident dispatch is already immutably bound to different authority or placement",
+            ));
+        }
+        ensure_bound_instance_eligible(state, work_order, placement, &existing)?;
+        return Ok(existing);
+    }
+
+    let node = state
+        .inner
+        .registry
+        .node(selected_node_id)
+        .map_err(|error| ManagerApiError::not_found("node_not_found", error.to_string()))?;
+    let now = OffsetDateTime::now_utc();
+    if node.health.status != HealthStatus::Healthy
+        || node.last_heartbeat_at + Duration::seconds(60) <= now
+    {
+        return Err(ManagerApiError::forbidden(
+            "stale_or_unhealthy_node",
+            "selected node heartbeat is stale or unhealthy",
+        ));
+    }
+    if node
+        .registration
+        .scope
+        .fleet_id
+        .as_ref()
+        .is_some_and(|fleet_id| fleet_id != &state.inner.fleet_id)
+        || node
+            .registration
+            .scope
+            .tenant_id
+            .as_ref()
+            .is_some_and(|tenant_id| tenant_id != &work_order.envelope.work_order.tenant_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "resident_node_scope_mismatch",
+            "selected node is outside the signed fleet or tenant scope",
+        ));
+    }
+
+    let mut eligible = Vec::new();
+    for instance_id in &node.instances {
+        let instance = state
+            .inner
+            .registry
+            .instance(instance_id)
+            .map_err(|error| ManagerApiError::not_found("instance_not_found", error.to_string()))?;
+        if instance_is_eligible(
+            &instance,
+            &node.registration.runtime_version,
+            &work_order.envelope.work_order.tenant_id,
+            &placement.request,
+            now,
+        ) {
+            eligible.push(instance.registration.instance_id);
+        }
+    }
+    let instance_id = match eligible.as_slice() {
+        [instance_id] => instance_id.clone(),
+        [] => {
+            return Err(ManagerApiError::forbidden(
+                "no_eligible_resident_instance",
+                "selected node has no healthy resident instance supporting the signed tenant and placement requirements",
+            ))
+        }
+        _ => {
+            return Err(ManagerApiError::conflict(
+                "ambiguous_eligible_resident_instances",
+                "selected node has multiple eligible resident instances; exact instance selection is required",
+            ))
+        }
+    };
+    let resident_daemon_url = node
+        .registration
+        .capability_document
+        .constraints
+        .get("resident_daemon_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "missing_resident_daemon_url",
+                "node capability constraints must include resident_daemon_url",
+            )
+        })?
+        .to_string();
+    let resident_origin = state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&resident_daemon_url)?;
+    let binding = DispatchBinding {
+        work_order_payload_digest: work_order.payload_digest.clone(),
+        placement_decision_digest: placement.decision_digest.clone(),
+        node_id: selected_node_id.clone(),
+        instance_id,
+        resident_daemon_url,
+        resident_origin,
+    };
+    let mut bindings = state.inner.dispatch_bindings.lock().map_err(|_| {
+        ManagerApiError::internal("dispatch_binding_lock", "dispatch binding unavailable")
+    })?;
+    match bindings.get(work_order_id) {
+        Some(existing)
+            if existing.work_order_payload_digest == binding.work_order_payload_digest
+                && existing.placement_decision_digest == binding.placement_decision_digest
+                && existing.node_id == binding.node_id
+                && existing.instance_id == binding.instance_id
+                && existing.resident_daemon_url == binding.resident_daemon_url
+                && existing.resident_origin == binding.resident_origin =>
+        {
+            Ok(existing.clone())
+        }
+        Some(_) => Err(ManagerApiError::conflict(
+            "dispatch_binding_replacement",
+            "resident dispatch was concurrently bound to a different instance",
+        )),
+        None => {
+            bindings.insert(work_order_id.to_string(), binding.clone());
+            Ok(binding)
+        }
+    }
+}
+
+fn ensure_bound_instance_eligible(
+    state: &ManagerState,
+    work_order: &AcceptedWorkOrder,
+    placement: &BoundPlacement,
+    binding: &DispatchBinding,
+) -> Result<(), ManagerApiError> {
+    let node = state
+        .inner
+        .registry
+        .node(&binding.node_id)
+        .map_err(|error| ManagerApiError::not_found("node_not_found", error.to_string()))?;
+    let instance = state
+        .inner
+        .registry
+        .instance(&binding.instance_id)
+        .map_err(|error| ManagerApiError::not_found("instance_not_found", error.to_string()))?;
+    let now = OffsetDateTime::now_utc();
+    if node.health.status != HealthStatus::Healthy
+        || node.last_heartbeat_at + Duration::seconds(60) <= now
+        || !instance_is_eligible(
+            &instance,
+            &node.registration.runtime_version,
+            &work_order.envelope.work_order.tenant_id,
+            &placement.request,
+            now,
+        )
+    {
+        return Err(ManagerApiError::forbidden(
+            "bound_resident_instance_no_longer_eligible",
+            "the immutably selected resident instance is no longer healthy or compatible",
+        ));
+    }
+    let current_origin = state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&binding.resident_daemon_url)?;
+    if current_origin != binding.resident_origin {
+        return Err(ManagerApiError::forbidden(
+            "resident_origin_binding_mismatch",
+            "resident origin no longer matches the immutable dispatch binding",
+        ));
+    }
+    Ok(())
+}
+
+fn instance_is_eligible(
+    instance: &splendor_kernel::InstanceRecord,
+    node_runtime_version: &str,
+    tenant_id: &TenantId,
+    placement: &PlacementRequest,
+    now: OffsetDateTime,
+) -> bool {
+    let features = instance
+        .registration
+        .supported_features
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    instance.registration.runtime_mode == RuntimeMode::Resident
+        && instance.health.status == HealthStatus::Healthy
+        && instance.last_heartbeat_at + Duration::seconds(60) > now
+        && instance.registration.hosted_tenants.contains(tenant_id)
+        && instance.registration.runtime_version == node_runtime_version
+        && placement
+            .required_runtime_version
+            .as_ref()
+            .is_none_or(|required| required == &instance.registration.runtime_version)
+        && features.contains("runtime.resident")
+        && features.contains("gateway.verified")
+        && placement
+            .required_capabilities
+            .iter()
+            .all(|required| features.contains(required.as_str()))
 }
 
 #[derive(Debug)]
@@ -3603,6 +4222,7 @@ enum ResidentHttpError {
     InvalidUrl,
     Transport {
         timeout: bool,
+        request_sent: bool,
     },
     ResponseTooLarge,
     UnexpectedStatus {
@@ -3612,7 +4232,32 @@ enum ResidentHttpError {
     InvalidResponse,
 }
 
+impl ResidentHttpError {
+    fn effect_may_have_occurred(&self) -> bool {
+        match self {
+            Self::InvalidUrl => false,
+            Self::Transport { request_sent, .. } => *request_sent,
+            Self::ResponseTooLarge | Self::UnexpectedStatus { .. } | Self::InvalidResponse => true,
+        }
+    }
+}
+
 impl ResidentDispatchClient {
+    fn validate_base_url(&self, base_url: &str) -> Result<String, ManagerApiError> {
+        let url = reqwest::Url::parse(base_url).map_err(|_| {
+            ManagerApiError::bad_request(
+                "invalid_resident_daemon_url",
+                "resident daemon URL must be an allowlisted exact origin",
+            )
+        })?;
+        validate_resident_url(&url, self.allow_loopback_http, &self.allowed_origins).map_err(|_| {
+            ManagerApiError::bad_request(
+                "resident_origin_not_allowed",
+                "resident daemon URL origin is not in the configured exact-origin allowlist",
+            )
+        })
+    }
+
     async fn post_json<T: for<'de> Deserialize<'de> + Serialize>(
         &self,
         base_url: &str,
@@ -3623,7 +4268,7 @@ impl ResidentDispatchClient {
         expected_status: reqwest::StatusCode,
     ) -> Result<ResidentHttpResponse<T>, ResidentHttpError> {
         let mut url = reqwest::Url::parse(base_url).map_err(|_| ResidentHttpError::InvalidUrl)?;
-        validate_resident_url(&url, self.allow_loopback_http)?;
+        validate_resident_url(&url, self.allow_loopback_http, &self.allowed_origins)?;
         let base_path = url.path().trim_end_matches('/');
         url.set_path(&format!("{base_path}{path}"));
         url.set_query(None);
@@ -3640,6 +4285,7 @@ impl ResidentDispatchClient {
                 .await
                 .map_err(|error| ResidentHttpError::Transport {
                     timeout: error.is_timeout(),
+                    request_sent: !error.is_connect(),
                 })?;
             let status = response.status();
             let bytes = read_bounded_response(response, self.maximum_response_bytes).await?;
@@ -3663,7 +4309,10 @@ impl ResidentDispatchClient {
             })
         })
         .await
-        .map_err(|_| ResidentHttpError::Transport { timeout: true })?
+        .map_err(|_| ResidentHttpError::Transport {
+            timeout: true,
+            request_sent: true,
+        })?
     }
 
     fn signed_caller(
@@ -3707,6 +4356,7 @@ async fn read_bounded_response(
             .await
             .map_err(|error| ResidentHttpError::Transport {
                 timeout: error.is_timeout(),
+                request_sent: true,
             })?
     {
         if body.len().saturating_add(chunk.len()) > maximum_response_bytes {
@@ -3720,26 +4370,68 @@ async fn read_bounded_response(
 fn validate_resident_url(
     url: &reqwest::Url,
     allow_loopback_http: bool,
-) -> Result<(), ResidentHttpError> {
-    if !url.username().is_empty() || url.password().is_some() || url.host_str().is_none() {
+    allowed_origins: &HashSet<String>,
+) -> Result<String, ResidentHttpError> {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
         return Err(ResidentHttpError::InvalidUrl);
     }
-    if url.scheme() == "https" {
-        return Ok(());
-    }
-    if url.scheme() != "http" || !allow_loopback_http {
+    if url.scheme() != "https" && (url.scheme() != "http" || !allow_loopback_http) {
         return Err(ResidentHttpError::InvalidUrl);
     }
-    let is_loopback = url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if !is_loopback {
+    if url.scheme() == "http"
+        && !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
         return Err(ResidentHttpError::InvalidUrl);
     }
-    Ok(())
+    let origin = url.origin().ascii_serialization();
+    if !allowed_origins.contains(&origin) {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    Ok(origin)
+}
+
+fn canonical_allowed_origins(
+    origins: &[String],
+    allow_loopback_http: bool,
+) -> Result<HashSet<String>, String> {
+    let mut canonical = HashSet::new();
+    for raw in origins {
+        let url = reqwest::Url::parse(raw)
+            .map_err(|_| "resident allowed origin is invalid".to_string())?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+            || (url.scheme() != "https" && (url.scheme() != "http" || !allow_loopback_http))
+            || (url.scheme() == "http"
+                && !url.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                }))
+        {
+            return Err("resident allowed origin is invalid".to_string());
+        }
+        let origin = url.origin().ascii_serialization();
+        if !canonical.insert(origin) {
+            return Err("resident allowed origins must be unique".to_string());
+        }
+    }
+    Ok(canonical)
 }
 
 fn bounded_upstream_code(code: String) -> Option<String> {
@@ -3758,8 +4450,8 @@ fn bounded_upstream_code(code: String) -> Option<String> {
 fn resident_http_error_reason(error: &ResidentHttpError) -> &'static str {
     match error {
         ResidentHttpError::InvalidUrl => "invalid_resident_url",
-        ResidentHttpError::Transport { timeout: true } => "resident_timeout",
-        ResidentHttpError::Transport { timeout: false } => "resident_transport_failure",
+        ResidentHttpError::Transport { timeout: true, .. } => "resident_timeout",
+        ResidentHttpError::Transport { timeout: false, .. } => "resident_transport_failure",
         ResidentHttpError::ResponseTooLarge => "resident_response_too_large",
         ResidentHttpError::UnexpectedStatus { .. } => "resident_rejected_request",
         ResidentHttpError::InvalidResponse => "resident_invalid_response",
@@ -3774,7 +4466,7 @@ fn resident_http_error(
     if effect_unknown {
         return ManagerApiError::gateway_timeout(
             "resident_start_effect_unknown",
-            "resident start timed out; effect certainty is unknown and automatic retry is forbidden",
+            "resident start completed without authoritative success; effect certainty is unknown and automatic retry is forbidden",
         );
     }
     match error {
@@ -3782,11 +4474,11 @@ fn resident_http_error(
             "invalid_resident_daemon_url",
             "resident daemon URL must use HTTPS, except explicit loopback tests",
         ),
-        ResidentHttpError::Transport { timeout: true } => ManagerApiError::gateway_timeout(
+        ResidentHttpError::Transport { timeout: true, .. } => ManagerApiError::gateway_timeout(
             format!("resident_{phase}_timeout"),
             format!("resident {phase} request timed out"),
         ),
-        ResidentHttpError::Transport { timeout: false } => ManagerApiError::bad_gateway(
+        ResidentHttpError::Transport { timeout: false, .. } => ManagerApiError::bad_gateway(
             format!("resident_{phase}_transport_error"),
             format!("resident {phase} request failed before a valid response"),
         ),
@@ -3885,6 +4577,19 @@ mod tests {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("timestamp formats")
+    }
+
+    fn manager_with_allowed_origins(allowed_origins: Vec<String>) -> ManagerState {
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "resident-dispatch-client",
+            "manager-resident-unit-test",
+        )
+        .expect("unit-test caller signer");
+        let mut options = ResidentDispatchOptions::loopback_test();
+        options.allowed_origins = allowed_origins;
+        ManagerState::local_acceptance_with_dispatch(signer, options).expect("unit-test manager")
     }
 
     fn test_work_order(target_agent: &str) -> WorkOrderEnvelope {
@@ -4068,7 +4773,14 @@ mod tests {
             "node_id": node_id,
             "runtime_mode": "resident",
             "hosted_tenants": [tenant_id],
-            "supported_features": ["message.remote"],
+            "supported_features": [
+                "runtime.resident",
+                "gateway.verified",
+                "message.remote",
+                "message.remote.proposal",
+                "sql.read_fixture",
+                "artifact.create_internal"
+            ],
             "runtime_version": "0.1-test",
             "health": {"status": "healthy", "observed_at": now_rfc3339(), "metadata": {}},
             "registered_at": now_rfc3339()
@@ -4558,6 +5270,66 @@ mod tests {
         assert_eq!(error.body.code, "instance_registration_rejected");
     }
 
+    #[tokio::test]
+    async fn accepted_work_order_ids_are_immutable_and_matching_resubmission_is_idempotent() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+        let original = dispatch_test_work_order();
+        let first = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: original.clone(),
+                expected_audience: "central-manager".to_string(),
+            }),
+        )
+        .await
+        .expect("first work order accepted")
+        .0;
+        let duplicate = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: original.clone(),
+                expected_audience: "central-manager".to_string(),
+            }),
+        )
+        .await
+        .expect("matching signed bytes accepted idempotently")
+        .0;
+        assert!(first.accepted && duplicate.accepted);
+
+        let mut replacement_payload = original.work_order.clone();
+        replacement_payload.objective = "same ID with replacement authority".to_string();
+        let replacement = WorkOrderEnvelope::signed_with_shared_secret(
+            replacement_payload,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("valid replacement signature");
+        let denied = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security,
+                work_order: replacement,
+                expected_audience: "central-manager".to_string(),
+            }),
+        )
+        .await
+        .expect_err("same ID cannot replace accepted signed bytes");
+        assert_eq!(denied.status, StatusCode::CONFLICT);
+        assert_eq!(denied.body.code, "work_order_payload_replacement");
+        let stored = state
+            .inner
+            .work_orders
+            .lock()
+            .expect("work-order lock")
+            .get("wo_test_dispatch")
+            .cloned()
+            .expect("original remains stored");
+        assert_eq!(stored, original);
+    }
+
     #[test]
     fn manager_mutating_endpoints_require_matching_audit_attribution() {
         let state = ManagerState::local_acceptance();
@@ -4647,7 +5419,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_governance_handlers_cover_s5_authority_and_audit_paths() {
-        let state = ManagerState::local_acceptance();
+        let resident_url = spawn_fixed_status_server();
+        let state = manager_with_allowed_origins(vec![resident_url.clone()]);
         let security = manager_security(
             &state,
             vec![
@@ -4995,7 +5768,6 @@ mod tests {
 
         let target_node_id = "00000000-0000-4000-8000-000000000905";
         let target_instance_id = "00000000-0000-4000-8000-000000000906";
-        let resident_url = spawn_fixed_status_server();
         let registered_node = register_node(
             State(state.clone()),
             Json(RegisterNodeRequest {
@@ -6024,11 +6796,7 @@ mod tests {
         .expect("work order accepted");
         let placement_request = PlacementRequest {
             target: PlacementTarget::CustomerVpc,
-            required_capabilities: vec![
-                "sql.read_fixture".to_string(),
-                "artifact.create_internal".to_string(),
-                "message.remote.proposal".to_string(),
-            ],
+            required_capabilities: vec!["message.remote.proposal".to_string()],
             data_locality: Some(DataLocality::Vpc),
             dedicated_instance: false,
             required_runtime_version: None,
@@ -6612,7 +7380,7 @@ mod tests {
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("rejected-placement".to_string()),
+                work_order_id: None,
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
                     required_capabilities: vec!["missing.capability".to_string()],
@@ -6842,6 +7610,7 @@ mod tests {
                 "sql.read_fixture",
                 "artifact.create_internal",
                 "message.remote.proposal",
+                "runtime.resident",
             ],
         );
         let cloud_node = node(
@@ -6885,7 +7654,7 @@ mod tests {
             .expect("node registered");
         }
 
-        let candidates = placement_candidates(&state).expect("placement candidates");
+        let candidates = placement_candidates(&state, None).expect("placement candidates");
         assert!(candidates.iter().any(|candidate| {
             candidate.candidate_id == edge_node.node_id.to_string()
                 && candidate.target == PlacementTarget::EdgeDevice
@@ -6897,7 +7666,8 @@ mod tests {
                 && candidate.data_locality == Some(DataLocality::OnPrem)
         }));
 
-        let work_order = test_work_order("33333333-3333-4333-8333-333333333333");
+        let work_order = dispatch_test_work_order();
+        let work_order_id = work_order.work_order.work_order_id.to_string();
         let _ = submit_work_order(
             State(state.clone()),
             Json(SubmitWorkOrderRequest {
@@ -6909,11 +7679,11 @@ mod tests {
         .await
         .expect("work order submitted");
 
-        let rejected = evaluate_placement(
+        let mismatched_placement = evaluate_placement(
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("wo_test_remote".to_string()),
+                work_order_id: Some(work_order_id.clone()),
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
                     required_capabilities: vec!["capability.not.present".to_string()],
@@ -6926,10 +7696,13 @@ mod tests {
             }),
         )
         .await
-        .expect("rejected placement decision");
-        assert_eq!(rejected.0.status, PlacementDecisionStatus::Rejected);
+        .expect_err("placement cannot weaken or replace signed constraints");
+        assert_eq!(
+            mismatched_placement.body.code,
+            "placement_request_work_order_mismatch"
+        );
         let error = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6937,17 +7710,17 @@ mod tests {
             }),
         )
         .await
-        .expect_err("rejected placement cannot dispatch");
-        assert_eq!(error.body.code, "placement_rejected");
+        .expect_err("unbound placement cannot dispatch");
+        assert_eq!(error.body.code, "placement_required");
 
         let selected = evaluate_placement(
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("wo_test_remote".to_string()),
+                work_order_id: Some(work_order_id.clone()),
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
-                    required_capabilities: vec!["sql.read_fixture".to_string()],
+                    required_capabilities: vec!["runtime.resident".to_string()],
                     data_locality: Some(DataLocality::Vpc),
                     dedicated_instance: false,
                     required_runtime_version: None,
@@ -6961,7 +7734,7 @@ mod tests {
         assert_eq!(selected.0.status, PlacementDecisionStatus::Selected);
 
         let mismatch = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6972,8 +7745,21 @@ mod tests {
         .expect_err("target mismatch rejected");
         assert_eq!(mismatch.body.code, "dispatch_target_mismatch");
 
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(
+                    &vpc_node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000301",
+                    &TenantId::new(),
+                ),
+            }),
+        )
+        .await
+        .expect("wrong-tenant instance registered");
         let no_instance = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6981,8 +7767,8 @@ mod tests {
             }),
         )
         .await
-        .expect_err("node without instance rejected");
-        assert_eq!(no_instance.body.code, "node_has_no_instance");
+        .expect_err("instance that does not host the signed tenant is ineligible");
+        assert_eq!(no_instance.body.code, "no_eligible_resident_instance");
 
         let mut invalid_candidate = selected.0.clone();
         invalid_candidate.candidate_id = Some("not-a-node-id".to_string());
@@ -6991,9 +7777,9 @@ mod tests {
             .placements
             .lock()
             .expect("placement lock")
-            .insert("wo_test_remote".to_string(), invalid_candidate.clone());
+            .insert(work_order_id.clone(), invalid_candidate.clone());
         let missing_target = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -7001,11 +7787,14 @@ mod tests {
             }),
         )
         .await
-        .expect_err("invalid placement candidate cannot infer target");
-        assert_eq!(missing_target.body.code, "missing_target_node");
+        .expect_err("mutated placement cannot replace its immutable binding");
+        assert_eq!(
+            missing_target.body.code,
+            "dispatch_work_order_binding_mismatch"
+        );
 
         let missing_candidate = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -7013,15 +7802,18 @@ mod tests {
             }),
         )
         .await
-        .expect_err("invalid placement candidate rejected");
-        assert_eq!(missing_candidate.body.code, "placement_candidate_missing");
+        .expect_err("mutated placement remains fail closed");
+        assert_eq!(
+            missing_candidate.body.code,
+            "dispatch_work_order_binding_mismatch"
+        );
 
         state
             .inner
             .placements
             .lock()
             .expect("placement lock")
-            .insert("wo_test_remote".to_string(), selected.0.clone());
+            .insert(work_order_id.clone(), selected.0.clone());
 
         let _ = register_instance(
             State(state.clone()),
@@ -7037,52 +7829,8 @@ mod tests {
         .await
         .expect("instance registered");
 
-        let no_url_node: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "node_id": "00000000-0000-4000-8000-000000000704",
-            "kind": "vpc.worker",
-            "scope": {"fleet_id": state.inner.fleet_id, "tenant_id": null},
-            "capability_document": {
-                "schema": "splendor.capabilities.v1",
-                "capabilities": ["sql.read_fixture"],
-                "constraints": {"placement_target": "customer_vpc", "data_locality": "vpc"}
-            },
-            "runtime_version": "0.1-test",
-            "health": {"status": "healthy", "observed_at": now_rfc3339(), "metadata": {}},
-            "registered_at": now_rfc3339()
-        }))
-        .expect("no url node");
-        let _ = register_node(
-            State(state.clone()),
-            Json(RegisterNodeRequest {
-                security: security.clone(),
-                registration: no_url_node.clone(),
-            }),
-        )
-        .await
-        .expect("no url node registered");
-        let _ = register_instance(
-            State(state.clone()),
-            Json(RegisterInstanceRequest {
-                security: security.clone(),
-                registration: instance(
-                    &no_url_node.node_id.to_string(),
-                    "00000000-0000-4000-8000-000000000704",
-                    &tenant_id,
-                ),
-            }),
-        )
-        .await
-        .expect("no url instance registered");
-        let mut no_url_placement = selected.0.clone();
-        no_url_placement.candidate_id = Some(no_url_node.node_id.to_string());
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), no_url_placement);
-        let missing_url = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+        let blocked_egress = dispatch_work_order(
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -7090,55 +7838,24 @@ mod tests {
             }),
         )
         .await
-        .expect_err("missing resident url rejected");
-        assert_eq!(missing_url.body.code, "missing_resident_daemon_url");
+        .expect_err("unallowlisted resident origin is rejected before network I/O");
+        assert_eq!(blocked_egress.body.code, "resident_origin_not_allowed");
 
-        let offline_node: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "node_id": "00000000-0000-4000-8000-000000000804",
-            "kind": "vpc.worker",
-            "scope": {"fleet_id": state.inner.fleet_id, "tenant_id": null},
-            "capability_document": {
-                "schema": "splendor.capabilities.v1",
-                "capabilities": ["sql.read_fixture"],
-                "constraints": {"placement_target": "customer_vpc", "data_locality": "vpc", "resident_daemon_url": "http://127.0.0.1:1"}
-            },
-            "runtime_version": "0.1-test",
-            "health": {"status": "offline", "observed_at": now_rfc3339(), "metadata": {}},
-            "registered_at": now_rfc3339()
-        }))
-        .expect("offline node");
-        let _ = register_node(
-            State(state.clone()),
-            Json(RegisterNodeRequest {
-                security: security.clone(),
-                registration: offline_node.clone(),
-            }),
-        )
-        .await
-        .expect("offline node registered");
         let _ = register_instance(
             State(state.clone()),
             Json(RegisterInstanceRequest {
                 security: security.clone(),
                 registration: instance(
-                    &offline_node.node_id.to_string(),
-                    "00000000-0000-4000-8000-000000000804",
+                    &vpc_node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000303",
                     &tenant_id,
                 ),
             }),
         )
         .await
-        .expect("offline instance registered");
-        let mut offline_placement = selected.0.clone();
-        offline_placement.candidate_id = Some(offline_node.node_id.to_string());
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), offline_placement);
-        let stale = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+        .expect("second eligible instance registered");
+        let ambiguous = dispatch_work_order(
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -7146,27 +7863,20 @@ mod tests {
             }),
         )
         .await
-        .expect_err("offline node rejected");
-        assert_eq!(stale.body.code, "stale_or_unhealthy_node");
-
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), selected.0);
+        .expect_err("multiple eligible resident instances are rejected before egress");
+        assert_eq!(ambiguous.body.code, "ambiguous_eligible_resident_instances");
 
         state
             .inner
             .work_orders
             .lock()
             .expect("work order lock")
-            .get_mut("wo_test_remote")
+            .get_mut(&work_order_id)
             .expect("work order")
             .work_order
             .objective = "tampered after signature".to_string();
         let bad_signature = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -7175,34 +7885,7 @@ mod tests {
         )
         .await
         .expect_err("tampered dispatch work order rejected");
-        assert_eq!(bad_signature.body.code, "bad_signature");
-
-        let mut refreshed_work_order =
-            test_work_order("33333333-3333-4333-8333-333333333333").work_order;
-        refreshed_work_order.allowed_adapters = vec!["fixture-sql".to_string()];
-        let refreshed = WorkOrderEnvelope::signed_with_shared_secret(
-            refreshed_work_order,
-            "work-order-local-key",
-            b"splendor-local-work-order-secret",
-        )
-        .expect("refreshed work order signed");
-        state
-            .inner
-            .work_orders
-            .lock()
-            .expect("work order lock")
-            .insert("wo_test_remote".to_string(), refreshed);
-        let resident_http = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
-            State(state),
-            Json(DispatchWorkOrderRequest {
-                security,
-                target_node_id: None,
-            }),
-        )
-        .await
-        .expect_err("unavailable resident daemon rejected");
-        assert_eq!(resident_http.body.code, "resident_create_transport_error");
+        assert_eq!(bad_signature.body.code, "work_order_binding_mismatch");
     }
 
     #[tokio::test]
@@ -7250,6 +7933,7 @@ mod tests {
             .await
             .expect("transport listener");
         let address = listener.local_addr().expect("transport address");
+        let base_url = format!("http://{address}");
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -7267,6 +7951,7 @@ mod tests {
             signer,
             ResidentDispatchOptions {
                 maximum_response_bytes: 512,
+                allowed_origins: vec![base_url.clone()],
                 ..ResidentDispatchOptions::loopback_test()
             },
         )
@@ -7278,7 +7963,6 @@ mod tests {
             .resident_dispatch
             .signed_caller(&tenant_id, &instance_id, EndpointScope::RunsCreate)
             .expect("transport caller");
-        let base_url = format!("http://{address}");
         let redirected = state
             .inner
             .resident_dispatch
@@ -7343,9 +8027,36 @@ mod tests {
             validate_resident_url(
                 &reqwest::Url::parse("http://192.0.2.1:8077").expect("url"),
                 true,
+                &HashSet::new(),
             ),
             Err(ResidentHttpError::InvalidUrl)
         ));
+        let allowed = &state.inner.resident_dispatch.allowed_origins;
+        for hostile in [
+            format!("http://user@{address}"),
+            format!("{base_url}/path"),
+            format!("{base_url}?next=https://attacker.invalid"),
+            format!("{base_url}#fragment"),
+            "http://127.0.0.1:1".to_string(),
+        ] {
+            assert!(matches!(
+                validate_resident_url(
+                    &reqwest::Url::parse(&hostile).expect("syntactically valid hostile URL"),
+                    true,
+                    allowed,
+                ),
+                Err(ResidentHttpError::InvalidUrl)
+            ));
+        }
+        assert!(canonical_allowed_origins(&["http://127.0.0.1:8077".to_string()], false).is_err());
+        assert!(canonical_allowed_origins(
+            &[
+                "https://resident.example:8443".to_string(),
+                "https://resident.example:8443/".to_string()
+            ],
+            false
+        )
+        .is_err());
         server.abort();
     }
 

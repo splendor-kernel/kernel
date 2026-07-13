@@ -1257,10 +1257,19 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         call_json_with_token(app.clone(), Method::POST, "/runs", create, &signed.encoded).await;
     assert_eq!(status, StatusCode::OK);
 
+    let start_signed = signer
+        .sign(
+            &tenant_id,
+            &instance_id,
+            vec![EndpointScope::RunsStart],
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("fresh start token");
     let lifecycle = LifecycleRequest {
-        credential: Some(credential.clone()),
+        credential: Some(start_signed.credential.clone()),
         work_order: None,
-        audit_attribution: Some(credential_audit(&credential)),
+        audit_attribution: Some(credential_audit(&start_signed.credential)),
         reason: None,
         approval_evidence: None,
     };
@@ -1269,7 +1278,7 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         Method::POST,
         &format!("/runs/{}/start", created.run_id),
         lifecycle,
-        &signed.encoded,
+        &start_signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1300,13 +1309,22 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         .next()
         .expect("resident run causal trace");
 
+    let action_signed = signer
+        .sign(
+            &tenant_id,
+            &instance_id,
+            vec![EndpointScope::ActionsSubmit],
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("fresh action token");
     let submit_request = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
-        credential: Some(credential.clone()),
-        audit_attribution: Some(credential_audit(&credential)),
+        credential: Some(action_signed.credential.clone()),
+        audit_attribution: Some(credential_audit(&action_signed.credential)),
         causal_trace_id: Some(causal_trace_id),
         action: action(ACTION, PERMISSION),
         adapter: Some(ADAPTER.to_string()),
@@ -1320,7 +1338,7 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         Method::POST,
         "/actions",
         submit_request,
-        &signed.encoded,
+        &action_signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1329,7 +1347,16 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         .run_authority_evaluation_count(&created.run_id)
         .expect("resident authority count");
 
-    let replay_audit = credential_audit(&credential);
+    let replay_signed = signer
+        .sign(
+            &tenant_id,
+            &instance_id,
+            vec![EndpointScope::ReplayCreate],
+            OffsetDateTime::now_utc(),
+            Duration::minutes(1),
+        )
+        .expect("fresh replay token");
+    let replay_audit = credential_audit(&replay_signed.credential);
     let (status, replay): (StatusCode, ReplayResponse) = call_json_with_token(
         app.clone(),
         Method::POST,
@@ -1337,10 +1364,10 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         json!({
             "mode": "inspect_only",
             "side_effects_allowed": false,
-            "credential": credential.clone(),
+            "credential": replay_signed.credential.clone(),
             "audit_attribution": replay_audit,
         }),
-        &signed.encoded,
+        &replay_signed.encoded,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1386,6 +1413,15 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         ]
     };
     for (label, invalid) in invalid_cases {
+        let valid_bearer = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                OffsetDateTime::now_utc(),
+                Duration::minutes(1),
+            )
+            .expect("fresh mirror-validation token");
         let mut request = create_request(
             &format!("wo_c02_resident_{label}"),
             tenant_id.clone(),
@@ -1395,9 +1431,14 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         );
         request.credential = Some(invalid.clone());
         request.audit_attribution = Some(credential_audit(&invalid));
-        let (status, error): (StatusCode, ApiErrorBody) =
-            call_json_with_token(app.clone(), Method::POST, "/runs", request, &signed.encoded)
-                .await;
+        let (status, error): (StatusCode, ApiErrorBody) = call_json_with_token(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            request,
+            &valid_bearer.encoded,
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
         assert_eq!(error.code, "caller_credential_mirror_mismatch", "{label}");
     }

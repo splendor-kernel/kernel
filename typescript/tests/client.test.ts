@@ -166,6 +166,37 @@ test("client refuses unauthenticated fallback", () => {
   assert.throws(() => new SplendorClient({ baseUrl: "   ", token: "token" }), /baseUrl/);
 });
 
+test("client restricts bearer transport to HTTPS or explicit loopback HTTP", () => {
+  const fetcher = makeRawFetch("{}", 200);
+  for (const baseUrl of [
+    "https://daemon.example",
+    "https://daemon.example:8443/v1",
+    "http://localhost:8077",
+    "http://127.0.0.1:8077",
+    "http://[::1]:8077"
+  ]) {
+    assert.doesNotThrow(() => new SplendorClient({ baseUrl, token: "token", fetch: fetcher }), baseUrl);
+  }
+  for (const baseUrl of [
+    "http://daemon.example",
+    "http://192.0.2.1:8077",
+    "ftp://daemon.example",
+    "ws://daemon.example",
+    "daemon.example",
+    "https://user:password@daemon.example",
+    "https://daemon.example?",
+    "https://daemon.example?redirect=https://attacker.invalid",
+    "https://daemon.example#",
+    "https://daemon.example#fragment"
+  ]) {
+    assert.throws(
+      () => new SplendorClient({ baseUrl, token: "token", fetch: fetcher }),
+      /HTTPS or explicit loopback HTTP/,
+      baseUrl
+    );
+  }
+});
+
 test("client reports unavailable fetch implementation", () => {
   const originalFetch = globalThis.fetch;
   try {

@@ -53,7 +53,7 @@ services:
     network_mode: service:splendor-daemon-local
     volumes:
       - ../../..:/workspace
-      - e2e-auth:/run/splendor-auth:ro
+      - e2e-runner-auth:/run/splendor-auth:ro
 
   resident-auth-fixture:
     build:
@@ -66,11 +66,25 @@ services:
       - bash
       - -lc
       - |
-        python3 tests/e2e/use-cases/fixtures/resident_auth_fixture.py init --out /run/splendor-auth
-        chown -R splendor:splendor /run/splendor-auth
+        python3 tests/e2e/use-cases/fixtures/resident_auth_fixture.py init \
+          --manager-out /run/splendor-manager-auth \
+          --runner-out /run/splendor-runner-auth \
+          --vpc-out /run/splendor-vpc-auth \
+          --cloud-out /run/splendor-cloud-auth \
+          --edge-out /run/splendor-edge-auth
+        chown -R splendor:splendor \
+          /run/splendor-manager-auth \
+          /run/splendor-runner-auth \
+          /run/splendor-vpc-auth \
+          /run/splendor-cloud-auth \
+          /run/splendor-edge-auth
     volumes:
       - ../../..:/workspace:ro
-      - e2e-auth:/run/splendor-auth
+      - e2e-manager-auth:/run/splendor-manager-auth
+      - e2e-runner-auth:/run/splendor-runner-auth
+      - e2e-vpc-auth:/run/splendor-vpc-auth
+      - e2e-cloud-auth:/run/splendor-cloud-auth
+      - e2e-edge-auth:/run/splendor-edge-auth
 
   fake-http-service:
     image: python:3.12-slim
@@ -139,11 +153,12 @@ services:
       SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE: /run/splendor-auth/caller-signing-key.pk8
       SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
       SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS: https://resident-cloud-node:8091,https://resident-vpc-node:8092,https://resident-edge-node:8093
     command: ["splendor-manager"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
-      - e2e-auth:/run/splendor-auth:ro
+      - e2e-manager-auth:/run/splendor-auth:ro
     depends_on:
       resident-auth-fixture:
         condition: service_completed_successfully
@@ -167,7 +182,7 @@ services:
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
-      - e2e-auth:/run/splendor-auth:ro
+      - e2e-cloud-auth:/run/splendor-auth:ro
     depends_on:
       resident-auth-fixture:
         condition: service_completed_successfully
@@ -191,7 +206,7 @@ services:
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
-      - e2e-auth:/run/splendor-auth:ro
+      - e2e-vpc-auth:/run/splendor-auth:ro
     depends_on:
       resident-auth-fixture:
         condition: service_completed_successfully
@@ -216,7 +231,7 @@ services:
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
-      - e2e-auth:/run/splendor-auth:ro
+      - e2e-edge-auth:/run/splendor-auth:ro
     depends_on:
       resident-auth-fixture:
         condition: service_completed_successfully
@@ -225,5 +240,9 @@ services:
     image: ghcr.io/shopify/toxiproxy:latest
 
 volumes:
-  e2e-auth:
+  e2e-manager-auth:
+  e2e-runner-auth:
+  e2e-vpc-auth:
+  e2e-cloud-auth:
+  e2e-edge-auth:
   e2e-state:

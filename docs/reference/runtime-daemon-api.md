@@ -158,8 +158,15 @@ Resident requests use `Authorization: Bearer` with the accepted closed Ed25519
 profile from [RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md). The
 body/header `CallerCredential` and `AuditAttribution` objects are compatibility
 mirrors only. They must exactly match the verified projection and cannot supply
-proof. `401` responses include the bounded `WWW-Authenticate` Bearer challenge;
+proof. Resident middleware carries verified context internally and can supply
+the compatibility projection when wire mirrors are omitted; supplied mirrors
+remain equality checks only. `401` responses include the bounded `WWW-Authenticate` Bearer challenge;
 scope, tenant, and mirror mismatches return `403`.
+For mutating requests, the verified JTI is atomically consumed before handler
+mutation; reuse returns `caller_token_replayed`. Reads may reuse an unexpired
+token. The projected `credential_id` is a bounded domain-separated `sha256:`
+correlation digest, never raw JTI, and middleware replaces caller-supplied audit
+time with its server authentication timestamp before trace recording.
 
 Run creation and run resume require signed, unexpired, unrevoked, scoped work
 orders. The daemon checks work-order tenant, run scope where applicable, and
@@ -227,6 +234,9 @@ same run and receipt with `duplicate: true` and does not create another run slot
 Reusing an idempotency key for a different scope fails closed with
 `create_run_idempotency_scope_mismatch`; public error details intentionally omit
 raw attempted/existing scope fields and caller identifiers.
+The stable caller scope contains principal identity but not ephemeral bearer
+credential/JTI correlation ID, so a safe retry can present a fresh one-use token
+without changing the durable idempotency scope.
 
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
@@ -319,7 +329,9 @@ PerceptsAppended
 
 `DaemonAudit { endpoint, audit }` is emitted for accepted mutating daemon calls
 after S0 security validation and before the runtime mutation, preserving caller
-identity and credential attribution in the run trace.
+identity and credential correlation attribution in the run trace. Resident audit
+timestamps are server-owned; caller-supplied compatibility timestamps are not
+persisted.
 
 Trace export is a POST audit boundary even though it uses the trace-read scope:
 its request body must include non-null `credential` and `audit_attribution`, and
@@ -441,6 +453,7 @@ Required 0.02-S5 failures include:
 | Condition | HTTP | Code |
 | --- | --- | --- |
 | Missing/invalid resident bearer, key/JTI revocation, stale trust, or clock rollback | `401` | bounded caller-auth reason code plus `WWW-Authenticate` |
+| Reused resident bearer JTI on a mutating request | `401` | `caller_token_replayed` before handler mutation |
 | Verified bearer has wrong endpoint scope/tenant or mismatched metadata mirror | `403` | daemon security or mirror mismatch code |
 | Invalid run | `404` | `invalid_run` |
 | Malformed percept body | `400` | `malformed_percept` |

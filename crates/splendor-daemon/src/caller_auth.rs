@@ -6,6 +6,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use ring::digest::{digest, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -13,11 +14,12 @@ use splendor_types::{
     AppPrincipal, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
     EndpointScope, InstanceId, RevocationStatus, TenantId,
 };
-use std::collections::HashSet;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
@@ -30,6 +32,12 @@ const MAX_TRUST_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOKEN_SCOPES: usize = 16;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const ED25519_SIGNATURE_BYTES: usize = 64;
+const MAX_TRUST_SNAPSHOT_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
+const MAX_REVOKED_JTIS: usize = 100_000;
+const MAX_TRUST_KEYS: usize = 64;
+const MAX_CONSUMED_MUTATING_JTIS: usize = 100_000;
+const MAX_TRUST_REVISION: u64 = i64::MAX as u64;
+const JTI_CORRELATION_DOMAIN: &[u8] = b"splendor.resident.caller-jti-correlation.v1\0";
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +114,7 @@ struct CallerTokenVerifierInner {
     expected_instance_id: InstanceId,
     clock_leeway_seconds: i64,
     maximum_observed_unix_time: AtomicI64,
+    consumed_mutating_jtis: Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Clone)]
@@ -163,6 +172,8 @@ pub enum CallerAuthError {
     InvalidTenant,
     #[error("caller token has been revoked")]
     RevokedToken,
+    #[error("caller token was already used for a mutating request")]
+    ReplayedToken,
     #[error("caller trust snapshot is unavailable, invalid, or stale")]
     InvalidTrustSnapshot,
     #[error("caller authentication clock moved backwards")]
@@ -244,6 +255,7 @@ impl CallerTokenVerifier {
                 expected_instance_id,
                 clock_leeway_seconds: 30,
                 maximum_observed_unix_time: AtomicI64::new(i64::MIN),
+                consumed_mutating_jtis: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -252,7 +264,7 @@ impl CallerTokenVerifier {
         path: impl AsRef<Path>,
         expected_instance_id: InstanceId,
     ) -> Result<Self, CallerAuthError> {
-        let bytes = read_bounded(path.as_ref(), MAX_TRUST_FILE_BYTES)?;
+        let bytes = read_bounded(path.as_ref(), MAX_TRUST_FILE_BYTES, false)?;
         let trust =
             serde_json::from_slice(&bytes).map_err(|_| CallerAuthError::InvalidTrustSnapshot)?;
         Self::new(trust, expected_instance_id)
@@ -263,6 +275,43 @@ impl CallerTokenVerifier {
         token: &str,
         now: OffsetDateTime,
     ) -> Result<CallerCredential, CallerAuthError> {
+        self.verify_claims(token, now)
+            .map(|verified| verified.credential)
+    }
+
+    /// Verifies a caller token and atomically consumes its JTI for one mutating
+    /// request. Read-only requests should continue to use [`Self::verify`].
+    ///
+    /// Consumption occurs before the daemon handler is entered, so concurrent
+    /// copies of a captured bearer cannot both reach run or gateway mutation.
+    pub fn verify_and_consume_mutation(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<CallerCredential, CallerAuthError> {
+        let verified = self.verify_claims(token, now)?;
+        let mut consumed = self
+            .inner
+            .consumed_mutating_jtis
+            .lock()
+            .map_err(|_| CallerAuthError::InvalidTrustSnapshot)?;
+        let now_unix = now.unix_timestamp();
+        consumed.retain(|_, expires_at| *expires_at > now_unix);
+        if consumed.contains_key(&verified.raw_jti) {
+            return Err(CallerAuthError::ReplayedToken);
+        }
+        if consumed.len() >= MAX_CONSUMED_MUTATING_JTIS {
+            return Err(CallerAuthError::InvalidTrustSnapshot);
+        }
+        consumed.insert(verified.raw_jti, verified.expires_at_unix);
+        Ok(verified.credential)
+    }
+
+    fn verify_claims(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<VerifiedCallerClaims, CallerAuthError> {
         if token.is_empty() || token.len() > MAX_CALLER_TOKEN_BYTES {
             return Err(CallerAuthError::MalformedToken);
         }
@@ -340,7 +389,7 @@ impl CallerTokenVerifier {
         &self,
         claims: CallerTokenClaims,
         now: OffsetDateTime,
-    ) -> Result<CallerCredential, CallerAuthError> {
+    ) -> Result<VerifiedCallerClaims, CallerAuthError> {
         if claims.splendor_ver != CALLER_TOKEN_SCHEMA_VERSION {
             return Err(CallerAuthError::UnsupportedProfile);
         }
@@ -425,8 +474,8 @@ impl CallerTokenVerifier {
         if tenant_id.is_nil() {
             return Err(CallerAuthError::InvalidTenant);
         }
-        Ok(CallerCredential {
-            credential_id: canonical_jti,
+        let credential = CallerCredential {
+            credential_id: caller_jti_correlation(&canonical_jti),
             principal: ClientPrincipal {
                 app: AppPrincipal {
                     app_principal_id: claims.app_principal_id,
@@ -442,6 +491,11 @@ impl CallerTokenVerifier {
             },
             expires_at,
             revocation: RevocationStatus::Active,
+        };
+        Ok(VerifiedCallerClaims {
+            credential,
+            raw_jti: canonical_jti,
+            expires_at_unix: claims.exp,
         })
     }
 }
@@ -489,8 +543,7 @@ impl CallerTokenSigner {
         kid: impl Into<String>,
         path: impl AsRef<Path>,
     ) -> Result<Self, CallerAuthError> {
-        require_private_file_permissions(path.as_ref())?;
-        let bytes = read_bounded(path.as_ref(), 64 * 1024)?;
+        let bytes = read_bounded(path.as_ref(), 64 * 1024, true)?;
         Self::from_pkcs8(issuer, app_principal_id, client_principal_id, kid, &bytes)
     }
 
@@ -597,7 +650,7 @@ impl CallerTokenSigner {
             URL_SAFE_NO_PAD.encode(signature.as_ref())
         );
         let credential = CallerCredential {
-            credential_id: jti,
+            credential_id: caller_jti_correlation(&jti),
             principal: ClientPrincipal {
                 app: AppPrincipal {
                     app_principal_id: self.inner.app_principal_id.clone(),
@@ -639,12 +692,23 @@ fn decode_segment(segment: &str) -> Result<Vec<u8>, CallerAuthError> {
 fn validate_trust_snapshot_shape(trust: &CallerTokenTrustSnapshot) -> Result<(), CallerAuthError> {
     if trust.schema_version != CALLER_TRUST_SCHEMA_VERSION
         || trust.revision == 0
+        || trust.revision > MAX_TRUST_REVISION
         || trust.issuer.trim().is_empty()
         || trust.app_principal_id.trim().is_empty()
         || trust.max_token_ttl_seconds == 0
         || trust.max_token_ttl_seconds > 300
         || trust.keys.is_empty()
+        || trust.keys.len() > MAX_TRUST_KEYS
         || trust.allowed_scopes.is_empty()
+        || trust.revoked_jtis.len() > MAX_REVOKED_JTIS
+        || trust.issuer.len() > 512
+        || trust.app_principal_id.len() > 256
+    {
+        return Err(CallerAuthError::InvalidTrustSnapshot);
+    }
+    let lifetime = trust.expires_at - trust.issued_at;
+    if trust.expires_at <= trust.issued_at
+        || lifetime > Duration::seconds(MAX_TRUST_SNAPSHOT_LIFETIME_SECONDS)
     {
         return Err(CallerAuthError::InvalidTrustSnapshot);
     }
@@ -691,9 +755,11 @@ fn validate_trust_snapshot_at(
     let latest_current = now
         .checked_add(leeway)
         .ok_or(CallerAuthError::InvalidTrustSnapshot)?;
+    let lifetime = trust.expires_at - trust.issued_at;
     if trust.issued_at > latest_current
         || trust.expires_at <= now
         || trust.expires_at <= trust.issued_at
+        || lifetime > Duration::seconds(MAX_TRUST_SNAPSHOT_LIFETIME_SECONDS)
     {
         return Err(CallerAuthError::InvalidTrustSnapshot);
     }
@@ -739,31 +805,83 @@ fn parse_endpoint_scope(value: &str) -> Option<EndpointScope> {
     .find(|scope| scope.as_str() == value)
 }
 
-fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, CallerAuthError> {
-    let metadata = fs::metadata(path).map_err(|_| CallerAuthError::KeyLoad)?;
+fn read_bounded(path: &Path, maximum: usize, private: bool) -> Result<Vec<u8>, CallerAuthError> {
+    let mut file = open_regular_file(path)?;
+    if private {
+        require_private_file_permissions(&file)?;
+    }
+    let metadata = file.metadata().map_err(|_| CallerAuthError::KeyLoad)?;
     if metadata.len() > maximum as u64 {
         return Err(CallerAuthError::KeyLoad);
     }
-    fs::read(path).map_err(|_| CallerAuthError::KeyLoad)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| CallerAuthError::KeyLoad)?;
+    if bytes.len() > maximum {
+        return Err(CallerAuthError::KeyLoad);
+    }
+    Ok(bytes)
+}
+
+fn open_regular_file(path: &Path) -> Result<File, CallerAuthError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|_| CallerAuthError::KeyLoad)?;
+    if !file
+        .metadata()
+        .map_err(|_| CallerAuthError::KeyLoad)?
+        .file_type()
+        .is_file()
+    {
+        return Err(CallerAuthError::KeyLoad);
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
-fn require_private_file_permissions(path: &Path) -> Result<(), CallerAuthError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = fs::metadata(path)
-        .map_err(|_| CallerAuthError::KeyLoad)?
-        .permissions()
-        .mode()
-        & 0o777;
-    if mode & 0o077 != 0 {
+fn require_private_file_permissions(file: &File) -> Result<(), CallerAuthError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = file.metadata().map_err(|_| CallerAuthError::KeyLoad)?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(CallerAuthError::KeyLoad);
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn require_private_file_permissions(_path: &Path) -> Result<(), CallerAuthError> {
+fn require_private_file_permissions(_file: &File) -> Result<(), CallerAuthError> {
     Ok(())
+}
+
+struct VerifiedCallerClaims {
+    credential: CallerCredential,
+    raw_jti: String,
+    expires_at_unix: i64,
+}
+
+/// Returns the bounded, domain-separated digest used to correlate one caller
+/// credential in audit records without persisting its raw JTI.
+pub fn caller_jti_correlation(jti: &str) -> String {
+    let mut input = Vec::with_capacity(JTI_CORRELATION_DOMAIN.len() + jti.len());
+    input.extend_from_slice(JTI_CORRELATION_DOMAIN);
+    input.extend_from_slice(jti.as_bytes());
+    format!("sha256:{}", hex_bytes(digest(&SHA256, &input).as_ref()))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        rendered.push(HEX[(byte >> 4) as usize] as char);
+        rendered.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -792,6 +910,13 @@ mod tests {
         let claims = serde_json::from_slice(&decode_segment(segments[1]).expect("claims bytes"))
             .expect("claims JSON");
         (header, claims)
+    }
+
+    fn raw_jti(token: &str) -> String {
+        decoded_token(token).1["jti"]
+            .as_str()
+            .expect("raw token JTI")
+            .to_string()
     }
 
     fn fixture() -> (
@@ -870,6 +995,47 @@ mod tests {
     }
 
     #[test]
+    fn mutating_jti_consumption_is_atomic_while_read_verification_is_reusable() {
+        let (signer, verifier, tenant_id, instance_id, now) = fixture();
+        let signed = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("signed");
+        verifier.verify(&signed.encoded, now).expect("first read");
+        verifier.verify(&signed.encoded, now).expect("second read");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let verifier = verifier.clone();
+            let encoded = signed.encoded.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                verifier.verify_and_consume_mutation(&encoded, now)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(CallerAuthError::ReplayedToken)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn tampering_wrong_audience_expiry_revocation_and_eddsa_fail_closed() {
         let (signer, verifier, tenant_id, instance_id, now) = fixture();
         let signed = signer
@@ -926,7 +1092,7 @@ mod tests {
             vec![EndpointScope::RunsCreate],
             now,
         );
-        revoked_trust.revoked_jtis = vec![expired.credential.credential_id.clone()];
+        revoked_trust.revoked_jtis = vec![raw_jti(&expired.encoded)];
         let revoked = CallerTokenVerifier::new(revoked_trust, instance_id).expect("verifier");
         assert!(matches!(
             revoked.verify(&expired.encoded, now),
@@ -1143,6 +1309,51 @@ mod tests {
     }
 
     #[test]
+    fn trust_bounds_and_regular_file_reads_fail_closed() {
+        let (signer, _verifier, _tenant_id, instance_id, now) = fixture();
+        let mut trust = CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            vec![EndpointScope::RunsCreate],
+            now,
+        );
+        trust.revision = MAX_TRUST_REVISION + 1;
+        assert!(matches!(
+            CallerTokenVerifier::new(trust.clone(), instance_id.clone()),
+            Err(CallerAuthError::InvalidTrustSnapshot)
+        ));
+        trust.revision = 1;
+        trust.expires_at = trust.issued_at + Duration::hours(25);
+        assert!(matches!(
+            CallerTokenVerifier::new(trust.clone(), instance_id.clone()),
+            Err(CallerAuthError::InvalidTrustSnapshot)
+        ));
+
+        trust.expires_at = trust.issued_at + Duration::hours(1);
+        let root = std::env::temp_dir().join(format!(
+            "splendor-caller-trust-file-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("fixture directory");
+        let trust_path = root.join("trust.json");
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("trust file");
+        assert!(CallerTokenVerifier::from_file(&root, instance_id.clone()).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&trust_path, root.join("trust-link.json"))
+                .expect("trust symlink");
+            assert!(matches!(
+                CallerTokenVerifier::from_file(root.join("trust-link.json"), instance_id),
+                Err(CallerAuthError::KeyLoad)
+            ));
+        }
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
     fn signed_token_debug_and_auth_errors_redact_bearer_material() {
         let (signer, verifier, tenant_id, instance_id, now) = fixture();
         let signed = signer
@@ -1167,7 +1378,7 @@ mod tests {
             vec![EndpointScope::RunsCreate],
             now,
         );
-        trust.revoked_jtis = vec![signed.credential.credential_id.clone()];
+        trust.revoked_jtis = vec![raw_jti(&signed.encoded)];
         let trust_rendered = format!("{trust:?}");
         assert!(!trust_rendered.contains(&signed.credential.credential_id));
         assert!(trust_rendered.contains("revoked_jti_count: 1"));

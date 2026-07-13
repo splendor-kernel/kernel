@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
   version: 0.03-dev
-  description: Runtime daemon API with explicit local-development and TLS resident profiles. Resident/non-dev requests require the accepted Ed25519 caller bearer profile; caller metadata fields remain non-authoritative compatibility mirrors. Signed work orders authorize runs, while C02 and the gateway separately authorize effects. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
+  description: Runtime daemon API with explicit local-development and TLS resident profiles. Resident/non-dev requests require the accepted Ed25519 caller bearer profile; mutating bearer JTIs are one-use while read-only requests may reuse an unexpired token. Caller metadata fields remain non-authoritative compatibility mirrors, raw JTIs are replaced by bounded correlation digests, and audit timestamps are server-owned. Signed work orders authorize runs, while C02 and the gateway separately authorize effects. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
   x-splendor-compatibility:
     stable_docs: docs/spec/0.1/api-stability.md
     compatibility_line: '0.1'
@@ -16,6 +16,7 @@ paths:
   /runs:
     post:
       summary: Create a local run from a signed work order.
+      description: A resident bearer JTI is consumed once before mutation. A retry must use a fresh bearer; durable create idempotency remains scoped to the caller principal and request authority, not the ephemeral JTI correlation digest.
       operationId: createRun
       security:
         - ResidentCallerBearer: []
@@ -67,6 +68,7 @@ paths:
   /runs/{run_id}/start:
     post:
       summary: Execute one local scheduler tick.
+      description: The resident bearer JTI is consumed once before the tick can mutate state or reach the gateway. Reuse is rejected before run mutation.
       operationId: startRun
       security:
         - ResidentCallerBearer: []
@@ -603,6 +605,7 @@ paths:
       responses:
         '200': { description: Work order accepted., content: { application/json: { schema: { $ref: '#/components/schemas/WorkOrderValidationReport' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /work-orders/{work_order_id}/revoke:
     post:
       summary: Revoke a submitted work order.
@@ -619,6 +622,7 @@ paths:
   /work-orders/{work_order_id}/dispatch:
     post:
       summary: Dispatch an accepted work order to a resident daemon.
+      description: Dispatch is immutably bound to the accepted signed payload, placement decision, selected node, and exactly one healthy compatible resident instance. The resident origin must match the manager's configured exact-origin allowlist. Any post-send start result without authoritative success is quarantined as effect-unknown and is never retried automatically.
       operationId: dispatchWorkOrder
       parameters:
         - name: work_order_id
@@ -628,7 +632,11 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchWorkOrderRequest' } } } }
       responses:
         '200': { description: Dispatch report., content: { application/json: { schema: { $ref: '#/components/schemas/DispatchReport' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
   /fleet/telemetry/read:
     post:
       summary: Read observational fleet telemetry.
@@ -1003,6 +1011,11 @@ components:
         daemon verifies the fixed Ed25519 profile, exact issuer and instance
         audience, tenant binding, endpoint scope, lifetime, trust freshness,
         key status, and JTI revocation before consulting compatibility mirrors.
+        A verified JTI is atomically one-use for mutating requests; reads may
+        reuse it until expiry. Replay denial occurs before handler mutation and
+        records only a domain-separated SHA-256 correlation digest. Resident
+        middleware passes verified context internally; compatibility body/header
+        mirrors may be omitted, but any supplied mirror must match exactly.
         This bearer authenticates the app only; it does not replace a signed
         work order, C02 run authority, verifiers, or gateway authorization.
   parameters:
@@ -1067,6 +1080,18 @@ components:
             $ref: '#/components/schemas/ApiError'
     Conflict:
       description: Run state, duplicate ID, or trace ordering conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    BadGateway:
+      description: Resident transport or create response failed before a valid dispatch result was available.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    GatewayTimeout:
+      description: Resident start was sent but no authoritative success was available; effect certainty is unknown and automatic retry is forbidden.
       content:
         application/json:
           schema:
@@ -1322,7 +1347,9 @@ components:
       description: >-
         Caller identity projection. On the resident daemon this object is a
         deprecated/non-authoritative mirror derived from the verified bearer and
-        cannot supply proof or widen token facts.
+        cannot supply proof or widen token facts. For resident bearer projection,
+        credential_id is a `sha256:`-prefixed domain-separated correlation digest,
+        never the raw token JTI.
       type: object
       required: [credential_id, principal, scopes, binding, audience, expires_at, revocation]
       properties:
@@ -1495,7 +1522,7 @@ components:
             - type: 'null'
             - $ref: '#/components/schemas/WorkOrderSignature'
     AuditAttribution:
-      description: Attribution mirror that must name the authenticated principal and credential ID; it is not authentication proof.
+      description: Attribution mirror that must name the authenticated principal and credential correlation ID; it is not authentication proof. In resident mode, any caller-supplied requested_at value is ignored and replaced with the server authentication timestamp before trace/audit recording.
       type: object
       required: [principal, credential_id, requested_at]
       properties:

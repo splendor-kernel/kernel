@@ -4,7 +4,8 @@ use serde::Deserialize;
 use splendor_daemon::caller_auth::CallerTokenSigner;
 use splendor_daemon::manager::{router, ManagerState, ResidentDispatchOptions};
 use splendor_types::{FleetId, WorkOrderKeyring};
-use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use tokio::net::TcpListener;
@@ -91,12 +92,21 @@ fn configured_manager_state() -> Result<ManagerState, std::io::Error> {
         "SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE",
     )?))?;
     let root_ca_path = required_env("SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE")?;
-    let root_ca_metadata = fs::metadata(&root_ca_path)?;
-    if root_ca_metadata.len() > CONFIG_FILE_LIMIT {
-        return Err(invalid_config("resident root CA"));
-    }
     let mut options = ResidentDispatchOptions::production();
-    options.root_ca_pem = Some(fs::read(root_ca_path)?);
+    options.root_ca_pem = Some(read_regular_file(
+        Path::new(&root_ca_path),
+        CONFIG_FILE_LIMIT,
+        false,
+    )?);
+    options.allowed_origins = required_env("SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS")?
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .collect();
+    if options.allowed_origins.is_empty() {
+        return Err(invalid_config("resident allowed origins"));
+    }
     ManagerState::acceptance_with_dispatch_config(
         manager_id,
         fleet_id,
@@ -108,12 +118,9 @@ fn configured_manager_state() -> Result<ManagerState, std::io::Error> {
 }
 
 fn load_work_order_keyring(path: &Path) -> Result<WorkOrderKeyring, std::io::Error> {
-    require_private_file_permissions(path)?;
-    if fs::metadata(path)?.len() > CONFIG_FILE_LIMIT {
-        return Err(invalid_config("work-order keyring"));
-    }
-    let file: WorkOrderKeyringFile = serde_json::from_slice(&fs::read(path)?)
-        .map_err(|_| invalid_config("work-order keyring"))?;
+    let bytes = read_regular_file(path, CONFIG_FILE_LIMIT, true)?;
+    let file: WorkOrderKeyringFile =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_config("work-order keyring"))?;
     if file.schema_version != "splendor.work_order_keyring.v1" || file.keys.is_empty() {
         return Err(invalid_config("work-order keyring"));
     }
@@ -144,21 +151,64 @@ fn invalid_config(kind: &str) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn require_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
+fn require_private_file_permissions(file: &File, path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = file.metadata()?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("{} must not be group/world accessible", path.display()),
+            format!(
+                "{} must be owned by the service user and not be group/world accessible",
+                path.display()
+            ),
         ));
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn require_private_file_permissions(_path: &Path) -> Result<(), std::io::Error> {
+fn require_private_file_permissions(_file: &File, _path: &Path) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+fn open_regular_file(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} must be a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn read_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+    private: bool,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = open_regular_file(path)?;
+    if private {
+        require_private_file_permissions(&file, path)?;
+    }
+    let metadata = file.metadata()?;
+    if metadata.len() > maximum_bytes {
+        return Err(invalid_config("oversized file"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(invalid_config("oversized file"));
+    }
+    Ok(bytes)
 }
 
 #[tokio::main]
@@ -213,6 +263,7 @@ mod tests {
             "SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE",
             "SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE",
             "SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE",
+            "SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS",
         ] {
             std::env::remove_var(name);
         }
@@ -245,6 +296,26 @@ mod tests {
         super::validate_manager_bind_addr("0.0.0.0:8081")
             .expect("explicit local acceptance non-loopback allowed");
         assert!(super::validate_manager_bind_addr("manager.example:8081").is_err());
+    }
+
+    #[test]
+    fn manager_config_reads_reject_non_regular_and_symlink_files() {
+        let root = std::env::temp_dir().join(format!(
+            "splendor-manager-file-hardening-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("fixture directory");
+        assert!(super::read_regular_file(&root, super::CONFIG_FILE_LIMIT, false).is_err());
+        let target = root.join("target.json");
+        write_private_bytes(&target, b"{}");
+        #[cfg(unix)]
+        {
+            let link = root.join("link.json");
+            std::os::unix::fs::symlink(&target, &link).expect("fixture symlink");
+            assert!(super::read_regular_file(&link, super::CONFIG_FILE_LIMIT, false).is_err());
+            assert!(super::read_regular_file(&link, super::CONFIG_FILE_LIMIT, true).is_err());
+        }
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
     }
 
     #[test]
@@ -312,6 +383,10 @@ mod tests {
             (
                 "SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE",
                 root_ca.display().to_string(),
+            ),
+            (
+                "SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS",
+                "https://localhost:8091".to_string(),
             ),
         ] {
             std::env::set_var(name, value);

@@ -20,6 +20,10 @@ transport security -> caller authentication -> endpoint scopes -> signed work or
 
 A caller token authenticates the app. A signed work order authorizes run create or
 resume. The Action Gateway authorizes side effects. No layer replaces another.
+Resident bearer JTIs are atomically one-use for mutating requests and reusable
+for reads until expiry. Audit stores only a domain-separated `sha256:`
+correlation digest, and resident middleware replaces caller-supplied audit time
+with a server-owned timestamp before trace recording.
 
 Explicit insecure local development mode is allowed only when it is enabled
 explicitly, bound to loopback or a Unix domain socket, visibly warned at startup,
@@ -65,6 +69,12 @@ keyrings are explicit and never inherited from `local_dev`. Missing inputs,
 unknown mode values, nil instance identity, stale caller trust, or permissive
 private-file modes fail startup/authentication closed.
 
+Configuration reads are bounded regular-file reads. Unix builds reject symlinks
+with `O_NOFOLLOW`; private files are checked on the opened descriptor for
+effective-user ownership and no group/world permission. This does not attest the
+host, mount source, ACLs, container identity, or hardware key custody. Non-Unix
+builds do not claim the Unix owner/mode check.
+
 The acceptance-only manager binary also requires explicit outbound dispatch
 configuration. It is not a production-authenticated inbound manager:
 
@@ -79,12 +89,21 @@ SPLENDOR_MANAGER_CALLER_KEY_ID=<caller-key-id> \
 SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE=/run/splendor/caller-signing-key.pk8 \
 SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE=/run/splendor/work-order-keyring.json \
 SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE=/etc/splendor/resident-root-ca.pem \
+SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS=https://resident-a.example:8443,https://resident-b.example:8443 \
 cargo run -p splendor-daemon --bin splendor-manager
 ```
 
 The caller signing key and manager work-order keyring must be owner-only files.
+The exact-origin allowlist is mandatory; userinfo, path, query, fragment,
+non-HTTPS production origins, and origin mismatches are rejected before token
+minting or network I/O. Loopback HTTP is available only to explicit test/local
+construction.
 The accepted UC-E2E-S4 composition generates test-only keys and TLS material in
-an untracked Docker volume; it does not use source-known development keys.
+separate role volumes. Residents never mount the caller private key. The manager
+has all per-instance work-order v1 issuer secrets, while each resident has only
+its own verifier secret. Work-order v1 is still keyed-BLAKE3 shared-secret
+verification, so this is scoped sibling isolation rather than asymmetric key
+separation.
 
 ## Run Path
 
@@ -126,11 +145,19 @@ Trace responses are ordered records. Replay validates run scope and sequence con
 - Missing/malformed/revoked/wrong-audience resident bearer proof returns `401`
   with a bounded `WWW-Authenticate` challenge; body/header identity metadata is
   a mirror, not proof.
+- Reusing a mutating bearer JTI returns `caller_token_replayed` before run or
+  gateway mutation. Safe create retries use a fresh bearer with the same durable
+  request/idempotency keys; ephemeral JTI digests are not part of that scope.
 - Missing endpoint scope fails closed.
 - Unsigned, expired, revoked, or incompatible work orders reject run create/resume.
 - Missing approval evidence on resume from `waiting_for_approval` returns `approval_required` before a tick runs.
 - `/actions` rejects caller-supplied bypass states and always routes side effects through the gateway.
 - Trace reads require visibility and redaction policy.
+- Manager dispatch requires immutable work-order/placement/node/instance
+  binding and exactly one healthy compatible resident. A post-send start reset,
+  timeout, malformed/oversized body, 5xx, or wrong run identity is
+  `resident_start_effect_unknown`, receives no automatic retry, and does not
+  publish running telemetry.
 
 ## Teardown
 

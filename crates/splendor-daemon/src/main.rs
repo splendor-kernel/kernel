@@ -7,7 +7,8 @@ use serde::Deserialize;
 use splendor_daemon::caller_auth::CallerTokenVerifier;
 use splendor_daemon::{router, DaemonConfig, DaemonState};
 use splendor_types::{InstanceId, PolicyBundleKeyring, WorkOrderKeyring};
-use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
@@ -22,8 +23,8 @@ enum DaemonRuntime {
     Resident {
         state: DaemonState,
         bind_addr: SocketAddr,
-        tls_cert_path: PathBuf,
-        tls_key_path: PathBuf,
+        tls_cert_pem: Vec<u8>,
+        tls_key_pem: Vec<u8>,
     },
 }
 
@@ -107,8 +108,8 @@ fn resident_runtime() -> Result<DaemonRuntime, std::io::Error> {
     let policy_keyring_path = required_env("SPLENDOR_POLICY_KEYRING_FILE")?;
     let tls_cert_path = PathBuf::from(required_env("SPLENDOR_TLS_CERT_FILE")?);
     let tls_key_path = PathBuf::from(required_env("SPLENDOR_TLS_KEY_FILE")?);
-    require_private_file_permissions(&tls_key_path)?;
-    fs::metadata(&tls_cert_path)?;
+    let tls_key_pem = read_regular_file(&tls_key_path, KEYRING_FILE_LIMIT, true)?;
+    let tls_cert_pem = read_regular_file(&tls_cert_path, KEYRING_FILE_LIMIT, false)?;
 
     let caller_token_verifier =
         CallerTokenVerifier::from_file(caller_trust_path, instance_id.clone()).map_err(|_| {
@@ -129,8 +130,8 @@ fn resident_runtime() -> Result<DaemonRuntime, std::io::Error> {
             policy_bundle_keyring,
         )),
         bind_addr,
-        tls_cert_path,
-        tls_key_path,
+        tls_cert_pem,
+        tls_key_pem,
     })
 }
 
@@ -162,13 +163,9 @@ fn load_secret_keyring(
     path: &Path,
     expected_schema: &str,
 ) -> Result<SharedSecretKeyringFile, std::io::Error> {
-    require_private_file_permissions(path)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > KEYRING_FILE_LIMIT {
-        return Err(invalid_keyring("oversized"));
-    }
+    let bytes = read_regular_file(path, KEYRING_FILE_LIMIT, true)?;
     let file: SharedSecretKeyringFile =
-        serde_json::from_slice(&fs::read(path)?).map_err(|_| invalid_keyring("malformed"))?;
+        serde_json::from_slice(&bytes).map_err(|_| invalid_keyring("malformed"))?;
     if file.schema_version != expected_schema || file.keys.is_empty() {
         return Err(invalid_keyring("schema"));
     }
@@ -204,21 +201,70 @@ fn invalid_keyring(kind: &str) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn require_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
+fn require_private_file_permissions(file: &File, path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = file.metadata()?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("{} must not be group/world accessible", path.display()),
+            format!(
+                "{} must be owned by the service user and not be group/world accessible",
+                path.display()
+            ),
         ));
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn require_private_file_permissions(_path: &Path) -> Result<(), std::io::Error> {
+fn require_private_file_permissions(_file: &File, _path: &Path) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+fn open_regular_file(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} must be a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn read_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+    private: bool,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = open_regular_file(path)?;
+    if private {
+        require_private_file_permissions(&file, path)?;
+    }
+    let metadata = file.metadata()?;
+    if metadata.len() > maximum_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} exceeds the configured file limit", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} exceeds the configured file limit", path.display()),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[tokio::main]
@@ -234,10 +280,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DaemonRuntime::Resident {
             state,
             bind_addr,
-            tls_cert_path,
-            tls_key_path,
+            tls_cert_pem,
+            tls_key_pem,
         } => {
-            let tls = RustlsConfig::from_pem_file(tls_cert_path, tls_key_path).await?;
+            let tls = RustlsConfig::from_pem(tls_cert_pem, tls_key_pem).await?;
             eprintln!(
                 "Splendor resident runtime daemon listening with TLS and verified caller authentication on {bind_addr}"
             );
@@ -458,6 +504,26 @@ mod tests {
         std::env::set_var("SPLENDOR_DAEMON_BIND_ADDR", "127.0.0.1:8077");
         let parsed = super::bind_addr("127.0.0.1:8077").expect("socket");
         assert_eq!(parsed.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn resident_config_reads_reject_non_regular_and_symlink_files() {
+        let root = std::env::temp_dir().join(format!(
+            "splendor-resident-file-hardening-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("fixture directory");
+        assert!(super::read_regular_file(&root, super::KEYRING_FILE_LIMIT, false).is_err());
+        let target = root.join("target.json");
+        write_private_bytes(&target, b"{}");
+        #[cfg(unix)]
+        {
+            let link = root.join("link.json");
+            std::os::unix::fs::symlink(&target, &link).expect("fixture symlink");
+            assert!(super::read_regular_file(&link, super::KEYRING_FILE_LIMIT, false).is_err());
+            assert!(super::read_regular_file(&link, super::KEYRING_FILE_LIMIT, true).is_err());
+        }
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
     }
 
     fn write_private_fixture(path: &std::path::Path, value: serde_json::Value) {

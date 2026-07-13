@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, State};
 use axum::http::{Method, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
@@ -67,6 +68,21 @@ struct TimeoutFaultState {
     start_calls: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PostSendStartFault {
+    ExecuteThenReset,
+    Malformed,
+    Oversized,
+    WrongRunId,
+    InternalServerError,
+}
+
+#[derive(Clone)]
+struct PostSendFaultState {
+    start_calls: Arc<AtomicUsize>,
+    fault: PostSendStartFault,
+}
+
 async fn fault_create_run(Json(payload): Json<serde_json::Value>) -> Json<CreateRunResponse> {
     let work_order: WorkOrderEnvelope =
         serde_json::from_value(payload["work_order"].clone()).expect("fault work order");
@@ -106,6 +122,62 @@ async fn spawn_timeout_fault_server() -> FaultHarness {
         .route("/runs/:run_id/start", post(fault_timeout_start))
         .with_state(TimeoutFaultState {
             start_calls: Arc::clone(&start_calls),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("fault server remains available");
+    });
+    FaultHarness {
+        base_url: format!("http://{address}"),
+        start_calls,
+        server,
+    }
+}
+
+async fn fault_post_send_start(
+    Path(_run_id): Path<RunId>,
+    State(state): State<PostSendFaultState>,
+) -> Response {
+    state.start_calls.fetch_add(1, Ordering::SeqCst);
+    match state.fault {
+        PostSendStartFault::ExecuteThenReset => {
+            panic!("fault injection: effect executed before connection reset")
+        }
+        PostSendStartFault::Malformed => (StatusCode::OK, "not-json").into_response(),
+        PostSendStartFault::Oversized => (StatusCode::OK, "x".repeat(4 * 1024)).into_response(),
+        PostSendStartFault::WrongRunId => Json(TickResponse {
+            run_id: RunId::new(),
+            status: splendor_daemon::RunStatus::Running,
+            tick_id: 1,
+            state_node_id: "state_fault_wrong_run".to_string(),
+            action_outcomes: Vec::new(),
+        })
+        .into_response(),
+        PostSendStartFault::InternalServerError => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                code: "fault_after_start".to_string(),
+                message: "fault injected after start processing".to_string(),
+                details: serde_json::Value::Null,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn spawn_post_send_fault_server(fault: PostSendStartFault) -> FaultHarness {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fault listener");
+    let address = listener.local_addr().expect("fault address");
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/runs", post(fault_create_run))
+        .route("/runs/:run_id/start", post(fault_post_send_start))
+        .with_state(PostSendFaultState {
+            start_calls: Arc::clone(&start_calls),
+            fault,
         });
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -273,6 +345,7 @@ fn instance_registration(
     node_id: &NodeId,
     instance_id: &InstanceId,
     tenant_id: &TenantId,
+    capability: &str,
 ) -> InstanceRegistration {
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -282,7 +355,7 @@ fn instance_registration(
         "node_id": node_id,
         "runtime_mode": "resident",
         "hosted_tenants": [tenant_id],
-        "supported_features": ["runtime.resident", "gateway.verified"],
+        "supported_features": ["runtime.resident", "gateway.verified", capability],
         "runtime_version": "0.1-test",
         "health": {"status": "healthy", "observed_at": now, "metadata": {}},
         "registered_at": now,
@@ -401,6 +474,7 @@ async fn register_and_place(
                 fixture.node_id,
                 fixture.instance_id,
                 fixture.tenant_id,
+                fixture.capability,
             ),
         },
     )
@@ -503,11 +577,16 @@ fn manager_state_with_options(
     .expect("manager state")
 }
 
-fn manager_state(signer: CallerTokenSigner, root_ca_pem: Vec<u8>) -> ManagerState {
+fn manager_state(
+    signer: CallerTokenSigner,
+    root_ca_pem: Vec<u8>,
+    allowed_origin: &str,
+) -> ManagerState {
     manager_state_with_options(
         signer,
         ResidentDispatchOptions {
             root_ca_pem: Some(root_ca_pem),
+            allowed_origins: vec![allowed_origin.to_string()],
             ..ResidentDispatchOptions::production()
         },
     )
@@ -526,7 +605,11 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
     let success_run = RunId::parse("44444444-4444-4444-8444-444444444444").expect("run");
     let success_resident =
         spawn_resident(&signer, success_instance.clone(), MANAGER_WORK_ORDER_KEY).await;
-    let success_manager = manager_state(signer.clone(), success_resident.root_ca_pem.clone());
+    let success_manager = manager_state(
+        signer.clone(),
+        success_resident.root_ca_pem.clone(),
+        &success_resident.base_url,
+    );
     let success_app = manager_router(success_manager);
     let security = manager_security(&fleet_id);
     let success_work_order = signed_work_order(
@@ -725,6 +808,7 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
     let hostname_app = manager_router(manager_state(
         signer.clone(),
         success_resident.root_ca_pem.clone(),
+        &success_resident.base_url,
     ));
     let hostname_security = manager_security(&fleet_id);
     let hostname_url = success_resident
@@ -760,8 +844,8 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
         },
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(hostname_error.code, "resident_create_transport_error");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hostname_error.code, "resident_origin_not_allowed");
 
     let rejection_signer = caller_signer();
     let rejection_instance =
@@ -773,6 +857,7 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
     let rejection_app = manager_router(manager_state(
         rejection_signer.clone(),
         rejection_resident.root_ca_pem.clone(),
+        &rejection_resident.base_url,
     ));
     let rejection_security = manager_security(&fleet_id);
     register_and_place(
@@ -863,7 +948,7 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
 }
 
 #[tokio::test]
-async fn real_resident_start_rejection_is_terminal_partial_failure_without_running_telemetry() {
+async fn real_resident_start_rejection_is_terminal_effect_unknown_without_running_telemetry() {
     let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
     let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
     let agent_id = AgentId::parse(AGENT_ID).expect("agent");
@@ -882,7 +967,11 @@ async fn real_resident_start_rejection_is_terminal_partial_failure_without_runni
         ],
     )
     .await;
-    let app = manager_router(manager_state(signer.clone(), resident.root_ca_pem.clone()));
+    let app = manager_router(manager_state(
+        signer.clone(),
+        resident.root_ca_pem.clone(),
+        &resident.base_url,
+    ));
     let security = manager_security(&fleet_id);
     register_and_place(
         &app,
@@ -916,9 +1005,12 @@ async fn real_resident_start_rejection_is_terminal_partial_failure_without_runni
             &request,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "attempt {attempt}");
-        assert_eq!(error.code, "resident_start_rejected", "attempt {attempt}");
-        assert!(error.message.contains("invalid_caller_token_scope"));
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "attempt {attempt}");
+        assert_eq!(
+            error.code, "resident_start_effect_unknown",
+            "attempt {attempt}"
+        );
+        assert!(error.message.contains("automatic retry is forbidden"));
     }
 
     let inspect_token = signer
@@ -976,7 +1068,7 @@ async fn real_resident_start_rejection_is_terminal_partial_failure_without_runni
     assert_eq!(
         audit
             .iter()
-            .filter(|event| event.event_type == "dispatch.partial_failure")
+            .filter(|event| event.event_type == "dispatch.effect_unknown")
             .count(),
         1
     );
@@ -999,6 +1091,7 @@ async fn start_timeout_is_effect_unknown_and_duplicate_dispatch_never_retries_it
         signer,
         ResidentDispatchOptions {
             start_timeout: StdDuration::from_millis(500),
+            allowed_origins: vec![fault.base_url.clone()],
             ..ResidentDispatchOptions::loopback_test()
         },
     ));
@@ -1110,4 +1203,118 @@ async fn start_timeout_is_effect_unknown_and_duplicate_dispatch_never_retries_it
     assert!(!audit
         .iter()
         .any(|event| event.event_type == "run.dispatched"));
+}
+
+#[tokio::test]
+async fn every_post_send_start_fault_is_terminal_effect_unknown_without_retry_or_telemetry() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    for (index, fault_kind) in [
+        PostSendStartFault::ExecuteThenReset,
+        PostSendStartFault::Malformed,
+        PostSendStartFault::Oversized,
+        PostSendStartFault::WrongRunId,
+        PostSendStartFault::InternalServerError,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fault = spawn_post_send_fault_server(fault_kind).await;
+        let signer = caller_signer();
+        let app = manager_router(manager_state_with_options(
+            signer,
+            ResidentDispatchOptions {
+                start_timeout: StdDuration::from_millis(500),
+                maximum_response_bytes: 512,
+                allowed_origins: vec![fault.base_url.clone()],
+                ..ResidentDispatchOptions::loopback_test()
+            },
+        ));
+        let security = manager_security(&fleet_id);
+        let node_id = NodeId::new();
+        let instance_id = InstanceId::new();
+        let run_id = RunId::new();
+        let work_order_id = format!("wo_post_send_fault_{index}");
+        let capability = format!("dispatch.post_send_fault.{index}");
+        register_and_place(
+            &app,
+            &security,
+            ResidentPlacementFixture {
+                fleet_id: &fleet_id,
+                node_id: &node_id,
+                instance_id: &instance_id,
+                tenant_id: &tenant_id,
+                resident_url: &fault.base_url,
+                capability: &capability,
+            },
+            signed_work_order(
+                &work_order_id,
+                run_id,
+                tenant_id.clone(),
+                agent_id.clone(),
+                &capability,
+            ),
+        )
+        .await;
+        let request = DispatchWorkOrderRequest {
+            security: security.clone(),
+            target_node_id: Some(node_id),
+        };
+        let uri = format!("/work-orders/{work_order_id}/dispatch");
+        for attempt in 0..2 {
+            let (status, error): (StatusCode, ManagerApiErrorBody) =
+                call_manager(app.clone(), Method::POST, &uri, &request).await;
+            assert_eq!(
+                status,
+                StatusCode::GATEWAY_TIMEOUT,
+                "{fault_kind:?} attempt {attempt}"
+            );
+            assert_eq!(
+                error.code, "resident_start_effect_unknown",
+                "{fault_kind:?} attempt {attempt}"
+            );
+            assert!(error.message.contains("automatic retry is forbidden"));
+        }
+        assert_eq!(
+            fault.start_calls.load(Ordering::SeqCst),
+            1,
+            "{fault_kind:?} must never be retried"
+        );
+        let (status, telemetry): (StatusCode, FleetTelemetrySnapshot) = call_manager(
+            app.clone(),
+            Method::POST,
+            "/fleet/telemetry/read",
+            &ManagerReadRequest {
+                security: security.clone(),
+                tenant_id: None,
+                agent_id: None,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(telemetry.runs.is_empty());
+        let (status, audit): (StatusCode, Vec<ManagerAuditEvent>) = call_manager(
+            app,
+            Method::POST,
+            "/fleet/audit/read",
+            &ManagerReadRequest {
+                security,
+                tenant_id: None,
+                agent_id: None,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event.event_type == "dispatch.effect_unknown")
+                .count(),
+            1
+        );
+        assert!(!audit
+            .iter()
+            .any(|event| event.event_type == "run.dispatched"));
+    }
 }
