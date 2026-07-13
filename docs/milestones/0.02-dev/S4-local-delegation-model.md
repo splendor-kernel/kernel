@@ -30,7 +30,9 @@ inheritance.
 
 ## Public contracts changed
 
-- `splendor_types::TaskRequest` for `splendor.message.task_request.v1`.
+- `splendor_types::TaskRequest` for live `splendor.message.task_request.v2`, with
+  a mandatory non-authorizing child capability-grant reference. Legacy v1 is
+  replay/migration-only.
 - `splendor_types::TaskResponse` for `splendor.message.task_response.v1`.
 - `splendor_types::DelegatedAuthority` and `TaskFailure`.
 - `splendor_types::TraceEventKind` variants for local delegation.

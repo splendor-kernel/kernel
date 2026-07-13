@@ -59,15 +59,18 @@ mutation, and seed.
 `AUTH-007c` fixes and tests the production-local delegation manager boundary:
 registered root runs remain unbound for non-delegating compatibility, but must be
 explicitly and immutably bound to one trusted `ValidatedCapabilityGrant` before
-creating child work. The manager privately retains the exact validated grant,
-including trust state, while public run records expose its ID as evidence only.
+creating child work. The Authority Service privately retains exact validated
+root/child grants and issues opaque caller/runtime handles; kernel contexts expose
+only handles and grant IDs as evidence.
 Grant IDs are unique across root and child bindings within one manager, grant
 subjects must match the run principal snapshot, and child creation rejects a
 missing, content-mismatched, or colliding binding before request, routing,
-child-start, insertion, or fan-out effects. Successful child records retain the
-issued grant privately for exact binding plus its complete chain. The local
-authority ledger supports recursive narrowing, atomic aggregate budget/fan-out
-reservations, cleanup, and descendant revocation while depth remains.
+child-start, insertion, or fan-out effects. Successful child records retain an
+opaque live authority handle bound to the complete immutable chain. The local
+authority ledger supports recursive narrowing, exact child agent/run bindings,
+atomic aggregate budget/fan-out reservations, cumulative per-tick action
+accounting, cleanup, and descendant revocation while depth remains. A final
+delegated-action permit is retained through gateway entry.
 `AUTH-007d` adds an exact-family current-v1 versus v0/v2 rejection matrix for
 authority operations, scopes, grants, requests, revocation records, and policy
 bundles. It also closes the policy-distribution gap that previously accepted a
@@ -81,18 +84,22 @@ unsupported/future/expired candidates, apply the existing revocation block for a
 revoked candidate, record rejection/sync-failure traces, and keep blocked action
 attempts at zero adapter calls.
 
-This slice adds only backward-compatible daemon/OpenAPI/TypeScript fields for raw
-obligation receipts and inspect-only replay authority summaries. It does not add
+This slice retains the backward-compatible daemon/OpenAPI/TypeScript fields for
+raw obligation receipts. AUTH-003 hardening intentionally versions the live task
+request, delegation edge/chain, and redacted trace-summary contracts to v2: live
+task requests require `capability_grant_id`, and default trace evidence no longer
+exposes full grants/chains. It does not add
 an authority revocation/watch endpoint, change endpoint names, or change Python,
 fleet behavior, node admission,
 workload-controller wiring, approval
 workflow execution, MFA/provider integration, gate-engine migration, obligation
 receipt storage, production PKI, external revocation introspection, production
 lease renewal, revocation watches, incident-controller integration, or introduce
-a new adapter execution path. It adds optional local
-trace/message/run-record authority reference fields for `AUTH-003b`, additive
-`DelegationGrant.cleanup_obligations` and optional delegation-ledger trace
-evidence (older v1 payloads use strict defaults/absence), optional
+a new adapter execution path. It adds local trace/message/run-record authority
+reference fields for `AUTH-003b`, v2 edge binding digests, cleanup obligations,
+and redacted delegation-ledger trace summaries. Legacy task-request v1 is
+non-authorizing replay/migration data and is not accepted for live delegation
+creation. It also retains optional
 gateway action obligation evidence for `AUTH-004b`, and a matching optional
 `@splendor/types` primitive field for schema parity. `AUTH-005a` adds no public
 schema churn; it exposes authority-crate Rust types/functions that cache only
@@ -293,8 +300,8 @@ The bounded `AUTH-003b` slice wires the authority-owned builder into the current
 local delegation manager:
 
 - `LocalDelegationManager::create_child_run` now requires `LocalDelegationAuthority`
-  with a trusted parent `ValidatedCapabilityGrant`, child principal, audience,
-  and non-authorizing parent/child grant refs;
+  with an opaque authority-owned caller handle, child principal, audience, and
+  non-authorizing parent/child grant refs;
 - parent and child run records carry run-bound principal IDs; the manager binds
   the parent grant subject to the parent run's principal snapshot and evaluates
   parent/child grant liveness at the current decision time before routing any
@@ -311,11 +318,14 @@ local delegation manager:
   gateway submission and is not standalone capability authority;
 - `InMemoryDelegationAuthorityLedger` is the sole local validity/accounting owner:
   it stores exact roots and complete immutable ordered chains, validates each
-  edge with deterministic index/reason, owns fan-out, atomically reserves every
-  budget component across direct subtrees, and records reservation lifecycle;
+  edge and semantic binding digest with deterministic index/reason, owns exact
+  child agent/run bindings and fan-out, atomically reserves every budget component
+  across direct subtrees, cumulatively accounts action usage by tick, and records
+  reservation lifecycle;
 - issued child grants may recursively narrow only through their exact run binding
   and remaining trusted depth/scope/role/time/budget;
-- every delegated action carries and evaluates the exact issued child grant ID;
+- every delegated action carries the exact issued child grant ID, evaluates the
+  live ledger-owned handle, and retains a final permit through gateway entry;
 - cancellation/revocation propagates through descendants. Message payload grant
   refs remain evidence only.
 
@@ -591,8 +601,8 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
   `DelegationRequested`, task message routing, `ChildRunStarted`, child insertion,
   or parent fan-out mutation;
 - successful child records remain automatically bound to their authority-issued
-  exact validated grant and complete immutable chain; `LocalChildRun` exposes the
-  trusted grant only for exact local action/nested composition;
+  exact validated grant and complete immutable chain, but `LocalChildRun` and
+  `AgentContext` expose only opaque authority handles and non-authorizing IDs;
 - proposed child grant IDs colliding with any existing root or child private
   binding deny with `child_capability_grant_id_collision` before request, routing,
   child-start, insertion, or fan-out mutation;
@@ -614,15 +624,23 @@ The bounded `AUTH-007c` slice adds local delegation replay hardening and evidenc
 - grant-ID uniqueness is local to one `LocalDelegationManager`. The different-
   tenant matrix case uses a separate manager only to exercise grant tenant-scope
   denial and makes no cross-manager, cross-instance, or typed-audience claim.
-- the additive `LegacyMultiScopeProfile` compatibility builder uses the existing
+- the `LegacyMultiScopeProfile` compatibility builder uses the existing
   local-profile validator to create one bounded parent grant over explicit,
   non-empty child agent/run ID lists. This restores the one-manager,
   one-parent/two-specialist E2E without duplicating the parent across managers;
-  empty/nil lists and invalid or wildcard-like audiences fail closed. Agent and
-  run lists are independent scope dimensions with Cartesian containment, not
-  index-paired edges. Real authority issuance tests allow listed combinations
-  and deny an unlisted agent or unlisted run with `overbroad_scope`; a typed
-  paired agent/run edge contract is explicitly deferred.
+  empty/nil lists and invalid or wildcard-like audiences fail closed. Raw
+  capability containment still treats agent and run lists as independent set
+  dimensions, but trusted root admission zips equal-length lists into exact,
+  immutable child bindings. Empty, unequal, duplicate, nil, or recombined pairs
+  deny with `delegation_child_runtime_binding_denied`; a typed paired edge remains
+  future migration work.
+- live delegated messages use `splendor.message.task_request.v2` and require the
+  authority-owned child grant reference. v1 is retained only for non-authorizing
+  replay/migration data. Delegation edge and chain schemas are v2 and each edge
+  carries an exact semantic binding digest.
+- normal trace/replay payloads use `DelegationLedgerTraceSummary` v2 rather than
+  serializing full grants, scopes, objectives, allowlists, obligations, result
+  parameters, or budget values. Complete chain evidence remains authority-owned.
 - the binding API is trusted local run-admission setup and has no new durable
   trace event in this bounded slice. Adding such an event would expand the public
   trace schema; no durable binding-mutation trace claim is made.

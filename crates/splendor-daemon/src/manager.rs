@@ -1439,9 +1439,10 @@ async fn sync_trace_buffer(
 fn supported_message_schemas() -> Vec<SupportedMessageSchema> {
     vec![
         SupportedMessageSchema {
-            schema: "splendor.message.task_request.v1".to_string(),
-            version: "v1".to_string(),
-            description: "Scoped task/delegation request between agents".to_string(),
+            schema: TASK_REQUEST_SCHEMA.to_string(),
+            version: "v2".to_string(),
+            description: "Scoped task/delegation request with mandatory grant reference"
+                .to_string(),
             delivery_authority_granted: false,
         },
         SupportedMessageSchema {
@@ -3694,13 +3695,14 @@ mod tests {
                         "child_run_id": child_run_id,
                         "target_agent_id": target_agent,
                         "objective": "scoped task request",
-                        "delegated_authority": delegated_authority
+                        "delegated_authority": delegated_authority,
+                        "capability_grant_id": "77777777-7777-4777-8777-777777777777"
                     },
                     "causal_parent": null,
                     "requires_response": true,
                     "created_at": now_rfc3339()
                 },
-                "schema_version": "v1",
+                "schema_version": "v2",
                 "delivery_status": "pending",
                 "trace_links": {}
             },
@@ -3776,7 +3778,13 @@ mod tests {
         let error = state
             .validate_security(&missing_scope, None, EndpointScope::FleetRead, false)
             .expect_err("missing scope rejected");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.status,
+            StatusCode::FORBIDDEN,
+            "unexpected rejection: {} {}",
+            error.body.code,
+            error.body.message
+        );
         assert_eq!(error.body.code, "missing_scope");
 
         let mut wrong_audience = valid.clone();
@@ -4921,7 +4929,7 @@ mod tests {
                 run_id: run_id.clone(),
                 source_agent_id: source_agent.clone(),
                 target_agent_id: target_agent.clone(),
-                schema: "splendor.message.task_request.v1".to_string(),
+                schema: TASK_REQUEST_SCHEMA.to_string(),
                 causal_parent: None,
                 delivery_status: "delivered".to_string(),
                 trace_event_id: delivery_trace_event_id.clone(),
@@ -4986,7 +4994,7 @@ mod tests {
         assert!(schemas
             .schemas
             .iter()
-            .any(|schema| schema.schema == "splendor.message.task_request.v1"));
+            .any(|schema| schema.schema == TASK_REQUEST_SCHEMA));
 
         let envelope: MessageEnvelope = serde_json::from_value(serde_json::json!({
             "message": {
@@ -5871,7 +5879,13 @@ mod tests {
         let error = send_message(State(state.clone()), Json(permission_smuggle))
             .await
             .expect_err("extra nested permission rejected");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.status,
+            StatusCode::FORBIDDEN,
+            "unexpected rejection: {} {}",
+            error.body.code,
+            error.body.message
+        );
         assert_eq!(error.body.code, "message_payload_scope_smuggling");
         assert!(!state
             .inner

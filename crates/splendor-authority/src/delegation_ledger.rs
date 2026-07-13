@@ -10,12 +10,13 @@ use crate::{
     ValidatedCapabilityGrant,
 };
 use splendor_types::{
-    AuthorityBudgetScope, CapabilityGrant, CapabilityGrantId, DelegationChain,
-    DelegationCleanupObligations, DelegationLedgerEvidence, DelegationReservationStatus,
-    PrincipalId, DELEGATION_CHAIN_SCHEMA_VERSION,
+    AgentId, AuthorityBudgetScope, AuthorityDecisionStatus, CapabilityGrant, CapabilityGrantId,
+    CapabilityRequest, DelegationChain, DelegationCleanupObligations, DelegationLedgerEvidence,
+    DelegationReservationStatus, PrincipalId, QuotaUsage, RunId, TenantId,
+    CAPABILITY_REQUEST_SCHEMA_VERSION, DELEGATION_CHAIN_SCHEMA_VERSION,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -48,6 +49,18 @@ struct LedgerNode {
     parent_fan_out_limit: u32,
     budget: AuthorityBudgetScope,
     status: EdgeStatus,
+    runtime_binding: Option<RuntimeBinding>,
+    handle_token: CapabilityGrantId,
+    own_tick_usage: HashMap<u64, QuotaUsage>,
+    subtree_tick_usage: HashMap<u64, QuotaUsage>,
+    allowed_child_bindings: Vec<(AgentId, RunId)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeBinding {
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    run_id: RunId,
 }
 
 #[derive(Default)]
@@ -64,8 +77,8 @@ pub struct DelegationReservation {
 
 impl DelegationReservation {
     /// Authority-issued immutable child edge and validated grant.
-    pub fn issued(&self) -> &DelegationChildGrant {
-        &self.issued
+    pub fn delegation_grant(&self) -> &splendor_types::DelegationGrant {
+        self.issued.delegation_grant()
     }
 
     /// Replay-safe evidence for the reserved state.
@@ -76,6 +89,230 @@ impl DelegationReservation {
     fn child_grant_id(&self) -> &CapabilityGrantId {
         &self.issued.child_grant().grant().grant_id
     }
+}
+
+/// Opaque authority-owned identity used by a run to create a narrower child.
+///
+/// The handle cannot be constructed from a grant ID, message, run ID, or raw
+/// capability payload. Every use is re-bound to the owning ledger and current
+/// node lifecycle before delegation is reserved.
+#[derive(Clone)]
+pub struct DelegationCallerHandle {
+    state: Arc<Mutex<LedgerState>>,
+    grant_id: CapabilityGrantId,
+    token: CapabilityGrantId,
+}
+
+impl std::fmt::Debug for DelegationCallerHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DelegationCallerHandle")
+            .field("grant_id", &self.grant_id)
+            .field("authority", &"<opaque>")
+            .finish()
+    }
+}
+
+impl DelegationCallerHandle {
+    /// Non-authorizing grant reference for action/message correlation.
+    pub fn grant_id(&self) -> &CapabilityGrantId {
+        &self.grant_id
+    }
+
+    /// Returns an opaque live runtime authority view for this exact run binding.
+    pub fn runtime_authority(&self) -> DelegatedRuntimeAuthorityHandle {
+        DelegatedRuntimeAuthorityHandle {
+            state: Arc::clone(&self.state),
+            grant_id: self.grant_id.clone(),
+            token: self.token.clone(),
+        }
+    }
+
+    /// Compares opaque authority ownership without exposing validation material.
+    pub fn is_same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+            && self.grant_id == other.grant_id
+            && self.token == other.token
+    }
+
+    /// Trusted admission compatibility check. The supplied wrapper never
+    /// becomes live authority; it must equal the ledger-owned binding exactly.
+    pub fn matches_validated_grant(&self, grant: &ValidatedCapabilityGrant) -> bool {
+        self.state.lock().ok().is_some_and(|state| {
+            state
+                .nodes
+                .get(&self.grant_id)
+                .is_some_and(|node| node.handle_token == self.token && node.grant == *grant)
+        })
+    }
+
+    /// Returns bounded defaults for constructing a narrower child request. This
+    /// is configuration only; every value is revalidated from live ledger state.
+    pub fn child_request_defaults(
+        &self,
+    ) -> Result<DelegationChildRequestDefaults, DelegationLedgerError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DelegationLedgerError::StorageUnavailable)?;
+        let node = state
+            .nodes
+            .get(&self.grant_id)
+            .ok_or(DelegationLedgerError::ParentGrantMissing)?;
+        if node.handle_token != self.token || node.status != EdgeStatus::Active {
+            return Err(DelegationLedgerError::ParentGrantMismatch);
+        }
+        Ok(DelegationChildRequestDefaults {
+            budget: node.budget,
+            not_before: node.grant.grant().not_before,
+            expires_at: node.grant.grant().expires_at,
+            max_delegation_depth: node.grant.grant().max_delegation_depth.saturating_sub(1),
+        })
+    }
+}
+
+/// Non-authorizing defaults projected from a live parent handle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DelegationChildRequestDefaults {
+    pub budget: AuthorityBudgetScope,
+    pub not_before: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub max_delegation_depth: u32,
+}
+
+/// Opaque authority-owned live child runtime authority.
+#[derive(Clone)]
+pub struct DelegatedRuntimeAuthorityHandle {
+    state: Arc<Mutex<LedgerState>>,
+    grant_id: CapabilityGrantId,
+    token: CapabilityGrantId,
+}
+
+impl std::fmt::Debug for DelegatedRuntimeAuthorityHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DelegatedRuntimeAuthorityHandle")
+            .field("grant_id", &self.grant_id)
+            .field("authority", &"<opaque>")
+            .finish()
+    }
+}
+
+impl DelegatedRuntimeAuthorityHandle {
+    /// Non-authorizing grant reference required on delegated action proposals.
+    pub fn grant_id(&self) -> &CapabilityGrantId {
+        &self.grant_id
+    }
+
+    /// Atomically performs final live authorization and reserves cumulative
+    /// authority-owned usage before the gateway can be entered.
+    pub fn authorize_action(
+        &self,
+        request: DelegatedActionAuthorizationRequest,
+    ) -> Result<DelegatedActionPermit, DelegatedActionAuthorizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DelegatedActionAuthorizationError::AuthorityUnavailable)?;
+        authorize_live_action(&mut state, &self.grant_id, &self.token, request)?;
+        Ok(DelegatedActionPermit {
+            _state: Arc::clone(&self.state),
+            grant_id: self.grant_id.clone(),
+        })
+    }
+}
+
+/// Exact final delegated-action authorization request.
+#[derive(Clone, Debug)]
+pub struct DelegatedActionAuthorizationRequest {
+    pub supplied_grant_id: Option<CapabilityGrantId>,
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub run_id: RunId,
+    pub tick_id: u64,
+    pub operations: Vec<splendor_types::AuthorityOperation>,
+    pub usage_estimate: QuotaUsage,
+    pub now: OffsetDateTime,
+}
+
+/// Linearization permit proving final live delegated authorization occurred.
+pub struct DelegatedActionPermit {
+    _state: Arc<Mutex<LedgerState>>,
+    grant_id: CapabilityGrantId,
+}
+
+impl std::fmt::Debug for DelegatedActionPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DelegatedActionPermit")
+            .field("grant_id", &self.grant_id)
+            .field("authority", &"<opaque>")
+            .finish()
+    }
+}
+
+impl DelegatedActionPermit {
+    pub fn grant_id(&self) -> &CapabilityGrantId {
+        &self.grant_id
+    }
+}
+
+/// Stable fail-closed delegated-action authorization failures.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum DelegatedActionAuthorizationError {
+    #[error("delegated authority is unavailable")]
+    AuthorityUnavailable,
+    #[error("delegated authority handle is invalid")]
+    InvalidHandle,
+    #[error("delegated capability grant reference does not match")]
+    GrantReferenceMismatch,
+    #[error("delegated runtime identity does not match")]
+    RuntimeBindingMismatch,
+    #[error("delegated authority is no longer active")]
+    AuthorityInactive,
+    #[error("delegated authority is not yet valid")]
+    NotYetValid,
+    #[error("delegated authority is expired")]
+    Expired,
+    #[error("delegated authority is revoked")]
+    Revoked,
+    #[error("delegated operation is denied: {reason}")]
+    OperationDenied { reason: String },
+    #[error("delegated cumulative budget is exceeded: {dimension}")]
+    BudgetExceeded { dimension: &'static str },
+    #[error("delegated retained executable budget is exceeded: {dimension}")]
+    RetainedBudgetExceeded { dimension: &'static str },
+}
+
+impl DelegatedActionAuthorizationError {
+    pub fn reason_code(&self) -> String {
+        match self {
+            Self::AuthorityUnavailable => "delegated_authority_unavailable".to_string(),
+            Self::InvalidHandle => "delegated_authority_handle_invalid".to_string(),
+            Self::GrantReferenceMismatch => "delegated_capability_grant_ref_mismatch".to_string(),
+            Self::RuntimeBindingMismatch => "delegated_runtime_binding_mismatch".to_string(),
+            Self::AuthorityInactive => "delegated_authority_inactive".to_string(),
+            Self::NotYetValid => "delegated_authority_not_yet_valid".to_string(),
+            Self::Expired => "delegated_authority_expired".to_string(),
+            Self::Revoked => "delegated_authority_revoked".to_string(),
+            Self::OperationDenied { reason } => reason.clone(),
+            Self::BudgetExceeded { dimension } => {
+                format!("delegated_cumulative_budget_exceeded_{dimension}")
+            }
+            Self::RetainedBudgetExceeded { dimension } => {
+                format!("delegated_retained_budget_exceeded_{dimension}")
+            }
+        }
+    }
+}
+
+/// Successful committed child authority, containing handles rather than a
+/// requester-visible validated grant clone.
+#[derive(Debug)]
+pub struct CommittedDelegation {
+    pub evidence: DelegationLedgerEvidence,
+    pub caller: DelegationCallerHandle,
+    pub runtime_authority: DelegatedRuntimeAuthorityHandle,
 }
 
 /// Deterministic chain validation failure naming the first failing edge.
@@ -124,6 +361,9 @@ pub enum DelegationLedgerError {
     /// Parent cleanup was attempted while descendant allocations remain active.
     #[error("delegation cleanup requires descendants to finish first")]
     ActiveDescendants,
+    /// Requested child agent/run pair was not an exact authority-owned binding.
+    #[error("delegation child agent/run binding is not allowed")]
+    ChildRuntimeBindingDenied,
 }
 
 impl DelegationLedgerError {
@@ -146,14 +386,24 @@ impl DelegationLedgerError {
             Self::RoleEscalation => "delegation_role_escalation".to_string(),
             Self::ReservationNotActive => "delegation_reservation_not_active".to_string(),
             Self::ActiveDescendants => "delegation_active_descendants".to_string(),
+            Self::ChildRuntimeBindingDenied => {
+                "delegation_child_runtime_binding_denied".to_string()
+            }
         }
     }
 }
 
 /// In-memory authority owner for local delegation validity and accounting.
-#[derive(Default)]
 pub struct InMemoryDelegationAuthorityLedger {
-    state: Mutex<LedgerState>,
+    state: Arc<Mutex<LedgerState>>,
+}
+
+impl Default for InMemoryDelegationAuthorityLedger {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LedgerState::default())),
+        }
+    }
 }
 
 impl std::fmt::Debug for InMemoryDelegationAuthorityLedger {
@@ -172,26 +422,85 @@ impl InMemoryDelegationAuthorityLedger {
     }
 
     /// Registers one immutable validated root grant. Exact retries are idempotent.
+    #[cfg(test)]
     pub fn register_root(
         &self,
         root: &ValidatedCapabilityGrant,
-    ) -> Result<(), DelegationLedgerError> {
+    ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
+        self.register_root_with_binding(root, None, exact_scope_bindings(root.grant())?)
+    }
+
+    /// Registers one root with the exact runtime binding used for nested calls
+    /// and final action authorization.
+    pub fn register_root_runtime(
+        &self,
+        root: &ValidatedCapabilityGrant,
+        tenant_id: TenantId,
+        agent_id: AgentId,
+        run_id: RunId,
+    ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
+        let bindings = exact_scope_bindings(root.grant())?;
+        self.register_root_with_binding(
+            root,
+            Some(RuntimeBinding {
+                tenant_id,
+                agent_id,
+                run_id,
+            }),
+            bindings,
+        )
+    }
+
+    /// Registers a root with explicit exact child agent/run bindings for a
+    /// multi-valued compatibility scope. The two scope lists are never treated
+    /// as a Cartesian authorization surface.
+    pub fn register_root_runtime_with_child_bindings(
+        &self,
+        root: &ValidatedCapabilityGrant,
+        tenant_id: TenantId,
+        agent_id: AgentId,
+        run_id: RunId,
+        child_bindings: Vec<(AgentId, RunId)>,
+    ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
+        validate_explicit_child_bindings(root.grant(), &child_bindings)?;
+        self.register_root_with_binding(
+            root,
+            Some(RuntimeBinding {
+                tenant_id,
+                agent_id,
+                run_id,
+            }),
+            child_bindings,
+        )
+    }
+
+    fn register_root_with_binding(
+        &self,
+        root: &ValidatedCapabilityGrant,
+        runtime_binding: Option<RuntimeBinding>,
+        allowed_child_bindings: Vec<(AgentId, RunId)>,
+    ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
         let mut state = self.lock()?;
         let id = root.grant().grant_id.clone();
         if let Some(existing) = state.nodes.get(&id) {
-            return if existing.parent_grant_id.is_none() && existing.grant == *root {
-                Ok(())
+            return if existing.parent_grant_id.is_none()
+                && existing.grant == *root
+                && existing.runtime_binding == runtime_binding
+                && existing.allowed_child_bindings == allowed_child_bindings
+            {
+                Ok(handle_for_node(&self.state, &id, existing))
             } else {
                 Err(DelegationLedgerError::RootGrantConflict)
             };
         }
+        let handle_token = CapabilityGrantId::new();
         state.nodes.insert(
             id.clone(),
             LedgerNode {
                 grant: root.clone(),
                 chain: DelegationChain {
                     schema_version: DELEGATION_CHAIN_SCHEMA_VERSION.to_string(),
-                    root_grant_id: id,
+                    root_grant_id: id.clone(),
                     grants: Vec::new(),
                     max_depth: root.grant().max_delegation_depth,
                 },
@@ -199,28 +508,40 @@ impl InMemoryDelegationAuthorityLedger {
                 parent_fan_out_limit: LOCAL_DELEGATION_FAN_OUT_LIMIT,
                 budget: root.grant().scope.budget,
                 status: EdgeStatus::Active,
+                runtime_binding,
+                handle_token: handle_token.clone(),
+                own_tick_usage: HashMap::new(),
+                subtree_tick_usage: HashMap::new(),
+                allowed_child_bindings,
             },
         );
-        Ok(())
+        Ok(DelegationCallerHandle {
+            state: Arc::clone(&self.state),
+            grant_id: id,
+            token: handle_token,
+        })
     }
 
     /// Atomically validates, issues, chain-checks, and reserves one child edge.
     pub fn reserve_child(
         &self,
-        parent: &ValidatedCapabilityGrant,
+        parent: &DelegationCallerHandle,
         mut request: DelegationChildGrantRequest,
         now: OffsetDateTime,
         audience: String,
         expected_child_subject: PrincipalId,
     ) -> Result<DelegationReservation, DelegationLedgerError> {
         let mut state = self.lock()?;
-        let parent_id = parent.grant().grant_id.clone();
+        if !Arc::ptr_eq(&self.state, &parent.state) {
+            return Err(DelegationLedgerError::ParentGrantMismatch);
+        }
+        let parent_id = parent.grant_id.clone();
         let parent_node = state
             .nodes
             .get(&parent_id)
             .cloned()
             .ok_or(DelegationLedgerError::ParentGrantMissing)?;
-        if parent_node.grant != *parent {
+        if parent_node.handle_token != parent.token || parent_node.status != EdgeStatus::Active {
             return Err(DelegationLedgerError::ParentGrantMismatch);
         }
         validate_delegation_chain(parent_node.chain_root(&state)?, &parent_node.chain)?;
@@ -232,6 +553,22 @@ impl InMemoryDelegationAuthorityLedger {
                 return Err(DelegationLedgerError::RoleEscalation);
             }
         }
+
+        let parent_binding = parent_runtime_binding(&parent_node, &request)?;
+        if !parent_node
+            .allowed_child_bindings
+            .contains(&(request.child_agent_id.clone(), request.child_run_id.clone()))
+        {
+            return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
+        }
+        request.parent_grant_id = Some(parent_id.clone());
+        request.issuer = parent_node.grant.grant().subject.clone();
+        request.parent_run_id = parent_binding.run_id.clone();
+        request.parent_agent_id = parent_binding.agent_id.clone();
+        let requested_budget = request.scope.budget;
+        request.scope = parent_node.grant.grant().scope.clone();
+        request.scope.tenant_ids = Some(vec![parent_binding.tenant_id.clone()]);
+        request.scope.budget = requested_budget;
 
         let current_fan_out = state
             .nodes
@@ -245,7 +582,7 @@ impl InMemoryDelegationAuthorityLedger {
         // lower, or otherwise become the effective limit.
         request.max_fan_out = parent_node.parent_fan_out_limit;
         let issued = issue_delegation_child_grant(
-            parent,
+            &parent_node.grant,
             request,
             DelegationValidationContext {
                 now,
@@ -268,6 +605,29 @@ impl InMemoryDelegationAuthorityLedger {
         validate_delegation_chain(parent_node.chain_root(&state)?, &chain)?;
 
         let child_id = issued.child_grant().grant().grant_id.clone();
+        let runtime_binding = Some(RuntimeBinding {
+            tenant_id: issued
+                .child_grant()
+                .grant()
+                .scope
+                .tenant_ids
+                .as_ref()
+                .and_then(|ids| ids.first())
+                .cloned()
+                .ok_or(DelegationLedgerError::ParentGrantMismatch)?,
+            agent_id: issued.delegation_grant().child_agent_id.clone(),
+            run_id: issued.delegation_grant().child_run_id.clone(),
+        });
+        let handle_token = CapabilityGrantId::new();
+        let allowed_child_bindings = parent_node
+            .allowed_child_bindings
+            .iter()
+            .filter(|binding| {
+                binding.0 != issued.delegation_grant().child_agent_id
+                    || binding.1 != issued.delegation_grant().child_run_id
+            })
+            .cloned()
+            .collect();
         let budget = issued.delegation_grant().budget;
         let evidence = DelegationLedgerEvidence {
             chain: chain.clone(),
@@ -285,6 +645,11 @@ impl InMemoryDelegationAuthorityLedger {
                 parent_fan_out_limit: LOCAL_DELEGATION_FAN_OUT_LIMIT,
                 budget,
                 status: EdgeStatus::Reserved,
+                runtime_binding,
+                handle_token,
+                own_tick_usage: HashMap::new(),
+                subtree_tick_usage: HashMap::new(),
+                allowed_child_bindings,
             },
         );
         Ok(DelegationReservation { issued, evidence })
@@ -294,13 +659,24 @@ impl InMemoryDelegationAuthorityLedger {
     pub fn commit(
         &self,
         reservation: &DelegationReservation,
-    ) -> Result<DelegationLedgerEvidence, DelegationLedgerError> {
-        self.transition(
+    ) -> Result<CommittedDelegation, DelegationLedgerError> {
+        let evidence = self.transition(
             reservation,
             EdgeStatus::Active,
             DelegationReservationStatus::Committed,
             None,
-        )
+        )?;
+        let state = self.lock()?;
+        let node = state
+            .nodes
+            .get(reservation.child_grant_id())
+            .ok_or(DelegationLedgerError::ReservationNotActive)?;
+        let caller = handle_for_node(&self.state, reservation.child_grant_id(), node);
+        Ok(CommittedDelegation {
+            evidence,
+            runtime_authority: caller.runtime_authority(),
+            caller,
+        })
     }
 
     /// Releases a reservation only when routing produced no effect.
@@ -476,6 +852,19 @@ impl InMemoryDelegationAuthorityLedger {
             .lock()
             .map_err(|_| DelegationLedgerError::StorageUnavailable)
     }
+
+    #[cfg(test)]
+    fn caller_for_test(
+        &self,
+        grant_id: &CapabilityGrantId,
+    ) -> Result<DelegationCallerHandle, DelegationLedgerError> {
+        let state = self.lock()?;
+        let node = state
+            .nodes
+            .get(grant_id)
+            .ok_or(DelegationLedgerError::ParentGrantMissing)?;
+        Ok(handle_for_node(&self.state, grant_id, node))
+    }
 }
 
 impl LedgerNode {
@@ -503,6 +892,421 @@ impl LedgerNode {
             reason,
         }
     }
+}
+
+fn handle_for_node(
+    state: &Arc<Mutex<LedgerState>>,
+    grant_id: &CapabilityGrantId,
+    node: &LedgerNode,
+) -> DelegationCallerHandle {
+    DelegationCallerHandle {
+        state: Arc::clone(state),
+        grant_id: grant_id.clone(),
+        token: node.handle_token.clone(),
+    }
+}
+
+fn parent_runtime_binding(
+    node: &LedgerNode,
+    request: &DelegationChildGrantRequest,
+) -> Result<RuntimeBinding, DelegationLedgerError> {
+    if let Some(binding) = node.runtime_binding.clone() {
+        return Ok(binding);
+    }
+    #[cfg(test)]
+    {
+        let tenant_id = node
+            .grant
+            .grant()
+            .scope
+            .tenant_ids
+            .as_ref()
+            .and_then(|ids| ids.first())
+            .cloned()
+            .ok_or(DelegationLedgerError::ParentGrantMismatch)?;
+        Ok(RuntimeBinding {
+            tenant_id,
+            agent_id: request.parent_agent_id.clone(),
+            run_id: request.parent_run_id.clone(),
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = request;
+        Err(DelegationLedgerError::ParentGrantMismatch)
+    }
+}
+
+fn exact_scope_bindings(
+    grant: &CapabilityGrant,
+) -> Result<Vec<(AgentId, RunId)>, DelegationLedgerError> {
+    let agents = grant
+        .scope
+        .agent_ids
+        .as_ref()
+        .ok_or(DelegationLedgerError::ChildRuntimeBindingDenied)?;
+    let runs = grant
+        .scope
+        .run_ids
+        .as_ref()
+        .ok_or(DelegationLedgerError::ChildRuntimeBindingDenied)?;
+    if agents.len() != 1 || runs.len() != 1 {
+        return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
+    }
+    Ok(vec![(agents[0].clone(), runs[0].clone())])
+}
+
+fn validate_explicit_child_bindings(
+    grant: &CapabilityGrant,
+    bindings: &[(AgentId, RunId)],
+) -> Result<(), DelegationLedgerError> {
+    let agents = grant
+        .scope
+        .agent_ids
+        .as_ref()
+        .ok_or(DelegationLedgerError::ChildRuntimeBindingDenied)?;
+    let runs = grant
+        .scope
+        .run_ids
+        .as_ref()
+        .ok_or(DelegationLedgerError::ChildRuntimeBindingDenied)?;
+    if bindings.is_empty() {
+        return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (agent_id, run_id) in bindings {
+        if agent_id.is_nil()
+            || run_id.is_nil()
+            || !agents.contains(agent_id)
+            || !runs.contains(run_id)
+            || !seen.insert((agent_id.clone(), run_id.clone()))
+        {
+            return Err(DelegationLedgerError::ChildRuntimeBindingDenied);
+        }
+    }
+    Ok(())
+}
+
+fn authorize_live_action(
+    state: &mut LedgerState,
+    grant_id: &CapabilityGrantId,
+    token: &CapabilityGrantId,
+    request: DelegatedActionAuthorizationRequest,
+) -> Result<(), DelegatedActionAuthorizationError> {
+    let node = state
+        .nodes
+        .get(grant_id)
+        .cloned()
+        .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+    if &node.handle_token != token {
+        return Err(DelegatedActionAuthorizationError::InvalidHandle);
+    }
+    if request.supplied_grant_id.as_ref() != Some(grant_id) {
+        return Err(DelegatedActionAuthorizationError::GrantReferenceMismatch);
+    }
+    if node.status != EdgeStatus::Active {
+        return Err(DelegatedActionAuthorizationError::AuthorityInactive);
+    }
+    let binding = node
+        .runtime_binding
+        .as_ref()
+        .ok_or(DelegatedActionAuthorizationError::RuntimeBindingMismatch)?;
+    if binding.tenant_id != request.tenant_id
+        || binding.agent_id != request.agent_id
+        || binding.run_id != request.run_id
+    {
+        return Err(DelegatedActionAuthorizationError::RuntimeBindingMismatch);
+    }
+    if request.now < node.grant.grant().not_before {
+        return Err(DelegatedActionAuthorizationError::NotYetValid);
+    }
+    if request.now >= node.grant.grant().expires_at {
+        return Err(DelegatedActionAuthorizationError::Expired);
+    }
+    if matches!(
+        node.grant.grant().revocation,
+        splendor_types::RevocationStatus::Revoked { .. }
+    ) {
+        return Err(DelegatedActionAuthorizationError::Revoked);
+    }
+
+    let mut exact_scope = node.grant.grant().scope.clone();
+    exact_scope.tenant_ids = Some(vec![request.tenant_id.clone()]);
+    exact_scope.agent_ids = Some(vec![request.agent_id.clone()]);
+    exact_scope.run_ids = Some(vec![request.run_id.clone()]);
+    // Scope containment is checked against the immutable reserved budget. Live
+    // usage is enforced separately below by the cumulative authority ledger.
+    exact_scope.budget = node.budget;
+    for operation in &request.operations {
+        let decision = crate::evaluate_capability_request(
+            std::slice::from_ref(&node.grant),
+            &CapabilityRequest {
+                schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
+                subject: node.grant.grant().subject.clone(),
+                operation: operation.clone(),
+                scope: exact_scope.clone(),
+                requested_at: request.now,
+                metadata: Default::default(),
+            },
+            request.now,
+        );
+        if decision.status != AuthorityDecisionStatus::Allowed {
+            return Err(DelegatedActionAuthorizationError::OperationDenied {
+                reason: decision
+                    .reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "delegated_operation_denied".to_string()),
+            });
+        }
+    }
+
+    let retained = retained_executable_budget(state, grant_id, node.budget)?;
+    let usage = conservative_usage(retained, request.usage_estimate);
+    let own_current = node
+        .own_tick_usage
+        .get(&request.tick_id)
+        .copied()
+        .unwrap_or_default();
+    ensure_usage_fits(own_current, usage, retained).map_err(|error| match error {
+        DelegatedActionAuthorizationError::BudgetExceeded { dimension } => {
+            DelegatedActionAuthorizationError::RetainedBudgetExceeded { dimension }
+        }
+        other => other,
+    })?;
+
+    let mut lineage = vec![grant_id.clone()];
+    let mut cursor = node.parent_grant_id.clone();
+    while let Some(parent_id) = cursor {
+        let parent = state
+            .nodes
+            .get(&parent_id)
+            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+        lineage.push(parent_id.clone());
+        cursor = parent.parent_grant_id.clone();
+    }
+    for ancestor_id in &lineage {
+        let ancestor = state
+            .nodes
+            .get(ancestor_id)
+            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+        if ancestor.status != EdgeStatus::Active {
+            return Err(DelegatedActionAuthorizationError::AuthorityInactive);
+        }
+        let subtree_current = ancestor
+            .subtree_tick_usage
+            .get(&request.tick_id)
+            .copied()
+            .unwrap_or_default();
+        ensure_usage_fits(subtree_current, usage, ancestor.budget)?;
+    }
+
+    let node = state
+        .nodes
+        .get_mut(grant_id)
+        .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?;
+    node.own_tick_usage
+        .entry(request.tick_id)
+        .or_default()
+        .accumulate(usage);
+    for ancestor_id in lineage {
+        state
+            .nodes
+            .get_mut(&ancestor_id)
+            .ok_or(DelegatedActionAuthorizationError::InvalidHandle)?
+            .subtree_tick_usage
+            .entry(request.tick_id)
+            .or_default()
+            .accumulate(usage);
+    }
+    Ok(())
+}
+
+fn retained_executable_budget(
+    state: &LedgerState,
+    grant_id: &CapabilityGrantId,
+    budget: AuthorityBudgetScope,
+) -> Result<AuthorityBudgetScope, DelegatedActionAuthorizationError> {
+    let children = state
+        .nodes
+        .values()
+        .filter(|node| node.parent_grant_id.as_ref() == Some(grant_id) && node.status.accounts());
+    let mut reserved = zero_budget_like(budget);
+    for child in children {
+        reserved = add_budget(reserved, child.budget)?;
+    }
+    Ok(subtract_budget(budget, reserved))
+}
+
+fn zero_budget_like(budget: AuthorityBudgetScope) -> AuthorityBudgetScope {
+    AuthorityBudgetScope {
+        max_actions_per_tick: budget.max_actions_per_tick.map(|_| 0),
+        max_action_duration_ms: budget.max_action_duration_ms.map(|_| 0),
+        max_filesystem_read_bytes: budget.max_filesystem_read_bytes.map(|_| 0),
+        max_filesystem_write_bytes: budget.max_filesystem_write_bytes.map(|_| 0),
+        max_network_read_bytes: budget.max_network_read_bytes.map(|_| 0),
+        max_network_write_bytes: budget.max_network_write_bytes.map(|_| 0),
+        max_http_requests_per_minute: budget.max_http_requests_per_minute.map(|_| 0),
+    }
+}
+
+fn add_budget(
+    left: AuthorityBudgetScope,
+    right: AuthorityBudgetScope,
+) -> Result<AuthorityBudgetScope, DelegatedActionAuthorizationError> {
+    macro_rules! add {
+        ($field:ident, $dimension:literal) => {
+            match (left.$field, right.$field) {
+                (Some(a), Some(b)) => Some(a.checked_add(b).ok_or(
+                    DelegatedActionAuthorizationError::BudgetExceeded {
+                        dimension: $dimension,
+                    },
+                )?),
+                (None, None) => None,
+                _ => {
+                    return Err(DelegatedActionAuthorizationError::BudgetExceeded {
+                        dimension: $dimension,
+                    })
+                }
+            }
+        };
+    }
+    Ok(AuthorityBudgetScope {
+        max_actions_per_tick: add!(max_actions_per_tick, "max_actions_per_tick"),
+        max_action_duration_ms: add!(max_action_duration_ms, "max_action_duration_ms"),
+        max_filesystem_read_bytes: add!(max_filesystem_read_bytes, "max_filesystem_read_bytes"),
+        max_filesystem_write_bytes: add!(max_filesystem_write_bytes, "max_filesystem_write_bytes"),
+        max_network_read_bytes: add!(max_network_read_bytes, "max_network_read_bytes"),
+        max_network_write_bytes: add!(max_network_write_bytes, "max_network_write_bytes"),
+        max_http_requests_per_minute: add!(
+            max_http_requests_per_minute,
+            "max_http_requests_per_minute"
+        ),
+    })
+}
+
+fn subtract_budget(
+    limit: AuthorityBudgetScope,
+    reserved: AuthorityBudgetScope,
+) -> AuthorityBudgetScope {
+    macro_rules! subtract {
+        ($field:ident) => {
+            match (limit.$field, reserved.$field) {
+                (Some(limit), Some(reserved)) => Some(limit.saturating_sub(reserved)),
+                (Some(limit), None) => Some(limit),
+                (None, _) => None,
+            }
+        };
+    }
+    AuthorityBudgetScope {
+        max_actions_per_tick: subtract!(max_actions_per_tick),
+        max_action_duration_ms: subtract!(max_action_duration_ms),
+        max_filesystem_read_bytes: subtract!(max_filesystem_read_bytes),
+        max_filesystem_write_bytes: subtract!(max_filesystem_write_bytes),
+        max_network_read_bytes: subtract!(max_network_read_bytes),
+        max_network_write_bytes: subtract!(max_network_write_bytes),
+        max_http_requests_per_minute: subtract!(max_http_requests_per_minute),
+    }
+}
+
+fn conservative_usage(limits: AuthorityBudgetScope, estimate: QuotaUsage) -> QuotaUsage {
+    QuotaUsage {
+        actions: estimate.actions.max(1),
+        action_duration_ms: conservative_u64(
+            estimate.action_duration_ms,
+            limits.max_action_duration_ms,
+        ),
+        filesystem_read_bytes: conservative_u64(
+            estimate.filesystem_read_bytes,
+            limits.max_filesystem_read_bytes,
+        ),
+        filesystem_write_bytes: conservative_u64(
+            estimate.filesystem_write_bytes,
+            limits.max_filesystem_write_bytes,
+        ),
+        network_read_bytes: conservative_u64(
+            estimate.network_read_bytes,
+            limits.max_network_read_bytes,
+        ),
+        network_write_bytes: conservative_u64(
+            estimate.network_write_bytes,
+            limits.max_network_write_bytes,
+        ),
+        http_requests: conservative_u32(
+            estimate.http_requests,
+            limits.max_http_requests_per_minute,
+        ),
+    }
+}
+
+fn conservative_u64(estimate: u64, limit: Option<u64>) -> u64 {
+    if estimate == 0 {
+        limit.unwrap_or(0)
+    } else {
+        estimate
+    }
+}
+
+fn conservative_u32(estimate: u32, limit: Option<u32>) -> u32 {
+    if estimate == 0 {
+        limit.unwrap_or(0)
+    } else {
+        estimate
+    }
+}
+
+fn ensure_usage_fits(
+    current: QuotaUsage,
+    additional: QuotaUsage,
+    limit: AuthorityBudgetScope,
+) -> Result<(), DelegatedActionAuthorizationError> {
+    macro_rules! check {
+        ($usage:ident, $limit:ident, $dimension:literal) => {
+            if let Some(limit) = limit.$limit {
+                if current
+                    .$usage
+                    .checked_add(additional.$usage)
+                    .is_none_or(|value| value > limit)
+                {
+                    return Err(DelegatedActionAuthorizationError::BudgetExceeded {
+                        dimension: $dimension,
+                    });
+                }
+            }
+        };
+    }
+    check!(actions, max_actions_per_tick, "max_actions_per_tick");
+    check!(
+        action_duration_ms,
+        max_action_duration_ms,
+        "max_action_duration_ms"
+    );
+    check!(
+        filesystem_read_bytes,
+        max_filesystem_read_bytes,
+        "max_filesystem_read_bytes"
+    );
+    check!(
+        filesystem_write_bytes,
+        max_filesystem_write_bytes,
+        "max_filesystem_write_bytes"
+    );
+    check!(
+        network_read_bytes,
+        max_network_read_bytes,
+        "max_network_read_bytes"
+    );
+    check!(
+        network_write_bytes,
+        max_network_write_bytes,
+        "max_network_write_bytes"
+    );
+    check!(
+        http_requests,
+        max_http_requests_per_minute,
+        "max_http_requests_per_minute"
+    );
+    Ok(())
 }
 
 fn evidence_with_status(
@@ -541,6 +1345,53 @@ pub fn validate_delegation_chain(
     let mut previous_edge: Option<&splendor_types::DelegationGrant> = None;
     for (index, edge) in chain.grants.iter().enumerate() {
         let child = &edge.child_capability_grant;
+        if edge.schema_version != splendor_types::DELEGATION_GRANT_SCHEMA_VERSION {
+            return Err(chain_error(index, "invalid_edge_schema"));
+        }
+        if !matches!(
+            crate::delegation::delegation_edge_binding_digest(edge),
+            Ok(digest) if digest == edge.binding_digest
+        ) {
+            return Err(chain_error(index, "edge_binding_digest_mismatch"));
+        }
+        if edge.parent_run_id.is_nil()
+            || edge.child_run_id.is_nil()
+            || edge.parent_run_id == edge.child_run_id
+            || edge.parent_agent_id.is_nil()
+            || edge.child_agent_id.is_nil()
+            || edge.parent_agent_id == edge.child_agent_id
+        {
+            return Err(chain_error(index, "runtime_identity_invalid"));
+        }
+        if edge.objective.trim().is_empty() || edge.objective.trim() != edge.objective {
+            return Err(chain_error(index, "objective_invalid"));
+        }
+        if edge.allowed_message_schemas.is_empty()
+            || has_duplicates(&edge.allowed_message_schemas)
+            || edge.allowed_message_schemas.iter().any(|schema| {
+                !schema.starts_with("splendor.message.")
+                    || splendor_types::MessageSchemaVersion::from_schema(schema).is_err()
+            })
+        {
+            return Err(chain_error(index, "message_schema_contract_invalid"));
+        }
+        if edge.allowed_recipient_agent_ids.is_empty()
+            || edge.allowed_recipient_agent_ids.iter().any(AgentId::is_nil)
+            || has_duplicates(&edge.allowed_recipient_agent_ids)
+        {
+            return Err(chain_error(index, "message_recipient_contract_invalid"));
+        }
+        if edge.result_contract.schema_version
+            != splendor_types::DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION
+            || splendor_types::MessageSchemaVersion::from_schema(
+                &edge.result_contract.result_schema,
+            )
+            .is_err()
+            || edge.result_contract.result_schema != splendor_types::TASK_RESPONSE_SCHEMA
+            || edge.result_contract.max_result_bytes == Some(0)
+        {
+            return Err(chain_error(index, "result_contract_invalid"));
+        }
         if edge.parent_grant_id != parent.grant_id
             || child.parent_grant_ids.as_slice() != [parent.grant_id.clone()]
         {
@@ -562,6 +1413,12 @@ pub fn validate_delegation_chain(
             || edge.remaining_delegation_depth != child.max_delegation_depth
         {
             return Err(chain_error(index, "edge_child_grant_projection_mismatch"));
+        }
+        if child.issuer != parent.subject || child.subject.is_nil() {
+            return Err(chain_error(index, "principal_binding_mismatch"));
+        }
+        if edge.not_before >= edge.expires_at {
+            return Err(chain_error(index, "edge_time_window_invalid"));
         }
         if !child
             .scope
@@ -593,6 +1450,11 @@ pub fn validate_delegation_chain(
         previous_edge = Some(edge);
     }
     Ok(())
+}
+
+fn has_duplicates<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values.iter().any(|value| !seen.insert(value))
 }
 
 fn chain_error(index: usize, reason: &str) -> DelegationChainValidationError {
@@ -749,8 +1611,9 @@ mod tests {
         mut request: DelegationChildGrantRequest,
     ) -> Result<DelegationReservation, DelegationLedgerError> {
         request.max_fan_out = u32::MAX;
+        let caller = ledger.caller_for_test(&parent.grant().grant_id)?;
         ledger.reserve_child(
-            parent,
+            &caller,
             request,
             fixture.now,
             fixture.audience.clone(),
@@ -774,7 +1637,10 @@ mod tests {
             LOCAL_DELEGATION_FAN_OUT_LIMIT
         );
         let committed = ledger.commit(&first).expect("first committed");
-        assert_eq!(committed.status, DelegationReservationStatus::Committed);
+        assert_eq!(
+            committed.evidence.status,
+            DelegationReservationStatus::Committed
+        );
         assert!(matches!(
             ledger.commit(&first),
             Err(DelegationLedgerError::ReservationNotActive)
@@ -859,17 +1725,26 @@ mod tests {
         ledger.register_root(&root).expect("root");
         let first =
             reserve(&ledger, &fixture, &root, request_for(&fixture, &root)).expect("first child");
-        ledger.commit(&first).expect("active child");
+        let committed = ledger.commit(&first).expect("active child");
 
-        let mut nested = request_for(&fixture, first.issued().child_grant());
+        let child_grant = unchecked_validated_grant_for_tests(
+            first.delegation_grant().child_capability_grant.clone(),
+        );
+        let mut nested = request_for(&fixture, &child_grant);
         nested.parent_grant_id = Some(first.child_grant_id().clone());
-        nested.issuer = first.issued().child_grant().grant().subject.clone();
+        nested.issuer = child_grant.grant().subject.clone();
         nested.parent_run_id = fixture.child_run_id.clone();
         nested.parent_agent_id = fixture.child_agent_id.clone();
         nested.child_run_id = RunId::new();
         nested.role_profile = DelegationRoleProfile::Actuator;
         assert!(matches!(
-            reserve(&ledger, &fixture, first.issued().child_grant(), nested),
+            ledger.reserve_child(
+                &committed.caller,
+                nested,
+                fixture.now,
+                fixture.audience.clone(),
+                fixture.child_subject.clone(),
+            ),
             Err(DelegationLedgerError::RoleEscalation)
         ));
         assert!(matches!(
@@ -891,7 +1766,7 @@ mod tests {
 
         let mut cases = Vec::new();
         let mut chain = baseline.clone();
-        chain.schema_version = "splendor.authority.delegation_chain.v2".to_string();
+        chain.schema_version = "splendor.authority.delegation_chain.v1".to_string();
         cases.push((chain, "invalid_chain_schema"));
         let mut chain = baseline.clone();
         chain.root_grant_id = CapabilityGrantId::new();
@@ -901,23 +1776,35 @@ mod tests {
         cases.push((chain, "root_depth_mismatch"));
         let mut chain = baseline.clone();
         chain.grants[0].parent_grant_id = CapabilityGrantId::new();
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "parent_child_grant_ref_mismatch"));
         let mut chain = baseline.clone();
         chain.grants[0].budget.max_actions_per_tick = Some(1);
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "edge_child_grant_projection_mismatch"));
         let mut chain = baseline.clone();
         chain.grants[0].child_agent_id = splendor_types::AgentId::new();
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "child_scope_identity_mismatch"));
         let mut chain = baseline.clone();
         chain.grants[0].max_fan_out = 1;
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "fan_out_not_authority_owned"));
         let mut chain = baseline.clone();
         chain.grants[0].cleanup_obligations.cancel_descendants = false;
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "cleanup_obligations_weakened"));
         let mut chain = baseline.clone();
         chain.grants[0].remaining_delegation_depth = root.grant().max_delegation_depth;
         chain.grants[0].child_capability_grant.max_delegation_depth =
             root.grant().max_delegation_depth;
+        chain.grants[0].binding_digest =
+            crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
         cases.push((chain, "delegation_depth_not_monotonic"));
         let mut chain = baseline.clone();
         chain
@@ -979,15 +1866,16 @@ mod tests {
             )),
             Err(DelegationLedgerError::RootGrantConflict)
         ));
-        assert!(matches!(
-            reserve(
-                &ledger,
-                &fixture,
-                &unchecked_validated_grant_for_tests(conflicting_root),
-                request_for(&fixture, &root),
-            ),
-            Err(DelegationLedgerError::ParentGrantMismatch)
-        ));
+        let stale_clone_attempt = reserve(
+            &ledger,
+            &fixture,
+            &unchecked_validated_grant_for_tests(conflicting_root),
+            request_for(&fixture, &root),
+        )
+        .expect("opaque handle derives the immutable ledger parent");
+        ledger
+            .release(&stale_clone_attempt, "test_release")
+            .expect("released");
 
         let request = request_for(&fixture, &root);
         let reservation = reserve(&ledger, &fixture, &root, request.clone()).expect("reserved");
@@ -1056,6 +1944,503 @@ mod tests {
                 dimension: "overflow"
             })
         ));
+    }
+
+    #[test]
+    fn live_child_handle_enforces_exact_binding_cumulative_tick_usage_and_cleanup() {
+        let fixture = Fixture::new();
+        let root = parent_grant(&fixture);
+        let ledger = InMemoryDelegationAuthorityLedger::new();
+        let root_caller = ledger
+            .register_root_runtime(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+            )
+            .expect("root handle");
+        let mut request = request_for(&fixture, &root);
+        request.scope.budget.max_actions_per_tick = Some(1);
+        request.scope.budget.max_action_duration_ms = Some(10);
+        let reservation = ledger
+            .reserve_child(
+                &root_caller,
+                request,
+                fixture.now,
+                fixture.audience.clone(),
+                fixture.child_subject.clone(),
+            )
+            .expect("child reserved");
+        let grant_id = reservation.child_grant_id().clone();
+        let operation = reservation
+            .delegation_grant()
+            .child_capability_grant
+            .operations[0]
+            .clone();
+        let committed = ledger.commit(&reservation).expect("child committed");
+        let authorize = |tick_id| DelegatedActionAuthorizationRequest {
+            supplied_grant_id: Some(grant_id.clone()),
+            tenant_id: fixture.tenant_id.clone(),
+            agent_id: fixture.child_agent_id.clone(),
+            run_id: fixture.child_run_id.clone(),
+            tick_id,
+            operations: vec![operation.clone()],
+            usage_estimate: QuotaUsage {
+                actions: 1,
+                action_duration_ms: 1,
+                ..QuotaUsage::default()
+            },
+            now: fixture.now,
+        };
+
+        committed
+            .runtime_authority
+            .authorize_action(authorize(7))
+            .expect("first action reserved");
+        assert!(matches!(
+            committed.runtime_authority.authorize_action(authorize(7)),
+            Err(DelegatedActionAuthorizationError::RetainedBudgetExceeded {
+                dimension: "max_actions_per_tick"
+            })
+        ));
+        committed
+            .runtime_authority
+            .authorize_action(authorize(8))
+            .expect("new tick has fresh usage");
+        ledger.cleanup(&grant_id, "complete").expect("cleanup");
+        assert!(matches!(
+            committed.runtime_authority.authorize_action(authorize(9)),
+            Err(DelegatedActionAuthorizationError::AuthorityInactive)
+        ));
+    }
+
+    #[test]
+    fn opaque_handles_and_live_action_denials_cover_fail_closed_boundaries() {
+        let fixture = Fixture::new();
+        let root = parent_grant(&fixture);
+        let ledger = InMemoryDelegationAuthorityLedger::new();
+        let root_caller = ledger
+            .register_root_runtime(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+            )
+            .expect("root handle");
+        assert!(format!("{root_caller:?}").contains("<opaque>"));
+        assert_eq!(root_caller.grant_id(), &root.grant().grant_id);
+        assert_eq!(
+            root_caller
+                .child_request_defaults()
+                .expect("defaults")
+                .expires_at,
+            root.grant().expires_at
+        );
+        let root_runtime = root_caller.runtime_authority();
+        assert!(format!("{root_runtime:?}").contains("<opaque>"));
+        assert_eq!(root_runtime.grant_id(), root_caller.grant_id());
+
+        let reservation = ledger
+            .reserve_child(
+                &root_caller,
+                request_for(&fixture, &root),
+                fixture.now,
+                fixture.audience.clone(),
+                fixture.child_subject.clone(),
+            )
+            .expect("child reserved");
+        let grant_id = reservation.child_grant_id().clone();
+        let operation = reservation
+            .delegation_grant()
+            .child_capability_grant
+            .operations[0]
+            .clone();
+        let committed = ledger.commit(&reservation).expect("child committed");
+        let request = |now, tick_id| DelegatedActionAuthorizationRequest {
+            supplied_grant_id: Some(grant_id.clone()),
+            tenant_id: fixture.tenant_id.clone(),
+            agent_id: fixture.child_agent_id.clone(),
+            run_id: fixture.child_run_id.clone(),
+            tick_id,
+            operations: vec![operation.clone()],
+            usage_estimate: QuotaUsage {
+                actions: 1,
+                action_duration_ms: 1,
+                ..QuotaUsage::default()
+            },
+            now,
+        };
+        let permit = committed
+            .runtime_authority
+            .authorize_action(request(fixture.now, 1))
+            .expect("permit");
+        assert!(format!("{permit:?}").contains("<opaque>"));
+        assert_eq!(permit.grant_id(), &grant_id);
+
+        let mut wrong_runtime = request(fixture.now, 2);
+        wrong_runtime.run_id = RunId::new();
+        assert!(matches!(
+            committed.runtime_authority.authorize_action(wrong_runtime),
+            Err(DelegatedActionAuthorizationError::RuntimeBindingMismatch)
+        ));
+        assert!(matches!(
+            committed.runtime_authority.authorize_action(request(
+                reservation.delegation_grant().not_before - time::Duration::seconds(1),
+                3,
+            )),
+            Err(DelegatedActionAuthorizationError::NotYetValid)
+        ));
+        assert!(matches!(
+            committed
+                .runtime_authority
+                .authorize_action(request(reservation.delegation_grant().expires_at, 4,)),
+            Err(DelegatedActionAuthorizationError::Expired)
+        ));
+        let mut wrong_operation = request(fixture.now, 5);
+        wrong_operation.operations = vec![crate::gateway_action_operation("not.granted")];
+        assert!(matches!(
+            committed
+                .runtime_authority
+                .authorize_action(wrong_operation),
+            Err(DelegatedActionAuthorizationError::OperationDenied { .. })
+        ));
+        let invalid_handle = DelegatedRuntimeAuthorityHandle {
+            state: Arc::clone(&ledger.state),
+            grant_id: grant_id.clone(),
+            token: CapabilityGrantId::new(),
+        };
+        assert!(matches!(
+            invalid_handle.authorize_action(request(fixture.now, 6)),
+            Err(DelegatedActionAuthorizationError::InvalidHandle)
+        ));
+        {
+            let mut state = ledger.lock().expect("state");
+            let node = state.nodes.get_mut(&grant_id).expect("child node");
+            let mut raw = node.grant.grant().clone();
+            raw.revocation = splendor_types::RevocationStatus::Revoked {
+                reason: "test".to_string(),
+            };
+            node.grant = unchecked_validated_grant_for_tests(raw);
+        }
+        assert!(matches!(
+            committed
+                .runtime_authority
+                .authorize_action(request(fixture.now, 7)),
+            Err(DelegatedActionAuthorizationError::Revoked)
+        ));
+        {
+            let mut state = ledger.lock().expect("state");
+            let node = state.nodes.get_mut(&grant_id).expect("child node");
+            let mut raw = node.grant.grant().clone();
+            raw.revocation = splendor_types::RevocationStatus::Active;
+            node.grant = unchecked_validated_grant_for_tests(raw);
+            state
+                .nodes
+                .get_mut(root_caller.grant_id())
+                .expect("root node")
+                .status = EdgeStatus::Revoked;
+        }
+        assert!(matches!(
+            committed
+                .runtime_authority
+                .authorize_action(request(fixture.now, 8)),
+            Err(DelegatedActionAuthorizationError::AuthorityInactive)
+        ));
+        assert_eq!(conservative_u64(3, Some(10)), 3);
+        assert_eq!(conservative_u32(2, Some(10)), 2);
+
+        let reason_codes = [
+            DelegatedActionAuthorizationError::AuthorityUnavailable.reason_code(),
+            DelegatedActionAuthorizationError::InvalidHandle.reason_code(),
+            DelegatedActionAuthorizationError::GrantReferenceMismatch.reason_code(),
+            DelegatedActionAuthorizationError::RuntimeBindingMismatch.reason_code(),
+            DelegatedActionAuthorizationError::AuthorityInactive.reason_code(),
+            DelegatedActionAuthorizationError::NotYetValid.reason_code(),
+            DelegatedActionAuthorizationError::Expired.reason_code(),
+            DelegatedActionAuthorizationError::Revoked.reason_code(),
+            DelegatedActionAuthorizationError::OperationDenied {
+                reason: "operation_not_granted".to_string(),
+            }
+            .reason_code(),
+            DelegatedActionAuthorizationError::BudgetExceeded {
+                dimension: "actions",
+            }
+            .reason_code(),
+            DelegatedActionAuthorizationError::RetainedBudgetExceeded {
+                dimension: "actions",
+            }
+            .reason_code(),
+        ];
+        assert!(reason_codes.iter().all(|reason| !reason.is_empty()));
+
+        let foreign_ledger = InMemoryDelegationAuthorityLedger::new();
+        let foreign = foreign_ledger.register_root(&root).expect("foreign root");
+        assert!(matches!(
+            ledger.reserve_child(
+                &foreign,
+                request_for(&fixture, &root),
+                fixture.now,
+                fixture.audience.clone(),
+                fixture.child_subject.clone(),
+            ),
+            Err(DelegationLedgerError::ParentGrantMismatch)
+        ));
+        let inactive = InMemoryDelegationAuthorityLedger::new();
+        let inactive_caller = inactive.register_root(&root).expect("inactive root");
+        inactive
+            .cleanup(inactive_caller.grant_id(), "test")
+            .expect("root cleanup");
+        assert!(matches!(
+            inactive_caller.child_request_defaults(),
+            Err(DelegationLedgerError::ParentGrantMismatch)
+        ));
+        assert!(matches!(
+            inactive.reserve_child(
+                &inactive_caller,
+                request_for(&fixture, &root),
+                fixture.now,
+                fixture.audience.clone(),
+                fixture.child_subject.clone(),
+            ),
+            Err(DelegationLedgerError::ParentGrantMismatch)
+        ));
+    }
+
+    #[test]
+    fn exact_root_bindings_and_chain_shapes_reject_ambiguous_inputs() {
+        let fixture = Fixture::new();
+        let root = parent_grant(&fixture);
+        let ledger = InMemoryDelegationAuthorityLedger::new();
+        assert!(matches!(
+            ledger.register_root_runtime_with_child_bindings(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+                Vec::new(),
+            ),
+            Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+        ));
+        assert!(matches!(
+            ledger.register_root_runtime_with_child_bindings(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+                vec![(AgentId::new(), RunId::new())],
+            ),
+            Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+        ));
+        assert!(matches!(
+            ledger.register_root_runtime_with_child_bindings(
+                &root,
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+                vec![
+                    (fixture.child_agent_id.clone(), fixture.child_run_id.clone()),
+                    (fixture.child_agent_id.clone(), fixture.child_run_id.clone()),
+                ],
+            ),
+            Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+        ));
+        let mut multi = root.grant().clone();
+        multi
+            .scope
+            .agent_ids
+            .as_mut()
+            .expect("agents")
+            .push(AgentId::new());
+        multi
+            .scope
+            .run_ids
+            .as_mut()
+            .expect("runs")
+            .push(RunId::new());
+        assert!(matches!(
+            ledger.register_root_runtime(
+                &unchecked_validated_grant_for_tests(multi),
+                fixture.tenant_id.clone(),
+                fixture.parent_agent_id.clone(),
+                fixture.parent_run_id.clone(),
+            ),
+            Err(DelegationLedgerError::ChildRuntimeBindingDenied)
+        ));
+
+        ledger.register_root(&root).expect("root");
+        let reservation =
+            reserve(&ledger, &fixture, &root, request_for(&fixture, &root)).expect("edge");
+        let baseline = reservation.evidence().chain.clone();
+        let mut cases = Vec::new();
+        macro_rules! invalid_edge {
+            ($reason:literal, $body:expr) => {{
+                let mut chain = baseline.clone();
+                $body(&mut chain.grants[0]);
+                chain.grants[0].binding_digest =
+                    crate::delegation_edge_binding_digest(&chain.grants[0]).expect("digest");
+                cases.push((chain, $reason));
+            }};
+        }
+        invalid_edge!(
+            "invalid_edge_schema",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.schema_version = "splendor.authority.delegation_grant.v1".to_string()
+            }
+        );
+        invalid_edge!(
+            "runtime_identity_invalid",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.parent_run_id = edge.child_run_id.clone()
+            }
+        );
+        invalid_edge!(
+            "objective_invalid",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.objective = " invalid ".to_string()
+            }
+        );
+        invalid_edge!(
+            "message_schema_contract_invalid",
+            |edge: &mut splendor_types::DelegationGrant| { edge.allowed_message_schemas.clear() }
+        );
+        invalid_edge!(
+            "message_recipient_contract_invalid",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.allowed_recipient_agent_ids.clear()
+            }
+        );
+        invalid_edge!(
+            "result_contract_invalid",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.result_contract.max_result_bytes = Some(0)
+            }
+        );
+        invalid_edge!(
+            "principal_binding_mismatch",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.child_capability_grant.issuer = PrincipalId::new()
+            }
+        );
+        invalid_edge!(
+            "edge_time_window_invalid",
+            |edge: &mut splendor_types::DelegationGrant| {
+                edge.not_before = edge.expires_at;
+                edge.child_capability_grant.not_before = edge.expires_at;
+            }
+        );
+        for (chain, expected) in cases {
+            assert_eq!(
+                validate_delegation_chain(&root, &chain)
+                    .expect_err("invalid chain")
+                    .reason,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn exact_edge_binding_digest_rejects_every_semantic_field_mutation() {
+        let fixture = Fixture::new();
+        let root = parent_grant(&fixture);
+        let ledger = InMemoryDelegationAuthorityLedger::new();
+        ledger.register_root(&root).expect("root");
+        let reservation =
+            reserve(&ledger, &fixture, &root, request_for(&fixture, &root)).expect("edge");
+        let baseline = reservation.evidence().chain.clone();
+        let mut cases = Vec::new();
+        macro_rules! mutated {
+            ($body:expr) => {{
+                let mut chain = baseline.clone();
+                $body(&mut chain.grants[0]);
+                cases.push(chain);
+            }};
+        }
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge.objective.push_str(" changed"));
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge.parent_run_id = RunId::new());
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge.child_run_id = RunId::new());
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.parent_agent_id = AgentId::new()
+        );
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge.child_agent_id = AgentId::new());
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge
+            .allowed_message_schemas
+            .push("splendor.message.note.v1".to_string()));
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge
+            .allowed_recipient_agent_ids
+            .push(AgentId::new()));
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge
+            .result_contract
+            .requires_response = false);
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.role_profile =
+                DelegationRoleProfile::Critic
+        );
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge
+            .cleanup_obligations
+            .cancel_descendants = false);
+        mutated!(|edge: &mut splendor_types::DelegationGrant| edge
+            .child_capability_grant
+            .operations
+            .clear());
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.expires_at +=
+                time::Duration::seconds(1)
+        );
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.remaining_delegation_depth =
+                edge.remaining_delegation_depth.saturating_add(1)
+        );
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.max_fan_out =
+                edge.max_fan_out.saturating_sub(1)
+        );
+        mutated!(
+            |edge: &mut splendor_types::DelegationGrant| edge.budget.max_actions_per_tick = Some(1)
+        );
+
+        for chain in cases {
+            let error = validate_delegation_chain(&root, &chain).expect_err("mutation denied");
+            assert_eq!(error.edge_index, 0);
+            assert_eq!(error.reason, "edge_binding_digest_mismatch");
+        }
+    }
+
+    #[test]
+    fn default_trace_summary_redacts_complete_authority_parameters() {
+        let fixture = Fixture::new();
+        let root = parent_grant(&fixture);
+        let ledger = InMemoryDelegationAuthorityLedger::new();
+        ledger.register_root(&root).expect("root");
+        let reservation =
+            reserve(&ledger, &fixture, &root, request_for(&fixture, &root)).expect("edge");
+        let mut evidence = reservation.evidence().clone();
+        evidence.budget = AuthorityBudgetScope {
+            max_actions_per_tick: Some(1),
+            max_action_duration_ms: Some(1),
+            max_filesystem_read_bytes: Some(1),
+            max_filesystem_write_bytes: Some(1),
+            max_network_read_bytes: Some(1),
+            max_network_write_bytes: Some(1),
+            max_http_requests_per_minute: Some(1),
+        };
+        let summary = evidence.redacted_trace_summary();
+        assert_eq!(summary.reserved_budget_dimensions.len(), 7);
+        let json = serde_json::to_string(&summary).expect("summary");
+        assert!(json.contains("chain_digest"));
+        assert!(json.contains("child_grant_id"));
+        for forbidden in [
+            "child_capability_grant",
+            "allowed_message_schemas",
+            "allowed_recipient_agent_ids",
+            "cleanup_obligations",
+            "result_contract",
+            "objective",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "redacted summary leaked {forbidden}"
+            );
+        }
     }
 
     fn budget_for_dimension(dimension: usize, value: u64) -> AuthorityBudgetScope {

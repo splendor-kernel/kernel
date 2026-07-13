@@ -152,7 +152,7 @@ fn invalid_schema_envelope(
         source_agent_id,
         target_agent_id,
         run_id,
-        schema: "splendor.message.task_request.v2".to_string(),
+        schema: "splendor.message.task_request.v3".to_string(),
         payload: serde_json::json!({"task": "forecast"}),
         causal_parent: None,
         requires_response: false,

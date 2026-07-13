@@ -14,8 +14,11 @@ use serde::{de, Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-/// Canonical local task request schema used by 0.02-S4 local delegation.
-pub const TASK_REQUEST_SCHEMA: &str = "splendor.message.task_request.v1";
+/// Legacy non-authorizing local task request schema identifier retained for
+/// migration/replay classification; it is never accepted for live delegation.
+pub const TASK_REQUEST_SCHEMA_V1: &str = "splendor.message.task_request.v1";
+/// Canonical live local task request schema with a mandatory child grant ref.
+pub const TASK_REQUEST_SCHEMA: &str = "splendor.message.task_request.v2";
 
 /// Canonical local task response schema used by 0.02-S4 local delegation.
 pub const TASK_RESPONSE_SCHEMA: &str = "splendor.message.task_response.v1";
@@ -31,23 +34,26 @@ pub const LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION: &str =
 pub enum MessageSchemaVersion {
     /// Version 1 message payload schema suffix (`.v1`).
     V1,
+    /// Version 2 live delegated task request schema suffix (`.v2`).
+    V2,
 }
 
 impl MessageSchemaVersion {
     /// Latest schema version accepted by this crate.
-    pub const LATEST: Self = Self::V1;
+    pub const LATEST: Self = Self::V2;
 
     /// Returns the canonical schema suffix for this version.
     pub fn suffix(self) -> &'static str {
         match self {
             Self::V1 => "v1",
+            Self::V2 => "v2",
         }
     }
 
     /// Extracts and validates the message schema version from a schema string.
     ///
     /// The schema must be transport-neutral and end with a version suffix like
-    /// `splendor.message.task_request.v1`. Only `v1` is accepted in 0.02-S1;
+    /// `splendor.message.task_request.v2`. Versions `v1` and `v2` are recognized;
     /// unsupported versions fail closed before any router can handle them.
     pub fn from_schema(schema: &str) -> Result<Self, MessageValidationError> {
         validate_schema_name(schema)?;
@@ -70,6 +76,7 @@ impl MessageSchemaVersion {
         }
         match digits {
             "1" => Ok(Self::V1),
+            "2" => Ok(Self::V2),
             _ => Err(MessageValidationError::UnsupportedSchemaVersion {
                 version: version.to_string(),
             }),
@@ -307,7 +314,7 @@ impl DelegatedAuthority {
     }
 }
 
-/// Structured payload for `splendor.message.task_request.v1`.
+/// Structured payload for live `splendor.message.task_request.v2` delegation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskRequest {
     /// Parent run requesting delegated local work.
@@ -320,6 +327,9 @@ pub struct TaskRequest {
     pub objective: String,
     /// Explicit authority granted to the child run.
     pub delegated_authority: DelegatedAuthority,
+    /// Mandatory non-authorizing reference to the exact authority-owned child
+    /// grant. The manager validates this against owned state before routing.
+    pub capability_grant_id: CapabilityGrantId,
     /// Non-authorizing authority evidence refs recorded by the runtime-local
     /// authority-backed delegation path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,12 +345,32 @@ impl TaskRequest {
         objective: impl Into<String>,
         delegated_authority: DelegatedAuthority,
     ) -> Result<Self, MessageValidationError> {
+        Self::new_with_grant_ref(
+            parent_run_id,
+            child_run_id,
+            target_agent_id,
+            objective,
+            delegated_authority,
+            CapabilityGrantId::new(),
+        )
+    }
+
+    /// Builds a live delegated task request bound to an exact child grant ref.
+    pub fn new_with_grant_ref(
+        parent_run_id: RunId,
+        child_run_id: RunId,
+        target_agent_id: AgentId,
+        objective: impl Into<String>,
+        delegated_authority: DelegatedAuthority,
+        capability_grant_id: CapabilityGrantId,
+    ) -> Result<Self, MessageValidationError> {
         let request = Self {
             parent_run_id,
             child_run_id,
             target_agent_id,
             objective: objective.into(),
             delegated_authority,
+            capability_grant_id,
             authority_evidence: None,
         };
         request.validate()?;
@@ -355,6 +385,7 @@ impl TaskRequest {
         authority_evidence: LocalDelegationAuthorityEvidence,
     ) -> Result<Self, MessageValidationError> {
         authority_evidence.validate()?;
+        self.capability_grant_id = authority_evidence.child_capability_grant_id.clone();
         self.authority_evidence = Some(authority_evidence);
         self.validate()?;
         Ok(self)
@@ -401,8 +432,20 @@ impl TaskRequest {
         if self.objective.trim().is_empty() {
             return Err(payload_error(TASK_REQUEST_SCHEMA, "objective is required"));
         }
+        if self.capability_grant_id.is_nil() {
+            return Err(payload_error(
+                TASK_REQUEST_SCHEMA,
+                "capability_grant_id is required",
+            ));
+        }
         if let Some(authority_evidence) = &self.authority_evidence {
             authority_evidence.validate()?;
+            if authority_evidence.child_capability_grant_id != self.capability_grant_id {
+                return Err(payload_error(
+                    TASK_REQUEST_SCHEMA,
+                    "capability_grant_id must match authority evidence",
+                ));
+            }
         }
         Ok(())
     }

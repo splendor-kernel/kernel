@@ -10,8 +10,15 @@
   supports exact-grant nested children, binds every child action to its issued
   grant, propagates cancellation/revocation, enforces cleanup obligations, and
   records reservation release/fail-safe consumption for inspect-only replay.
-  Legacy `DelegatedAuthority` is narrowing-only. The additive v1 cleanup/trace
-  fields preserve older deserialization. Remote Message Service/Agent Controller
+  Runtime callers now receive opaque live caller/child handles rather than
+  validated grants; child actions recheck lifecycle, exact grant/run/agent
+  binding, and cumulative per-tick budget, then retain a final permit through
+  gateway entry. Exact semantic edge digests reject chain mutation, and exact
+  agent/run bindings reject Cartesian identity recombination. Legacy
+  `DelegatedAuthority` is narrowing-only. Live task requests, delegation
+  edge/chain contracts, and redacted ledger trace summaries are v2; task v1 is
+  replay/migration-only and full authority parameters remain ledger-owned.
+  Remote Message Service/Agent Controller
   adoption and G18/G70/G71 remain deferred/not exercised; no gold was run.
 - Integrated current daemon run admission/effects with one opaque live C02 grant
   admitted only from the verified signed-work-order wrapper. Scheduler, direct,
@@ -73,11 +80,13 @@
 
 ### Explicitly not included
 
-- No new authorizing schema version, policy cache persistence/fleet redesign,
+- No policy cache persistence/fleet redesign,
   resident persistence/watch, canonical
   historical-signature migration seam, or broad rolling-version compatibility
   claim. The additive exact receipt/profile/tick contract fields and parity tests
-  are limited to the current C02 daemon effect path. The in-memory cache state and
+  are limited to the current C02 daemon effect path. AUTH-003 intentionally adds
+  v2 task-request, delegation edge/chain, and redacted trace-summary contracts as
+  described above. The in-memory cache state and
   public Rust mutation API did change.
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent

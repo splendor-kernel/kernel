@@ -290,15 +290,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(causal_parent.trace_event_id.clone()),
     );
     request.child_run_id = child_run_id.clone();
-    let child_authority = local_delegation_authority(
+    let parent_grant = local_delegation_parent_grant(
         orchestrator_principal.clone(),
         specialist_principal.clone(),
         &tenant_id,
         &request,
     )?;
-    let bound_parent_grant = child_authority.parent_capability_grant.clone();
-    manager
-        .bind_root_run_capability_grant(&parent_run_id, &child_authority.parent_capability_grant)?;
+    manager.bind_root_run_capability_grant(&parent_run_id, &parent_grant)?;
+    let mut child_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run_id)?,
+        specialist_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    );
+    child_authority.max_fan_out = 3;
     let child_run =
         manager.create_child_run(&parent_runtime, &child_runtime, request, child_authority)?;
     let consumed_request = manager.router().consume(
@@ -460,8 +465,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
     let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut overbroad_authority = LocalDelegationAuthority::new(
-        bound_parent_grant.clone(),
+    let mut overbroad_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run_id)?,
         specialist_principal.clone(),
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
@@ -509,8 +514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
     let cross_child_run_id = cross_tenant.child_run_id.clone();
     let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut cross_authority = LocalDelegationAuthority::new(
-        bound_parent_grant,
+    let mut cross_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run_id)?,
         other_specialist_principal,
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
@@ -670,12 +675,12 @@ fn authority(actions: &[&str], adapters: &[&str], permissions: &[&str]) -> Deleg
     }
 }
 
-fn local_delegation_authority(
+fn local_delegation_parent_grant(
     parent_principal: PrincipalId,
     child_principal: PrincipalId,
     tenant_id: &TenantId,
     request: &LocalDelegationRequest,
-) -> Result<LocalDelegationAuthority, Box<dyn std::error::Error>> {
+) -> Result<splendor_authority::ValidatedCapabilityGrant, Box<dyn std::error::Error>> {
     let parent_grant = grant_from_legacy_allowlists(
         CompatibilityGrantContext {
             grant_id: CapabilityGrantId::new(),
@@ -704,14 +709,8 @@ fn local_delegation_authority(
         RevocationStatus::Active,
         Some("local_delegation:example".to_string()),
     )?;
-    let mut authority = LocalDelegationAuthority::new(
-        parent_grant,
-        child_principal,
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
-    authority.max_fan_out = 3;
-    Ok(authority)
+    let _ = child_principal;
+    Ok(parent_grant)
 }
 
 fn gateway(

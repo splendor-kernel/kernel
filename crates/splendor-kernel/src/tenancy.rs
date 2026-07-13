@@ -5,14 +5,13 @@
 //! spend another agent's local runtime budget before actions are executed.
 
 use splendor_authority::{
-    compatibility_permission_operation, evaluate_capability_request, gateway_action_operation,
-    gateway_adapter_operation, ValidatedCapabilityGrant,
+    compatibility_permission_operation, gateway_action_operation, gateway_adapter_operation,
+    DelegatedActionAuthorizationRequest, DelegatedActionPermit, DelegatedRuntimeAuthorityHandle,
 };
 use splendor_gateway::TenantAccess;
 use splendor_types::{
-    Action, AgentId, AuthorityBudgetScope, CapabilityGrantId, CapabilityRequest,
-    DelegatedAuthority, QuotaUsage, RunId, StateNodeId, TenantId, VerificationResult, WorkOrder,
-    CAPABILITY_REQUEST_SCHEMA_VERSION,
+    Action, AgentId, CapabilityGrantId, DelegatedAuthority, QuotaUsage, RunId, StateNodeId,
+    TenantId, VerificationResult, WorkOrder,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -326,8 +325,8 @@ pub struct AgentContext {
     /// Optional local child-run authority. When present, the loop engine denies
     /// actions outside this explicit delegated scope before gateway submission.
     pub delegated_authority: Option<DelegatedAuthority>,
-    /// Exact authority-issued grant backing the compatibility projection.
-    pub delegated_capability_grant: Option<ValidatedCapabilityGrant>,
+    /// Opaque authority-owned live runtime handle backing the compatibility projection.
+    pub delegated_runtime_authority: Option<DelegatedRuntimeAuthorityHandle>,
 }
 
 impl AgentContext {
@@ -340,7 +339,7 @@ impl AgentContext {
             state_head: None,
             config,
             delegated_authority: None,
-            delegated_capability_grant: None,
+            delegated_runtime_authority: None,
         }
     }
 
@@ -357,16 +356,16 @@ impl AgentContext {
     /// Restricts this agent context to an explicit local delegated authority.
     pub fn set_delegated_authority(&mut self, authority: DelegatedAuthority) {
         self.delegated_authority = Some(authority);
-        self.delegated_capability_grant = None;
+        self.delegated_runtime_authority = None;
     }
 
-    /// Installs an authority-issued child grant plus a narrowing legacy projection.
-    pub fn set_delegated_capability_grant(
+    /// Installs opaque live child authority plus a narrowing legacy projection.
+    pub fn set_delegated_runtime_authority(
         &mut self,
-        grant: ValidatedCapabilityGrant,
+        authority: DelegatedRuntimeAuthorityHandle,
         projection: DelegatedAuthority,
     ) {
-        self.delegated_capability_grant = Some(grant);
+        self.delegated_runtime_authority = Some(authority);
         self.delegated_authority = Some(projection);
     }
 
@@ -390,6 +389,7 @@ impl AgentContext {
     }
 
     /// Verifies a delegated action against the exact authority-issued grant.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_delegated_action_with_grant(
         &self,
         action: &Action,
@@ -398,42 +398,13 @@ impl AgentContext {
         supplied_grant_id: Option<&CapabilityGrantId>,
         usage: QuotaUsage,
         now: OffsetDateTime,
-    ) -> VerificationResult {
+        tick_id: u64,
+    ) -> DelegatedActionAuthorization {
         let Some(projection) = self.delegated_authority.as_ref() else {
-            return VerificationResult::allow();
+            return DelegatedActionAuthorization::allowed_without_permit();
         };
-        let Some(grant) = self.delegated_capability_grant.as_ref() else {
-            return VerificationResult::deny("delegated_capability_grant_missing");
-        };
-        if supplied_grant_id != Some(&grant.grant().grant_id) {
-            return VerificationResult::deny("delegated_capability_grant_ref_mismatch");
-        }
-
-        let mut scope = grant.grant().scope.clone();
-        scope.tenant_ids = Some(vec![self.tenant_id.clone()]);
-        scope.agent_ids = Some(vec![self.agent_id.clone()]);
-        scope.run_ids = Some(vec![run_id.clone()]);
-        let limits = grant.grant().scope.budget;
-        scope.budget = AuthorityBudgetScope {
-            max_actions_per_tick: limits.max_actions_per_tick.map(|_| usage.actions),
-            max_action_duration_ms: limits
-                .max_action_duration_ms
-                .map(|_| usage.action_duration_ms),
-            max_filesystem_read_bytes: limits
-                .max_filesystem_read_bytes
-                .map(|_| usage.filesystem_read_bytes),
-            max_filesystem_write_bytes: limits
-                .max_filesystem_write_bytes
-                .map(|_| usage.filesystem_write_bytes),
-            max_network_read_bytes: limits
-                .max_network_read_bytes
-                .map(|_| usage.network_read_bytes),
-            max_network_write_bytes: limits
-                .max_network_write_bytes
-                .map(|_| usage.network_write_bytes),
-            max_http_requests_per_minute: limits
-                .max_http_requests_per_minute
-                .map(|_| usage.http_requests),
+        let Some(authority) = self.delegated_runtime_authority.as_ref() else {
+            return DelegatedActionAuthorization::denied("delegated_runtime_authority_missing");
         };
         let mut operations = vec![gateway_action_operation(action.name.clone())];
         if let Some(adapter) = adapter {
@@ -446,40 +417,63 @@ impl AgentContext {
                 .cloned()
                 .map(compatibility_permission_operation),
         );
-        let mut reasons = Vec::new();
-        for operation in operations {
-            let decision = evaluate_capability_request(
-                std::slice::from_ref(grant),
-                &CapabilityRequest {
-                    schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION.to_string(),
-                    subject: grant.grant().subject.clone(),
-                    operation,
-                    scope: scope.clone(),
-                    requested_at: now,
-                    metadata: Default::default(),
-                },
-                now,
-            );
-            if decision.status != splendor_types::AuthorityDecisionStatus::Allowed {
-                reasons.extend(decision.reasons);
-            }
-        }
-        if !reasons.is_empty() {
-            reasons.sort();
-            reasons.dedup();
-            return VerificationResult {
-                allowed: false,
-                reasons,
-                artifacts: serde_json::json!({
-                    "source": "delegation_authority_ledger",
-                    "grant_id": grant.grant().grant_id,
-                }),
-            };
-        }
-
         // Legacy allowlists are a final narrowing projection only. They can
         // deny an authority-allowed action but never independently allow one.
-        projection.verify_action(&action.name, adapter, &action.required_permissions)
+        let projection_result =
+            projection.verify_action(&action.name, adapter, &action.required_permissions);
+        if !projection_result.allowed {
+            return DelegatedActionAuthorization {
+                verification: projection_result,
+                permit: None,
+            };
+        }
+        match authority.authorize_action(DelegatedActionAuthorizationRequest {
+            supplied_grant_id: supplied_grant_id.cloned(),
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            run_id: run_id.clone(),
+            tick_id,
+            operations,
+            usage_estimate: usage,
+            now,
+        }) {
+            Ok(permit) => DelegatedActionAuthorization {
+                verification: VerificationResult::allow(),
+                permit: Some(permit),
+            },
+            Err(error) => DelegatedActionAuthorization::denied(error.reason_code()),
+        }
+    }
+}
+
+/// Final delegated action decision plus the permit held through gateway entry.
+#[derive(Debug)]
+pub struct DelegatedActionAuthorization {
+    pub verification: VerificationResult,
+    permit: Option<DelegatedActionPermit>,
+}
+
+impl DelegatedActionAuthorization {
+    fn allowed_without_permit() -> Self {
+        Self {
+            verification: VerificationResult::allow(),
+            permit: None,
+        }
+    }
+
+    fn denied(reason: impl Into<String>) -> Self {
+        Self {
+            verification: VerificationResult::deny(reason),
+            permit: None,
+        }
+    }
+
+    pub fn allowed(&self) -> bool {
+        self.verification.allowed
+    }
+
+    pub(crate) fn take_permit(&mut self) -> Option<DelegatedActionPermit> {
+        self.permit.take()
     }
 }
 

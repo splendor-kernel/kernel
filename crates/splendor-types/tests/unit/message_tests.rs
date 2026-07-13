@@ -446,7 +446,7 @@ fn delegated_authority_denies_missing_action_adapter_and_permission() {
 
 #[test]
 fn invalid_schema_versions_are_rejected_before_routing() {
-    assert_eq!(MessageSchemaVersion::LATEST.suffix(), "v1");
+    assert_eq!(MessageSchemaVersion::LATEST.suffix(), "v2");
     assert_eq!(
         MessageSchemaVersion::from_schema("v1"),
         Err(MessageValidationError::MissingSchemaVersion)
@@ -470,11 +470,13 @@ fn invalid_schema_versions_are_rejected_before_routing() {
         })
     );
     assert_eq!(
-        MessageSchemaVersion::from_schema("splendor.message.task_request.v2"),
-        Err(MessageValidationError::UnsupportedSchemaVersion {
-            version: "v2".to_string()
-        })
+        MessageSchemaVersion::from_schema("splendor.message.task_request.v2").expect("v2 schema"),
+        MessageSchemaVersion::V2
     );
+    assert!(matches!(
+        MessageSchemaVersion::from_schema("splendor.message.task_request.v3"),
+        Err(MessageValidationError::UnsupportedSchemaVersion { .. })
+    ));
 }
 
 #[test]
@@ -595,17 +597,15 @@ fn message_envelope_validates_schema_version_and_status() {
     let envelope = MessageEnvelope::new(message.clone()).expect("valid envelope");
 
     assert_eq!(envelope.message, message);
-    assert_eq!(envelope.schema_version, MessageSchemaVersion::V1);
+    assert_eq!(envelope.schema_version, MessageSchemaVersion::V2);
     assert_eq!(envelope.delivery_status, MessageDeliveryStatus::Pending);
     envelope.validate().expect("envelope remains valid");
 
     let mut mismatched = envelope;
-    mismatched.message.schema = "splendor.message.task_request.v2".to_string();
+    mismatched.message.schema = "splendor.message.task_request.v1".to_string();
     assert_eq!(
         mismatched.validate(),
-        Err(MessageValidationError::UnsupportedSchemaVersion {
-            version: "v2".to_string()
-        })
+        Err(MessageValidationError::SchemaVersionMismatch)
     );
 }
 
@@ -618,7 +618,7 @@ fn causal_parent_and_trace_links_round_trip_for_replay() {
         .expect("valid fixture has causal parent");
     let envelope = MessageEnvelope {
         message,
-        schema_version: MessageSchemaVersion::V1,
+        schema_version: MessageSchemaVersion::V2,
         delivery_status: MessageDeliveryStatus::Queued,
         trace_links: MessageTraceLinks {
             queued_trace_id: Some(TraceEventId::new()),
@@ -642,7 +642,7 @@ fn payload_validation_failure_is_structured_for_rejection_trace() {
     assert_eq!(
         error,
         MessageValidationError::PayloadValidationFailed {
-            schema: "splendor.message.task_request.v1".to_string(),
+            schema: "splendor.message.task_request.v2".to_string(),
             reason: "missing task".to_string()
         }
     );

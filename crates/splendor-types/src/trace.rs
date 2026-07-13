@@ -21,7 +21,7 @@
 
 use crate::{
     Action, AgentId, ApprovalTraceContext, AuditAttribution, CircuitBreakerTraceContext,
-    Constraint, ContentHash, DelegationLedgerEvidence, EscalationContext, Feedback,
+    Constraint, ContentHash, DelegationLedgerTraceSummary, EscalationContext, Feedback,
     GovernanceObjectKind, GovernanceScope, GovernanceState, GovernanceTransition,
     GovernanceTransitionError, GovernanceTransitionRejection, IdentityValidationError,
     LocalDelegationAuthorityEvidence, MessageId, MessageTraceContext, PolicyBundleId,
@@ -957,9 +957,9 @@ pub struct LocalDelegationTraceContext {
     /// local child-run routing or replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
-    /// Complete authority-owned chain and budget-reservation transition.
+    /// Redacted authority-ledger chain and budget-reservation transition summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation_ledger: Option<DelegationLedgerEvidence>,
+    pub delegation_ledger: Option<DelegationLedgerTraceSummary>,
 }
 
 impl LocalDelegationTraceContext {
@@ -990,8 +990,8 @@ impl LocalDelegationTraceContext {
         self
     }
 
-    /// Returns a copy with complete authority-ledger evidence.
-    pub fn with_delegation_ledger(mut self, evidence: DelegationLedgerEvidence) -> Self {
+    /// Returns a copy with redacted authority-ledger trace evidence.
+    pub fn with_delegation_ledger(mut self, evidence: DelegationLedgerTraceSummary) -> Self {
         self.delegation_ledger = Some(evidence);
         self
     }

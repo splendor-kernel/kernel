@@ -68,14 +68,14 @@ pub use authority::{
     AuthorityResourceKind, AuthorityTimeScope, AuthorityVerb, CapabilityGrant,
     CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
     DataPurpose, DelegationChain, DelegationCleanupObligations, DelegationGrant,
-    DelegationLedgerEvidence, DelegationReservationStatus, DelegationResultContract,
-    DelegationRoleProfile, DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
-    AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
-    AUTHORITY_OBLIGATION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
-    CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
-    CAPABILITY_SCOPE_SCHEMA_VERSION, DELEGATION_CHAIN_SCHEMA_VERSION,
-    DELEGATION_GRANT_SCHEMA_VERSION, DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION,
-    REVOCATION_RECORD_SCHEMA_VERSION,
+    DelegationLedgerEvidence, DelegationLedgerTraceSummary, DelegationReservationStatus,
+    DelegationResultContract, DelegationRoleProfile, DriverOperationRef, LocalityScope,
+    NetworkScope, RevocationRecord, AUTHORITY_DECISION_SCHEMA_VERSION,
+    AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION, AUTHORITY_OBLIGATION_SCHEMA_VERSION,
+    AUTHORITY_OPERATION_SCHEMA_VERSION, CAPABILITY_GRANT_SCHEMA_VERSION,
+    CAPABILITY_REQUEST_SCHEMA_VERSION, CAPABILITY_SCOPE_SCHEMA_VERSION,
+    DELEGATION_CHAIN_SCHEMA_VERSION, DELEGATION_GRANT_SCHEMA_VERSION,
+    DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION, REVOCATION_RECORD_SCHEMA_VERSION,
 };
 pub use capabilities::{
     is_valid_capability_name, CapabilityDocument, CapabilityValidationError,
@@ -157,7 +157,8 @@ pub use message::{
     MessageValidationError, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion,
     RemoteMessageRetryPolicy, RemoteMessageTraceContext, RemoteMessageValidationError, TaskFailure,
     TaskRequest, TaskResponse, TaskResponseStatus,
-    LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    TASK_REQUEST_SCHEMA_V1, TASK_RESPONSE_SCHEMA,
 };
 pub use node_registry::{
     HealthStatus, InstanceHealth, InstanceHeartbeat, InstanceRegistration, ManagementAuditEvent,

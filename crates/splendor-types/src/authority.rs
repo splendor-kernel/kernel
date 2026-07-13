@@ -31,9 +31,9 @@ pub const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION: &str =
 /// Canonical schema identifier for authority revocation records.
 pub const REVOCATION_RECORD_SCHEMA_VERSION: &str = "splendor.authority.revocation_record.v1";
 /// Canonical schema identifier for behavior-free delegation grants.
-pub const DELEGATION_GRANT_SCHEMA_VERSION: &str = "splendor.authority.delegation_grant.v1";
+pub const DELEGATION_GRANT_SCHEMA_VERSION: &str = "splendor.authority.delegation_grant.v2";
 /// Canonical schema identifier for behavior-free delegation chains.
-pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation_chain.v1";
+pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation_chain.v2";
 /// Canonical schema identifier for delegated child result contracts.
 pub const DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION: &str =
     "splendor.authority.delegation_result_contract.v1";
@@ -586,6 +586,8 @@ fn cleanup_obligations_are_default(value: &DelegationCleanupObligations) -> bool
 pub struct DelegationGrant {
     /// Delegation-grant schema version.
     pub schema_version: String,
+    /// Canonical digest binding every semantic field on this exact edge.
+    pub binding_digest: String,
     /// Parent capability grant that the child grant narrows from.
     pub parent_grant_id: CapabilityGrantId,
     /// Parent run that requested delegated work.
@@ -670,6 +672,74 @@ pub struct DelegationLedgerEvidence {
     /// Stable reason for release, fail-safe consumption, cleanup, or revocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Default redacted trace projection for an authority-owned delegation ledger
+/// transition. Complete grants, scopes, obligations, objectives, message
+/// allowlists, and result parameters remain inside the authority owner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationLedgerTraceSummary {
+    pub schema_version: String,
+    pub root_grant_id: CapabilityGrantId,
+    pub parent_grant_id: CapabilityGrantId,
+    pub child_grant_id: CapabilityGrantId,
+    pub chain_digest: String,
+    pub chain_depth: u32,
+    pub reserved_budget_dimensions: Vec<String>,
+    pub status: DelegationReservationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DelegationLedgerEvidence {
+    /// Produces the policy-independent default trace projection.
+    pub fn redacted_trace_summary(&self) -> DelegationLedgerTraceSummary {
+        let last = self.chain.grants.last();
+        let parent_grant_id = last
+            .map(|edge| edge.parent_grant_id.clone())
+            .unwrap_or_else(|| self.chain.root_grant_id.clone());
+        let child_grant_id = last
+            .map(|edge| edge.child_capability_grant.grant_id.clone())
+            .unwrap_or_else(|| self.chain.root_grant_id.clone());
+        let bytes = serde_json::to_vec(&self.chain).unwrap_or_default();
+        DelegationLedgerTraceSummary {
+            schema_version: "splendor.trace.delegation_ledger_summary.v2".to_string(),
+            root_grant_id: self.chain.root_grant_id.clone(),
+            parent_grant_id,
+            child_grant_id,
+            chain_digest: crate::ContentHash::blake3(bytes).to_string(),
+            chain_depth: self.chain.grants.len() as u32,
+            reserved_budget_dimensions: budget_dimension_names(&self.budget),
+            status: self.status,
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+fn budget_dimension_names(budget: &AuthorityBudgetScope) -> Vec<String> {
+    let mut names = Vec::new();
+    if budget.max_actions_per_tick.is_some() {
+        names.push("max_actions_per_tick".to_string());
+    }
+    if budget.max_action_duration_ms.is_some() {
+        names.push("max_action_duration_ms".to_string());
+    }
+    if budget.max_filesystem_read_bytes.is_some() {
+        names.push("max_filesystem_read_bytes".to_string());
+    }
+    if budget.max_filesystem_write_bytes.is_some() {
+        names.push("max_filesystem_write_bytes".to_string());
+    }
+    if budget.max_network_read_bytes.is_some() {
+        names.push("max_network_read_bytes".to_string());
+    }
+    if budget.max_network_write_bytes.is_some() {
+        names.push("max_network_write_bytes".to_string());
+    }
+    if budget.max_http_requests_per_minute.is_some() {
+        names.push("max_http_requests_per_minute".to_string());
+    }
+    names
 }
 
 /// Authority evaluation request.

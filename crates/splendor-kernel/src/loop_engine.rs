@@ -727,13 +727,14 @@ impl LoopEngine {
                 },
             )?;
 
-            let delegated_scope = self.agent.verify_delegated_action_with_grant(
+            let mut delegated_scope = self.agent.verify_delegated_action_with_grant(
                 &action,
                 candidate.adapter.as_deref(),
                 self.runtime.run_id(),
                 candidate.delegated_capability_grant_id.as_ref(),
                 candidate.usage,
                 OffsetDateTime::now_utc(),
+                tick_id,
             );
             let mut outcome = if !constraint_evaluation.result.allowed {
                 ActionOutcome {
@@ -745,14 +746,14 @@ impl LoopEngine {
                     error: Some(constraint_evaluation.result.reasons.join(", ")),
                     completed_at: OffsetDateTime::now_utc(),
                 }
-            } else if !delegated_scope.allowed {
+            } else if !delegated_scope.allowed() {
                 ActionOutcome {
                     action_id: action_id.clone(),
                     status: ActionStatus::Denied,
-                    verification: delegated_scope.clone(),
+                    verification: delegated_scope.verification.clone(),
                     post_verification: None,
                     output: None,
-                    error: Some(delegated_scope.reasons.join(", ")),
+                    error: Some(delegated_scope.verification.reasons.join(", ")),
                     completed_at: OffsetDateTime::now_utc(),
                 }
             } else {
@@ -772,6 +773,9 @@ impl LoopEngine {
                     authority_obligation_receipts: candidate.authority_obligation_receipts.clone(),
                 };
 
+                // Keep the live authority permit through gateway entry. The
+                // permit linearizes cleanup/revocation against this effect.
+                let _delegated_permit = delegated_scope.take_permit();
                 match self.gateway.submit(request) {
                     Ok(outcome) => outcome,
                     Err(error) => outcome_from_gateway_error(action_id.clone(), error),

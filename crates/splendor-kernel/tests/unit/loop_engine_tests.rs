@@ -986,7 +986,7 @@ fn loop_engine_denies_child_action_outside_delegated_scope_and_skips_gateway() {
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_capability_grant_missing".to_string()));
+            .contains(&"delegated_runtime_authority_missing".to_string()));
     }
 }
 
@@ -1045,7 +1045,7 @@ fn loop_engine_denies_delegated_action_without_explicit_adapter_and_skips_gatewa
     if let TraceEventKind::ActionDenied { result, .. } = &denied.kind {
         assert!(result
             .reasons
-            .contains(&"delegated_capability_grant_missing".to_string()));
+            .contains(&"delegated_runtime_authority_missing".to_string()));
     }
 }
 

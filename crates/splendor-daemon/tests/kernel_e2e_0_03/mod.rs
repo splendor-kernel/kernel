@@ -1259,12 +1259,12 @@ fn delegated_authority(actions: &[&str], permissions: &[&str]) -> DelegatedAutho
     }
 }
 
-fn local_delegation_authority(
+fn local_delegation_parent_grant(
     parent_principal: PrincipalId,
     child_principal: PrincipalId,
     tenant_id: &TenantId,
     request: &LocalDelegationRequest,
-) -> TestResult<LocalDelegationAuthority> {
+) -> TestResult<splendor_authority::ValidatedCapabilityGrant> {
     let parent_grant = grant_from_legacy_allowlists(
         CompatibilityGrantContext {
             grant_id: CapabilityGrantId::new(),
@@ -1295,14 +1295,8 @@ fn local_delegation_authority(
         RevocationStatus::Active,
         Some("local_delegation:e2e".to_string()),
     )?;
-    let mut authority = LocalDelegationAuthority::new(
-        parent_grant,
-        child_principal,
-        "daemon:local",
-        OffsetDateTime::now_utc(),
-    );
-    authority.max_fan_out = 4;
-    Ok(authority)
+    let _ = child_principal;
+    Ok(parent_grant)
 }
 
 fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
@@ -1396,8 +1390,8 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
     };
-    let mut child_a_authority = LocalDelegationAuthority::new(
-        parent_grant.clone(),
+    let mut child_a_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run)?,
         specialist_a_principal.clone(),
         "daemon:local",
         OffsetDateTime::now_utc(),
@@ -1435,8 +1429,8 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
     };
-    let mut child_b_authority = LocalDelegationAuthority::new(
-        parent_grant,
+    let mut child_b_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run)?,
         specialist_b_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
@@ -1453,6 +1447,25 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         child_b_request,
         child_b_authority,
     )?;
+
+    let laundering_denial = child_a
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action(
+                "summarize.document",
+                SideEffectClass::External,
+                &["doc.read"],
+            ),
+            Some("fixture"),
+            &child_a_run,
+            child_a.run.capability_grant_id.as_ref(),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        )
+        .verification
+        .reasons;
+    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
 
     let response = manager.complete_child_run(
         &parent_runtime,
@@ -1480,22 +1493,6 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         splendor_types::TaskResponseStatus::Failed
     );
 
-    let laundering_denial = child_a
-        .child_agent
-        .verify_delegated_action_with_grant(
-            &action(
-                "summarize.document",
-                SideEffectClass::External,
-                &["doc.read"],
-            ),
-            Some("fixture"),
-            &child_a_run,
-            child_a.run.capability_grant_id.as_ref(),
-            QuotaUsage::single_action(),
-            OffsetDateTime::now_utc(),
-        )
-        .reasons;
-    assert!(laundering_denial.contains(&"operation_not_granted".to_string()));
     manager.cancel_parent_run(&parent_runtime, &parent_run, "done")?;
     let cancelled_request = LocalDelegationRequest::new(
         parent_run.clone(),
@@ -1505,12 +1502,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority(&["parse.document"], &["doc.read"]),
         None,
     );
-    let cancelled_authority = local_delegation_authority(
-        orchestrator_principal,
+    let cancelled_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&parent_run)?,
         specialist_a_principal,
-        &tenant_id,
-        &cancelled_request,
-    )?;
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
     let cancelled_attempt = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -2601,16 +2598,19 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         delegated_authority: delegated_authority(&["document.parse"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&run_id, 1)),
     };
-    let tenant_mismatch_authority = local_delegation_authority(
+    let tenant_mismatch_parent_grant = local_delegation_parent_grant(
         orchestrator_principal,
-        shared_principal,
+        shared_principal.clone(),
         &tenant_a,
         &tenant_mismatch_request,
     )?;
-    manager.bind_root_run_capability_grant(
-        &run_id,
-        &tenant_mismatch_authority.parent_capability_grant,
-    )?;
+    manager.bind_root_run_capability_grant(&run_id, &tenant_mismatch_parent_grant)?;
+    let tenant_mismatch_authority = LocalDelegationAuthority::from_caller(
+        manager.delegation_caller_handle(&run_id)?,
+        shared_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
     let tenant_mismatch = manager
         .create_child_run(
             &parent_runtime,
@@ -3233,13 +3233,19 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         delegated_authority: delegated_authority(&["summarize.local"], &[]),
         parent_causal_trace_id: causal_trace_id.clone(),
     };
-    let child_authority = local_delegation_authority(
+    let child_parent_grant = local_delegation_parent_grant(
         orchestrator_principal,
-        local_specialist_principal,
+        local_specialist_principal.clone(),
         &tenant_id,
         &child_request,
     )?;
-    delegation.bind_root_run_capability_grant(&run_id, &child_authority.parent_capability_grant)?;
+    delegation.bind_root_run_capability_grant(&run_id, &child_parent_grant)?;
+    let child_authority = LocalDelegationAuthority::from_caller(
+        delegation.delegation_caller_handle(&run_id)?,
+        local_specialist_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    );
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,
@@ -3255,9 +3261,11 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             child.run.capability_grant_id.as_ref(),
             QuotaUsage::single_action(),
             OffsetDateTime::now_utc(),
+            1,
         )
+        .verification
         .reasons;
-    assert!(laundering_denial.contains(&"operation_not_granted".to_string()));
+    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
 
     let (source_runtime, source_events) = runtime_for(run_id.clone());
     let (target_runtime, target_events) = runtime_for(run_id.clone());

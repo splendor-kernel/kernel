@@ -35,6 +35,21 @@ fn authority_operation_contract_is_typed_and_schema_versioned() {
 }
 
 #[test]
+fn authority_obligation_legacy_default_uses_current_schema() {
+    let obligation: AuthorityObligation = serde_json::from_value(serde_json::json!({
+        "obligation_id": AuthorityObligationId::new(),
+        "kind": "human_review",
+        "description": "review",
+        "parameters": {}
+    }))
+    .expect("legacy obligation defaults schema");
+    assert_eq!(
+        obligation.schema_version,
+        AUTHORITY_OBLIGATION_SCHEMA_VERSION
+    );
+}
+
+#[test]
 fn authority_data_purposes_are_separate_contract_values() {
     let purposes = vec![
         DataPurpose::Read,
@@ -316,6 +331,7 @@ fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
     };
     let delegation_grant = DelegationGrant {
         schema_version: DELEGATION_GRANT_SCHEMA_VERSION.to_string(),
+        binding_digest: "blake3:test-binding".to_string(),
         parent_grant_id: parent_grant_id.clone(),
         parent_run_id,
         parent_agent_id,

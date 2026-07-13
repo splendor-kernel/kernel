@@ -197,6 +197,7 @@ test("0.1-S1 stable primitive docs and example manifest are aligned", () => {
 
 test("TypeScript primitive field contracts match canonical Rust structs", () => {
   const message = readRepoFile("crates/splendor-types/src/message.rs");
+  const authority = readRepoFile("crates/splendor-types/src/authority.rs");
   const primitives = readRepoFile("crates/splendor-types/src/primitives.rs");
   const governance = readRepoFile("crates/splendor-types/src/governance.rs");
   const externalGovernance = readRepoFile("crates/splendor-types/src/external_governance.rs");
@@ -205,6 +206,11 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   const daemon = readRepoFile("crates/splendor-daemon/src/lib.rs");
 
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.message, extractStructFields(message, "Message"));
+  assert.deepEqual(CANONICAL_SCHEMA_FIELDS.task_request_v2, extractStructFields(message, "TaskRequest"));
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.delegation_ledger_trace_summary,
+    extractStructFields(authority, "DelegationLedgerTraceSummary")
+  );
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.percept, extractStructFields(primitives, "Percept"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_event, extractStructFields(trace, "TraceEvent"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.action_request, extractStructFields(gateway, "ActionRequest"));

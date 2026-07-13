@@ -12,11 +12,13 @@ chain validation, child issuance, and accounting. It is implemented in Rust as
 Local delegation lets an orchestrator coordinate named agents inside one
 Splendor instance without permission laundering. A child run does not inherit the
 parent run's tenant, agent, adapter, or action authority. The child agent context
-returned by `LocalDelegationManager::create_child_run` carries a
-an exact validated child grant plus `DelegatedAuthority`; the loop engine requires
-the issued grant reference and applies the legacy projection only as a further
-restriction before an adapter can execute. The child run is created only
-after the manager calls `splendor_authority::issue_delegation_child_grant` with a
+returned by `LocalDelegationManager::create_child_run` carries an opaque live
+authority handle plus `DelegatedAuthority`; it does not expose or copy the
+validated child grant. The loop engine requires the issued grant reference,
+re-evaluates the live ledger-owned authority, and applies the legacy projection
+only as a further restriction before an adapter can execute. The child run is
+created only after the manager calls
+`splendor_authority::issue_delegation_child_grant` with a
 trusted parent `ValidatedCapabilityGrant`; task messages and metadata alone do
 not confer authority.
 
@@ -26,7 +28,7 @@ child creation.
 
 ## Public contracts
 
-### TaskRequest (`splendor.message.task_request.v1`)
+### TaskRequest (`splendor.message.task_request.v2`)
 
 ```json
 {
@@ -34,6 +36,7 @@ child creation.
   "child_run_id": "run_child",
   "target_agent_id": "agent_specialist",
   "objective": "summarize receivables",
+  "capability_grant_id": "grant_child",
   "delegated_authority": {
     "allowed_actions": ["sql.query"],
     "allowed_adapters": ["sql"],
@@ -47,7 +50,9 @@ child creation.
 }
 ```
 
-`authority_evidence` is optional for compatibility and non-authorizing. Runtime
+`capability_grant_id` is mandatory for live delegated routing and must equal the
+authority-owned child grant. `authority_evidence` is optional and
+non-authorizing. Runtime
 child-run creation records it only after the authority-backed path has a trusted
 parent grant and issued child grant. A forged or standalone task payload with
 grant IDs is behavior-free data, not authority.
@@ -57,6 +62,7 @@ Validation fails closed when:
 - `parent_run_id`, `child_run_id`, or `target_agent_id` is missing/nil;
 - `child_run_id` equals `parent_run_id`;
 - `objective` is empty or whitespace;
+- `capability_grant_id` is missing, nil, or differs from authority-owned state;
 - payload `parent_run_id` does not match the enclosing message `run_id`;
 - payload `target_agent_id` does not match the enclosing message target.
 
@@ -130,8 +136,9 @@ authority and fails closed before gateway submission.
    message carrying non-authorizing grant refs, emits `ChildRunStarted`, and
    returns a scoped child `AgentContext`. The child record retains the issued
     complete ordered `DelegationChain`, issued child grant, cleanup obligations,
-    and budget reservation evidence. The issued grant may recursively create a
-    narrower local child while remaining depth is non-zero.
+    and budget reservation evidence inside the authority owner. Runtime callers
+    receive only opaque handles and redacted refs. The issued grant may
+    recursively create a narrower local child while remaining depth is non-zero.
 9. Every child action must carry the exact issued child grant ID. Missing, wrong,
    expired, revoked, over-budget, or out-of-scope evaluation denies before the
    gateway; the legacy projection can only narrow an authority allow.
@@ -162,8 +169,10 @@ All delegation events carry `LocalDelegationTraceContext` with parent/child run
 IDs, source/target agent IDs, objective, parent causal trace, task
 request/response message IDs when available, and optional non-authorizing
 `LocalDelegationAuthorityEvidence` refs. The additive optional
-`delegation_ledger` field carries the complete ordered chain, reserved budget,
-authority-owned fan-out cap, lifecycle status, and stable reason. Denied authority issuance may record a
+`delegation_ledger` field carries only a v2 redacted summary: root/parent/child
+grant IDs, chain digest/depth, bounded budget-dimension names, lifecycle status,
+and stable reason. Complete grants, objectives, scopes, allowlists, obligations,
+result parameters, and budget values remain authority-owned. Denied authority issuance may record a
 stable `authority_reason` such as `overbroad_operation` or
 `missing_authority_evidence`. Root binding denials use the exact stable reasons
 `missing_parent_run_grant_binding` and `parent_run_grant_mismatch`. Proposed
@@ -208,8 +217,9 @@ and its verifier chain.
 ## Replay behavior
 
 `splendor_kernel::replay_local_delegations(events)` reconstructs parent/child
-relationships, task messages, complete chains, reservation/commit/release/
-fail-safe-consume transitions, cleanup, failures, and revocation. It does not
+relationships, task messages, redacted chain digests/depth,
+reservation/commit/release/fail-safe-consume transitions, cleanup, failures, and
+revocation. It does not
 route messages, start children, invoke authority, submit gateway actions, or
 execute adapters.
 
@@ -267,10 +277,14 @@ execute adapters.
 ## Compatibility notes
 
 `register_root_run` remains source-compatible and supports non-delegating roots,
-but delegating callers must now explicitly bind a trusted grant before
+but delegating callers must explicitly bind a trusted grant before
 `create_child_run`. This is an intentional fail-closed local Rust API/security
-tightening. It adds no serialized grant/message/trace schema and no daemon,
-Python, or TypeScript contract.
+tightening. Live task requests moved from v1 to v2 and now require
+`capability_grant_id`; v1 is retained only as a non-authorizing legacy schema for
+stored replay/migration data and is not accepted by live delegation creation.
+Delegation grant/chain contracts and the default trace summary are v2. TypeScript
+exports the aligned `TaskRequestV2`, `CapabilityGrantId`, and redacted ledger
+summary types.
 
 The additive `LegacyMultiScopeProfile` and
 `grant_from_legacy_multi_scope_allowlists` authority compatibility builder allow
@@ -278,13 +292,14 @@ one parent grant to cover explicit non-empty lists of local child agent and run
 IDs. They use the existing local-profile validator; nil identities, empty lists,
 invalid audiences, and wildcard-like broad audience input fail closed.
 
-The two lists are independent `CapabilityScope` set dimensions. Containment is
-Cartesian: any listed agent may be combined with any listed run, and vector index
-positions do not define paired delegation edges. Authority issuance tests prove
-that listed combinations succeed while an unlisted agent or an unlisted run
-separately denies with `overbroad_scope`. A typed paired agent/run edge contract
-is explicitly deferred; callers that need pairing must enforce a separate
-narrower contract rather than infer pairs from list ordering.
+The underlying `CapabilityScope` lists remain independent set dimensions for
+capability containment. At trusted local root admission, however, equal-length
+agent/run lists are zipped into immutable exact child bindings. Empty,
+unequal-length, duplicate, or nil bindings fail closed. A caller cannot recombine
+a listed agent with another listed run; that denies with
+`delegation_child_runtime_binding_denied` before routing. This indexed legacy
+bridge is intentionally narrower than the raw scope and should migrate to a
+future typed paired-binding contract rather than restore Cartesian execution.
 
 The bounded `AUTH-007c` matrix uses the public manager/authority/router/trace path
 and covers tenant, parent agent/shared-principal, parent principal/run, child

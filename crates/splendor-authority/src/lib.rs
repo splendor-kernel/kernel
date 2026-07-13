@@ -30,12 +30,15 @@ pub use capability::{
     ValidatedCapabilityGrant,
 };
 pub use delegation::{
-    issue_delegation_child_grant, DelegationChildGrant, DelegationChildGrantRequest,
-    DelegationGrantError, DelegationValidationContext,
+    delegation_edge_binding_digest, issue_delegation_child_grant, DelegationChildGrant,
+    DelegationChildGrantRequest, DelegationGrantError, DelegationValidationContext,
 };
 pub use delegation_ledger::{
-    validate_delegation_chain, DelegationChainValidationError, DelegationLedgerError,
-    DelegationReservation, InMemoryDelegationAuthorityLedger, LOCAL_DELEGATION_FAN_OUT_LIMIT,
+    validate_delegation_chain, CommittedDelegation, DelegatedActionAuthorizationError,
+    DelegatedActionAuthorizationRequest, DelegatedActionPermit, DelegatedRuntimeAuthorityHandle,
+    DelegationCallerHandle, DelegationChainValidationError, DelegationChildRequestDefaults,
+    DelegationLedgerError, DelegationReservation, InMemoryDelegationAuthorityLedger,
+    LOCAL_DELEGATION_FAN_OUT_LIMIT,
 };
 pub use evidence::{
     authority_decision_evidence, authority_reason_category, compare_authority_evidence,

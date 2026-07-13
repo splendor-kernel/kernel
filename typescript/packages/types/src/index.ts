@@ -25,6 +25,7 @@ export type KillSwitchId = string;
 export type PolicyBundleId = string;
 export type PrincipalId = string;
 export type AuthorityDecisionId = string;
+export type CapabilityGrantId = string;
 export type AuthorityObligationId = string;
 export type AuthorityObligationReceiptId = string;
 
@@ -389,7 +390,7 @@ export interface Message {
   created_at: ISODateTime;
 }
 
-export type MessageSchemaVersion = "v1";
+export type MessageSchemaVersion = "v1" | "v2";
 export type MessageDeliveryStatus = "pending" | "queued" | "delivered" | "rejected" | "expired" | "consumed";
 
 export interface MessageTraceLinks {
@@ -436,12 +437,54 @@ export interface LocalDelegationTraceContext {
   objective: string;
   authority_evidence?: {
     schema_version: "splendor.message.local_delegation_authority_evidence.v1";
-    parent_capability_grant_id: string;
-    child_capability_grant_id: string;
+    parent_capability_grant_id: CapabilityGrantId;
+    child_capability_grant_id: CapabilityGrantId;
     authority_reason?: string;
   };
-  /** Additive v1 complete-chain and authority reservation lifecycle evidence. */
-  delegation_ledger?: JsonValue;
+  /** v2 redacted projection; full grants/chains remain authority-owned. */
+  delegation_ledger?: DelegationLedgerTraceSummary;
+}
+
+export type DelegationReservationStatus =
+  | "reserved"
+  | "committed"
+  | "released"
+  | "consumed_after_routing_failure"
+  | "cleaned"
+  | "revoked";
+
+export interface DelegationLedgerTraceSummary {
+  schema_version: "splendor.trace.delegation_ledger_summary.v2";
+  root_grant_id: CapabilityGrantId;
+  parent_grant_id: CapabilityGrantId;
+  child_grant_id: CapabilityGrantId;
+  chain_digest: string;
+  chain_depth: number;
+  reserved_budget_dimensions: string[];
+  status: DelegationReservationStatus;
+  reason?: string;
+}
+
+export interface DelegatedAuthority {
+  allowed_actions: string[];
+  allowed_adapters: string[];
+  allowed_permissions: string[];
+}
+
+/** Live delegated workload/message contract. v1 is replay/migration-only. */
+export interface TaskRequestV2 {
+  parent_run_id: RunId;
+  child_run_id: RunId;
+  target_agent_id: AgentId;
+  objective: string;
+  delegated_authority: DelegatedAuthority;
+  capability_grant_id: CapabilityGrantId;
+  authority_evidence?: {
+    schema_version: "splendor.message.local_delegation_authority_evidence.v1";
+    parent_capability_grant_id: CapabilityGrantId;
+    child_capability_grant_id: CapabilityGrantId;
+    authority_reason?: string;
+  };
 }
 
 export interface TaskFailure {
@@ -1517,6 +1560,26 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "requires_response",
     "created_at"
   ],
+  task_request_v2: [
+    "parent_run_id",
+    "child_run_id",
+    "target_agent_id",
+    "objective",
+    "delegated_authority",
+    "capability_grant_id",
+    "authority_evidence"
+  ],
+  delegation_ledger_trace_summary: [
+    "schema_version",
+    "root_grant_id",
+    "parent_grant_id",
+    "child_grant_id",
+    "chain_digest",
+    "chain_depth",
+    "reserved_budget_dimensions",
+    "status",
+    "reason"
+  ],
   run_config: [
     "trace_db",
     "state_db",
@@ -1665,6 +1728,8 @@ export const CANONICAL_SCHEMA_FIELDS = {
   capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints", "service_profiles"]
 } as const satisfies {
   message: readonly (keyof Message)[];
+  task_request_v2: readonly (keyof TaskRequestV2)[];
+  delegation_ledger_trace_summary: readonly (keyof DelegationLedgerTraceSummary)[];
   run_config: readonly (keyof RunConfig)[];
   percept: readonly (keyof Percept)[];
   action_request: readonly (keyof ActionRequest)[];
