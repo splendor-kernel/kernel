@@ -96,7 +96,7 @@ def manager_credential(scopes: list[str] | None = None, *, expired: bool = False
     return {
         "credential_id": "cred_uc_e2e_s4_manager",
         "principal": {"app": {"app_principal_id": "app_uc_e2e_s4", "label": "UC-E2E-S4"}, "client_principal_id": "client_uc_e2e_s4", "label": "UC-E2E-S4 manager client"},
-        "scopes": scopes or ["nodes_register", "instances_register", "nodes_heartbeat", "fleet_read", "fleet_dispatch", "work_orders_submit", "work_orders_revoke", "traces_read", "messages_send", "messages_read"],
+        "scopes": scopes or ["nodes_register", "instances_register", "nodes_heartbeat", "instances_heartbeat", "fleet_read", "fleet_dispatch", "work_orders_submit", "work_orders_revoke", "traces_read", "messages_send", "messages_read"],
         "binding": {"fleet": {"fleet_id": "99999999-9999-4999-8999-999999999999" if wrong_tenant else FLEET_ID}},
         "audience": {"central_manager": {"manager_id": "wrong-manager" if wrong_audience else "central-manager"}},
         "expires_at": utc(-5 if expired else 60),
@@ -209,7 +209,7 @@ def work_order(expires: int = 60, revoked: bool = False, target: str = "customer
         "allowed_permissions": ["fixture.sql.read"],
         "data_refs": ["dataset:eu-west.fixture.v1"],
         "quotas": {"max_actions_per_tick": 5, "max_action_duration_ms": 30000},
-        "placement": {"target": target, "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": [required_capability]},
+        "placement": {"target": target, "data_locality": "vpc", "requires_gpu": False, "dedicated_instance": False, "required_capabilities": [required_capability], "max_runtime_ms": 30000},
         "issued_at": utc(-2),
         "expires_at": utc(expires),
         "revocation": {"revoked": {"reason": "operator_revoked"}} if revoked else "active",
@@ -229,7 +229,7 @@ def message_work_order(expires: int = 60) -> dict[str, Any]:
         "allowed_permissions": [f"message.remote.proposal:{HELPER_AGENT_ID}"],
         "data_refs": [],
         "quotas": {"max_actions_per_tick": 1, "max_action_duration_ms": 30000},
-        "placement": {"target": "customer_vpc", "data_locality": "eu-west", "requires_gpu": False, "required_capabilities": ["message.remote.proposal"]},
+        "placement": {"target": "customer_vpc", "data_locality": "vpc", "requires_gpu": False, "dedicated_instance": False, "required_capabilities": ["message.remote.proposal"], "max_runtime_ms": 30000},
         "issued_at": utc(-2),
         "expires_at": utc(expires),
         "revocation": "active",
@@ -276,7 +276,7 @@ def main() -> int:
     parser.add_argument("--vpc-url", default="https://resident-vpc-node:8092")
     parser.add_argument("--cloud-url", default="https://resident-cloud-node:8091")
     parser.add_argument("--resident-auth-dir", default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"))
-    parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-tls-cert.pem"))
+    parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-root-ca.pem"))
     args = parser.parse_args()
     root = Path(args.root)
     auth_dir = Path(args.resident_auth_dir)
@@ -323,6 +323,10 @@ def main() -> int:
     for node in nodes:
         call("heartbeatNode", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/heartbeat", {**sec(cred), "heartbeat": {"node_id": node["node_id"], "health": node["health"], "recorded_at": utc(0)}})
         call("advertiseCapabilities", "POST", args.manager_url, f"/fleet/nodes/{node['node_id']}/capabilities", {**sec(cred), "capability_document": node["capability_document"]})
+    instance_heartbeats = [
+        call("heartbeatInstance", "POST", args.manager_url, f"/fleet/instances/{inst['instance_id']}/heartbeat", {**sec(cred), "heartbeat": {"node_id": inst["node_id"], "instance_id": inst["instance_id"], "health": inst["health"], "recorded_at": utc(0)}})
+        for inst in instances
+    ]
 
     dispatch_payload = work_order()
     envelope = sign_work_order(root, artifact_dir, commands, auth_dir, dispatch_payload)
@@ -454,6 +458,7 @@ def main() -> int:
     same_image_evidence = compose_same_image_evidence(root)
     required_positive_checks = {
         "node_list_authenticated": node_list["status"] == 200,
+        "instance_heartbeats_authenticated": all(result["status"] == 200 and result["body"].get("accepted") is True for result in instance_heartbeats),
         "work_order_accepted": validation["status"] == 200 and validation["body"].get("accepted") is True,
         "message_work_order_accepted": message_validation["status"] == 200 and message_validation["body"].get("accepted") is True,
         "placement_selected": placement["body"].get("status") == "selected" and placement["body"].get("candidate_id") == VPC_NODE_ID,

@@ -40,6 +40,9 @@ Every request includes:
 - `X-Splendor-API-Version: <apiVersion>`
 - `X-Splendor-Client: @splendor/client`
 
+Every credentialed Fetch call also sets `redirect: "error"`; bearer headers are
+never forwarded by an automatic redirect.
+
 Stable 0.1 clients should send `apiVersion: "0.1"` when targeting a daemon that
 documents 0.1 compatibility. Current implementation limitation: the daemon does
 not actively negotiate or reject API version headers, and this package still

@@ -378,7 +378,7 @@ export class SplendorClient {
 
     let response: Response;
     try {
-      response = await this.fetcher(url, { method, headers, body });
+      response = await this.fetcher(url, { method, headers, body, redirect: "error" });
     } catch (error) {
       const cause = this.redactText(error instanceof Error ? error.message : String(error));
       throw new SplendorClientError({

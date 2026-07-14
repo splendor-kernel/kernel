@@ -378,6 +378,8 @@ pub enum DaemonEndpoint {
     },
     /// `GET /runs/:run_id/state-head`.
     StateHeadRead { tenant_id: TenantId, run_id: RunId },
+    /// `POST /state-snapshots/export` and `POST /state-snapshots/import`.
+    StateHandoff { tenant_id: TenantId, run_id: RunId },
     /// `POST /runs/:run_id/replay`.
     ReplayCreate { tenant_id: TenantId, run_id: RunId },
     /// `POST /actions`.
@@ -438,6 +440,7 @@ impl DaemonEndpoint {
             Self::PerceptAppend { .. } => EndpointScope::PerceptsAppend,
             Self::TraceRead { .. } => EndpointScope::TracesRead,
             Self::StateHeadRead { .. } => EndpointScope::StateRead,
+            Self::StateHandoff { .. } => EndpointScope::StateHandoff,
             Self::ReplayCreate { .. } => EndpointScope::ReplayCreate,
             Self::ActionSubmit { .. } => EndpointScope::ActionsSubmit,
             Self::Health => EndpointScope::HealthRead,
@@ -464,6 +467,7 @@ impl DaemonEndpoint {
             | Self::PerceptAppend { tenant_id, .. }
             | Self::TraceRead { tenant_id, .. }
             | Self::StateHeadRead { tenant_id, .. }
+            | Self::StateHandoff { tenant_id, .. }
             | Self::ReplayCreate { tenant_id, .. }
             | Self::ActionSubmit { tenant_id, .. }
             | Self::PolicySync { tenant_id, .. }
@@ -494,6 +498,7 @@ impl DaemonEndpoint {
             | Self::PerceptAppend { .. }
             | Self::TraceRead { .. }
             | Self::StateHeadRead { .. }
+            | Self::StateHandoff { .. }
             | Self::ReplayCreate { .. }
             | Self::ActionSubmit { .. }
             | Self::PolicySync { .. }
@@ -514,6 +519,7 @@ impl DaemonEndpoint {
                 | Self::RunResume { .. }
                 | Self::RunStop { .. }
                 | Self::PerceptAppend { .. }
+                | Self::StateHandoff { .. }
                 | Self::ActionSubmit { .. }
                 | Self::PolicySync { .. }
                 | Self::NodeRegister { .. }
@@ -891,6 +897,7 @@ fn validate_endpoint_contract(endpoint: &DaemonEndpoint) -> Result<(), DaemonSec
         | DaemonEndpoint::RunResume { .. }
         | DaemonEndpoint::RunStop { .. }
         | DaemonEndpoint::StateHeadRead { .. }
+        | DaemonEndpoint::StateHandoff { .. }
         | DaemonEndpoint::ReplayCreate { .. }
         | DaemonEndpoint::PolicySync { .. }
         | DaemonEndpoint::Health

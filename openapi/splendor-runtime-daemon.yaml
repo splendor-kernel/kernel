@@ -563,6 +563,20 @@ paths:
       responses:
         '200': { description: Instance registered., content: { application/json: { schema: { $ref: '#/components/schemas/InstanceRegistration' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/instances/{instance_id}/heartbeat:
+    post:
+      summary: Record runtime instance heartbeat through the typed registry owner.
+      operationId: heartbeatInstance
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatInstanceRequest' } } } }
+      responses:
+        '200': { description: Instance heartbeat recorded., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedTraceResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /fleet/nodes/{node_id}/heartbeat:
     post:
       summary: Record node heartbeat.
@@ -1443,6 +1457,7 @@ components:
           type: string
         data_locality:
           type: [string, 'null']
+          enum: [cloud, vpc, on_prem, device, null]
         requires_gpu:
           type: [boolean, 'null']
         dedicated_instance:
@@ -1792,6 +1807,15 @@ components:
         health:
           $ref: '#/components/schemas/NodeHealth'
         recorded_at: { type: string, format: date-time }
+    InstanceHeartbeat:
+      type: object
+      required: [node_id, instance_id, health, recorded_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        recorded_at: { type: string, format: date-time }
     CapabilityDocument:
       type: object
       required: [schema, capabilities, constraints]
@@ -1816,7 +1840,9 @@ components:
         required_capabilities:
           type: array
           items: { type: string }
-        data_locality: { type: [string, 'null'] }
+        data_locality:
+          type: [string, 'null']
+          enum: [cloud, vpc, on_prem, device, null]
         dedicated_instance: { type: boolean }
         required_runtime_version: { type: [string, 'null'] }
         max_runtime_ms: { type: [integer, 'null'], minimum: 0 }
@@ -2298,6 +2324,14 @@ components:
           properties:
             heartbeat:
               $ref: '#/components/schemas/NodeHeartbeat'
+    HeartbeatInstanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [heartbeat]
+          properties:
+            heartbeat:
+              $ref: '#/components/schemas/InstanceHeartbeat'
     AdvertiseCapabilitiesRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'

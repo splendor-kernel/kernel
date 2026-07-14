@@ -171,8 +171,12 @@ def initialize(manager_out: Path, runner_out: Path, resident_outs: dict[str, Pat
         )
 
     with tempfile.TemporaryDirectory(prefix="splendor-resident-tls-") as temp:
+        root_key = Path(temp) / "resident-root-ca-key.pem"
+        root_cert = Path(temp) / "resident-root-ca.pem"
         tls_key = Path(temp) / "resident-tls-key.pem"
+        tls_request = Path(temp) / "resident-tls.csr"
         tls_cert = Path(temp) / "resident-tls-cert.pem"
+        tls_extensions = Path(temp) / "resident-tls-extensions.cnf"
         openssl(
             "req",
             "-x509",
@@ -180,26 +184,66 @@ def initialize(manager_out: Path, runner_out: Path, resident_outs: dict[str, Pat
             "rsa:2048",
             "-nodes",
             "-keyout",
+            str(root_key),
+            "-out",
+            str(root_cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=splendor-resident-acceptance-root",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        )
+        openssl(
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
             str(tls_key),
+            "-out",
+            str(tls_request),
+            "-subj",
+            "/CN=splendor-resident-acceptance",
+        )
+        tls_extensions.write_text(
+            "\n".join(
+                [
+                    "subjectAltName=DNS:resident-cloud-node,DNS:resident-vpc-node,DNS:resident-edge-node,DNS:localhost,IP:127.0.0.1",
+                    "basicConstraints=critical,CA:FALSE",
+                    "keyUsage=critical,digitalSignature,keyEncipherment",
+                    "extendedKeyUsage=serverAuth",
+                ]
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        openssl(
+            "x509",
+            "-req",
+            "-in",
+            str(tls_request),
+            "-CA",
+            str(root_cert),
+            "-CAkey",
+            str(root_key),
+            "-CAcreateserial",
             "-out",
             str(tls_cert),
             "-days",
             "1",
-            "-subj",
-            "/CN=splendor-resident-acceptance",
-            "-addext",
-            "subjectAltName=DNS:resident-cloud-node,DNS:resident-vpc-node,DNS:resident-edge-node,DNS:localhost,IP:127.0.0.1",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign",
-            "-addext",
-            "extendedKeyUsage=serverAuth",
+            "-sha256",
+            "-extfile",
+            str(tls_extensions),
         )
-        for out in [manager_out, runner_out, *resident_outs.values()]:
+        for out in [manager_out, runner_out]:
+            shutil.copy2(root_cert, out / "resident-root-ca.pem")
+            (out / "resident-root-ca.pem").chmod(0o644)
+        for out in resident_outs.values():
             shutil.copy2(tls_cert, out / "resident-tls-cert.pem")
             (out / "resident-tls-cert.pem").chmod(0o644)
-        for out in resident_outs.values():
             shutil.copy2(tls_key, out / "resident-tls-key.pem")
             (out / "resident-tls-key.pem").chmod(0o600)
 

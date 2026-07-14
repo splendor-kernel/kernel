@@ -3830,7 +3830,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
     let create_response_shape = serde_json::to_value(CreateRunResponse {
         request_id: "req_openapi_shape".to_string(),
         idempotency_key: "idem_openapi_shape".to_string(),
-        idempotency_receipt_id: "create_run:fnv64:0000000000000000".to_string(),
+        idempotency_receipt_id: format!("create_run:blake3:{}", "0".repeat(64)),
         duplicate: false,
         run_id: run_id.clone(),
         status: DaemonRunStatus::Pending,

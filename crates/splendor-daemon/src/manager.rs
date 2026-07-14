@@ -18,13 +18,13 @@ use splendor_types::{
     select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
     CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, ContentHash,
     CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
-    FleetTelemetrySnapshot, HealthStatus, InstanceId, InstanceRegistration, InstanceTelemetry,
-    Message, MessageEnvelope, MessageId, NodeHeartbeat, NodeId, NodeRegistration,
-    PlacementCandidate, PlacementDecision, PlacementDecisionStatus, PlacementExecutionMode,
-    PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId,
-    RunStatus, RunTelemetry, RuntimeMode, TaskRequest, TelemetryRuntimeMode, TenantId,
-    TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
-    TASK_REQUEST_SCHEMA,
+    FleetTelemetrySnapshot, HealthStatus, InstanceHeartbeat, InstanceId, InstanceRegistration,
+    InstanceTelemetry, Message, MessageEnvelope, MessageId, NodeHeartbeat, NodeId,
+    NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
+    PlacementExecutionMode, PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope,
+    RevocationStatus, RunId, RunStatus, RunTelemetry, RuntimeMode, TaskRequest,
+    TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope, WorkOrderKeyring,
+    WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -45,12 +45,11 @@ struct ManagerInner {
     work_orders: Mutex<HashMap<String, WorkOrderEnvelope>>,
     accepted_work_order_bindings: Mutex<HashMap<String, AcceptedWorkOrderBinding>>,
     revoked_work_orders: Mutex<HashSet<String>>,
+    work_order_revocation_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     placements: Mutex<HashMap<String, PlacementDecision>>,
     placement_bindings: Mutex<HashMap<String, BoundPlacementBinding>>,
     dispatch_bindings: Mutex<HashMap<String, DispatchBinding>>,
-    dispatches: Mutex<HashMap<String, DispatchReport>>,
-    terminal_dispatch_failures: Mutex<HashMap<String, ManagerApiError>>,
-    dispatches_in_flight: Mutex<HashSet<String>>,
+    dispatch_state: Mutex<DispatchLifecycleState>,
     resident_dispatch: ResidentDispatchClient,
     messages: Mutex<HashMap<String, MessageStatusReport>>,
     message_idempotency: Mutex<HashMap<String, String>>,
@@ -109,6 +108,13 @@ struct DispatchBinding {
     instance_id: InstanceId,
     resident_daemon_url: String,
     resident_origin: String,
+}
+
+#[derive(Default)]
+struct DispatchLifecycleState {
+    completed: HashMap<String, DispatchReport>,
+    terminal_failures: HashMap<String, ManagerApiError>,
+    in_flight: HashSet<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -271,12 +277,11 @@ impl ManagerState {
                 work_orders: Mutex::new(HashMap::new()),
                 accepted_work_order_bindings: Mutex::new(HashMap::new()),
                 revoked_work_orders: Mutex::new(HashSet::new()),
+                work_order_revocation_gates: Mutex::new(HashMap::new()),
                 placements: Mutex::new(HashMap::new()),
                 placement_bindings: Mutex::new(HashMap::new()),
                 dispatch_bindings: Mutex::new(HashMap::new()),
-                dispatches: Mutex::new(HashMap::new()),
-                terminal_dispatch_failures: Mutex::new(HashMap::new()),
-                dispatches_in_flight: Mutex::new(HashSet::new()),
+                dispatch_state: Mutex::new(DispatchLifecycleState::default()),
                 resident_dispatch,
                 messages: Mutex::new(HashMap::new()),
                 message_idempotency: Mutex::new(HashMap::new()),
@@ -371,6 +376,23 @@ impl ManagerState {
             });
         Ok(event_id)
     }
+
+    fn work_order_revocation_gate(
+        &self,
+        work_order_id: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ManagerApiError> {
+        let mut gates = self.inner.work_order_revocation_gates.lock().map_err(|_| {
+            ManagerApiError::internal(
+                "work_order_revocation_gate_unavailable",
+                "work-order revocation gate unavailable",
+            )
+        })?;
+        Ok(Arc::clone(
+            gates
+                .entry(work_order_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        ))
+    }
 }
 
 pub fn router(state: ManagerState) -> Router {
@@ -379,6 +401,10 @@ pub fn router(state: ManagerState) -> Router {
         .route("/fleet/nodes", post(register_node))
         .route("/fleet/nodes/list", post(list_nodes))
         .route("/fleet/instances", post(register_instance))
+        .route(
+            "/fleet/instances/:instance_id/heartbeat",
+            post(heartbeat_instance),
+        )
         .route("/fleet/nodes/:node_id/heartbeat", post(heartbeat_node))
         .route(
             "/fleet/nodes/:node_id/capabilities",
@@ -455,6 +481,13 @@ pub struct HeartbeatNodeRequest {
     #[serde(flatten)]
     pub security: ManagerSecurityFields,
     pub heartbeat: NodeHeartbeat,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatInstanceRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub heartbeat: InstanceHeartbeat,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1119,6 +1152,56 @@ async fn heartbeat_node(
     ))
 }
 
+async fn heartbeat_instance(
+    Path(instance_id): Path<InstanceId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<HeartbeatInstanceRequest>,
+) -> Result<Json<serde_json::Value>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::InstancesHeartbeat,
+        true,
+    )?;
+    if instance_id != request.heartbeat.instance_id {
+        return Err(ManagerApiError::bad_request(
+            "instance_id_mismatch",
+            "path instance_id does not match heartbeat",
+        ));
+    }
+    let record = state
+        .inner
+        .registry
+        .record_instance_heartbeat(request.heartbeat)
+        .map_err(|error| {
+            ManagerApiError::bad_request("instance_heartbeat_rejected", error.to_string())
+        })?;
+    state
+        .inner
+        .telemetry
+        .lock()
+        .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
+        .upsert_instance(InstanceTelemetry::new(
+            record.registration.node_id.clone(),
+            record.registration.instance_id.clone(),
+            record.registration.runtime_version.clone(),
+            TelemetryRuntimeMode::Resident,
+            record.registration.supported_features.clone(),
+            record.last_heartbeat_at,
+        ));
+    let trace_event_id = state.audit(
+        "instance.heartbeat_recorded",
+        serde_json::json!({
+            "node_id": record.registration.node_id,
+            "instance_id": record.registration.instance_id,
+            "status": record.health.status,
+        }),
+    )?;
+    Ok(Json(
+        serde_json::json!({"accepted": true, "trace_event_id": trace_event_id}),
+    ))
+}
+
 async fn advertise_capabilities(
     Path(node_id): Path<NodeId>,
     State(state): State<ManagerState>,
@@ -1276,6 +1359,14 @@ async fn revoke_work_order(
     State(state): State<ManagerState>,
     Json(request): Json<RevokeWorkOrderRequest>,
 ) -> Result<Json<serde_json::Value>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::WorkOrdersRevoke,
+        true,
+    )?;
+    let revocation_gate = state.work_order_revocation_gate(&work_order_id)?;
+    let _revocation_guard = revocation_gate.lock_owned().await;
     state.validate_security(
         &request.security.credential,
         Some(&request.security.audit_attribution),
@@ -1499,6 +1590,14 @@ async fn dispatch_work_order(
         EndpointScope::FleetDispatch,
         true,
     )?;
+    let revocation_gate = state.work_order_revocation_gate(&work_order_id)?;
+    let _revocation_guard = revocation_gate.lock_owned().await;
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::FleetDispatch,
+        true,
+    )?;
     if state
         .inner
         .revoked_work_orders
@@ -1680,49 +1779,15 @@ async fn dispatch_work_order(
             "work-order v1 resident dispatch requires exactly one allowed adapter",
         ));
     }
-    if let Some(existing) = state
-        .inner
-        .dispatches
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .get(&work_order_id)
-        .cloned()
-    {
-        return Ok(Json(existing));
-    }
-    if let Some(existing) = state
-        .inner
-        .terminal_dispatch_failures
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .get(&work_order_id)
-        .cloned()
-    {
-        return Err(existing);
+    if let Some(existing) = stored_dispatch_outcome(&state, &work_order_id)? {
+        return existing.map(Json);
     }
     let mut reservation = reserve_dispatch(&state, &work_order_id)?;
     // A dispatch may have completed between the optimistic lookup above and
     // reservation acquisition. Recheck while this caller owns the reservation
     // so a delayed concurrent duplicate cannot start a second tick.
-    if let Some(existing) = state
-        .inner
-        .dispatches
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .get(&work_order_id)
-        .cloned()
-    {
-        return Ok(Json(existing));
-    }
-    if let Some(existing) = state
-        .inner
-        .terminal_dispatch_failures
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .get(&work_order_id)
-        .cloned()
-    {
-        return Err(existing);
+    if let Some(existing) = stored_dispatch_outcome(&state, &work_order_id)? {
+        return existing.map(Json);
     }
     let dispatch_binding = resolve_dispatch_binding(
         &state,
@@ -1754,6 +1819,7 @@ async fn dispatch_work_order(
         })?,
         create_audit,
     )?;
+    revalidate_dispatch_authority(&state, &work_order, &run_id, &expected_target, "create")?;
     let create_response: ResidentHttpResponse<ResidentCreateRunResponse> = state
         .inner
         .resident_dispatch
@@ -1805,6 +1871,8 @@ async fn dispatch_work_order(
         "audit_attribution": start_audit,
         "reason":"manager_resident_dispatch"
     });
+    revalidate_dispatch_authority(&state, &work_order, &run_id, &expected_target, "start")?;
+    persist_provisional_start_quarantine(&state, &work_order_id)?;
     let start_result: Result<ResidentHttpResponse<ResidentTickResponse>, ResidentHttpError> = state
         .inner
         .resident_dispatch
@@ -1884,21 +1952,13 @@ async fn dispatch_work_order(
         trace_event_id,
         resident_daemon_url: daemon_url,
     };
-    match state.inner.dispatches.lock() {
-        Ok(mut dispatches) => {
-            dispatches.insert(work_order_id.clone(), report.clone());
-        }
-        Err(_) => {
-            return Err(persist_terminal_dispatch_failure(
-                &state,
-                &work_order_id,
-                ManagerApiError::internal(
-                    "dispatch_lock",
-                    "completed resident dispatch could not be persisted",
-                ),
-                &mut reservation,
-            ))
-        }
+    if let Err(error) = store_authoritative_dispatch_success(&state, &work_order_id, &report) {
+        return Err(persist_terminal_dispatch_failure(
+            &state,
+            &work_order_id,
+            error,
+            &mut reservation,
+        ));
     }
     state
         .inner
@@ -3793,6 +3853,78 @@ fn stable_manager_digest(
     Ok(ContentHash::blake3(input).to_string())
 }
 
+fn revalidate_dispatch_authority(
+    state: &ManagerState,
+    work_order: &AcceptedWorkOrder,
+    run_id: &RunId,
+    expected_target: &str,
+    phase: &str,
+) -> Result<(), ManagerApiError> {
+    let work_order_id = work_order.envelope.work_order.work_order_id.to_string();
+    if state
+        .inner
+        .revoked_work_orders
+        .lock()
+        .map_err(|_| ManagerApiError::internal("revocation_lock", "revocation lock unavailable"))?
+        .contains(&work_order_id)
+    {
+        state.audit(
+            "work_order.rejected",
+            serde_json::json!({
+                "work_order_id": work_order_id,
+                "reason": "revoked_work_order",
+                "phase": phase,
+            }),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            "revoked_work_order",
+            "work order was revoked before resident dispatch",
+        ));
+    }
+    if let Err(error) = splendor_types::validate_work_order(
+        &work_order.envelope,
+        &WorkOrderValidationContext {
+            tenant_id: work_order.envelope.work_order.tenant_id.clone(),
+            agent_id: work_order.envelope.work_order.agent_id.clone(),
+            run_id: Some(run_id.clone()),
+            expected_placement_target: Some(expected_target.to_string()),
+            now: OffsetDateTime::now_utc(),
+        },
+        &state.inner.work_order_keyring,
+    ) {
+        state.audit(
+            "work_order.rejected",
+            serde_json::json!({
+                "work_order_id": work_order_id,
+                "reason": error.reason_code(),
+                "phase": phase,
+            }),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            error.reason_code(),
+            error.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_signed_data_locality(
+    value: Option<&str>,
+) -> Result<Option<DataLocality>, ManagerApiError> {
+    value
+        .map(|value| match value {
+            "cloud" => Ok(DataLocality::Cloud),
+            "vpc" => Ok(DataLocality::Vpc),
+            "on_prem" => Ok(DataLocality::OnPrem),
+            "device" => Ok(DataLocality::Device),
+            _ => Err(ManagerApiError::forbidden(
+                "unsupported_work_order_data_locality",
+                "signed work-order data_locality must use the current typed locality class vocabulary",
+            )),
+        })
+        .transpose()
+}
+
 fn validate_placement_request_against_work_order(
     request: &PlacementRequest,
     work_order: &WorkOrderEnvelope,
@@ -3804,16 +3936,7 @@ fn validate_placement_request_against_work_order(
     let mut signed_capabilities = signed.required_capabilities.clone();
     signed_capabilities.sort();
     signed_capabilities.dedup();
-    let signed_locality = signed
-        .data_locality
-        .as_deref()
-        .and_then(|value| match value {
-            "cloud" => Some(DataLocality::Cloud),
-            "vpc" => Some(DataLocality::Vpc),
-            "on_prem" => Some(DataLocality::OnPrem),
-            "device" => Some(DataLocality::Device),
-            _ => None,
-        });
+    let signed_locality = parse_signed_data_locality(signed.data_locality.as_deref())?;
     let gpu_requirement_satisfied = !signed.requires_gpu.unwrap_or(false)
         || requested_capabilities
             .iter()
@@ -4168,22 +4291,41 @@ impl Drop for DispatchReservation {
         if !self.release_on_drop {
             return;
         }
-        if let Ok(mut in_flight) = self.inner.dispatches_in_flight.lock() {
-            in_flight.remove(&self.work_order_id);
+        if let Ok(mut state) = self.inner.dispatch_state.lock() {
+            state.in_flight.remove(&self.work_order_id);
         }
     }
+}
+
+fn stored_dispatch_outcome(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<Option<Result<DispatchReport, ManagerApiError>>, ManagerApiError> {
+    let dispatch_state = state
+        .inner
+        .dispatch_state
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?;
+    if let Some(report) = dispatch_state.completed.get(work_order_id) {
+        return Ok(Some(Ok(report.clone())));
+    }
+    Ok(dispatch_state
+        .terminal_failures
+        .get(work_order_id)
+        .cloned()
+        .map(Err))
 }
 
 fn reserve_dispatch(
     state: &ManagerState,
     work_order_id: &str,
 ) -> Result<DispatchReservation, ManagerApiError> {
-    let mut in_flight = state
+    let mut dispatch_state = state
         .inner
-        .dispatches_in_flight
+        .dispatch_state
         .lock()
         .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?;
-    if !in_flight.insert(work_order_id.to_string()) {
+    if !dispatch_state.in_flight.insert(work_order_id.to_string()) {
         return Err(ManagerApiError::conflict(
             "dispatch_in_progress",
             "a resident dispatch is already in progress for this work order",
@@ -4196,15 +4338,61 @@ fn reserve_dispatch(
     })
 }
 
+fn persist_provisional_start_quarantine(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<(), ManagerApiError> {
+    let mut dispatch_state = state.inner.dispatch_state.lock().map_err(|_| {
+        ManagerApiError::internal(
+            "dispatch_terminal_state_unavailable",
+            "resident start quarantine could not be persisted; start was not sent",
+        )
+    })?;
+    if dispatch_state.completed.contains_key(work_order_id) {
+        return Err(ManagerApiError::conflict(
+            "dispatch_already_completed",
+            "resident dispatch already has an authoritative success report",
+        ));
+    }
+    dispatch_state.terminal_failures.insert(
+        work_order_id.to_string(),
+        ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start may have been sent; effect certainty is unknown and automatic retry is forbidden",
+        ),
+    );
+    Ok(())
+}
+
+fn store_authoritative_dispatch_success(
+    state: &ManagerState,
+    work_order_id: &str,
+    report: &DispatchReport,
+) -> Result<(), ManagerApiError> {
+    let mut dispatch_state = state.inner.dispatch_state.lock().map_err(|_| {
+        ManagerApiError::internal(
+            "dispatch_lock",
+            "completed resident dispatch could not be persisted",
+        )
+    })?;
+    dispatch_state
+        .completed
+        .insert(work_order_id.to_string(), report.clone());
+    dispatch_state.terminal_failures.remove(work_order_id);
+    Ok(())
+}
+
 fn persist_terminal_dispatch_failure(
     state: &ManagerState,
     work_order_id: &str,
     error: ManagerApiError,
     reservation: &mut DispatchReservation,
 ) -> ManagerApiError {
-    match state.inner.terminal_dispatch_failures.lock() {
-        Ok(mut failures) => {
-            failures.insert(work_order_id.to_string(), error.clone());
+    match state.inner.dispatch_state.lock() {
+        Ok(mut dispatch_state) => {
+            dispatch_state
+                .terminal_failures
+                .insert(work_order_id.to_string(), error.clone());
             error
         }
         Err(_) => {
@@ -4548,8 +4736,17 @@ mod tests {
         AgentId, ClientPrincipal, FleetId, TelemetryAuthority, WorkOrder, WorkOrderId,
         WorkOrderPlacement, WorkOrderQuotaPolicy,
     };
+    use std::future::Future;
     use std::io::{Read, Write};
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
     use tower::ServiceExt;
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        future.poll(&mut context)
+    }
 
     fn credential(fleet_id: FleetId, scopes: Vec<EndpointScope>) -> CallerCredential {
         CallerCredential {
@@ -4618,7 +4815,7 @@ mod tests {
                 quotas: WorkOrderQuotaPolicy::default(),
                 placement: WorkOrderPlacement {
                     target: "customer_vpc".to_string(),
-                    data_locality: Some("eu-west".to_string()),
+                    data_locality: Some("vpc".to_string()),
                     requires_gpu: Some(false),
                     dedicated_instance: Some(false),
                     required_capabilities: vec!["runtime.resident".to_string()],
@@ -4676,7 +4873,7 @@ mod tests {
                 quotas: WorkOrderQuotaPolicy::default(),
                 placement: WorkOrderPlacement {
                     target: "customer_vpc".to_string(),
-                    data_locality: Some("eu-west".to_string()),
+                    data_locality: Some("vpc".to_string()),
                     requires_gpu: Some(false),
                     dedicated_instance: Some(false),
                     required_capabilities: vec!["message.remote.proposal".to_string()],
@@ -5161,6 +5358,29 @@ mod tests {
         .expect_err("heartbeat requires heartbeat scope");
         assert_eq!(heartbeat_error.body.code, "missing_scope");
 
+        let instance_heartbeat_error = heartbeat_instance(
+            Path(InstanceId::parse("00000000-0000-4000-8000-000000000604").expect("instance")),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: missing_scope.clone(),
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id.clone(),
+                    instance_id: InstanceId::parse("00000000-0000-4000-8000-000000000604")
+                        .expect("instance"),
+                    health: instance(
+                        "00000000-0000-4000-8000-000000000504",
+                        "00000000-0000-4000-8000-000000000604",
+                        &tenant_id,
+                    )
+                    .health,
+                    recorded_at: OffsetDateTime::now_utc(),
+                },
+            }),
+        )
+        .await
+        .expect_err("instance heartbeat requires instance heartbeat scope");
+        assert_eq!(instance_heartbeat_error.body.code, "missing_scope");
+
         let advertise_error = advertise_capabilities(
             Path(node.node_id.clone()),
             State(state.clone()),
@@ -5172,6 +5392,133 @@ mod tests {
         .await
         .expect_err("capability advertisement requires node scope");
         assert_eq!(advertise_error.body.code, "missing_scope");
+    }
+
+    #[tokio::test]
+    async fn authenticated_instance_heartbeat_refreshes_stale_instance_without_static_mutation() {
+        let state = ManagerState::local_acceptance();
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000714",
+            "http://127.0.0.1:1",
+            "resident_cloud_pool",
+            "cloud",
+            vec!["runtime.resident"],
+        );
+        let instance_id =
+            InstanceId::parse("00000000-0000-4000-8000-000000000715").expect("instance");
+        let registration_security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+            ],
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: registration_security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("node registered");
+        let mut registration = instance(
+            &node.node_id.to_string(),
+            &instance_id.to_string(),
+            &tenant_id,
+        );
+        registration.health.observed_at = OffsetDateTime::now_utc() - Duration::seconds(61);
+        registration.registered_at = registration.health.observed_at;
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: registration_security,
+                registration: registration.clone(),
+            }),
+        )
+        .await
+        .expect("stale instance registered");
+
+        let placement = PlacementRequest::new(PlacementTarget::ResidentCloudPool);
+        let stale = state
+            .inner
+            .registry
+            .instance(&instance_id)
+            .expect("stale instance record");
+        assert!(!instance_is_eligible(
+            &stale,
+            &node.runtime_version,
+            &tenant_id,
+            &placement,
+            OffsetDateTime::now_utc(),
+        ));
+
+        let heartbeat_security = manager_security(&state, vec![EndpointScope::InstancesHeartbeat]);
+        let refreshed_at = OffsetDateTime::now_utc();
+        let response = heartbeat_instance(
+            Path(instance_id.clone()),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: heartbeat_security.clone(),
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id.clone(),
+                    instance_id: instance_id.clone(),
+                    health: splendor_types::InstanceHealth {
+                        status: HealthStatus::Healthy,
+                        observed_at: refreshed_at,
+                        metadata: serde_json::json!({"queue_depth": 0}),
+                    },
+                    recorded_at: refreshed_at,
+                },
+            }),
+        )
+        .await
+        .expect("authenticated instance heartbeat accepted");
+        assert_eq!(response.0["accepted"], true);
+
+        let refreshed = state
+            .inner
+            .registry
+            .instance(&instance_id)
+            .expect("refreshed instance record");
+        assert_eq!(refreshed.registration, registration);
+        assert_eq!(
+            refreshed.health.metadata,
+            serde_json::json!({"queue_depth": 0})
+        );
+        assert!(instance_is_eligible(
+            &refreshed,
+            &node.runtime_version,
+            &tenant_id,
+            &placement,
+            refreshed_at,
+        ));
+
+        let mismatched = heartbeat_instance(
+            Path(InstanceId::new()),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: heartbeat_security,
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id,
+                    instance_id,
+                    health: refreshed.health,
+                    recorded_at: refreshed_at + Duration::seconds(1),
+                },
+            }),
+        )
+        .await
+        .expect_err("path/body instance mismatch rejected before registry mutation");
+        assert_eq!(mismatched.body.code, "instance_id_mismatch");
+        assert!(state
+            .inner
+            .audit
+            .lock()
+            .expect("manager audit")
+            .iter()
+            .any(|event| event.event_type == "instance.heartbeat_recorded"));
     }
 
     #[tokio::test]
@@ -6061,6 +6408,54 @@ mod tests {
             .as_array()
             .expect("policy actions")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn placement_rejects_unknown_signed_locality_class_instead_of_ignoring_it() {
+        let state = ManagerState::local_acceptance();
+        let mut work_order = dispatch_test_work_order().work_order;
+        work_order.work_order_id =
+            WorkOrderId::try_new("wo_unknown_locality").expect("work-order id");
+        work_order.placement.data_locality = Some("eu-west".to_string());
+        let envelope = WorkOrderEnvelope::signed_with_shared_secret(
+            work_order,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("signed unknown-locality work order");
+        submit_test_work_order(
+            &state,
+            &manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]),
+            envelope,
+        )
+        .await;
+
+        let error = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: manager_security(&state, vec![EndpointScope::FleetRead]),
+                work_order_id: Some("wo_unknown_locality".to_string()),
+                request: PlacementRequest {
+                    target: PlacementTarget::CustomerVpc,
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    data_locality: Some(DataLocality::Vpc),
+                    dedicated_instance: false,
+                    required_runtime_version: None,
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+            }),
+        )
+        .await
+        .expect_err("region-like locality cannot be reinterpreted as a typed class");
+        assert_eq!(error.body.code, "unsupported_work_order_data_locality");
+        assert!(state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .get("wo_unknown_locality")
+            .is_none());
     }
 
     #[test]
@@ -7889,6 +8284,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revocation_gate_queues_revoke_before_dispatch_and_prevents_egress() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::FleetRead,
+                EndpointScope::FleetDispatch,
+                EndpointScope::WorkOrdersSubmit,
+                EndpointScope::WorkOrdersRevoke,
+            ],
+        );
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000814",
+            "http://127.0.0.1:1",
+            "customer_vpc",
+            "vpc",
+            vec!["runtime.resident"],
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("node registered");
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(
+                    &node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000815",
+                    &tenant_id,
+                ),
+            }),
+        )
+        .await
+        .expect("instance registered");
+        submit_test_work_order(&state, &security, dispatch_test_work_order()).await;
+        let _ = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some("wo_test_dispatch".to_string()),
+                request: PlacementRequest {
+                    target: PlacementTarget::CustomerVpc,
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    data_locality: Some(DataLocality::Vpc),
+                    dedicated_instance: false,
+                    required_runtime_version: None,
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+            }),
+        )
+        .await
+        .expect("placement selected");
+
+        let gate = state
+            .work_order_revocation_gate("wo_test_dispatch")
+            .expect("revocation gate");
+        let barrier = Arc::clone(&gate).lock_owned().await;
+        let mut revoke = Box::pin(revoke_work_order(
+            Path("wo_test_dispatch".to_string()),
+            State(state.clone()),
+            Json(RevokeWorkOrderRequest {
+                security: security.clone(),
+                reason: "revoke wins race".to_string(),
+            }),
+        ));
+        assert!(poll_once(revoke.as_mut()).is_pending());
+        let mut dispatch = Box::pin(dispatch_work_order(
+            Path("wo_test_dispatch".to_string()),
+            State(state.clone()),
+            Json(DispatchWorkOrderRequest {
+                security,
+                target_node_id: Some(node.node_id),
+            }),
+        ));
+        assert!(poll_once(dispatch.as_mut()).is_pending());
+        drop(barrier);
+
+        let _ = revoke.await.expect("queued revocation committed");
+        let error = dispatch
+            .await
+            .expect_err("dispatch queued behind revocation is denied");
+        assert_eq!(error.body.code, "revoked_work_order");
+        assert!(state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .get("wo_test_dispatch")
+            .is_none());
+        assert!(state
+            .inner
+            .dispatch_state
+            .lock()
+            .expect("dispatch state")
+            .in_flight
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn resident_transport_disables_redirects_and_bounds_response_bodies() {
         assert_eq!(
             bounded_upstream_code("resident_scope_denied".to_string()).as_deref(),
@@ -8063,18 +8568,18 @@ mod tests {
     #[test]
     fn terminal_dispatch_storage_failure_quarantines_duplicate_execution() {
         let state = ManagerState::local_acceptance();
+        let mut reservation = reserve_dispatch(&state, "wo_quarantined").expect("reservation");
         let poison_state = state.clone();
         let _ = std::thread::spawn(move || {
             let _guard = poison_state
                 .inner
-                .terminal_dispatch_failures
+                .dispatch_state
                 .lock()
                 .expect("terminal failure lock");
             panic!("poison terminal dispatch storage for fail-closed test");
         })
         .join();
 
-        let mut reservation = reserve_dispatch(&state, "wo_quarantined").expect("reservation");
         let error = persist_terminal_dispatch_failure(
             &state,
             "wo_quarantined",
@@ -8082,11 +8587,12 @@ mod tests {
             &mut reservation,
         );
         assert_eq!(error.body.code, "dispatch_terminal_state_unavailable");
+        assert!(!reservation.release_on_drop);
         drop(reservation);
         let duplicate = match reserve_dispatch(&state, "wo_quarantined") {
             Err(error) => error,
             Ok(_) => panic!("quarantined dispatch must remain in flight"),
         };
-        assert_eq!(duplicate.body.code, "dispatch_in_progress");
+        assert_eq!(duplicate.body.code, "dispatch_lock");
     }
 }

@@ -99,8 +99,9 @@ Validation is fixed and fail closed:
    projected credential and audit data by `sha256:` plus a domain-separated
    SHA-256 digest. `SignedCallerToken` and trust key debug output are explicitly
    redacted.
-10. The in-memory one-use set is pruned at token expiry and bounded at 100,000
-    live mutating JTIs. If it cannot be checked or is full, mutation fails closed.
+10. The in-memory one-use set retains each consumed JTI through `exp` plus the
+    accepted clock leeway, then prunes it, and is bounded at 100,000 live mutating
+    JTIs. If it cannot be checked or is full, mutation fails closed.
     The current daemon/runtime and this ledger are process-local; restart-durable
     admission/idempotency/replay storage remains outside this acceptance slice.
 
@@ -171,6 +172,9 @@ Dispatch rules:
 
 - The signed work order must contain a stable `run_id` and pass signature,
   expiry, revocation, identity, and placement validation before network I/O.
+- Signed `data_locality` accepts only the current typed `cloud`, `vpc`,
+  `on_prem`, or `device` classes. Region-like or unknown strings are rejected;
+  they are never ignored or reinterpreted as region semantics.
 - The accepted work-order ID is immutable: matching signed bytes are idempotent,
   while any same-ID payload or envelope replacement is rejected. Placement is
   bound to that accepted payload and one immutable decision digest.
@@ -191,6 +195,10 @@ Dispatch rules:
   credential/JTI digest, so a safe retry can use a fresh one-use bearer.
 - Start uses a fresh `runs_start` token and requires exact HTTP status plus an
   exact `TickResponse` run identity.
+- A per-work-order asynchronous revocation gate linearizes revocation against the
+  complete create/start dispatch. Dispatch rechecks revocation and expiry
+  immediately before each outbound request. A revocation that acquires the gate
+  first prevents all egress; one that loses waits for create/start to finish.
 - Non-2xx, oversized, malformed, or identity-mismatched responses are failures.
   They never emit `run.dispatched` or publish running telemetry.
 - After a start request may have been sent, every transport reset/timeout,
@@ -201,6 +209,10 @@ Dispatch rules:
 - One dispatch per work order may be in flight. Successful duplicates return the
   stored report. Terminal start failures return the stored failure. Concurrent
   duplicates cannot start another tick.
+- Before awaiting start, the manager stores a provisional terminal
+  unknown-effect quarantine. Cancellation after the request may have been sent
+  leaves that quarantine in place. It is cleared only in the same protected state
+  update that stores the authoritative typed success report.
 - Telemetry uses the typed returned run status and exact signed tenant, agent,
   node, instance, and run identities.
 
@@ -217,7 +229,8 @@ projection directly.
 The TypeScript client rejects relative URLs, unsupported schemes, URL
 credentials, query, and fragment. Bearer transport requires HTTPS, except exact
 `localhost`, `127.0.0.1`, or `[::1]` HTTP used explicitly for local development.
-It never falls back to plaintext remote transport or anonymous requests.
+It sets Fetch `redirect: "error"` on every credentialed request and never falls
+back to plaintext remote transport or anonymous requests.
 
 Work-order v1 and gateway schemas are unchanged. A future work-order v2 may sign
 exact action/adapter/permission tuples; this RFC does not infer those tuples from

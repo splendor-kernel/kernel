@@ -211,7 +211,7 @@ test("createRun posts run config with work-order envelope and audit attribution"
   const { fetcher, calls } = makeFetch({
     request_id: "req_test_create_run",
     idempotency_key: "idem_test_create_run",
-    idempotency_receipt_id: "create_run:fnv64:test",
+    idempotency_receipt_id: "create_run:blake3:test",
     duplicate: false,
     run_id: runId,
     status: "pending"
@@ -225,10 +225,24 @@ test("createRun posts run config with work-order envelope and audit attribution"
   assert.equal(calls.length, 1);
   assert.equal(new URL(calls[0].url).pathname, "/v1/runs");
   assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.redirect, "error");
   const headers = new Headers(calls[0].init.headers);
   assert.equal(headers.get("authorization"), "Bearer token");
   assert.equal(headers.get("x-splendor-api-version"), "0.02-dev");
   assert.deepEqual(calls[0].jsonBody, createRunRequest);
+});
+
+test("every credentialed request rejects redirects at fetch", async () => {
+  const { fetcher, calls } = makeFetch({ status: "ok" });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+
+  await client.getHealth();
+  await client.inspectRun(runId);
+  await client.startRun(runId, lifecycleRequest);
+
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.init.redirect === "error"));
+  assert.ok(calls.every((call) => new Headers(call.init.headers).get("authorization") === "Bearer token"));
 });
 
 test("createRun fails closed when work order or audit attribution is absent", async () => {

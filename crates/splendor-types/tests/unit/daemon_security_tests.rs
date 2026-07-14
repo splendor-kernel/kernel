@@ -142,6 +142,38 @@ fn valid_run_create_request_is_authorized() {
 }
 
 #[test]
+fn state_handoff_requires_handoff_scope_and_audit_attribution() {
+    let now = time::OffsetDateTime::now_utc();
+    let tenant_id = TenantId::new();
+    let run_id = RunId::new();
+    let request = DaemonSecurityRequest {
+        endpoint: DaemonEndpoint::StateHandoff {
+            tenant_id: tenant_id.clone(),
+            run_id,
+        },
+        credential: Some(credential(
+            tenant_id,
+            vec![EndpointScope::StateHandoff],
+            now,
+        )),
+        expected_audience: audience(),
+        work_order: None,
+        audit_attribution: Some(attribution(now)),
+        insecure_dev_mode: None,
+    };
+
+    let decision = validate_daemon_request(&request, now).expect("handoff authorized");
+    assert_eq!(decision.scope, EndpointScope::StateHandoff);
+
+    let mut missing_attribution = request;
+    missing_attribution.audit_attribution = None;
+    assert_eq!(
+        validate_daemon_request(&missing_attribution, now),
+        Err(DaemonSecurityError::MissingAuditAttribution)
+    );
+}
+
+#[test]
 fn endpoint_scope_strings_cover_daemon_and_registry_surface() {
     let cases = [
         (EndpointScope::RunsCreate, "splendor.runs.create"),

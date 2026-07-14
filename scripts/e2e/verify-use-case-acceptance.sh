@@ -69,6 +69,12 @@ if [[ ( "${MODE}" == "all" || "${MODE}" == "scenario" ) && "${INSIDE_COMPOSE}" =
     export SPLENDOR_E2E_SOURCE_REV="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || printf unknown-source-revision)"
     export SPLENDOR_E2E_SCENARIO="${SCENARIO:-UC-E2E-S0}"
     export SPLENDOR_E2E_MODE_ARG="${MODE}"
+    SETUP_ARGS=( -f "${COMPOSE_FILE}" --profile setup run --rm )
+    if [[ "${REUSE_BUILD}" == "0" ]]; then
+      SETUP_ARGS+=( --build )
+    fi
+    SETUP_ARGS+=( resident-auth-fixture )
+    docker compose "${SETUP_ARGS[@]}"
     COMPOSE_ARGS=( -f "${COMPOSE_FILE}" up --abort-on-container-exit --exit-code-from e2e-runner )
     if [[ "${REUSE_BUILD}" == "0" ]]; then
       COMPOSE_ARGS+=( --build )

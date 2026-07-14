@@ -95,6 +95,12 @@ Resident URLs use HTTPS and no resident inherits local development keys. Because
 work-order v1 uses keyed-BLAKE3 shared secrets, this fixture proves scoped sibling
 isolation, not asymmetric issuer/verifier separation.
 
+The executable harness runs `resident-auth-fixture` first through the explicit
+Compose `setup` profile and waits for success before starting the long-running
+topology. The subsequent `up --abort-on-container-exit` does not enable that
+one-shot profile, so fixture completion cannot abort the acceptance runner or
+resident services.
+
 ```yaml
 services:
   e2e-runner:

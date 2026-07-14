@@ -152,6 +152,14 @@ The daemon security contract includes S2 endpoint scopes:
 | `splendor.nodes.heartbeat` | Record node heartbeat. |
 | `splendor.instances.heartbeat` | Record instance heartbeat. |
 
+The bounded acceptance-manager route is
+`POST /fleet/instances/{instance_id}/heartbeat`. It requires the existing
+`splendor.instances.heartbeat` scope and delegates mutation to
+`NodeRegistry::record_instance_heartbeat`; it does not create a second instance
+lifecycle owner. The central-manager inbound API remains acceptance-only
+self-asserted metadata as documented by RFC 0011, not a production-authenticated
+remote manager claim.
+
 Non-dev calls require authenticated caller credentials, matching tenant/fleet
 binding, matching audience, expiry/revocation checks, endpoint scope, and audit
 attribution. These scopes do not grant authority to start runs or execute agent

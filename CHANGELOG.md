@@ -58,6 +58,19 @@
   key/TLS material in separate role volumes with per-instance work-order v1
   secrets; v1 remains a scoped shared-secret residual rather than asymmetric
   verifier separation.
+- Closed the final resident-auth dispatch races: consumed mutating JTIs now live
+  through expiry leeway; work-order revocation is serialized across full
+  create/start dispatch with last-moment authority checks; start cancellation
+  retains an unknown-effect quarantine until an authoritative success report is
+  stored; signed locality rejects unknown classes; and the existing typed
+  registry now backs an authenticated instance-heartbeat manager route. The
+  TypeScript bearer client rejects redirects, create/idempotency fingerprints use
+  domain-separated BLAKE3, verifier debug output redacts consumed JTIs, and the
+  one-shot acceptance auth fixture runs only in an explicit Compose setup phase.
+  Resident trace views retain only bounded `sha256:` caller-correlation digests,
+  allowing central sync to verify original hash chains without exposing bearer
+  or JTI material, and state snapshot export/import now enforce their documented
+  `splendor.state.handoff` scope rather than the state-head read scope.
 - Corrected CLI run-level trace composition so agents sharing one configured
   `run_id` also share one runtime cursor, producing a contiguous sequence/hash
   chain with distinct agent identities. Signed resume retains that cursor and

@@ -15,7 +15,8 @@ use splendor_daemon::manager::{
     router as manager_router, DispatchReport, DispatchWorkOrderRequest, ManagerApiErrorBody,
     ManagerAuditEvent, ManagerReadRequest, ManagerSecurityFields, ManagerState,
     PlacementEvaluationRequest, RegisterInstanceRequest, RegisterNodeRequest,
-    ResidentDispatchOptions, SubmitWorkOrderRequest, WorkOrderValidationReport,
+    ResidentDispatchOptions, RevokeWorkOrderRequest, SubmitWorkOrderRequest,
+    WorkOrderValidationReport,
 };
 use splendor_daemon::{
     router as resident_router, ApiErrorBody, CreateRunResponse, DaemonConfig, DaemonState,
@@ -57,7 +58,24 @@ struct FaultHarness {
     server: JoinHandle<()>,
 }
 
+struct BarrierHarness {
+    base_url: String,
+    create_calls: Arc<AtomicUsize>,
+    start_calls: Arc<AtomicUsize>,
+    create_entered: Arc<tokio::sync::Barrier>,
+    create_release: Arc<tokio::sync::Barrier>,
+    start_entered: Arc<tokio::sync::Barrier>,
+    start_release: Arc<tokio::sync::Barrier>,
+    server: JoinHandle<()>,
+}
+
 impl Drop for FaultHarness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl Drop for BarrierHarness {
     fn drop(&mut self) {
         self.server.abort();
     }
@@ -81,6 +99,16 @@ enum PostSendStartFault {
 struct PostSendFaultState {
     start_calls: Arc<AtomicUsize>,
     fault: PostSendStartFault,
+}
+
+#[derive(Clone)]
+struct BarrierDispatchState {
+    create_calls: Arc<AtomicUsize>,
+    start_calls: Arc<AtomicUsize>,
+    create_entered: Arc<tokio::sync::Barrier>,
+    create_release: Arc<tokio::sync::Barrier>,
+    start_entered: Arc<tokio::sync::Barrier>,
+    start_release: Arc<tokio::sync::Barrier>,
 }
 
 async fn fault_create_run(Json(payload): Json<serde_json::Value>) -> Json<CreateRunResponse> {
@@ -191,6 +219,72 @@ async fn spawn_post_send_fault_server(fault: PostSendStartFault) -> FaultHarness
     }
 }
 
+async fn barrier_create_run(
+    State(state): State<BarrierDispatchState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<CreateRunResponse> {
+    state.create_calls.fetch_add(1, Ordering::SeqCst);
+    state.create_entered.wait().await;
+    state.create_release.wait().await;
+    fault_create_run(Json(payload)).await
+}
+
+async fn barrier_start_run(
+    Path(run_id): Path<RunId>,
+    State(state): State<BarrierDispatchState>,
+) -> Json<TickResponse> {
+    state.start_calls.fetch_add(1, Ordering::SeqCst);
+    state.start_entered.wait().await;
+    state.start_release.wait().await;
+    Json(TickResponse {
+        run_id,
+        status: splendor_daemon::RunStatus::Running,
+        tick_id: 1,
+        state_node_id: "state_barrier_dispatch".to_string(),
+        action_outcomes: Vec::new(),
+    })
+}
+
+async fn spawn_barrier_dispatch_server() -> BarrierHarness {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("barrier listener");
+    let address = listener.local_addr().expect("barrier address");
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let create_entered = Arc::new(tokio::sync::Barrier::new(2));
+    let create_release = Arc::new(tokio::sync::Barrier::new(2));
+    let start_entered = Arc::new(tokio::sync::Barrier::new(2));
+    let start_release = Arc::new(tokio::sync::Barrier::new(2));
+    let state = BarrierDispatchState {
+        create_calls: Arc::clone(&create_calls),
+        start_calls: Arc::clone(&start_calls),
+        create_entered: Arc::clone(&create_entered),
+        create_release: Arc::clone(&create_release),
+        start_entered: Arc::clone(&start_entered),
+        start_release: Arc::clone(&start_release),
+    };
+    let app = Router::new()
+        .route("/runs", post(barrier_create_run))
+        .route("/runs/:run_id/start", post(barrier_start_run))
+        .with_state(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("barrier server remains available");
+    });
+    BarrierHarness {
+        base_url: format!("http://{address}"),
+        create_calls,
+        start_calls,
+        create_entered,
+        create_release,
+        start_entered,
+        start_release,
+        server,
+    }
+}
+
 impl Drop for ResidentHarness {
     fn drop(&mut self) {
         self.server.abort();
@@ -288,9 +382,11 @@ fn manager_security(fleet_id: &FleetId) -> ManagerSecurityFields {
         scopes: vec![
             EndpointScope::NodesRegister,
             EndpointScope::InstancesRegister,
+            EndpointScope::InstancesHeartbeat,
             EndpointScope::FleetRead,
             EndpointScope::FleetDispatch,
             EndpointScope::WorkOrdersSubmit,
+            EndpointScope::WorkOrdersRevoke,
             EndpointScope::TracesRead,
         ],
         binding: CredentialBinding::Fleet {
@@ -371,6 +467,25 @@ fn signed_work_order(
     capability: &str,
 ) -> WorkOrderEnvelope {
     let now = OffsetDateTime::now_utc();
+    signed_work_order_expiring_at(
+        work_order_id,
+        run_id,
+        tenant_id,
+        agent_id,
+        capability,
+        now + Duration::minutes(10),
+    )
+}
+
+fn signed_work_order_expiring_at(
+    work_order_id: &str,
+    run_id: RunId,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    capability: &str,
+    expires_at: OffsetDateTime,
+) -> WorkOrderEnvelope {
+    let now = OffsetDateTime::now_utc();
     WorkOrderEnvelope::signed_with_shared_secret(
         WorkOrder {
             schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
@@ -394,7 +509,7 @@ fn signed_work_order(
                 execution_mode: PlacementExecutionMode::Live,
             },
             issued_at: now - Duration::minutes(1),
-            expires_at: now + Duration::minutes(10),
+            expires_at,
             revocation: RevocationStatus::Active,
         },
         WORK_ORDER_KEY_ID,
@@ -737,13 +852,17 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
         .collect::<HashSet<_>>();
     assert_eq!(
         audit_credentials.len(),
-        1,
-        "resident trace export must redact caller JTIs"
+        2,
+        "resident trace export must retain one bounded correlation digest per create/start caller"
     );
-    assert_eq!(
-        audit_credentials.into_iter().next().as_deref(),
-        Some("[REDACTED]")
-    );
+    assert!(audit_credentials.iter().all(|credential_id| {
+        credential_id.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    }));
     assert!(events.iter().any(|event| match &event.kind {
         TraceEventKind::DaemonAudit { audit, .. } => {
             audit.principal.app.app_principal_id == "central-manager"
@@ -1145,8 +1264,8 @@ async fn start_timeout_is_effect_unknown_and_duplicate_dispatch_never_retries_it
         &request,
     )
     .await;
-    assert_eq!(concurrent_status, StatusCode::CONFLICT);
-    assert_eq!(concurrent_error.code, "dispatch_in_progress");
+    assert_eq!(concurrent_status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(concurrent_error.code, "resident_start_effect_unknown");
 
     let (status, error) = first.await.expect("first dispatch task");
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
@@ -1203,6 +1322,241 @@ async fn start_timeout_is_effect_unknown_and_duplicate_dispatch_never_retries_it
     assert!(!audit
         .iter()
         .any(|event| event.event_type == "run.dispatched"));
+}
+
+#[tokio::test]
+async fn dispatch_gate_makes_revoke_wait_through_create_and_start_when_dispatch_wins() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let node_id = NodeId::new();
+    let instance_id = InstanceId::new();
+    let run_id = RunId::new();
+    let signer = caller_signer();
+    let resident = spawn_barrier_dispatch_server().await;
+    let app = manager_router(manager_state_with_options(
+        signer,
+        ResidentDispatchOptions {
+            allowed_origins: vec![resident.base_url.clone()],
+            ..ResidentDispatchOptions::loopback_test()
+        },
+    ));
+    let security = manager_security(&fleet_id);
+    register_and_place(
+        &app,
+        &security,
+        ResidentPlacementFixture {
+            fleet_id: &fleet_id,
+            node_id: &node_id,
+            instance_id: &instance_id,
+            tenant_id: &tenant_id,
+            resident_url: &resident.base_url,
+            capability: "dispatch.revoke_race",
+        },
+        signed_work_order(
+            "wo_dispatch_wins_revoke_race",
+            run_id,
+            tenant_id.clone(),
+            agent_id,
+            "dispatch.revoke_race",
+        ),
+    )
+    .await;
+
+    let dispatch_app = app.clone();
+    let dispatch_security = security.clone();
+    let dispatch_node = node_id.clone();
+    let dispatch = tokio::spawn(async move {
+        call_manager::<_, DispatchReport>(
+            dispatch_app,
+            Method::POST,
+            "/work-orders/wo_dispatch_wins_revoke_race/dispatch",
+            &DispatchWorkOrderRequest {
+                security: dispatch_security,
+                target_node_id: Some(dispatch_node),
+            },
+        )
+        .await
+    });
+    resident.create_entered.wait().await;
+
+    let revoke_app = app.clone();
+    let revoke_security = security.clone();
+    let mut revoke = tokio::spawn(async move {
+        call_manager::<_, serde_json::Value>(
+            revoke_app,
+            Method::POST,
+            "/work-orders/wo_dispatch_wins_revoke_race/revoke",
+            &RevokeWorkOrderRequest {
+                security: revoke_security,
+                reason: "race revocation".to_string(),
+            },
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(50), &mut revoke)
+            .await
+            .is_err()
+    );
+
+    resident.create_release.wait().await;
+    resident.start_entered.wait().await;
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(50), &mut revoke)
+            .await
+            .is_err()
+    );
+    resident.start_release.wait().await;
+
+    let (dispatch_status, _) = dispatch.await.expect("dispatch task");
+    assert_eq!(dispatch_status, StatusCode::OK);
+    let (revoke_status, revoke_body) = revoke.await.expect("revoke task");
+    assert_eq!(revoke_status, StatusCode::OK);
+    assert_eq!(revoke_body["revoked"], true);
+    assert_eq!(resident.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resident.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn dispatch_revalidates_expiry_after_create_and_sends_no_start() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let node_id = NodeId::new();
+    let instance_id = InstanceId::new();
+    let run_id = RunId::new();
+    let signer = caller_signer();
+    let resident = spawn_barrier_dispatch_server().await;
+    let app = manager_router(manager_state_with_options(
+        signer,
+        ResidentDispatchOptions {
+            allowed_origins: vec![resident.base_url.clone()],
+            ..ResidentDispatchOptions::loopback_test()
+        },
+    ));
+    let security = manager_security(&fleet_id);
+    register_and_place(
+        &app,
+        &security,
+        ResidentPlacementFixture {
+            fleet_id: &fleet_id,
+            node_id: &node_id,
+            instance_id: &instance_id,
+            tenant_id: &tenant_id,
+            resident_url: &resident.base_url,
+            capability: "dispatch.expiry_revalidation",
+        },
+        signed_work_order_expiring_at(
+            "wo_expiry_between_create_and_start",
+            run_id,
+            tenant_id.clone(),
+            agent_id,
+            "dispatch.expiry_revalidation",
+            OffsetDateTime::now_utc() + Duration::seconds(1),
+        ),
+    )
+    .await;
+
+    let dispatch = tokio::spawn(async move {
+        call_manager::<_, ManagerApiErrorBody>(
+            app,
+            Method::POST,
+            "/work-orders/wo_expiry_between_create_and_start/dispatch",
+            &DispatchWorkOrderRequest {
+                security,
+                target_node_id: Some(node_id),
+            },
+        )
+        .await
+    });
+    resident.create_entered.wait().await;
+    tokio::time::sleep(StdDuration::from_millis(1_100)).await;
+    resident.create_release.wait().await;
+
+    let (status, error) = dispatch.await.expect("dispatch task");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "expired_work_order");
+    assert_eq!(resident.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resident.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn abort_after_start_send_leaves_terminal_effect_unknown_quarantine() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let node_id = NodeId::new();
+    let instance_id = InstanceId::new();
+    let run_id = RunId::new();
+    let signer = caller_signer();
+    let resident = spawn_barrier_dispatch_server().await;
+    let app = manager_router(manager_state_with_options(
+        signer,
+        ResidentDispatchOptions {
+            allowed_origins: vec![resident.base_url.clone()],
+            ..ResidentDispatchOptions::loopback_test()
+        },
+    ));
+    let security = manager_security(&fleet_id);
+    register_and_place(
+        &app,
+        &security,
+        ResidentPlacementFixture {
+            fleet_id: &fleet_id,
+            node_id: &node_id,
+            instance_id: &instance_id,
+            tenant_id: &tenant_id,
+            resident_url: &resident.base_url,
+            capability: "dispatch.abort_after_send",
+        },
+        signed_work_order(
+            "wo_abort_after_start_send",
+            run_id,
+            tenant_id.clone(),
+            agent_id,
+            "dispatch.abort_after_send",
+        ),
+    )
+    .await;
+    let request = DispatchWorkOrderRequest {
+        security: security.clone(),
+        target_node_id: Some(node_id),
+    };
+
+    let first_app = app.clone();
+    let first_request = request.clone();
+    let dispatch = tokio::spawn(async move {
+        call_manager::<_, DispatchReport>(
+            first_app,
+            Method::POST,
+            "/work-orders/wo_abort_after_start_send/dispatch",
+            &first_request,
+        )
+        .await
+    });
+    resident.create_entered.wait().await;
+    resident.create_release.wait().await;
+    resident.start_entered.wait().await;
+    dispatch.abort();
+    assert!(dispatch
+        .await
+        .expect_err("dispatch cancelled")
+        .is_cancelled());
+
+    let (retry_status, retry_error): (StatusCode, ManagerApiErrorBody) = call_manager(
+        app,
+        Method::POST,
+        "/work-orders/wo_abort_after_start_send/dispatch",
+        &request,
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(retry_error.code, "resident_start_effect_unknown");
+    assert!(retry_error.message.contains("automatic retry is forbidden"));
+    assert_eq!(resident.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resident.start_calls.load(Ordering::SeqCst), 1);
+    resident.start_release.wait().await;
 }
 
 #[tokio::test]

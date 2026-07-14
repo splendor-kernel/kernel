@@ -20,7 +20,7 @@ services:
       SPLENDOR_DAEMON_URL: http://127.0.0.1:8077
       SPLENDOR_MANAGER_URL: http://central-manager:8081
       SPLENDOR_RESIDENT_AUTH_DIR: /run/splendor-auth
-      SPLENDOR_RESIDENT_CA_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_RESIDENT_CA_FILE: /run/splendor-auth/resident-root-ca.pem
       SPLENDOR_VPC_NODE_URL: https://resident-vpc-node:8092
       SPLENDOR_CLOUD_NODE_URL: https://resident-cloud-node:8091
       SPLENDOR_EDGE_NODE_URL: https://resident-edge-node:8093
@@ -56,6 +56,7 @@ services:
       - e2e-runner-auth:/run/splendor-auth:ro
 
   resident-auth-fixture:
+    profiles: ["setup"]
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -152,16 +153,13 @@ services:
       SPLENDOR_MANAGER_CALLER_KEY_ID: manager-resident-acceptance
       SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE: /run/splendor-auth/caller-signing-key.pk8
       SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
-      SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE: /run/splendor-auth/resident-tls-cert.pem
+      SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE: /run/splendor-auth/resident-root-ca.pem
       SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS: https://resident-cloud-node:8091,https://resident-vpc-node:8092,https://resident-edge-node:8093
     command: ["splendor-manager"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-manager-auth:/run/splendor-auth:ro
-    depends_on:
-      resident-auth-fixture:
-        condition: service_completed_successfully
 
   resident-cloud-node:
     build:
@@ -183,9 +181,6 @@ services:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-cloud-auth:/run/splendor-auth:ro
-    depends_on:
-      resident-auth-fixture:
-        condition: service_completed_successfully
 
   resident-vpc-node:
     build:
@@ -207,9 +202,6 @@ services:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-vpc-auth:/run/splendor-auth:ro
-    depends_on:
-      resident-auth-fixture:
-        condition: service_completed_successfully
 
   resident-edge-node:
     build:
@@ -232,9 +224,6 @@ services:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-edge-auth:/run/splendor-auth:ro
-    depends_on:
-      resident-auth-fixture:
-        condition: service_completed_successfully
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest

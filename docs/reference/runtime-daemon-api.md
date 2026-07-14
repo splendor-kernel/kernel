@@ -237,6 +237,8 @@ raw attempted/existing scope fields and caller identifiers.
 The stable caller scope contains principal identity but not ephemeral bearer
 credential/JTI correlation ID, so a safe retry can present a fresh one-use token
 without changing the durable idempotency scope.
+Create-run request fingerprints and idempotency receipt hashes use
+domain-separated BLAKE3. The earlier FNV representation is not emitted.
 
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
@@ -314,6 +316,10 @@ are returned in monotonic sequence order. Range reads use `start` inclusive and
 and `POST /runs/{run_id}/traces/export` both require an explicit
 `redaction_policy`; the export response also includes a deterministic
 `integrity_hash` summary over the returned trace chain.
+Resident audit records retain only the bounded domain-separated `sha256:`
+`credential_id` correlation digest described above; arbitrary credential IDs
+and credential material remain redacted. This permits central trace sync to
+verify the resident's original hash chain without exposing bearer or JTI bytes.
 For resident daemon configuration, run trace identities carry the configured
 `instance_id`; local development retains the existing unset placement identity.
 

@@ -108,13 +108,33 @@ pub struct CallerTokenVerifier {
     inner: Arc<CallerTokenVerifierInner>,
 }
 
-#[derive(Debug)]
 struct CallerTokenVerifierInner {
     trust: CallerTokenTrustSnapshot,
     expected_instance_id: InstanceId,
     clock_leeway_seconds: i64,
     maximum_observed_unix_time: AtomicI64,
     consumed_mutating_jtis: Mutex<HashMap<String, i64>>,
+}
+
+impl std::fmt::Debug for CallerTokenVerifierInner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let consumed_jti_count = self
+            .consumed_mutating_jtis
+            .lock()
+            .map(|consumed| consumed.len())
+            .ok();
+        formatter
+            .debug_struct("CallerTokenVerifierInner")
+            .field("trust", &self.trust)
+            .field("expected_instance_id", &self.expected_instance_id)
+            .field("clock_leeway_seconds", &self.clock_leeway_seconds)
+            .field(
+                "maximum_observed_unix_time",
+                &self.maximum_observed_unix_time.load(Ordering::SeqCst),
+            )
+            .field("consumed_mutating_jti_count", &consumed_jti_count)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -296,14 +316,18 @@ impl CallerTokenVerifier {
             .lock()
             .map_err(|_| CallerAuthError::InvalidTrustSnapshot)?;
         let now_unix = now.unix_timestamp();
-        consumed.retain(|_, expires_at| *expires_at > now_unix);
+        consumed.retain(|_, retained_until| *retained_until >= now_unix);
         if consumed.contains_key(&verified.raw_jti) {
             return Err(CallerAuthError::ReplayedToken);
         }
         if consumed.len() >= MAX_CONSUMED_MUTATING_JTIS {
             return Err(CallerAuthError::InvalidTrustSnapshot);
         }
-        consumed.insert(verified.raw_jti, verified.expires_at_unix);
+        let retained_until = verified
+            .expires_at_unix
+            .checked_add(self.inner.clock_leeway_seconds)
+            .ok_or(CallerAuthError::InvalidLifetime)?;
+        consumed.insert(verified.raw_jti, retained_until);
         Ok(verified.credential)
     }
 
@@ -1036,6 +1060,64 @@ mod tests {
     }
 
     #[test]
+    fn consumed_mutating_jti_is_retained_through_expiry_leeway_boundary() {
+        let (signer, verifier, tenant_id, instance_id, now) = fixture();
+        let consumed = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("consumed token");
+        let consumed_jti = raw_jti(&consumed.encoded);
+        verifier
+            .verify_and_consume_mutation(&consumed.encoded, now)
+            .expect("first mutation consumes JTI");
+
+        let at_boundary = now + Duration::seconds(90);
+        let boundary_token = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                at_boundary,
+                Duration::seconds(60),
+            )
+            .expect("boundary token");
+        verifier
+            .verify_and_consume_mutation(&boundary_token.encoded, at_boundary)
+            .expect("fresh mutation at retention boundary");
+        assert!(verifier
+            .inner
+            .consumed_mutating_jtis
+            .lock()
+            .expect("consumed JTI ledger")
+            .contains_key(&consumed_jti));
+
+        let after_boundary = at_boundary + Duration::seconds(1);
+        let later_token = signer
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                after_boundary,
+                Duration::seconds(60),
+            )
+            .expect("later token");
+        verifier
+            .verify_and_consume_mutation(&later_token.encoded, after_boundary)
+            .expect("fresh mutation after retention boundary");
+        assert!(!verifier
+            .inner
+            .consumed_mutating_jtis
+            .lock()
+            .expect("consumed JTI ledger")
+            .contains_key(&consumed_jti));
+    }
+
+    #[test]
     fn tampering_wrong_audience_expiry_revocation_and_eddsa_fail_closed() {
         let (signer, verifier, tenant_id, instance_id, now) = fixture();
         let signed = signer
@@ -1241,6 +1323,23 @@ mod tests {
         let trust_debug = format!("{verifier:?}");
         assert!(!trust_debug.contains(&public_key_encoding));
         assert!(trust_debug.contains("[REDACTED]"));
+
+        let consumed = rotated
+            .sign(
+                &tenant_id,
+                &instance_id,
+                vec![EndpointScope::RunsCreate],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("consumed token");
+        let consumed_jti = raw_jti(&consumed.encoded);
+        verifier
+            .verify_and_consume_mutation(&consumed.encoded, now)
+            .expect("consume token");
+        let verifier_debug = format!("{verifier:?}");
+        assert!(!verifier_debug.contains(&consumed_jti));
+        assert!(verifier_debug.contains("consumed_mutating_jti_count: Some(1)"));
     }
 
     #[test]

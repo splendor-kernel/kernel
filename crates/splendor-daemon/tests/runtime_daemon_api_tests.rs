@@ -1453,7 +1453,7 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     );
 
     let credential =
-        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::StateRead]);
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::StateHandoff]);
     let audit_attribution = matching_attribution(&credential);
     let export_request = StateSnapshotExportRequest {
         run_id: created.run_id.clone(),

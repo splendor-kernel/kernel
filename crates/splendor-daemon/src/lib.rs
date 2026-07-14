@@ -915,7 +915,7 @@ impl ActionAdapter for RecordingAdapter {
                 "data_ref": data_ref,
                 "raw_payload_included": false,
                 "analysis_summary": "trace-safe aggregate analysis for scoped data ref",
-                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "data_ref": data_ref, "fixture": "uc-e2e-s7"})),
+                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-data-read.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "data_ref": data_ref, "fixture": "uc-e2e-s7"})),
             })
         } else if action.action.name == "artifact.create_internal" {
             let path = action
@@ -932,7 +932,7 @@ impl ActionAdapter for RecordingAdapter {
                 "artifact_path": path,
                 "tenant_id": action.tenant_id,
                 "raw_payload_included": false,
-                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "artifact_path": path, "kind": "internal"})),
+                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-artifact-create.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "artifact_path": path, "kind": "internal"})),
             })
         } else if action.action.name == "artifact.publish_external" {
             serde_json::json!({
@@ -942,7 +942,7 @@ impl ActionAdapter for RecordingAdapter {
                 "published": true,
                 "external_store": "fake-artifact-store",
                 "raw_payload_included": false,
-                "integrity": stable_json_hash(&serde_json::json!({"tenant_id": action.tenant_id, "action": action.action.name, "kind": "external_publish"})),
+                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-artifact-publish.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "action": action.action.name, "kind": "external_publish"})),
             })
         } else {
             serde_json::json!({
@@ -1977,22 +1977,25 @@ fn create_run_caller_scope(security: &DaemonSecurityDecision) -> serde_json::Val
 }
 
 fn create_run_request_fingerprint(request: &CreateRunRequest, work_order: &WorkOrder) -> String {
-    stable_json_hash(&serde_json::json!({
-        "validated_work_order": work_order,
-        "allowed_actions": &request.allowed_actions,
-        "allowed_adapters": &request.allowed_adapters,
-        "allowed_permissions": &request.allowed_permissions,
-        "policy_actions": &request.policy_actions,
-        "policy_bundle_required": request.policy_bundle_required,
-        "policy_bundle": &request.policy_bundle,
-        "registered_actions": &request.registered_actions,
-        "approval_policies": &request.approval_policies,
-        "circuit_breakers": &request.circuit_breakers,
-        "allowed_percept_schemas": &request.allowed_percept_schemas,
-        "allowed_percept_sources": &request.allowed_percept_sources,
-        "initial_state": &request.initial_state,
-        "snapshot_interval": request.snapshot_interval,
-    }))
+    stable_json_fingerprint(
+        b"splendor.daemon.create-run-request.v1\0",
+        &serde_json::json!({
+            "validated_work_order": work_order,
+            "allowed_actions": &request.allowed_actions,
+            "allowed_adapters": &request.allowed_adapters,
+            "allowed_permissions": &request.allowed_permissions,
+            "policy_actions": &request.policy_actions,
+            "policy_bundle_required": request.policy_bundle_required,
+            "policy_bundle": &request.policy_bundle,
+            "registered_actions": &request.registered_actions,
+            "approval_policies": &request.approval_policies,
+            "circuit_breakers": &request.circuit_breakers,
+            "allowed_percept_schemas": &request.allowed_percept_schemas,
+            "allowed_percept_sources": &request.allowed_percept_sources,
+            "initial_state": &request.initial_state,
+            "snapshot_interval": request.snapshot_interval,
+        }),
+    )
 }
 
 fn bound_work_order_payload_digest(
@@ -2048,10 +2051,13 @@ fn create_run_idempotency_scope(
 }
 
 fn create_run_receipt_id(idempotency_key: &str, scope: &CreateRunIdempotencyScope) -> String {
-    let hash = stable_json_hash(&serde_json::json!({
-        "idempotency_key": idempotency_key,
-        "scope": scope,
-    }));
+    let hash = stable_json_fingerprint(
+        b"splendor.daemon.create-run-receipt.v1\0",
+        &serde_json::json!({
+            "idempotency_key": idempotency_key,
+            "scope": scope,
+        }),
+    );
     format!("create_run:{hash}")
 }
 
@@ -2929,7 +2935,7 @@ async fn export_state_snapshot(
     let run = state.run_slot(&request.run_id)?;
     let slot = run.lock().map_err(|_| lock_error())?;
     state.validate_security(
-        DaemonEndpoint::StateHeadRead {
+        DaemonEndpoint::StateHandoff {
             tenant_id: slot.tenant_id.clone(),
             run_id: request.run_id.clone(),
         },
@@ -3007,7 +3013,7 @@ async fn import_state_snapshot(
     let run = state.run_slot(&run_id)?;
     let mut slot = run.lock().map_err(|_| lock_error())?;
     state.validate_security(
-        DaemonEndpoint::StateHeadRead {
+        DaemonEndpoint::StateHandoff {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
         },
@@ -5103,10 +5109,38 @@ fn redact_trace_records(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
     records
         .into_iter()
         .map(|mut record| {
+            let audit_correlation = bounded_daemon_audit_correlation(&record.payload);
             record.payload = redact_trace_value(record.payload);
+            if let (Some(correlation), Some(value)) = (
+                audit_correlation,
+                record
+                    .payload
+                    .pointer_mut("/kind/DaemonAudit/audit/credential_id"),
+            ) {
+                *value = serde_json::Value::String(correlation);
+            }
             record
         })
         .collect()
+}
+
+fn bounded_daemon_audit_correlation(payload: &serde_json::Value) -> Option<String> {
+    let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok()?;
+    let TraceEventKind::DaemonAudit { audit, .. } = event.kind else {
+        return None;
+    };
+    audit
+        .credential_id
+        .filter(|credential_id| is_bounded_sha256_correlation(credential_id))
+}
+
+fn is_bounded_sha256_correlation(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn redact_trace_value(value: serde_json::Value) -> serde_json::Value {
@@ -5460,14 +5494,11 @@ fn compact_trace_match_text(value: &str) -> String {
         .collect()
 }
 
-fn stable_json_hash(value: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("fnv64:{hash:016x}")
+fn stable_json_fingerprint(domain: &[u8], value: &serde_json::Value) -> String {
+    let mut input = Vec::with_capacity(domain.len() + 256);
+    input.extend_from_slice(domain);
+    input.extend_from_slice(&serde_json::to_vec(value).unwrap_or_default());
+    ContentHash::blake3(input).to_string()
 }
 
 fn trace_error(error: TraceStoreError) -> ApiError {
@@ -5985,6 +6016,43 @@ mod tests {
             authority_obligation_evidence: None,
             authority_obligation_receipts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn request_fingerprints_use_domain_separated_blake3() {
+        let request = unit_create_run_request(
+            TenantId::new(),
+            splendor_types::AgentId::new(),
+            Some(RunId::new()),
+            "wo_unit_blake3_fingerprint",
+            "req_unit_blake3_fingerprint",
+            "idem_unit_blake3_fingerprint",
+        );
+        let fingerprint = create_run_request_fingerprint(&request, &request.work_order.work_order);
+        assert!(fingerprint.starts_with("blake3:"));
+        assert_eq!(fingerprint.len(), "blake3:".len() + 64);
+        assert_ne!(
+            fingerprint,
+            stable_json_fingerprint(
+                b"splendor.daemon.different-domain.v1\0",
+                &serde_json::json!({
+                    "validated_work_order": &request.work_order.work_order,
+                    "allowed_actions": &request.allowed_actions,
+                    "allowed_adapters": &request.allowed_adapters,
+                    "allowed_permissions": &request.allowed_permissions,
+                    "policy_actions": &request.policy_actions,
+                    "policy_bundle_required": request.policy_bundle_required,
+                    "policy_bundle": &request.policy_bundle,
+                    "registered_actions": &request.registered_actions,
+                    "approval_policies": &request.approval_policies,
+                    "circuit_breakers": &request.circuit_breakers,
+                    "allowed_percept_schemas": &request.allowed_percept_schemas,
+                    "allowed_percept_sources": &request.allowed_percept_sources,
+                    "initial_state": &request.initial_state,
+                    "snapshot_interval": request.snapshot_interval,
+                }),
+            )
+        );
     }
 
     #[tokio::test]
@@ -6761,6 +6829,51 @@ mod tests {
         let persisted_after_json = serde_json::to_string(&persisted_after).expect("raw trace json");
         assert!(persisted_after_json.contains(reason_canary));
         assert!(persisted_after_json.contains(status_canary));
+    }
+
+    #[test]
+    fn trace_redaction_preserves_only_bounded_credential_correlation_digests() {
+        let correlation = format!("sha256:{}", "a".repeat(64));
+        let run_id = RunId::new();
+        let store = InMemoryTraceStore::default();
+        let event = TraceEvent::new(
+            run_id.clone(),
+            0,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::DaemonAudit {
+                endpoint: "splendor.runs.create".to_string(),
+                audit: AuditAttribution {
+                    principal: splendor_types::ClientPrincipal::new("app", "client"),
+                    credential_id: Some(correlation.clone()),
+                    requested_at: OffsetDateTime::now_utc(),
+                },
+            },
+        );
+        store
+            .append(
+                &run_id.to_string(),
+                serde_json::to_value(event).expect("audit event"),
+            )
+            .expect("append audit event");
+        let records = store.read(&run_id.to_string()).expect("audit records");
+        let redacted = redact_trace_records(records.clone());
+
+        assert_eq!(
+            redacted[0]
+                .payload
+                .pointer("/kind/DaemonAudit/audit/credential_id")
+                .and_then(serde_json::Value::as_str),
+            Some(correlation.as_str())
+        );
+        assert_eq!(redacted, records);
+        assert!(!is_bounded_sha256_correlation(&format!(
+            "sha256:{}",
+            "A".repeat(64)
+        )));
+        assert_eq!(
+            redact_trace_value(serde_json::json!({"credential_id": correlation}))["credential_id"],
+            "[REDACTED]"
+        );
     }
 
     #[test]

@@ -44,6 +44,7 @@ FUTURE_GROUPS = {
         "registerNode",
         "registerInstance",
         "heartbeatNode",
+        "heartbeatInstance",
         "advertiseCapabilities",
         "listNodes",
         "evaluatePlacement",

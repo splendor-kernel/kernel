@@ -64,8 +64,8 @@ denies requests.
 Mutating resident requests atomically consume the verified canonical JTI before
 handler mutation. Concurrent or subsequent reuse is denied with
 `caller_token_replayed`; read-only requests may reuse a token until expiry. The
-live consumed-JTI set is expiry-pruned and bounded; inability to consult it fails
-closed.
+live consumed-JTI set retains entries through token expiry plus accepted clock
+leeway, then prunes them, and is bounded; inability to consult it fails closed.
 
 The daemon derives the authoritative `CallerCredential` from verified claims.
 Request-body credential/audit fields and `X-Splendor-Caller-Credential` remain
@@ -237,7 +237,8 @@ communication. `validate_client_connection_policy()` rejects
 when explicit local dev mode passes its local-only warning checks.
 The TypeScript client also rejects remote HTTP, relative/unsupported schemes,
 URL credentials, query, and fragment. Plain HTTP is accepted only for exact
-loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
+loopback hosts (`localhost`, `127.0.0.1`, `[::1]`). Every credentialed Fetch call
+sets `redirect: "error"` so bearer headers are not forwarded automatically.
 
 ## Replay behavior
 
