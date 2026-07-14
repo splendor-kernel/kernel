@@ -2202,6 +2202,7 @@ fn run_trace_state_handoff(artifacts: &Path) -> TestResult<StateSyncEvidence> {
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
         run_id: run_id.clone(),
+        receiver_instance_id: None,
     };
     let mut receiver = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
@@ -3338,14 +3339,13 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             },
             source_instance_id: Some("instance_journey_a".to_string()),
             receiver_instance_id: Some("instance_journey_c".to_string()),
-            previous_state_node_id: Some(source_commit.node_id.to_string()),
+            previous_state_node_id: None,
             source_trace_id: Some(TraceId::from_run_sequence(&run_id, 2)),
             created_at: now,
         },
     )?;
-    let mut receiver_graph = StateGraph::with_head(
+    let mut receiver_graph = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
-        Some(source_commit.node_id.clone()),
         SnapshotPolicy::default(),
     );
     let imported = receiver_graph.import_handoff(
@@ -3361,6 +3361,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             tenant_id: tenant_id.clone(),
             agent_id: orchestrator.clone(),
             run_id: run_id.clone(),
+            receiver_instance_id: None,
         },
         now,
         StateMetadata::new(now, Some("final_journey_import".to_string())),

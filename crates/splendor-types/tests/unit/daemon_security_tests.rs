@@ -126,7 +126,7 @@ fn valid_run_create_request_is_authorized() {
             now,
         )),
         Some(signed_work_order(
-            tenant_id,
+            tenant_id.clone(),
             None,
             vec![EndpointScope::RunsCreate],
             now,
@@ -149,21 +149,33 @@ fn state_handoff_requires_handoff_scope_and_audit_attribution() {
     let request = DaemonSecurityRequest {
         endpoint: DaemonEndpoint::StateHandoff {
             tenant_id: tenant_id.clone(),
-            run_id,
+            run_id: run_id.clone(),
         },
         credential: Some(credential(
-            tenant_id,
+            tenant_id.clone(),
             vec![EndpointScope::StateHandoff],
             now,
         )),
         expected_audience: audience(),
-        work_order: None,
+        work_order: Some(signed_work_order(
+            tenant_id.clone(),
+            Some(run_id),
+            vec![EndpointScope::StateHandoff],
+            now,
+        )),
         audit_attribution: Some(attribution(now)),
         insecure_dev_mode: None,
     };
 
     let decision = validate_daemon_request(&request, now).expect("handoff authorized");
     assert_eq!(decision.scope, EndpointScope::StateHandoff);
+
+    let mut missing_work_order = request.clone();
+    missing_work_order.work_order = None;
+    assert_eq!(
+        validate_daemon_request(&missing_work_order, now),
+        Err(DaemonSecurityError::MissingWorkOrder)
+    );
 
     let mut missing_attribution = request;
     missing_attribution.audit_attribution = None;

@@ -107,13 +107,22 @@ The in-memory registry stores static registration separately from mutable health
 A heartbeat never overwrites node kind, registry scope, capability document,
 runtime version, hosted tenants, or supported features.
 
-Heartbeat timestamps may not move backwards. A regressing heartbeat is rejected
-and leaves the previous record unchanged.
+`registered_at`, `health.observed_at`, and heartbeat `recorded_at` are
+sender-reported observational metadata. They do not determine freshness. The
+registry records a manager-observed receipt timestamp through
+`register_*_received_at` and `record_*_heartbeat_received_at`; the convenience
+methods obtain that timestamp from the receiving process. A sender therefore
+cannot keep a node fresh by reporting a far-future timestamp or reorder manager
+receipts by reporting an old timestamp.
+
+Manager-observed receipt time may not move backwards. A receipt-time regression
+is rejected and leaves the previous record unchanged.
 
 ## Stale heartbeat detection
 
 `NodeRegistryConfig::stale_after` controls freshness. Stale detection is
-deterministic and uses the caller-provided time:
+deterministic and compares the query time with manager-observed
+`last_heartbeat_at`:
 
 ```text
 fresh  when now <  last_heartbeat_at + stale_after
@@ -155,8 +164,9 @@ The daemon security contract includes S2 endpoint scopes:
 The bounded acceptance-manager route is
 `POST /fleet/instances/{instance_id}/heartbeat`. It requires the existing
 `splendor.instances.heartbeat` scope and delegates mutation to
-`NodeRegistry::record_instance_heartbeat`; it does not create a second instance
-lifecycle owner. The central-manager inbound API remains acceptance-only
+`NodeRegistry::record_instance_heartbeat_received_at` with a server-owned receipt
+timestamp; it does not create a second instance lifecycle owner. The
+central-manager inbound API remains acceptance-only
 self-asserted metadata as documented by RFC 0011, not a production-authenticated
 remote manager claim.
 
@@ -175,7 +185,8 @@ actions.
 | Duplicate node/instance ID | Reject without overwriting the existing record. |
 | Unknown parent node | Reject instance registration or heartbeat. |
 | Instance hosted tenants exceed parent node tenant scope | Reject before registration. |
-| Heartbeat timestamp regression | Reject without changing health. |
+| Sender timestamp is old or far in the future | Retain it as observational metadata; freshness still uses receipt time. |
+| Manager receipt-time regression | Reject without changing health. |
 | Audit sink failure | Fail closed and do not apply mutation. |
 | Registry storage unavailable | Fail closed. |
 
@@ -215,7 +226,7 @@ let node = NodeRegistration {
 };
 
 let registry = InMemoryNodeRegistry::new();
-registry.register_node(node)?;
+registry.register_node_received_at(node, now)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

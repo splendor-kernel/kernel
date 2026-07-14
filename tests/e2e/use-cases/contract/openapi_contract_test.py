@@ -279,6 +279,8 @@ def main() -> int:
         "submitAction",
         "replayRun",
         "exportTraces",
+        "exportStateSnapshot",
+        "importStateSnapshot",
     }
     for op_id in sorted(mutating_core & operation_ids):
         block = blocks.get(op_id, "")
@@ -343,8 +345,57 @@ def main() -> int:
     schema_failures.extend(
         require_schema_fields(text, "TraceExportRequest", {"credential", "audit_attribution", "redaction_policy", "start", "end"})
     )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "ExportStateSnapshotRequest",
+            {
+                "run_id",
+                "credential",
+                "audit_attribution",
+                "work_order_id",
+                "source_instance_id",
+                "receiver_instance_id",
+                "previous_state_node_id",
+            },
+        )
+    )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "ImportStateSnapshotRequest",
+            {"handoff", "work_order", "credential", "audit_attribution"},
+        )
+    )
+    schema_failures.extend(
+        require_schema_required_fields(
+            text,
+            "ImportStateSnapshotRequest",
+            {"handoff", "work_order", "credential", "audit_attribution"},
+        )
+    )
+    schema_failures.extend(
+        require_schema_fields(
+            text,
+            "StateHandoff",
+            {
+                "schema_version",
+                "handoff_id",
+                "mode",
+                "authority",
+                "source_instance_id",
+                "receiver_instance_id",
+                "previous_state_node_id",
+                "snapshot",
+                "source_trace_id",
+                "created_at",
+            },
+        )
+    )
     schema_failures.extend(require_non_null_authority_fields(text, "ReplayRequest"))
     schema_failures.extend(require_non_null_authority_fields(text, "TraceExportRequest"))
+    schema_failures.extend(require_non_null_authority_fields(text, "ExportStateSnapshotRequest"))
+    schema_failures.extend(require_non_null_authority_fields(text, "ImportStateSnapshotRequest"))
     schema_failures.extend(
         require_schema_fields(text, "VersionResponse", {"daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"})
     )

@@ -69,8 +69,12 @@
   one-shot acceptance auth fixture runs only in an explicit Compose setup phase.
   Resident trace views retain only bounded `sha256:` caller-correlation digests,
   allowing central sync to verify original hash chains without exposing bearer
-  or JTI material, and state snapshot export/import now enforce their documented
-  `splendor.state.handoff` scope rather than the state-head read scope.
+  or JTI material. State snapshot export/import now enforce their documented
+  `splendor.state.handoff` scope plus exact signed run work-order authority,
+  receiver identity/head binding, replay denial, and scheduler/loop/state-owner
+  mutation. Registry freshness now uses monotonic manager receipt time rather
+  than sender timestamps, and unknown work-order revoke/dispatch IDs allocate no
+  revocation gate, tombstone, reservation, or terminal dispatch state.
 - Corrected CLI run-level trace composition so agents sharing one configured
   `run_id` also share one runtime cursor, producing a contiguous sequence/hash
   chain with distinct agent identities. Signed resume retains that cursor and

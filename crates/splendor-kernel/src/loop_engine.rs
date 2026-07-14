@@ -7,7 +7,8 @@
 use crate::{
     apply_escalation_to_outcome, escalations_require_intervention, AgentContext,
     EscalationEvaluator, EscalationOutcomeInput, KernelRuntime, KernelRuntimeConfig,
-    PolicyRuntimeAuthority, StateCommit, StateGraph, StateGraphError,
+    PolicyRuntimeAuthority, StateCommit, StateGraph, StateGraphError, StateHandoffExportRequest,
+    StateHandoffScope,
 };
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, ActionGateway, ActionId, ActionOutcome, ActionRequest,
@@ -17,8 +18,9 @@ use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ApprovalTraceContext, CapabilityGrantId, Constraint, ContentHash, EscalationContext,
     EscalationPolicy, EscalationPolicyError, Feedback, Percept, PolicyBundleId,
-    PolicyBundleTraceContext, QuotaUsage, Reward, RunId, SnapshotId, TickId, TraceEvent,
-    TraceEventId, TraceEventKind, TraceIdentityContext, VerificationResult, WorkOrder,
+    PolicyBundleTraceContext, QuotaUsage, Reward, RunId, SnapshotId, StateHandoff, TickId,
+    TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext, VerificationResult, WorkOrder,
+    WorkOrderEnvelope, WorkOrderKeyring,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -628,6 +630,63 @@ impl LoopEngine {
         self.state = snapshot.state;
         self.agent.set_state_head(snapshot.node_id);
         Ok(())
+    }
+
+    /// Exports the current state head and records the source handoff boundary.
+    pub fn export_state_handoff(
+        &self,
+        request: StateHandoffExportRequest,
+    ) -> Result<(StateHandoff, TraceEvent), LoopError> {
+        let mut handoff = self.state_graph.export_current_handoff(request)?;
+        let event = self.runtime.record_state_handoff_exported(&mut handoff)?;
+        Ok((handoff, event))
+    }
+
+    /// Imports state through the graph owner and records the receiver boundary.
+    ///
+    /// Trace failure rolls the live graph/agent head back to the previous value;
+    /// immutable unreferenced store objects may remain but cannot affect runtime
+    /// behavior.
+    pub fn import_state_handoff(
+        &mut self,
+        handoff: &StateHandoff,
+        work_order: &WorkOrderEnvelope,
+        keyring: &WorkOrderKeyring,
+        scope: &StateHandoffScope,
+        now: OffsetDateTime,
+        metadata: StateMetadata,
+    ) -> Result<(StateCommit, TraceEvent), LoopError> {
+        let previous_head = self.state_graph.head().cloned();
+        let previous_state = self.state.clone();
+        let commit = match self
+            .state_graph
+            .import_handoff(handoff, work_order, keyring, scope, now, metadata)
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.runtime
+                    .record_state_handoff_import_failed(handoff, error.reason_code())?;
+                return Err(error.into());
+            }
+        };
+        let event = match self
+            .runtime
+            .record_state_handoff_imported(handoff, commit.node_id.to_string())
+        {
+            Ok(event) => event,
+            Err(error) => {
+                self.state_graph.set_head(previous_head.clone());
+                self.agent.state_head = previous_head;
+                self.state = previous_state;
+                return Err(error.into());
+            }
+        };
+        self.state = StateData {
+            bytes: handoff.snapshot.state_bytes.clone(),
+            content_type: handoff.snapshot.content_type.clone(),
+        };
+        self.agent.set_state_head(commit.node_id.clone());
+        Ok((commit, event))
     }
 
     /// Adds a perceptor to the loop engine.

@@ -532,7 +532,10 @@ impl DaemonEndpoint {
     }
 
     fn requires_work_order(&self) -> bool {
-        matches!(self, Self::RunCreate { .. } | Self::RunResume { .. })
+        matches!(
+            self,
+            Self::RunCreate { .. } | Self::RunResume { .. } | Self::StateHandoff { .. }
+        )
     }
 }
 
@@ -803,7 +806,9 @@ fn validate_work_order(
         return Err(DaemonSecurityError::IncompatibleWorkOrder);
     }
 
-    if let DaemonEndpoint::RunResume { run_id, .. } = endpoint {
+    if let DaemonEndpoint::RunResume { run_id, .. } | DaemonEndpoint::StateHandoff { run_id, .. } =
+        endpoint
+    {
         match &work_order.run_id {
             Some(work_order_run_id) if work_order_run_id == run_id => {}
             _ => return Err(DaemonSecurityError::IncompatibleWorkOrder),

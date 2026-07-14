@@ -62,17 +62,23 @@ created.
 
 - `export_handoff(snapshot_id, request) -> StateHandoff` builds a versioned
   snapshot handoff envelope from an existing snapshot.
-- `import_handoff(handoff, work_order, scope, now, metadata) -> StateCommit`
+- `export_current_handoff(request) -> StateHandoff` snapshots and exports the
+  current head through the graph owner.
+- `import_handoff(handoff, work_order, keyring, scope, now, metadata) -> StateCommit`
   validates authority, source trace continuity, previous receiver head, snapshot
-  hash, and parent linkage before updating the receiver head.
-- `attach_read_only_reference(reference, work_order, scope, now)` records an
-  immutable state reference without changing the receiver state head.
+  hash, receiver instance, replay state, and parent linkage before updating the
+  receiver head.
+- `attach_read_only_reference(reference, work_order, keyring, scope, now)`
+  records an immutable state reference without changing the receiver state head.
 - `commit_from_read_only_reference(...)` always fails closed; read-only
   references cannot become mutable parents.
 
 Successful snapshot import creates a receiver-owned state node with the same
-content-addressed node ID and snapshot ID as the exported source snapshot. A
-failed import leaves the receiver `head` unchanged.
+content-addressed node ID and snapshot ID as the exported source snapshot. The
+daemon routes export/import through the scheduler and loop engine rather than
+mutating the backing store directly. A failed or replayed import leaves the
+receiver `head` unchanged; if the imported trace event cannot be persisted, the
+loop owner also restores its prior live state and agent head.
 
 State handoff is documented in detail in
 [`state-handoff.md`](state-handoff.md).
@@ -81,8 +87,9 @@ State handoff is documented in detail in
 
 `StateGraphError::Store` wraps `StateStoreError` failures. State handoff adds
 fail-closed errors for incompatible work orders, unsigned/expired/revoked work
-orders, stale previous heads, missing trace continuity, invalid modes, and
-read-only reference mutation attempts.
+orders, wrong receiver instances, replayed handoffs, stale previous heads,
+missing trace continuity, invalid modes, and read-only reference mutation
+attempts.
 
 ## Example
 

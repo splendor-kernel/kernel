@@ -1394,10 +1394,17 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
 
 #[tokio::test]
 async fn state_snapshot_export_import_uses_authenticated_state_authority() {
-    let state = DaemonState::local_dev();
-    let app = router(state);
+    let source_app = router(DaemonState::local_dev());
+    let receiver_app = router(DaemonState::local_dev());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let work_order = signed_work_order(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Some(run_id.clone()),
+        vec![EndpointScope::RunsCreate],
+    );
     let policy_action_id = ActionId::new();
     let mut planned_action = read_only_action("allowed_action");
     planned_action.preconditions = vec!["ready".to_string()];
@@ -1409,24 +1416,47 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
         satisfied_preconditions: vec!["ready".to_string()],
         authority_obligation_receipts: Vec::new(),
     }];
+    let mut source_create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        policy_actions,
+        vec![RegisteredAction {
+            name: "allowed_action".to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
+        }],
+    );
+    source_create.work_order = work_order.clone();
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
-        app.clone(),
+        source_app.clone(),
         Method::POST,
         "/runs",
-        serde_json::to_value(create_request(
-            tenant_id.clone(),
-            agent_id.clone(),
-            policy_actions,
-            vec![RegisteredAction {
-                name: "allowed_action".to_string(),
-                adapter: "daemon.local".to_string(),
-                required_permissions: Some(Vec::new()),
-            }],
-        ))
-        .expect("create request"),
+        serde_json::to_value(source_create).expect("source create request"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(created.run_id, run_id);
+
+    let mut receiver_create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        Vec::new(),
+        vec![RegisteredAction {
+            name: "allowed_action".to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
+        }],
+    );
+    receiver_create.work_order = work_order.clone();
+    let (status, receiver_created): (StatusCode, CreateRunResponse) = call_json(
+        receiver_app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(receiver_create).expect("receiver create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receiver_created.run_id, run_id);
 
     let lifecycle = LifecycleRequest {
         credential: None,
@@ -1436,7 +1466,7 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
         approval_evidence: None,
     };
     let (status, tick): (StatusCode, TickResponse) = call_json(
-        app.clone(),
+        source_app.clone(),
         Method::POST,
         &format!("/runs/{}/start", created.run_id),
         serde_json::to_value(lifecycle).expect("start request"),
@@ -1459,12 +1489,13 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
         run_id: created.run_id.clone(),
         credential: Some(credential.clone()),
         audit_attribution: Some(audit_attribution.clone()),
-        work_order_id: "wo_state_handoff_test".to_string(),
-        source_instance_id: Some("instance_source".to_string()),
-        receiver_instance_id: Some("instance_receiver".to_string()),
+        work_order_id: "wo_test".to_string(),
+        source_instance_id: Some("00000000-0000-4000-8000-000000000301".to_string()),
+        receiver_instance_id: Some("00000000-0000-4000-8000-000000000302".to_string()),
+        previous_state_node_id: None,
     };
     let (status, exported): (StatusCode, StateSnapshotExportResponse) = call_json(
-        app.clone(),
+        source_app.clone(),
         Method::POST,
         "/state-snapshots/export",
         serde_json::to_value(export_request.clone()).expect("export request"),
@@ -1473,25 +1504,151 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(exported.run_id, created.run_id);
     assert_eq!(exported.state_node_id, tick.state_node_id);
+    assert_eq!(exported.handoff.schema_version, "splendor.state_handoff.v0");
+    assert_eq!(exported.handoff.authority.work_order_id, "wo_test");
     assert_eq!(
         exported.handoff.source_trace_id.as_ref(),
         Some(&exported.trace_event_id)
     );
-    assert_eq!(
-        exported.handoff.previous_state_node_id.as_deref(),
-        Some(tick.state_node_id.as_str())
-    );
+    assert_eq!(exported.handoff.previous_state_node_id, None);
 
-    let import_request = StateSnapshotImportRequest {
-        handoff: exported.handoff.clone(),
-        credential: Some(credential.clone()),
-        audit_attribution: Some(audit_attribution.clone()),
-    };
-    let (status, imported): (StatusCode, StateSnapshotImportResponse) = call_json(
-        app.clone(),
+    let mut wrong_hash = exported.handoff.clone();
+    wrong_hash.snapshot.state_bytes.push(99);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        receiver_app.clone(),
         Method::POST,
         "/state-snapshots/import",
-        serde_json::to_value(import_request).expect("import request"),
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: wrong_hash,
+            work_order: work_order.clone(),
+            credential: Some(credential.clone()),
+            audit_attribution: Some(audit_attribution.clone()),
+        })
+        .expect("wrong hash import"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "state_handoff_rejected");
+
+    for (label, mut invalid_handoff) in [
+        ("schema", exported.handoff.clone()),
+        ("mode", exported.handoff.clone()),
+        ("trace", exported.handoff.clone()),
+        ("head", exported.handoff.clone()),
+    ] {
+        match label {
+            "schema" => invalid_handoff.schema_version = "splendor.state_handoff.v999".to_string(),
+            "mode" => invalid_handoff.mode = splendor_types::StateReferenceMode::ReadOnlyReference,
+            "trace" => invalid_handoff.source_trace_id = None,
+            "head" => invalid_handoff.previous_state_node_id = Some("blake3:stale".to_string()),
+            _ => unreachable!(),
+        }
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            receiver_app.clone(),
+            Method::POST,
+            "/state-snapshots/import",
+            serde_json::to_value(StateSnapshotImportRequest {
+                handoff: invalid_handoff,
+                work_order: work_order.clone(),
+                credential: Some(credential.clone()),
+                audit_attribution: Some(audit_attribution.clone()),
+            })
+            .expect("invalid import request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+        assert_eq!(error.code, "state_handoff_rejected", "{label}");
+    }
+
+    let mut wrong_work_order = work_order.clone();
+    wrong_work_order.work_order.work_order_id = WorkOrderId::try_new("wo_other").unwrap();
+    resign_work_order(&mut wrong_work_order);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        receiver_app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: exported.handoff.clone(),
+            work_order: wrong_work_order,
+            credential: Some(credential.clone()),
+            audit_attribution: Some(audit_attribution.clone()),
+        })
+        .expect("wrong work order import"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "resume_work_order_identity_mismatch");
+
+    let mut unsigned_work_order = work_order.clone();
+    unsigned_work_order.signature = None;
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        receiver_app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: exported.handoff.clone(),
+            work_order: unsigned_work_order,
+            credential: Some(credential.clone()),
+            audit_attribution: Some(audit_attribution.clone()),
+        })
+        .expect("unsigned work order import"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "unsigned_work_order");
+
+    for (label, revocation) in [
+        ("expired", RevocationStatus::Active),
+        (
+            "revoked",
+            RevocationStatus::Revoked {
+                reason: "test revocation".to_string(),
+            },
+        ),
+    ] {
+        let mut invalid_work_order = work_order.clone();
+        invalid_work_order.work_order.revocation = revocation;
+        if label == "expired" {
+            invalid_work_order.work_order.expires_at = OffsetDateTime::now_utc();
+        }
+        resign_work_order(&mut invalid_work_order);
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            receiver_app.clone(),
+            Method::POST,
+            "/state-snapshots/import",
+            serde_json::to_value(StateSnapshotImportRequest {
+                handoff: exported.handoff.clone(),
+                work_order: invalid_work_order,
+                credential: Some(credential.clone()),
+                audit_attribution: Some(audit_attribution.clone()),
+            })
+            .expect("inactive work order import"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
+        assert_eq!(error.code, format!("{label}_work_order"), "{label}");
+    }
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_empty(
+        receiver_app.clone(),
+        Method::GET,
+        &format!("/runs/{}/state-head", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error.code, "state_head_not_found");
+
+    let (status, imported): (StatusCode, StateSnapshotImportResponse) = call_json(
+        receiver_app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: exported.handoff.clone(),
+            work_order: work_order.clone(),
+            credential: Some(credential.clone()),
+            audit_attribution: Some(audit_attribution.clone()),
+        })
+        .expect("import request"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1500,7 +1657,7 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     assert_eq!(imported.state_node_id, tick.state_node_id);
 
     let (status, head): (StatusCode, StateHeadResponse) = call_empty(
-        app.clone(),
+        receiver_app.clone(),
         Method::GET,
         &format!("/runs/{}/state-head", created.run_id),
     )
@@ -1509,7 +1666,31 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     assert_eq!(head.state_node_id, imported.state_node_id);
 
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
-        app.clone(),
+        receiver_app.clone(),
+        Method::POST,
+        "/state-snapshots/import",
+        serde_json::to_value(StateSnapshotImportRequest {
+            handoff: exported.handoff.clone(),
+            work_order: work_order.clone(),
+            credential: Some(credential.clone()),
+            audit_attribution: Some(audit_attribution.clone()),
+        })
+        .expect("replayed import request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "state_handoff_rejected");
+    let (status, replay_head): (StatusCode, StateHeadResponse) = call_empty(
+        receiver_app.clone(),
+        Method::GET,
+        &format!("/runs/{}/state-head", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay_head.state_node_id, imported.state_node_id);
+
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        source_app.clone(),
         Method::POST,
         "/state-snapshots/export",
         serde_json::to_value(StateSnapshotExportRequest {
@@ -1526,11 +1707,12 @@ async fn state_snapshot_export_import_uses_authenticated_state_authority() {
     let mut wrong_handoff = exported.handoff;
     wrong_handoff.authority.tenant_id = TenantId::new();
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
-        app,
+        receiver_app,
         Method::POST,
         "/state-snapshots/import",
         serde_json::to_value(StateSnapshotImportRequest {
             handoff: wrong_handoff,
+            work_order,
             credential: Some(credential),
             audit_attribution: Some(audit_attribution),
         })

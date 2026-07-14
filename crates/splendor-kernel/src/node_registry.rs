@@ -139,11 +139,32 @@ pub trait NodeRegistry: Send + Sync {
         registration: NodeRegistration,
     ) -> Result<NodeRecord, NodeRegistryError>;
 
+    /// Registers a node at a manager-observed receipt time. This explicit form
+    /// supports deterministic tests without trusting payload timestamps.
+    fn register_node_received_at(
+        &self,
+        registration: NodeRegistration,
+        received_at: OffsetDateTime,
+    ) -> Result<NodeRecord, NodeRegistryError> {
+        let _ = received_at;
+        self.register_node(registration)
+    }
+
     /// Registers an instance under an existing node.
     fn register_instance(
         &self,
         registration: InstanceRegistration,
     ) -> Result<InstanceRecord, NodeRegistryError>;
+
+    /// Registers an instance at a manager-observed receipt time.
+    fn register_instance_received_at(
+        &self,
+        registration: InstanceRegistration,
+        received_at: OffsetDateTime,
+    ) -> Result<InstanceRecord, NodeRegistryError> {
+        let _ = received_at;
+        self.register_instance(registration)
+    }
 
     /// Records a node heartbeat. Only mutable health and heartbeat timestamp are
     /// updated.
@@ -152,12 +173,34 @@ pub trait NodeRegistry: Send + Sync {
         heartbeat: NodeHeartbeat,
     ) -> Result<NodeRecord, NodeRegistryError>;
 
+    /// Records a node heartbeat using manager-observed receipt time for
+    /// freshness. Payload timestamps remain observational only.
+    fn record_node_heartbeat_received_at(
+        &self,
+        heartbeat: NodeHeartbeat,
+        received_at: OffsetDateTime,
+    ) -> Result<NodeRecord, NodeRegistryError> {
+        let _ = received_at;
+        self.record_node_heartbeat(heartbeat)
+    }
+
     /// Records an instance heartbeat. Only mutable health and heartbeat timestamp
     /// are updated.
     fn record_instance_heartbeat(
         &self,
         heartbeat: InstanceHeartbeat,
     ) -> Result<InstanceRecord, NodeRegistryError>;
+
+    /// Records an instance heartbeat using manager-observed receipt time for
+    /// freshness. Payload timestamps remain observational only.
+    fn record_instance_heartbeat_received_at(
+        &self,
+        heartbeat: InstanceHeartbeat,
+        received_at: OffsetDateTime,
+    ) -> Result<InstanceRecord, NodeRegistryError> {
+        let _ = received_at;
+        self.record_instance_heartbeat(heartbeat)
+    }
 
     /// Returns a node record snapshot.
     fn node(&self, node_id: &NodeId) -> Result<NodeRecord, NodeRegistryError>;
@@ -253,6 +296,14 @@ impl NodeRegistry for InMemoryNodeRegistry {
         &self,
         registration: NodeRegistration,
     ) -> Result<NodeRecord, NodeRegistryError> {
+        self.register_node_received_at(registration, OffsetDateTime::now_utc())
+    }
+
+    fn register_node_received_at(
+        &self,
+        registration: NodeRegistration,
+        received_at: OffsetDateTime,
+    ) -> Result<NodeRecord, NodeRegistryError> {
         registration.validate()?;
 
         let mut state = self.lock_state()?;
@@ -261,7 +312,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
         }
 
         let event = ManagementAuditEvent::new(
-            registration.registered_at,
+            received_at,
             ManagementAuditEventKind::NodeRegistered {
                 node_id: registration.node_id.clone(),
                 scope: registration.scope.clone(),
@@ -271,7 +322,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
 
         let record = NodeRecord {
             health: registration.health.clone(),
-            last_heartbeat_at: registration.health.observed_at,
+            last_heartbeat_at: received_at,
             registration,
             instances: Vec::new(),
         };
@@ -284,6 +335,14 @@ impl NodeRegistry for InMemoryNodeRegistry {
     fn register_instance(
         &self,
         registration: InstanceRegistration,
+    ) -> Result<InstanceRecord, NodeRegistryError> {
+        self.register_instance_received_at(registration, OffsetDateTime::now_utc())
+    }
+
+    fn register_instance_received_at(
+        &self,
+        registration: InstanceRegistration,
+        received_at: OffsetDateTime,
     ) -> Result<InstanceRecord, NodeRegistryError> {
         registration.validate()?;
 
@@ -311,7 +370,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
         }
 
         let event = ManagementAuditEvent::new(
-            registration.registered_at,
+            received_at,
             ManagementAuditEventKind::InstanceRegistered {
                 node_id: registration.node_id.clone(),
                 instance_id: registration.instance_id.clone(),
@@ -321,7 +380,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
 
         let record = InstanceRecord {
             health: registration.health.clone(),
-            last_heartbeat_at: registration.health.observed_at,
+            last_heartbeat_at: received_at,
             registration,
         };
         if let Some(node) = state.nodes.get_mut(&record.registration.node_id) {
@@ -337,6 +396,14 @@ impl NodeRegistry for InMemoryNodeRegistry {
         &self,
         heartbeat: NodeHeartbeat,
     ) -> Result<NodeRecord, NodeRegistryError> {
+        self.record_node_heartbeat_received_at(heartbeat, OffsetDateTime::now_utc())
+    }
+
+    fn record_node_heartbeat_received_at(
+        &self,
+        heartbeat: NodeHeartbeat,
+        received_at: OffsetDateTime,
+    ) -> Result<NodeRecord, NodeRegistryError> {
         heartbeat.validate()?;
 
         let mut state = self.lock_state()?;
@@ -345,16 +412,15 @@ impl NodeRegistry for InMemoryNodeRegistry {
             .get(&heartbeat.node_id)
             .cloned()
             .ok_or_else(|| NodeRegistryError::UnknownNode(heartbeat.node_id.clone()))?;
-        if heartbeat.recorded_at < existing.last_heartbeat_at {
+        if received_at < existing.last_heartbeat_at {
             return Err(NodeRegistryError::HeartbeatTimestampRegression {
                 identity: heartbeat.node_id.to_string(),
                 last_heartbeat_at: existing.last_heartbeat_at,
-                attempted_at: heartbeat.recorded_at,
+                attempted_at: received_at,
             });
         }
-
         let event = ManagementAuditEvent::new(
-            heartbeat.recorded_at,
+            received_at,
             ManagementAuditEventKind::NodeHeartbeatRecorded {
                 node_id: heartbeat.node_id.clone(),
                 status: heartbeat.health.status,
@@ -364,7 +430,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
 
         let mut updated = existing;
         updated.health = heartbeat.health;
-        updated.last_heartbeat_at = heartbeat.recorded_at;
+        updated.last_heartbeat_at = received_at;
         state.nodes.insert(heartbeat.node_id, updated.clone());
         Ok(updated)
     }
@@ -372,6 +438,14 @@ impl NodeRegistry for InMemoryNodeRegistry {
     fn record_instance_heartbeat(
         &self,
         heartbeat: InstanceHeartbeat,
+    ) -> Result<InstanceRecord, NodeRegistryError> {
+        self.record_instance_heartbeat_received_at(heartbeat, OffsetDateTime::now_utc())
+    }
+
+    fn record_instance_heartbeat_received_at(
+        &self,
+        heartbeat: InstanceHeartbeat,
+        received_at: OffsetDateTime,
     ) -> Result<InstanceRecord, NodeRegistryError> {
         heartbeat.validate()?;
 
@@ -390,16 +464,15 @@ impl NodeRegistry for InMemoryNodeRegistry {
                 expected_node_id: existing.registration.node_id,
             });
         }
-        if heartbeat.recorded_at < existing.last_heartbeat_at {
+        if received_at < existing.last_heartbeat_at {
             return Err(NodeRegistryError::HeartbeatTimestampRegression {
                 identity: heartbeat.instance_id.to_string(),
                 last_heartbeat_at: existing.last_heartbeat_at,
-                attempted_at: heartbeat.recorded_at,
+                attempted_at: received_at,
             });
         }
-
         let event = ManagementAuditEvent::new(
-            heartbeat.recorded_at,
+            received_at,
             ManagementAuditEventKind::InstanceHeartbeatRecorded {
                 node_id: heartbeat.node_id,
                 instance_id: heartbeat.instance_id.clone(),
@@ -410,7 +483,7 @@ impl NodeRegistry for InMemoryNodeRegistry {
 
         let mut updated = existing;
         updated.health = heartbeat.health;
-        updated.last_heartbeat_at = heartbeat.recorded_at;
+        updated.last_heartbeat_at = received_at;
         state
             .instances
             .insert(heartbeat.instance_id, updated.clone());

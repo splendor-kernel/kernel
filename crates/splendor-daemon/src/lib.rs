@@ -695,6 +695,7 @@ struct RunSlot {
     gateway: Arc<dyn ActionGateway>,
     run_authority: RunAuthorityHandle,
     work_order_id: WorkOrderId,
+    work_order_envelope: WorkOrderEnvelope,
     bound_work_order_payload_digest: String,
     authority_recorder: Arc<dyn PreEffectAuthorityDecisionRecorder>,
     action_profiles: Vec<splendor_gateway::TrustedActionProfile>,
@@ -1361,6 +1362,8 @@ pub struct StateSnapshotExportRequest {
     pub work_order_id: String,
     pub source_instance_id: Option<String>,
     pub receiver_instance_id: Option<String>,
+    #[serde(default)]
+    pub previous_state_node_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1376,6 +1379,7 @@ pub struct StateSnapshotExportResponse {
 #[serde(rename_all = "snake_case")]
 pub struct StateSnapshotImportRequest {
     pub handoff: splendor_types::StateHandoff,
+    pub work_order: WorkOrderEnvelope,
     pub credential: Option<CallerCredential>,
     pub audit_attribution: Option<AuditAttribution>,
 }
@@ -2364,6 +2368,7 @@ async fn create_run(
         gateway,
         run_authority,
         work_order_id: validated_work_order.work_order_id.clone(),
+        work_order_envelope: request.work_order,
         bound_work_order_payload_digest,
         authority_recorder,
         action_profiles,
@@ -2934,68 +2939,75 @@ async fn export_state_snapshot(
     )?;
     let run = state.run_slot(&request.run_id)?;
     let slot = run.lock().map_err(|_| lock_error())?;
+    let work_order_authorization = work_order_authorization_for_endpoint(
+        &slot.work_order_envelope,
+        vec![EndpointScope::StateHandoff],
+    );
     state.validate_security(
         DaemonEndpoint::StateHandoff {
             tenant_id: slot.tenant_id.clone(),
             run_id: request.run_id.clone(),
         },
         request.credential,
-        None,
+        Some(work_order_authorization),
         request.audit_attribution,
     )?;
-    let state_head = slot.state_head.as_ref().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "state_head_not_found",
-            "run has no state head",
-        )
-    })?;
-    let snapshot_id = slot.state_store.snapshot(state_head).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "state_store_error",
-            error.to_string(),
-        )
-    })?;
-    let snapshot = slot
-        .state_store
-        .export_snapshot(&snapshot_id)
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "state_store_error",
-                error.to_string(),
-            )
-        })?;
-    let handoff = splendor_types::StateHandoff {
-        schema_version: "splendor.state_handoff.v1".to_string(),
-        handoff_id: format!("handoff-{}", snapshot.snapshot_id),
-        mode: splendor_types::StateReferenceMode::SnapshotImport,
+    let validated = validate_daemon_work_order(
+        &state,
+        &slot.work_order_envelope,
+        &slot.tenant_id,
+        &slot.agent_id,
+        Some(request.run_id.clone()),
+        None,
+    )?;
+    ensure_resume_work_order_matches_original(&slot, &validated)?;
+    if request.work_order_id != slot.work_order_id.as_str() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "state_handoff_work_order_mismatch",
+            "state handoff export work order does not match the admitted run",
+        ));
+    }
+    let source_instance_id = state
+        .inner
+        .runtime_identity
+        .instance_id
+        .as_ref()
+        .map(ToString::to_string);
+    if source_instance_id.is_some() && request.source_instance_id != source_instance_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "state_handoff_source_instance_mismatch",
+            "state handoff source instance does not match this runtime",
+        ));
+    }
+    validate_optional_handoff_instance_id(
+        "receiver_instance_id",
+        request.receiver_instance_id.as_deref(),
+    )?;
+    let source_instance_id = source_instance_id.or(request.source_instance_id);
+    let export = splendor_kernel::StateHandoffExportRequest {
+        handoff_id: format!("handoff-{}", TraceId::new()),
         authority: splendor_types::StateHandoffAuthority {
             tenant_id: slot.tenant_id.clone(),
             agent_id: slot.agent_id.clone(),
             run_id: request.run_id.clone(),
-            work_order_id: request.work_order_id,
+            work_order_id: slot.work_order_id.to_string(),
         },
-        source_instance_id: request.source_instance_id,
+        source_instance_id,
         receiver_instance_id: request.receiver_instance_id,
-        previous_state_node_id: Some(state_head.to_string()),
-        snapshot,
+        previous_state_node_id: request.previous_state_node_id,
         source_trace_id: None,
         created_at: OffsetDateTime::now_utc(),
     };
-    let event_id = record_run_event_returning_id(
-        &slot,
-        TraceEventKind::StateHandoffExported {
-            handoff: splendor_types::StateHandoffTraceContext::exported(&handoff),
-        },
-    )?;
-    let mut handoff = handoff;
-    handoff.source_trace_id = Some(event_id.clone());
+    let (handoff, event) = slot
+        .scheduler
+        .export_state_handoff_for_agent(&slot.agent_id, export)
+        .map_err(ApiError::from)?;
     Ok(Json(StateSnapshotExportResponse {
         run_id: request.run_id,
-        state_node_id: state_head.to_string(),
-        trace_event_id: event_id,
+        state_node_id: handoff.snapshot.state_node_id.clone(),
+        trace_event_id: event.trace_event_id,
         handoff,
     }))
 }
@@ -3012,31 +3024,85 @@ async fn import_state_snapshot(
     let run_id = request.handoff.authority.run_id.clone();
     let run = state.run_slot(&run_id)?;
     let mut slot = run.lock().map_err(|_| lock_error())?;
+    let work_order_authorization = work_order_authorization_for_endpoint(
+        &request.work_order,
+        vec![EndpointScope::StateHandoff],
+    );
     state.validate_security(
         DaemonEndpoint::StateHandoff {
             tenant_id: slot.tenant_id.clone(),
             run_id: run_id.clone(),
         },
         request.credential,
-        None,
+        Some(work_order_authorization),
         request.audit_attribution,
     )?;
+    let validated = match validate_daemon_work_order(
+        &state,
+        &request.work_order,
+        &slot.tenant_id,
+        &slot.agent_id,
+        Some(run_id.clone()),
+        None,
+    ) {
+        Ok(validated) => validated,
+        Err(error) => {
+            return Err(record_pre_import_handoff_failure(
+                &slot,
+                &request.handoff,
+                error,
+            )?)
+        }
+    };
+    if let Err(error) = ensure_resume_work_order_matches_original(&slot, &validated) {
+        return Err(record_pre_import_handoff_failure(
+            &slot,
+            &request.handoff,
+            error,
+        )?);
+    }
     if request.handoff.authority.tenant_id != slot.tenant_id
         || request.handoff.authority.agent_id != slot.agent_id
+        || request.handoff.authority.work_order_id != slot.work_order_id.as_str()
     {
-        let event_id = record_run_event_returning_id(
-            &slot,
-            TraceEventKind::StateHandoffImportFailed {
-                handoff: splendor_types::StateHandoffTraceContext::exported(&request.handoff),
-                reason: "authority_mismatch".to_string(),
-            },
-        )?;
-        return Err(ApiError::new(
+        let error = ApiError::new(
             StatusCode::FORBIDDEN,
             "state_handoff_authority_mismatch",
-            "state handoff tenant/agent binding does not match target run",
-        )
-        .details(serde_json::json!({"trace_event_id": event_id})));
+            "state handoff authority does not match the admitted target run",
+        );
+        return Err(record_pre_import_handoff_failure(
+            &slot,
+            &request.handoff,
+            error,
+        )?);
+    }
+    validate_optional_handoff_instance_id(
+        "source_instance_id",
+        request.handoff.source_instance_id.as_deref(),
+    )?;
+    validate_optional_handoff_instance_id(
+        "receiver_instance_id",
+        request.handoff.receiver_instance_id.as_deref(),
+    )?;
+    let receiver_instance_id = state
+        .inner
+        .runtime_identity
+        .instance_id
+        .as_ref()
+        .map(ToString::to_string);
+    if let Some(expected_receiver) = receiver_instance_id.as_deref() {
+        if request.handoff.receiver_instance_id.as_deref() != Some(expected_receiver) {
+            let error = ApiError::new(
+                StatusCode::FORBIDDEN,
+                "state_handoff_receiver_instance_mismatch",
+                "state handoff receiver instance does not match this runtime",
+            );
+            return Err(record_pre_import_handoff_failure(
+                &slot,
+                &request.handoff,
+                error,
+            )?);
+        }
     }
     let metadata = splendor_store::StateMetadata {
         created_at: OffsetDateTime::now_utc(),
@@ -3046,43 +3112,68 @@ async fn import_state_snapshot(
         run_id: Some(run_id.clone()),
         trace_event_id: request.handoff.source_trace_id.clone(),
     };
-    let imported = match slot
-        .state_store
-        .import_handoff_snapshot(&request.handoff.snapshot, metadata)
-    {
-        Ok(imported) => imported,
-        Err(error) => {
-            let event_id = record_run_event_returning_id(
-                &slot,
-                TraceEventKind::StateHandoffImportFailed {
-                    handoff: splendor_types::StateHandoffTraceContext::exported(&request.handoff),
-                    reason: error.to_string(),
-                },
-            )?;
+    let scope = splendor_kernel::StateHandoffScope {
+        tenant_id: slot.tenant_id.clone(),
+        agent_id: slot.agent_id.clone(),
+        run_id: run_id.clone(),
+        receiver_instance_id,
+    };
+    let agent_id = slot.agent_id.clone();
+    let (imported, event) = match slot.scheduler.import_state_handoff_for_agent(
+        &agent_id,
+        &request.handoff,
+        &request.work_order,
+        &state.inner.work_order_keyring,
+        &scope,
+        OffsetDateTime::now_utc(),
+        metadata,
+    ) {
+        Ok(result) => result,
+        Err(SchedulerError::Loop(LoopError::StateGraph(error))) => {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "state_handoff_rejected",
-                error.to_string(),
-            )
-            .details(serde_json::json!({"trace_event_id": event_id})));
+                error.reason_code(),
+            ));
         }
+        Err(error) => return Err(ApiError::from(error)),
     };
     slot.state_head = Some(imported.node_id.clone());
-    let event_id = record_run_event_returning_id(
-        &slot,
-        TraceEventKind::StateHandoffImported {
-            handoff: splendor_types::StateHandoffTraceContext::imported(
-                &request.handoff,
-                imported.node_id.to_string(),
-            ),
-        },
-    )?;
     Ok(Json(StateSnapshotImportResponse {
         run_id,
         state_node_id: imported.node_id.to_string(),
-        trace_event_id: event_id,
+        trace_event_id: event.trace_event_id,
         accepted: true,
     }))
+}
+
+fn validate_optional_handoff_instance_id(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ApiError> {
+    if value.is_some_and(|value| splendor_types::InstanceId::parse(value).is_err()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_state_handoff_instance_id",
+            format!("{field} must be a valid instance ID"),
+        ));
+    }
+    Ok(())
+}
+
+fn record_pre_import_handoff_failure(
+    slot: &RunSlot,
+    handoff: &splendor_types::StateHandoff,
+    error: ApiError,
+) -> Result<ApiError, ApiError> {
+    let event_id = record_run_event_returning_id(
+        slot,
+        TraceEventKind::StateHandoffImportFailed {
+            handoff: splendor_types::StateHandoffTraceContext::exported(handoff),
+            reason: error.body.code.clone(),
+        },
+    )?;
+    Ok(error.details(serde_json::json!({"trace_event_id": event_id})))
 }
 
 async fn traces(
@@ -7145,6 +7236,7 @@ mod tests {
             gateway: Arc::new(splendor_gateway::UnimplementedGateway),
             run_authority,
             work_order_id: work_order.work_order_id.clone(),
+            work_order_envelope: request.work_order.clone(),
             bound_work_order_payload_digest,
             authority_recorder: Arc::new(splendor_gateway::NoPreEffectAuthorityDecisionRecorder),
             action_profiles: Vec::new(),

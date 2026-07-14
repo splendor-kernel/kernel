@@ -32,6 +32,11 @@ Important fields:
   parent node IDs.
 - `source_trace_id`: source trace event that proves the export boundary.
 
+In resident mode, `source_instance_id` is derived from the source runtime and
+`receiver_instance_id` must match the importing runtime. The export caller
+supplies the receiver's expected `previous_state_node_id`; `null` means the
+receiver must not already have a head.
+
 ### `StateReference`
 
 `StateReference` uses `mode = read_only_reference`. Attaching it records the
@@ -46,17 +51,24 @@ receiver state node after import, snapshot ID, and source trace ID.
 
 ## Lifecycle
 
-1. Source commits state and creates a snapshot through the state graph.
-2. Source calls `StateGraph::export_handoff` for that snapshot.
-3. Source records `state.handoff.exported` through
+1. Source commits state through its loop engine and state graph.
+2. Source asks its scheduler/loop owner to snapshot the current head and export
+   `splendor.state_handoff.v0`.
+3. The same owner records `state.handoff.exported` through
    `KernelRuntime::record_state_handoff_exported`, which writes the source trace
    ID back into the handoff envelope.
-4. Receiver validates signed work-order authority, expected tenant/agent/run,
-   previous head, source trace continuity, snapshot ID, state hash, and node
-   parent linkage.
-5. Receiver imports bytes into its own store and updates its head only after all
-   validation succeeds.
-6. Receiver records `state.handoff.imported` or `state.handoff.import_failed`.
+4. Receiver validates endpoint caller scope plus a signed, unexpired, unrevoked,
+   run-bound work-order envelope that exactly matches the work order admitted for
+   the target run.
+5. Receiver validates tenant/agent/run/work-order authority, intended receiver
+   instance, previous head, source trace continuity, snapshot ID, state hash, and
+   node parent linkage.
+6. Receiver imports through its scheduler/loop/state-graph owner. Direct daemon
+   state-store mutation is not an import path.
+7. The owner records `state.handoff.imported`; only then does the daemon publish
+   the imported head. Trace failure rolls the live graph, agent head, and state
+   bytes back to their previous values. Immutable unreferenced store objects may
+   remain but cannot affect runtime behavior.
 
 ## Trace events
 
@@ -69,6 +81,9 @@ Canonical event classes:
 | `StateHandoffImportFailed` | `state.handoff.import_failed` | Receiver failed closed before changing head. |
 | `ReadOnlyStateReferenced` | `state.reference.read_only` | Receiver attached a read-only reference. |
 
+Import-failure trace reasons use bounded reason codes; signed revocation text,
+snapshot bytes, and raw work-order validation details are not copied into trace.
+
 ## Failure modes
 
 Imports fail closed when:
@@ -77,8 +92,12 @@ Imports fail closed when:
 - work-order signature metadata is missing;
 - work order is expired or revoked;
 - tenant, agent, run, work-order ID, or required scope is incompatible;
+- the import work order differs from the exact work order admitted for the
+  target run;
+- the handoff receiver instance does not match the resident runtime;
 - source trace ID is missing;
 - receiver current head does not match `previous_state_node_id`;
+- the receiver already owns the handed-off state node;
 - snapshot ID does not match exported bytes;
 - state hash does not match exported bytes;
 - source node ID does not match parent IDs plus state hash;
@@ -88,11 +107,13 @@ A failed import leaves the receiver state head unchanged.
 
 ## Security notes
 
-`StateGraph::import_handoff` requires a signed `WorkOrderAuthorization` with
-`EndpointScope::RunsResume`. `StateGraph::attach_read_only_reference` requires
-`EndpointScope::StateRead`. Caller credentials and daemon endpoint checks remain
-separate from this primitive; a daemon token alone does not authorize state
-import or side effects.
+`StateGraph::import_handoff` cryptographically validates the supplied
+`WorkOrderEnvelope` against the receiver keyring and exact tenant/agent/run/
+work-order binding. `StateGraph::attach_read_only_reference` applies the same
+work-order identity validation. The daemon additionally requires an authenticated
+caller with `splendor.state.handoff`, audit attribution, and a run-bound work
+order. Caller credentials and work-order authority remain separate; neither a
+daemon token nor a handoff payload alone authorizes import or side effects.
 
 ## Replay behavior
 
@@ -103,6 +124,9 @@ policies, call gateways, or execute adapters.
 
 ## Compatibility notes
 
-This is a 0.03-dev v0 schema. Fields are explicit and versioned so later
+This is a 0.03-dev v0 handoff schema. The daemon import request now requires the
+signed `work_order` envelope and export accepts explicit
+`previous_state_node_id`; clients using the prior incomplete import shape must
+send the exact run-admitted envelope. Fields are explicit and versioned so later
 migration, state fork/merge, and cross-instance scheduling can extend the
 primitive without introducing hidden shared mutable state.

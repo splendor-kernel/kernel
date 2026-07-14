@@ -118,6 +118,8 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/percepts` | Append a daemon-submitted percept queue entry | `splendor.percepts.append` |
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
+| `POST` | `/state-snapshots/export` | Export the current state head as a trace-linked v0 handoff | `splendor.state.handoff` |
+| `POST` | `/state-snapshots/import` | Import a validated v0 handoff through the run's state owner | `splendor.state.handoff` |
 | `GET` | `/runs/{run_id}/traces` | Read ordered trace records; requires `redaction_policy` | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/traces/export` | Export ordered trace records with redaction policy and integrity metadata | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/replay` | Start inspect-only replay summary | `splendor.replay.create` |
@@ -168,12 +170,13 @@ token. The projected `credential_id` is a bounded domain-separated `sha256:`
 correlation digest, never raw JTI, and middleware replaces caller-supplied audit
 time with its server authentication timestamp before trace recording.
 
-Run creation and run resume require signed, unexpired, unrevoked, scoped work
-orders. The daemon checks work-order tenant, run scope where applicable, and
-agent compatibility for run creation. Resume additionally requires the original
-`work_order_id` and the exact canonical work-order payload admitted at creation,
-normalized to the resolved `run_id`; a newly signed broader or otherwise changed
-work order is rejected. Caller credentials never authorize actions directly;
+Run creation, run resume, and state handoff require signed, unexpired, unrevoked,
+scoped work orders. The daemon checks work-order tenant, run scope where
+applicable, and agent compatibility for run creation. Resume and state import
+additionally require the original `work_order_id` and the exact canonical
+work-order payload admitted at creation, normalized to the resolved `run_id`; a
+newly signed broader or otherwise changed work order is rejected. Caller
+credentials never authorize actions directly;
 `/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
@@ -307,6 +310,37 @@ Response fields include:
 - `data_hash`;
 - commit timestamp;
 - optional state label.
+
+## State handoff behavior
+
+`POST /state-snapshots/export` and `POST /state-snapshots/import` are mutating
+audit boundaries. Both require authenticated caller scope
+`splendor.state.handoff`, matching tenant/run binding, audit attribution, and
+signed run-bound work-order authority. Export revalidates the envelope retained
+from run admission and rejects a request-level work-order ID or resident source
+instance mismatch.
+
+Export accepts `receiver_instance_id` and `previous_state_node_id`; the latter
+is the receiver head expected before import (`null` requires no receiver head).
+The source scheduler/loop/state-graph owner snapshots its current head and emits
+`splendor.state_handoff.v0` plus `state.handoff.exported`.
+
+Import request bodies include both `handoff` and the signed `work_order`
+envelope. The envelope must cryptographically validate and exactly match the
+target run's admitted work-order identity and canonical payload. Resident import
+also requires the handoff's `receiver_instance_id` to equal the configured
+runtime instance. Schema, mode, source trace linkage, receiver previous head,
+snapshot ID/hash/parent linkage, and replay are checked before mutation.
+
+Import routes through the target scheduler and loop engine; the daemon does not
+mutate the backing state store directly. A successful import records
+`state.handoff.imported` before publishing the new daemon state head. Validation,
+store, or trace failure fails closed. Trace failure restores the prior live graph,
+agent head, and state bytes; a replayed import leaves the imported head unchanged.
+
+This is a compatibility correction to the earlier incomplete import request:
+clients must now send the exact signed `work_order`, and exports that target a
+non-empty receiver must send its expected `previous_state_node_id`.
 
 ## Trace behavior
 

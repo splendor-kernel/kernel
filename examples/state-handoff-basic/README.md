@@ -6,13 +6,16 @@ unit-test-backed flow, not a multi-host migration demo.
 ## What it proves
 
 1. A source state graph commits state and creates a snapshot.
-2. The source exports a `StateHandoff` envelope from that snapshot.
+2. The source scheduler/loop/state-graph owner exports a `StateHandoff` envelope
+   from the current head.
 3. `KernelRuntime::record_state_handoff_exported` records the source trace event
    and writes the source trace ID into the handoff.
-4. The receiver imports only when the signed work order authorizes the same
-   tenant, agent, run, and `splendor.runs.resume` scope.
-5. Snapshot ID, state hash, parent linkage, previous receiver head, and source
-   trace continuity are verified before the receiver head changes.
+4. The receiver imports only when the signed work order is valid for the same
+   tenant, agent, run, and work-order ID. The daemon additionally requires
+   `splendor.state.handoff` and the exact envelope admitted for the target run.
+5. Snapshot ID, state hash, parent linkage, receiver instance, previous receiver
+   head, replay state, and source trace continuity are verified before the
+   receiver head changes.
 6. Read-only references can be attached for inspection but cannot be mutated.
 7. Replay emits a `handoff_boundary` record and does not import state or execute
    side effects.
@@ -23,6 +26,7 @@ unit-test-backed flow, not a multi-host migration demo.
 cargo test -p splendor-store state_store_exports_and_imports_handoff_snapshot_with_parent_linkage
 cargo test -p splendor-kernel state_graph_imports_valid_handoff_with_work_order_authority
 cargo test -p splendor-kernel read_only_state_reference_cannot_be_mutated_by_receiver
+cargo test -p splendor-daemon --test runtime_daemon_api_tests state_snapshot_export_import_uses_authenticated_state_authority
 cargo test -p splendorctl replay_identifies_state_handoff_boundary
 ```
 

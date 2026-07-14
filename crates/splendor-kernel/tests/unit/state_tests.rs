@@ -38,6 +38,7 @@ fn scope(tenant_id: TenantId, agent_id: AgentId, run_id: RunId) -> StateHandoffS
         tenant_id,
         agent_id,
         run_id,
+        receiver_instance_id: None,
     }
 }
 
@@ -231,7 +232,58 @@ fn state_graph_imports_valid_handoff_with_work_order_authority() {
 
     assert_eq!(receiver.head(), Some(&commit.node_id));
     assert_eq!(commit.node_id.to_string(), handoff.snapshot.state_node_id);
-    assert_eq!(commit.snapshot_id, Some(handoff.snapshot.snapshot_id));
+    assert_eq!(
+        commit.snapshot_id.as_ref(),
+        Some(&handoff.snapshot.snapshot_id)
+    );
+
+    let replay = receiver
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(Some("replay")),
+        )
+        .expect_err("same state handoff cannot be replayed");
+    assert!(matches!(replay, StateGraphError::ReplayedHandoff { .. }));
+    assert_eq!(receiver.head(), Some(&commit.node_id));
+}
+
+#[test]
+fn state_graph_rejects_wrong_receiver_instance_before_import() {
+    let (handoff, tenant_id, agent_id, run_id, now) = exported_handoff(None, true);
+    let mut receiver = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let work_order = work_order(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec![EndpointScope::RunsResume],
+        now,
+    );
+    let scope = StateHandoffScope {
+        tenant_id,
+        agent_id,
+        run_id,
+        receiver_instance_id: Some("other_instance".to_string()),
+    };
+
+    let error = receiver
+        .import_handoff(
+            &handoff,
+            &work_order,
+            &keyring(),
+            &scope,
+            now,
+            metadata(None),
+        )
+        .expect_err("wrong receiver instance denied");
+    assert!(matches!(error, StateGraphError::IncompatibleWorkOrder));
+    assert!(receiver.head().is_none());
 }
 
 #[test]

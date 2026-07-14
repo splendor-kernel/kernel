@@ -199,6 +199,12 @@ Dispatch rules:
   complete create/start dispatch. Dispatch rechecks revocation and expiry
   immediately before each outbound request. A revocation that acquires the gate
   first prevents all egress; one that loses waits for create/start to finish.
+- The revocation gate is allocated atomically with accepted signed work-order
+  state. Unknown revoke/dispatch IDs return `work_order_not_found` before
+  allocating a gate, revocation tombstone, in-flight reservation, or terminal
+  dispatch result. Accepted gates/results remain process-local lifecycle state
+  so exact duplicate and unknown-effect behavior is preserved; the acceptance
+  manager is not a production retention service.
 - Non-2xx, oversized, malformed, or identity-mismatched responses are failures.
   They never emit `run.dispatched` or publish running telemetry.
 - After a start request may have been sent, every transport reset/timeout,
@@ -246,6 +252,19 @@ resident security audit fact without raw token/JTI. Create/start continue throug
 the existing signed-work-order, state commit, trace, C02, verifier, and gateway
 paths. Replay remains inspect-only and does not mint bearer tokens, perform
 resident network calls, or execute adapters.
+
+The existing state-handoff daemon operations now apply this resident boundary
+consistently: both require caller scope `splendor.state.handoff` plus signed
+run-bound work-order authority. Import carries and cryptographically revalidates
+the exact work-order envelope admitted for the target run, enforces the intended
+receiver instance, and routes mutation through the scheduler/loop/state owner.
+This is a correction to the existing v0 path, not a new state-node or trace-event
+schema.
+
+Registry registration and heartbeat freshness use manager-observed receipt time.
+Sender `registered_at`, `recorded_at`, and health observation timestamps remain
+observational and cannot pin freshness in the future or reorder receipts. A
+manager receipt-time regression fails closed.
 
 Trust/key read failure, stale trust, caller verification failure, TLS failure,
 response-limit failure, and dispatch uncertainty all fail closed. No fallback to

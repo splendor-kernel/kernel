@@ -1103,14 +1103,14 @@ def main() -> int:
     specialist_escalation = call("submitAction", "POST", args.vpc_url, "/actions", {"run_id": SPECIALIST_RUN, "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "causal_trace_id": task_sent["body"].get("trace_event_id"), "action": action("artifact.publish_external", "artifact.publish_external", "External", publish_ref=EXTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
 
     state_before = call("getStateHead", "GET", args.vpc_url, f"/runs/{ORCH_RUN}/state-head", headers=credential_header(vpc_cred))
-    handoff_export = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": ORCH_RUN, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ORCH, "source_instance_id": VPC_INSTANCE, "receiver_instance_id": CLOUD_INSTANCE})
+    handoff_export = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": ORCH_RUN, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ORCH, "source_instance_id": VPC_INSTANCE, "receiver_instance_id": CLOUD_INSTANCE, "previous_state_node_id": None})
     cloud_create = call("createRun", "POST", args.cloud_url, "/runs", create_run_payload(run_id=ORCH_RUN, agent_id=ORCH_AGENT, envelope=orch_envelope, credential=cloud_cred, initial_state={"resume_target": "cloud"}))
     cloud_pause = call("pauseRun", "POST", args.cloud_url, f"/runs/{ORCH_RUN}/pause", {"credential": cloud_cred, "audit_attribution": audit(cloud_cred), "reason": "s10_state_handoff_pause_before_import"})
-    handoff_import = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": handoff_export["body"].get("handoff"), "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
+    handoff_import = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": handoff_export["body"].get("handoff"), "work_order": orch_envelope, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
     bad_handoff = copy.deepcopy(handoff_export["body"].get("handoff", {}))
     if bad_handoff:
         bad_handoff.setdefault("snapshot", {}).setdefault("state_hash", {})["value"] = "0" * 64
-    tampered_state_import = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
+    tampered_state_import = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "work_order": orch_envelope, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
     cloud_resume = call("resumeRun", "POST", args.cloud_url, f"/runs/{ORCH_RUN}/resume", {"credential": cloud_cred, "work_order": orch_envelope, "audit_attribution": audit(cloud_cred), "reason": "s10_state_handoff_resume"})
     state_after = call("getStateHead", "GET", args.cloud_url, f"/runs/{ORCH_RUN}/state-head", headers=credential_header(cloud_cred))
 

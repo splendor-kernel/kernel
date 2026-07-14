@@ -14,7 +14,10 @@ continuity portion of FR-0.03-10.
 - Added state-store snapshot export/import with hash and parent-linkage
   validation.
 - Added state-graph import validation for signed work-order authority, tenant,
-  agent, run, previous head, and source trace continuity.
+  agent, run, intended receiver instance, previous head, replay, and source trace
+  continuity.
+- Routed daemon export/import through the scheduler, loop engine, and state graph
+  owner; daemon import requires the exact signed envelope admitted for the run.
 - Added read-only reference attachment and explicit mutation denial.
 - Added replay recognition of handoff boundaries.
 
@@ -32,7 +35,11 @@ continuity portion of FR-0.03-10.
   `StateHandoffTraceContext`.
 - State store trait: `get_node`, `export_snapshot`, `import_handoff_snapshot`.
 - State graph API: `export_handoff`, `import_handoff`,
-  `attach_read_only_reference`, and `commit_from_read_only_reference`.
+  `export_current_handoff`, `attach_read_only_reference`, and
+  `commit_from_read_only_reference`.
+- Daemon API: import now requires `work_order`; export accepts explicit receiver
+  `previous_state_node_id`. This corrects the prior incomplete public request
+  shape and requires client migration.
 - Trace event variants: `StateHandoffExported`, `StateHandoffImported`,
   `StateHandoffImportFailed`, and `ReadOnlyStateReferenced`.
 - `splendorctl replay` emits `handoff_boundary` records.
@@ -72,7 +79,10 @@ head update.
 - Import verifies snapshot ID, byte hash, source node ID, parent IDs, work order,
   source trace continuity, and expected previous receiver head.
 - Receiver state head updates only after validation and local node/snapshot
-  persistence succeed.
+  persistence plus imported-event trace persistence succeed.
+- Failed trace persistence restores the live graph, agent head, and state bytes;
+  immutable unreferenced store objects cannot affect runtime behavior.
+- Replaying an already imported handoff is denied without changing the head.
 - Read-only references are stored separately from the mutable head and cannot be
   committed from.
 
@@ -80,7 +90,8 @@ head update.
 
 No adapter or side-effect path was added. Handoff authority validation fails
 closed on unsigned, expired, revoked, wrong-scope, wrong-tenant, wrong-agent,
-wrong-run, or wrong-work-order inputs.
+wrong-run, wrong-work-order, wrong-receiver, or replayed inputs. Daemon callers
+must also hold `splendor.state.handoff` and provide audit attribution.
 
 ## Replay behavior
 
@@ -98,6 +109,7 @@ executes adapters.
 | negative | mismatched authority, stale head, missing trace fail closed | `cargo test -p splendor-kernel state_graph_rejects_*handoff*` |
 | negative | unsigned, expired, revoked, wrong-scope, wrong-work-order, and unsupported schema fail closed | `cargo test -p splendor-kernel state_graph_rejects_invalid_handoff_work_orders_and_schema` |
 | state | failed import leaves receiver head unchanged | `cargo test -p splendor-kernel state_graph_failed_handoff_import_leaves_receiver_head_unchanged` |
+| integration | daemon export/import uses exact signed run authority through the state owner | `cargo test -p splendor-daemon --test runtime_daemon_api_tests state_snapshot_export_import_uses_authenticated_state_authority` |
 | replay | replay identifies handoff boundary | `cargo test -p splendorctl replay_identifies_state_handoff_boundary` |
 
 Full workspace evidence should be gathered with `cargo test --workspace` before

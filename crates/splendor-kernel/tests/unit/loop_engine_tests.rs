@@ -5,12 +5,13 @@ use splendor_store::{
     StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceStoreError,
 };
 use splendor_types::{
-    validate_policy_bundle, ActionId, ApprovalDecision, ApprovalEvidence, ApprovalId,
+    validate_policy_bundle, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId,
     ApprovalTraceContext, ConstraintKind, ConstraintScope, DelegatedAuthority, PerceptProvenance,
     PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyBundleKeyring,
     PolicyBundleTraceContext, PolicyBundleValidationContext, PolicyDegradedMode, QuotaUsage,
-    RevocationStatus, RunId, TenantId, TraceEvent, WorkOrder, WorkOrderId, WorkOrderPlacement,
-    WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
+    RevocationStatus, RunId, StateHandoffAuthority, TenantId, TraceEvent, TraceId, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,17 @@ impl crate::TraceSink for FailingActionVerificationTraceSink {
         drop(failed);
 
         self.events.lock().expect("events lock").push(event.clone());
+        Ok(())
+    }
+}
+
+struct FailingStateHandoffImportedTraceSink;
+
+impl crate::TraceSink for FailingStateHandoffImportedTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), crate::TraceError> {
+        if matches!(event.kind, TraceEventKind::StateHandoffImported { .. }) {
+            return Err(crate::TraceError::Store(TraceStoreError::Poisoned));
+        }
         Ok(())
     }
 }
@@ -380,6 +392,23 @@ fn work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrder {
     }
 }
 
+fn signed_work_order_for(agent: &AgentContext, run_id: RunId) -> WorkOrderEnvelope {
+    WorkOrderEnvelope::signed_with_shared_secret(
+        work_order_for(agent, run_id),
+        "key_loop_state_handoff",
+        b"loop-state-handoff-secret",
+    )
+    .expect("signed work order")
+}
+
+fn state_handoff_keyring() -> WorkOrderKeyring {
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret("key_loop_state_handoff", b"loop-state-handoff-secret")
+        .expect("state handoff key");
+    keyring
+}
+
 fn policy_bundle_for(
     agent: &AgentContext,
     expires_at: OffsetDateTime,
@@ -470,6 +499,113 @@ impl StateStore for FailingStateStore {
     ) -> Result<StateSnapshot, StateStoreError> {
         Err(StateStoreError::MissingSnapshot)
     }
+}
+
+#[test]
+fn state_handoff_import_trace_failure_restores_live_owner_state() {
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let run_id = RunId::new();
+    let agent = AgentContext::new(
+        agent_id.clone(),
+        tenant_id.clone(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let work_order = signed_work_order_for(&agent, run_id.clone());
+    let now = OffsetDateTime::now_utc();
+
+    let mut source = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let mut source_metadata = StateMetadata::new(now, Some("source".to_string()));
+    source_metadata.tenant_id = Some(tenant_id.clone());
+    source_metadata.agent_id = Some(agent_id.clone());
+    source_metadata.run_id = Some(run_id.clone());
+    source
+        .commit(
+            StateData {
+                bytes: vec![9],
+                content_type: Some("application/octet-stream".to_string()),
+            },
+            source_metadata,
+        )
+        .expect("source commit");
+
+    let receiver_state = StateData {
+        bytes: vec![1],
+        content_type: Some("application/octet-stream".to_string()),
+    };
+    let mut receiver = StateGraph::new(
+        Arc::new(InMemoryStateStore::default()),
+        SnapshotPolicy::default(),
+    );
+    let mut receiver_metadata = StateMetadata::new(now, Some("receiver".to_string()));
+    receiver_metadata.tenant_id = Some(tenant_id.clone());
+    receiver_metadata.agent_id = Some(agent_id.clone());
+    receiver_metadata.run_id = Some(run_id.clone());
+    let previous = receiver
+        .commit(receiver_state.clone(), receiver_metadata)
+        .expect("receiver commit");
+
+    let handoff = source
+        .export_current_handoff(StateHandoffExportRequest {
+            handoff_id: "handoff_trace_failure".to_string(),
+            authority: StateHandoffAuthority {
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                work_order_id: work_order.work_order.work_order_id.to_string(),
+            },
+            source_instance_id: None,
+            receiver_instance_id: None,
+            previous_state_node_id: Some(previous.node_id.to_string()),
+            source_trace_id: Some(TraceId::new()),
+            created_at: now,
+        })
+        .expect("handoff export");
+
+    let runtime = KernelRuntime::new(KernelRuntimeConfig {
+        trace_sink: Arc::new(FailingStateHandoffImportedTraceSink),
+        run_id: Some(run_id.clone()),
+        ..KernelRuntimeConfig::default()
+    });
+    let mut engine = LoopEngine::with_runtime(
+        agent,
+        receiver,
+        receiver_state.clone(),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        runtime,
+    );
+    let mut import_metadata = StateMetadata::new(now, Some("import".to_string()));
+    import_metadata.tenant_id = Some(tenant_id.clone());
+    import_metadata.agent_id = Some(agent_id.clone());
+    import_metadata.run_id = Some(run_id.clone());
+
+    let error = engine
+        .import_state_handoff(
+            &handoff,
+            &work_order,
+            &state_handoff_keyring(),
+            &StateHandoffScope {
+                tenant_id,
+                agent_id,
+                run_id,
+                receiver_instance_id: None,
+            },
+            now,
+            import_metadata,
+        )
+        .expect_err("trace failure denies imported live state");
+
+    assert!(matches!(
+        error,
+        LoopError::Trace(crate::TraceError::Store(TraceStoreError::Poisoned))
+    ));
+    assert_eq!(engine.state_graph.head(), Some(&previous.node_id));
+    assert_eq!(engine.agent.state_head.as_ref(), Some(&previous.node_id));
+    assert_eq!(engine.state, receiver_state);
 }
 
 #[test]

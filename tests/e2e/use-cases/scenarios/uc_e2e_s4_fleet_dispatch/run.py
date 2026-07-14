@@ -33,6 +33,7 @@ WORK_ORDER_KEY_IDS = {
     EDGE_INSTANCE_ID: "work-order-acceptance-edge",
 }
 RUNTIME_IMAGE_IDENTITY = "splendor-kernel-runtime:acceptance-target-runtime"
+HEARTBEAT_STALE_AFTER_SECONDS = 60
 
 
 def utc(offset_minutes: int = 0) -> str:
@@ -353,7 +354,7 @@ def main() -> int:
 
     vpc_export_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["state_handoff"])
     vpc_export_cred = vpc_export_auth["credential"]
-    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_export_cred, "audit_attribution": audit(vpc_export_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID}, credential_header(vpc_export_auth))
+    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_export_cred, "audit_attribution": audit(vpc_export_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID, "previous_state_node_id": None}, credential_header(vpc_export_auth))
     cloud_create_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_create"])
     cloud_create_cred = cloud_create_auth["credential"]
     cloud_work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", WORK_ORDER_ID)
@@ -365,7 +366,7 @@ def main() -> int:
     call("createRun", "POST", args.cloud_url, "/runs", cloud_create, credential_header(cloud_create_auth))
     cloud_import_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     cloud_import_cred = cloud_import_auth["credential"]
-    imported = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "credential": cloud_import_cred, "audit_attribution": audit(cloud_import_cred)}, credential_header(cloud_import_auth))
+    imported = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "work_order": cloud_envelope, "credential": cloud_import_cred, "audit_attribution": audit(cloud_import_cred)}, credential_header(cloud_import_auth))
     cloud_state_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_read"])
     state_before_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
     bad_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
@@ -373,19 +374,19 @@ def main() -> int:
         bad_handoff["authority"]["tenant_id"] = "99999999-9999-4999-8999-999999999999"
     wrong_handoff_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     wrong_handoff_cred = wrong_handoff_auth["credential"]
-    wrong_handoff = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "credential": wrong_handoff_cred, "audit_attribution": audit(wrong_handoff_cred)}, credential_header(wrong_handoff_auth))
+    wrong_handoff = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "work_order": cloud_envelope, "credential": wrong_handoff_cred, "audit_attribution": audit(wrong_handoff_cred)}, credential_header(wrong_handoff_auth))
     wrong_hash_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if wrong_hash_handoff:
         wrong_hash_handoff["snapshot"]["state_hash"]["value"] = "0" * 64
     wrong_hash_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     wrong_hash_cred = wrong_hash_auth["credential"]
-    wrong_hash = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_hash_handoff, "credential": wrong_hash_cred, "audit_attribution": audit(wrong_hash_cred)}, credential_header(wrong_hash_auth))
+    wrong_hash = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_hash_handoff, "work_order": cloud_envelope, "credential": wrong_hash_cred, "audit_attribution": audit(wrong_hash_cred)}, credential_header(wrong_hash_auth))
     wrong_run_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if wrong_run_handoff:
         wrong_run_handoff["authority"]["run_id"] = "77777777-7777-4777-8777-777777777777"
     wrong_run_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     wrong_run_cred = wrong_run_auth["credential"]
-    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "credential": wrong_run_cred, "audit_attribution": audit(wrong_run_cred)}, credential_header(wrong_run_auth))
+    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "work_order": cloud_envelope, "credential": wrong_run_cred, "audit_attribution": audit(wrong_run_cred)}, credential_header(wrong_run_auth))
     state_after_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
 
     vpc_trace_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["traces_read"])
@@ -414,6 +415,9 @@ def main() -> int:
     call("registerNode", "POST", args.manager_url, "/fleet/nodes", {**sec(cred), "registration": stale_node})
     stale_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order(work_order_id="wo_uc_e2e_s4_stale", required_capability="stale.only"))
     call("submitStaleWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(cred), "work_order": stale_envelope, "expected_audience": "central-manager"})
+    # Freshness is receiver-owned, so exercise real manager receipt-time aging
+    # instead of trusting the deliberately old sender timestamps above.
+    time.sleep(HEARTBEAT_STALE_AFTER_SECONDS + 1)
     stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(cred), "work_order_id": "wo_uc_e2e_s4_stale", "request": {**placement_request, "required_capabilities": ["stale.only"]}})
 
     def neg(case: str, passed: bool, **details: Any) -> dict[str, Any]:

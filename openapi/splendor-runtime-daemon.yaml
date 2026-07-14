@@ -2415,22 +2415,17 @@ components:
         audit_attribution:
           $ref: '#/components/schemas/AuditAttribution'
         work_order_id: { type: string }
-        source_instance_id: { type: string, format: uuid }
-        receiver_instance_id: { type: string, format: uuid }
+        source_instance_id: { type: [string, 'null'], format: uuid }
+        receiver_instance_id: { type: [string, 'null'], format: uuid }
+        previous_state_node_id: { type: [string, 'null'] }
     ImportStateSnapshotRequest:
       type: object
-      required: [handoff, credential, audit_attribution]
+      required: [handoff, work_order, credential, audit_attribution]
       properties:
         handoff:
-          type: object
-          required: [authority, snapshot]
-          properties:
-            authority:
-              type: object
-              required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
-            snapshot:
-              type: object
-              required: [state_node_id, state_hash]
+          $ref: '#/components/schemas/StateHandoff'
+        work_order:
+          $ref: '#/components/schemas/WorkOrderEnvelope'
         credential:
           $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
@@ -2454,25 +2449,50 @@ components:
         accepted: { type: boolean }
     StateHandoff:
       type: object
-      required: [authority, snapshot]
+      required: [schema_version, handoff_id, mode, authority, source_instance_id, receiver_instance_id, previous_state_node_id, snapshot, source_trace_id, created_at]
       properties:
+        schema_version:
+          type: string
+          const: splendor.state_handoff.v0
+        handoff_id: { type: string }
+        mode:
+          type: string
+          enum: [snapshot_import, read_only_reference]
         authority:
           type: object
-          required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+          required: [tenant_id, agent_id, run_id, work_order_id]
           properties:
             tenant_id: { type: string, format: uuid }
             agent_id: { type: string, format: uuid }
             run_id: { type: string, format: uuid }
             work_order_id: { type: string }
-            source_instance_id: { type: string, format: uuid }
-            receiver_instance_id: { type: string, format: uuid }
+        source_instance_id: { type: [string, 'null'], format: uuid }
+        receiver_instance_id: { type: [string, 'null'], format: uuid }
+        previous_state_node_id: { type: [string, 'null'] }
         snapshot:
           type: object
-          required: [state_node_id, state_hash]
+          required: [snapshot_id, state_node_id, parent_state_node_ids, state_hash, state_bytes, content_type]
           properties:
+            snapshot_id: { type: string }
             state_node_id: { type: string }
-            state_hash: { type: string }
+            parent_state_node_ids:
+              type: array
+              items: { type: string }
+            state_hash:
+              type: object
+              required: [algorithm, value]
+              properties:
+                algorithm:
+                  type: string
+                  enum: [Blake3, Sha256]
+                value: { type: string }
+            state_bytes:
+              type: array
+              items: { type: integer, minimum: 0, maximum: 255 }
+            content_type: { type: [string, 'null'] }
           additionalProperties: true
+        source_trace_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
     Percept:
       type: object
       required: [schema, payload, provenance, timestamp]

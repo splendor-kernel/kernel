@@ -377,21 +377,22 @@ impl ManagerState {
         Ok(event_id)
     }
 
-    fn work_order_revocation_gate(
+    fn accepted_work_order_revocation_gate(
         &self,
         work_order_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<()>>, ManagerApiError> {
-        let mut gates = self.inner.work_order_revocation_gates.lock().map_err(|_| {
+        let gates = self.inner.work_order_revocation_gates.lock().map_err(|_| {
             ManagerApiError::internal(
                 "work_order_revocation_gate_unavailable",
                 "work-order revocation gate unavailable",
             )
         })?;
-        Ok(Arc::clone(
-            gates
-                .entry(work_order_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        ))
+        gates.get(work_order_id).cloned().ok_or_else(|| {
+            ManagerApiError::not_found(
+                "work_order_not_found",
+                "work order must be accepted before revocation or dispatch",
+            )
+        })
     }
 }
 
@@ -1014,7 +1015,12 @@ async fn register_node(
         true,
     )?;
     let requested = request.registration;
-    let (record, registered_new) = match state.inner.registry.register_node(requested.clone()) {
+    let received_at = OffsetDateTime::now_utc();
+    let (record, registered_new) = match state
+        .inner
+        .registry
+        .register_node_received_at(requested.clone(), received_at)
+    {
         Ok(record) => (record, true),
         Err(NodeRegistryError::DuplicateNode(node_id)) => {
             let record = state.inner.registry.node(&node_id).map_err(|e| {
@@ -1068,7 +1074,12 @@ async fn register_instance(
         true,
     )?;
     let requested = request.registration;
-    let (record, registered_new) = match state.inner.registry.register_instance(requested.clone()) {
+    let received_at = OffsetDateTime::now_utc();
+    let (record, registered_new) = match state
+        .inner
+        .registry
+        .register_instance_received_at(requested.clone(), received_at)
+    {
         Ok(record) => (record, true),
         Err(NodeRegistryError::DuplicateInstance(instance_id)) => {
             let record = state.inner.registry.instance(&instance_id).map_err(|e| {
@@ -1132,10 +1143,11 @@ async fn heartbeat_node(
             "path node_id does not match heartbeat",
         ));
     }
+    let received_at = OffsetDateTime::now_utc();
     let record = state
         .inner
         .registry
-        .record_node_heartbeat(request.heartbeat)
+        .record_node_heartbeat_received_at(request.heartbeat, received_at)
         .map_err(|e| ManagerApiError::bad_request("heartbeat_rejected", e.to_string()))?;
     state
         .inner
@@ -1169,10 +1181,11 @@ async fn heartbeat_instance(
             "path instance_id does not match heartbeat",
         ));
     }
+    let received_at = OffsetDateTime::now_utc();
     let record = state
         .inner
         .registry
-        .record_instance_heartbeat(request.heartbeat)
+        .record_instance_heartbeat_received_at(request.heartbeat, received_at)
         .map_err(|error| {
             ManagerApiError::bad_request("instance_heartbeat_rejected", error.to_string())
         })?;
@@ -1284,6 +1297,16 @@ async fn submit_work_order(
     match validation {
         Ok(_) => {
             let idempotent = {
+                let mut gates = state
+                    .inner
+                    .work_order_revocation_gates
+                    .lock()
+                    .map_err(|_| {
+                        ManagerApiError::internal(
+                            "work_order_revocation_gate_unavailable",
+                            "work-order revocation gate unavailable",
+                        )
+                    })?;
                 let mut work_orders = state.inner.work_orders.lock().map_err(|_| {
                     ManagerApiError::internal("work_order_lock", "work order lock unavailable")
                 })?;
@@ -1311,8 +1334,15 @@ async fn submit_work_order(
                             "an accepted work-order ID cannot be replaced with different signed bytes",
                         ));
                     }
+                    if !gates.contains_key(&work_order_id) {
+                        return Err(ManagerApiError::conflict(
+                            "work_order_gate_missing",
+                            "accepted work order is missing its revocation gate",
+                        ));
+                    }
                     true
                 } else {
+                    gates.insert(work_order_id.clone(), Arc::new(tokio::sync::Mutex::new(())));
                     work_orders.insert(work_order_id.clone(), accepted.envelope.clone());
                     bindings.insert(
                         work_order_id.clone(),
@@ -1365,7 +1395,7 @@ async fn revoke_work_order(
         EndpointScope::WorkOrdersRevoke,
         true,
     )?;
-    let revocation_gate = state.work_order_revocation_gate(&work_order_id)?;
+    let revocation_gate = state.accepted_work_order_revocation_gate(&work_order_id)?;
     let _revocation_guard = revocation_gate.lock_owned().await;
     state.validate_security(
         &request.security.credential,
@@ -1590,7 +1620,7 @@ async fn dispatch_work_order(
         EndpointScope::FleetDispatch,
         true,
     )?;
-    let revocation_gate = state.work_order_revocation_gate(&work_order_id)?;
+    let revocation_gate = state.accepted_work_order_revocation_gate(&work_order_id)?;
     let _revocation_guard = revocation_gate.lock_owned().await;
     state.validate_security(
         &request.security.credential,
@@ -5431,15 +5461,14 @@ mod tests {
         );
         registration.health.observed_at = OffsetDateTime::now_utc() - Duration::seconds(61);
         registration.registered_at = registration.health.observed_at;
-        let _ = register_instance(
-            State(state.clone()),
-            Json(RegisterInstanceRequest {
-                security: registration_security,
-                registration: registration.clone(),
-            }),
-        )
-        .await
-        .expect("stale instance registered");
+        state
+            .inner
+            .registry
+            .register_instance_received_at(
+                registration.clone(),
+                OffsetDateTime::now_utc() - Duration::seconds(61),
+            )
+            .expect("stale instance registered at manager-observed time");
 
         let placement = PlacementRequest::new(PlacementTarget::ResidentCloudPool);
         let stale = state
@@ -5456,7 +5485,8 @@ mod tests {
         ));
 
         let heartbeat_security = manager_security(&state, vec![EndpointScope::InstancesHeartbeat]);
-        let refreshed_at = OffsetDateTime::now_utc();
+        let received_before = OffsetDateTime::now_utc();
+        let reported_future = received_before + Duration::days(365);
         let response = heartbeat_instance(
             Path(instance_id.clone()),
             State(state.clone()),
@@ -5467,10 +5497,10 @@ mod tests {
                     instance_id: instance_id.clone(),
                     health: splendor_types::InstanceHealth {
                         status: HealthStatus::Healthy,
-                        observed_at: refreshed_at,
+                        observed_at: reported_future,
                         metadata: serde_json::json!({"queue_depth": 0}),
                     },
-                    recorded_at: refreshed_at,
+                    recorded_at: reported_future,
                 },
             }),
         )
@@ -5488,12 +5518,16 @@ mod tests {
             refreshed.health.metadata,
             serde_json::json!({"queue_depth": 0})
         );
+        let received_after = OffsetDateTime::now_utc();
+        assert!(refreshed.last_heartbeat_at >= received_before);
+        assert!(refreshed.last_heartbeat_at <= received_after);
+        assert_ne!(refreshed.last_heartbeat_at, reported_future);
         assert!(instance_is_eligible(
             &refreshed,
             &node.runtime_version,
             &tenant_id,
             &placement,
-            refreshed_at,
+            received_after,
         ));
 
         let mismatched = heartbeat_instance(
@@ -5505,7 +5539,7 @@ mod tests {
                     node_id: node.node_id,
                     instance_id,
                     health: refreshed.health,
-                    recorded_at: refreshed_at + Duration::seconds(1),
+                    recorded_at: reported_future + Duration::seconds(1),
                 },
             }),
         )
@@ -8349,7 +8383,7 @@ mod tests {
         .expect("placement selected");
 
         let gate = state
-            .work_order_revocation_gate("wo_test_dispatch")
+            .accepted_work_order_revocation_gate("wo_test_dispatch")
             .expect("revocation gate");
         let barrier = Arc::clone(&gate).lock_owned().await;
         let mut revoke = Box::pin(revoke_work_order(
@@ -8391,6 +8425,62 @@ mod tests {
             .expect("dispatch state")
             .in_flight
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_work_order_ids_do_not_allocate_revocation_or_dispatch_state() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::FleetDispatch,
+                EndpointScope::WorkOrdersRevoke,
+            ],
+        );
+
+        for index in 0..128 {
+            let work_order_id = format!("wo_unknown_{index}");
+            let revoke_error = revoke_work_order(
+                Path(work_order_id.clone()),
+                State(state.clone()),
+                Json(RevokeWorkOrderRequest {
+                    security: security.clone(),
+                    reason: "unknown ID must not create a tombstone".to_string(),
+                }),
+            )
+            .await
+            .expect_err("unknown revoke denied");
+            assert_eq!(revoke_error.body.code, "work_order_not_found");
+
+            let dispatch_error = dispatch_work_order(
+                Path(work_order_id),
+                State(state.clone()),
+                Json(DispatchWorkOrderRequest {
+                    security: security.clone(),
+                    target_node_id: None,
+                }),
+            )
+            .await
+            .expect_err("unknown dispatch denied");
+            assert_eq!(dispatch_error.body.code, "work_order_not_found");
+        }
+
+        assert!(state
+            .inner
+            .work_order_revocation_gates
+            .lock()
+            .expect("gate state")
+            .is_empty());
+        assert!(state
+            .inner
+            .revoked_work_orders
+            .lock()
+            .expect("revocation state")
+            .is_empty());
+        let dispatch = state.inner.dispatch_state.lock().expect("dispatch state");
+        assert!(dispatch.completed.is_empty());
+        assert!(dispatch.terminal_failures.is_empty());
+        assert!(dispatch.in_flight.is_empty());
     }
 
     #[tokio::test]
