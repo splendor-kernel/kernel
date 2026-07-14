@@ -4,6 +4,14 @@
 
 ### Added
 
+- Corrected resident state-handoff import to fail closed before store, state-head,
+  or run-trace mutation. Caller bearer authentication, endpoint scope, and the
+  exact signed target work order remain required but cannot authenticate the v0
+  handoff source or prove the caller-carried source trace exists. Resident import
+  now returns `503 state_handoff_proof_unavailable` with `needs_intervention`;
+  successful import remains experimental loopback `local_dev` compatibility.
+  Signed source manifests, source event/evidence verification, and durable replay
+  remain downstream STA-005/EVT-005/EVID-005 work. Gold was not exercised.
 - Hardened the bounded non-gold, production-local AUTH-003 delegation slice:
   the Authority Service now stores and validates immutable ordered chains,
   atomically reserves authority-owned fan-out and component-wise subtree budgets,

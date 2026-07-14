@@ -561,7 +561,7 @@ Validate distributed/fleet execution using explicit identities, node/instance re
 
 ## Use case
 
-A central manager dispatches a signed data-local work order to a resident VPC node. The VPC node executes the run, sends a typed remote message to a cloud helper for a non-authoritative proposal, exports a state snapshot, simulates interruption, resumes on a compatible node from an explicit state reference, and syncs traces to the central trace index.
+A central manager dispatches a signed data-local work order to a resident VPC node. The VPC node executes the run, sends a typed remote message to a cloud helper for a non-authoritative proposal, and exports a state snapshot. A compatible resident receiver prepares its own state, rejects import because v0 lacks accepted source-authenticated proof, preserves its state unchanged, and the fleet syncs traces to the central trace index.
 
 ## Components exercised
 
@@ -601,7 +601,7 @@ A central manager dispatches a signed data-local work order to a resident VPC no
 7. VPC node sends a remote typed message to cloud helper requesting a proposal.
 8. Cloud helper returns a proposal message without authority to mutate data or act.
 9. VPC node commits state and exports explicit state snapshot reference.
-10. Simulate interruption and resume on a compatible resident node after state-head validation.
+10. Attempt import on a compatible resident node; require `state_handoff_proof_unavailable`/`needs_intervention` before store/state/trace mutation and verify the receiver head is unchanged.
 11. Local trace buffers sync to central trace aggregation without losing ordering or integrity.
 12. Fleet telemetry reports health, run status, quota use, and trace sync status.
 
@@ -612,7 +612,7 @@ A central manager dispatches a signed data-local work order to a resident VPC no
 - Capability mismatch gives a deterministic rejection reason.
 - Duplicate remote message with same idempotency marker is not double-applied.
 - Remote message delivery failure is trace-linked and does not mutate remote state directly.
-- State handoff with wrong state hash or wrong tenant/run binding is rejected.
+- Hash-valid fabricated and hash-tampered handoffs cannot bypass the missing-source-proof denial; a wrong-run request is rejected before mutation.
 - Telemetry cannot authorize work-order dispatch, action execution, or placement.
 
 ## Required trace evidence
@@ -625,16 +625,13 @@ A central manager dispatches a signed data-local work order to a resident VPC no
 - placement.evaluated
 - run.dispatched
 - remote_message.sent / delivered / failed
-- run.interrupted
 - state.exported
-- state.imported / rejected
-- run.resumed
 - trace.sync.started / completed / failed
 - telemetry.reported
 
 ## Replay/audit evidence
 
-- Replay reconstructs run interruption/resume, state handoff, remote message causality, and denial reasons without re-executing remote side effects.
+- Replay reconstructs the export boundary, remote message causality, and denial reasons without re-executing remote side effects. Resident proof denial itself creates no run-trace mutation.
 
 ## Container command
 
@@ -1126,7 +1123,7 @@ A central manager receives a signed work order for a governed field-intelligence
 - external publication requires approval;
 - a circuit breaker and kill switch are tested on separate controlled branches;
 - traces aggregate centrally;
-- state handoff/resume occurs once;
+- state handoff export occurs once, resident import fails closed without source proof, receiver state remains unchanged, and the receiver resumes only from its own state;
 - audit/replay explains the full journey without side effects.
 
 This is not an enterprise product demo. It is a kernel acceptance journey that uses the full component surface while keeping external systems deterministic and simulated.
@@ -1176,7 +1173,7 @@ All available components in the acceptance topology:
 9. Edge node validates cloud proposal locally, performs bounded high-level inspection through device simulator, buffers traces during a network partition, and syncs after reconnect.
 10. Orchestrator collects typed messages, commits state, and creates internal artifact.
 11. External publication pauses for approval, receives scoped approval, and executes once.
-12. Simulate run interruption and state handoff/resume.
+12. Export state, prove resident import denial before mutation, then resume the receiver from its own committed state.
 13. Aggregate traces and telemetry centrally.
 14. Export audit package and run inspect-only replay.
 

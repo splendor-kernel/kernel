@@ -110,8 +110,9 @@ S4_REQUIRED_NEGATIVES = {
     "remote_message_delivery_failure",
     "unsupported_remote_message_schema",
     "unauthorized_remote_message_recipient",
-    "state_handoff_wrong_tenant_rejected",
-    "state_handoff_wrong_hash_rejected",
+    "resident_state_handoff_proof_unavailable",
+    "hash_valid_fabricated_handoff_proof_unavailable",
+    "state_handoff_wrong_hash_not_evaluated_without_proof",
     "state_handoff_wrong_run_rejected",
     "receiver_state_unchanged_on_failed_import",
     "trace_sync_idempotent_duplicate",
@@ -427,7 +428,7 @@ S10_REQUIRED_POSITIVES = {
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
     "external_publication_approval_gated_and_executed_once",
-    "state_handoff_imported_and_resumed_once",
+    "resident_state_handoff_denied_without_source_proof_and_receiver_resumed",
     "central_trace_aggregation_completed",
     "audit_and_replay_explain_without_side_effects",
 }
@@ -464,7 +465,6 @@ S10_REQUIRED_EVENTS = {
     "artifact.publish.executed",
     "state.committed",
     "state.exported",
-    "state.imported",
     "run.resumed",
     "trace.sync.completed",
     "replay.explained",
@@ -604,7 +604,6 @@ S10_RESPONSE_EVENT_ORIGINALS = {
     "cloud_helper.proposal.received": {"sendMessage"},
     "approval.granted": {"grantApproval"},
     "state.exported": {"exportStateSnapshot"},
-    "state.imported": {"importStateSnapshot"},
     "trace.sync.completed": {"syncTraceBuffer", "syncDeviceTraceBuffer"},
     "governance.audit.exported": {"exportGovernanceAudit"},
 }
@@ -1866,12 +1865,17 @@ def load_s4_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if remote.get("unauthorized_recipient", {}).get("status") != 403:
         failures.append("s4_unauthorized_recipient_not_rejected")
     handoff = read_json(artifact_dir / "state-handoff-report.json")
-    if not handoff.get("exported", {}).get("handoff") or handoff.get("imported", {}).get("accepted") is not True:
-        failures.append("s4_state_handoff_export_import_missing")
-    if handoff.get("rejected", {}).get("status") not in {400, 403}:
-        failures.append("s4_bad_state_handoff_not_rejected")
-    if handoff.get("wrong_hash", {}).get("status") != 403:
-        failures.append("s4_wrong_hash_handoff_not_rejected")
+    import_denied = handoff.get("resident_import_denied", {})
+    if not handoff.get("exported", {}).get("handoff"):
+        failures.append("s4_state_handoff_export_missing")
+    if import_denied.get("status") != 503 or import_denied.get("body", {}).get("code") != "state_handoff_proof_unavailable":
+        failures.append("s4_resident_handoff_import_not_denied_without_source_proof")
+    if import_denied.get("body", {}).get("details", {}).get("disposition") != "needs_intervention":
+        failures.append("s4_resident_handoff_denial_missing_intervention_disposition")
+    if handoff.get("hash_valid_fabricated", {}).get("status") != 503:
+        failures.append("s4_hash_valid_fabricated_handoff_not_denied")
+    if handoff.get("wrong_hash", {}).get("status") != 503:
+        failures.append("s4_wrong_hash_handoff_reached_validation_without_source_proof")
     if handoff.get("wrong_run", {}).get("status") not in {400, 404}:
         failures.append("s4_wrong_run_handoff_not_rejected")
     if handoff.get("receiver_unchanged_on_failed_import") is not True:
@@ -3085,9 +3089,14 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if edge.get("inspect_zone", {}).get("status") != "Executed" or edge.get("device_trace_sync", {}).get("accepted") is not True:
         failures.append("s10_edge_inspection_or_trace_sync_missing")
     state = read_json(artifact_dir / "state-handoff-report.json")
-    if state.get("imported", {}).get("accepted") is not True or state.get("cloud_resume", {}).get("status") not in {"running", "waiting_for_approval", "completed"}:
-        failures.append("s10_state_handoff_resume_missing")
-    if state.get("tampered_state_import", {}).get("status") != 403:
+    import_denied = state.get("resident_import_denied", {})
+    if import_denied.get("status") != 503 or import_denied.get("body", {}).get("code") != "state_handoff_proof_unavailable":
+        failures.append("s10_resident_state_handoff_not_denied_without_source_proof")
+    if state.get("receiver_unchanged_on_import_denial") is not True:
+        failures.append("s10_resident_handoff_denial_mutated_receiver_state")
+    if state.get("cloud_resume", {}).get("status") not in {"running", "waiting_for_approval", "completed"}:
+        failures.append("s10_receiver_own_state_resume_missing")
+    if state.get("tampered_state_import", {}).get("status") != 503:
         failures.append("s10_tampered_state_import_not_rejected")
     trace_sync = read_json(artifact_dir / "trace-sync-report.json")
     for key in ["vpc", "edge", "cloud"]:

@@ -352,9 +352,6 @@ def main() -> int:
     unauthorized_message = {**message, "message": {**message["message"], "message_id": "55555555-5555-4555-8555-555555555558", "target_agent_id": AGENT_ID}}
     unauthorized_remote = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(cred), "work_order_id": MESSAGE_WORK_ORDER_ID, "message_envelope": unauthorized_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "proposal-unauthorized", "simulate_failure": None})
 
-    vpc_export_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["state_handoff"])
-    vpc_export_cred = vpc_export_auth["credential"]
-    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_export_cred, "audit_attribution": audit(vpc_export_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID, "previous_state_node_id": None}, credential_header(vpc_export_auth))
     cloud_create_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_create"])
     cloud_create_cred = cloud_create_auth["credential"]
     cloud_work_order_id = envelope.get("work_order_id") or envelope.get("work_order", {}).get("work_order_id", WORK_ORDER_ID)
@@ -364,14 +361,21 @@ def main() -> int:
     cloud_create_cred = cloud_create_auth["credential"]
     cloud_create = {**cloud_create, "work_order": cloud_envelope, "credential": cloud_create_cred, "audit_attribution": audit(cloud_create_cred)}
     call("createRun", "POST", args.cloud_url, "/runs", cloud_create, credential_header(cloud_create_auth))
-    cloud_import_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
-    cloud_import_cred = cloud_import_auth["credential"]
-    imported = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "work_order": cloud_envelope, "credential": cloud_import_cred, "audit_attribution": audit(cloud_import_cred)}, credential_header(cloud_import_auth))
+    cloud_start_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_start"])
+    cloud_start_cred = cloud_start_auth["credential"]
+    cloud_start = call("startRun", "POST", args.cloud_url, f"/runs/{run_id}/start", {"credential": cloud_start_cred, "work_order": None, "audit_attribution": audit(cloud_start_cred), "reason": "prepare fail-closed handoff receiver", "approval_evidence": None}, credential_header(cloud_start_auth))
     cloud_state_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_read"])
     state_before_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
+    vpc_export_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["state_handoff"])
+    vpc_export_cred = vpc_export_auth["credential"]
+    exported = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": run_id, "credential": vpc_export_cred, "audit_attribution": audit(vpc_export_cred), "work_order_id": WORK_ORDER_ID, "source_instance_id": VPC_INSTANCE_ID, "receiver_instance_id": CLOUD_INSTANCE_ID, "previous_state_node_id": state_before_failed_import["body"].get("state_node_id")}, credential_header(vpc_export_auth))
+    cloud_import_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
+    cloud_import_cred = cloud_import_auth["credential"]
+    import_denied = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": exported["body"].get("handoff"), "work_order": cloud_envelope, "credential": cloud_import_cred, "audit_attribution": audit(cloud_import_cred)}, credential_header(cloud_import_auth))
     bad_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
     if bad_handoff:
-        bad_handoff["authority"]["tenant_id"] = "99999999-9999-4999-8999-999999999999"
+        bad_handoff["handoff_id"] = "fabricated-hash-valid-handoff"
+        bad_handoff["source_trace_id"] = "99999999-9999-4999-8999-999999999999"
     wrong_handoff_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     wrong_handoff_cred = wrong_handoff_auth["credential"]
     wrong_handoff = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": bad_handoff, "work_order": cloud_envelope, "credential": wrong_handoff_cred, "audit_attribution": audit(wrong_handoff_cred)}, credential_header(wrong_handoff_auth))
@@ -449,8 +453,9 @@ def main() -> int:
         neg("remote_message_delivery_failure", failed_remote["body"].get("delivery_status") == "failed", status=failed_remote["body"].get("delivery_status")),
         neg("unsupported_remote_message_schema", unsupported_remote["status"] == 400 and unsupported_remote["body"].get("code") == "unsupported_message_schema", status=unsupported_remote["status"], code=unsupported_remote["body"].get("code")),
         neg("unauthorized_remote_message_recipient", unauthorized_remote["status"] == 403 and unauthorized_remote["body"].get("code") == "unauthorized_recipient", status=unauthorized_remote["status"], code=unauthorized_remote["body"].get("code")),
-        neg("state_handoff_wrong_tenant_rejected", wrong_handoff["status"] == 403 and wrong_handoff["body"].get("code") == "state_handoff_authority_mismatch", status=wrong_handoff["status"], code=wrong_handoff["body"].get("code")),
-        neg("state_handoff_wrong_hash_rejected", wrong_hash["status"] == 403 and wrong_hash["body"].get("code") == "state_handoff_rejected", status=wrong_hash["status"], code=wrong_hash["body"].get("code")),
+        neg("resident_state_handoff_proof_unavailable", import_denied["status"] == 503 and import_denied["body"].get("code") == "state_handoff_proof_unavailable" and import_denied["body"].get("details", {}).get("disposition") == "needs_intervention", status=import_denied["status"], code=import_denied["body"].get("code")),
+        neg("hash_valid_fabricated_handoff_proof_unavailable", wrong_handoff["status"] == 503 and wrong_handoff["body"].get("code") == "state_handoff_proof_unavailable", status=wrong_handoff["status"], code=wrong_handoff["body"].get("code")),
+        neg("state_handoff_wrong_hash_not_evaluated_without_proof", wrong_hash["status"] == 503 and wrong_hash["body"].get("code") == "state_handoff_proof_unavailable", status=wrong_hash["status"], code=wrong_hash["body"].get("code")),
         neg("state_handoff_wrong_run_rejected", wrong_run["status"] in {400, 404}, status=wrong_run["status"], code=wrong_run["body"].get("code")),
         neg("receiver_state_unchanged_on_failed_import", receiver_unchanged, before=state_before_failed_import["body"].get("state_node_id"), after=state_after_failed_import["body"].get("state_node_id")),
         neg("trace_sync_idempotent_duplicate", sync_duplicate["body"].get("duplicate_records", 0) >= len(records), duplicate_records=sync_duplicate["body"].get("duplicate_records")),
@@ -469,7 +474,7 @@ def main() -> int:
         "dispatch_started_resident_run": dispatch["body"].get("create_run_status") in {200, 201} and dispatch["body"].get("start_run_status") in {200, 201},
         "remote_message_delivered": remote["body"].get("delivery_status") == "delivered" and remote["body"].get("recipient_validated") is True and remote["body"].get("work_order_authority_validated") is True and remote["body"].get("route_permission") == f"message.remote.proposal:{HELPER_AGENT_ID}" and remote["body"].get("remote_state_mutated") is False,
         "remote_message_received_publicly": received["status"] == 200 and received["body"].get("receive_side_validated") is True,
-        "state_handoff_imported": imported["body"].get("accepted") is True,
+        "resident_state_handoff_denied_without_source_proof": import_denied["status"] == 503 and import_denied["body"].get("code") == "state_handoff_proof_unavailable" and receiver_unchanged,
         "trace_sync_accepted": sync["body"].get("accepted_records", 0) > 0,
         "telemetry_observational": telemetry["body"].get("authority") == "observational_only",
         "replay_public_api": replay["status"] == 200 and replay["body"].get("mode") == "inspect_only",
@@ -482,7 +487,7 @@ def main() -> int:
         "status": "passed" if not scenario_failures else "failed",
         "fr_coverage": ["FR-0.03-02", "FR-0.03-04", "FR-0.03-05", "FR-0.03-08", "FR-0.03-09", "FR-0.03-10", "FR-0.03-11"],
         "components": ["central-manager", "resident-daemon", "fleet", "work-order", "placement", "remote-message", "state-handoff", "trace-sync", "fleet-telemetry", "replay/audit"],
-        "positive_evidence": ["registered VPC and cloud nodes", "narrow signed dispatch and message work orders accepted", "VPC placement selected", "manager dispatched to resident daemon over verified TLS", "per-instance work-order key isolation rejected VPC authority at the cloud sibling", "remote proposal message delivered", "state snapshot exported/imported", "trace buffer synced", "telemetry reported observational-only"],
+        "positive_evidence": ["registered VPC and cloud nodes", "narrow signed dispatch and message work orders accepted", "VPC placement selected", "manager dispatched to resident daemon over verified TLS", "per-instance work-order key isolation rejected VPC authority at the cloud sibling", "remote proposal message delivered", "state snapshot exported while resident import failed closed without source proof and preserved receiver state", "trace buffer synced", "telemetry reported observational-only"],
         "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True],
         "replay_evidence": ["resident replayRun public API returned inspect_only replay over exported trace evidence without side effects"],
         "replay_mode": "inspect_only",
@@ -491,7 +496,7 @@ def main() -> int:
         "anti_drift_checks": ["same_runtime_image_for_splendor_instances", "public_manager_and_resident_https_used", "ephemeral_acceptance_keys_only", "telemetry_non_authoritative", "no_per_node_custom_images", "no_private_rust_helper_only_demo"],
         "run_ids": [run_id],
         "trace_event_ids": sorted({tid for ids in event_ids.values() for tid in ids if tid}),
-        "state_node_ids": [exported["body"].get("state_node_id", ""), imported["body"].get("state_node_id", "")],
+        "state_node_ids": [exported["body"].get("state_node_id", ""), state_before_failed_import["body"].get("state_node_id", "")],
         "state_hashes": [exported["body"].get("handoff", {}).get("snapshot", {}).get("state_hash", {}).get("value", "")],
         "message_ids": [message["message"]["message_id"], duplicate_message["message"]["message_id"], failed_message["message"]["message_id"]],
         "work_order_ids": [WORK_ORDER_ID, MESSAGE_WORK_ORDER_ID],
@@ -514,10 +519,10 @@ def main() -> int:
         "placement-decision.json": placement["body"],
         "dispatch-report.json": dispatch["body"],
         "remote-message-report.json": {"delivered": remote["body"], "received": received["body"], "duplicate": duplicate["body"], "failed": failed_remote["body"], "unsupported_schema": unsupported_remote, "unauthorized_recipient": unauthorized_remote},
-        "state-handoff-report.json": {"exported": exported["body"], "imported": imported["body"], "rejected": wrong_handoff, "wrong_hash": wrong_hash, "wrong_run": wrong_run, "receiver_state_before_failed_import": state_before_failed_import["body"], "receiver_state_after_failed_import": state_after_failed_import["body"], "receiver_unchanged_on_failed_import": receiver_unchanged},
+        "state-handoff-report.json": {"exported": exported["body"], "resident_import_denied": import_denied, "hash_valid_fabricated": wrong_handoff, "wrong_hash": wrong_hash, "wrong_run": wrong_run, "receiver_start": cloud_start["body"], "receiver_state_before_failed_import": state_before_failed_import["body"], "receiver_state_after_failed_import": state_after_failed_import["body"], "receiver_unchanged_on_failed_import": receiver_unchanged},
         "trace-sync-report.json": {**sync["body"], "duplicate_sync": sync_duplicate["body"], "tampered_sync": sync_tampered},
         "fleet-telemetry.json": telemetry["body"],
-        "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "remote_messages_resent": False, "derived_from_public_replay_api": True, "reconstructed": ["run.dispatched", "remote_message.delivered", "remote_message.duplicate", "remote_message.failed", "state.exported", "state.imported", "state.rejected", "trace.sync.completed"], "denial_reasons": [item["case"] for item in negatives if item.get("passed") is True]},
+        "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "remote_messages_resent": False, "derived_from_public_replay_api": True, "reconstructed": ["run.dispatched", "remote_message.delivered", "remote_message.duplicate", "remote_message.failed", "state.exported", "trace.sync.completed"], "denial_reasons": [item["case"] for item in negatives if item.get("passed") is True]},
         "audit-report.json": {"events": audit_events, "negative_cases": negatives},
         "anti-drift-results.json": {"status": "passed" if not scenario_failures else "failed", "same_image_fleet": same_image_evidence.get("all_same") is True, "private_helper_only_e2e": False, "telemetry_authorizes_dispatch": False, "gateway_bypass": False, "replay_side_effects_allowed_default": False},
         "stdout.log": "UC-E2E-S4 fleet dispatch scenario completed through public manager and verified-TLS resident APIs\n",

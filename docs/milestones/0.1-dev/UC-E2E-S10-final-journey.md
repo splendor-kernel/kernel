@@ -9,7 +9,7 @@ Validate the final `0.1-dev` use-case acceptance journey after prior UC-E2E scen
 - Adds `tests/e2e/use-cases/scenarios/uc_e2e_s10_final_journey/run.py` as the S10 scenario runner.
 - Runs after S1-S9 when invoked directly and as part of `--all`.
 - Uses public manager, daemon, edge-device, device simulator, `splendorctl work-order sign`, contract, trace/state export, telemetry, governance audit, and replay surfaces.
-- Requires machine-readable evidence for API contract status, topology hash, signed work-order placement, data-local analysis, typed specialist response, proposal-only cloud helper, bounded edge inspection, approval-gated publication, one state handoff/resume, central trace aggregation, replay/audit, controlled negative branches, anti-drift results, and FR/primitive coverage.
+- Requires machine-readable evidence for API contract status, topology hash, signed work-order placement, data-local analysis, typed specialist response, proposal-only cloud helper, bounded edge inspection, approval-gated publication, state-handoff export plus fail-closed resident import with unchanged receiver state, receiver resume from its own state, central trace aggregation, replay/audit, controlled negative branches, anti-drift results, and FR/primitive coverage.
 - Updates report aggregation so S10 remains failed unless required artifacts, IDs, events, positives, negatives, replay suppression, and coverage matrix evidence are present.
 
 ## Non-Goals
@@ -37,7 +37,7 @@ Validate the final `0.1-dev` use-case acceptance journey after prior UC-E2E scen
 | Fleet/node identity | validates node and instance registration, capabilities, placement, dispatch, telemetry, and audit attribution |
 | Message | validates typed specialist task request/response and cloud-helper proposal messages with duplicate non-double-apply evidence |
 | Gateway/verifier/adapter | validates data, artifact, governance, and device actions remain mediated by public gateway/API calls |
-| State graph | validates explicit state export/import, state hash evidence, and one resume after handoff |
+| State graph | validates explicit export, resident proof-unavailable denial before mutation, unchanged receiver state, and resume from the receiver's own state |
 | Trace store | validates central trace aggregation, required event IDs, tamper rejection, and trace/state export paths |
 | Approval/governance | validates external publication pause/grant/execute-once, expired approval denial, circuit breaker, kill switch, and audit export |
 | Physical/edge | validates high-level bounded inspection through the simulator and raw physical action rejection |
@@ -62,7 +62,6 @@ S10 requires evidence for:
 - `artifact.publish.executed`
 - `state.committed`
 - `state.exported`
-- `state.imported`
 - `run.resumed`
 - `trace.sync.completed`
 - `replay.explained`
@@ -91,7 +90,7 @@ S10 includes independent negative branches for invalid work order, unauthorized 
 | message | Prove typed specialist/cloud helper causality | `message-flow.json`, `manager-audit-export.json` |
 | governance | Prove approval/circuit-breaker/kill-switch branches | `artifact-publication-report.json`, `governance-branches.json` |
 | physical/edge | Prove bounded simulator execution and raw-action denial | `edge-inspection-report.json` |
-| state/trace | Prove handoff, resume, trace sync, and tamper rejection | `state-handoff-report.json`, `trace-sync-report.json`, `trace-export.jsonl`, `state-export.json` |
+| state/trace | Prove export, resident proof denial without receiver mutation, receiver-own-state resume, trace sync, and tamper rejection | `state-handoff-report.json`, `trace-sync-report.json`, `trace-export.jsonl`, `state-export.json` |
 | replay/audit | Prove no replay side effects and explainability | `replay-report.json`, `audit-package.json`, `audit-report.json` |
 | coverage | Prove FR and primitive coverage | `fr-primitive-coverage-matrix.json`, `anti-drift-results.json` |
 

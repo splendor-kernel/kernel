@@ -476,7 +476,7 @@ State handoff event variants correspond to these canonical event classes:
 | Rust variant | Canonical event class | Purpose |
 | --- | --- | --- |
 | `StateHandoffExported` | `state.handoff.exported` | Source exported a snapshot handoff. |
-| `StateHandoffImported` | `state.handoff.imported` | Receiver imported a validated snapshot. |
+| `StateHandoffImported` | `state.handoff.imported` | Explicit local-dev/lower-level receiver imported a validated snapshot. |
 | `StateHandoffImportFailed` | `state.handoff.import_failed` | Receiver failed closed before changing state head. |
 | `ReadOnlyStateReferenced` | `state.reference.read_only` | Receiver attached an immutable state reference. |
 
@@ -492,7 +492,12 @@ All state handoff events carry `StateHandoffTraceContext`:
 | `previous_state_node_id` | Receiver head expected before import/reference. |
 | `receiver_state_node_id` | Receiver-owned node after successful import. |
 | `snapshot_id` | Snapshot ID verified from state bytes. |
-| `source_trace_id` | Source event proving the export/reference boundary. |
+| `source_trace_id` | Source-declared export/reference linkage; v0 does not authenticate source-event existence. |
+
+Resident/non-dev daemon import does not emit `StateHandoffImported` or
+`StateHandoffImportFailed`: it returns `state_handoff_proof_unavailable` before
+the state owner or run trace is mutated. Accepted source event/evidence proof is a
+future EVT-005/EVID-005 dependency.
 
 ### TraceIntegrity
 

@@ -100,7 +100,7 @@ REQUIRED_POSITIVES = {
     "edge_bounded_inspection_executed",
     "internal_artifact_created",
     "external_publication_approval_gated_and_executed_once",
-    "state_handoff_imported_and_resumed_once",
+    "resident_state_handoff_denied_without_source_proof_and_receiver_resumed",
     "central_trace_aggregation_completed",
     "audit_and_replay_explain_without_side_effects",
 }
@@ -121,7 +121,6 @@ REQUIRED_EVENTS = {
     "artifact.publish.executed",
     "state.committed",
     "state.exported",
-    "state.imported",
     "run.resumed",
     "trace.sync.completed",
     "replay.explained",
@@ -1103,10 +1102,13 @@ def main() -> int:
     specialist_escalation = call("submitAction", "POST", args.vpc_url, "/actions", {"run_id": SPECIALIST_RUN, "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "causal_trace_id": task_sent["body"].get("trace_event_id"), "action": action("artifact.publish_external", "artifact.publish_external", "External", publish_ref=EXTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
 
     state_before = call("getStateHead", "GET", args.vpc_url, f"/runs/{ORCH_RUN}/state-head", headers=credential_header(vpc_cred))
-    handoff_export = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": ORCH_RUN, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ORCH, "source_instance_id": VPC_INSTANCE, "receiver_instance_id": CLOUD_INSTANCE, "previous_state_node_id": None})
     cloud_create = call("createRun", "POST", args.cloud_url, "/runs", create_run_payload(run_id=ORCH_RUN, agent_id=ORCH_AGENT, envelope=orch_envelope, credential=cloud_cred, initial_state={"resume_target": "cloud"}))
+    cloud_start = call("startRun", "POST", args.cloud_url, f"/runs/{ORCH_RUN}/start", {"credential": cloud_cred, "work_order": None, "audit_attribution": audit(cloud_cred), "reason": "s10_prepare_fail_closed_handoff_receiver", "approval_evidence": None})
+    cloud_state_before_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{ORCH_RUN}/state-head", headers=credential_header(cloud_cred))
     cloud_pause = call("pauseRun", "POST", args.cloud_url, f"/runs/{ORCH_RUN}/pause", {"credential": cloud_cred, "audit_attribution": audit(cloud_cred), "reason": "s10_state_handoff_pause_before_import"})
+    handoff_export = call("exportStateSnapshot", "POST", args.vpc_url, "/state-snapshots/export", {"run_id": ORCH_RUN, "credential": vpc_cred, "audit_attribution": audit(vpc_cred), "work_order_id": WORK_ORDER_ORCH, "source_instance_id": VPC_INSTANCE, "receiver_instance_id": CLOUD_INSTANCE, "previous_state_node_id": cloud_state_before_import["body"].get("state_node_id")})
     handoff_import = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": handoff_export["body"].get("handoff"), "work_order": orch_envelope, "credential": cloud_cred, "audit_attribution": audit(cloud_cred)})
+    cloud_state_after_import_denial = call("getStateHeadAfterImportDenial", "GET", args.cloud_url, f"/runs/{ORCH_RUN}/state-head", headers=credential_header(cloud_cred))
     bad_handoff = copy.deepcopy(handoff_export["body"].get("handoff", {}))
     if bad_handoff:
         bad_handoff.setdefault("snapshot", {}).setdefault("state_hash", {})["value"] = "0" * 64
@@ -1175,7 +1177,6 @@ def main() -> int:
     add_event_evidence(event_evidence, "cloud_helper.proposal.received", trace_event_id=cloud_delivery["body"].get("trace_event_id"), source="public_api_response", original_event_type="sendMessage", artifact="cloud-helper-report.json", run_id=CLOUD_HELPER_RUN, message_id=CLOUD_MESSAGE_ID, work_order_id=WORK_ORDER_CLOUD_HELPER, details={"delivery_status": cloud_delivery["body"].get("delivery_status"), "proposal_id": ROUTE_PROPOSAL_ID})
     add_event_evidence(event_evidence, "approval.granted", trace_event_id=approval_grant["body"].get("trace_event_id"), source="public_api_response", original_event_type="grantApproval", artifact="artifact-publication-report.json", run_id=ORCH_RUN, action_id=approval_context.get("action_id"), approval_id=approval_context.get("approval_id"), details={"status": approval_grant["body"].get("status")})
     add_event_evidence(event_evidence, "state.exported", trace_event_id=handoff_export["body"].get("trace_event_id"), source="public_api_response", original_event_type="exportStateSnapshot", artifact="state-handoff-report.json", run_id=ORCH_RUN, work_order_id=WORK_ORDER_ORCH, state_node_id=handoff_export["body"].get("state_node_id"), details={"source_instance_id": VPC_INSTANCE, "receiver_instance_id": CLOUD_INSTANCE})
-    add_event_evidence(event_evidence, "state.imported", trace_event_id=handoff_import["body"].get("trace_event_id"), source="public_api_response", original_event_type="importStateSnapshot", artifact="state-handoff-report.json", run_id=ORCH_RUN, work_order_id=WORK_ORDER_ORCH, state_node_id=handoff_import["body"].get("state_node_id"), details={"accepted": handoff_import["body"].get("accepted")})
     for label, response, run_id, node_id, instance_id in [
         ("vpc", trace_sync_vpc, ORCH_RUN, VPC_NODE, VPC_INSTANCE),
         ("edge", trace_sync_edge, EDGE_RUN, EDGE_NODE, EDGE_INSTANCE),
@@ -1206,7 +1207,7 @@ def main() -> int:
         {"case": "expired_approval_rejected", "passed": expired_approval["body"].get("status") == "Denied" and expired_approval["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "expired", "status": expired_approval["body"].get("status")},
         {"case": "circuit_breaker_blocks_matching_publish_attempt", "passed": breaker_payload["status"] == 200 and breaker_sync["body"].get("accepted") is True and breaker_block["body"].get("status") == "Denied", "status": breaker_block["body"].get("status")},
         {"case": "kill_switch_cancels_separate_run", "passed": kill_switch["body"].get("propagation_acknowledged") is True and kill_switch["body"].get("cancel_status") == 200 and kill_switch["body"].get("target_derived_from_registry") is True, "cancel_status": kill_switch["body"].get("cancel_status")},
-        {"case": "tampered_trace_state_import_rejected", "passed": trace_sync_tampered["status"] == 403 and tampered_state_import["status"] == 403, "trace_status": trace_sync_tampered["status"], "state_status": tampered_state_import["status"]},
+        {"case": "tampered_trace_state_import_rejected", "passed": trace_sync_tampered["status"] == 403 and tampered_state_import["status"] == 503 and tampered_state_import["body"].get("code") == "state_handoff_proof_unavailable", "trace_status": trace_sync_tampered["status"], "state_status": tampered_state_import["status"], "state_code": tampered_state_import["body"].get("code")},
         {"case": "replay_side_effect_mode_rejected_by_default", "passed": unsafe_replay["status"] in {400, 403} and replay_counts_before == replay_counts_after, "status": unsafe_replay["status"]},
     ]
     contract_report = read_json(report_dir / "contract-status.json")
@@ -1224,7 +1225,7 @@ def main() -> int:
         "edge_bounded_inspection_executed": device_register["status"] == 200 and device_status["status"] == 200 and policy_cache["body"].get("loaded") is True and inspect_zone["body"].get("status") == "Executed" and waypoint["body"].get("status") == "Executed" and all(item.get("total_delta") == item.get("expected_sim_delta") for item in simulator_evidence),
         "internal_artifact_created": internal_artifact["body"].get("status") == "Executed" and internal_evidence.get("artifact_path") == INTERNAL_ARTIFACT and bool(internal_evidence.get("trace_event_id")),
         "external_publication_approval_gated_and_executed_once": publish_needs_approval["body"].get("status") == "NeedsApproval" and approval_request["status"] == 200 and approval_grant["body"].get("status") == "granted" and approved_publish["body"].get("status") == "Executed" and len(orch_publish_executions) == 1 and bool(publish_evidence.get("trace_event_id")),
-        "state_handoff_imported_and_resumed_once": handoff_export["status"] == 200 and cloud_create["status"] == 200 and cloud_pause["status"] == 200 and handoff_import["body"].get("accepted") is True and cloud_resume["status"] == 200 and bool(state_after["body"].get("state_node_id")),
+        "resident_state_handoff_denied_without_source_proof_and_receiver_resumed": handoff_export["status"] == 200 and cloud_create["status"] == 200 and cloud_start["status"] == 200 and cloud_pause["status"] == 200 and handoff_import["status"] == 503 and handoff_import["body"].get("code") == "state_handoff_proof_unavailable" and handoff_import["body"].get("details", {}).get("disposition") == "needs_intervention" and cloud_state_before_import["body"].get("state_node_id") == cloud_state_after_import_denial["body"].get("state_node_id") and cloud_resume["status"] == 200 and bool(state_after["body"].get("state_node_id")),
         "central_trace_aggregation_completed": trace_sync_vpc["body"].get("accepted_records", 0) > 0 and trace_sync_edge["body"].get("accepted_records", 0) > 0 and trace_sync_cloud["body"].get("accepted_records", 0) > 0 and telemetry["body"].get("authority") == "observational_only",
         "audit_and_replay_explain_without_side_effects": replay_orch["body"].get("mode") == "inspect_only" and replay_edge["body"].get("mode") == "inspect_only" and replay_counts_before == replay_counts_after and governance_audit["body"].get("exported") is True,
     }
@@ -1237,7 +1238,7 @@ def main() -> int:
     topology_path = root / "tests" / "e2e" / "use-cases" / "docker-compose.acceptance.yml"
     topology = {"compose_file": str(topology_path), "topology_hash": digest_file(topology_path), "services": ["central-manager", "resident-vpc-node", "resident-cloud-node", "resident-edge-node", "device-sim", "e2e-runner"]}
     trace_event_ids = sorted({tid for values in event_ids.values() for tid in values if tid} | {trace_id(record) for record in records if trace_id(record)})
-    state_node_ids = sorted({state_before["body"].get("state_node_id", ""), handoff_export["body"].get("state_node_id", ""), handoff_import["body"].get("state_node_id", ""), state_after["body"].get("state_node_id", ""), cloud_resume["body"].get("state_node_id", "")})
+    state_node_ids = sorted({state_before["body"].get("state_node_id", ""), handoff_export["body"].get("state_node_id", ""), cloud_state_before_import["body"].get("state_node_id", ""), cloud_state_after_import_denial["body"].get("state_node_id", ""), state_after["body"].get("state_node_id", ""), cloud_resume["body"].get("state_node_id", "")})
     state_hashes = sorted({state_before["body"].get("data_hash", ""), state_after["body"].get("data_hash", ""), handoff_export["body"].get("handoff", {}).get("snapshot", {}).get("state_hash", {}).get("value", "")})
     action_ids = collect_action_ids(records, [data_analysis, specialist_data, helper_publish_denial, inspect_zone, waypoint, cloud_direct_denial, internal_artifact, publish_needs_approval, approved_publish, expired_approval, unauthorized_data, specialist_escalation, breaker_block])
     artifact_ids = sorted(value for value in {INTERNAL_ARTIFACT, EXTERNAL_ARTIFACT, internal_evidence.get("artifact_path") or "", publish_evidence.get("artifact_path") or ""} if value)
@@ -1393,7 +1394,7 @@ def main() -> int:
         "artifact-publication-report.json": {"internal_artifact": internal_artifact["body"], "internal_artifact_evidence": internal_evidence, "publish_needs_approval": publish_needs_approval["body"], "approval_request": approval_request["body"], "approval_grant": approval_grant["body"], "approved_publish": approved_publish["body"], "approved_publish_evidence": publish_evidence, "expired_approval": expired_approval["body"], "publish_execution_count_for_positive_run": len(orch_publish_executions)},
         "cloud-helper-report.json": {"proposal": cloud_proposal, "delivery": cloud_delivery["body"], "read": cloud_read["body"], "duplicate": duplicate_delivery["body"], "publish_denial": helper_publish_denial["body"], "device_direct_denial": cloud_direct_denial["body"]},
         "edge-inspection-report.json": {"device_profile": device_register["body"], "start": edge_start["body"], "inspect_zone": inspect_zone["body"], "move_to_waypoint": waypoint["body"], "offline_sensor": offline_sensor["body"], "upload_summary": upload_summary["body"], "device_trace_sync": device_trace_sync["body"], "simulator_evidence": simulator_evidence},
-        "state-handoff-report.json": {"exported": handoff_export["body"], "cloud_create": cloud_create["body"], "cloud_pause": cloud_pause["body"], "imported": handoff_import["body"], "tampered_state_import": tampered_state_import, "cloud_resume": cloud_resume["body"], "state_before": state_before["body"], "state_after": state_after["body"]},
+        "state-handoff-report.json": {"exported": handoff_export["body"], "cloud_create": cloud_create["body"], "cloud_start": cloud_start["body"], "cloud_pause": cloud_pause["body"], "resident_import_denied": handoff_import, "tampered_state_import": tampered_state_import, "cloud_resume": cloud_resume["body"], "source_state_before": state_before["body"], "receiver_state_before_import": cloud_state_before_import["body"], "receiver_state_after_import_denial": cloud_state_after_import_denial["body"], "receiver_unchanged_on_import_denial": cloud_state_before_import["body"].get("state_node_id") == cloud_state_after_import_denial["body"].get("state_node_id"), "receiver_state_after_resume": state_after["body"]},
         "trace-sync-report.json": {"vpc": trace_sync_vpc["body"], "vpc_specialist": trace_sync_vpc_spec["body"], "edge": trace_sync_edge["body"], "cloud": trace_sync_cloud["body"], "cloud_orchestrator": trace_sync_cloud_orch["body"], "device": device_trace_sync["body"], "tampered": trace_sync_tampered},
         "governance-branches.json": {"circuit_breaker": {"created": breaker["body"], "sync_payload": breaker_payload["body"], "synced": breaker_sync["body"], "blocked_action": breaker_block["body"], "run_create": cb_create["body"]}, "kill_switch": {"run_create": kill_create["body"], "activated": kill_switch["body"]}},
         "negative-branches.json": {item["case"]: item for item in negatives},

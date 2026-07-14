@@ -32,7 +32,7 @@ This matrix connects post-implementation use-case acceptance sprints to Splendor
 | --- | --- | --- |
 | `0.01-dev` | local loop, identities, percept-policy-constraint-gateway-verifier-adapter-outcome-state-trace, permissions/quotas, persistent state, append-only trace, replay, Python SDK, CLI | S1 is primary; S2 validates daemon/clients; S8 validates replay/compat; S9 validates failure; S10 validates aggregate. |
 | `0.02-dev` | message schema, local router, inbox/outbox, trace-linked messages, delegation, per-agent isolation, daemon API, TypeScript client, multi-agent replay | S3 is primary; S2 validates API/client; S7 validates shared specialist/data isolation; S8 validates replay; S10 validates aggregate. |
-| `0.03-dev` | distributed IDs, node/instance registry, capabilities, signed work orders, remote dispatch, heartbeat, trace aggregation, remote messages, state handoff, telemetry | S4 is primary; S8 validates trace/state import/export; S9 validates stale/failure behavior; S10 validates aggregate. |
+| `0.03-dev` | distributed IDs, node/instance registry, capabilities, signed work orders, remote dispatch, heartbeat, trace aggregation, remote messages, state handoff, telemetry | S4 is primary and proves resident export plus fail-closed import without source proof; S8 validates local trace/state import/export; S9 validates stale/failure behavior; S10 validates aggregate. |
 | `0.04-dev` | governance outcomes, approvals, pause/resume, escalation, circuit breakers, kill switch, policy TTL, external governance adapter, audit/replay | S5 is primary; S7 validates data/artifact approval; S8 validates audit/replay; S9 validates failure races; S10 validates aggregate. |
 | `0.05-dev` | device profiles, physical capability model, offline policy cache, local trace buffer, robotics adapter interface, high-level actions only, safety verifier, operator intervention, cloud-helper proposals | S6 is primary; S8 validates replay/audit; S9 validates offline/failure; S10 validates aggregate. |
 | `0.1-dev` | stable primitive specs, versioning, runtime compatibility, adapter maturity, conformance, migration, operational docs, hard invariant guarantees | S0, S2, S8, S9, and S10 are primary. |
@@ -56,7 +56,7 @@ This matrix connects post-implementation use-case acceptance sprints to Splendor
 | Verifier | S1 standard chain, S5 approval verifier, S6 safety verifier, S9 unavailable verifier. |
 | Adapter | S1 HTTP/FS, S5 artifact/governance, S6 device sim, S9 failure. |
 | Quota | S1 quota exhaustion, S3 per-agent ledger, S9 quota pressure. |
-| State graph | S1 commits, S4 handoff, S8 import/export/tamper, S10 aggregate. |
+| State graph | S1 commits, S4 resident export/proof denial, S8 local import/export/tamper, S10 aggregate. |
 | Trace store | S1 required events, S4 aggregation, S8 integrity/import, S10 aggregate. |
 | Message | S3 local typed messages, S4 remote messages, S7 shared specialist, S10 aggregate. |
 | Replay | S1 inspect-only, S3 causal graph, S5 governance explanation, S8 compatibility, S10 final. |

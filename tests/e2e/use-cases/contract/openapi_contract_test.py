@@ -313,6 +313,17 @@ def main() -> int:
         if marker not in text:
             failures.append(f"resident authentication contract missing marker: {marker}")
 
+    import_block = blocks.get("importStateSnapshot", "")
+    for marker in [
+        "'503':",
+        "state_handoff_proof_unavailable",
+        "needs_intervention",
+        "signed_source_handoff_manifest",
+        "No state-store, state-head, or run-trace mutation occurs",
+    ]:
+        if marker not in import_block:
+            failures.append(f"resident state import fail-closed contract missing marker: {marker}")
+
     schema_failures: list[str] = []
     schema_failures.extend(
         require_schema_fields(

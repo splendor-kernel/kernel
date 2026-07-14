@@ -221,6 +221,14 @@ impl DaemonState {
         }
     }
 
+    fn allows_experimental_local_state_handoff_import(&self) -> bool {
+        matches!(
+            &self.inner.expected_audience,
+            CredentialAudience::Daemon { .. }
+        ) && self.inner.caller_token_verifier.is_none()
+            && self.inner.insecure_dev_mode.is_some()
+    }
+
     fn record_resident_security_audit(
         &self,
         event_type: &str,
@@ -3037,14 +3045,20 @@ async fn import_state_snapshot(
         Some(work_order_authorization),
         request.audit_attribution,
     )?;
-    let validated = match validate_daemon_work_order(
+    let validated = validate_daemon_work_order(
         &state,
         &request.work_order,
         &slot.tenant_id,
         &slot.agent_id,
         Some(run_id.clone()),
         None,
-    ) {
+    );
+    if !state.allows_experimental_local_state_handoff_import() {
+        let validated = validated?;
+        ensure_resume_work_order_matches_original(&slot, &validated)?;
+        return Err(state_handoff_proof_unavailable());
+    }
+    let validated = match validated {
         Ok(validated) => validated,
         Err(error) => {
             return Err(record_pre_import_handoff_failure(
@@ -3144,6 +3158,19 @@ async fn import_state_snapshot(
         state_node_id: imported.node_id.to_string(),
         trace_event_id: event.trace_event_id,
         accepted: true,
+    }))
+}
+
+fn state_handoff_proof_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "state_handoff_proof_unavailable",
+        "resident state handoff import requires source-authenticated signed handoff proof",
+    )
+    .details(serde_json::json!({
+        "disposition": "needs_intervention",
+        "retryable": false,
+        "required_proof": "signed_source_handoff_manifest"
     }))
 }
 

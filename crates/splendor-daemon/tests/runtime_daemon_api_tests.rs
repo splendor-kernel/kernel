@@ -1393,7 +1393,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
 }
 
 #[tokio::test]
-async fn state_snapshot_export_import_uses_authenticated_state_authority() {
+async fn experimental_local_dev_state_snapshot_import_preserves_compatibility() {
     let source_app = router(DaemonState::local_dev());
     let receiver_app = router(DaemonState::local_dev());
     let tenant_id = TenantId::new();

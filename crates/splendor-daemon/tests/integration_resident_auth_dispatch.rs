@@ -19,19 +19,21 @@ use splendor_daemon::manager::{
     WorkOrderValidationReport,
 };
 use splendor_daemon::{
-    router as resident_router, ApiErrorBody, CreateRunResponse, DaemonConfig, DaemonState,
-    StateHeadResponse, TickResponse, TracePageResponse,
+    router as resident_router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonConfig,
+    DaemonState, LifecycleRequest, StateHeadResponse, StateSnapshotExportRequest,
+    StateSnapshotExportResponse, StateSnapshotImportRequest, TickResponse, TracePageResponse,
 };
+use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
     AgentId, AppPrincipal, AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience,
     CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, InstanceId,
     InstanceRegistration, NodeId, NodeRegistration, PlacementDecision, PlacementExecutionMode,
     PlacementRequest, PlacementTarget, RevocationStatus, RunId, TelemetryAuthority, TenantId,
-    TraceEvent, TraceEventKind, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring,
-    WorkOrderPlacement, WorkOrderQuotaPolicy,
+    TraceEvent, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
+    WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
 };
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::format_description::well_known::Rfc3339;
@@ -67,6 +69,50 @@ struct BarrierHarness {
     start_entered: Arc<tokio::sync::Barrier>,
     start_release: Arc<tokio::sync::Barrier>,
     server: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ArmableTraceStore {
+    inner: InMemoryTraceStore,
+    fail_appends: AtomicBool,
+    failed_append_attempts: AtomicUsize,
+}
+
+impl ArmableTraceStore {
+    fn arm(&self) {
+        self.failed_append_attempts.store(0, Ordering::SeqCst);
+        self.fail_appends.store(true, Ordering::SeqCst);
+    }
+
+    fn record_count(&self, run_id: &RunId) -> usize {
+        self.inner
+            .read(&run_id.to_string())
+            .map(|records| records.len())
+            .unwrap_or_default()
+    }
+}
+
+impl TraceStore for ArmableTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        if self.fail_appends.load(Ordering::SeqCst) {
+            self.failed_append_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read(run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read_range(run_id, start, end)
+    }
 }
 
 impl Drop for FaultHarness {
@@ -317,6 +363,23 @@ async fn spawn_resident_with_scopes(
     work_order_key: &[u8],
     allowed_scopes: Vec<EndpointScope>,
 ) -> ResidentHarness {
+    spawn_resident_with_scopes_and_trace_store(
+        signer,
+        instance_id,
+        work_order_key,
+        allowed_scopes,
+        None,
+    )
+    .await
+}
+
+async fn spawn_resident_with_scopes_and_trace_store(
+    signer: &CallerTokenSigner,
+    instance_id: InstanceId,
+    work_order_key: &[u8],
+    allowed_scopes: Vec<EndpointScope>,
+    trace_store: Option<Arc<dyn TraceStore>>,
+) -> ResidentHarness {
     let trust = CallerTokenTrustSnapshot::single_key(
         signer.issuer(),
         signer.app_principal_id(),
@@ -334,12 +397,11 @@ async fn spawn_resident_with_scopes(
     policy_keyring
         .insert_shared_secret("policy-resident-test", [9_u8; 32])
         .expect("resident policy key");
-    let state = DaemonState::new(DaemonConfig::resident(
-        instance_id,
-        verifier,
-        work_order_keyring,
-        policy_keyring,
-    ));
+    let config = DaemonConfig::resident(instance_id, verifier, work_order_keyring, policy_keyring);
+    let state = match trace_store {
+        Some(trace_store) => DaemonState::with_trace_store(config, trace_store),
+        None => DaemonState::new(config),
+    };
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["localhost".to_string()]).expect("test TLS certificate");
     let cert_pem = cert.pem().into_bytes();
@@ -518,6 +580,53 @@ fn signed_work_order_expiring_at(
     .expect("signed work order")
 }
 
+fn resident_create_request(
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    work_order: WorkOrderEnvelope,
+    initial_state: serde_json::Value,
+) -> CreateRunRequest {
+    CreateRunRequest {
+        request_id: format!("req_{}", TraceId::new()),
+        idempotency_key: format!("idem_{}", TraceId::new()),
+        tenant_id,
+        agent_id,
+        work_order,
+        credential: None,
+        audit_attribution: None,
+        allowed_actions: vec!["daemon.record".to_string()],
+        allowed_adapters: vec!["daemon.recording".to_string()],
+        allowed_permissions: vec!["fixture.execute".to_string()],
+        policy_actions: Vec::new(),
+        policy_bundle_required: false,
+        policy_bundle: None,
+        registered_actions: Vec::new(),
+        approval_policies: Vec::new(),
+        circuit_breakers: Vec::new(),
+        allowed_percept_schemas: Vec::new(),
+        allowed_percept_sources: Vec::new(),
+        initial_state: Some(initial_state),
+        snapshot_interval: Some(1),
+    }
+}
+
+fn resident_token(
+    signer: &CallerTokenSigner,
+    tenant_id: &TenantId,
+    instance_id: &InstanceId,
+    scope: EndpointScope,
+) -> SignedCallerToken {
+    signer
+        .sign(
+            tenant_id,
+            instance_id,
+            vec![scope],
+            OffsetDateTime::now_utc(),
+            Duration::seconds(60),
+        )
+        .expect("resident caller token")
+}
+
 async fn call_manager<T: Serialize, R: DeserializeOwned>(
     app: Router,
     method: Method,
@@ -664,6 +773,38 @@ async fn resident_get<R: DeserializeOwned>(
     (status, parsed, body)
 }
 
+async fn resident_post<T: Serialize, R: DeserializeOwned>(
+    base_url: &str,
+    root_ca_pem: &[u8],
+    path: &str,
+    body: &T,
+    signed: &SignedCallerToken,
+) -> (reqwest::StatusCode, R, String) {
+    let root = reqwest::Certificate::from_pem(root_ca_pem).expect("test resident root");
+    let response = reqwest::Client::builder()
+        .add_root_certificate(root)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("resident test client")
+        .post(format!("{base_url}{path}"))
+        .bearer_auth(&signed.encoded)
+        .header("content-type", "application/json")
+        .header(
+            "x-splendor-caller-credential",
+            serde_json::to_string(&signed.credential).expect("credential projection"),
+        )
+        .json(body)
+        .send()
+        .await
+        .expect("resident request");
+    let status = response.status();
+    let response_body = response.text().await.expect("resident response body");
+    let parsed = serde_json::from_str(&response_body).unwrap_or_else(|error| {
+        panic!("resident response JSON failed ({status}): {error}; body={response_body}")
+    });
+    (status, parsed, response_body)
+}
+
 fn caller_signer() -> CallerTokenSigner {
     CallerTokenSigner::generate_for_test(
         "urn:splendor:manager:central-manager",
@@ -705,6 +846,262 @@ fn manager_state(
             ..ResidentDispatchOptions::production()
         },
     )
+}
+
+#[tokio::test]
+async fn resident_state_import_requires_source_authenticated_proof_before_mutation() {
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let run_id = RunId::parse("44444444-4444-4444-8444-444444444499").expect("run");
+    let source_instance =
+        InstanceId::parse("00000000-0000-4000-8000-000000000398").expect("source instance");
+    let receiver_instance =
+        InstanceId::parse("00000000-0000-4000-8000-000000000399").expect("receiver instance");
+    let signer = caller_signer();
+    let scopes = vec![
+        EndpointScope::RunsCreate,
+        EndpointScope::RunsStart,
+        EndpointScope::StateRead,
+        EndpointScope::StateHandoff,
+    ];
+    let source = spawn_resident_with_scopes(
+        &signer,
+        source_instance.clone(),
+        MANAGER_WORK_ORDER_KEY,
+        scopes.clone(),
+    )
+    .await;
+    let receiver_trace_store = Arc::new(ArmableTraceStore::default());
+    let receiver = spawn_resident_with_scopes_and_trace_store(
+        &signer,
+        receiver_instance.clone(),
+        MANAGER_WORK_ORDER_KEY,
+        scopes,
+        Some(receiver_trace_store.clone()),
+    )
+    .await;
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+    let work_order = signed_work_order(
+        "wo_resident_handoff_proof",
+        run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+        "state.handoff",
+    );
+    for (resident, instance_id, seed) in [
+        (&source, &source_instance, "source"),
+        (&receiver, &receiver_instance, "receiver"),
+    ] {
+        let token = resident_token(&signer, &tenant_id, instance_id, EndpointScope::RunsCreate);
+        let (status, created, _): (reqwest::StatusCode, CreateRunResponse, String) = resident_post(
+            &resident.base_url,
+            &resident.root_ca_pem,
+            "/runs",
+            &resident_create_request(
+                tenant_id.clone(),
+                agent_id.clone(),
+                work_order.clone(),
+                serde_json::json!({"seed": seed}),
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(created.run_id, run_id);
+
+        let token = resident_token(&signer, &tenant_id, instance_id, EndpointScope::RunsStart);
+        let (status, tick, _): (reqwest::StatusCode, TickResponse, String) = resident_post(
+            &resident.base_url,
+            &resident.root_ca_pem,
+            &format!("/runs/{run_id}/start"),
+            &LifecycleRequest {
+                credential: None,
+                work_order: None,
+                audit_attribution: None,
+                reason: Some("prepare state handoff denial fixture".to_string()),
+                approval_evidence: None,
+            },
+            &token,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(tick.run_id, run_id);
+    }
+
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &receiver_instance,
+        EndpointScope::StateRead,
+    );
+    let (status, receiver_head, _): (reqwest::StatusCode, StateHeadResponse, String) =
+        resident_get(
+            &receiver.base_url,
+            &receiver.root_ca_pem,
+            &format!("/runs/{run_id}/state-head"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &source_instance,
+        EndpointScope::StateHandoff,
+    );
+    let (status, exported, _): (reqwest::StatusCode, StateSnapshotExportResponse, String) =
+        resident_post(
+            &source.base_url,
+            &source.root_ca_pem,
+            "/state-snapshots/export",
+            &StateSnapshotExportRequest {
+                run_id: run_id.clone(),
+                credential: None,
+                audit_attribution: None,
+                work_order_id: work_order.work_order.work_order_id.to_string(),
+                source_instance_id: Some(source_instance.to_string()),
+                receiver_instance_id: Some(receiver_instance.to_string()),
+                previous_state_node_id: Some(receiver_head.state_node_id.clone()),
+            },
+            &token,
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        exported.handoff.snapshot.state_node_id,
+        exported.state_node_id
+    );
+
+    let baseline_trace_count = receiver_trace_store.record_count(&run_id);
+    let mut fabricated = exported.handoff.clone();
+    fabricated.handoff_id = "fabricated-hash-valid-handoff".to_string();
+    fabricated.source_trace_id = Some(TraceId::new());
+    let mut stale = exported.handoff.clone();
+    stale.previous_state_node_id = Some("blake3:stale-receiver-head".to_string());
+    let replayed = exported.handoff.clone();
+
+    for (label, handoff) in [
+        ("hash-valid fabricated", fabricated),
+        ("stale", stale),
+        ("first repeated attempt", replayed.clone()),
+        ("second repeated attempt", replayed),
+    ] {
+        let token = resident_token(
+            &signer,
+            &tenant_id,
+            &receiver_instance,
+            EndpointScope::StateHandoff,
+        );
+        let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+            &receiver.base_url,
+            &receiver.root_ca_pem,
+            "/state-snapshots/import",
+            &StateSnapshotImportRequest {
+                handoff,
+                work_order: work_order.clone(),
+                credential: None,
+                audit_attribution: None,
+            },
+            &token,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{label}");
+        assert_eq!(error.code, "state_handoff_proof_unavailable", "{label}");
+        assert_eq!(
+            error.details["disposition"], "needs_intervention",
+            "{label}"
+        );
+        assert_eq!(
+            receiver_trace_store.record_count(&run_id),
+            baseline_trace_count,
+            "{label} must not append a run trace"
+        );
+    }
+
+    let alternate_work_order = WorkOrderEnvelope::signed_with_shared_secret(
+        work_order.work_order.clone(),
+        "alternate-resident-handoff-key",
+        [0x73; 32],
+    )
+    .expect("alternate signer envelope");
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &receiver_instance,
+        EndpointScope::StateHandoff,
+    );
+    let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &receiver.base_url,
+        &receiver.root_ca_pem,
+        "/state-snapshots/import",
+        &StateSnapshotImportRequest {
+            handoff: exported.handoff.clone(),
+            work_order: alternate_work_order,
+            credential: None,
+            audit_attribution: None,
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(error.code, "unknown_signature_key");
+    assert_eq!(
+        receiver_trace_store.record_count(&run_id),
+        baseline_trace_count
+    );
+
+    receiver_trace_store.arm();
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &receiver_instance,
+        EndpointScope::StateHandoff,
+    );
+    let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &receiver.base_url,
+        &receiver.root_ca_pem,
+        "/state-snapshots/import",
+        &StateSnapshotImportRequest {
+            handoff: exported.handoff,
+            work_order,
+            credential: None,
+            audit_attribution: None,
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.code, "state_handoff_proof_unavailable");
+    assert_eq!(
+        receiver_trace_store
+            .failed_append_attempts
+            .load(Ordering::SeqCst),
+        0,
+        "resident proof denial must occur before any trace append"
+    );
+    assert_eq!(
+        receiver_trace_store.record_count(&run_id),
+        baseline_trace_count
+    );
+
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &receiver_instance,
+        EndpointScope::StateRead,
+    );
+    let (status, unchanged_head, _): (reqwest::StatusCode, StateHeadResponse, String) =
+        resident_get(
+            &receiver.base_url,
+            &receiver.root_ca_pem,
+            &format!("/runs/{run_id}/state-head"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(unchanged_head.state_node_id, receiver_head.state_node_id);
 }
 
 #[tokio::test]

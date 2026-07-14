@@ -119,7 +119,7 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
 | `POST` | `/state-snapshots/export` | Export the current state head as a trace-linked v0 handoff | `splendor.state.handoff` |
-| `POST` | `/state-snapshots/import` | Import a validated v0 handoff through the run's state owner | `splendor.state.handoff` |
+| `POST` | `/state-snapshots/import` | Experimental loopback-local import; resident mode denies until source proof exists | `splendor.state.handoff` |
 | `GET` | `/runs/{run_id}/traces` | Read ordered trace records; requires `redaction_policy` | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/traces/export` | Export ordered trace records with redaction policy and integrity metadata | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/replay` | Start inspect-only replay summary | `splendor.replay.create` |
@@ -176,7 +176,10 @@ applicable, and agent compatibility for run creation. Resume and state import
 additionally require the original `work_order_id` and the exact canonical
 work-order payload admitted at creation, normalized to the resolved `run_id`; a
 newly signed broader or otherwise changed work order is rejected. Caller
-credentials never authorize actions directly;
+credentials and the exact target work order are still insufficient for resident
+state import: resident mode requires source-authenticated handoff proof that v0
+does not provide and returns `state_handoff_proof_unavailable`. Caller credentials
+never authorize actions directly;
 `/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
@@ -313,8 +316,9 @@ Response fields include:
 
 ## State handoff behavior
 
-`POST /state-snapshots/export` and `POST /state-snapshots/import` are mutating
-audit boundaries. Both require authenticated caller scope
+`POST /state-snapshots/export` is a trace-recorded export boundary. Import is a
+mutating boundary only on explicit loopback `local_dev`; resident import is
+fail-closed before mutation. Both endpoints require authenticated caller scope
 `splendor.state.handoff`, matching tenant/run binding, audit attribution, and
 signed run-bound work-order authority. Export revalidates the envelope retained
 from run admission and rejects a request-level work-order ID or resident source
@@ -327,20 +331,26 @@ The source scheduler/loop/state-graph owner snapshots its current head and emits
 
 Import request bodies include both `handoff` and the signed `work_order`
 envelope. The envelope must cryptographically validate and exactly match the
-target run's admitted work-order identity and canonical payload. Resident import
-also requires the handoff's `receiver_instance_id` to equal the configured
-runtime instance. Schema, mode, source trace linkage, receiver previous head,
-snapshot ID/hash/parent linkage, and replay are checked before mutation.
+target run's admitted work-order identity and canonical payload. In resident
+mode those necessary checks are followed by a stable
+`503 state_handoff_proof_unavailable` response with
+`details.disposition = needs_intervention`. The v0 payload has no accepted source
+signature/evidence proof, and its source trace ID is only caller-carried linkage.
+The denial occurs before schema/hash/head/replay processing and before any state
+store, state head, or run trace mutation.
 
-Import routes through the target scheduler and loop engine; the daemon does not
-mutate the backing state store directly. A successful import records
+Only explicit loopback `local_dev` compatibility routes import through the target
+scheduler and loop engine; the daemon does not mutate the backing state store
+directly. A successful local-dev import records
 `state.handoff.imported` before publishing the new daemon state head. Validation,
 store, or trace failure fails closed. Trace failure restores the prior live graph,
 agent head, and state bytes; a replayed import leaves the imported head unchanged.
 
-This is a compatibility correction to the earlier incomplete import request:
-clients must now send the exact signed `work_order`, and exports that target a
-non-empty receiver must send its expected `previous_state_node_id`.
+This is a security compatibility correction to the earlier incomplete import
+request. Clients must still send the exact signed target `work_order`, but that
+does not authorize resident import. Successful resident import remains unavailable
+until STA-005/EVT-005/EVID-005 supply accepted source-authenticated manifest,
+source event/evidence verification, and durable replay semantics.
 
 ## Trace behavior
 

@@ -75,8 +75,11 @@ created.
 
 Successful snapshot import creates a receiver-owned state node with the same
 content-addressed node ID and snapshot ID as the exported source snapshot. The
-daemon routes export/import through the scheduler and loop engine rather than
-mutating the backing store directly. A failed or replayed import leaves the
+explicit loopback-local daemon compatibility path routes import through the
+scheduler and loop engine rather than mutating the backing store directly.
+Resident daemon import does not call this API: v0 lacks accepted
+source-authenticated proof and returns `state_handoff_proof_unavailable` before
+mutation. A failed or replayed lower-level/local-dev import leaves the
 receiver `head` unchanged; if the imported trace event cannot be persisted, the
 loop owner also restores its prior live state and agent head.
 

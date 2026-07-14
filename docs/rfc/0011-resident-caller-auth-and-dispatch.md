@@ -253,13 +253,20 @@ the existing signed-work-order, state commit, trace, C02, verifier, and gateway
 paths. Replay remains inspect-only and does not mint bearer tokens, perform
 resident network calls, or execute adapters.
 
-The existing state-handoff daemon operations now apply this resident boundary
+The existing state-handoff daemon operations apply this resident boundary
 consistently: both require caller scope `splendor.state.handoff` plus signed
-run-bound work-order authority. Import carries and cryptographically revalidates
-the exact work-order envelope admitted for the target run, enforces the intended
-receiver instance, and routes mutation through the scheduler/loop/state owner.
-This is a correction to the existing v0 path, not a new state-node or trace-event
-schema.
+run-bound work-order authority. Export remains a read-only snapshot operation with
+a source trace boundary. Import cryptographically revalidates the exact work-order
+envelope admitted for the target run, but then fails closed with
+`503 state_handoff_proof_unavailable` and `needs_intervention` before state-store,
+state-head, or run-trace mutation. The v0 `StateHandoff` is self-consistent but is
+not source-signed, and its caller-carried source trace ID does not prove that an
+authenticated source event exists. Caller authentication and target work-order
+authority are necessary but cannot substitute for source proof. Explicit
+loopback `local_dev` retains the existing import path as experimental
+compatibility only. This is a security correction to the existing v0 path, not a
+new state-node or trace-event schema; source-authenticated manifest/evidence and
+durable replay work remain with STA-005, EVT-005, and EVID-005.
 
 Registry registration and heartbeat freshness use manager-observed receipt time.
 Sender `registered_at`, `recorded_at`, and health observation timestamps remain
