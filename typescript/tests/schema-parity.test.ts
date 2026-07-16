@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ACTION_STATUS_VALUES,
+  APPROVAL_CHALLENGE_SCHEMA_VERSION,
   AUTHORITY_OPERATION_NAMESPACE_VALUES,
   AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
   AUTHORITY_RESOURCE_KIND_VALUES,
@@ -13,6 +14,8 @@ import {
   ENDPOINT_SCOPE_VALUES,
   EXTERNAL_GOVERNANCE_ADAPTER_SCHEMA_VERSION,
   GOVERNED_ARTIFACT_REF_SCHEMA_VERSION,
+  RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+  RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
   STABLE_0_1_ENUM_VALUES,
   STABLE_0_1_PRIMITIVES,
   STABLE_0_1_REQUIRED_FIELDS,
@@ -22,6 +25,8 @@ import {
 import type {
   ApprovalDenial,
   ApprovalGrant,
+  ApprovalChallenge,
+  ApprovalRequestPayload,
   ApprovalRequest,
   AuthorityObligationReceipt,
   AuthorityObligationReceiptValidation,
@@ -29,7 +34,12 @@ import type {
   ExternalApprovalMapping,
   ExternalGovernanceAdapterContract,
   GovernedArtifactRef,
-  RegisteredAction
+  GovernanceApprovalRecord,
+  PhysicalActionResourceCoordinate,
+  ResidentApprovalReceiptRevocationAck,
+  ResidentApprovalReceiptRevocationRequest,
+  RegisteredAction,
+  SubmitActionRequest
 } from "@splendor/types";
 
 const repoRoot = process.cwd();
@@ -81,6 +91,22 @@ function extractOpenApiSchemaBlock(source: string, schema: string): string {
   const remainder = source.slice(start + 1);
   const nextSchema = /\n    [A-Za-z][A-Za-z0-9]+:\n/.exec(remainder.slice(1));
   return nextSchema ? remainder.slice(0, nextSchema.index + 1) : remainder;
+}
+
+function extractOpenApiSchemaPropertyFields(source: string, schema: string): string[] {
+  return Array.from(
+    extractOpenApiSchemaBlock(source, schema).matchAll(/^        ([a-z][A-Za-z0-9_]*):/gm),
+    (field) => field[1]
+  );
+}
+
+function extractOpenApiPathBlock(source: string, path: string): string {
+  const marker = `  ${path}:\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `OpenAPI path ${path} must exist`);
+  const remainder = source.slice(start + marker.length);
+  const nextPath = /^  \/[^\n]+:\n/m.exec(remainder);
+  return source.slice(start, nextPath ? start + marker.length + nextPath.index : source.length);
 }
 
 function pascalToSnake(value: string): string {
@@ -213,7 +239,16 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
   );
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.percept, extractStructFields(primitives, "Percept"));
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.trace_event, extractStructFields(trace, "TraceEvent"));
-  assert.deepEqual(CANONICAL_SCHEMA_FIELDS.action_request, extractStructFields(gateway, "ActionRequest"));
+  const actionRequestFields = extractStructFields(gateway, "ActionRequest");
+  assert.ok(
+    actionRequestFields.includes("physical_action_resource_coordinate"),
+    "Rust ActionRequest must retain its trusted kernel-only physical coordinate"
+  );
+  assert.deepEqual(
+    CANONICAL_SCHEMA_FIELDS.action_request,
+    actionRequestFields.filter((field) => field !== "physical_action_resource_coordinate"),
+    "serialized TypeScript ActionRequest must omit the serde-skipped trusted coordinate"
+  );
   assert.deepEqual(CANONICAL_SCHEMA_FIELDS.action_outcome, extractStructFields(gateway, "ActionOutcome"));
   assert.deepEqual(
     CANONICAL_SCHEMA_FIELDS.external_governance_reference,
@@ -269,7 +304,32 @@ test("TypeScript primitive field contracts match canonical Rust structs", () => 
 
 test("C02 obligation receipt and trusted action profile contracts stay exact", () => {
   const authority = readRepoFile("crates/splendor-types/src/authority.rs");
+  const approval = readRepoFile("crates/splendor-types/src/approval.rs");
+  const daemon = readRepoFile("crates/splendor-daemon/src/lib.rs");
+  const manager = readRepoFile("crates/splendor-daemon/src/manager.rs");
   const openapi = readRepoFile("openapi/splendor-runtime-daemon.yaml");
+  const challengeFields = [
+    "schema_version",
+    "approval_id",
+    "tenant_id",
+    "agent_id",
+    "run_id",
+    "action_id",
+    "action_name",
+    "adapter",
+    "policy_id",
+    "risk_level",
+    "subject",
+    "authority_decision_id",
+    "obligation_id",
+    "receipt_audience",
+    "canonical_request_digest",
+    "gateway_action_request_digest",
+    "physical_action_resource_coordinate",
+    "authority_decision_digest",
+    "requested_at",
+    "expires_at"
+  ];
   const receiptFields = [
     "schema_version",
     "receipt_id",
@@ -291,35 +351,129 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     "validation"
   ];
   const validationFields = ["validation_kind", "algorithm", "key_id", "digest", "signature"];
+  const physicalCoordinateFields = ["resource_kind", "node_id"];
+  const revocationRequestFields = ["schema_version", "authority_obligation_receipt", "reason"];
+  const revocationAckFields = [
+    "schema_version",
+    "receipt_id",
+    "approval_id",
+    "target_instance_id",
+    "run_id",
+    "receipt_audience",
+    "status",
+    "effect_certainty",
+    "acknowledged_at"
+  ];
+  const governanceApprovalRecordFields = [
+    "approval_id",
+    "tenant_id",
+    "agent_id",
+    "run_id",
+    "action_id",
+    "action_name",
+    "adapter",
+    "policy_id",
+    "risk_level",
+    "audience",
+    "status",
+    "reason",
+    "issued_by",
+    "requested_by",
+    "decided_by",
+    "expires_at",
+    "trace_event_id",
+    "evidence",
+    "challenge",
+    "authority_obligation_receipt",
+    "resident_receipt_revocation_ack"
+  ];
   const rustReceiptVersion =
     /pub const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION:\s*&str\s*=\s*\n?\s*"([^"]+)"/.exec(
       authority
     )?.[1];
   assert.equal(AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION, rustReceiptVersion);
+  const rustChallengeVersion =
+    /pub const APPROVAL_CHALLENGE_SCHEMA_VERSION:\s*&str\s*=\s*"([^"]+)"/.exec(approval)?.[1];
+  assert.equal(APPROVAL_CHALLENGE_SCHEMA_VERSION, rustChallengeVersion);
+  const rustRevocationVersion =
+    /pub const RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION:\s*&str\s*=\s*\n?\s*"([^"]+)"/.exec(
+      approval
+    )?.[1];
+  const rustRevocationAckVersion =
+    /pub const RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION:\s*&str\s*=\s*\n?\s*"([^"]+)"/.exec(
+      approval
+    )?.[1];
+  assert.equal(RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION, rustRevocationVersion);
+  assert.equal(RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION, rustRevocationAckVersion);
 
+  assert.deepEqual(extractStructFields(approval, "ApprovalChallenge"), challengeFields);
   assert.deepEqual(extractStructFields(authority, "AuthorityObligationReceipt"), receiptFields);
+  assert.deepEqual(
+    extractStructFields(authority, "PhysicalActionResourceCoordinate"),
+    physicalCoordinateFields
+  );
+  assert.deepEqual(
+    extractStructFields(approval, "ResidentApprovalReceiptRevocationRequest"),
+    revocationRequestFields
+  );
+  assert.deepEqual(
+    extractStructFields(approval, "ResidentApprovalReceiptRevocationAck"),
+    revocationAckFields
+  );
+  assert.deepEqual(
+    extractStructFields(manager, "GovernanceApprovalRecord"),
+    governanceApprovalRecordFields
+  );
   assert.deepEqual(
     extractStructFields(authority, "AuthorityObligationReceiptValidation"),
     validationFields
   );
   for (const [schema, fields] of [
+    ["ApprovalChallenge", challengeFields],
     ["AuthorityObligationReceipt", receiptFields],
-    ["AuthorityObligationReceiptValidation", validationFields]
+    ["AuthorityObligationReceiptValidation", validationFields],
+    ["PhysicalActionResourceCoordinate", physicalCoordinateFields],
+    ["ResidentApprovalReceiptRevocationRequest", revocationRequestFields],
+    ["ResidentApprovalReceiptRevocationAck", revocationAckFields]
   ] as const) {
     const block = extractOpenApiSchemaBlock(openapi, schema);
     assert.match(block, /additionalProperties: false/);
-    for (const field of fields) assert.match(block, new RegExp(`^        ${field}:`, "m"));
+    assert.deepEqual(extractOpenApiSchemaPropertyFields(openapi, schema), fields);
   }
+  const submitActionSchema = extractOpenApiSchemaBlock(openapi, "SubmitActionRequest");
   assert.match(extractOpenApiSchemaBlock(openapi, "DaemonActionCandidate"), /maxItems: 64/);
-  assert.match(extractOpenApiSchemaBlock(openapi, "SubmitActionRequest"), /maxItems: 64/);
+  assert.match(submitActionSchema, /maxItems: 64/);
+  assert.match(submitActionSchema, /additionalProperties: false/);
+  assert.deepEqual(
+    extractOpenApiSchemaPropertyFields(openapi, "SubmitActionRequest"),
+    CANONICAL_SCHEMA_FIELDS.submit_action_request
+  );
+  assert.doesNotMatch(submitActionSchema, /physical_action_resource_coordinate/);
+  assert.match(
+    daemon,
+    /#\[serde\(rename_all = "snake_case", deny_unknown_fields\)\]\s*pub struct SubmitActionRequest/
+  );
+  // @ts-expect-error the physical coordinate is server/runtime-derived, never caller input
+  const forbiddenSubmitActionField: keyof SubmitActionRequest = "physical_action_resource_coordinate";
+  assert.equal(forbiddenSubmitActionField, "physical_action_resource_coordinate");
   const registeredActionSchema = extractOpenApiSchemaBlock(openapi, "RegisteredAction");
   assert.match(registeredActionSchema, /additionalProperties: false/);
   assert.match(registeredActionSchema, /uniqueItems: true/);
   assert.match(registeredActionSchema, /maxItems: 64/);
   const receiptSchema = extractOpenApiSchemaBlock(openapi, "AuthorityObligationReceipt");
+  const challengeSchema = extractOpenApiSchemaBlock(openapi, "ApprovalChallenge");
+  assert.match(challengeSchema, /enum: \[splendor\.approval_challenge\.v1\]/);
   assert.match(
     receiptSchema,
     /enum: \[splendor\.authority\.obligation_receipt\.v1\]/
+  );
+  assert.match(
+    extractOpenApiSchemaBlock(openapi, "ResidentApprovalReceiptRevocationRequest"),
+    /enum: \[splendor\.resident\.approval_receipt_revocation\.v1\]/
+  );
+  assert.match(
+    extractOpenApiSchemaBlock(openapi, "ResidentApprovalReceiptRevocationAck"),
+    /enum: \[splendor\.resident\.approval_receipt_revocation_ack\.v1\]/
   );
   for (const nullable of ["evidence_ref", "approval_id", "approval_trace_event_id"]) {
     assert.match(
@@ -365,6 +519,54 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     approval_trace_event_id: null,
     validation
   };
+  const challenge: ApprovalChallenge = {
+    schema_version: APPROVAL_CHALLENGE_SCHEMA_VERSION,
+    approval_id: "00000000-0000-4000-8000-000000000010" as ApprovalChallenge["approval_id"],
+    tenant_id: "00000000-0000-4000-8000-000000000011" as ApprovalChallenge["tenant_id"],
+    agent_id: "00000000-0000-4000-8000-000000000012" as ApprovalChallenge["agent_id"],
+    run_id: "00000000-0000-4000-8000-000000000013" as ApprovalChallenge["run_id"],
+    action_id: "00000000-0000-4000-8000-000000000014" as ApprovalChallenge["action_id"],
+    action_name: "artifact.publish",
+    adapter: "artifact-store",
+    policy_id: "approval-policy",
+    risk_level: "high",
+    subject: "00000000-0000-4000-8000-000000000015" as ApprovalChallenge["subject"],
+    authority_decision_id: "00000000-0000-4000-8000-000000000016" as ApprovalChallenge["authority_decision_id"],
+    obligation_id: "00000000-0000-4000-8000-000000000017" as ApprovalChallenge["obligation_id"],
+    receipt_audience: "daemon:run",
+    canonical_request_digest: "blake3:request",
+    gateway_action_request_digest: "blake3:action",
+    physical_action_resource_coordinate: {
+      resource_kind: "physical_node",
+      node_id: "00000000-0000-4000-8000-000000000018"
+    },
+    authority_decision_digest: "blake3:decision",
+    requested_at: "2026-07-12T00:00:00Z",
+    expires_at: "2026-07-12T00:05:00Z"
+  };
+  const physicalCoordinate: PhysicalActionResourceCoordinate = {
+    resource_kind: "physical_node",
+    node_id: challenge.physical_action_resource_coordinate!.node_id
+  };
+  const revocationRequest: ResidentApprovalReceiptRevocationRequest = {
+    schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
+    authority_obligation_receipt: receipt,
+    reason: "operator revoked approval"
+  };
+  const revocationAck: ResidentApprovalReceiptRevocationAck = {
+    schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+    receipt_id: receipt.receipt_id,
+    approval_id: challenge.approval_id,
+    target_instance_id: "00000000-0000-4000-8000-000000000019",
+    run_id: challenge.run_id,
+    receipt_audience: challenge.receipt_audience,
+    status: "revoked",
+    effect_certainty: "known",
+    acknowledged_at: "2026-07-12T00:01:00Z"
+  };
+  const retainedRevocationAck: GovernanceApprovalRecord["resident_receipt_revocation_ack"] = revocationAck;
+  const absentRevocationAck: GovernanceApprovalRecord["resident_receipt_revocation_ack"] = undefined;
+  const nullRevocationAck: GovernanceApprovalRecord["resident_receipt_revocation_ack"] = null;
   const profile: RegisteredAction = {
     name: "fixture.write",
     adapter: "fixture.local",
@@ -374,6 +576,40 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     action_id: "00000000-0000-4000-8000-000000000006" as DaemonActionCandidate["action_id"]
   };
   assert.equal(receipt.kind, "human_review");
+  assert.equal(challenge.schema_version, "splendor.approval_challenge.v1");
+  assert.equal(physicalCoordinate.resource_kind, "physical_node");
+  assert.equal(revocationRequest.reason, "operator revoked approval");
+  assert.equal(revocationAck.effect_certainty, "known");
+  assert.equal(retainedRevocationAck?.status, "revoked");
+  assert.equal(absentRevocationAck, undefined);
+  assert.equal(nullRevocationAck, null);
+  const governanceRecordSchema = extractOpenApiSchemaBlock(openapi, "GovernanceApprovalRecord");
+  assert.deepEqual(
+    extractOpenApiSchemaPropertyFields(openapi, "GovernanceApprovalRecord"),
+    governanceApprovalRecordFields
+  );
+  assert.match(
+    governanceRecordSchema,
+    /resident_receipt_revocation_ack:\n\s+description:[^\n]+\n\s+oneOf:\n\s+- type: 'null'\n\s+- \$ref: '#\/components\/schemas\/ResidentApprovalReceiptRevocationAck'/
+  );
+  assert.doesNotMatch(
+    governanceRecordSchema,
+    /required: \[[^\]]*resident_receipt_revocation_ack[^\]]*\]/
+  );
+  const revokePath = extractOpenApiPathBlock(
+    openapi,
+    "/runs/{run_id}/approval-receipts/{receipt_id}/revoke"
+  );
+  assert.match(revokePath, /operationId: revokeApprovalReceipt/);
+  assert.match(revokePath, /\$ref: '#\/components\/schemas\/ResidentApprovalReceiptRevocationRequest'/);
+  assert.match(revokePath, /\$ref: '#\/components\/schemas\/ResidentApprovalReceiptRevocationAck'/);
+  assert.match(revokePath, /ResidentCallerBearer/);
+  assert.match(revokePath, new RegExp(ENDPOINT_SCOPE_LABELS.approval_receipts_revoke.replaceAll(".", "\\.")));
+  assert.doesNotMatch(revokePath, /splendor\.approvals\.manage/);
+  assert.match(
+    daemon,
+    /credential\.scopes\.as_slice\(\) != \[EndpointScope::ApprovalReceiptsRevoke\]/
+  );
   assert.deepEqual(profile.required_permissions, ["fixture.write"]);
   assert.equal(candidateIdentity.action_id, "00000000-0000-4000-8000-000000000006");
 
@@ -383,6 +619,26 @@ test("C02 obligation receipt and trusted action profile contracts stay exact", (
     credential: "secret"
   };
   assert.equal(invalidValidation.validation_kind, "local_signature");
+});
+
+test("manager approval risk and decision attribution remain additive and exact", () => {
+  const openapi = readRepoFile("openapi/splendor-runtime-daemon.yaml");
+  const request = extractOpenApiSchemaBlock(openapi, "ApprovalRequestPayload");
+  const record = extractOpenApiSchemaBlock(openapi, "GovernanceApprovalRecord");
+  const omittedRisk: ApprovalRequestPayload["risk_level"] = undefined;
+  const nullRisk: GovernanceApprovalRecord["risk_level"] = null;
+
+  assert.equal(omittedRisk, undefined);
+  assert.equal(nullRisk, null);
+  assert.match(request, /risk_level: \{ type: \[string, 'null'\] \}/);
+  assert.doesNotMatch(
+    request,
+    /required: \[[^\]]*risk_level[^\]]*\]/,
+    "manager approval request risk must remain optional"
+  );
+  assert.match(record, /required: \[[^\]]*requested_by[^\]]*\]/);
+  assert.match(record, /^        requested_by:/m);
+  assert.match(record, /^        decided_by:/m);
 });
 
 test("TypeScript governance approval statuses mirror Rust object validators", () => {

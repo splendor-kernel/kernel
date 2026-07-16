@@ -6,7 +6,8 @@ use base64::Engine as _;
 use serde::Deserialize;
 use splendor_daemon::caller_auth::CallerTokenVerifier;
 use splendor_daemon::{router, DaemonConfig, DaemonState};
-use splendor_types::{InstanceId, PolicyBundleKeyring, WorkOrderKeyring};
+use splendor_kernel::LocalAuthorityObligationReceiptConfig;
+use splendor_types::{InstanceId, PolicyBundleKeyring, PrincipalId, WorkOrderKeyring};
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::net::SocketAddr;
@@ -40,6 +41,17 @@ struct SharedSecretKeyringFile {
 struct SharedSecretKey {
     key_id: String,
     shared_secret_base64url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityReceiptConfigFile {
+    schema_version: String,
+    issuer_principal_id: String,
+    audience_prefix: String,
+    key_id: String,
+    validation_secret_base64url: String,
+    revocation_ref: String,
 }
 
 fn required_env(name: &str) -> Result<String, std::io::Error> {
@@ -76,8 +88,15 @@ fn daemon_runtime() -> Result<DaemonRuntime, std::io::Error> {
                     "local_dev mode requires a loopback bind address",
                 ));
             }
+            let config = match std::env::var("SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE") {
+                Ok(path) if !path.trim().is_empty() => DaemonConfig::local_dev()
+                    .with_authority_obligation_receipt_config(load_authority_receipt_config(
+                        Path::new(&path),
+                    )?),
+                _ => DaemonConfig::local_dev(),
+            };
             Ok(DaemonRuntime::LocalDev {
-                state: DaemonState::local_dev(),
+                state: DaemonState::new(config),
                 bind_addr,
             })
         }
@@ -106,6 +125,8 @@ fn resident_runtime() -> Result<DaemonRuntime, std::io::Error> {
     let caller_trust_path = required_env("SPLENDOR_CALLER_TRUST_FILE")?;
     let work_order_keyring_path = required_env("SPLENDOR_WORK_ORDER_KEYRING_FILE")?;
     let policy_keyring_path = required_env("SPLENDOR_POLICY_KEYRING_FILE")?;
+    let authority_receipt_config_path =
+        required_env("SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE")?;
     let tls_cert_path = PathBuf::from(required_env("SPLENDOR_TLS_CERT_FILE")?);
     let tls_key_path = PathBuf::from(required_env("SPLENDOR_TLS_KEY_FILE")?);
     let tls_key_pem = read_regular_file(&tls_key_path, KEYRING_FILE_LIMIT, true)?;
@@ -123,12 +144,17 @@ fn resident_runtime() -> Result<DaemonRuntime, std::io::Error> {
     let bind_addr = bind_addr("127.0.0.1:8077")?;
 
     Ok(DaemonRuntime::Resident {
-        state: DaemonState::new(DaemonConfig::resident(
-            instance_id,
-            caller_token_verifier,
-            work_order_keyring,
-            policy_bundle_keyring,
-        )),
+        state: DaemonState::new(
+            DaemonConfig::resident(
+                instance_id,
+                caller_token_verifier,
+                work_order_keyring,
+                policy_bundle_keyring,
+            )
+            .with_authority_obligation_receipt_config(load_authority_receipt_config(
+                Path::new(&authority_receipt_config_path),
+            )?),
+        ),
         bind_addr,
         tls_cert_pem,
         tls_key_pem,
@@ -157,6 +183,33 @@ fn load_policy_keyring(path: &Path) -> Result<PolicyBundleKeyring, std::io::Erro
             .map_err(|_| invalid_keyring("policy"))?;
     }
     Ok(keyring)
+}
+
+fn load_authority_receipt_config(
+    path: &Path,
+) -> Result<LocalAuthorityObligationReceiptConfig, std::io::Error> {
+    let bytes = read_regular_file(path, KEYRING_FILE_LIMIT, true)?;
+    let file: AuthorityReceiptConfigFile =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_keyring("authority receipt"))?;
+    if file.schema_version != "splendor.authority_obligation_receipt_config.v1" {
+        return Err(invalid_keyring("authority receipt"));
+    }
+    let issuer = PrincipalId::parse(&file.issuer_principal_id)
+        .map_err(|_| invalid_keyring("authority receipt"))?;
+    let secret = URL_SAFE_NO_PAD
+        .decode(file.validation_secret_base64url.as_bytes())
+        .map_err(|_| invalid_keyring("authority receipt"))?;
+    if secret.len() < 32 {
+        return Err(invalid_keyring("authority receipt"));
+    }
+    LocalAuthorityObligationReceiptConfig::trusted_local(
+        issuer,
+        file.audience_prefix,
+        file.key_id,
+        file.validation_secret_base64url,
+        file.revocation_ref,
+    )
+    .map_err(|_| invalid_keyring("authority receipt"))
 }
 
 fn load_secret_keyring(
@@ -317,6 +370,7 @@ mod tests {
                 "SPLENDOR_CALLER_TRUST_FILE",
                 "SPLENDOR_WORK_ORDER_KEYRING_FILE",
                 "SPLENDOR_POLICY_KEYRING_FILE",
+                "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
                 "SPLENDOR_TLS_CERT_FILE",
                 "SPLENDOR_TLS_KEY_FILE",
             ] {
@@ -335,6 +389,7 @@ mod tests {
                 "SPLENDOR_CALLER_TRUST_FILE",
                 "SPLENDOR_WORK_ORDER_KEYRING_FILE",
                 "SPLENDOR_POLICY_KEYRING_FILE",
+                "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
                 "SPLENDOR_TLS_CERT_FILE",
                 "SPLENDOR_TLS_KEY_FILE",
             ] {
@@ -415,6 +470,7 @@ mod tests {
         let trust_path = root.join("caller-trust.json");
         let work_order_path = root.join("work-order-keyring.json");
         let policy_path = root.join("policy-keyring.json");
+        let authority_receipt_path = root.join("authority-receipt-config.json");
         let cert_path = root.join("resident-cert.pem");
         let key_path = root.join("resident-key.pem");
         std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
@@ -445,6 +501,20 @@ mod tests {
                 }]
             }),
         );
+        write_private_fixture(
+            &authority_receipt_path,
+            serde_json::json!({
+                "schema_version": "splendor.authority_obligation_receipt_config.v1",
+                "issuer_principal_id": "00000000-0000-4000-8000-0000000004c0",
+                "audience_prefix": "splendor.daemon.run",
+                "key_id": "approval-receipt-local-key",
+                "validation_secret_base64url": base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    [11_u8; 32]
+                ),
+                "revocation_ref": "local-approval-receipts"
+            }),
+        );
         std::fs::write(&cert_path, b"acceptance certificate placeholder").expect("cert file");
         write_private_bytes(&key_path, b"acceptance key placeholder");
 
@@ -455,6 +525,10 @@ mod tests {
                 work_order_path.as_os_str(),
             ),
             ("SPLENDOR_POLICY_KEYRING_FILE", policy_path.as_os_str()),
+            (
+                "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
+                authority_receipt_path.as_os_str(),
+            ),
             ("SPLENDOR_TLS_CERT_FILE", cert_path.as_os_str()),
             ("SPLENDOR_TLS_KEY_FILE", key_path.as_os_str()),
         ];
@@ -481,6 +555,15 @@ mod tests {
             std::env::set_var(missing, value);
         }
 
+        write_private_bytes(&trust_path, b"not-json");
+        assert!(super::daemon_runtime()
+            .err()
+            .expect("invalid caller trust denied")
+            .to_string()
+            .contains("CALLER_TRUST_FILE"));
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("restore trust file");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -494,6 +577,65 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn resident_keyrings_reject_malformed_ambiguous_and_weak_secrets() {
+        let root = std::env::temp_dir().join(format!(
+            "splendor-resident-keyring-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("fixture directory");
+        let path = root.join("keyring.json");
+
+        write_private_bytes(&path, b"not-json");
+        assert!(super::load_work_order_keyring(&path).is_err());
+        for value in [
+            serde_json::json!({"schema_version": "wrong", "keys": [{"key_id": "key", "shared_secret_base64url": "AA"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": []}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "", "shared_secret_base64url": "AA"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [
+                {"key_id": "duplicate", "shared_secret_base64url": "AA"},
+                {"key_id": "duplicate", "shared_secret_base64url": "AA"}
+            ]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "key", "shared_secret_base64url": "%%%"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "key", "shared_secret_base64url": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [1_u8; 8])}]}),
+        ] {
+            write_private_fixture(&path, value);
+            assert!(super::load_work_order_keyring(&path).is_err());
+        }
+
+        write_private_fixture(
+            &path,
+            serde_json::json!({
+                "schema_version": "splendor.policy_keyring.v1",
+                "keys": [{
+                    "key_id": "policy-key",
+                    "shared_secret_base64url": base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        [9_u8; 32]
+                    )
+                }]
+            }),
+        );
+        super::load_policy_keyring(&path).expect("valid policy keyring");
+        assert!(super::load_work_order_keyring(&path).is_err());
+
+        write_private_bytes(&path, b"oversized");
+        assert!(super::read_regular_file(&path, 1, false).is_err());
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn resident_startup_rejects_malformed_instance_identity() {
+        let _env = StartupEnvGuard::acquire();
+        std::env::set_var("SPLENDOR_DAEMON_MODE", "resident");
+        std::env::set_var("SPLENDOR_INSTANCE_ID", "not-a-uuid");
+        assert!(super::daemon_runtime()
+            .err()
+            .expect("malformed instance denied")
+            .to_string()
+            .contains("non-nil UUID"));
     }
 
     #[test]

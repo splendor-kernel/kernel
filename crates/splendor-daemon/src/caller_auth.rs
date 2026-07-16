@@ -12,7 +12,7 @@ use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use splendor_types::{
     AppPrincipal, CallerCredential, ClientPrincipal, CredentialAudience, CredentialBinding,
-    EndpointScope, InstanceId, RevocationStatus, TenantId,
+    EndpointScope, FleetId, InstanceId, RevocationStatus, TenantId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -30,6 +30,7 @@ pub const CALLER_TRUST_SCHEMA_VERSION: &str = "splendor.caller_trust.v1";
 pub const MAX_CALLER_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_TRUST_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOKEN_SCOPES: usize = 16;
+const MAX_TRUST_ALLOWED_SCOPES: usize = 64;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const ED25519_SIGNATURE_BYTES: usize = 64;
 const MAX_TRUST_SNAPSHOT_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
@@ -50,6 +51,10 @@ pub struct CallerTokenTrustSnapshot {
     pub expires_at: OffsetDateTime,
     pub issuer: String,
     pub app_principal_id: String,
+    /// Optional exact token subject binding. Resident trust snapshots may omit
+    /// this for wire compatibility; central-manager trust requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_client_principal_id: Option<String>,
     pub max_token_ttl_seconds: u64,
     pub allowed_scopes: Vec<String>,
     pub keys: Vec<CallerVerificationKey>,
@@ -83,6 +88,10 @@ impl std::fmt::Debug for CallerTokenTrustSnapshot {
             .field("expires_at", &self.expires_at)
             .field("issuer", &self.issuer)
             .field("app_principal_id", &self.app_principal_id)
+            .field(
+                "expected_client_principal_id",
+                &self.expected_client_principal_id,
+            )
             .field("max_token_ttl_seconds", &self.max_token_ttl_seconds)
             .field("allowed_scopes", &self.allowed_scopes)
             .field("keys", &self.keys)
@@ -110,7 +119,7 @@ pub struct CallerTokenVerifier {
 
 struct CallerTokenVerifierInner {
     trust: CallerTokenTrustSnapshot,
-    expected_instance_id: InstanceId,
+    target: CallerTokenTarget,
     clock_leeway_seconds: i64,
     maximum_observed_unix_time: AtomicI64,
     consumed_mutating_jtis: Mutex<HashMap<String, i64>>,
@@ -126,7 +135,7 @@ impl std::fmt::Debug for CallerTokenVerifierInner {
         formatter
             .debug_struct("CallerTokenVerifierInner")
             .field("trust", &self.trust)
-            .field("expected_instance_id", &self.expected_instance_id)
+            .field("target", &self.target)
             .field("clock_leeway_seconds", &self.clock_leeway_seconds)
             .field(
                 "maximum_observed_unix_time",
@@ -135,6 +144,17 @@ impl std::fmt::Debug for CallerTokenVerifierInner {
             .field("consumed_mutating_jti_count", &consumed_jti_count)
             .finish()
     }
+}
+
+#[derive(Clone, Debug)]
+enum CallerTokenTarget {
+    Instance {
+        instance_id: InstanceId,
+    },
+    CentralManager {
+        manager_id: String,
+        fleet_id: FleetId,
+    },
 }
 
 #[derive(Clone)]
@@ -190,6 +210,10 @@ pub enum CallerAuthError {
     InvalidScope,
     #[error("caller token tenant binding is invalid")]
     InvalidTenant,
+    #[error("caller token fleet binding is invalid")]
+    InvalidFleet,
+    #[error("caller token binding profile is invalid")]
+    InvalidBinding,
     #[error("caller token has been revoked")]
     RevokedToken,
     #[error("caller token was already used for a mutating request")]
@@ -224,7 +248,10 @@ struct CallerTokenClaims {
     jti: String,
     splendor_ver: u16,
     app_principal_id: String,
-    tenant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet_id: Option<String>,
     scope: Vec<String>,
 }
 
@@ -244,6 +271,7 @@ impl CallerTokenTrustSnapshot {
             expires_at: now + Duration::hours(1),
             issuer: issuer.into(),
             app_principal_id: app_principal_id.into(),
+            expected_client_principal_id: None,
             max_token_ttl_seconds: 300,
             allowed_scopes: allowed_scopes
                 .into_iter()
@@ -257,6 +285,15 @@ impl CallerTokenTrustSnapshot {
             }],
             revoked_jtis: Vec::new(),
         }
+    }
+
+    /// Binds this trust snapshot to one exact caller-token subject.
+    pub fn with_expected_client_principal_id(
+        mut self,
+        client_principal_id: impl Into<String>,
+    ) -> Self {
+        self.expected_client_principal_id = Some(client_principal_id.into());
+        self
     }
 }
 
@@ -272,7 +309,9 @@ impl CallerTokenVerifier {
         Ok(Self {
             inner: Arc::new(CallerTokenVerifierInner {
                 trust,
-                expected_instance_id,
+                target: CallerTokenTarget::Instance {
+                    instance_id: expected_instance_id,
+                },
                 clock_leeway_seconds: 30,
                 maximum_observed_unix_time: AtomicI64::new(i64::MIN),
                 consumed_mutating_jtis: Mutex::new(HashMap::new()),
@@ -288,6 +327,60 @@ impl CallerTokenVerifier {
         let trust =
             serde_json::from_slice(&bytes).map_err(|_| CallerAuthError::InvalidTrustSnapshot)?;
         Self::new(trust, expected_instance_id)
+    }
+
+    /// Builds a verifier for the bounded central-manager caller-token profile.
+    pub fn for_manager(
+        trust: CallerTokenTrustSnapshot,
+        manager_id: impl Into<String>,
+        expected_fleet_id: FleetId,
+    ) -> Result<Self, CallerAuthError> {
+        let manager_id = manager_id.into();
+        if manager_id.trim().is_empty()
+            || manager_id.len() > 256
+            || expected_fleet_id.is_nil()
+            || trust.expected_client_principal_id.is_none()
+        {
+            return Err(CallerAuthError::InvalidTrustSnapshot);
+        }
+        validate_trust_snapshot_shape(&trust)?;
+        Ok(Self {
+            inner: Arc::new(CallerTokenVerifierInner {
+                trust,
+                target: CallerTokenTarget::CentralManager {
+                    manager_id,
+                    fleet_id: expected_fleet_id,
+                },
+                clock_leeway_seconds: 30,
+                maximum_observed_unix_time: AtomicI64::new(i64::MIN),
+                consumed_mutating_jtis: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// Loads an owner-only manager trust snapshot and rejects stale trust at
+    /// startup. Resident public trust-file compatibility remains unchanged.
+    pub fn from_manager_file(
+        path: impl AsRef<Path>,
+        manager_id: impl Into<String>,
+        expected_fleet_id: FleetId,
+    ) -> Result<Self, CallerAuthError> {
+        let bytes = read_bounded(path.as_ref(), MAX_TRUST_FILE_BYTES, true)?;
+        let trust: CallerTokenTrustSnapshot =
+            serde_json::from_slice(&bytes).map_err(|_| CallerAuthError::InvalidTrustSnapshot)?;
+        validate_trust_snapshot_at(&trust, OffsetDateTime::now_utc(), 30)?;
+        Self::for_manager(trust, manager_id, expected_fleet_id)
+    }
+
+    /// Returns whether this verifier configures the supplied Ed25519 public key.
+    /// Used only by process composition to reject trust-domain key reuse,
+    /// including overlap through a revoked key retained in the trust snapshot.
+    pub(crate) fn trusts_public_key(&self, public_key: &[u8]) -> bool {
+        self.inner.trust.keys.iter().any(|key| {
+            URL_SAFE_NO_PAD
+                .decode(key.public_key.as_bytes())
+                .is_ok_and(|trusted| trusted == public_key)
+        })
     }
 
     pub fn verify(
@@ -420,14 +513,26 @@ impl CallerTokenVerifier {
         if claims.iss != self.inner.trust.issuer {
             return Err(CallerAuthError::WrongIssuer);
         }
-        let expected_audience =
-            format!("urn:splendor:instance:{}", self.inner.expected_instance_id);
+        let expected_audience = match &self.inner.target {
+            CallerTokenTarget::Instance { instance_id } => {
+                format!("urn:splendor:instance:{instance_id}")
+            }
+            CallerTokenTarget::CentralManager { manager_id, .. } => {
+                format!("urn:splendor:manager:{manager_id}")
+            }
+        };
         if claims.aud != expected_audience {
             return Err(CallerAuthError::WrongAudience);
         }
         if claims.app_principal_id != self.inner.trust.app_principal_id
             || claims.sub.trim().is_empty()
             || claims.sub.len() > 256
+            || self
+                .inner
+                .trust
+                .expected_client_principal_id
+                .as_ref()
+                .is_some_and(|expected| expected != &claims.sub)
         {
             return Err(CallerAuthError::WrongSubject);
         }
@@ -452,6 +557,7 @@ impl CallerTokenVerifier {
         if claims.iat > latest_current
             || claims.nbf > latest_current
             || claims.exp <= expiry_floor
+            || claims.exp <= claims.iat
             || claims.exp <= claims.nbf
             || claims.nbf < earliest_nbf
             || token_ttl > maximum_ttl
@@ -466,6 +572,9 @@ impl CallerTokenVerifier {
             return Err(CallerAuthError::MalformedToken);
         }
         let canonical_jti = jti.to_string();
+        if claims.jti != canonical_jti {
+            return Err(CallerAuthError::MalformedToken);
+        }
         if self
             .inner
             .trust
@@ -493,11 +602,42 @@ impl CallerTokenVerifier {
             }
             scopes.push(parse_endpoint_scope(&raw).ok_or(CallerAuthError::InvalidScope)?);
         }
-        let tenant_id =
-            TenantId::parse(&claims.tenant_id).map_err(|_| CallerAuthError::InvalidTenant)?;
-        if tenant_id.is_nil() {
-            return Err(CallerAuthError::InvalidTenant);
-        }
+        let (binding, audience) = match (&self.inner.target, claims.tenant_id, claims.fleet_id) {
+            (CallerTokenTarget::Instance { instance_id }, Some(raw_tenant_id), None) => {
+                let tenant_id =
+                    TenantId::parse(&raw_tenant_id).map_err(|_| CallerAuthError::InvalidTenant)?;
+                if tenant_id.is_nil() {
+                    return Err(CallerAuthError::InvalidTenant);
+                }
+                (
+                    CredentialBinding::Tenant { tenant_id },
+                    CredentialAudience::Instance {
+                        instance_id: instance_id.clone(),
+                    },
+                )
+            }
+            (
+                CallerTokenTarget::CentralManager {
+                    manager_id,
+                    fleet_id: expected_fleet_id,
+                },
+                None,
+                Some(raw_fleet_id),
+            ) => {
+                let fleet_id =
+                    FleetId::parse(&raw_fleet_id).map_err(|_| CallerAuthError::InvalidFleet)?;
+                if fleet_id.is_nil() || &fleet_id != expected_fleet_id {
+                    return Err(CallerAuthError::InvalidFleet);
+                }
+                (
+                    CredentialBinding::Fleet { fleet_id },
+                    CredentialAudience::CentralManager {
+                        manager_id: manager_id.clone(),
+                    },
+                )
+            }
+            _ => return Err(CallerAuthError::InvalidBinding),
+        };
         let credential = CallerCredential {
             credential_id: caller_jti_correlation(&canonical_jti),
             principal: ClientPrincipal {
@@ -509,10 +649,8 @@ impl CallerTokenVerifier {
                 label: None,
             },
             scopes,
-            binding: CredentialBinding::Tenant { tenant_id },
-            audience: CredentialAudience::Instance {
-                instance_id: self.inner.expected_instance_id.clone(),
-            },
+            binding,
+            audience,
             expires_at,
             revocation: RevocationStatus::Active,
         };
@@ -612,12 +750,66 @@ impl CallerTokenSigner {
         now: OffsetDateTime,
         ttl: Duration,
     ) -> Result<SignedCallerToken, CallerAuthError> {
-        if ttl <= Duration::ZERO
-            || ttl > Duration::minutes(5)
-            || scopes.is_empty()
-            || tenant_id.is_nil()
-            || instance_id.is_nil()
-        {
+        if tenant_id.is_nil() || instance_id.is_nil() {
+            return Err(CallerAuthError::InvalidLifetime);
+        }
+        self.sign_for_target(
+            format!("urn:splendor:instance:{instance_id}"),
+            Some(tenant_id.to_string()),
+            None,
+            CredentialBinding::Tenant {
+                tenant_id: tenant_id.clone(),
+            },
+            CredentialAudience::Instance {
+                instance_id: instance_id.clone(),
+            },
+            scopes,
+            now,
+            ttl,
+        )
+    }
+
+    /// Signs one fleet-bound token for a concrete central-manager audience.
+    pub fn sign_for_manager(
+        &self,
+        fleet_id: &FleetId,
+        manager_id: &str,
+        scopes: Vec<EndpointScope>,
+        now: OffsetDateTime,
+        ttl: Duration,
+    ) -> Result<SignedCallerToken, CallerAuthError> {
+        if fleet_id.is_nil() || manager_id.trim().is_empty() || manager_id.len() > 256 {
+            return Err(CallerAuthError::InvalidFleet);
+        }
+        self.sign_for_target(
+            format!("urn:splendor:manager:{manager_id}"),
+            None,
+            Some(fleet_id.to_string()),
+            CredentialBinding::Fleet {
+                fleet_id: fleet_id.clone(),
+            },
+            CredentialAudience::CentralManager {
+                manager_id: manager_id.to_string(),
+            },
+            scopes,
+            now,
+            ttl,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_for_target(
+        &self,
+        audience_claim: String,
+        tenant_id: Option<String>,
+        fleet_id: Option<String>,
+        binding: CredentialBinding,
+        audience: CredentialAudience,
+        scopes: Vec<EndpointScope>,
+        now: OffsetDateTime,
+        ttl: Duration,
+    ) -> Result<SignedCallerToken, CallerAuthError> {
+        if ttl <= Duration::ZERO || ttl > Duration::minutes(5) || scopes.is_empty() {
             return Err(CallerAuthError::InvalidLifetime);
         }
         let mut seen = HashSet::new();
@@ -653,14 +845,15 @@ impl CallerTokenSigner {
         let claims = CallerTokenClaims {
             iss: self.inner.issuer.clone(),
             sub: self.inner.client_principal_id.clone(),
-            aud: format!("urn:splendor:instance:{instance_id}"),
+            aud: audience_claim,
             iat: issued_at_unix,
             nbf: issued_at_unix,
             exp: expires_at_unix,
             jti: jti.clone(),
             splendor_ver: CALLER_TOKEN_SCHEMA_VERSION,
             app_principal_id: self.inner.app_principal_id.clone(),
-            tenant_id: tenant_id.to_string(),
+            tenant_id,
+            fleet_id,
             scope,
         };
         let encoded_header = URL_SAFE_NO_PAD
@@ -684,12 +877,8 @@ impl CallerTokenSigner {
                 label: None,
             },
             scopes,
-            binding: CredentialBinding::Tenant {
-                tenant_id: tenant_id.clone(),
-            },
-            audience: CredentialAudience::Instance {
-                instance_id: instance_id.clone(),
-            },
+            binding,
+            audience,
             expires_at,
             revocation: RevocationStatus::Active,
         };
@@ -727,6 +916,10 @@ fn validate_trust_snapshot_shape(trust: &CallerTokenTrustSnapshot) -> Result<(),
         || trust.revoked_jtis.len() > MAX_REVOKED_JTIS
         || trust.issuer.len() > 512
         || trust.app_principal_id.len() > 256
+        || trust
+            .expected_client_principal_id
+            .as_ref()
+            .is_some_and(|subject| subject.trim().is_empty() || subject.len() > 256)
     {
         return Err(CallerAuthError::InvalidTrustSnapshot);
     }
@@ -751,7 +944,7 @@ fn validate_trust_snapshot_shape(trust: &CallerTokenTrustSnapshot) -> Result<(),
         }
     }
     let mut scopes = HashSet::new();
-    if trust.allowed_scopes.len() > MAX_TOKEN_SCOPES
+    if trust.allowed_scopes.len() > MAX_TRUST_ALLOWED_SCOPES
         || trust
             .allowed_scopes
             .iter()
@@ -820,9 +1013,11 @@ fn parse_endpoint_scope(value: &str) -> Option<EndpointScope> {
         EndpointScope::PoliciesPublish,
         EndpointScope::PoliciesRevoke,
         EndpointScope::ApprovalsManage,
+        EndpointScope::ApprovalReceiptsRevoke,
         EndpointScope::GovernanceControl,
         EndpointScope::DeviceRegister,
         EndpointScope::DeviceRead,
+        EndpointScope::DeviceTraceSync,
         EndpointScope::OperatorIntervene,
     ]
     .into_iter()
@@ -1016,6 +1211,158 @@ mod tests {
             second.credential.credential_id
         );
         assert_ne!(first.encoded, second.encoded);
+    }
+
+    #[test]
+    fn manager_token_projects_exact_fleet_bound_caller_and_consumes_once() {
+        let now = OffsetDateTime::from_unix_timestamp(1_783_958_400).expect("time");
+        let fleet_id = FleetId::new();
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:approval-issuer",
+            "approval-control-plane",
+            "approval-client",
+            "approval-manager-test",
+        )
+        .expect("signer");
+        let trust = CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            vec![EndpointScope::ApprovalsManage],
+            now,
+        )
+        .with_expected_client_principal_id("approval-client");
+        let verifier = CallerTokenVerifier::for_manager(trust, "central-manager", fleet_id.clone())
+            .expect("manager verifier");
+        let signed = signer
+            .sign_for_manager(
+                &fleet_id,
+                "central-manager",
+                vec![EndpointScope::ApprovalsManage],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("manager token");
+
+        let verified = verifier
+            .verify_and_consume_mutation(&signed.encoded, now)
+            .expect("verified manager mutation");
+        assert_eq!(verified, signed.credential);
+        assert_eq!(
+            verified.binding,
+            CredentialBinding::Fleet {
+                fleet_id: fleet_id.clone()
+            }
+        );
+        assert_eq!(
+            verified.audience,
+            CredentialAudience::CentralManager {
+                manager_id: "central-manager".to_string()
+            }
+        );
+        assert_eq!(verified.scopes, vec![EndpointScope::ApprovalsManage]);
+        assert!(matches!(
+            verifier.verify_and_consume_mutation(&signed.encoded, now),
+            Err(CallerAuthError::ReplayedToken)
+        ));
+    }
+
+    #[test]
+    fn manager_token_tamper_wrong_target_fleet_scope_and_binding_fail_closed() {
+        let now = OffsetDateTime::from_unix_timestamp(1_783_958_400).expect("time");
+        let fleet_id = FleetId::new();
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:approval-issuer",
+            "approval-control-plane",
+            "approval-client",
+            "approval-manager-test",
+        )
+        .expect("signer");
+        let trust = CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            vec![EndpointScope::ApprovalsManage],
+            now,
+        )
+        .with_expected_client_principal_id("approval-client");
+        let verifier = CallerTokenVerifier::for_manager(trust, "central-manager", fleet_id.clone())
+            .expect("manager verifier");
+        let signed = signer
+            .sign_for_manager(
+                &fleet_id,
+                "central-manager",
+                vec![EndpointScope::ApprovalsManage],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("manager token");
+
+        let (header, mut wrong_subject_claims) = decoded_token(&signed.encoded);
+        wrong_subject_claims["sub"] = serde_json::json!("other-approval-client");
+        assert!(matches!(
+            verifier.verify(&resign_token(&signer, &header, &wrong_subject_claims), now),
+            Err(CallerAuthError::WrongSubject)
+        ));
+
+        let mut tampered = signed.encoded.clone().into_bytes();
+        let last = tampered.last_mut().expect("token byte");
+        *last = if *last == b'a' { b'b' } else { b'a' };
+        assert!(matches!(
+            verifier.verify(std::str::from_utf8(&tampered).expect("utf8"), now),
+            Err(CallerAuthError::InvalidSignature | CallerAuthError::MalformedToken)
+        ));
+
+        let wrong_target = signer
+            .sign_for_manager(
+                &fleet_id,
+                "other-manager",
+                vec![EndpointScope::ApprovalsManage],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("wrong-target token");
+        assert!(matches!(
+            verifier.verify(&wrong_target.encoded, now),
+            Err(CallerAuthError::WrongAudience)
+        ));
+
+        let wrong_fleet = signer
+            .sign_for_manager(
+                &FleetId::new(),
+                "central-manager",
+                vec![EndpointScope::ApprovalsManage],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("wrong-fleet token");
+        assert!(matches!(
+            verifier.verify(&wrong_fleet.encoded, now),
+            Err(CallerAuthError::InvalidFleet)
+        ));
+
+        let wrong_scope = signer
+            .sign_for_manager(
+                &fleet_id,
+                "central-manager",
+                vec![EndpointScope::FleetRead],
+                now,
+                Duration::seconds(60),
+            )
+            .expect("wrong-scope token");
+        assert!(matches!(
+            verifier.verify(&wrong_scope.encoded, now),
+            Err(CallerAuthError::InvalidScope)
+        ));
+
+        let (header, mut claims) = decoded_token(&signed.encoded);
+        claims["tenant_id"] = serde_json::json!(TenantId::new().to_string());
+        assert!(matches!(
+            verifier.verify(&resign_token(&signer, &header, &claims), now),
+            Err(CallerAuthError::InvalidBinding)
+        ));
     }
 
     #[test]
@@ -1248,6 +1595,21 @@ mod tests {
             Err(CallerAuthError::InvalidLifetime)
         ));
 
+        let mut non_positive_lifetime = claims.clone();
+        non_positive_lifetime["exp"] = non_positive_lifetime["iat"].clone();
+        assert!(matches!(
+            verifier.verify(&resign_token(&signer, &header, &non_positive_lifetime), now),
+            Err(CallerAuthError::InvalidLifetime)
+        ));
+
+        let mut noncanonical_jti = claims.clone();
+        noncanonical_jti["jti"] =
+            serde_json::json!(format!("{{{}}}", claims["jti"].as_str().expect("jti")));
+        assert!(matches!(
+            verifier.verify(&resign_token(&signer, &header, &noncanonical_jti), now),
+            Err(CallerAuthError::MalformedToken)
+        ));
+
         let mut excessive = claims;
         excessive["exp"] = serde_json::json!(now.unix_timestamp() + 301);
         assert!(matches!(
@@ -1431,6 +1793,46 @@ mod tests {
         ));
 
         trust.expires_at = trust.issued_at + Duration::hours(1);
+        let seventeen_scopes = vec![
+            EndpointScope::RunsCreate,
+            EndpointScope::RunsStart,
+            EndpointScope::RunsRead,
+            EndpointScope::RunsPause,
+            EndpointScope::RunsResume,
+            EndpointScope::RunsStop,
+            EndpointScope::ActionsSubmit,
+            EndpointScope::StateRead,
+            EndpointScope::StateHandoff,
+            EndpointScope::TracesRead,
+            EndpointScope::ReplayCreate,
+            EndpointScope::HealthRead,
+            EndpointScope::DeviceRegister,
+            EndpointScope::DeviceRead,
+            EndpointScope::DeviceTraceSync,
+            EndpointScope::OperatorIntervene,
+            EndpointScope::PoliciesSync,
+        ];
+        let broad_trust = CallerTokenTrustSnapshot::single_key(
+            signer.issuer(),
+            signer.app_principal_id(),
+            signer.kid(),
+            &signer.public_key_bytes(),
+            seventeen_scopes.clone(),
+            now,
+        );
+        CallerTokenVerifier::new(broad_trust, instance_id.clone())
+            .expect("trust may enumerate more known scopes than one token");
+        assert!(matches!(
+            signer.sign(
+                &TenantId::new(),
+                &instance_id,
+                seventeen_scopes,
+                now,
+                Duration::seconds(60),
+            ),
+            Err(CallerAuthError::InvalidScope)
+        ));
+
         let root = std::env::temp_dir().join(format!(
             "splendor-caller-trust-file-{}",
             uuid::Uuid::new_v4()

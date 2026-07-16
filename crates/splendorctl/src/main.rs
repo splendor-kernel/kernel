@@ -3815,6 +3815,55 @@ fn append_failure_evidence_event(
     Ok(())
 }
 
+fn side_effect_executed_before_trace_failure(
+    store: &dyn TraceStore,
+    run_id: &str,
+    failed_payload: &serde_json::Value,
+) -> Result<bool, TraceStoreError> {
+    let failed_identity: TraceIdentityContext = serde_json::from_value(
+        failed_payload
+            .get("identity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )?;
+    let Some(failed_tick_id) = failed_identity.tick_id else {
+        return Ok(false);
+    };
+    if non_read_only_action_executed_for_tick(failed_payload, failed_tick_id)? {
+        return Ok(true);
+    }
+
+    match store.read(run_id) {
+        Ok(records) => {
+            for record in records {
+                if non_read_only_action_executed_for_tick(&record.payload, failed_tick_id)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(TraceStoreError::RunNotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn non_read_only_action_executed_for_tick(
+    payload: &serde_json::Value,
+    expected_tick_id: splendor_types::TickId,
+) -> Result<bool, TraceStoreError> {
+    if trace_payload_kind(payload).as_deref() != Some("ActionExecuted") {
+        return Ok(false);
+    }
+
+    let event: TraceEvent = serde_json::from_value(payload.clone())?;
+    Ok(event.identity.tick_id == Some(expected_tick_id)
+        && matches!(
+            event.kind,
+            TraceEventKind::ActionExecuted { action, .. }
+                if action.side_effect_class != SideEffectClass::ReadOnly
+        ))
+}
+
 impl TraceStore for FailingTraceStore {
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
         if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
@@ -3826,13 +3875,15 @@ impl TraceStore for FailingTraceStore {
                 // can use that sequence. Other injected failures terminate the
                 // loop immediately and retain the existing standalone evidence.
                 if self.fail_on_event != "ActionVerificationCompleted" {
+                    let side_effect_executed =
+                        side_effect_executed_before_trace_failure(&self.inner, run_id, &payload)?;
                     append_failure_evidence_event(
                         &self.inner,
                         run_id,
                         "TraceWriteFailed",
                         serde_json::json!({
                             "failed_event": self.fail_on_event,
-                            "side_effect_executed": false,
+                            "side_effect_executed": side_effect_executed,
                             "failure_injection": "splendorctl_public_run_config",
                         }),
                     )?;

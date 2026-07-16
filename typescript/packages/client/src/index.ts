@@ -1,5 +1,6 @@
 import type {
   ActionOutcome,
+  AuthorityObligationReceiptId,
   AppendPerceptResponse,
   AuditAttribution,
   CapabilitiesResponse,
@@ -10,6 +11,8 @@ import type {
   LifecycleRequest,
   Percept,
   ReplayResponse,
+  ResidentApprovalReceiptRevocationAck,
+  ResidentApprovalReceiptRevocationRequest,
   RunInspectResponse,
   RunId,
   StateHead,
@@ -274,6 +277,21 @@ export class SplendorClient {
         audit_attribution: request.audit_attribution ?? this.requireAudit()
       }
     });
+  }
+
+  async revokeApprovalReceipt(
+    runId: RunId,
+    receiptId: AuthorityObligationReceiptId,
+    request: ResidentApprovalReceiptRevocationRequest
+  ): Promise<ResidentApprovalReceiptRevocationAck> {
+    if (request.authority_obligation_receipt.receipt_id !== receiptId) {
+      throw new TypeError("revokeApprovalReceipt requires the path and retained receipt identities to match");
+    }
+    return this.request<ResidentApprovalReceiptRevocationAck>(
+      "POST",
+      `runs/${encodeURIComponent(runId)}/approval-receipts/${encodeURIComponent(receiptId)}/revoke`,
+      { body: request }
+    );
   }
 
   async getHealth(): Promise<HealthResponse> {

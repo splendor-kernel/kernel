@@ -30,6 +30,7 @@
 //!     quota_usage: splendor_types::QuotaUsage::single_action(),
 //!     satisfied_preconditions: vec![],
 //!     requested_at: OffsetDateTime::now_utc(),
+//!     physical_action_resource_coordinate: None,
 //!     approval_evidence: None,
 //!     authority_obligation_evidence: None,
 //!     authority_obligation_receipts: vec![],
@@ -39,24 +40,30 @@
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
-    authority_decision_evidence, compatibility_permission_operation, gateway_action_operation,
-    gateway_adapter_operation, verify_obligation_receipts, AuthorityObligationEffectPermit,
-    AuthorityObligationReceiptLedger, AuthorityObligationReceiptValidationContext,
+    authority_decision_evidence, canonical_authority_request_digest,
+    compatibility_permission_operation, gateway_action_operation, gateway_adapter_operation,
+    verify_obligation_receipts, AuthorityObligationEffectPermit, AuthorityObligationReceiptLedger,
+    AuthorityObligationReceiptValidationContext, APPROVAL_OBLIGATION_ACTION_DIGEST,
+    APPROVAL_OBLIGATION_ACTION_ID, APPROVAL_OBLIGATION_ACTION_NAME, APPROVAL_OBLIGATION_ADAPTER,
+    APPROVAL_OBLIGATION_APPROVAL_ID, APPROVAL_OBLIGATION_EXPIRES_AT, APPROVAL_OBLIGATION_POLICY_ID,
+    APPROVAL_OBLIGATION_RECEIPT_AUDIENCE, APPROVAL_OBLIGATION_RISK_LEVEL,
 };
 use splendor_types::{
-    is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalDecision,
-    ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext, AuthorityDecision,
-    AuthorityDecisionId, AuthorityDecisionStatus, AuthorityObligationId,
-    AuthorityObligationReceipt, AuthorityOperationNamespace, AuthorityResourceKind, AuthorityVerb,
-    CapabilityGrantId, CircuitBreaker, CircuitBreakerScope, ContentHash, EffectCertainty,
-    ErrorCategory, ErrorTaxonomy, IdentityValidationError, QuotaUsage, ReasonCode, RetryClass,
-    RunId, RuntimeIdentityContext, SideEffectClass, TenantId, TickId, VerificationResult,
-    APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
-    FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    is_allowed_physical_action, Action, AgentId, ApprovalActionScope, ApprovalChallenge,
+    ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy, ApprovalTraceContext,
+    AuthorityDecision, AuthorityDecisionId, AuthorityDecisionStatus, AuthorityObligationId,
+    AuthorityObligationKind, AuthorityObligationReceipt, AuthorityOperationNamespace,
+    AuthorityResourceKind, AuthorityVerb, CapabilityGrantId, CircuitBreaker, CircuitBreakerScope,
+    ContentHash, EffectCertainty, ErrorCategory, ErrorTaxonomy, IdentityValidationError,
+    PhysicalActionResourceCoordinate, QuotaUsage, ReasonCode, RetryClass, RunId,
+    RuntimeIdentityContext, SideEffectClass, TenantId, TickId, VerificationResult,
+    APPROVAL_CHALLENGE_SCHEMA_VERSION, APPROVAL_EVIDENCE_SCHEMA_VERSION,
+    APPROVAL_POLICY_SCHEMA_VERSION, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::{ready, Future, Ready};
 use std::sync::Arc;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub use splendor_types::ActionId;
@@ -109,6 +116,10 @@ pub struct ActionRequest {
     pub satisfied_preconditions: Vec<String>,
     /// Timestamp when the action was requested.
     pub requested_at: OffsetDateTime,
+    /// Trusted server-derived physical target. This field is never decoded from
+    /// requester JSON and is set only by kernel composition.
+    #[serde(skip)]
+    pub physical_action_resource_coordinate: Option<PhysicalActionResourceCoordinate>,
     /// Optional approval grant/denial evidence presented for this action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_evidence: Option<ApprovalEvidence>,
@@ -167,6 +178,10 @@ pub struct ActionOutcome {
     pub output: Option<serde_json::Value>,
     /// Optional error message for denied or failed actions.
     pub error: Option<String>,
+    /// Exact behavior-free approval challenge when this action paused. The
+    /// challenge is not authority and must be satisfied by a trusted receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_challenge: Option<ApprovalChallenge>,
     /// Timestamp when the outcome was recorded.
     pub completed_at: OffsetDateTime,
 }
@@ -529,6 +544,9 @@ pub enum ApprovalVerification {
     NotRequired,
     /// Scoped approval evidence is valid; execution may continue.
     Granted(VerificationResult),
+    /// A raw obligation receipt is present, but only the final trusted authority
+    /// obligation verifier may decide whether execution can continue.
+    Deferred,
     /// Approval is required but no valid evidence was supplied yet.
     Required(VerificationResult),
     /// Approval evidence denied, expired, was revoked, or had the wrong scope.
@@ -620,6 +638,9 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
         };
 
         let Some(evidence) = action.approval_evidence.as_ref() else {
+            if !action.authority_obligation_receipts.is_empty() {
+                return ApprovalVerification::Deferred;
+            }
             return ApprovalVerification::Required(approval_result(
                 false,
                 "approval_required",
@@ -689,7 +710,7 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
             ));
         }
 
-        if evidence.expires_at < now {
+        if evidence.expires_at <= now {
             return ApprovalVerification::Denied(approval_result(
                 false,
                 "approval_expired",
@@ -700,13 +721,16 @@ impl ApprovalVerifier for PolicyApprovalVerifier {
         }
 
         match evidence.decision {
-            ApprovalDecision::Granted => ApprovalVerification::Granted(approval_result(
-                true,
-                "approval_granted",
-                "granted",
-                context,
-                Some(policy.policy_id.clone()),
-            )),
+            ApprovalDecision::Granted if action.authority_obligation_receipts.is_empty() => {
+                ApprovalVerification::Required(approval_result(
+                    false,
+                    "approval_obligation_receipt_required",
+                    "required",
+                    context,
+                    Some(policy.policy_id.clone()),
+                ))
+            }
+            ApprovalDecision::Granted => ApprovalVerification::Deferred,
             ApprovalDecision::Denied => ApprovalVerification::Denied(approval_result(
                 false,
                 "approval_denied",
@@ -1664,6 +1688,7 @@ impl ActionGateway for VerifiedActionGateway {
                     post_verification: None,
                     output: None,
                     error: Some("adapter_mismatch".to_string()),
+                    approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 });
             }
@@ -1722,12 +1747,57 @@ impl ActionGateway for VerifiedActionGateway {
             Some(adapter_id),
             OffsetDateTime::now_utc(),
         );
+        let approval_verification = match approval_verification {
+            ApprovalVerification::Granted(mut result)
+                if action.approval_evidence.is_some()
+                    && action.authority_obligation_receipts.is_empty() =>
+            {
+                result.allowed = false;
+                if !result
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "approval_obligation_receipt_required")
+                {
+                    result
+                        .reasons
+                        .push("approval_obligation_receipt_required".to_string());
+                }
+                ApprovalVerification::Required(result)
+            }
+            other => other,
+        };
         let approval_grant = match approval_verification {
             ApprovalVerification::NotRequired => None,
             ApprovalVerification::Granted(result) => Some(result),
+            ApprovalVerification::Deferred => None,
             ApprovalVerification::Required(mut result) => {
+                let challenge = match prepared_authority.as_deref() {
+                    Some(prepared) => {
+                        match approval_challenge_from_prepared(prepared, &action, Some(adapter_id))
+                        {
+                            Ok(challenge) => challenge,
+                            Err(reason) => {
+                                let mut result = VerificationResult::deny(reason);
+                                attach_request_context(&mut result, &action);
+                                return Ok(needs_intervention_outcome(action.action_id, result));
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(challenge) = challenge.as_ref() {
+                    if let Err(reason) = bind_approval_result_to_challenge(&mut result, challenge) {
+                        let mut result = VerificationResult::deny(reason);
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_intervention_outcome(action.action_id, result));
+                    }
+                }
                 attach_request_context(&mut result, &action);
-                return Ok(needs_approval_outcome(action.action_id, result));
+                return Ok(needs_approval_outcome_with_challenge(
+                    action.action_id,
+                    result,
+                    challenge,
+                ));
             }
             ApprovalVerification::Denied(mut result) => {
                 attach_request_context(&mut result, &action);
@@ -1850,6 +1920,19 @@ impl ActionGateway for VerifiedActionGateway {
         // linearization have completed, while durable evidence and the adapter
         // remain ahead. This prevents a receipt that expires during verifier
         // work from reaching an effect.
+        let final_approval_challenge = match final_prepared_authority.as_deref() {
+            Some(prepared) => {
+                match approval_challenge_from_prepared(prepared, &action, Some(adapter_id)) {
+                    Ok(challenge) => challenge,
+                    Err(reason) => {
+                        let mut result = VerificationResult::deny(reason);
+                        attach_request_context(&mut result, &action);
+                        return Ok(needs_intervention_outcome(action.action_id, result));
+                    }
+                }
+            }
+            None => None,
+        };
         let mut authority_obligation_grants = Vec::new();
         let receipts_to_consume = if let Some(prepared) = final_prepared_authority.as_ref() {
             if prepared.conditional_decisions.is_empty() {
@@ -2019,6 +2102,41 @@ impl ActionGateway for VerifiedActionGateway {
                 })
             };
             attach_allowed_artifact(&mut verification, "authority_obligation", artifacts);
+            if let Some(challenge) = final_approval_challenge.as_ref() {
+                let Some(receipt) = action.authority_obligation_receipts.iter().find(|receipt| {
+                    receipt.authority_decision_id == challenge.authority_decision_id
+                        && receipt.obligation_id == challenge.obligation_id
+                }) else {
+                    let mut result =
+                        VerificationResult::deny("approval_obligation_receipt_missing_after_claim");
+                    attach_request_context(&mut result, &action);
+                    return Ok(needs_intervention_outcome(action.action_id, result));
+                };
+                let approval = ApprovalTraceContext {
+                    approval_id: challenge.approval_id.clone(),
+                    tenant_id: challenge.tenant_id.clone(),
+                    agent_id: challenge.agent_id.clone(),
+                    run_id: challenge.run_id.clone(),
+                    action_id: Some(challenge.action_id.clone()),
+                    action_name: challenge.action_name.clone(),
+                    adapter: Some(challenge.adapter.clone()),
+                    decision: Some(ApprovalDecision::Granted),
+                    reason: Some("authority_obligation_receipt_validated".to_string()),
+                    policy_id: Some(challenge.policy_id.clone()),
+                    risk_level: challenge.risk_level.clone(),
+                    issued_at: Some(receipt.issued_at),
+                    expires_at: Some(receipt.expires_at),
+                    revoked: false,
+                };
+                let result = approval_result(
+                    true,
+                    "approval_granted",
+                    "granted",
+                    approval,
+                    Some(challenge.policy_id.clone()),
+                );
+                attach_allowed_artifact(&mut verification, "approval", result.artifacts);
+            }
         }
 
         let requires_pre_effect_record =
@@ -2079,6 +2197,7 @@ impl ActionGateway for VerifiedActionGateway {
                     post_verification: None,
                     output: None,
                     error: Some(error.to_string()),
+                    approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 })
             }
@@ -2113,6 +2232,7 @@ impl ActionGateway for VerifiedActionGateway {
             post_verification: Some(post_verification),
             output: Some(adapter_result.output),
             error,
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -2367,6 +2487,179 @@ fn bind_current_gateway_authority_decision(
     Ok(decision)
 }
 
+fn approval_challenge_from_prepared(
+    prepared: &PreparedAuthorityAllow,
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> Result<Option<ApprovalChallenge>, String> {
+    let mut matching = Vec::new();
+    for decision in &prepared.conditional_decisions {
+        for obligation in &decision.obligations {
+            if obligation.kind == AuthorityObligationKind::ApprovalRequired
+                && obligation
+                    .parameters
+                    .contains_key(APPROVAL_OBLIGATION_APPROVAL_ID)
+            {
+                matching.push((decision, obligation));
+            }
+        }
+    }
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    if matching.len() != 1 {
+        return Err("approval_challenge_ambiguous".to_string());
+    }
+    let (decision, obligation) = matching[0];
+    if decision.status != AuthorityDecisionStatus::Conditional
+        || decision.obligations.len() != 1
+        || decision.request.operation != gateway_action_operation(&action.action.name)
+    {
+        return Err("approval_challenge_decision_invalid".to_string());
+    }
+    let parameters = &obligation.parameters;
+    let has_risk_level = parameters.contains_key(APPROVAL_OBLIGATION_RISK_LEVEL);
+    if parameters.len() != if has_risk_level { 9 } else { 8 } {
+        return Err("approval_challenge_parameters_invalid".to_string());
+    }
+    let approval_id = ApprovalId::parse(required_obligation_parameter(
+        parameters,
+        APPROVAL_OBLIGATION_APPROVAL_ID,
+    )?)
+    .map_err(|_| "approval_challenge_approval_id_invalid".to_string())?;
+    let obligation_action_id = ActionId::parse(required_obligation_parameter(
+        parameters,
+        APPROVAL_OBLIGATION_ACTION_ID,
+    )?)
+    .map_err(|_| "approval_challenge_action_id_invalid".to_string())?;
+    let action_name = required_obligation_parameter(parameters, APPROVAL_OBLIGATION_ACTION_NAME)?;
+    let adapter = required_obligation_parameter(parameters, APPROVAL_OBLIGATION_ADAPTER)?;
+    let policy_id = required_obligation_parameter(parameters, APPROVAL_OBLIGATION_POLICY_ID)?;
+    let receipt_audience =
+        required_obligation_parameter(parameters, APPROVAL_OBLIGATION_RECEIPT_AUDIENCE)?;
+    let expires_at = OffsetDateTime::parse(
+        required_obligation_parameter(parameters, APPROVAL_OBLIGATION_EXPIRES_AT)?,
+        &Rfc3339,
+    )
+    .map_err(|_| "approval_challenge_expiry_invalid".to_string())?;
+    let action_digest =
+        required_obligation_parameter(parameters, APPROVAL_OBLIGATION_ACTION_DIGEST)?;
+    let expected_action_digest =
+        canonical_gateway_authority_action_digest(action, effective_adapter)?;
+    let bound_action_digest = decision
+        .request
+        .metadata
+        .get(GATEWAY_AUTHORITY_ACTION_DIGEST_METADATA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "approval_challenge_action_digest_missing".to_string())?;
+    let decision_digest = decision
+        .request
+        .metadata
+        .get(GATEWAY_AUTHORITY_DECISION_DIGEST_METADATA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "approval_challenge_decision_digest_missing".to_string())?;
+    let expected_decision_digest = canonical_gateway_authority_decision_digest(decision)?;
+    if obligation_action_id != action.action_id
+        || action_name != action.action.name
+        || Some(adapter) != effective_adapter
+        || policy_id.trim().is_empty()
+        || action_digest != expected_action_digest
+        || bound_action_digest != expected_action_digest
+        || decision_digest != expected_decision_digest
+        || decision.request.scope.audiences.as_deref() != Some(&[receipt_audience.to_string()])
+        || expires_at <= action.requested_at
+    {
+        return Err("approval_challenge_binding_mismatch".to_string());
+    }
+    let canonical_request_digest = canonical_authority_request_digest(&decision.request)
+        .map_err(|error| error.reason_code())?;
+    let risk_level = parameters
+        .get(APPROVAL_OBLIGATION_RISK_LEVEL)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "approval_challenge_risk_level_invalid".to_string())
+        })
+        .transpose()?;
+    Ok(Some(ApprovalChallenge {
+        schema_version: APPROVAL_CHALLENGE_SCHEMA_VERSION.to_string(),
+        approval_id,
+        tenant_id: action.tenant_id.clone(),
+        agent_id: action.agent_id.clone(),
+        run_id: action.run_id.clone(),
+        action_id: action.action_id.clone(),
+        action_name: action.action.name.clone(),
+        adapter: adapter.to_string(),
+        policy_id: policy_id.to_string(),
+        risk_level,
+        subject: decision.request.subject.clone(),
+        authority_decision_id: decision.decision_id.clone(),
+        obligation_id: obligation.obligation_id.clone(),
+        receipt_audience: receipt_audience.to_string(),
+        canonical_request_digest,
+        gateway_action_request_digest: expected_action_digest,
+        physical_action_resource_coordinate: action.physical_action_resource_coordinate.clone(),
+        authority_decision_digest: expected_decision_digest,
+        requested_at: action.requested_at,
+        expires_at,
+    }))
+}
+
+fn required_obligation_parameter<'a>(
+    parameters: &'a std::collections::BTreeMap<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<&'a str, String> {
+    parameters
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("approval_challenge_parameter_missing:{key}"))
+}
+
+fn bind_approval_result_to_challenge(
+    result: &mut VerificationResult,
+    challenge: &ApprovalChallenge,
+) -> Result<(), String> {
+    let artifacts = result
+        .artifacts
+        .as_object_mut()
+        .ok_or_else(|| "approval_challenge_artifact_unavailable".to_string())?;
+    if artifacts
+        .get("policy_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(challenge.policy_id.as_str())
+    {
+        return Err("approval_challenge_policy_mismatch".to_string());
+    }
+    let approval = artifacts
+        .get("approval")
+        .cloned()
+        .ok_or_else(|| "approval_challenge_context_unavailable".to_string())?;
+    let mut approval: ApprovalTraceContext = serde_json::from_value(approval)
+        .map_err(|_| "approval_challenge_context_invalid".to_string())?;
+    approval.approval_id = challenge.approval_id.clone();
+    approval.tenant_id = challenge.tenant_id.clone();
+    approval.agent_id = challenge.agent_id.clone();
+    approval.run_id = challenge.run_id.clone();
+    approval.action_id = Some(challenge.action_id.clone());
+    approval.action_name = challenge.action_name.clone();
+    approval.adapter = Some(challenge.adapter.clone());
+    approval.decision = None;
+    approval.policy_id = Some(challenge.policy_id.clone());
+    approval.risk_level = challenge.risk_level.clone();
+    approval.issued_at = None;
+    approval.expires_at = Some(challenge.expires_at);
+    approval.revoked = false;
+    artifacts.insert(
+        "approval".to_string(),
+        serde_json::to_value(approval)
+            .map_err(|_| "approval_challenge_context_unavailable".to_string())?,
+    );
+    Ok(())
+}
+
 fn action_with_current_authority_decision(
     action: &ActionRequest,
     decision: AuthorityDecision,
@@ -2410,6 +2703,7 @@ fn identity_denied_outcome(action_id: ActionId, error: IdentityValidationError) 
         post_verification: None,
         output: None,
         error: Some(error.to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }
@@ -2527,7 +2821,48 @@ pub fn canonical_gateway_authority_action_digest(
     action: &ActionRequest,
     effective_adapter: Option<&str>,
 ) -> Result<String, String> {
-    let payload = GatewayAuthorityActionDigestPayload {
+    let bytes = if is_physical_action(&action.action) {
+        let physical_action_resource_coordinate = action
+            .physical_action_resource_coordinate
+            .as_ref()
+            .filter(|coordinate| !coordinate.node_id.is_nil())
+            .ok_or_else(|| "physical_action_resource_coordinate_required".to_string())?;
+        serde_json::to_vec(&GatewayPhysicalAuthorityActionDigestPayload {
+            schema_version: "splendor.gateway.authority_action_binding.physical.v2",
+            physical_action_resource_coordinate,
+            action_id: &action.action_id,
+            tenant_id: &action.tenant_id,
+            agent_id: &action.agent_id,
+            run_id: &action.run_id,
+            action: &action.action,
+            effective_adapter,
+            quota_usage: action.quota_usage,
+            satisfied_preconditions: &action.satisfied_preconditions,
+            requested_at: action.requested_at,
+        })
+        .map_err(|error| format!("gateway_action_request_digest_unavailable:{error}"))?
+    } else {
+        return canonical_gateway_authority_action_v1_compat_digest(action, effective_adapter);
+    };
+    Ok(ContentHash::blake3(bytes).to_string())
+}
+
+/// Computes the frozen v1 action-binding digest for fail-closed migration of an
+/// already stored physical-v1 approval challenge.
+///
+/// This helper never authorizes a physical action. Callers must remove any v2
+/// physical resource coordinate first, compare only against an immutable stored
+/// v1 challenge, and use the result solely to apply raw denial, expiry, or
+/// revocation. Live physical authorization always uses
+/// [`canonical_gateway_authority_action_digest`] and its physical-v2 binding.
+pub fn canonical_gateway_authority_action_v1_compat_digest(
+    action: &ActionRequest,
+    effective_adapter: Option<&str>,
+) -> Result<String, String> {
+    if action.physical_action_resource_coordinate.is_some() {
+        return Err("physical_action_resource_coordinate_unexpected".to_string());
+    }
+    let bytes = serde_json::to_vec(&GatewayAuthorityActionDigestPayload {
         schema_version: "splendor.gateway.authority_action_binding.v1",
         action_id: &action.action_id,
         tenant_id: &action.tenant_id,
@@ -2538,9 +2873,8 @@ pub fn canonical_gateway_authority_action_digest(
         quota_usage: action.quota_usage,
         satisfied_preconditions: &action.satisfied_preconditions,
         requested_at: action.requested_at,
-    };
-    let bytes = serde_json::to_vec(&payload)
-        .map_err(|error| format!("gateway_action_request_digest_unavailable:{error}"))?;
+    })
+    .map_err(|error| format!("gateway_action_request_digest_unavailable:{error}"))?;
     Ok(ContentHash::blake3(bytes).to_string())
 }
 
@@ -2567,7 +2901,6 @@ pub fn canonical_gateway_authority_decision_digest(
         reasons: &decision.reasons,
         matched_grant_ids: &decision.matched_grant_ids,
         obligations: &decision.obligations,
-        decided_at: decision.decided_at,
     };
     let bytes = serde_json::to_vec(&payload)
         .map_err(|error| format!("authority_decision_digest_unavailable:{error}"))?;
@@ -2590,6 +2923,22 @@ struct GatewayAuthorityActionDigestPayload<'a> {
 }
 
 #[derive(Serialize)]
+struct GatewayPhysicalAuthorityActionDigestPayload<'a> {
+    schema_version: &'static str,
+    physical_action_resource_coordinate: &'a PhysicalActionResourceCoordinate,
+    action_id: &'a ActionId,
+    tenant_id: &'a TenantId,
+    agent_id: &'a AgentId,
+    run_id: &'a RunId,
+    action: &'a Action,
+    effective_adapter: Option<&'a str>,
+    quota_usage: QuotaUsage,
+    satisfied_preconditions: &'a [String],
+    #[serde(with = "time::serde::rfc3339")]
+    requested_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
 struct GatewayAuthorityDecisionDigestPayload<'a> {
     schema_version: &'static str,
     decision_schema_version: &'a str,
@@ -2599,8 +2948,6 @@ struct GatewayAuthorityDecisionDigestPayload<'a> {
     reasons: &'a [String],
     matched_grant_ids: &'a [splendor_types::CapabilityGrantId],
     obligations: &'a [splendor_types::AuthorityObligation],
-    #[serde(with = "time::serde::rfc3339")]
-    decided_at: OffsetDateTime,
 }
 
 fn authority_decision_action_binding_reasons(
@@ -2949,6 +3296,34 @@ pub fn is_physical_action(action: &Action) -> bool {
 }
 
 fn verify_physical_action_boundary(action: &ActionRequest) -> Option<VerificationResult> {
+    let physical = is_physical_action(&action.action);
+    if physical
+        && action
+            .physical_action_resource_coordinate
+            .as_ref()
+            .is_none_or(|coordinate| coordinate.node_id.is_nil())
+    {
+        return Some(VerificationResult {
+            allowed: false,
+            reasons: vec!["physical_action_resource_coordinate_required".to_string()],
+            artifacts: serde_json::json!({
+                "source": "physical_action_boundary",
+                "action": action.action.name,
+                "matched_policy": "trusted_physical_resource_coordinate_required",
+            }),
+        });
+    }
+    if !physical && action.physical_action_resource_coordinate.is_some() {
+        return Some(VerificationResult {
+            allowed: false,
+            reasons: vec!["physical_action_resource_coordinate_unexpected".to_string()],
+            artifacts: serde_json::json!({
+                "source": "physical_action_boundary",
+                "action": action.action.name,
+                "matched_policy": "physical_resource_coordinate_not_request_metadata",
+            }),
+        });
+    }
     let normalized = normalize_physical_token(&action.action.name);
     if FORBIDDEN_PHYSICAL_ACTION_PATTERNS
         .iter()
@@ -3395,11 +3770,20 @@ fn denied_outcome(action_id: ActionId, verification: VerificationResult) -> Acti
         post_verification: None,
         output: None,
         error: Some(error),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }
 
 fn needs_approval_outcome(action_id: ActionId, verification: VerificationResult) -> ActionOutcome {
+    needs_approval_outcome_with_challenge(action_id, verification, None)
+}
+
+fn needs_approval_outcome_with_challenge(
+    action_id: ActionId,
+    verification: VerificationResult,
+    approval_challenge: Option<ApprovalChallenge>,
+) -> ActionOutcome {
     ActionOutcome {
         action_id,
         status: ActionStatus::NeedsApproval,
@@ -3407,6 +3791,7 @@ fn needs_approval_outcome(action_id: ActionId, verification: VerificationResult)
         post_verification: None,
         output: None,
         error: Some("approval_required".to_string()),
+        approval_challenge,
         completed_at: OffsetDateTime::now_utc(),
     }
 }
@@ -3422,6 +3807,7 @@ fn needs_intervention_outcome(
         post_verification: None,
         output: None,
         error: Some("needs_intervention".to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }

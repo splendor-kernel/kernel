@@ -94,7 +94,7 @@ or replay inspection. Mutating daemon calls also emit `DaemonAudit` before the
 mutation so caller attribution is persisted in the run trace.
 
 0.04-S2 approval lifecycle events are emitted by the gateway/daemon approval path
-when an action requires approval, a grant is presented, evidence is denied,
+when an action requires approval, a trusted receipt is validated, legacy evidence is denied,
 evidence is expired, or evidence is revoked. They are ordered in the same run
 trace and do not authorize adapter execution outside the gateway.
 
@@ -360,7 +360,7 @@ gateway/verifier path.
 | --- | --- | --- |
 | `ActionNeedsApproval` | `action.needs_approval` | The approval verifier paused the action before adapter execution. |
 | `ApprovalRequested` | `approval.requested` | A policy-created approval request was recorded. |
-| `ApprovalGranted` | `approval.granted` | Scoped approval grant evidence was presented. |
+| `ApprovalGranted` | `approval.granted` | A trusted approval-obligation receipt was validated and matched to the exact current challenge. |
 | `ApprovalDenied` | `approval.denied` | Approval denial, unsupported schema, or wrong-scope evidence was rejected. |
 | `ApprovalExpired` | `approval.expired` | Expired approval evidence was rejected. |
 | `ApprovalRevoked` | `approval.revoked` | Revoked approval evidence was rejected. |

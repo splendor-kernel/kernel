@@ -75,8 +75,10 @@ effective-user ownership and no group/world permission. This does not attest the
 host, mount source, ACLs, container identity, or hardware key custody. Non-Unix
 builds do not claim the Unix owner/mode check.
 
-The acceptance-only manager binary also requires explicit outbound dispatch
-configuration. It is not a production-authenticated inbound manager:
+The acceptance-only manager binary also requires explicit outbound dispatch and
+approval-receipt configuration. Its four approval mutation endpoints use a
+bounded inbound verifier; this does not make the remaining manager API a
+production-authenticated inbound manager:
 
 ```bash
 SPLENDOR_MANAGER_MODE=local_acceptance \
@@ -88,12 +90,26 @@ SPLENDOR_MANAGER_CALLER_CLIENT_PRINCIPAL_ID=<client-principal> \
 SPLENDOR_MANAGER_CALLER_KEY_ID=<caller-key-id> \
 SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE=/run/splendor/caller-signing-key.pk8 \
 SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE=/run/splendor/work-order-keyring.json \
+SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE=/run/splendor/authority-obligation-receipt-config.json \
+SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE=/run/splendor/approval-caller-trust.json \
 SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE=/etc/splendor/resident-root-ca.pem \
 SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS=https://resident-a.example:8443,https://resident-b.example:8443 \
 cargo run -p splendor-daemon --bin splendor-manager
 ```
 
-The caller signing key and manager work-order keyring must be owner-only files.
+The caller signing key, manager work-order keyring, receipt configuration, and
+manager approval caller trust snapshot must be owner-only files. The approval
+trust snapshot uses `splendor.caller_trust.v1`, must be live at startup, and
+allows only the intended manager approval scopes. Approval request/grant/deny/
+revoke require a fresh Ed25519 bearer with audience
+`urn:splendor:manager:<manager_id>`, exactly one matching fleet claim, and
+`splendor.approvals.manage`; the body credential and audit attribution are only
+matching mirrors. Missing, malformed, stale, forged, replayed, wrong-target,
+wrong-fleet, or wrong-scope proof cannot mutate approval state, append approval
+audit, or issue a receipt. Circuit breaker, policy, fleet, work-order, message,
+and other manager endpoints retain the existing `local_acceptance` limitation.
+No manager TLS or full inbound authentication claim is made.
+
 The exact-origin allowlist is mandatory; userinfo, path, query, fragment,
 non-HTTPS production origins, and origin mismatches are rejected before token
 minting or network I/O. Loopback HTTP is available only to explicit test/local
@@ -150,7 +166,9 @@ Trace responses are ordered records. Replay validates run scope and sequence con
   request/idempotency keys; ephemeral JTI digests are not part of that scope.
 - Missing endpoint scope fails closed.
 - Unsigned, expired, revoked, or incompatible work orders reject run create/resume.
-- Missing approval evidence on resume from `waiting_for_approval` returns `approval_required` before a tick runs.
+- `waiting_for_approval` progresses only through an exact receipt-bearing
+  `/actions` retry. Lifecycle resume with raw evidence, receipts, or no approval
+  material returns a stable `409` migration code before a tick runs.
 - `/actions` rejects caller-supplied bypass states and always routes side effects through the gateway.
 - Trace reads require visibility and redaction policy.
 - Manager dispatch requires immutable work-order/placement/node/instance

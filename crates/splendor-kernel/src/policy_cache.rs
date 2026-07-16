@@ -1001,6 +1001,7 @@ fn policy_outcome(request: ActionRequest, verification: VerificationResult) -> A
         post_verification: None,
         output: None,
         error: Some(error),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }

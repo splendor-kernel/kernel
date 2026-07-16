@@ -69,7 +69,9 @@ receiver state node after import, snapshot ID, and source trace ID.
    unexpired, unrevoked work order admitted for the target run.
 5. Because v0 has no accepted source-authenticated manifest/evidence proof, the
    resident returns `503 state_handoff_proof_unavailable` with
-   `disposition = needs_intervention` before handoff validation or mutation.
+   `disposition = needs_intervention` before handoff validation or mutation. A
+   valid exact-profile request for an unknown run receives the same denial, so
+   this pre-proof boundary does not expose resident run existence.
 6. Only explicit loopback `local_dev` compatibility proceeds to validate the
    handoff authority, receiver, previous head, trace linkage, snapshot ID/hash,
    and parent linkage, then imports through the scheduler/loop/state-graph owner.
@@ -91,8 +93,10 @@ Canonical event classes:
 Import-failure trace reasons use bounded reason codes; signed revocation text,
 snapshot bytes, and raw work-order validation details are not copied into trace.
 Resident proof-unavailable denial intentionally emits no run-trace mutation; it
-occurs before the run state owner is invoked. Transport authentication may still
-produce its separate bounded resident security audit attribution.
+occurs before the run state owner is invoked. It records only the bounded
+resident security audit event `state_handoff.proof_denied`, with method, fixed
+path, server time, and the redacted `sha256:` credential correlation. The
+diagnostic buffer retains at most 1,024 events and never stores bearer/JTI data.
 
 ## Failure modes
 

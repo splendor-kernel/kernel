@@ -7,12 +7,22 @@ import os
 import shutil
 import ssl
 import subprocess
+import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fixtures"))
+from canonical_fleet_profiles import (  # noqa: E402
+    CLOUD_INSTANCE_FEATURES,
+    CLOUD_NODE_CAPABILITIES,
+    EDGE_INSTANCE_FEATURES,
+    EDGE_NODE_CAPABILITIES,
+    VPC_INSTANCE_FEATURES,
+    VPC_NODE_CAPABILITIES,
+)
+from resident_http import request_json_no_redirect  # noqa: E402
 
 FLEET_ID = "00000000-0000-4000-8000-000000000104"
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
@@ -72,25 +82,14 @@ def splendorctl(root: Path) -> list[str]:
 
 
 def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None, context: ssl.SSLContext | None = None) -> tuple[int, dict[str, Any]]:
-    payload = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base_url.rstrip("/") + path, data=payload, method=method)
-    if payload is not None:
-        req.add_header("content-type", "application/json")
-    for name, value in (headers or {}).items():
-        req.add_header(name, value)
-    try:
-        with urllib.request.urlopen(req, timeout=20, context=context) as resp:
-            raw = resp.read().decode("utf-8")
-            return resp.status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        try:
-            parsed = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            parsed = {"raw": raw}
-        return exc.code, parsed
-    except urllib.error.URLError:
-        return 599, {"code": "transport_unavailable"}
+    return request_json_no_redirect(
+        method,
+        base_url.rstrip("/") + path,
+        body,
+        headers,
+        context,
+        timeout=20,
+    )
 
 
 def manager_credential(scopes: list[str] | None = None, *, expired: bool = False, wrong_audience: bool = False, wrong_tenant: bool = False, revoked: bool = False) -> dict[str, Any]:
@@ -161,8 +160,8 @@ def node_registration(node_id: str, kind: str, target: str, locality: str, url: 
     }
 
 
-def instance_registration(node_id: str, instance_id: str) -> dict[str, Any]:
-    return {"instance_id": instance_id, "node_id": node_id, "runtime_mode": "resident", "hosted_tenants": [TENANT_ID], "supported_features": ["runtime.resident", "gateway.verified", "trace.buffer.local", "state.handoff", "message.remote", "message.remote.proposal", "sql.read_fixture"], "runtime_version": "0.1-acceptance", "health": {"status": "healthy", "observed_at": utc(0), "metadata": {"runtime_image_identity": RUNTIME_IMAGE_IDENTITY}}, "registered_at": utc(0)}
+def instance_registration(node_id: str, instance_id: str, supported_features: list[str]) -> dict[str, Any]:
+    return {"instance_id": instance_id, "node_id": node_id, "runtime_mode": "resident", "hosted_tenants": [TENANT_ID], "supported_features": supported_features, "runtime_version": "0.1-acceptance", "health": {"status": "healthy", "observed_at": utc(0), "metadata": {"runtime_image_identity": RUNTIME_IMAGE_IDENTITY}}, "registered_at": utc(0)}
 
 
 def compose_same_image_evidence(root: Path) -> dict[str, Any]:
@@ -197,13 +196,13 @@ def compose_same_image_evidence(root: Path) -> dict[str, Any]:
     }
 
 
-def work_order(expires: int = 60, revoked: bool = False, target: str = "customer_vpc", *, work_order_id: str = WORK_ORDER_ID, required_capability: str = "sql.read_fixture") -> dict[str, Any]:
+def work_order(expires: int = 60, revoked: bool = False, target: str = "customer_vpc", *, work_order_id: str = WORK_ORDER_ID, required_capability: str = "sql.read_fixture", run_id: str = RUN_ID) -> dict[str, Any]:
     return {
         "schema_version": "splendor.work_order.v1",
         "work_order_id": work_order_id,
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
-        "run_id": RUN_ID,
+        "run_id": run_id,
         "objective": "UC-E2E-S4 single-adapter resident dispatch with VPC data locality",
         "allowed_actions": ["sql.read_fixture"],
         "allowed_adapters": ["fixture-sql"],
@@ -311,11 +310,15 @@ def main() -> int:
 
     cred = manager_credential()
     nodes = [
-        node_registration(VPC_NODE_ID, "vpc.worker", "customer_vpc", "vpc", args.vpc_url, ["sql.read_fixture", "data.read_fixture", "artifact.create_internal", "artifact.publish_external", "message.remote.proposal", "runtime.resident"]),
-        node_registration(CLOUD_NODE_ID, "cloud.worker", "resident_cloud_pool", "cloud", args.cloud_url, ["message.remote.proposal", "runtime.resident"]),
-        node_registration(EDGE_NODE_ID, "edge.appliance", "edge_device", "device", "https://resident-edge-node:8093", ["runtime.resident", "trace.buffer.local"]),
+        node_registration(VPC_NODE_ID, "vpc.worker", "customer_vpc", "vpc", args.vpc_url, list(VPC_NODE_CAPABILITIES)),
+        node_registration(CLOUD_NODE_ID, "cloud.worker", "resident_cloud_pool", "cloud", args.cloud_url, list(CLOUD_NODE_CAPABILITIES)),
+        node_registration(EDGE_NODE_ID, "edge.device", "edge_device", "device", "https://resident-edge-node:8093", list(EDGE_NODE_CAPABILITIES)),
     ]
-    instances = [instance_registration(VPC_NODE_ID, VPC_INSTANCE_ID), instance_registration(CLOUD_NODE_ID, CLOUD_INSTANCE_ID), instance_registration(EDGE_NODE_ID, EDGE_INSTANCE_ID)]
+    instances = [
+        instance_registration(VPC_NODE_ID, VPC_INSTANCE_ID, list(VPC_INSTANCE_FEATURES)),
+        instance_registration(CLOUD_NODE_ID, CLOUD_INSTANCE_ID, list(CLOUD_INSTANCE_FEATURES)),
+        instance_registration(EDGE_NODE_ID, EDGE_INSTANCE_ID, list(EDGE_INSTANCE_FEATURES)),
+    ]
     for node in nodes:
         call("registerNode", "POST", args.manager_url, "/fleet/nodes", {**sec(cred), "registration": node})
     node_list = call("listNodes", "POST", args.manager_url, "/fleet/nodes/list", sec(cred))
@@ -386,11 +389,15 @@ def main() -> int:
     wrong_hash_cred = wrong_hash_auth["credential"]
     wrong_hash = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_hash_handoff, "work_order": cloud_envelope, "credential": wrong_hash_cred, "audit_attribution": audit(wrong_hash_cred)}, credential_header(wrong_hash_auth))
     wrong_run_handoff = json.loads(json.dumps(exported["body"].get("handoff", {})))
+    wrong_run_id = "77777777-7777-4777-8777-777777777777"
+    wrong_run_work_order_id = "wo_uc_e2e_s4_unknown_run_handoff"
+    wrong_run_envelope = sign_work_order(root, artifact_dir, commands, auth_dir, work_order(work_order_id=wrong_run_work_order_id, run_id=wrong_run_id), CLOUD_INSTANCE_ID)
     if wrong_run_handoff:
-        wrong_run_handoff["authority"]["run_id"] = "77777777-7777-4777-8777-777777777777"
+        wrong_run_handoff["authority"]["run_id"] = wrong_run_id
+        wrong_run_handoff["authority"]["work_order_id"] = wrong_run_work_order_id
     wrong_run_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["state_handoff"])
     wrong_run_cred = wrong_run_auth["credential"]
-    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "work_order": cloud_envelope, "credential": wrong_run_cred, "audit_attribution": audit(wrong_run_cred)}, credential_header(wrong_run_auth))
+    wrong_run = call("importStateSnapshot", "POST", args.cloud_url, "/state-snapshots/import", {"handoff": wrong_run_handoff, "work_order": wrong_run_envelope, "credential": wrong_run_cred, "audit_attribution": audit(wrong_run_cred)}, credential_header(wrong_run_auth))
     state_after_failed_import = call("getStateHead", "GET", args.cloud_url, f"/runs/{run_id}/state-head", headers=credential_header(cloud_state_auth))
 
     vpc_trace_auth = resident_auth(root, auth_dir, VPC_INSTANCE_ID, ["traces_read"])
@@ -456,7 +463,7 @@ def main() -> int:
         neg("resident_state_handoff_proof_unavailable", import_denied["status"] == 503 and import_denied["body"].get("code") == "state_handoff_proof_unavailable" and import_denied["body"].get("details", {}).get("disposition") == "needs_intervention", status=import_denied["status"], code=import_denied["body"].get("code")),
         neg("hash_valid_fabricated_handoff_proof_unavailable", wrong_handoff["status"] == 503 and wrong_handoff["body"].get("code") == "state_handoff_proof_unavailable", status=wrong_handoff["status"], code=wrong_handoff["body"].get("code")),
         neg("state_handoff_wrong_hash_not_evaluated_without_proof", wrong_hash["status"] == 503 and wrong_hash["body"].get("code") == "state_handoff_proof_unavailable", status=wrong_hash["status"], code=wrong_hash["body"].get("code")),
-        neg("state_handoff_wrong_run_rejected", wrong_run["status"] in {400, 404}, status=wrong_run["status"], code=wrong_run["body"].get("code")),
+        neg("state_handoff_wrong_run_rejected", wrong_run["status"] == 503 and wrong_run["body"].get("code") == "state_handoff_proof_unavailable", status=wrong_run["status"], code=wrong_run["body"].get("code")),
         neg("receiver_state_unchanged_on_failed_import", receiver_unchanged, before=state_before_failed_import["body"].get("state_node_id"), after=state_after_failed_import["body"].get("state_node_id")),
         neg("trace_sync_idempotent_duplicate", sync_duplicate["body"].get("duplicate_records", 0) >= len(records), duplicate_records=sync_duplicate["body"].get("duplicate_records")),
         neg("trace_sync_tamper_rejected", sync_tampered["status"] == 403 and sync_tampered["body"].get("code") == "trace_sync_rejected", status=sync_tampered["status"], code=sync_tampered["body"].get("code")),

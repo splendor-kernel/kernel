@@ -5,14 +5,18 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
+import ssl
 import subprocess
-import urllib.error
-import urllib.request
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fixtures"))
+from resident_http import request_json_no_redirect  # noqa: E402
 
 SOURCE_SCENARIOS = ["UC-E2E-S1", "UC-E2E-S3", "UC-E2E-S4", "UC-E2E-S5", "UC-E2E-S6", "UC-E2E-S7"]
 TYPE_PARITY_SCENARIOS = ["UC-E2E-S2", "UC-E2E-S3"]
@@ -74,23 +78,22 @@ def splendorctl(root: Path) -> list[str]:
     return ["cargo", "run", "-q", "-p", "splendorctl", "--"]
 
 
-def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
-    payload = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base_url.rstrip("/") + path, data=payload, method=method)
-    if payload is not None:
-        req.add_header("content-type", "application/json")
-    for name, value in (headers or {}).items():
-        req.add_header(name, value)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
-            return resp.status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        try:
-            return exc.code, json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return exc.code, {"raw": raw}
+def request_json(
+    method: str,
+    base_url: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    context: ssl.SSLContext | None = None,
+) -> tuple[int, dict[str, Any]]:
+    return request_json_no_redirect(
+        method,
+        base_url.rstrip("/") + path,
+        body,
+        headers,
+        context,
+        timeout=20,
+    )
 
 
 def digest_bytes(data: bytes) -> str:
@@ -221,31 +224,145 @@ def tamper_state_export(state: dict[str, Any]) -> dict[str, Any]:
     return tampered
 
 
-def replay_credential(instance_id: str, tenant_id: str = "11111111-1111-4111-8111-111111111111") -> dict[str, Any]:
-    return {
-        "credential_id": f"cred_uc_e2e_s8_replay_{instance_id[-3:]}",
-        "principal": {"app": {"app_principal_id": "app_uc_e2e_s8", "label": "UC-E2E-S8"}, "client_principal_id": "client_uc_e2e_s8", "label": "UC-E2E-S8 replay client"},
-        "scopes": ["runs_read", "replay_create", "traces_read", "state_read"],
-        "binding": {"tenant": {"tenant_id": tenant_id}},
-        "audience": {"instance": {"instance_id": instance_id}},
-        "expires_at": "2099-01-01T00:00:00Z",
-        "revocation": "active",
-    }
+def resident_auth(
+    root: Path,
+    auth_dir: Path,
+    instance_id: str,
+    scopes: list[str],
+    tenant_id: str = "11111111-1111-4111-8111-111111111111",
+) -> dict[str, Any]:
+    command = [
+        "python3",
+        str(root / "tests/e2e/use-cases/fixtures/resident_auth_fixture.py"),
+        "token",
+        "--auth-dir",
+        str(auth_dir),
+        "--tenant-id",
+        tenant_id,
+        "--instance-id",
+        instance_id,
+    ]
+    for scope in scopes:
+        command.extend(["--scope", scope])
+    process = subprocess.run(command, text=True, capture_output=True)
+    if process.returncode != 0:
+        raise SystemExit("resident caller token fixture failed")
+    return json.loads(process.stdout)
 
 
 def audit(credential: dict[str, Any]) -> dict[str, Any]:
     return {"principal": credential["principal"], "credential_id": credential["credential_id"], "requested_at": utc_now()}
 
 
-def credential_header(credential: dict[str, Any]) -> dict[str, str]:
-    return {"x-splendor-caller-credential": json.dumps(credential, sort_keys=True)}
+def credential_header(auth: dict[str, Any]) -> dict[str, str]:
+    return {
+        "authorization": f"Bearer {auth['token']}",
+        "x-splendor-caller-credential": json.dumps(
+            auth["credential"], sort_keys=True
+        ),
+    }
 
 
-def public_replay_execution(base_url: str, run_id: str, credential: dict[str, Any], label: str) -> dict[str, Any]:
-    before_status, before = request_json("GET", base_url, f"/runs/{run_id}", headers=credential_header(credential))
-    replay_status, replay = request_json("POST", base_url, f"/runs/{run_id}/replay", {"credential": credential, "audit_attribution": audit(credential), "mode": "inspect_only", "side_effects_allowed": False})
-    unsafe_status, unsafe = request_json("POST", base_url, f"/runs/{run_id}/replay", {"credential": credential, "audit_attribution": audit(credential), "mode": "inspect_only", "side_effects_allowed": True})
-    after_status, after = request_json("GET", base_url, f"/runs/{run_id}", headers=credential_header(credential))
+def public_replay_execution(
+    root: Path,
+    auth_dir: Path,
+    resident_ssl: ssl.SSLContext,
+    base_url: str,
+    run_id: str,
+    instance_id: str,
+    label: str,
+) -> dict[str, Any]:
+    context = resident_ssl if base_url.lower().startswith("https://") else None
+    auth_events: list[dict[str, Any]] = []
+    used_credentials: set[str] = set()
+
+    def call(
+        operation: str,
+        method: str,
+        path: str,
+        scope: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        auth = resident_auth(root, auth_dir, instance_id, [scope])
+        credential = auth["credential"]
+        credential_id = credential["credential_id"]
+        if credential_id in used_credentials:
+            raise SystemExit("resident caller fixture reused a bearer JTI")
+        used_credentials.add(credential_id)
+        if credential.get("scopes") != [scope] or credential.get("audience") != {
+            "instance": {"instance_id": instance_id}
+        }:
+            raise SystemExit("resident caller fixture returned an invalid request scope or audience")
+        secured_body = (
+            None
+            if body is None
+            else {
+                **body,
+                "credential": credential,
+                "audit_attribution": audit(credential),
+            }
+        )
+        status, response = request_json(
+            method,
+            base_url,
+            path,
+            secured_body,
+            credential_header(auth),
+            context,
+        )
+        auth_events.append(
+            {
+                "operation_id": operation,
+                "method": method,
+                "scope": scope,
+                "credential_id": credential_id,
+                "target_instance_id": instance_id,
+                "audience_instance_id": credential["audience"]["instance"][
+                    "instance_id"
+                ],
+                "bearer_present": True,
+                "caller_credential_header_present": True,
+                "tls_verified_with_acceptance_ca": context is not None,
+                "mutating": method in {"POST", "PUT", "PATCH", "DELETE"},
+                "credential_and_audit_mirrored_in_body": secured_body is not None,
+                "body_credential_matches_verified_projection": (
+                    secured_body is not None
+                    and secured_body.get("credential") == credential
+                ),
+                "body_audit_matches_verified_projection": (
+                    secured_body is not None
+                    and secured_body.get("audit_attribution", {}).get(
+                        "credential_id"
+                    )
+                    == credential_id
+                    and secured_body.get("audit_attribution", {}).get("principal")
+                    == credential["principal"]
+                ),
+                "raw_bearer_recorded": False,
+            }
+        )
+        return status, response
+
+    before_status, before = call(
+        "inspectRunBeforeReplay", "GET", f"/runs/{run_id}", "runs_read"
+    )
+    replay_status, replay = call(
+        "replayRun",
+        "POST",
+        f"/runs/{run_id}/replay",
+        "replay_create",
+        {"mode": "inspect_only", "side_effects_allowed": False},
+    )
+    unsafe_status, unsafe = call(
+        "replayRunUnsafeNegative",
+        "POST",
+        f"/runs/{run_id}/replay",
+        "replay_create",
+        {"mode": "inspect_only", "side_effects_allowed": True},
+    )
+    after_status, after = call(
+        "inspectRunAfterReplay", "GET", f"/runs/{run_id}", "runs_read"
+    )
     return {
         "label": label,
         "base_url": base_url,
@@ -259,6 +376,7 @@ def public_replay_execution(base_url: str, run_id: str, credential: dict[str, An
         "replay": replay,
         "unsafe_replay": unsafe,
         "side_effects_executed": before.get("adapter_executions") != after.get("adapter_executions"),
+        "auth_events": auth_events,
     }
 
 
@@ -442,10 +560,27 @@ def main() -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--base-url", default="http://splendor-daemon-local:8080")
-    parser.add_argument("--vpc-url", default="http://resident-vpc-node:8092")
-    parser.add_argument("--edge-url", default="http://resident-edge-node:8093")
+    parser.add_argument("--vpc-url", default="https://resident-vpc-node:8092")
+    parser.add_argument("--edge-url", default="https://resident-edge-node:8093")
+    parser.add_argument(
+        "--resident-auth-dir",
+        default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"),
+    )
+    parser.add_argument(
+        "--resident-ca-file",
+        default=os.environ.get(
+            "SPLENDOR_RESIDENT_CA_FILE",
+            "/run/splendor-auth/resident-root-ca.pem",
+        ),
+    )
     args = parser.parse_args()
+    if not args.vpc_url.lower().startswith("https://"):
+        raise SystemExit("UC-E2E-S8 resident VPC URL must use HTTPS")
+    if not args.edge_url.lower().startswith("https://"):
+        raise SystemExit("UC-E2E-S8 resident edge URL must use HTTPS")
     root = Path(args.root)
+    auth_dir = Path(args.resident_auth_dir)
+    resident_ssl = ssl.create_default_context(cafile=args.resident_ca_file)
     report_dir = Path(args.report_dir)
     artifacts_root = report_dir / "artifacts"
     artifact_dir = artifacts_root / "UC-E2E-S8"
@@ -566,7 +701,78 @@ def main() -> int:
     ]:
         for run_id in source_by_id[scenario_id]["report"].get("run_ids", [])[:2]:
             if run_id:
-                replay_api_runs.append(public_replay_execution(base_url, run_id, replay_credential(instance_id), scenario_id))
+                replay_api_runs.append(
+                    public_replay_execution(
+                        root,
+                        auth_dir,
+                        resident_ssl,
+                        base_url,
+                        run_id,
+                        instance_id,
+                        scenario_id,
+                    )
+                )
+    resident_security_events = [
+        auth_event
+        for replay_run in replay_api_runs
+        for auth_event in replay_run["auth_events"]
+    ]
+    resident_credential_ids = [
+        auth_event["credential_id"] for auth_event in resident_security_events
+    ]
+    mutating_credential_ids = [
+        auth_event["credential_id"]
+        for auth_event in resident_security_events
+        if auth_event["mutating"]
+    ]
+    resident_security_passed = bool(resident_security_events) and (
+        len(resident_credential_ids) == len(set(resident_credential_ids))
+        and len(mutating_credential_ids) == len(set(mutating_credential_ids))
+        and all(
+            event["bearer_present"]
+            and event["caller_credential_header_present"]
+            and event["tls_verified_with_acceptance_ca"]
+            and event["raw_bearer_recorded"] is False
+            and event["target_instance_id"] == event["audience_instance_id"]
+            and (
+                (event["method"] == "GET" and event["scope"] == "runs_read")
+                or (
+                    event["method"] == "POST"
+                    and event["scope"] == "replay_create"
+                    and event["credential_and_audit_mirrored_in_body"]
+                    and event["body_credential_matches_verified_projection"]
+                    and event["body_audit_matches_verified_projection"]
+                )
+            )
+            for event in resident_security_events
+        )
+    )
+    resident_security_report = {
+        "status": "passed" if resident_security_passed else "failed",
+        "transport": "verified_tls",
+        "resident_urls": sorted(
+            {item["base_url"] for item in replay_api_runs}
+        ),
+        "ca_file": str(args.resident_ca_file),
+        "request_local_bearer": True,
+        "exact_endpoint_scopes": True,
+        "fresh_jti_per_request": len(resident_credential_ids)
+        == len(set(resident_credential_ids)),
+        "fresh_mutating_jti_per_request": len(mutating_credential_ids)
+        == len(set(mutating_credential_ids)),
+        "body_credential_and_audit_mirrors_aligned": all(
+            not event["mutating"]
+            or (
+                event["body_credential_matches_verified_projection"]
+                and event["body_audit_matches_verified_projection"]
+            )
+            for event in resident_security_events
+        ),
+        "raw_bearer_recorded": False,
+        "events": resident_security_events,
+    }
+    if not resident_security_passed:
+        failures.append("resident_tls_or_request_local_bearer_auth_not_verified")
     side_effect_counts_before = {item["label"] + ":" + item["run_id"]: item["adapter_executions_before"] for item in replay_api_runs}
     side_effect_counts_after = {item["label"] + ":" + item["run_id"]: item["adapter_executions_after"] for item in replay_api_runs}
     explanations = collect_explanations_with_public_tool(root, commands, sources, artifact_dir)
@@ -713,6 +919,7 @@ def main() -> int:
         "verifier_explanations_cover_required_categories": {item["category"] for item in explanations} == {"approval", "denial", "quota_failure", "work_order_rejection", "data_scope_denial", "safety_denial"},
         "schema_migration_and_type_parity_validated": schema_report["status"] == "passed",
         "audit_package_built": len(explanations) >= 6,
+        "resident_tls_bearer_auth_verified": resident_security_passed,
     }
     failures.extend(f"negative_failed:{item['case']}" for item in negative_cases if item.get("passed") is not True)
     failures.extend(f"positive_failed:{key}" for key, ok in positive_checks.items() if ok is not True)
@@ -777,6 +984,7 @@ def main() -> int:
         "audit-package.json": audit_package,
         "audit-report.json": audit_package,
         "anti-drift-results.json": anti,
+        "resident-security.json": resident_security_report,
         "public-boundary-evidence.json": {"commands": public_command_outputs, "replay_api_runs": replay_api_runs, "replay_mode_outputs": replay_mode_report["outputs"], "real_credential_negative": real_credential_negative, "schema_public_command": schema_report.get("public_command")},
     }
     for name, data in artifacts.items():

@@ -37,6 +37,7 @@ impl ActionGateway for CountingGateway {
             post_verification: Some(VerificationResult::allow()),
             output: Some(serde_json::json!({"ok": true})),
             error: None,
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -62,6 +63,7 @@ fn request(side_effect_class: SideEffectClass) -> ActionRequest {
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: vec![],
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),

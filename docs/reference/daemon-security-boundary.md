@@ -56,6 +56,12 @@ explicit trust snapshot, exact issuer, exact `urn:splendor:instance:<instance_id
 audience, tenant, endpoint scopes, 300-second maximum lifetime, active key, JTI
 revocation, and fresh trust state. Unknown fields/algorithms/keys, bad signatures,
 stale trust, clock rollback, and malformed or oversized tokens fail closed.
+Resident trust may omit an exact client-subject binding for compatibility. The
+central-manager approval verifier is stricter: its trust snapshot must name one
+exact `expected_client_principal_id`, and any other signed `sub` is rejected.
+Manager process composition also rejects approval trust containing the outbound
+manager-to-resident dispatch signing key. Approval-control-plane proof and
+resident-dispatch proof therefore use separate Ed25519 key pairs and subjects.
 The current file-backed verifier loads trust at resident startup. Operators apply
 an atomically replaced trust/revocation snapshot with a controlled restart; hot
 reload/watch propagation is not implemented, and an expired loaded snapshot
@@ -128,8 +134,17 @@ The reference `EndpointScope` values map to daemon operations:
 | `splendor.instances.register` | register an instance under a node |
 | `splendor.nodes.heartbeat` | record node health heartbeat |
 | `splendor.instances.heartbeat` | record instance health heartbeat |
+| `splendor.device.register` | register a physical/edge device profile |
+| `splendor.device.read` | read device status or policy-cache status only |
+| `splendor.device.trace_sync` | validate and acknowledge a reconnect trace batch mutation |
+| `splendor.operator.intervene` | request/grant/deny a scoped operator intervention |
 
 Missing endpoint scopes fail closed.
+
+`splendor.device.read` cannot authorize `POST
+/devices/{node_id}/trace-buffer/sync`. Trace sync is mutating, requires audit
+attribution, and consumes a resident caller JTI. A fresh exact-scope
+`splendor.device.trace_sync` bearer is required.
 
 Fleet-bound credentials are modeled for later fleet-facing endpoints. Tenant-run
 endpoints require an exact tenant binding and reject fleet-bound credentials so a
@@ -201,6 +216,18 @@ after gateway execution and is not accepted from daemon callers.
 not authority to execute side effects; side effects remain authorized only by the
 Action Gateway and its verifier chain.
 
+## Approval receipt revocation
+
+`POST /runs/{run_id}/approval-receipts/{receipt_id}/revoke` is a resident-only
+mutating boundary. It requires an authenticated caller, exact tenant/run binding,
+instance audience binding, server-owned audit attribution, and the dedicated
+`splendor.approval_receipts.revoke` scope. `splendor.approvals.manage` and
+`splendor.actions.submit` do not imply this scope. The closed request body is not
+rewritten into generic caller-credential mirrors; unknown fields fail decoding.
+Caller authentication authorizes access to the endpoint, while the retained
+signed receipt and resident ledger determine whether the exact revocation is
+valid and whether execution already claimed it.
+
 ## Node and instance registry endpoints
 
 0.03-S2 adds daemon-security contract coverage for registry mutations. These
@@ -255,7 +282,9 @@ orders to re-execute actions.
 - No PKI or fleet mTLS rollout.
 - No node bootstrap protocol.
 - No production authentication claim for the current central-manager inbound
-  acceptance API. RFC 0011 secures manager outbound resident dispatch only.
+  acceptance API. RFC 0011 secures manager outbound resident dispatch and the
+  four bounded local approval mutations only; it does not add general manager
+  authentication or manager TLS.
 - No governance approval workflow is implemented by this S0 security-boundary
   validator; approval enforcement is documented separately for 0.04-S2.
 - No broad runtime permission engine.

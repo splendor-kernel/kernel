@@ -12,25 +12,32 @@ use splendor_daemon::caller_auth::{
     CallerTokenSigner, CallerTokenTrustSnapshot, CallerTokenVerifier, SignedCallerToken,
 };
 use splendor_daemon::manager::{
-    router as manager_router, DispatchReport, DispatchWorkOrderRequest, ManagerApiErrorBody,
-    ManagerAuditEvent, ManagerReadRequest, ManagerSecurityFields, ManagerState,
-    PlacementEvaluationRequest, RegisterInstanceRequest, RegisterNodeRequest,
-    ResidentDispatchOptions, RevokeWorkOrderRequest, SubmitWorkOrderRequest,
-    WorkOrderValidationReport,
+    router as manager_router, ApprovalDecisionRequest, ApprovalRequestPayload, DispatchReport,
+    DispatchWorkOrderRequest, GovernanceApprovalRecord, ManagerApiErrorBody, ManagerAuditEvent,
+    ManagerReadRequest, ManagerSecurityFields, ManagerState, PlacementEvaluationRequest,
+    RegisterInstanceRequest, RegisterNodeRequest, ResidentDispatchOptions, RevokeWorkOrderRequest,
+    SubmitWorkOrderRequest, WorkOrderValidationReport,
 };
 use splendor_daemon::{
     router as resident_router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonConfig,
-    DaemonState, LifecycleRequest, StateHeadResponse, StateSnapshotExportRequest,
-    StateSnapshotExportResponse, StateSnapshotImportRequest, TickResponse, TracePageResponse,
+    DaemonState, LifecycleRequest, RunInspectResponse, StateHeadResponse,
+    StateSnapshotExportRequest, StateSnapshotExportResponse, StateSnapshotImportRequest,
+    SubmitActionRequest, TickResponse, TracePageResponse,
 };
+use splendor_kernel::LocalAuthorityObligationReceiptConfig;
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
-    AgentId, AppPrincipal, AuditAttribution, CallerCredential, ClientPrincipal, CredentialAudience,
-    CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, InstanceId,
-    InstanceRegistration, NodeId, NodeRegistration, PlacementDecision, PlacementExecutionMode,
-    PlacementRequest, PlacementTarget, RevocationStatus, RunId, TelemetryAuthority, TenantId,
-    TraceEvent, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
-    WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    Action, ActionId, AgentId, AppPrincipal, ApprovalChallenge, ApprovalId, ApprovalPolicy,
+    AuditAttribution, AuthorityDecisionId, AuthorityObligationId, CallerCredential,
+    ClientPrincipal, CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
+    FleetTelemetrySnapshot, InstanceId, InstanceRegistration, NodeId, NodeRegistration,
+    PlacementDecision, PlacementExecutionMode, PlacementRequest, PlacementTarget, PrincipalId,
+    ResidentApprovalReceiptRevocationAck, ResidentApprovalReceiptRevocationRequest,
+    ResidentApprovalReceiptRevocationStatus, RevocationStatus, RunId, SideEffectClass,
+    TelemetryAuthority, TenantId, TraceEvent, TraceEventKind, TraceId, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    APPROVAL_CHALLENGE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,6 +53,17 @@ const TENANT_ID: &str = "11111111-1111-4111-8111-111111111111";
 const AGENT_ID: &str = "22222222-2222-4222-8222-222222222222";
 const WORK_ORDER_KEY_ID: &str = "resident-dispatch-test-key";
 const MANAGER_WORK_ORDER_KEY: &[u8] = &[0x5a; 32];
+
+fn authority_receipt_config() -> LocalAuthorityObligationReceiptConfig {
+    LocalAuthorityObligationReceiptConfig::trusted_local(
+        PrincipalId::parse("00000000-0000-4000-8000-0000000004c0").expect("receipt issuer"),
+        "splendor.daemon.run",
+        "approval-receipt-local-key",
+        "splendor-local-approval-receipt-secret-v1",
+        "local-approval-receipts",
+    )
+    .expect("authority receipt config")
+}
 
 struct ResidentHarness {
     base_url: String,
@@ -397,7 +415,8 @@ async fn spawn_resident_with_scopes_and_trace_store(
     policy_keyring
         .insert_shared_secret("policy-resident-test", [9_u8; 32])
         .expect("resident policy key");
-    let config = DaemonConfig::resident(instance_id, verifier, work_order_keyring, policy_keyring);
+    let config = DaemonConfig::resident(instance_id, verifier, work_order_keyring, policy_keyring)
+        .with_authority_obligation_receipt_config(authority_receipt_config());
     let state = match trace_store {
         Some(trace_store) => DaemonState::with_trace_store(config, trace_store),
         None => DaemonState::new(config),
@@ -580,6 +599,34 @@ fn signed_work_order_expiring_at(
     .expect("signed work order")
 }
 
+fn resident_dispatch_approval_policy(work_order: &WorkOrderEnvelope) -> ApprovalPolicy {
+    ApprovalPolicy {
+        schema_version: APPROVAL_POLICY_SCHEMA_VERSION.to_string(),
+        policy_id: "resident-dispatch-approval".to_string(),
+        tenant_id: work_order.work_order.tenant_id.clone(),
+        agent_id: Some(work_order.work_order.agent_id.clone()),
+        action_name: Some("daemon.record".to_string()),
+        adapter: Some("daemon.recording".to_string()),
+        required_permission: Some("fixture.execute".to_string()),
+        side_effect_class: None,
+        risk_level: Some("high".to_string()),
+        reason: "resident dispatch action requires approval".to_string(),
+        expires_at: Some(work_order.work_order.expires_at - Duration::seconds(1)),
+    }
+}
+
+fn resident_record_action(name: &str) -> Action {
+    Action {
+        name: name.to_string(),
+        params: serde_json::json!({"source": "resident-manager-integration"}),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: vec!["fixture.execute".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    }
+}
+
 fn resident_create_request(
     tenant_id: TenantId,
     agent_id: AgentId,
@@ -657,6 +704,38 @@ async fn call_manager<T: Serialize, R: DeserializeOwned>(
     (status, value)
 }
 
+async fn call_manager_with_token<T: Serialize, R: DeserializeOwned>(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: &T,
+    token: &str,
+) -> (StatusCode, R) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(body).expect("request JSON")))
+                .expect("request"),
+        )
+        .await
+        .expect("manager response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .expect("manager response body");
+    let value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "manager response JSON failed ({status}): {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    (status, value)
+}
+
 struct ResidentPlacementFixture<'a> {
     fleet_id: &'a FleetId,
     node_id: &'a NodeId,
@@ -671,6 +750,16 @@ async fn register_and_place(
     security: &ManagerSecurityFields,
     fixture: ResidentPlacementFixture<'_>,
     work_order: WorkOrderEnvelope,
+) {
+    register_and_place_with_policies(app, security, fixture, work_order, Vec::new()).await;
+}
+
+async fn register_and_place_with_policies(
+    app: &Router,
+    security: &ManagerSecurityFields,
+    fixture: ResidentPlacementFixture<'_>,
+    work_order: WorkOrderEnvelope,
+    approval_policies: Vec<ApprovalPolicy>,
 ) {
     let (status, _): (StatusCode, NodeRegistration) = call_manager(
         app.clone(),
@@ -713,6 +802,7 @@ async fn register_and_place(
             security: security.clone(),
             work_order,
             expected_audience: "central-manager".to_string(),
+            approval_policies,
         },
     )
     .await;
@@ -848,6 +938,195 @@ fn manager_state(
     )
 }
 
+fn manager_state_with_approval_auth(
+    resident_signer: CallerTokenSigner,
+    approval_signer: &CallerTokenSigner,
+    root_ca_pem: Vec<u8>,
+    allowed_origin: &str,
+) -> ManagerState {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let mut keyring = WorkOrderKeyring::new();
+    keyring
+        .insert_shared_secret(WORK_ORDER_KEY_ID, MANAGER_WORK_ORDER_KEY)
+        .expect("manager test work-order key");
+    let approval_trust = CallerTokenTrustSnapshot::single_key(
+        approval_signer.issuer(),
+        approval_signer.app_principal_id(),
+        approval_signer.kid(),
+        &approval_signer.public_key_bytes(),
+        vec![EndpointScope::ApprovalsManage],
+        OffsetDateTime::now_utc(),
+    )
+    .with_expected_client_principal_id("approval-client");
+    let approval_verifier =
+        CallerTokenVerifier::for_manager(approval_trust, "central-manager", fleet_id.clone())
+            .expect("approval caller verifier");
+    ManagerState::acceptance_with_dispatch_receipt_and_approval_auth(
+        "central-manager",
+        fleet_id,
+        keyring,
+        resident_signer,
+        ResidentDispatchOptions {
+            root_ca_pem: Some(root_ca_pem),
+            allowed_origins: vec![allowed_origin.to_string()],
+            ..ResidentDispatchOptions::production()
+        },
+        authority_receipt_config(),
+        approval_verifier,
+    )
+    .expect("manager state with approval auth")
+}
+
+fn approval_token(signer: &CallerTokenSigner, fleet_id: &FleetId) -> SignedCallerToken {
+    signer
+        .sign_for_manager(
+            fleet_id,
+            "central-manager",
+            vec![EndpointScope::ApprovalsManage],
+            OffsetDateTime::now_utc(),
+            Duration::seconds(60),
+        )
+        .expect("approval caller token")
+}
+
+fn approval_security(token: &SignedCallerToken) -> ManagerSecurityFields {
+    ManagerSecurityFields {
+        credential: token.credential.clone(),
+        audit_attribution: AuditAttribution {
+            principal: token.credential.principal.clone(),
+            credential_id: Some(token.credential.credential_id.clone()),
+            requested_at: OffsetDateTime::now_utc(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn resident_lifecycle_inspect_pause_resume_and_stop_remain_scope_bound() {
+    let signer = caller_signer();
+    let instance_id = InstanceId::new();
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let run_id = RunId::new();
+    let resident = spawn_resident_with_scopes(
+        &signer,
+        instance_id.clone(),
+        MANAGER_WORK_ORDER_KEY,
+        vec![
+            EndpointScope::RunsCreate,
+            EndpointScope::RunsRead,
+            EndpointScope::RunsPause,
+            EndpointScope::RunsResume,
+            EndpointScope::RunsStop,
+        ],
+    )
+    .await;
+    let work_order = signed_work_order(
+        "wo_resident_lifecycle_scope",
+        run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+        "lifecycle.scope",
+    );
+
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsCreate);
+    let (status, created, _): (reqwest::StatusCode, CreateRunResponse, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        "/runs",
+        &resident_create_request(
+            tenant_id.clone(),
+            agent_id,
+            work_order.clone(),
+            serde_json::json!({"lifecycle": "pending"}),
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created.run_id, run_id);
+
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsRead);
+    let (status, inspected, _): (reqwest::StatusCode, serde_json::Value, String) = resident_get(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(inspected["status"], "pending");
+
+    let pause_request = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: None,
+        reason: Some("bounded lifecycle pause".to_string()),
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsPause);
+    let (status, paused, _): (reqwest::StatusCode, serde_json::Value, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}/pause"),
+        &pause_request,
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(paused["status"], "paused");
+
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsPause);
+    let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}/pause"),
+        &pause_request,
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(error.code, "invalid_run_state");
+
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsResume);
+    let (status, resumed, _): (reqwest::StatusCode, TickResponse, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}/resume"),
+        &LifecycleRequest {
+            credential: None,
+            work_order: Some(work_order),
+            audit_attribution: None,
+            reason: Some("bounded lifecycle resume".to_string()),
+            approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(resumed.status, splendor_daemon::RunStatus::Running);
+
+    let token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsStop);
+    let (status, stopped, _): (reqwest::StatusCode, serde_json::Value, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}/stop"),
+        &LifecycleRequest {
+            credential: None,
+            work_order: None,
+            audit_attribution: None,
+            reason: Some("bounded lifecycle stop".to_string()),
+            approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(stopped["status"], "cancelled");
+}
+
 #[tokio::test]
 async fn resident_state_import_requires_source_authenticated_proof_before_mutation() {
     let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
@@ -921,6 +1200,7 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
                 audit_attribution: None,
                 reason: Some("prepare state handoff denial fixture".to_string()),
                 approval_evidence: None,
+                authority_obligation_receipts: Vec::new(),
             },
             &token,
         )
@@ -975,6 +1255,7 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
     );
 
     let baseline_trace_count = receiver_trace_store.record_count(&run_id);
+    let baseline_security_audit_count = receiver.state.resident_security_audit_events().len();
     let mut fabricated = exported.handoff.clone();
     fabricated.handoff_id = "fabricated-hash-valid-handoff".to_string();
     fabricated.source_trace_id = Some(TraceId::new());
@@ -982,6 +1263,7 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
     stale.previous_state_node_id = Some("blake3:stale-receiver-head".to_string());
     let replayed = exported.handoff.clone();
 
+    let mut proof_denial_credentials = Vec::new();
     for (label, handoff) in [
         ("hash-valid fabricated", fabricated),
         ("stale", stale),
@@ -994,6 +1276,10 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
             &receiver_instance,
             EndpointScope::StateHandoff,
         );
+        proof_denial_credentials.push((
+            token.credential.credential_id.clone(),
+            token.encoded.clone(),
+        ));
         let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
             &receiver.base_url,
             &receiver.root_ca_pem,
@@ -1019,6 +1305,63 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
             "{label} must not append a run trace"
         );
     }
+    let proof_denial_audits = receiver.state.resident_security_audit_events();
+    let proof_denial_audits = &proof_denial_audits[baseline_security_audit_count..];
+    assert_eq!(proof_denial_audits.len(), proof_denial_credentials.len());
+    for (event, (credential_id, raw_token)) in proof_denial_audits
+        .iter()
+        .zip(proof_denial_credentials.iter())
+    {
+        assert_eq!(event.event_type, "state_handoff.proof_denied");
+        assert_eq!(event.method, "POST");
+        assert_eq!(event.path, "/state-snapshots/import");
+        assert_eq!(&event.credential_correlation, credential_id);
+        assert!(event.credential_correlation.starts_with("sha256:"));
+        assert!(!serde_json::to_string(event)
+            .expect("proof denial audit JSON")
+            .contains(raw_token));
+    }
+
+    let unknown_run_id =
+        RunId::parse("77777777-7777-4777-8777-777777777777").expect("unknown handoff run");
+    let unknown_work_order = signed_work_order(
+        "wo_resident_handoff_unknown_run",
+        unknown_run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+        "state.handoff",
+    );
+    let mut unknown_handoff = exported.handoff.clone();
+    unknown_handoff.authority.run_id = unknown_run_id.clone();
+    unknown_handoff.authority.work_order_id =
+        unknown_work_order.work_order.work_order_id.to_string();
+    let token = resident_token(
+        &signer,
+        &tenant_id,
+        &receiver_instance,
+        EndpointScope::StateHandoff,
+    );
+    let unknown_credential_id = token.credential.credential_id.clone();
+    let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &receiver.base_url,
+        &receiver.root_ca_pem,
+        "/state-snapshots/import",
+        &StateSnapshotImportRequest {
+            handoff: unknown_handoff,
+            work_order: unknown_work_order,
+            credential: None,
+            audit_attribution: None,
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.code, "state_handoff_proof_unavailable");
+    assert_eq!(receiver_trace_store.record_count(&unknown_run_id), 0);
+    let security_audits = receiver.state.resident_security_audit_events();
+    let unknown_audit = security_audits.last().expect("unknown-run proof audit");
+    assert_eq!(unknown_audit.event_type, "state_handoff.proof_denied");
+    assert_eq!(unknown_audit.credential_correlation, unknown_credential_id);
 
     let alternate_work_order = WorkOrderEnvelope::signed_with_shared_secret(
         work_order.work_order.clone(),
@@ -1051,6 +1394,11 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
         receiver_trace_store.record_count(&run_id),
         baseline_trace_count
     );
+    assert_eq!(
+        receiver.state.resident_security_audit_events().len(),
+        baseline_security_audit_count + proof_denial_credentials.len() + 1,
+        "invalid work-order signatures must not be recorded as source-proof denials"
+    );
 
     receiver_trace_store.arm();
     let token = resident_token(
@@ -1074,6 +1422,15 @@ async fn resident_state_import_requires_source_authenticated_proof_before_mutati
     .await;
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error.code, "state_handoff_proof_unavailable");
+    assert_eq!(
+        receiver
+            .state
+            .resident_security_audit_events()
+            .last()
+            .expect("final proof denial audit")
+            .credential_correlation,
+        token.credential.credential_id
+    );
     assert_eq!(
         receiver_trace_store
             .failed_append_attempts
@@ -1461,6 +1818,582 @@ async fn real_manager_dispatch_authenticates_and_real_resident_non_2xx_fails_clo
     assert!(!rejection_audit
         .iter()
         .any(|event| event.event_type == "run.dispatched"));
+}
+
+#[tokio::test]
+async fn manager_admitted_approval_policy_reaches_real_tls_resident_without_broadening_authority() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let instance_id = InstanceId::new();
+    let node_id = NodeId::new();
+    let run_id = RunId::new();
+    let signer = caller_signer();
+    let resident = spawn_resident_with_scopes(
+        &signer,
+        instance_id.clone(),
+        MANAGER_WORK_ORDER_KEY,
+        vec![
+            EndpointScope::RunsCreate,
+            EndpointScope::RunsStart,
+            EndpointScope::RunsRead,
+            EndpointScope::TracesRead,
+            EndpointScope::ActionsSubmit,
+        ],
+    )
+    .await;
+    let app = manager_router(manager_state(
+        signer.clone(),
+        resident.root_ca_pem.clone(),
+        &resident.base_url,
+    ));
+    let security = manager_security(&fleet_id);
+    let work_order_id = "wo_resident_approval_admission";
+    let work_order = signed_work_order(
+        work_order_id,
+        run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+        "approval.admission",
+    );
+    let approval_policy = resident_dispatch_approval_policy(&work_order);
+    register_and_place_with_policies(
+        &app,
+        &security,
+        ResidentPlacementFixture {
+            fleet_id: &fleet_id,
+            node_id: &node_id,
+            instance_id: &instance_id,
+            tenant_id: &tenant_id,
+            resident_url: &resident.base_url,
+            capability: "approval.admission",
+        },
+        work_order.clone(),
+        vec![approval_policy.clone()],
+    )
+    .await;
+
+    let dispatch_request = DispatchWorkOrderRequest {
+        security: security.clone(),
+        target_node_id: Some(node_id),
+    };
+    let (status, dispatch): (StatusCode, DispatchReport) = call_manager(
+        app.clone(),
+        Method::POST,
+        &format!("/work-orders/{work_order_id}/dispatch"),
+        &dispatch_request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dispatch.run_id, run_id);
+    let start: TickResponse = serde_json::from_str(
+        dispatch
+            .start_run_body
+            .as_deref()
+            .expect("retained resident start response"),
+    )
+    .expect("typed resident start response");
+    assert_eq!(start.status, splendor_daemon::RunStatus::Running);
+    assert!(
+        start.action_outcomes.is_empty(),
+        "policy_actions remain empty"
+    );
+
+    let trace_token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::TracesRead);
+    let (trace_status, traces, _): (reqwest::StatusCode, TracePageResponse, String) = resident_get(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!("/runs/{run_id}/traces?redaction_policy=resident-test"),
+        &trace_token,
+    )
+    .await;
+    assert_eq!(trace_status, reqwest::StatusCode::OK);
+    let causal_trace_id = traces
+        .records
+        .first()
+        .and_then(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .map(|event| event.trace_event_id)
+        .expect("resident causal trace");
+
+    let disallowed_token = resident_token(
+        &signer,
+        &tenant_id,
+        &instance_id,
+        EndpointScope::ActionsSubmit,
+    );
+    let (action_status, disallowed, _): (
+        reqwest::StatusCode,
+        splendor_gateway::ActionOutcome,
+        String,
+    ) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        "/actions",
+        &SubmitActionRequest {
+            action_id: Some(ActionId::new()),
+            run_id: run_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            credential: None,
+            audit_attribution: None,
+            causal_trace_id: Some(causal_trace_id.clone()),
+            action: resident_record_action("daemon.delete"),
+            adapter: Some("daemon.recording".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+            requested_at: Some(OffsetDateTime::now_utc()),
+            approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
+        },
+        &disallowed_token,
+    )
+    .await;
+    assert_eq!(action_status, reqwest::StatusCode::OK);
+    assert_eq!(disallowed.status, splendor_gateway::ActionStatus::Denied);
+    assert!(disallowed
+        .verification
+        .reasons
+        .iter()
+        .any(|reason| reason == "trusted_action_profile_missing"));
+
+    let action_id = ActionId::new();
+    let requested_at = OffsetDateTime::now_utc();
+    let approval_token = resident_token(
+        &signer,
+        &tenant_id,
+        &instance_id,
+        EndpointScope::ActionsSubmit,
+    );
+    let (action_status, outcome, _): (
+        reqwest::StatusCode,
+        splendor_gateway::ActionOutcome,
+        String,
+    ) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        "/actions",
+        &SubmitActionRequest {
+            action_id: Some(action_id.clone()),
+            run_id: run_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            credential: None,
+            audit_attribution: None,
+            causal_trace_id: Some(causal_trace_id),
+            action: resident_record_action("daemon.record"),
+            adapter: Some("daemon.recording".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+            requested_at: Some(requested_at),
+            approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
+        },
+        &approval_token,
+    )
+    .await;
+    assert_eq!(action_status, reqwest::StatusCode::OK);
+    assert_eq!(
+        outcome.status,
+        splendor_gateway::ActionStatus::NeedsApproval
+    );
+    let challenge = outcome
+        .approval_challenge
+        .expect("manager-admitted policy creates exact resident challenge");
+    assert_eq!(challenge.policy_id, approval_policy.policy_id);
+    assert_eq!(challenge.action_id, action_id);
+    assert_eq!(challenge.requested_at, requested_at);
+    assert_eq!(challenge.tenant_id, tenant_id);
+    assert_eq!(challenge.agent_id, agent_id);
+    assert_eq!(challenge.run_id, run_id);
+    assert_eq!(challenge.adapter, "daemon.recording");
+    assert!(challenge
+        .receipt_audience
+        .contains(&instance_id.to_string()));
+
+    let inspect_token = resident_token(&signer, &tenant_id, &instance_id, EndpointScope::RunsRead);
+    let (inspect_status, inspected, _): (reqwest::StatusCode, RunInspectResponse, String) =
+        resident_get(
+            &resident.base_url,
+            &resident.root_ca_pem,
+            &format!("/runs/{run_id}"),
+            &inspect_token,
+        )
+        .await;
+    assert_eq!(inspect_status, reqwest::StatusCode::OK);
+    assert_eq!(
+        inspected.status,
+        splendor_daemon::RunStatus::WaitingForApproval
+    );
+    assert_eq!(inspected.adapter_executions, 0);
+
+    let mut replacement_policy = approval_policy;
+    replacement_policy.reason = "attempted post-dispatch policy swap".to_string();
+    let (replacement_status, replacement_error): (StatusCode, ManagerApiErrorBody) = call_manager(
+        app.clone(),
+        Method::POST,
+        "/work-orders",
+        &SubmitWorkOrderRequest {
+            security: security.clone(),
+            work_order,
+            expected_audience: "central-manager".to_string(),
+            approval_policies: vec![replacement_policy],
+        },
+    )
+    .await;
+    assert_eq!(replacement_status, StatusCode::CONFLICT);
+    assert_eq!(
+        replacement_error.code,
+        "work_order_approval_policies_replacement"
+    );
+
+    let (duplicate_status, duplicate): (StatusCode, DispatchReport) = call_manager(
+        app,
+        Method::POST,
+        &format!("/work-orders/{work_order_id}/dispatch"),
+        &dispatch_request,
+    )
+    .await;
+    assert_eq!(duplicate_status, StatusCode::OK);
+    assert_eq!(duplicate.trace_event_id, dispatch.trace_event_id);
+    assert_eq!(duplicate.start_run_body, dispatch.start_run_body);
+}
+
+#[tokio::test]
+async fn granted_approval_revocation_requires_exact_resident_acknowledgement() {
+    let fleet_id = FleetId::parse(FLEET_ID).expect("fleet");
+    let tenant_id = TenantId::parse(TENANT_ID).expect("tenant");
+    let agent_id = AgentId::parse(AGENT_ID).expect("agent");
+    let instance_id = InstanceId::new();
+    let node_id = NodeId::new();
+    let run_id = RunId::new();
+    let resident_signer = caller_signer();
+    let approval_signer = CallerTokenSigner::generate_for_test(
+        "urn:splendor:approval-control-plane",
+        "approval-control-plane",
+        "approval-client",
+        "approval-manager-integration",
+    )
+    .expect("approval signer");
+    let resident = spawn_resident_with_scopes(
+        &resident_signer,
+        instance_id.clone(),
+        MANAGER_WORK_ORDER_KEY,
+        vec![
+            EndpointScope::RunsCreate,
+            EndpointScope::RunsStart,
+            EndpointScope::ActionsSubmit,
+            EndpointScope::ApprovalReceiptsRevoke,
+        ],
+    )
+    .await;
+    let manager = manager_state_with_approval_auth(
+        resident_signer.clone(),
+        &approval_signer,
+        resident.root_ca_pem.clone(),
+        &resident.base_url,
+    );
+    let app = manager_router(manager);
+    let security = manager_security(&fleet_id);
+    let work_order_id = "wo_resident_approval_revocation";
+    let work_order = signed_work_order(
+        work_order_id,
+        run_id.clone(),
+        tenant_id.clone(),
+        agent_id.clone(),
+        "approval.revocation",
+    );
+    register_and_place(
+        &app,
+        &security,
+        ResidentPlacementFixture {
+            fleet_id: &fleet_id,
+            node_id: &node_id,
+            instance_id: &instance_id,
+            tenant_id: &tenant_id,
+            resident_url: &resident.base_url,
+            capability: "approval.revocation",
+        },
+        work_order,
+    )
+    .await;
+    let (status, dispatch): (StatusCode, DispatchReport) = call_manager(
+        app.clone(),
+        Method::POST,
+        &format!("/work-orders/{work_order_id}/dispatch"),
+        &DispatchWorkOrderRequest {
+            security,
+            target_node_id: Some(node_id),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dispatch.run_id, run_id);
+    assert_eq!(dispatch.selected_instance_id, instance_id);
+
+    let now = OffsetDateTime::now_utc();
+    let approval_id = ApprovalId::new();
+    let action_id = ActionId::new();
+    let audience = authority_receipt_config()
+        .for_resident_instance(&instance_id)
+        .expect("resident receipt config")
+        .audience_for_run(&run_id);
+    let challenge = ApprovalChallenge {
+        schema_version: APPROVAL_CHALLENGE_SCHEMA_VERSION.to_string(),
+        approval_id: approval_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        run_id: run_id.clone(),
+        action_id: action_id.clone(),
+        action_name: "daemon.record".to_string(),
+        adapter: "daemon.recording".to_string(),
+        policy_id: "resident-approval-revocation".to_string(),
+        risk_level: Some("high".to_string()),
+        subject: PrincipalId::new(),
+        authority_decision_id: AuthorityDecisionId::new(),
+        obligation_id: AuthorityObligationId::new(),
+        receipt_audience: audience.clone(),
+        canonical_request_digest: format!("blake3:{}", "1".repeat(64)),
+        gateway_action_request_digest: format!("blake3:{}", "2".repeat(64)),
+        physical_action_resource_coordinate: None,
+        authority_decision_digest: format!("blake3:{}", "3".repeat(64)),
+        requested_at: now,
+        expires_at: now + Duration::minutes(5),
+    };
+    let request_token = approval_token(&approval_signer, &fleet_id);
+    let (status, requested): (StatusCode, GovernanceApprovalRecord) = call_manager_with_token(
+        app.clone(),
+        Method::POST,
+        "/approvals",
+        &ApprovalRequestPayload {
+            security: approval_security(&request_token),
+            approval_id: approval_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            action_id: action_id.clone(),
+            action_name: challenge.action_name.clone(),
+            adapter: challenge.adapter.clone(),
+            policy_id: challenge.policy_id.clone(),
+            risk_level: challenge.risk_level.clone(),
+            audience: audience.clone(),
+            expires_at: challenge.expires_at,
+            reason: "resident approval requested".to_string(),
+            challenge: Some(challenge),
+        },
+        &request_token.encoded,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(requested.status, "requested");
+
+    let grant_token = approval_token(&approval_signer, &fleet_id);
+    let (status, granted): (StatusCode, GovernanceApprovalRecord) = call_manager_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/approvals/{approval_id}/grant"),
+        &ApprovalDecisionRequest {
+            security: approval_security(&grant_token),
+            reason: "resident approval granted".to_string(),
+            expires_at: None,
+        },
+        &grant_token.encoded,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let receipt = granted
+        .authority_obligation_receipt
+        .clone()
+        .expect("granted raw receipt retained");
+    assert_eq!(receipt.audience, audience);
+
+    let revocation_body = ResidentApprovalReceiptRevocationRequest {
+        schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION.to_string(),
+        authority_obligation_receipt: receipt.clone(),
+        reason: "scope isolation".to_string(),
+    };
+    for (case, path_run_id, token_tenant, scopes) in [
+        (
+            "existing",
+            run_id.clone(),
+            tenant_id.clone(),
+            vec![EndpointScope::ActionsSubmit],
+        ),
+        (
+            "nonexistent",
+            RunId::new(),
+            tenant_id.clone(),
+            vec![EndpointScope::ActionsSubmit],
+        ),
+        (
+            "cross_tenant",
+            run_id.clone(),
+            TenantId::new(),
+            vec![EndpointScope::ActionsSubmit],
+        ),
+        (
+            "extra_scope",
+            run_id.clone(),
+            tenant_id.clone(),
+            vec![
+                EndpointScope::ApprovalReceiptsRevoke,
+                EndpointScope::ActionsSubmit,
+            ],
+        ),
+    ] {
+        let wrong_scope = resident_signer
+            .sign(
+                &token_tenant,
+                &instance_id,
+                scopes,
+                OffsetDateTime::now_utc(),
+                Duration::seconds(60),
+            )
+            .expect("wrong-scope resident token remains cryptographically valid");
+        let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+            &resident.base_url,
+            &resident.root_ca_pem,
+            &format!(
+                "/runs/{path_run_id}/approval-receipts/{}/revoke",
+                receipt.receipt_id
+            ),
+            &revocation_body,
+            &wrong_scope,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "case={case}");
+        assert_eq!(error.code, "missing_scope", "case={case}");
+    }
+
+    let mut concealed_response = None;
+    for (case, path_run_id, token_tenant) in [
+        ("nonexistent", RunId::new(), tenant_id.clone()),
+        ("cross_tenant", run_id.clone(), TenantId::new()),
+    ] {
+        let token = resident_token(
+            &resident_signer,
+            &token_tenant,
+            &instance_id,
+            EndpointScope::ApprovalReceiptsRevoke,
+        );
+        let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+            &resident.base_url,
+            &resident.root_ca_pem,
+            &format!(
+                "/runs/{path_run_id}/approval-receipts/{}/revoke",
+                receipt.receipt_id
+            ),
+            &revocation_body,
+            &token,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "case={case}");
+        assert_eq!(error.code, "invalid_run", "case={case}");
+        assert_eq!(error.details["run_id"], path_run_id.to_string());
+        let normalized = (status, error.code, error.message);
+        if let Some(expected) = concealed_response.as_ref() {
+            assert_eq!(
+                &normalized, expected,
+                "run existence leaked for case={case}"
+            );
+        } else {
+            concealed_response = Some(normalized);
+        }
+    }
+
+    let wrong_audience = resident_token(
+        &resident_signer,
+        &tenant_id,
+        &InstanceId::new(),
+        EndpointScope::ApprovalReceiptsRevoke,
+    );
+    let (status, error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!(
+            "/runs/{run_id}/approval-receipts/{}/revoke",
+            receipt.receipt_id
+        ),
+        &revocation_body,
+        &wrong_audience,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "wrong_caller_token_audience");
+
+    let mut wrong_target_body = revocation_body.clone();
+    wrong_target_body.authority_obligation_receipt.audience =
+        "splendor.daemon.approval_receipt.v2:instance:00000000-0000-4000-8000-000000000999:run:00000000-0000-4000-8000-000000000998".to_string();
+    let wrong_target_token = resident_token(
+        &resident_signer,
+        &tenant_id,
+        &instance_id,
+        EndpointScope::ApprovalReceiptsRevoke,
+    );
+    let (status, _error, _): (reqwest::StatusCode, ApiErrorBody, String) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!(
+            "/runs/{run_id}/approval-receipts/{}/revoke",
+            receipt.receipt_id
+        ),
+        &wrong_target_body,
+        &wrong_target_token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+
+    let revoke_token = approval_token(&approval_signer, &fleet_id);
+    let (status, revoked): (StatusCode, GovernanceApprovalRecord) = call_manager_with_token(
+        app,
+        Method::POST,
+        &format!("/approvals/{approval_id}/revoke"),
+        &ApprovalDecisionRequest {
+            security: approval_security(&revoke_token),
+            reason: "resident approval revoked".to_string(),
+            expires_at: None,
+        },
+        &revoke_token.encoded,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(revoked.status, "revoked");
+    assert_eq!(revoked.authority_obligation_receipt, Some(receipt.clone()));
+    let ack = revoked
+        .resident_receipt_revocation_ack
+        .expect("exact resident acknowledgement");
+    assert_eq!(ack.receipt_id, receipt.receipt_id);
+    assert_eq!(ack.approval_id, approval_id);
+    assert_eq!(ack.target_instance_id, instance_id);
+    assert_eq!(ack.run_id, run_id);
+    assert_eq!(ack.receipt_audience, receipt.audience);
+    assert_eq!(ack.status, ResidentApprovalReceiptRevocationStatus::Revoked);
+
+    let duplicate_token = resident_token(
+        &resident_signer,
+        &tenant_id,
+        &instance_id,
+        EndpointScope::ApprovalReceiptsRevoke,
+    );
+    let (status, duplicate, _): (
+        reqwest::StatusCode,
+        ResidentApprovalReceiptRevocationAck,
+        String,
+    ) = resident_post(
+        &resident.base_url,
+        &resident.root_ca_pem,
+        &format!(
+            "/runs/{run_id}/approval-receipts/{}/revoke",
+            receipt.receipt_id
+        ),
+        &revocation_body,
+        &duplicate_token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        duplicate.status,
+        ResidentApprovalReceiptRevocationStatus::AlreadyRevoked
+    );
 }
 
 #[tokio::test]

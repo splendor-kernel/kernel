@@ -23,7 +23,12 @@ from pathlib import Path
 ISSUER = "urn:splendor:manager:central-manager"
 APP_PRINCIPAL_ID = "central-manager"
 CLIENT_PRINCIPAL_ID = "resident-dispatch-client"
+MANAGER_CLIENT_PRINCIPAL_ID = "approval-management-client"
 KEY_ID = "manager-resident-acceptance"
+APPROVAL_ISSUER = "urn:splendor:manager:approval-control-plane"
+APPROVAL_APP_PRINCIPAL_ID = "approval-control-plane"
+APPROVAL_KEY_ID = "approval-control-plane-acceptance"
+APPROVAL_SIGNING_KEY_FILE = "approval-caller-signing-key.pk8"
 WORK_ORDER_KEYS = {
     "00000000-0000-4000-8000-000000000302": "work-order-acceptance-vpc",
     "00000000-0000-4000-8000-000000000304": "work-order-acceptance-cloud",
@@ -33,13 +38,24 @@ JTI_CORRELATION_DOMAIN = b"splendor.resident.caller-jti-correlation.v1\0"
 SCOPE_VALUES = {
     "runs_create": "splendor.runs.create",
     "runs_start": "splendor.runs.start",
+    "runs_pause": "splendor.runs.pause",
+    "runs_resume": "splendor.runs.resume",
+    "runs_stop": "splendor.runs.stop",
     "runs_read": "splendor.runs.read",
+    "actions_submit": "splendor.actions.submit",
+    "approval_receipts_revoke": "splendor.approval_receipts.revoke",
     "state_read": "splendor.state.read",
     "state_handoff": "splendor.state.handoff",
     "traces_read": "splendor.traces.read",
     "replay_create": "splendor.replay.create",
     "health_read": "splendor.health.read",
+    "device_register": "splendor.device.register",
+    "device_read": "splendor.device.read",
+    "device_trace_sync": "splendor.device.trace_sync",
+    "operator_intervene": "splendor.operator.intervene",
+    "policies_sync": "splendor.policies.sync",
 }
+MANAGER_SCOPE_VALUES = {"approvals_manage": "splendor.approvals.manage"}
 
 
 def b64url(raw: bytes) -> str:
@@ -127,6 +143,36 @@ def initialize(manager_out: Path, runner_out: Path, resident_outs: dict[str, Pat
     for out in resident_outs.values():
         write_json(out / "caller-trust.json", trust)
 
+    approval_key = runner_out / APPROVAL_SIGNING_KEY_FILE
+    with tempfile.TemporaryDirectory(prefix="splendor-approval-caller-") as temp:
+        approval_public_key = Path(temp) / "approval-caller-public-key.raw"
+        key_tool("generate", str(approval_key), str(approval_public_key))
+        approval_key.chmod(0o600)
+        approval_public = approval_public_key.read_bytes()
+    if len(approval_public) != 32:
+        raise SystemExit("acceptance approval caller public key was malformed")
+    manager_trust = {
+        "schema_version": "splendor.caller_trust.v1",
+        "revision": 1,
+        "issued_at": utc(now - timedelta(minutes=1)),
+        "expires_at": utc(now + timedelta(hours=23, minutes=59)),
+        "issuer": APPROVAL_ISSUER,
+        "app_principal_id": APPROVAL_APP_PRINCIPAL_ID,
+        "expected_client_principal_id": MANAGER_CLIENT_PRINCIPAL_ID,
+        "max_token_ttl_seconds": 300,
+        "allowed_scopes": list(MANAGER_SCOPE_VALUES.values()),
+        "keys": [
+            {
+                "kid": APPROVAL_KEY_ID,
+                "algorithm": "Ed25519",
+                "public_key": b64url(approval_public),
+                "status": "active",
+            }
+        ],
+        "revoked_jtis": [],
+    }
+    write_json(manager_out / "approval-caller-trust.json", manager_trust, private=True)
+
     manager_keys: list[dict[str, str]] = []
     for instance_id, key_id in WORK_ORDER_KEYS.items():
         resident_out = resident_outs.get(instance_id)
@@ -155,6 +201,20 @@ def initialize(manager_out: Path, runner_out: Path, resident_outs: dict[str, Pat
         },
         private=True,
     )
+    authority_receipt_config = {
+        "schema_version": "splendor.authority_obligation_receipt_config.v1",
+        "issuer_principal_id": "00000000-0000-4000-8000-0000000004c0",
+        "audience_prefix": "splendor.daemon.run",
+        "key_id": "approval-receipt-local-key",
+        "validation_secret_base64url": b64url(secrets.token_bytes(32)),
+        "revocation_ref": "local-approval-receipts",
+    }
+    for out in [manager_out, *resident_outs.values()]:
+        write_json(
+            out / "authority-obligation-receipt-config.json",
+            authority_receipt_config,
+            private=True,
+        )
     for instance_id, out in resident_outs.items():
         write_json(
             out / "policy-keyring.json",
@@ -300,6 +360,59 @@ def token(auth_dir: Path, tenant_id: str, instance_id: str, scopes: list[str]) -
     )
 
 
+def manager_token(auth_dir: Path, fleet_id: str, manager_id: str, scopes: list[str]) -> None:
+    if not scopes or len(scopes) != len(set(scopes)) or any(scope not in MANAGER_SCOPE_VALUES for scope in scopes):
+        raise SystemExit("acceptance manager caller scopes were invalid")
+    parsed_fleet = uuid.UUID(fleet_id)
+    if parsed_fleet.int == 0 or not manager_id.strip():
+        raise SystemExit("acceptance manager target was invalid")
+    now = int(datetime.now(timezone.utc).timestamp())
+    expires = now + 60
+    jti = str(uuid.uuid4())
+    header = {"alg": "Ed25519", "kid": APPROVAL_KEY_ID, "typ": "splendor-caller+jwt"}
+    claims = {
+        "iss": APPROVAL_ISSUER,
+        "sub": MANAGER_CLIENT_PRINCIPAL_ID,
+        "aud": f"urn:splendor:manager:{manager_id}",
+        "iat": now,
+        "nbf": now,
+        "exp": expires,
+        "jti": jti,
+        "splendor_ver": 1,
+        "app_principal_id": APPROVAL_APP_PRINCIPAL_ID,
+        "fleet_id": fleet_id,
+        "scope": [MANAGER_SCOPE_VALUES[scope] for scope in scopes],
+    }
+    encoded_header = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    encoded_claims = b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_claims}".encode("ascii")
+    signature = key_tool("sign", str(auth_dir / APPROVAL_SIGNING_KEY_FILE), input_bytes=signing_input)
+    if len(signature) != 64:
+        raise SystemExit("acceptance manager caller signature was malformed")
+    credential = {
+        "credential_id": "sha256:" + hashlib.sha256(JTI_CORRELATION_DOMAIN + jti.encode("ascii")).hexdigest(),
+        "principal": {
+            "app": {"app_principal_id": APPROVAL_APP_PRINCIPAL_ID, "label": None},
+            "client_principal_id": MANAGER_CLIENT_PRINCIPAL_ID,
+            "label": None,
+        },
+        "scopes": scopes,
+        "binding": {"fleet": {"fleet_id": fleet_id}},
+        "audience": {"central_manager": {"manager_id": manager_id}},
+        "expires_at": utc(datetime.fromtimestamp(expires, timezone.utc)),
+        "revocation": "active",
+    }
+    print(
+        json.dumps(
+            {
+                "token": f"{encoded_header}.{encoded_claims}.{b64url(signature)}",
+                "credential": credential,
+            },
+            separators=(",", ":"),
+        )
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -314,6 +427,11 @@ def main() -> int:
     token_parser.add_argument("--tenant-id", required=True)
     token_parser.add_argument("--instance-id", required=True)
     token_parser.add_argument("--scope", action="append", required=True)
+    manager_token_parser = subparsers.add_parser("manager-token")
+    manager_token_parser.add_argument("--auth-dir", required=True)
+    manager_token_parser.add_argument("--fleet-id", required=True)
+    manager_token_parser.add_argument("--manager-id", required=True)
+    manager_token_parser.add_argument("--scope", action="append", required=True)
     args = parser.parse_args()
     if args.command == "init":
         initialize(
@@ -325,8 +443,12 @@ def main() -> int:
                 "00000000-0000-4000-8000-000000000306": Path(args.edge_out),
             },
         )
-    else:
+    elif args.command == "token":
         token(Path(args.auth_dir), args.tenant_id, args.instance_id, args.scope)
+    else:
+        manager_token(
+            Path(args.auth_dir), args.fleet_id, args.manager_id, args.scope
+        )
     return 0
 
 

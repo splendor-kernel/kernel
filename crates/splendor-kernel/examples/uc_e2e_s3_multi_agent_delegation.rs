@@ -783,6 +783,7 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         quota_usage: input.quota_usage,
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),

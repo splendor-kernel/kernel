@@ -122,6 +122,15 @@ governance IDs. The journey keeps cloud helpers proposal-only, telemetry
 observational, replay side-effect-free by default, and physical actions
 high-level only.
 
+Independent aggregation re-derives the migrated approval contracts from retained
+API traffic rather than scenario summary booleans. S5 proves active raw-evidence
+rejection and acknowledged resident receipt revocation without tick, state, or
+adapter effects. S6 proves physical v2 server-node binding, wrong-node pre-claim
+rejection, one safety-verified execution, and replay denial. S10 proves manager
+submit/dispatch ordering, exact receipt retry, active raw rejection, both
+claim/revoke race outcomes, and token/signature-free retained evidence. Retained
+authority-receipt signatures are a blocking aggregation failure.
+
 ## Anti-drift rules
 
 The scanner fails closed on:

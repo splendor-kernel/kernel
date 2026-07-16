@@ -302,6 +302,11 @@ impl LocalSignedWorkOrderRunAuthority {
     pub fn grant_id(&self) -> &CapabilityGrantId {
         &self.inner.grant.grant().grant_id
     }
+
+    /// Immutable expiry of the admitted run grant.
+    pub fn expires_at(&self) -> OffsetDateTime {
+        self.inner.grant.grant().expires_at
+    }
 }
 
 #[derive(Clone, Copy)]

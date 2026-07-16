@@ -217,6 +217,71 @@ fn assert_denied_for_renewed_change(
 }
 
 #[test]
+fn renewal_boundary_helpers_fail_closed_at_expiry_and_time_overflow() {
+    let (fixture, _, cached, snapshot, policy, context, renewed) = run_success_fixture();
+    let expired_renewal = renewed_from(&renewed, fixture.now);
+    let request = renewal_request(
+        &cached,
+        Some(&snapshot),
+        Some(&policy),
+        &context,
+        NONCE,
+        &expired_renewal,
+        fixture.now,
+    );
+    let mut reasons = Vec::new();
+    verify_renewed_grant_shape(&request, &policy, fixture.now, &mut reasons);
+    assert!(reasons.contains(&REASON_AUTHORITY_RENEWAL_RENEWED_GRANT_EXPIRED.to_string()));
+    assert!(reasons.contains(&REASON_AUTHORITY_RENEWAL_CACHE_WINDOW_INVALID.to_string()));
+
+    let maximum_time =
+        OffsetDateTime::from_unix_timestamp(253_402_300_799).expect("maximum supported timestamp");
+    assert!(cache_age_exceeded(
+        maximum_time,
+        Duration::seconds(1),
+        maximum_time,
+    ));
+    assert!(exceeds_deadline(
+        maximum_time,
+        Duration::seconds(1),
+        maximum_time,
+    ));
+    assert_eq!(
+        cache_error_reason(crate::AuthorityGrantCacheError::InvalidCacheWindow),
+        REASON_AUTHORITY_RENEWAL_CACHE_WINDOW_INVALID
+    );
+    assert_eq!(
+        cache_error_reason(crate::AuthorityGrantCacheError::CachedAfterGrantExpiry),
+        REASON_AUTHORITY_RENEWAL_CACHE_OUTLIVES_GRANT
+    );
+    assert_eq!(
+        cache_error_reason(crate::AuthorityGrantCacheError::CacheOutlivesGrant),
+        REASON_AUTHORITY_RENEWAL_CACHE_OUTLIVES_GRANT
+    );
+
+    let mut raw_without_revision = renewed.grant().clone();
+    raw_without_revision.validation = None;
+    let without_revision = unchecked_validated_grant_for_tests(raw_without_revision);
+    let cached_without_revision = cached_for(
+        without_revision.clone(),
+        fixture.now - Duration::minutes(1),
+        fixture.now + Duration::minutes(1),
+    );
+    let request_without_revision = renewal_request(
+        &cached_without_revision,
+        Some(&snapshot),
+        Some(&policy),
+        &context,
+        NONCE,
+        &without_revision,
+        fixture.now + Duration::minutes(1),
+    );
+    let mut reasons = Vec::new();
+    verify_nonce_and_current_revision(&request_without_revision, &mut reasons);
+    assert!(reasons.contains(&REASON_AUTHORITY_RENEWAL_CURRENT_REVISION_MISSING.to_string()));
+}
+
+#[test]
 fn positive_renewal_requires_fresh_cache_snapshot_nonce_and_current_digest() {
     let (fixture, current, cached, snapshot, policy, context, renewed) = run_success_fixture();
 
@@ -249,6 +314,7 @@ fn positive_renewal_requires_fresh_cache_snapshot_nonce_and_current_digest() {
         renewed_cache.grant().grant().expires_at,
         fixture.now + Duration::minutes(25)
     );
+    assert!(result.into_renewed_cached_grant().is_some());
 }
 
 #[test]

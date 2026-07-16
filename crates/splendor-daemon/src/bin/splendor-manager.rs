@@ -1,9 +1,10 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
-use splendor_daemon::caller_auth::CallerTokenSigner;
+use splendor_daemon::caller_auth::{CallerTokenSigner, CallerTokenVerifier};
 use splendor_daemon::manager::{router, ManagerState, ResidentDispatchOptions};
-use splendor_types::{FleetId, WorkOrderKeyring};
+use splendor_kernel::LocalAuthorityObligationReceiptConfig;
+use splendor_types::{FleetId, PrincipalId, WorkOrderKeyring};
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::net::SocketAddr;
@@ -24,6 +25,17 @@ struct WorkOrderKeyringFile {
 struct SharedSecretKey {
     key_id: String,
     shared_secret_base64url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityReceiptConfigFile {
+    schema_version: String,
+    issuer_principal_id: String,
+    audience_prefix: String,
+    key_id: String,
+    validation_secret_base64url: String,
+    revocation_ref: String,
 }
 
 fn manager_bind_addr() -> String {
@@ -91,6 +103,15 @@ fn configured_manager_state() -> Result<ManagerState, std::io::Error> {
     let work_order_keyring = load_work_order_keyring(Path::new(&required_env(
         "SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE",
     )?))?;
+    let authority_receipt_config = load_authority_receipt_config(Path::new(&required_env(
+        "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
+    )?))?;
+    let approval_caller_verifier = CallerTokenVerifier::from_manager_file(
+        required_env("SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE")?,
+        manager_id.clone(),
+        fleet_id.clone(),
+    )
+    .map_err(|_| invalid_config("manager approval caller trust"))?;
     let root_ca_path = required_env("SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE")?;
     let mut options = ResidentDispatchOptions::production();
     options.root_ca_pem = Some(read_regular_file(
@@ -107,14 +128,43 @@ fn configured_manager_state() -> Result<ManagerState, std::io::Error> {
     if options.allowed_origins.is_empty() {
         return Err(invalid_config("resident allowed origins"));
     }
-    ManagerState::acceptance_with_dispatch_config(
+    ManagerState::acceptance_with_dispatch_receipt_and_approval_auth(
         manager_id,
         fleet_id,
         work_order_keyring,
         signer,
         options,
+        authority_receipt_config,
+        approval_caller_verifier,
     )
     .map_err(|_| invalid_config("resident dispatch"))
+}
+
+fn load_authority_receipt_config(
+    path: &Path,
+) -> Result<LocalAuthorityObligationReceiptConfig, std::io::Error> {
+    let bytes = read_regular_file(path, CONFIG_FILE_LIMIT, true)?;
+    let file: AuthorityReceiptConfigFile =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_config("authority receipt"))?;
+    if file.schema_version != "splendor.authority_obligation_receipt_config.v1" {
+        return Err(invalid_config("authority receipt"));
+    }
+    let issuer = PrincipalId::parse(&file.issuer_principal_id)
+        .map_err(|_| invalid_config("authority receipt"))?;
+    let secret = URL_SAFE_NO_PAD
+        .decode(file.validation_secret_base64url.as_bytes())
+        .map_err(|_| invalid_config("authority receipt"))?;
+    if secret.len() < 32 {
+        return Err(invalid_config("authority receipt"));
+    }
+    LocalAuthorityObligationReceiptConfig::trusted_local(
+        issuer,
+        file.audience_prefix,
+        file.key_id,
+        file.validation_secret_base64url,
+        file.revocation_ref,
+    )
+    .map_err(|_| invalid_config("authority receipt"))
 }
 
 fn load_work_order_keyring(path: &Path) -> Result<WorkOrderKeyring, std::io::Error> {
@@ -219,9 +269,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(configured_manager_state()?);
     let listener = TcpListener::bind(&bind_addr).await?;
     if bind_addr.starts_with("0.0.0.0:") {
-        eprintln!("WARNING: Splendor central manager is running in explicit local acceptance non-loopback mode on {bind_addr}; inbound caller proof is not production-ready");
+        eprintln!("WARNING: Splendor central manager is running in explicit local acceptance non-loopback mode on {bind_addr}; only approval mutations have bounded inbound bearer verification and all other manager endpoints remain acceptance-only");
     } else {
-        eprintln!("WARNING: Splendor central manager is running in explicit local acceptance mode on {bind_addr}; inbound caller proof is not production-ready");
+        eprintln!("WARNING: Splendor central manager is running in explicit local acceptance mode on {bind_addr}; only approval mutations have bounded inbound bearer verification and all other manager endpoints remain acceptance-only");
     }
     axum::serve(listener, app).await?;
     Ok(())
@@ -262,6 +312,8 @@ mod tests {
             "SPLENDOR_MANAGER_CALLER_KEY_ID",
             "SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE",
             "SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE",
+            "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
+            "SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE",
             "SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE",
             "SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS",
         ] {
@@ -321,7 +373,7 @@ mod tests {
     #[test]
     fn manager_outbound_dispatch_requires_explicit_private_keys_and_root_ca() {
         use ring::rand::SystemRandom;
-        use ring::signature::Ed25519KeyPair;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
 
         let _env = ManagerEnvGuard::acquire();
         let root =
@@ -329,10 +381,31 @@ mod tests {
         std::fs::create_dir(&root).expect("fixture directory");
         let signing_key = root.join("caller-signing-key.pk8");
         let work_order_keyring = root.join("work-order-keyring.json");
+        let authority_receipt_config = root.join("authority-receipt-config.json");
+        let approval_caller_trust = root.join("approval-caller-trust.json");
         let root_ca = root.join("resident-root-ca.pem");
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("caller signing key");
         write_private_bytes(&signing_key, pkcs8.as_ref());
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("caller key pair");
+        let approval_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("approval caller signing key");
+        let approval_key_pair =
+            Ed25519KeyPair::from_pkcs8(approval_pkcs8.as_ref()).expect("approval caller key pair");
+        let trust_now = time::OffsetDateTime::now_utc();
+        let approval_trust = splendor_daemon::caller_auth::CallerTokenTrustSnapshot::single_key(
+            "urn:splendor:manager:approval-control-plane",
+            "approval-control-plane",
+            "manager-approval-test",
+            approval_key_pair.public_key().as_ref(),
+            vec![splendor_types::EndpointScope::ApprovalsManage],
+            trust_now - time::Duration::seconds(1),
+        )
+        .with_expected_client_principal_id("approval-management-client");
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(&approval_trust).expect("approval trust JSON"),
+        );
         write_private_json(
             &work_order_keyring,
             serde_json::json!({
@@ -344,6 +417,20 @@ mod tests {
                         [7_u8; 32]
                     )
                 }]
+            }),
+        );
+        write_private_json(
+            &authority_receipt_config,
+            serde_json::json!({
+                "schema_version": "splendor.authority_obligation_receipt_config.v1",
+                "issuer_principal_id": "00000000-0000-4000-8000-0000000004c0",
+                "audience_prefix": "splendor.daemon.run",
+                "key_id": "approval-receipt-local-key",
+                "validation_secret_base64url": base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    [11_u8; 32]
+                ),
+                "revocation_ref": "local-approval-receipts"
             }),
         );
         let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -381,6 +468,14 @@ mod tests {
                 work_order_keyring.display().to_string(),
             ),
             (
+                "SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE",
+                authority_receipt_config.display().to_string(),
+            ),
+            (
+                "SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE",
+                approval_caller_trust.display().to_string(),
+            ),
+            (
                 "SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE",
                 root_ca.display().to_string(),
             ),
@@ -391,7 +486,64 @@ mod tests {
         ] {
             std::env::set_var(name, value);
         }
+
+        let overlapping_trust = splendor_daemon::caller_auth::CallerTokenTrustSnapshot::single_key(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "manager-resident-test",
+            key_pair.public_key().as_ref(),
+            vec![splendor_types::EndpointScope::ApprovalsManage],
+            trust_now - time::Duration::seconds(1),
+        )
+        .with_expected_client_principal_id("resident-dispatch-client");
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(&overlapping_trust).expect("overlapping approval trust JSON"),
+        );
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("overlapping approval and dispatch keys denied")
+            .to_string()
+            .contains("resident dispatch"));
+        let mut revoked_overlapping_trust = overlapping_trust;
+        revoked_overlapping_trust.keys[0].status =
+            splendor_daemon::caller_auth::CallerVerificationKeyStatus::Revoked;
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(revoked_overlapping_trust)
+                .expect("revoked overlapping approval trust JSON"),
+        );
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("revoked overlapping approval and dispatch keys denied")
+            .to_string()
+            .contains("resident dispatch"));
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(&approval_trust).expect("approval trust JSON"),
+        );
         super::configured_manager_state().expect("explicit outbound dispatch configuration");
+
+        for invalid_fleet_id in ["not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            std::env::set_var("SPLENDOR_FLEET_ID", invalid_fleet_id);
+            assert!(super::configured_manager_state()
+                .err()
+                .expect("invalid fleet denied")
+                .to_string()
+                .contains("non-nil UUID"));
+        }
+        std::env::set_var("SPLENDOR_FLEET_ID", "00000000-0000-4000-8000-000000000104");
+
+        std::env::set_var("SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS", " , ");
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("empty origin list denied")
+            .to_string()
+            .contains("resident allowed origins"));
+        std::env::set_var(
+            "SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS",
+            "https://localhost:8091",
+        );
 
         std::env::remove_var("SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE");
         assert!(super::configured_manager_state()
@@ -400,6 +552,40 @@ mod tests {
             .to_string()
             .contains("SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE"));
         std::env::set_var("SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE", &signing_key);
+
+        std::env::remove_var("SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE");
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("missing approval trust denied")
+            .to_string()
+            .contains("SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE"));
+        std::env::set_var(
+            "SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE",
+            &approval_caller_trust,
+        );
+
+        write_private_bytes(&approval_caller_trust, b"not-json");
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("malformed approval trust denied")
+            .to_string()
+            .contains("manager approval caller trust"));
+        let mut stale_trust = approval_trust.clone();
+        stale_trust.issued_at = trust_now - time::Duration::hours(2);
+        stale_trust.expires_at = trust_now - time::Duration::seconds(1);
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(stale_trust).expect("stale trust JSON"),
+        );
+        assert!(super::configured_manager_state()
+            .err()
+            .expect("stale approval trust denied")
+            .to_string()
+            .contains("manager approval caller trust"));
+        write_private_json(
+            &approval_caller_trust,
+            serde_json::to_value(approval_trust).expect("approval trust JSON"),
+        );
 
         #[cfg(unix)]
         {
@@ -412,6 +598,50 @@ mod tests {
                 .to_string()
                 .contains("group/world"));
         }
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn manager_work_order_keyring_rejects_malformed_ambiguous_and_weak_secrets() {
+        let root = std::env::temp_dir().join(format!(
+            "splendor-manager-keyring-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).expect("fixture directory");
+        let path = root.join("keyring.json");
+
+        write_private_bytes(&path, b"not-json");
+        assert!(super::load_work_order_keyring(&path).is_err());
+        for value in [
+            serde_json::json!({"schema_version": "wrong", "keys": [{"key_id": "key", "shared_secret_base64url": "AA"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": []}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "", "shared_secret_base64url": "AA"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [
+                {"key_id": "duplicate", "shared_secret_base64url": "AA"},
+                {"key_id": "duplicate", "shared_secret_base64url": "AA"}
+            ]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "key", "shared_secret_base64url": "%%%"}]}),
+            serde_json::json!({"schema_version": "splendor.work_order_keyring.v1", "keys": [{"key_id": "key", "shared_secret_base64url": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [1_u8; 8])}]}),
+        ] {
+            write_private_json(&path, value);
+            assert!(super::load_work_order_keyring(&path).is_err());
+        }
+
+        write_private_json(
+            &path,
+            serde_json::json!({
+                "schema_version": "splendor.work_order_keyring.v1",
+                "keys": [{
+                    "key_id": "manager-key",
+                    "shared_secret_base64url": base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        [7_u8; 32]
+                    )
+                }]
+            }),
+        );
+        super::load_work_order_keyring(&path).expect("valid manager keyring");
+        assert!(super::read_regular_file(&path, 1, false).is_err());
         std::fs::remove_dir_all(root).expect("remove fixture directory");
     }
 

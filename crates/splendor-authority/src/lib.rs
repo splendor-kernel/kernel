@@ -60,12 +60,17 @@ pub use issuance::{
     WorkOrderGrantIssuanceResult,
 };
 pub use obligations::{
-    canonical_authority_request_digest, issue_local_authority_obligation_receipt,
-    validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationEffectPermit, AuthorityObligationReceiptLedger,
-    AuthorityObligationReceiptValidationContext, InMemoryAuthorityObligationReceiptLedger,
+    apply_approval_policy_obligation, canonical_authority_request_digest,
+    issue_local_authority_obligation_receipt, validate_authority_obligation_receipt,
+    verify_obligation_receipts, ApprovalObligationContext, AuthorityObligationEffectPermit,
+    AuthorityObligationReceiptClock, AuthorityObligationReceiptLedger,
+    AuthorityObligationReceiptRevocationOutcome, AuthorityObligationReceiptValidationContext,
+    InMemoryAuthorityObligationReceiptLedger, LocalAuthorityObligationReceiptConfig,
     ObligationReceiptError, ObligationReceiptLedgerError, ObligationReceiptVerification,
-    ValidatedAuthorityObligationReceipt,
+    ValidatedAuthorityObligationReceipt, APPROVAL_OBLIGATION_ACTION_DIGEST,
+    APPROVAL_OBLIGATION_ACTION_ID, APPROVAL_OBLIGATION_ACTION_NAME, APPROVAL_OBLIGATION_ADAPTER,
+    APPROVAL_OBLIGATION_APPROVAL_ID, APPROVAL_OBLIGATION_EXPIRES_AT, APPROVAL_OBLIGATION_POLICY_ID,
+    APPROVAL_OBLIGATION_RECEIPT_AUDIENCE, APPROVAL_OBLIGATION_RISK_LEVEL,
 };
 pub use renewal::{
     renew_cached_authority_grant, AuthorityGrantRenewalContextError, AuthorityGrantRenewalPolicy,

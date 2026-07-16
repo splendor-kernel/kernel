@@ -107,6 +107,10 @@ fn endpoint_scope_labels_are_canonical() {
             "splendor.capabilities.read",
         ),
         (EndpointScope::PoliciesSync, "splendor.policies.sync"),
+        (
+            EndpointScope::ApprovalReceiptsRevoke,
+            "splendor.approval_receipts.revoke",
+        ),
     ];
 
     for (scope, label) in cases {
@@ -232,11 +236,16 @@ fn endpoint_scope_strings_cover_daemon_and_registry_surface() {
         (EndpointScope::PoliciesRevoke, "splendor.policies.revoke"),
         (EndpointScope::ApprovalsManage, "splendor.approvals.manage"),
         (
+            EndpointScope::ApprovalReceiptsRevoke,
+            "splendor.approval_receipts.revoke",
+        ),
+        (
             EndpointScope::GovernanceControl,
             "splendor.governance.control",
         ),
         (EndpointScope::DeviceRegister, "splendor.device.register"),
         (EndpointScope::DeviceRead, "splendor.device.read"),
+        (EndpointScope::DeviceTraceSync, "splendor.device.trace_sync"),
         (
             EndpointScope::OperatorIntervene,
             "splendor.operator.intervene",
@@ -315,6 +324,48 @@ fn non_mutating_health_and_capability_reads_do_not_require_attribution() {
         assert_eq!(decision.scope, scope);
         assert_eq!(decision.audit_attribution, None);
     }
+}
+
+#[test]
+fn device_trace_sync_requires_dedicated_mutating_scope_and_attribution() {
+    let now = time::OffsetDateTime::now_utc();
+    let tenant_id = TenantId::new();
+    let endpoint = DaemonEndpoint::DeviceTraceSync {
+        tenant_id: tenant_id.clone(),
+        node_id: NodeId::new(),
+    };
+    let request = DaemonSecurityRequest {
+        endpoint,
+        credential: Some(credential(
+            tenant_id.clone(),
+            vec![EndpointScope::DeviceTraceSync],
+            now,
+        )),
+        expected_audience: audience(),
+        work_order: None,
+        audit_attribution: Some(attribution(now)),
+        insecure_dev_mode: None,
+    };
+
+    let decision = validate_daemon_request(&request, now).expect("trace sync authorized");
+    assert_eq!(decision.scope, EndpointScope::DeviceTraceSync);
+    assert!(decision.audit_attribution.is_some());
+
+    let mut read_scope = request.clone();
+    read_scope.credential = Some(credential(tenant_id, vec![EndpointScope::DeviceRead], now));
+    assert_eq!(
+        validate_daemon_request(&read_scope, now),
+        Err(DaemonSecurityError::MissingScope {
+            scope: "splendor.device.trace_sync",
+        })
+    );
+
+    let mut missing_attribution = request;
+    missing_attribution.audit_attribution = None;
+    assert_eq!(
+        validate_daemon_request(&missing_attribution, now),
+        Err(DaemonSecurityError::MissingAuditAttribution)
+    );
 }
 
 #[test]

@@ -6,7 +6,9 @@
 //! without introducing a workflow engine or approval queue.
 
 use crate::{
-    Action, ActionId, AgentId, ApprovalId, RunId, SideEffectClass, TenantId, TraceEventId,
+    Action, ActionId, AgentId, ApprovalId, AuthorityDecisionId, AuthorityObligationId,
+    AuthorityObligationReceipt, AuthorityObligationReceiptId, EffectCertainty, InstanceId,
+    PhysicalActionResourceCoordinate, PrincipalId, RunId, SideEffectClass, TenantId, TraceEventId,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -15,9 +17,18 @@ use time::OffsetDateTime;
 pub const APPROVAL_POLICY_SCHEMA_VERSION: &str = "splendor.approval_policy.v1";
 /// Version tag for approval evidence objects introduced in 0.04-S2.
 pub const APPROVAL_EVIDENCE_SCHEMA_VERSION: &str = "splendor.approval_evidence.v1";
+/// Version tag for receipt-bound approval challenges introduced by AUTH-004c.
+pub const APPROVAL_CHALLENGE_SCHEMA_VERSION: &str = "splendor.approval_challenge.v1";
+/// Version tag for resident receipt-revocation requests.
+pub const RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION: &str =
+    "splendor.resident.approval_receipt_revocation.v1";
+/// Version tag for acknowledged resident receipt revocations.
+pub const RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION: &str =
+    "splendor.resident.approval_receipt_revocation_ack.v1";
 
 /// Declares when an action must pause for approval before adapter execution.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalPolicy {
     /// Schema version for compatibility checks.
     pub schema_version: String,
@@ -140,6 +151,7 @@ pub enum ApprovalDecision {
 
 /// Approval grant/denial token or percept-derived evidence.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalEvidence {
     /// Schema version for compatibility checks.
     pub schema_version: String,
@@ -171,6 +183,108 @@ pub struct ApprovalEvidence {
     pub revoked: bool,
     /// Optional trace event that requested this approval.
     pub trace_event_id: Option<TraceEventId>,
+}
+
+/// Behavior-free challenge for satisfying one exact approval authority obligation.
+///
+/// This object is safe to carry through daemon/manager APIs, traces, and replay,
+/// but is not authority. Only an `AuthorityObligationReceipt` issued by the
+/// owning approval service and validated at the final gateway boundary can
+/// satisfy the referenced obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalChallenge {
+    /// Challenge schema version.
+    pub schema_version: String,
+    /// Stable approval identity for this exact challenge.
+    pub approval_id: ApprovalId,
+    /// Exact tenant scope.
+    pub tenant_id: TenantId,
+    /// Exact agent scope.
+    pub agent_id: AgentId,
+    /// Exact run scope.
+    pub run_id: RunId,
+    /// Exact action identity.
+    pub action_id: ActionId,
+    /// Exact action name.
+    pub action_name: String,
+    /// Exact effective adapter.
+    pub adapter: String,
+    /// Approval policy that introduced the obligation.
+    pub policy_id: String,
+    /// Optional trace-safe policy risk label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    /// Authority subject from the live run grant.
+    pub subject: PrincipalId,
+    /// Stable current conditional authority decision identity.
+    pub authority_decision_id: AuthorityDecisionId,
+    /// Exact `ApprovalRequired` obligation identity.
+    pub obligation_id: AuthorityObligationId,
+    /// Trusted receipt audience coordinate for this run.
+    pub receipt_audience: String,
+    /// Digest of the exact conditional authority request.
+    pub canonical_request_digest: String,
+    /// Digest of the exact gateway action request and effective adapter.
+    pub gateway_action_request_digest: String,
+    /// Trusted physical target bound into a physical-v2 action digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_action_resource_coordinate: Option<PhysicalActionResourceCoordinate>,
+    /// Digest binding the complete semantic conditional decision.
+    pub authority_decision_digest: String,
+    /// Original action request time preserved across pause/resume or direct retry.
+    #[serde(with = "time::serde::rfc3339")]
+    pub requested_at: OffsetDateTime,
+    /// Latest time at which an owning service may issue/use a receipt.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// Closed request for revoking one exact resident obligation receipt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentApprovalReceiptRevocationRequest {
+    /// Request schema version.
+    pub schema_version: String,
+    /// Exact raw receipt retained by the manager after grant.
+    pub authority_obligation_receipt: AuthorityObligationReceipt,
+    /// Bounded audit reason; the resident validates the bound before mutation.
+    pub reason: String,
+}
+
+/// Successful authority-ledger revocation state acknowledged by a resident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidentApprovalReceiptRevocationStatus {
+    /// This request won the claim/revoke race.
+    Revoked,
+    /// The same exact or semantic receipt was already revoked.
+    AlreadyRevoked,
+}
+
+/// Closed resident acknowledgement proving known receipt revocation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentApprovalReceiptRevocationAck {
+    /// Acknowledgement schema version.
+    pub schema_version: String,
+    /// Exact receipt identity from the path and validated receipt.
+    pub receipt_id: AuthorityObligationReceiptId,
+    /// Approval identity bound by the validated receipt.
+    pub approval_id: ApprovalId,
+    /// Authenticated resident instance that owns the ledger.
+    pub target_instance_id: InstanceId,
+    /// Exact run whose verifier owns the ledger.
+    pub run_id: RunId,
+    /// Exact trusted resident instance+run audience.
+    pub receipt_audience: String,
+    /// Known successful revocation state.
+    pub status: ResidentApprovalReceiptRevocationStatus,
+    /// Must be `known` for every successful acknowledgement.
+    pub effect_certainty: EffectCertainty,
+    /// Resident trusted time at acknowledgement.
+    #[serde(with = "time::serde::rfc3339")]
+    pub acknowledged_at: OffsetDateTime,
 }
 
 impl ApprovalEvidence {

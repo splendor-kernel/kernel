@@ -124,6 +124,9 @@ pub struct ActionCandidate {
     pub usage: QuotaUsage,
     /// Preconditions satisfied for this action.
     pub satisfied_preconditions: Vec<String>,
+    /// Stable original request timestamp preserved across policy retries and
+    /// approval pause/resume boundaries.
+    pub requested_at: Option<OffsetDateTime>,
     /// Optional approval evidence supplied for this action evaluation.
     pub approval_evidence: Option<splendor_types::ApprovalEvidence>,
     /// Raw owning-service receipts for live authority obligations.
@@ -142,6 +145,7 @@ impl ActionCandidate {
             adapter: None,
             usage: QuotaUsage::single_action(),
             satisfied_preconditions,
+            requested_at: None,
             approval_evidence: None,
             authority_obligation_receipts: Vec::new(),
             delegated_capability_grant_id: None,
@@ -163,6 +167,12 @@ impl ActionCandidate {
     /// Overrides the satisfied preconditions for this action.
     pub fn with_satisfied_preconditions(mut self, preconditions: Vec<String>) -> Self {
         self.satisfied_preconditions = preconditions;
+        self
+    }
+
+    /// Preserves the original request timestamp for deterministic obligation binding.
+    pub fn with_requested_at(mut self, requested_at: OffsetDateTime) -> Self {
+        self.requested_at = Some(requested_at);
         self
     }
 
@@ -791,6 +801,16 @@ impl LoopEngine {
             },
         )?;
 
+        if decision
+            .actions
+            .iter()
+            .any(|candidate| candidate.approval_evidence.is_some())
+        {
+            return Err(LoopError::Policy(
+                "policy_raw_approval_evidence_forbidden".to_string(),
+            ));
+        }
+
         let candidate_actions = decision
             .actions
             .iter()
@@ -844,6 +864,7 @@ impl LoopEngine {
                     post_verification: None,
                     output: None,
                     error: Some(constraint_evaluation.result.reasons.join(", ")),
+                    approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 }
             } else if !delegated_scope.allowed() {
@@ -854,6 +875,7 @@ impl LoopEngine {
                     post_verification: None,
                     output: None,
                     error: Some(delegated_scope.verification.reasons.join(", ")),
+                    approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 }
             } else {
@@ -867,7 +889,10 @@ impl LoopEngine {
                     adapter: candidate.adapter.clone(),
                     quota_usage: candidate.usage,
                     satisfied_preconditions: candidate.satisfied_preconditions.clone(),
-                    requested_at: OffsetDateTime::now_utc(),
+                    requested_at: candidate
+                        .requested_at
+                        .unwrap_or_else(OffsetDateTime::now_utc),
+                    physical_action_resource_coordinate: None,
                     approval_evidence: candidate.approval_evidence.clone(),
                     authority_obligation_evidence: None,
                     authority_obligation_receipts: candidate.authority_obligation_receipts.clone(),
@@ -1183,6 +1208,7 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
         post_verification: None,
         output: None,
         error: Some(message),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }

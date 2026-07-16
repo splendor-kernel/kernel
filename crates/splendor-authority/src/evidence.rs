@@ -560,6 +560,19 @@ fn normalize_authority_reason(reason: &str) -> NormalizedAuthorityReason {
             normalized("capability_allowed", Category::Allowed)
         }
         "capability_conditional" => normalized("capability_conditional", Category::ObligationsGate),
+        "approval_required" => normalized("approval_required", Category::ObligationsGate),
+        "approval_policy_schema_unsupported" => normalized(
+            "approval_policy_schema_unsupported",
+            Category::IdentityValidation,
+        ),
+        "approval_policy_expired" => normalized("approval_policy_expired", Category::ExpiryTime),
+        "approval_obligation_conflict" => {
+            normalized("approval_obligation_conflict", Category::ObligationsGate)
+        }
+        "approval_challenge_binding_unavailable" => normalized(
+            "approval_challenge_binding_unavailable",
+            Category::ObligationsGate,
+        ),
         "missing_capability_grant" => {
             normalized("missing_capability_grant", Category::IdentityValidation)
         }

@@ -17,6 +17,7 @@ services:
       SPLENDOR_E2E_REPORT_DIR: /workspace/target/splendor-e2e/use-case-acceptance
       SPLENDOR_E2E_NO_COMPOSE: "1"
       SPLENDOR_E2E_SOURCE_REV: ${SPLENDOR_E2E_SOURCE_REV:-unknown-source-revision}
+      SPLENDOR_E2E_SOURCE_TREE_DIGEST: ${SPLENDOR_E2E_SOURCE_TREE_DIGEST:-unknown-source-tree-digest}
       SPLENDOR_DAEMON_URL: http://127.0.0.1:8077
       SPLENDOR_MANAGER_URL: http://central-manager:8081
       SPLENDOR_RESIDENT_AUTH_DIR: /run/splendor-auth
@@ -130,10 +131,12 @@ services:
     working_dir: /workspace
     environment:
       SPLENDOR_DAEMON_MODE: local_dev
+      SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
     command: ["splendor-daemon"]
     volumes:
       - ../../..:/workspace
       - e2e-state:/var/lib/splendor
+      - e2e-manager-auth:/run/splendor-auth:ro
 
   central-manager:
     build:
@@ -153,6 +156,8 @@ services:
       SPLENDOR_MANAGER_CALLER_KEY_ID: manager-resident-acceptance
       SPLENDOR_MANAGER_CALLER_SIGNING_KEY_FILE: /run/splendor-auth/caller-signing-key.pk8
       SPLENDOR_MANAGER_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
+      SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
+      SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE: /run/splendor-auth/approval-caller-trust.json
       SPLENDOR_MANAGER_RESIDENT_ROOT_CA_FILE: /run/splendor-auth/resident-root-ca.pem
       SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS: https://resident-cloud-node:8091,https://resident-vpc-node:8092,https://resident-edge-node:8093
     command: ["splendor-manager"]
@@ -174,6 +179,7 @@ services:
       SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
       SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
       SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]
@@ -195,6 +201,7 @@ services:
       SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
       SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
       SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]
@@ -217,6 +224,7 @@ services:
       SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
       SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
       SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
+      SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
     command: ["splendor-daemon"]

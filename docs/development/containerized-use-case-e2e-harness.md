@@ -91,7 +91,10 @@ test-only material into separate untracked role volumes before those services
 start. Residents never mount the caller private key; each resident mounts only
 its own work-order v1 verifier secret, while the manager receives all issuer
 secrets and the runner receives only the fixture signing inputs it exercises.
-Resident URLs use HTTPS and no resident inherits local development keys. Because
+Resident URLs use HTTPS, credentialed Python acceptance clients explicitly
+disable redirects while retaining CA/hostname verification, and no resident
+inherits local development keys. A resident 3xx is evidence of an error response,
+not permission to forward Authorization to a new origin or plaintext URL. Because
 work-order v1 uses keyed-BLAKE3 shared secrets, this fixture proves scoped sibling
 isolation, not asymmetric issuer/verifier separation.
 
@@ -230,6 +233,21 @@ The runner must execute phases in this order:
    - TypeScript package version
    - OpenAPI schema version
    - Docker image digest/topology hash
+   - source revision, dirty state, and deterministic source-tree digest
+
+The source-tree digest uses `splendor-e2e-source-tree-v1`: SHA-256 over
+domain-separated, length-prefixed fields containing the full `HEAD`, sorted
+staged entries as Git index path/mode/blob bytes, the sorted union of staged and
+unstaged tracked entries as current worktree path/type/Git mode/content (or
+deletion), and sorted untracked non-ignored path/type/Git mode/content. Ignored
+files and mtimes are excluded.
+The report exposes only the digest and change counts, not file contents.
+
+The host runner computes this identity before starting Compose and passes the
+digest with `SPLENDOR_E2E_SOURCE_TREE_DIGEST`; `SPLENDOR_E2E_SOURCE_REV` remains
+supported. A container without usable Git metadata requires both overrides to
+report a known identity. Missing or invalid metadata remains `unknown` and must
+not be represented as a clean tree.
 
 2. **Static anti-drift scan**
    - no scenario test claims E2E while importing private runtime helpers;
@@ -344,6 +362,9 @@ redaction policy present for trace export
 message schema validated before delivery
 state handoff hash validated
 approval token scoped and expiry checked
+resident approval receipt bound to exact instance and run
+resident receipt revocation acknowledged before manager success
+retained evidence excludes bearer, raw JTI, and receipt-signature bytes
 safety verifier executed before physical action
 ```
 
@@ -374,6 +395,10 @@ message-causal-graph.json
 fleet-telemetry.json
 placement-explanation.json
 approval-flow.json
+approval-receipt-revocation-report.json
+manager-approval-auth.json
+resident-security.json
+physical-approval-node-binding.json
 device-safety-evidence.json
 trace-sync-report.json
 schema-migration-report.json
@@ -403,6 +428,10 @@ fault-injection-report.json
 | Stale node heartbeat | Placement denied or policy-degraded with explanation. |
 | State hash mismatch | Reject import/handoff/replay. |
 | Expired approval | Cannot resume/execute. |
+| Raw approval evidence on active run | Reject before gateway, trace, tick, state, or adapter mutation. |
+| Wrong-node approval receipt | Reject before claim; original target remains usable. |
+| Resident receipt revocation | Require exact-scope authenticated known acknowledgement; uncertainty is not success. |
+| Retained bearer/JTI/receipt signature | Fail evidence aggregation. |
 | Circuit breaker active | Matching action denied. |
 | Kill switch active | Matching run/action cancelled or blocked. |
 | Raw motor command | Reject at schema/adapter boundary. |
@@ -444,7 +473,7 @@ This job may be expensive compared with sprint-local tests, so it can be require
 
 A reviewer should be able to answer these from the report alone:
 
-- What source revision and container topology were tested?
+- What source revision, exact clean/dirty source-tree digest, and container topology were tested?
 - Which FRs and primitives were covered?
 - Which public API operations were exercised?
 - Which clients were used: CLI, Python, TypeScript, raw OpenAPI-validated HTTP?

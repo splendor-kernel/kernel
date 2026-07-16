@@ -843,6 +843,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
             authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
@@ -885,6 +886,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         audit_attribution: Some(attribution(false)),
         reason: Some("kernel-e2e".to_string()),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, tick): (StatusCode, TickResponse) = call_json(
         app.clone(),
@@ -923,6 +925,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
@@ -950,6 +953,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
@@ -977,6 +981,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
@@ -1053,6 +1058,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: daemon_work_order_keyring(),
+        authority_obligation_receipt_config: None,
     }));
     let locked_tenant = TenantId::parse("00000000-0000-0000-0000-000000000211")?;
     let locked_agent = AgentId::parse("00000000-0000-0000-0000-000000000212")?;
@@ -3083,6 +3089,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
             authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
@@ -3137,6 +3144,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         audit_attribution: Some(attribution(false)),
         reason: Some("final journey start".to_string()),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, tick): (StatusCode, TickResponse) = call_json(
         app.clone(),
@@ -3174,6 +3182,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
@@ -3382,6 +3391,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             audit_attribution: Some(replay_audit),
             reason: Some("final journey replay".to_string()),
             approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         })?,
     )
     .await?;
@@ -3799,6 +3809,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             adapter: Some("fixture".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
             authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,

@@ -117,6 +117,7 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/cancel` | Cancel a local run while preserving trace/state evidence | `splendor.runs.stop` |
 | `POST` | `/runs/{run_id}/percepts` | Append a daemon-submitted percept queue entry | `splendor.percepts.append` |
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
+| `POST` | `/runs/{run_id}/approval-receipts/{receipt_id}/revoke` | Revoke one exact retained approval receipt at its owning resident ledger | `splendor.approval_receipts.revoke` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
 | `POST` | `/state-snapshots/export` | Export the current state head as a trace-linked v0 handoff | `splendor.state.handoff` |
 | `POST` | `/state-snapshots/import` | Experimental loopback-local import; resident mode denies until source proof exists | `splendor.state.handoff` |
@@ -179,7 +180,9 @@ newly signed broader or otherwise changed work order is rejected. Caller
 credentials and the exact target work order are still insufficient for resident
 state import: resident mode requires source-authenticated handoff proof that v0
 does not provide and returns `state_handoff_proof_unavailable`. Caller credentials
-never authorize actions directly;
+never authorize actions directly. A cryptographically valid exact-profile import
+for an unknown run receives the same proof-unavailable response rather than a
+run-not-found oracle;
 `/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
@@ -248,15 +251,19 @@ domain-separated BLAKE3. The earlier FNV representation is not emitted.
 
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
-carry scoped approval evidence into the verifier chain. Evidence is never treated
-as direct action authority.
+remain decodable for compatibility and fail-closed trace/replay handling, but a
+raw grant is never action authority. `SubmitActionRequest.authority_obligation_receipts`
+carries raw owning-service receipts to trusted daemon-side validation; lifecycle
+resume cannot consume them.
 
 `start` and `resume` execute exactly one scheduler tick. This keeps the local
 daemon deterministic while proving the daemon boundary. Continuous/background
 scheduling is not introduced here. `start` accepts only `pending` or `running`;
 it cannot be used to bypass signed-work-order checks for a paused run. `resume`
-accepts only `paused` or `waiting_for_approval` and requires the original bound
-work-order payload described above.
+executes a tick only from `paused` and requires the original bound work-order
+payload described above. Requests targeting `waiting_for_approval` are migration-
+safe rejections and do not tick; that state progresses only through an exact
+receipt-bearing `/actions` retry.
 
 Run statuses are:
 
@@ -271,24 +278,58 @@ stopped
 failed
 ```
 
-When a tick returns an approval-required action, the daemon records
-`RunPaused { reason: "waiting_for_approval" }`, stores the pending approval
-context for inspection/replay, and returns `waiting_for_approval`. Resume from
-that state requires a signed resume work order and
-`LifecycleRequest.approval_evidence`; missing evidence returns
-`403 approval_required` before a tick is run.
+When a tick returns an approval-required action, its `ActionOutcome` includes a
+full `splendor.approval_challenge.v1` challenge. The daemon records
+`RunPaused { reason: "waiting_for_approval" }`, stores that exact challenge, and
+returns `waiting_for_approval`. A trusted manager records the challenge and may
+issue one `AuthorityObligationReceipt`. The caller must retry the exact pending
+action through `/actions`, preserving action ID, tenant/agent/run, payload,
+effective adapter, quota, preconditions, and original `requested_at` while adding
+the receipt and causal trace link. Changed coordinates return
+`409 approval_challenge_retry_mismatch`. Successful execution records
+`RunResumed`, clears the challenge, and returns the run to `running` without a
+new scheduler tick or state-head advance.
 
-Direct `/actions` and run-bound physical action submissions admit gateway work
-only while the run is `pending` or `running`. Paused,
-`waiting_for_approval`, interrupted, resuming, completed, failed, cancelled,
-denied, and expired runs return `409 run_not_effect_capable` before gateway
-verification or adapter execution. Terminal transitions close live authority
+`/runs/{run_id}/resume` rejects raw evidence with
+`legacy_approval_evidence_non_authorizing`, rejects receipts with
+`approval_receipt_resume_not_supported`, and otherwise returns
+`approval_exact_action_retry_required` while waiting. These are deliberate
+fail-closed migration errors.
+
+Direct `/actions` and run-bound physical action submissions normally admit
+gateway work only while the run is `pending` or `running`. `waiting_for_approval`
+admits only the exact pending receipt-bearing retry described above or an exact
+receipt-free retry carrying raw `Denied` evidence for fail-closed verifier
+tracing; missing raw
+challenge state fails closed. Other actions in that state and effects while
+paused, interrupted, resuming, completed, failed, cancelled, denied, or expired
+return a `409` lifecycle/approval code before adapter execution. Terminal transitions close live authority
 admission before publishing terminal status. A final permit acquired before that
 closure may complete, but no later permit can be acquired; stop/cancel release
 per-run state before waiting for those earlier permits to quiesce. Unrelated runs
 remain inspectable while an earlier effect or lifecycle wait is blocked. Action
 completion records cannot overwrite a terminal lifecycle status published while
 the effect was in flight.
+
+Raw approval evidence is admitted by the kernel before daemon audit, runtime
+trace, lifecycle, or gateway mutation. Active runs reject all raw grants and
+denials at that boundary. The only raw-evidence exception is the exact pending
+`waiting_for_approval` retry carrying a fail-closed `Denied`, expired, or revoked
+decision with no obligation receipts; it can record a terminal denial but cannot
+reach adapter execution.
+
+The resident receipt-revocation endpoint accepts a closed versioned request with
+the exact retained raw receipt and a bounded reason. It requires an authenticated
+caller bound to the run tenant and the dedicated
+`splendor.approval_receipts.revoke` scope. The path receipt ID, receipt signature,
+resident instance/run audience, approval ID, and ledger coordinate must match.
+The process-local ledger atomically linearizes claim versus revoke: `revoked` or
+`already_revoked` returns a typed acknowledgement with `effect_certainty=known`;
+an already claimed receipt returns `409 approval_receipt_revocation_too_late`.
+After scope and audience authentication, an unknown run and an existing run
+outside the caller's tenant both return the same `404 invalid_run` shape; wrong
+scope remains `403` and wrong caller-token audience remains `401`.
+This endpoint does not claim restart-durable revocation storage.
 
 ## Percept ingestion
 
@@ -337,7 +378,10 @@ mode those necessary checks are followed by a stable
 `details.disposition = needs_intervention`. The v0 payload has no accepted source
 signature/evidence proof, and its source trace ID is only caller-carried linkage.
 The denial occurs before schema/hash/head/replay processing and before any state
-store, state head, or run trace mutation.
+store, state head, or run trace mutation. It records a bounded resident-only
+`state_handoff.proof_denied` security audit fact containing the fixed endpoint,
+method, server time, and redacted credential correlation; the diagnostic buffer
+retains at most 1,024 facts and contains no raw bearer or JTI.
 
 Only explicit loopback `local_dev` compatibility routes import through the target
 scheduler and loop engine; the daemon does not mutate the backing state store
@@ -451,9 +495,11 @@ execution. Trusted time is monotonic and observed expiry is latched, so clock
 rollback cannot reactivate an unclaimed receipt. The current authority-owned
 ledger is shared by verifier instances within one process-local run; it is
 in-memory and does not claim process-restart durability.
-They are not fresh authority. Current signed-work-order compatibility
-grants contain no obligations, so receipt issuance/provider workflows remain
-downstream C01/AUTH-004 adoption rather than daemon-owned behavior.
+They are not fresh authority. For a matching approval policy, the daemon narrows
+the already-allowed live run decision to one exact `ApprovalRequired` obligation;
+it never accepts a requester-supplied decision. The local manager can issue that
+one receipt from the recorded challenge. Other owning-service receipt workflows,
+production trust, and durable revocation/replay storage remain downstream work.
 
 For create-run compatibility admission, a non-empty request-level
 `allowed_permissions` list must equal the complete signed work-order permission
@@ -510,8 +556,12 @@ Required 0.02-S5 failures include:
 | Invalid policy bundle | `400` or `403` | policy validation reason code |
 | Unauthorized or missing scope/action trace link | `403` | daemon security error code |
 | Runtime unavailable | `503` | `runtime_unavailable` |
-| Resume from `waiting_for_approval` without evidence | `403` | `approval_required` |
-| Direct/physical effect while run is not `pending` or `running` | `409` | `run_not_effect_capable` |
+| Resume from `waiting_for_approval` with raw `ApprovalEvidence` | `409` | `legacy_approval_evidence_non_authorizing` |
+| Resume from `waiting_for_approval` with obligation receipts | `409` | `approval_receipt_resume_not_supported` |
+| Resume from `waiting_for_approval` without approval material | `409` | `approval_exact_action_retry_required` |
+| Non-exact `/actions` retry while waiting for approval | `409` | `approval_exact_action_retry_required` or `approval_challenge_retry_mismatch` |
+| Pending challenge unavailable while retrying | `503` | `approval_challenge_unavailable` |
+| Direct/physical effect from another non-capable lifecycle state | `409` | `run_not_effect_capable` |
 | Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
 | Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
 | Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |

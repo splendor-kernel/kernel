@@ -114,12 +114,16 @@ pub enum EndpointScope {
     PoliciesRevoke,
     /// Grant, deny, or revoke approvals under scoped authority.
     ApprovalsManage,
+    /// Revoke one exact approval receipt at its owning resident ledger.
+    ApprovalReceiptsRevoke,
     /// Create/clear circuit breakers or activate kill switches.
     GovernanceControl,
     /// Register physical or edge device profiles.
     DeviceRegister,
     /// Read physical or edge device status and policy cache state.
     DeviceRead,
+    /// Sync an offline device trace buffer after reconnect.
+    DeviceTraceSync,
     /// Grant or deny local operator intervention requests.
     OperatorIntervene,
 }
@@ -156,9 +160,11 @@ impl EndpointScope {
             Self::PoliciesPublish => "splendor.policies.publish",
             Self::PoliciesRevoke => "splendor.policies.revoke",
             Self::ApprovalsManage => "splendor.approvals.manage",
+            Self::ApprovalReceiptsRevoke => "splendor.approval_receipts.revoke",
             Self::GovernanceControl => "splendor.governance.control",
             Self::DeviceRegister => "splendor.device.register",
             Self::DeviceRead => "splendor.device.read",
+            Self::DeviceTraceSync => "splendor.device.trace_sync",
             Self::OperatorIntervene => "splendor.operator.intervene",
         }
     }
@@ -389,6 +395,8 @@ pub enum DaemonEndpoint {
         trace_linked: bool,
         gateway_verification: GatewayVerificationState,
     },
+    /// `POST /runs/:run_id/approval-receipts/:receipt_id/revoke`.
+    ApprovalReceiptRevoke { tenant_id: TenantId, run_id: RunId },
     /// `GET /health`.
     Health,
     /// `GET /capabilities`.
@@ -423,6 +431,11 @@ pub enum DaemonEndpoint {
         tenant_id: TenantId,
         node_id: NodeId,
     },
+    /// `POST /devices/:node_id/trace-buffer/sync`.
+    DeviceTraceSync {
+        tenant_id: TenantId,
+        node_id: NodeId,
+    },
     /// `POST /operator/interventions*`.
     OperatorIntervene { tenant_id: TenantId, run_id: RunId },
 }
@@ -443,6 +456,7 @@ impl DaemonEndpoint {
             Self::StateHandoff { .. } => EndpointScope::StateHandoff,
             Self::ReplayCreate { .. } => EndpointScope::ReplayCreate,
             Self::ActionSubmit { .. } => EndpointScope::ActionsSubmit,
+            Self::ApprovalReceiptRevoke { .. } => EndpointScope::ApprovalReceiptsRevoke,
             Self::Health => EndpointScope::HealthRead,
             Self::Capabilities => EndpointScope::CapabilitiesRead,
             Self::PolicySync { .. } => EndpointScope::PoliciesSync,
@@ -452,6 +466,7 @@ impl DaemonEndpoint {
             Self::InstanceHeartbeat { .. } => EndpointScope::InstancesHeartbeat,
             Self::DeviceProfileRegister { .. } => EndpointScope::DeviceRegister,
             Self::DeviceRead { .. } => EndpointScope::DeviceRead,
+            Self::DeviceTraceSync { .. } => EndpointScope::DeviceTraceSync,
             Self::OperatorIntervene { .. } => EndpointScope::OperatorIntervene,
         }
     }
@@ -470,9 +485,11 @@ impl DaemonEndpoint {
             | Self::StateHandoff { tenant_id, .. }
             | Self::ReplayCreate { tenant_id, .. }
             | Self::ActionSubmit { tenant_id, .. }
+            | Self::ApprovalReceiptRevoke { tenant_id, .. }
             | Self::PolicySync { tenant_id, .. }
             | Self::DeviceProfileRegister { tenant_id, .. }
             | Self::DeviceRead { tenant_id, .. }
+            | Self::DeviceTraceSync { tenant_id, .. }
             | Self::OperatorIntervene { tenant_id, .. } => Some(tenant_id),
             Self::Health
             | Self::Capabilities
@@ -501,11 +518,13 @@ impl DaemonEndpoint {
             | Self::StateHandoff { .. }
             | Self::ReplayCreate { .. }
             | Self::ActionSubmit { .. }
+            | Self::ApprovalReceiptRevoke { .. }
             | Self::PolicySync { .. }
             | Self::Health
             | Self::Capabilities
             | Self::DeviceProfileRegister { .. }
             | Self::DeviceRead { .. }
+            | Self::DeviceTraceSync { .. }
             | Self::OperatorIntervene { .. } => None,
         }
     }
@@ -521,12 +540,14 @@ impl DaemonEndpoint {
                 | Self::PerceptAppend { .. }
                 | Self::StateHandoff { .. }
                 | Self::ActionSubmit { .. }
+                | Self::ApprovalReceiptRevoke { .. }
                 | Self::PolicySync { .. }
                 | Self::NodeRegister { .. }
                 | Self::InstanceRegister { .. }
                 | Self::NodeHeartbeat { .. }
                 | Self::InstanceHeartbeat { .. }
                 | Self::DeviceProfileRegister { .. }
+                | Self::DeviceTraceSync { .. }
                 | Self::OperatorIntervene { .. }
         )
     }
@@ -904,11 +925,13 @@ fn validate_endpoint_contract(endpoint: &DaemonEndpoint) -> Result<(), DaemonSec
         | DaemonEndpoint::StateHeadRead { .. }
         | DaemonEndpoint::StateHandoff { .. }
         | DaemonEndpoint::ReplayCreate { .. }
+        | DaemonEndpoint::ApprovalReceiptRevoke { .. }
         | DaemonEndpoint::PolicySync { .. }
         | DaemonEndpoint::Health
         | DaemonEndpoint::Capabilities
         | DaemonEndpoint::DeviceProfileRegister { .. }
         | DaemonEndpoint::DeviceRead { .. }
+        | DaemonEndpoint::DeviceTraceSync { .. }
         | DaemonEndpoint::OperatorIntervene { .. } => Ok(()),
     }
 }

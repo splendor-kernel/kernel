@@ -72,6 +72,7 @@ fn sample_action() -> ActionRequest {
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),
@@ -86,6 +87,32 @@ fn unimplemented_gateway_denies_sync_and_async() {
 
     let async_result = block_on(AsyncActionGateway::submit(&gateway, sample_action()));
     assert!(matches!(async_result, Err(GatewayError::Unimplemented)));
+}
+
+#[test]
+fn action_identity_validation_rejects_each_nil_privileged_identity() {
+    let nil = "00000000-0000-0000-0000-000000000000";
+
+    let mut missing_action = base_request();
+    missing_action.action_id = ActionId::parse(nil).expect("nil action parses");
+    assert!(matches!(
+        missing_action.validate_identity(),
+        Err(IdentityValidationError::Missing { field: "action_id" })
+    ));
+
+    let mut missing_tenant = base_request();
+    missing_tenant.tenant_id = TenantId::parse(nil).expect("nil tenant parses");
+    assert!(matches!(
+        missing_tenant.validate_identity(),
+        Err(IdentityValidationError::Missing { field: "tenant_id" })
+    ));
+
+    let mut missing_agent = base_request();
+    missing_agent.agent_id = AgentId::parse(nil).expect("nil agent parses");
+    assert!(matches!(
+        missing_agent.validate_identity(),
+        Err(IdentityValidationError::Missing { field: "agent_id" })
+    ));
 }
 
 #[test]
@@ -329,6 +356,7 @@ fn base_request() -> ActionRequest {
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),
@@ -357,6 +385,28 @@ fn resource_boundary_denial_prevents_adapter_execution() {
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }
 
+#[test]
+fn trusted_adapter_side_effect_class_rejects_request_downgrade_before_effect() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("noop", "filesystem", adapter.clone());
+    let mut request = base_request();
+    request.adapter = Some("filesystem".to_string());
+    request.action.side_effect_class = SideEffectClass::ReadOnly;
+
+    let outcome = gateway.submit(request).expect("downgrade denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"side_effect_class_mismatch".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
 fn physical_request() -> ActionRequest {
     let mut request = base_request();
     request.action.name = "move_to_waypoint".to_string();
@@ -365,7 +415,137 @@ fn physical_request() -> ActionRequest {
         "waypoint_ref": "waypoint:A3",
         "physical_action": true,
     });
+    request.physical_action_resource_coordinate = Some(
+        splendor_types::PhysicalActionResourceCoordinate::physical_node(
+            splendor_types::NodeId::new(),
+        ),
+    );
     request
+}
+
+#[test]
+fn physical_authority_digest_is_v2_target_bound_while_nonphysical_v1_is_unchanged() {
+    #[derive(serde::Serialize)]
+    struct LegacyPayload<'a> {
+        schema_version: &'static str,
+        action_id: &'a ActionId,
+        tenant_id: &'a TenantId,
+        agent_id: &'a AgentId,
+        run_id: &'a RunId,
+        action: &'a Action,
+        effective_adapter: Option<&'a str>,
+        quota_usage: QuotaUsage,
+        satisfied_preconditions: &'a [String],
+        #[serde(with = "time::serde::rfc3339")]
+        requested_at: OffsetDateTime,
+    }
+
+    let mut nonphysical = base_request();
+    nonphysical.requested_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(42);
+    let legacy_bytes = serde_json::to_vec(&LegacyPayload {
+        schema_version: "splendor.gateway.authority_action_binding.v1",
+        action_id: &nonphysical.action_id,
+        tenant_id: &nonphysical.tenant_id,
+        agent_id: &nonphysical.agent_id,
+        run_id: &nonphysical.run_id,
+        action: &nonphysical.action,
+        effective_adapter: Some("test"),
+        quota_usage: nonphysical.quota_usage,
+        satisfied_preconditions: &nonphysical.satisfied_preconditions,
+        requested_at: nonphysical.requested_at,
+    })
+    .expect("legacy payload");
+    assert_eq!(
+        canonical_gateway_authority_action_digest(&nonphysical, Some("test"))
+            .expect("nonphysical digest"),
+        ContentHash::blake3(legacy_bytes).to_string(),
+        "nonphysical digest bytes must remain the exact v1 payload"
+    );
+
+    let mut physical = physical_request();
+    physical.requested_at = nonphysical.requested_at;
+    let node_a = NodeId::new();
+    physical.physical_action_resource_coordinate =
+        Some(splendor_types::PhysicalActionResourceCoordinate::physical_node(node_a));
+    let digest_a = canonical_gateway_authority_action_digest(&physical, Some("test"))
+        .expect("physical v2 digest");
+    physical.physical_action_resource_coordinate =
+        Some(splendor_types::PhysicalActionResourceCoordinate::physical_node(NodeId::new()));
+    let digest_b = canonical_gateway_authority_action_digest(&physical, Some("test"))
+        .expect("second physical v2 digest");
+    assert_ne!(
+        digest_a, digest_b,
+        "physical digest must bind the exact node"
+    );
+
+    physical.physical_action_resource_coordinate = None;
+    let physical_v1_bytes = serde_json::to_vec(&LegacyPayload {
+        schema_version: "splendor.gateway.authority_action_binding.v1",
+        action_id: &physical.action_id,
+        tenant_id: &physical.tenant_id,
+        agent_id: &physical.agent_id,
+        run_id: &physical.run_id,
+        action: &physical.action,
+        effective_adapter: Some("test"),
+        quota_usage: physical.quota_usage,
+        satisfied_preconditions: &physical.satisfied_preconditions,
+        requested_at: physical.requested_at,
+    })
+    .expect("physical-v1 payload");
+    assert_eq!(
+        canonical_gateway_authority_action_v1_compat_digest(&physical, Some("test"))
+            .expect("frozen physical-v1 migration digest"),
+        ContentHash::blake3(physical_v1_bytes).to_string()
+    );
+    assert_eq!(
+        canonical_gateway_authority_action_digest(&physical, Some("test"))
+            .expect_err("physical action without trusted target fails closed"),
+        "physical_action_resource_coordinate_required"
+    );
+    nonphysical.physical_action_resource_coordinate =
+        Some(splendor_types::PhysicalActionResourceCoordinate::physical_node(NodeId::new()));
+    assert_eq!(
+        canonical_gateway_authority_action_digest(&nonphysical, Some("test"))
+            .expect_err("nonphysical action cannot smuggle physical target metadata"),
+        "physical_action_resource_coordinate_unexpected"
+    );
+}
+
+#[test]
+fn physical_resource_coordinates_are_enforced_before_adapter_execution() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("move_to_waypoint", "robot", adapter.clone());
+    gateway.register_adapter("noop", "robot", adapter.clone());
+
+    let mut missing_target = physical_request();
+    missing_target.adapter = Some("robot".to_string());
+    missing_target.physical_action_resource_coordinate = None;
+    let denied = gateway
+        .submit(missing_target)
+        .expect("physical target denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert!(denied
+        .verification
+        .reasons
+        .contains(&"physical_action_resource_coordinate_required".to_string()));
+
+    let mut smuggled_target = base_request();
+    smuggled_target.adapter = Some("robot".to_string());
+    smuggled_target.physical_action_resource_coordinate =
+        Some(splendor_types::PhysicalActionResourceCoordinate::physical_node(NodeId::new()));
+    let denied = gateway
+        .submit(smuggled_target)
+        .expect("nonphysical target denial");
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert!(denied
+        .verification
+        .reasons
+        .contains(&"physical_action_resource_coordinate_unexpected".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
 }
 
 fn safe_safety_snapshot() -> SimulatedSafetySnapshot {
@@ -637,6 +817,22 @@ fn authority_evidence_for(
     )
 }
 
+#[test]
+fn verifier_without_one_use_claim_support_fails_closed() {
+    let now = OffsetDateTime::now_utc();
+    let request = base_request();
+    let (_, _, evidence) = authority_evidence_for(&request, "adapter", now);
+
+    let result = NoAuthorityObligationVerifier.claim_verified_receipts(&evidence.receipts, now);
+    let AuthorityObligationVerification::NeedsIntervention(result) = result else {
+        panic!("default receipt claim must require authority-owned replay state");
+    };
+    assert!(!result.allowed);
+    assert!(result
+        .reasons
+        .contains(&"authority_obligation_receipt_replay_state_unavailable".to_string()));
+}
+
 fn complete_live_conditional_fixture(
     mut request: ActionRequest,
     now: OffsetDateTime,
@@ -675,6 +871,26 @@ fn complete_live_conditional_fixture(
         context,
         vec![action_decision, adapter_decision, permission_decision],
     )
+}
+
+fn reissued_receipt_request(
+    request: &ActionRequest,
+    decisions: &[AuthorityDecision],
+    issuer: &PrincipalId,
+    context: &AuthorityObligationReceiptValidationContext,
+    now: OffsetDateTime,
+) -> ActionRequest {
+    let mut reissued = request.clone();
+    reissued.authority_obligation_receipts = decisions
+        .iter()
+        .map(|decision| {
+            issue_obligation_receipt(
+                unsigned_obligation_receipt(decision, issuer.clone(), now),
+                context,
+            )
+        })
+        .collect();
+    reissued
 }
 
 fn hostile_authority_values() -> Vec<String> {
@@ -896,6 +1112,65 @@ struct DelayingClaimRecorder {
 
 struct FailingAuthorityRecorder;
 
+struct TrustedInternalApprovalVerifier;
+
+impl ApprovalVerifier for TrustedInternalApprovalVerifier {
+    fn verify_approval(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> ApprovalVerification {
+        ApprovalVerification::Granted(VerificationResult {
+            allowed: true,
+            reasons: Vec::new(),
+            artifacts: serde_json::json!({"source": "trusted_internal_approval_test"}),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NonClaimingVerifierResult {
+    AllowedWithoutPermit,
+    NotRequired,
+    Denied,
+    Unavailable,
+}
+
+struct NonClaimingAuthorityObligationVerifier(NonClaimingVerifierResult);
+
+impl AuthorityObligationVerifier for NonClaimingAuthorityObligationVerifier {
+    fn verify_obligations(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> AuthorityObligationVerification {
+        AuthorityObligationVerification::Allowed(VerificationResult::allow())
+    }
+
+    fn claim_verified_receipts(
+        &self,
+        _receipts: &[AuthorityObligationReceipt],
+        _now: OffsetDateTime,
+    ) -> AuthorityObligationVerification {
+        match self.0 {
+            NonClaimingVerifierResult::AllowedWithoutPermit => {
+                AuthorityObligationVerification::Allowed(VerificationResult::allow())
+            }
+            NonClaimingVerifierResult::NotRequired => AuthorityObligationVerification::NotRequired,
+            NonClaimingVerifierResult::Denied => AuthorityObligationVerification::Denied(
+                VerificationResult::deny("authority_receipt_claim_denied"),
+            ),
+            NonClaimingVerifierResult::Unavailable => {
+                AuthorityObligationVerification::NeedsIntervention(VerificationResult::deny(
+                    "authority_receipt_claim_unavailable",
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UnavailableReceiptLedger;
 
@@ -1072,6 +1347,123 @@ fn live_conditional_authority_uses_only_raw_receipts_and_records_before_effect()
         .reasons
         .contains(&"authority_decision_request_mismatch".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+}
+
+#[test]
+fn non_claiming_obligation_verifiers_never_reach_adapter_effects() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (_, _, evidence) = authority_evidence_for(&request, "adapter", now);
+    request.authority_obligation_evidence = Some(evidence);
+
+    for (mode, expected_status, expected_reason) in [
+        (
+            NonClaimingVerifierResult::AllowedWithoutPermit,
+            ActionStatus::NeedsIntervention,
+            "authority_obligation_effect_permit_unavailable",
+        ),
+        (
+            NonClaimingVerifierResult::NotRequired,
+            ActionStatus::NeedsIntervention,
+            "authority_obligation_verifier_did_not_consume_receipts",
+        ),
+        (
+            NonClaimingVerifierResult::Denied,
+            ActionStatus::Denied,
+            "authority_receipt_claim_denied",
+        ),
+        (
+            NonClaimingVerifierResult::Unavailable,
+            ActionStatus::NeedsIntervention,
+            "authority_receipt_claim_unavailable",
+        ),
+    ] {
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway_with_verifier(
+            Arc::new(NonClaimingAuthorityObligationVerifier(mode)),
+            adapter.clone(),
+        );
+
+        let outcome = gateway
+            .submit(request.clone())
+            .expect("fail-closed claim outcome");
+
+        assert_eq!(outcome.status, expected_status);
+        assert!(outcome
+            .verification
+            .reasons
+            .contains(&expected_reason.to_string()));
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+    }
+}
+
+#[test]
+fn final_authority_downgrades_fail_closed_with_or_without_a_mislabeled_permit() {
+    let now = OffsetDateTime::now_utc();
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let mut action_decision = authority_decision_for(&request, "adapter", PrincipalId::new(), now);
+    action_decision.status = AuthorityDecisionStatus::Allowed;
+    action_decision.reasons = vec!["capability_allowed".to_string()];
+    action_decision.obligations.clear();
+    let mut adapter_decision = action_decision.clone();
+    adapter_decision.decision_id = AuthorityDecisionId::new();
+    adapter_decision.request.operation = gateway_adapter_operation("adapter");
+    let early = vec![action_decision, adapter_decision];
+
+    for (final_status, expected_outcome) in [
+        (AuthorityDecisionStatus::Denied, ActionStatus::Denied),
+        (
+            AuthorityDecisionStatus::NeedsApproval,
+            ActionStatus::NeedsApproval,
+        ),
+        (
+            AuthorityDecisionStatus::NeedsIntervention,
+            ActionStatus::NeedsIntervention,
+        ),
+    ] {
+        let mut downgraded = early.clone();
+        for decision in &mut downgraded {
+            decision.status = final_status;
+            decision.reasons = vec![match final_status {
+                AuthorityDecisionStatus::Denied => "capability_denied",
+                AuthorityDecisionStatus::NeedsApproval => "approval_required",
+                AuthorityDecisionStatus::NeedsIntervention => "verifier_unavailable",
+                _ => unreachable!("test covers only fail-closed final states"),
+            }
+            .to_string()];
+        }
+
+        for (final_evaluation, expected_final_outcome) in [
+            (
+                ScriptedFinalAuthority::Denied(downgraded.clone()),
+                expected_outcome,
+            ),
+            (
+                ScriptedFinalAuthority::Permitted(downgraded.clone()),
+                ActionStatus::NeedsIntervention,
+            ),
+        ] {
+            let adapter = Arc::new(CountingAdapter::default());
+            let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+                policy: VerificationResult::allow(),
+                quota: VerificationResult::allow(),
+            }));
+            gateway.register_adapter("noop", "adapter", adapter.clone());
+            gateway.set_action_authority_evaluator(Arc::new(ScriptedAuthorityEvaluator {
+                early: Some(early.clone()),
+                final_evaluation,
+            }));
+
+            let outcome = gateway
+                .submit(request.clone())
+                .expect("final authority downgrade outcome");
+
+            assert_eq!(outcome.status, expected_final_outcome);
+            assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+        }
+    }
 }
 
 #[test]
@@ -1252,7 +1644,7 @@ fn claimed_receipt_permit_survives_expiry_during_durable_recording() {
 #[test]
 fn trace_failure_burns_receipts_and_shared_ledger_survives_verifier_recreation() {
     let now = OffsetDateTime::now_utc();
-    let (request, _issuer, context, decisions) =
+    let (request, issuer, context, decisions) =
         complete_live_conditional_fixture(base_request(), now);
     let ledger = Arc::new(InMemoryAuthorityObligationReceiptLedger::default());
     let adapter = Arc::new(CountingAdapter::default());
@@ -1274,6 +1666,7 @@ fn trace_failure_burns_receipts_and_shared_ledger_survives_verifier_recreation()
         .contains(&"authority_evidence_append_failed".to_string()));
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
 
+    let reissued = reissued_receipt_request(&request, &decisions, &issuer, &context, now);
     let mut recreated = authority_gateway_with_ledger(context, ledger, adapter.clone());
     recreated.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
         decisions,
@@ -1284,8 +1677,8 @@ fn trace_failure_burns_receipts_and_shared_ledger_survives_verifier_recreation()
         adapter: adapter.clone(),
     }));
     let replayed = recreated
-        .submit(request)
-        .expect("shared-ledger replay denial");
+        .submit(reissued)
+        .expect("shared-ledger semantic replay denial");
     assert_eq!(replayed.status, ActionStatus::Denied);
     assert!(replayed
         .verification
@@ -1361,6 +1754,89 @@ fn concurrent_submissions_with_the_same_receipts_execute_at_most_once() {
         executions
     );
     assert_eq!(records.load(Ordering::SeqCst), executions);
+}
+
+#[test]
+fn freshly_reissued_receipts_for_the_same_semantic_claim_execute_at_most_once() {
+    let now = OffsetDateTime::now_utc();
+    let (request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = authority_gateway(context.clone(), adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: decisions.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::new(AtomicUsize::new(0)),
+        adapter: adapter.clone(),
+    }));
+
+    let first = gateway
+        .submit(request.clone())
+        .expect("first receipt outcome");
+    assert_eq!(first.status, ActionStatus::Executed);
+    let reissued = reissued_receipt_request(&request, &decisions, &issuer, &context, now);
+    assert_ne!(
+        request.authority_obligation_receipts[0].receipt_id,
+        reissued.authority_obligation_receipts[0].receipt_id
+    );
+
+    let replayed = gateway
+        .submit(reissued)
+        .expect("reissued semantic receipt denial");
+    assert_eq!(replayed.status, ActionStatus::Denied);
+    assert!(replayed
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+}
+
+#[test]
+fn concurrent_fresh_reissues_for_one_semantic_claim_execute_at_most_once() {
+    let now = OffsetDateTime::now_utc();
+    let (request, issuer, context, decisions) =
+        complete_live_conditional_fixture(base_request(), now);
+    let adapter = Arc::new(CountingAdapter::default());
+    let records = Arc::new(AtomicUsize::new(0));
+    let mut gateway = authority_gateway(context.clone(), adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: decisions.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::clone(&records),
+        adapter: adapter.clone(),
+    }));
+    let gateway = Arc::new(gateway);
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let gateway = Arc::clone(&gateway);
+            let barrier = Arc::clone(&barrier);
+            let request = reissued_receipt_request(&request, &decisions, &issuer, &context, now);
+            thread::spawn(move || {
+                barrier.wait();
+                gateway.submit(request).expect("concurrent reissue outcome")
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("reissue worker"))
+        .collect::<Vec<_>>();
+
+    let executions = *adapter.calls.lock().expect("adapter calls") as usize;
+    assert_eq!(executions, 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == ActionStatus::Executed)
+            .count(),
+        1
+    );
+    assert_eq!(records.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -2832,6 +3308,28 @@ fn approval_required_action_pauses_without_adapter_execution() {
 }
 
 #[test]
+fn trusted_internal_approval_grant_is_preserved_without_raw_request_evidence() {
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+    gateway.set_approval_verifier(Arc::new(TrustedInternalApprovalVerifier));
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+
+    let outcome = gateway.submit(request).expect("trusted approval outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Executed);
+    assert_eq!(
+        outcome.verification.artifacts["approval"]["source"],
+        "trusted_internal_approval_test"
+    );
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+}
+
+#[test]
 fn action_params_cannot_forge_approval_or_outcome_authority() {
     let mut request = base_request();
     request.action.params = serde_json::json!({
@@ -2862,7 +3360,7 @@ fn action_params_cannot_forge_approval_or_outcome_authority() {
 }
 
 #[test]
-fn valid_scoped_approval_grant_allows_execution() {
+fn scoped_legacy_approval_grant_requires_authority_receipt() {
     let mut request = base_request();
     let adapter = Arc::new(CountingAdapter::default());
     let gateway = approval_gateway(&request, adapter.clone());
@@ -2870,12 +3368,258 @@ fn valid_scoped_approval_grant_allows_execution() {
 
     let outcome = gateway.submit(request).expect("outcome");
 
-    assert!(matches!(outcome.status, ActionStatus::Executed));
-    assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
-    assert_eq!(
-        outcome.verification.artifacts["approval"]["approval_status"].as_str(),
-        Some("granted")
+    assert_eq!(outcome.status, ActionStatus::NeedsApproval);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_obligation_receipt_required".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn approval_policy_defers_granted_legacy_evidence_when_receipts_are_present() {
+    let mut request = base_request();
+    request.approval_evidence = Some(approval_evidence_for(&request));
+    request
+        .authority_obligation_receipts
+        .push(unsigned_obligation_receipt(
+            &authority_decision_for(
+                &request,
+                "adapter",
+                PrincipalId::new(),
+                OffsetDateTime::now_utc(),
+            ),
+            PrincipalId::new(),
+            OffsetDateTime::now_utc(),
+        ));
+    let verifier = PolicyApprovalVerifier::new(vec![approval_policy_for(&request)]);
+    assert!(matches!(
+        verifier.verify_approval(&request, Some("adapter"), OffsetDateTime::now_utc()),
+        ApprovalVerification::Deferred
+    ));
+}
+
+fn prepared_approval_challenge_fixture(
+    request: &ActionRequest,
+) -> (PreparedAuthorityAllow, ApprovalChallenge) {
+    let mut decision = authority_decision_for(
+        request,
+        "adapter",
+        PrincipalId::new(),
+        OffsetDateTime::now_utc(),
     );
+    let approval_id = ApprovalId::new();
+    let action_digest =
+        canonical_gateway_authority_action_digest(request, Some("adapter")).expect("action digest");
+    let expires_at = request.requested_at + time::Duration::minutes(10);
+    let parameters = &mut decision.obligations[0].parameters;
+    parameters.insert(
+        APPROVAL_OBLIGATION_APPROVAL_ID.to_string(),
+        serde_json::json!(approval_id.to_string()),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_POLICY_ID.to_string(),
+        serde_json::json!("approval-policy-unit"),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_RECEIPT_AUDIENCE.to_string(),
+        serde_json::json!(OBLIGATION_RECEIPT_AUDIENCE),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_EXPIRES_AT.to_string(),
+        serde_json::json!(expires_at.format(&Rfc3339).expect("expiry")),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_ACTION_ID.to_string(),
+        serde_json::json!(request.action_id.to_string()),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_ACTION_NAME.to_string(),
+        serde_json::json!(request.action.name),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_ADAPTER.to_string(),
+        serde_json::json!("adapter"),
+    );
+    parameters.insert(
+        APPROVAL_OBLIGATION_ACTION_DIGEST.to_string(),
+        serde_json::json!(action_digest),
+    );
+    bind_gateway_authority_decision_digest(&mut decision);
+    let prepared = PreparedAuthorityAllow {
+        verification: VerificationResult::allow(),
+        decisions: vec![decision.clone()],
+        conditional_decisions: vec![decision],
+    };
+    let challenge = approval_challenge_from_prepared(&prepared, request, Some("adapter"))
+        .expect("challenge conversion")
+        .expect("approval challenge");
+    (prepared, challenge)
+}
+
+#[test]
+fn approval_challenge_conversion_rejects_ambiguous_malformed_and_rebound_inputs() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (prepared, challenge) = prepared_approval_challenge_fixture(&request);
+
+    let mut ambiguous = prepared_approval_challenge_fixture(&request).0;
+    ambiguous
+        .conditional_decisions
+        .push(ambiguous.conditional_decisions[0].clone());
+    assert_eq!(
+        approval_challenge_from_prepared(&ambiguous, &request, Some("adapter")),
+        Err("approval_challenge_ambiguous".to_string())
+    );
+
+    let mut invalid_decision = prepared_approval_challenge_fixture(&request).0;
+    invalid_decision.conditional_decisions[0].status = AuthorityDecisionStatus::Allowed;
+    assert_eq!(
+        approval_challenge_from_prepared(&invalid_decision, &request, Some("adapter")),
+        Err("approval_challenge_decision_invalid".to_string())
+    );
+
+    let mut invalid_parameters = prepared_approval_challenge_fixture(&request).0;
+    invalid_parameters.conditional_decisions[0].obligations[0]
+        .parameters
+        .insert("unexpected".to_string(), serde_json::json!(true));
+    assert_eq!(
+        approval_challenge_from_prepared(&invalid_parameters, &request, Some("adapter")),
+        Err("approval_challenge_parameters_invalid".to_string())
+    );
+
+    for (key, value, expected) in [
+        (
+            APPROVAL_OBLIGATION_APPROVAL_ID,
+            "not-an-id",
+            "approval_challenge_approval_id_invalid",
+        ),
+        (
+            APPROVAL_OBLIGATION_ACTION_ID,
+            "not-an-id",
+            "approval_challenge_action_id_invalid",
+        ),
+    ] {
+        let mut malformed = prepared_approval_challenge_fixture(&request).0;
+        malformed.conditional_decisions[0].obligations[0]
+            .parameters
+            .insert(key.to_string(), serde_json::json!(value));
+        assert_eq!(
+            approval_challenge_from_prepared(&malformed, &request, Some("adapter")),
+            Err(expected.to_string())
+        );
+    }
+
+    let mut rebound = prepared_approval_challenge_fixture(&request).0;
+    rebound.conditional_decisions[0].obligations[0]
+        .parameters
+        .insert(
+            APPROVAL_OBLIGATION_ACTION_NAME.to_string(),
+            serde_json::json!("different"),
+        );
+    assert_eq!(
+        approval_challenge_from_prepared(&rebound, &request, Some("adapter")),
+        Err("approval_challenge_binding_mismatch".to_string())
+    );
+
+    let mut approval_result = VerificationResult::allow();
+    approval_result.artifacts = serde_json::json!({
+        "policy_id": "different-policy",
+        "approval": {
+            "approval_id": challenge.approval_id,
+            "tenant_id": request.tenant_id,
+            "agent_id": request.agent_id,
+            "run_id": request.run_id,
+            "action_id": request.action_id,
+            "action_name": request.action.name,
+            "adapter": "adapter",
+            "decision": null,
+            "reason": null,
+            "policy_id": "different-policy",
+            "risk_level": null,
+            "issued_at": null,
+            "expires_at": null,
+            "revoked": false
+        }
+    });
+    assert_eq!(
+        bind_approval_result_to_challenge(&mut approval_result, &challenge),
+        Err("approval_challenge_policy_mismatch".to_string())
+    );
+
+    assert!(prepared.verification.allowed);
+    assert_eq!(prepared.decisions.len(), 1);
+}
+
+#[test]
+fn malformed_authority_approval_challenge_fails_closed_in_gateway_flow() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    let (prepared, _) = prepared_approval_challenge_fixture(&request);
+    let mut action_decision = prepared.conditional_decisions[0].clone();
+    action_decision.obligations[0].parameters.insert(
+        APPROVAL_OBLIGATION_APPROVAL_ID.to_string(),
+        serde_json::json!("not-an-approval-id"),
+    );
+    let mut adapter_decision = action_decision.clone();
+    adapter_decision.decision_id = AuthorityDecisionId::new();
+    adapter_decision.request.operation = gateway_adapter_operation("adapter");
+    adapter_decision.status = AuthorityDecisionStatus::Allowed;
+    adapter_decision.obligations.clear();
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = approval_gateway(&request, adapter.clone());
+    gateway.set_action_authority_evaluator(Arc::new(ScriptedAuthorityEvaluator {
+        early: Some(vec![action_decision, adapter_decision]),
+        final_evaluation: ScriptedFinalAuthority::NotRequired,
+    }));
+
+    let outcome = gateway
+        .submit(request)
+        .expect("malformed approval challenge outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsIntervention);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_challenge_approval_id_invalid".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[derive(Clone, Debug)]
+struct UnsafeLegacyGrantApprovalVerifier;
+
+impl ApprovalVerifier for UnsafeLegacyGrantApprovalVerifier {
+    fn verify_approval(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+        _now: OffsetDateTime,
+    ) -> ApprovalVerification {
+        ApprovalVerification::Granted(VerificationResult::allow())
+    }
+}
+
+#[test]
+fn gateway_never_accepts_raw_legacy_grant_even_from_custom_approval_verifier() {
+    let mut request = base_request();
+    request.approval_evidence = Some(approval_evidence_for(&request));
+    let tenant_access = Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    });
+    let mut gateway = VerifiedActionGateway::new(tenant_access);
+    let adapter = Arc::new(CountingAdapter::default());
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+    gateway.set_approval_verifier(Arc::new(UnsafeLegacyGrantApprovalVerifier));
+
+    let outcome = gateway.submit(request).expect("outcome");
+
+    assert_eq!(outcome.status, ActionStatus::NeedsApproval);
+    assert!(outcome
+        .verification
+        .reasons
+        .contains(&"approval_obligation_receipt_required".to_string()));
+    assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
 }
 
 #[test]

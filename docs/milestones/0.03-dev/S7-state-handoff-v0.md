@@ -43,9 +43,10 @@ continuity portion of FR-0.03-10.
   `commit_from_read_only_reference`.
 - Daemon API: import now requires `work_order`; export accepts explicit receiver
   `previous_state_node_id`. This corrects the prior incomplete public request
-  shape. Successful import is restricted to explicit loopback `local_dev`;
-  resident mode returns `503 state_handoff_proof_unavailable` with
-  `needs_intervention` before mutation.
+   shape. Successful import is restricted to explicit loopback `local_dev`;
+   resident mode returns `503 state_handoff_proof_unavailable` with
+   `needs_intervention` before mutation, normalizes valid unknown-run requests to
+   the same response, and records a bounded redacted resident security audit fact.
 - Trace event variants: `StateHandoffExported`, `StateHandoffImported`,
   `StateHandoffImportFailed`, and `ReadOnlyStateReferenced`.
 - `splendorctl replay` emits `handoff_boundary` records.

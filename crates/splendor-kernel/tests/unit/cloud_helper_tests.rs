@@ -133,6 +133,11 @@ fn accepted_helper_plan_still_executes_only_through_local_gateway() {
             quota_usage: QuotaUsage::single_action(),
             satisfied_preconditions: vec!["cloud_helper.local_plan_validated".to_string()],
             requested_at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(30),
+            physical_action_resource_coordinate: Some(
+                splendor_types::PhysicalActionResourceCoordinate::physical_node(
+                    splendor_types::NodeId::new(),
+                ),
+            ),
             approval_evidence: None,
             authority_obligation_evidence: None,
             authority_obligation_receipts: Vec::new(),

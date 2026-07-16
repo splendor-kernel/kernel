@@ -5874,6 +5874,241 @@ fn run_from_config_trace_failure_injection_records_runtime_evidence_and_blocks_s
 }
 
 #[test]
+fn trace_failure_side_effect_evidence_is_tick_scoped_and_requires_action_executed() {
+    let store = splendor_store::InMemoryTraceStore::default();
+    let run_id = fixed_run_id(0x7101);
+    let action = Action {
+        name: "write_file".to_string(),
+        params: serde_json::json!({"path": "executed.txt"}),
+        side_effect_class: SideEffectClass::Filesystem,
+        cost_estimate: None,
+        required_permissions: vec!["fs.write".to_string()],
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    };
+    let prior_tick_event = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tick_id(TickId::from(1))
+            .with_action_id(fixed_action_id(0x7102)),
+        0,
+        OffsetDateTime::now_utc(),
+        TraceEventKind::ActionExecuted {
+            action: action.clone(),
+            outcome: serde_json::json!({"bytes_written": 1}),
+        },
+    )
+    .expect("prior tick execution event");
+    TraceStore::append(
+        &store,
+        &run_id.to_string(),
+        serde_json::to_value(prior_tick_event).expect("prior tick execution payload"),
+    )
+    .expect("persist prior tick execution");
+
+    let failed_action_event = TraceEvent::try_new_with_identity(
+        TraceIdentityContext::new(run_id.clone())
+            .with_tick_id(TickId::from(2))
+            .with_action_id(fixed_action_id(0x7103)),
+        1,
+        OffsetDateTime::now_utc(),
+        TraceEventKind::ActionFailed {
+            action: action.clone(),
+            error: "adapter failed before execution was established".to_string(),
+            result: VerificationResult::deny("adapter_failed"),
+        },
+    )
+    .expect("current tick action failure event");
+    TraceStore::append(
+        &store,
+        &run_id.to_string(),
+        serde_json::to_value(failed_action_event).expect("current tick action failure payload"),
+    )
+    .expect("persist current tick action failure");
+
+    let failed_payload = serde_json::to_value(
+        TraceEvent::try_new_with_identity(
+            TraceIdentityContext::new(run_id.clone()).with_tick_id(TickId::from(2)),
+            2,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::OutcomeRecorded {
+                outcome: serde_json::json!({"tick_id": 2, "status": "failed"}),
+                feedback: None,
+                reward: None,
+            },
+        )
+        .expect("current tick outcome event"),
+    )
+    .expect("current tick outcome payload");
+
+    assert!(!side_effect_executed_before_trace_failure(
+        &store,
+        &run_id.to_string(),
+        &failed_payload,
+    )
+    .expect("tick-scoped execution evidence"));
+
+    let current_execution_payload = serde_json::to_value(
+        TraceEvent::try_new_with_identity(
+            TraceIdentityContext::new(run_id.clone())
+                .with_tick_id(TickId::from(2))
+                .with_action_id(fixed_action_id(0x7103)),
+            2,
+            OffsetDateTime::now_utc(),
+            TraceEventKind::ActionExecuted {
+                action,
+                outcome: serde_json::json!({"bytes_written": 1}),
+            },
+        )
+        .expect("current failing execution event"),
+    )
+    .expect("current failing execution payload");
+    assert!(side_effect_executed_before_trace_failure(
+        &store,
+        &run_id.to_string(),
+        &current_execution_payload,
+    )
+    .expect("current failing event evidence"));
+}
+
+#[test]
+fn run_from_config_outcome_trace_failure_records_executed_effect_and_stops_run() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let fs_base = dir.path().join("fs");
+    let tenant_uuid = Uuid::new_v4();
+    let agent_uuid = Uuid::new_v4();
+    let run_uuid = Uuid::new_v4();
+    let run_id: RunId = run_uuid.into();
+    let work_order = signed_work_order_block(
+        tenant_uuid.into(),
+        agent_uuid.into(),
+        run_id.clone(),
+        vec!["write_file".to_string()],
+    );
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nfailure_injection:\n  trace_fail_on_event: OutcomeRecorded\ntenants:\n  - id: {}\n    allowed_actions: [\"write_file\"]\n    allowed_adapters: [\"filesystem\"]\n    allowed_permissions: [\"fs.write\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    allowed_permissions: [\"fs.write\"]\n    policy:\n      type: static\n      next_state: must-not-commit\n      actions:\n        - name: write_file\n          adapter: filesystem\n          side_effect_class: filesystem\n          required_permissions: [\"fs.write\"]\n          params:\n            path: \"executed.txt\"\n            contents: \"executed-once\"\nadapters:\n  filesystem:\n    base_dir: {}\n{}",
+        trace_path.display(),
+        state_path.display(),
+        run_uuid,
+        tenant_uuid,
+        agent_uuid,
+        tenant_uuid,
+        run_uuid,
+        fs_base.display(),
+        work_order,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+
+    let error = run_from_config(&config_path, Some(2), false)
+        .expect_err("post-effect trace failure must fail the tick");
+    assert!(error.contains("injected_trace_write_failure:OutcomeRecorded"));
+
+    let effect_path = fs_base.join(tenant_uuid.to_string()).join("executed.txt");
+    assert_eq!(
+        std::fs::read_to_string(effect_path).expect("executed filesystem effect"),
+        "executed-once"
+    );
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| {
+                trace_payload_kind(&record.payload).as_deref() == Some("ActionExecuted")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| {
+                trace_payload_kind(&record.payload).as_deref() == Some("LoopTickStarted")
+            })
+            .count(),
+        1
+    );
+    let evidence = records
+        .iter()
+        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
+        .expect("trace-write failure evidence");
+    assert_eq!(
+        evidence.payload["kind"]["TraceWriteFailed"]["failed_event"],
+        "OutcomeRecorded"
+    );
+    assert_eq!(
+        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
+        serde_json::json!(true)
+    );
+    for forbidden_event in ["OutcomeRecorded", "StateCommitted", "LoopTickCompleted"] {
+        assert!(records.iter().all(|record| {
+            trace_payload_kind(&record.payload).as_deref() != Some(forbidden_event)
+        }));
+    }
+}
+
+#[test]
+fn run_from_config_read_only_outcome_trace_failure_does_not_report_side_effect() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let trace_path = dir.path().join("trace.db");
+    let state_path = dir.path().join("state.db");
+    let config_path = dir.path().join("config.yaml");
+    let tenant_id: TenantId = Uuid::from_u128(0x7201).into();
+    let agent_id = fixed_agent_id(0x7202);
+    let run_id = fixed_run_id(0x7203);
+    let work_order = signed_work_order_block_with_authority(
+        tenant_id.clone(),
+        agent_id.clone(),
+        run_id.clone(),
+        vec!["inspect".to_string()],
+        vec!["read-only-test".to_string()],
+        Vec::new(),
+        OffsetDateTime::now_utc() + time::Duration::hours(1),
+        splendor_types::RevocationStatus::Active,
+    );
+    let config = format!(
+        "trace_db: {}\nstate_db: {}\nrun_id: {}\nfailure_injection:\n  trace_fail_on_event: OutcomeRecorded\ntenants:\n  - id: {}\n    allowed_actions: [\"inspect\"]\n    allowed_adapters: [\"read-only-test\"]\nagents:\n  - id: {}\n    tenant_id: {}\n    run_id: {}\n    policy:\n      type: static\n      actions:\n        - name: inspect\n          adapter: read-only-test\n          side_effect_class: read_only\n          params: {{}}\n{}",
+        trace_path.display(),
+        state_path.display(),
+        run_id,
+        tenant_id,
+        agent_id,
+        tenant_id,
+        run_id,
+        work_order,
+    );
+    std::fs::write(&config_path, config).expect("write config");
+    let (counter, overrides) = counting_run_overrides(&["read-only-test"], None);
+
+    let error = run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+        .expect_err("post-read trace failure must fail the tick");
+    assert!(error.contains("injected_trace_write_failure:OutcomeRecorded"));
+    assert_eq!(counter.calls_for("inspect"), 1);
+
+    let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+    let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+    let executed = records
+        .iter()
+        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("ActionExecuted"))
+        .expect("read-only action execution");
+    let executed_action: Action =
+        serde_json::from_value(executed.payload["kind"]["ActionExecuted"]["action"].clone())
+            .expect("executed read-only action");
+    assert_eq!(executed_action.side_effect_class, SideEffectClass::ReadOnly);
+    let evidence = records
+        .iter()
+        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
+        .expect("trace-write failure evidence");
+    assert_eq!(
+        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
 fn run_from_config_state_failure_injection_records_evidence_and_prevents_next_tick() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");
@@ -6410,6 +6645,7 @@ fn resource_boundary_request(params: serde_json::Value) -> splendor_gateway::Act
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),
@@ -6525,8 +6761,13 @@ fn failure_injection_trace_store_fails_once_then_delegates() {
         fail_on_event: "tick.started".to_string(),
         failed: Mutex::new(false),
     };
-    let run_id = RunId::new().to_string();
-    let payload = serde_json::json!({"kind": "tick.started", "tick_id": 1});
+    let typed_run_id = RunId::new();
+    let run_id = typed_run_id.to_string();
+    let payload = serde_json::json!({
+        "kind": "tick.started",
+        "tick_id": 1,
+        "identity": TraceIdentityContext::new(typed_run_id),
+    });
 
     assert_eq!(
         trace_payload_kind(&payload),
@@ -7383,6 +7624,7 @@ fn build_gateway_success() {
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
         authority_obligation_receipts: Vec::new(),

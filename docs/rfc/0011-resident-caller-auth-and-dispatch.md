@@ -2,13 +2,20 @@
 
 ## Status and binding
 
-**Status:** Accepted
+**Status:** Accepted base contract
+
 **Accepted:** 2026-07-13
+
+**Amendment target:** Required resident approval receipt security correction,
+specified 2026-07-15; bounded implementation evidence exists, but full target
+and gold completion remain unclaimed
+
 **Compatibility line:** additive 0.1 transport/security correction on the active
 0.2/v2 line
 
-This RFC accepts one closed resident authentication profile and one bounded
-manager-to-resident dispatch path. It is a narrow `IDR-002a` compatibility
+This RFC accepts one closed resident authentication profile, its additive
+fleet-bound manager-approval target, and one bounded manager-to-resident
+dispatch path. It is a narrow `IDR-002a` compatibility
 adapter and `FND-011`/`AUTH-007` security correction supporting the existing
 resident/fleet foundation. It does not accept the full C01 Principal Registry,
 full `IDR-002`, full `INT-003`, or any gold result. Gold remains
@@ -37,6 +44,12 @@ consume the verified JTI once before handler mutation; read-only requests may
 reuse an unexpired token. A caller bearer authenticates an app. A
 signed work order authorizes run admission. C02, verifiers, and the Action
 Gateway authorize effects.
+
+The device reconnect mutation uses the dedicated endpoint scope
+`splendor.device.trace_sync`. The read-only `splendor.device.read` scope cannot
+authorize trace ingestion. The resident validates a complete local batch from
+sequence zero, exact request/record run identity, contiguous sequence and
+previous-hash links, and recomputed event hashes before acknowledging any record.
 
 ## Closed caller-token profile
 
@@ -121,7 +134,9 @@ revision, issuance/expiry, exact issuer/app principal, maximum token TTL, allowe
 scopes, active/revoked Ed25519 public keys, and canonical revoked JTIs. Multiple
 active keys support rotation. Revision is non-zero and bounded to signed 64-bit
 interoperability, snapshot lifetime is at most 24 hours, active/revoked keys are
-limited to 64, and revoked JTIs to 100,000. Operators distribute a new public key, switch the
+limited to 64, the known allowed-scope catalog to 64, and revoked JTIs to
+100,000. Individual caller tokens remain limited to 16 unique scopes. Operators
+distribute a new public key, switch the
 manager signer, wait at least the maximum token TTL, then revoke/remove the old
 key. The current file-backed verifier loads the snapshot at process start, so an
 atomic snapshot replacement is activated by a controlled resident restart. A
@@ -155,6 +170,221 @@ Resident startup requires all of:
 `local_dev` remains visibly warned and loopback-only. Unknown modes fail.
 Resident TCP is TLS; remotely reachable plaintext resident mode is not defined.
 
+## Additive manager approval target
+
+The same parser, Ed25519 verifier, trust-snapshot schema, expiry/revocation
+checks, redaction rules, and one-use mutating-JTI ledger are reused for the four
+manager approval mutations. This is a distinct closed target profile, not a
+generic manager JWT mode:
+
+- audience is exactly `urn:splendor:manager:<manager_id>`;
+- `fleet_id` is the one required non-nil authority binding and `tenant_id` is
+  absent;
+- the projected credential is exactly `CentralManager` audience plus `Fleet`
+  binding for the configured manager fleet;
+- the token has exactly the one required endpoint scope
+  `splendor.approvals.manage`;
+- the trust snapshot includes an additive exact `expected_client_principal_id`
+  subject binding; omission remains decodable for resident compatibility but is
+  invalid for this manager target;
+- approval caller trust must not contain the manager's outbound resident-dispatch
+  signing key;
+- `Authorization: Bearer` is the only proof; the request credential and audit
+  principal/credential identity must exactly mirror the verified projection;
+- request, grant, deny, and revoke atomically consume the JTI before any
+  approval-state mutation, audit append, or receipt issuance.
+
+The acceptance manager requires the owner-only
+`SPLENDOR_MANAGER_APPROVAL_CALLER_TRUST_FILE` at startup. Missing, malformed,
+future-dated, or stale trust fails startup closed. Verification failure returns
+`401` with a bounded Bearer challenge; a verified caller with the wrong scope,
+fleet, or mirrors receives `403`. Raw bearer/JTI/key data is never written to
+manager audit or acceptance API-traffic evidence. Trust loading and replay state
+remain process-local; there is no hot reload or remote revocation propagation
+claim.
+
+## Required resident approval receipt amendment
+
+This section is a binding correction to the accepted base contract. It defines
+the required target for remediation and does not claim that the endpoint,
+versioned audiences, atomic revocation, or evidence below are implemented.
+
+### Exact resident receipt audience
+
+Secure resident approval challenges and receipts use exactly:
+
+```text
+splendor.daemon.approval_receipt.v2:instance:<InstanceId>:run:<RunId>
+```
+
+The resident derives `InstanceId` from trusted startup identity and `RunId` from
+the admitted run. The manager retains the exact audience returned in the
+resident-created challenge but cannot choose or rewrite it. Request bodies,
+credential/audit mirrors, action params, metadata, extensions, and approval
+records cannot set or override either typed coordinate.
+
+A run-only `splendor.daemon.run:<RunId>` audience remains decodable for explicit
+loopback `local_dev` compatibility only. It is non-authorizing in resident mode.
+Existing resident challenges or receipts with that v1 audience require a new
+challenge; no audience or receipt translation is allowed.
+
+### Dedicated resident revocation operation
+
+The amendment adds one resident mutation:
+
+```text
+POST /runs/{run_id}/approval-receipts/{receipt_id}/revoke
+scope: splendor.approval_receipts.revoke
+```
+
+It uses the existing closed resident token profile with an exact target-instance
+audience, tenant binding, TLS, fresh one-use mutating JTI, bounded body/response,
+redirect refusal, and exact-origin allowlist. `splendor.approvals.manage`,
+`splendor.actions.submit`, every `splendor.runs.*` lifecycle scope, and read
+scopes cannot invoke this endpoint. The manager inbound approval-revoke request
+consumes its own fresh manager-target JTI; the manager-to-resident command uses a
+second fresh JTI for the dedicated resident scope.
+
+The additive request concept is closed and versioned:
+
+```json
+{
+  "schema_version": "splendor.resident.approval_receipt_revocation.v1",
+  "authority_obligation_receipt": {
+    "...": "exact raw receipt retained at grant"
+  },
+  "reason": "<bounded audit reason>"
+}
+```
+
+The path supplies the exact run and receipt identities. Resident middleware
+supplies the authenticated target instance. No body field for node, instance,
+run, receipt audience, semantic claim, or revocation outcome is accepted. The
+raw receipt is behavior-free input; the kernel passes it through the opaque
+facade to the Authority Service for trusted validation and ledger mutation.
+
+The successful acknowledgement concept is also closed and versioned:
+
+```json
+{
+  "schema_version": "splendor.resident.approval_receipt_revocation_ack.v1",
+  "receipt_id": "<AuthorityObligationReceiptId>",
+  "approval_id": "<ApprovalId>",
+  "target_instance_id": "<InstanceId>",
+  "run_id": "<RunId>",
+  "receipt_audience": "splendor.daemon.approval_receipt.v2:instance:<InstanceId>:run:<RunId>",
+  "status": "revoked | already_revoked",
+  "effect_certainty": "known",
+  "acknowledged_at": "<server time>"
+}
+```
+
+`already_claimed` is a known non-success returned as an exact `409` response;
+the manager maps it to `too_late`. Wrong instance/run/audience, wrong receipt ID,
+malformed or expired receipt, missing ledger, stale trusted time, or unavailable
+authority validation fails closed without a successful acknowledgement.
+
+### Atomic claim/revoke and manager completion
+
+The Authority Service ledger validates the exact receipt and atomically
+linearizes revocation against the gateway's one-use claim. It permanently
+tombstones both `AuthorityObligationReceiptId` and the domain-separated semantic
+claim key for the process lifetime. Whichever operation wins writes the same
+terminal state to both coordinates:
+
+- revoke wins: `revoked`; exact or semantic duplicate revoke:
+  `already_revoked`; every later claim or semantic reissue denies;
+- claim wins: resident returns `already_claimed`; manager returns `too_late` and
+  must not change the approval record to successfully revoked;
+- lock, clock, validation, or ledger uncertainty: fail closed; neither side may
+  synthesize a winner.
+
+For a granted approval, `POST /approvals/{approval_id}/revoke` must use the exact
+raw receipt and target instance/run/origin retained with the grant. Caller input
+cannot redirect it. The manager may publish `status=revoked` only after it
+authenticates the exact resident through TLS/hostname and exact origin, receives a
+well-formed acknowledgement whose identities and v2 audience match the retained
+grant, and observes resident status `revoked` or `already_revoked`.
+
+The existing manager success object may add a
+`resident_receipt_revocation_ack` field carrying that acknowledgement. A resident
+`already_claimed` result is exposed as `approval_receipt_revocation_too_late` with
+known effect certainty. A timeout, reset, malformed/oversized response, non-2xx
+other than the exact `already_claimed` conflict, or identity mismatch after a send
+may have occurred is `approval_receipt_revocation_effect_unknown`; the manager
+approval record must not report successful revocation. Pre-send TLS, scope, or
+origin failure is known no-effect and also cannot report success. An explicit
+same-target retry uses a fresh JTI and may resolve uncertainty as
+`already_revoked`; no timeout is success and no retry may select another node or
+origin.
+
+The outcome mapping is fixed:
+
+| Resident observation | Manager outcome | Success | Effect certainty |
+| --- | --- | --- | --- |
+| `revoked` | `revoked` | yes | known revoked-before-claim |
+| `already_revoked` | `already_revoked` | yes | known revoked-before-claim |
+| `already_claimed` | `too_late` | no | known claim already won |
+| failure proven before send | `transport_failed` | no | known no revocation command delivered |
+| send may have occurred without an exact acknowledgement | `effect_unknown` | no | uncertain until an exact same-target retry resolves it |
+
+Wrong target instance, run, audience, or path receipt is rejected before
+receipt/semantic tombstone mutation. Such a rejection cannot poison the retained
+receipt at its original resident; a retry there requires a new exact-target JTI.
+
+### Physical binding and ownership
+
+The resident passes a server-derived typed physical `NodeId`/resource coordinate
+from the device path and registered profile into the kernel for physical action
+challenge construction. The physical gateway authority action digest uses the
+domain-separated physical v2 payload defined by RFC 0010. Body, metadata,
+extension, and action params cannot supply or override the node. Nonphysical
+digest bytes remain the existing v1 bytes. An outstanding physical v1 challenge
+must be re-challenged before a receipt can authorize an effect.
+
+Ownership remains one-directional:
+
+```text
+daemon TLS/auth + HTTP translation
+  -> kernel run/pending-challenge composition
+  -> authority receipt audience/digest/claim/revoke semantics
+  -> gateway effect only after successful claim
+```
+
+The daemon does not own receipt validity or a shadow tombstone set. The manager
+does not infer resident mutation from dispatch intent, local record mutation, or
+timeout.
+
+### Rollout order and bounded limitations
+
+Implementation must roll out in this order:
+
+1. Add behavior-free closed request/ack concepts, the dedicated endpoint scope,
+   exact target-instance+run audience v2, and physical resource-coordinate digest
+   contract without enabling manager success.
+2. Add the Authority Service atomic receipt+semantic claim/revocation ledger and
+   expose it only through the kernel facade.
+3. Add kernel pending-challenge admission so raw grants and all active-run raw
+   evidence reject before gateway, runtime trace, and lifecycle mutation; retain
+   only the exact waiting-run denial/expiry/revocation exception.
+4. Add the authenticated resident revocation endpoint and physical server-derived
+   binding, then reject secure resident v1 audiences and require physical v1
+   re-challenge.
+5. Add manager exact-target transport and only then permit post-grant manager
+   revocation to report resident-acknowledged success.
+6. Update OpenAPI/generated clients and run the contract, race, wrong-target,
+   uncertainty, raw-evidence, JTI, physical binding, and E2E criteria before any
+   implementation or completion claim.
+
+The ledger, approval records, trust snapshots, and JTI replay sets in this slice
+remain process-local and non-restart-durable. Restart invalidates outstanding
+process-local challenges and receipts and requires re-challenge; this contract
+does not provide a durable revocation watch or introspection service. It adds no
+production PKI, resident enrollment, durable receipt store, broad manager TLS or
+inbound authentication, or authentication for unrelated manager endpoints. The
+accepted one-use JTI, TLS/hostname, exact-origin, redaction, signed-work-order,
+C02, gateway, and local-safety requirements remain unchanged.
+
 ## Manager dispatch contract
 
 The manager validates the resident TLS chain and hostname, can add an explicit
@@ -176,8 +406,22 @@ Dispatch rules:
   `on_prem`, or `device` classes. Region-like or unknown strings are rejected;
   they are never ignored or reinterpreted as region semantics.
 - The accepted work-order ID is immutable: matching signed bytes are idempotent,
-  while any same-ID payload or envelope replacement is rejected. Placement is
-  bound to that accepted payload and one immutable decision digest.
+  while any same-ID payload or envelope replacement is rejected. An optional
+  manager-admitted approval-policy set is also immutable and independently
+  digest-bound to the accepted record; a same-ID policy replacement is rejected.
+  Placement is bound to that accepted payload and one immutable decision digest.
+- `SubmitWorkOrderRequest.approval_policies` is an additive, default-empty
+  acceptance-manager field, not a `WorkOrder` v1 signed field. Admission accepts
+  at most 64 closed `splendor.approval_policy.v1` objects and requires exact
+  tenant scope, absent-or-exact agent scope, action/adapter/permission references
+  contained by the signed allowlists, future expiry no later than work-order
+  expiry, unique bounded policy IDs, and bounded control-free reason/risk text.
+  A policy may only narrow execution by requiring approval. It cannot authorize
+  an action or widen signed authority.
+- Dispatch has no policy override. The manager loads and integrity-checks the
+  accepted work order plus its exact policy digest, sends that policy set in the
+  resident `CreateRunRequest`, and keeps `policy_actions` empty. The resident
+  still performs normal work-order, C02, verifier, gateway, and adapter checks.
 - Dispatch binds the accepted work-order digest and placement digest to the
   selected node, one exact instance, resident URL, and origin. The instance must
   be resident, healthy with a fresh heartbeat, host the signed tenant, match the
@@ -225,7 +469,8 @@ Dispatch rules:
 ## Compatibility and migration
 
 This is additive at the HTTP shape level: `Authorization: Bearer` becomes
-mandatory for resident/non-dev daemon requests. Existing credential and audit
+mandatory for resident/non-dev daemon requests and for manager approval
+request/grant/deny/revoke. Existing credential and audit
 objects remain in compatibility schemas but are non-authoritative mirrors.
 Resident requests may omit them because middleware supplies verified internal
 projection; explicit local-dev calls still follow the existing audit contract. A
@@ -238,9 +483,29 @@ credentials, query, and fragment. Bearer transport requires HTTPS, except exact
 It sets Fetch `redirect: "error"` on every credentialed request and never falls
 back to plaintext remote transport or anonymous requests.
 
-Work-order v1 and gateway schemas are unchanged. A future work-order v2 may sign
-exact action/adapter/permission tuples; this RFC does not infer those tuples from
-unsigned metadata.
+Work-order v1 and gateway schemas are unchanged. The manager
+`SubmitWorkOrderRequest` has the additive default-empty `approval_policies`
+field described above; it is not signed work-order authority. A future work-order
+v2 may sign exact action/adapter/permission tuples; this RFC does not infer those
+tuples from unsigned metadata.
+
+The remediation is additive at the endpoint/type level but fail-closed at the
+resident authorization boundary. It adds
+`splendor.resident.approval_receipt_revocation.v1`,
+`splendor.resident.approval_receipt_revocation_ack.v1`, the dedicated
+`splendor.approval_receipts.revoke` scope, and the resident revoke endpoint. The
+existing manager approval response may add the exact resident acknowledgement;
+old clients may ignore the field, but no client may infer success from a manager
+record or timeout without it. Secure resident run-only v1 receipt audiences and
+physical v1 challenges do not receive a permissive compatibility fallback.
+Nonphysical gateway authority action digest bytes remain v1 byte-for-byte.
+
+`splendor.device.trace_sync` is an additive scope and `DeviceTraceSync` is an
+additive daemon endpoint discriminator. Existing device status/cache reads remain
+on `splendor.device.read`; callers must request a fresh one-use trace-sync token
+for the mutating reconnect endpoint. Operator intervention evidence keeps its
+existing schema: authoritative record plus action request/path identity supply
+agent and node binding, so no caller-carried evidence fields are added.
 
 ## Trace, state, replay, and failure impact
 
@@ -252,6 +517,16 @@ resident security audit fact without raw token/JTI. Create/start continue throug
 the existing signed-work-order, state commit, trace, C02, verifier, and gateway
 paths. Replay remains inspect-only and does not mint bearer tokens, perform
 resident network calls, or execute adapters.
+
+Operator intervention evidence is non-authoritative. Physical action admission
+requires the stored record and evidence to remain granted and to match the exact
+tenant, agent, run, path node, and action. The stored expiry and current resident
+time control validity; evidence may shorten but cannot extend that expiry. Device
+trace sync rejects the whole batch with zero accepted records on empty, malformed
+integrity, non-zero/gapped/reordered sequence, cross-run, previous-hash, payload,
+or event-hash failure. Exact full-batch retry is revalidated and acknowledged;
+the local endpoint itself does not persist a central cursor or claim exactly-once
+delivery.
 
 The existing state-handoff daemon operations apply this resident boundary
 consistently: both require caller scope `splendor.state.handoff` plus signed
@@ -284,19 +559,28 @@ calls, or action execution is permitted.
   manager, mTLS enrollment system, hardware attestation, or full Principal
   Registry.
 - No request proof-of-possession or general HTTP Message Signatures.
-- No work-order-v2 schema, gateway semantic change, policy synthesis, or action
-  bypass.
+- No work-order-v2 schema, general gateway redesign, policy synthesis, or action
+  bypass. The one gateway correction is the physical v2 resource-binding digest;
+  nonphysical v1 bytes remain unchanged.
 - No automatic retry/reconciliation endpoint for unknown-effect starts.
+- No claim that resident receipt revocation is durable across process restart.
+  There is no durable receipt/semantic tombstone store, revocation watch,
+  introspection service, or success-on-timeout fallback.
 - Work-order v1 remains keyed-BLAKE3 shared-secret verification. Acceptance
   fixtures issue a distinct key ID/secret per resident; the manager receives all
   issuer secrets and each resident mounts only its own verifier secret. This is
   scoped sibling isolation, not asymmetric issuer/verifier separation: compromise
   of a resident's v1 verifier secret can forge authority for that resident until
   rotation. Work-order v2/asymmetric verification remains future work.
-- The current central-manager **inbound** API still validates self-asserted
-  acceptance metadata. This RFC secures manager outbound resident dispatch only.
-  `splendor-manager` remains explicit local acceptance/dev infrastructure and
-  must not be described or exposed as a production-authenticated remote API.
+- Except for the four bounded approval mutations above, the current
+  central-manager **inbound** API still validates self-asserted acceptance
+  metadata. `splendor-manager` remains explicit local acceptance/dev
+  infrastructure and must not be described or exposed as a
+  production-authenticated remote API. The approval correction does not add
+  manager TLS or general endpoint authentication.
+- The dedicated resident receipt-revocation call authenticates one exact outbound
+  manager-to-resident mutation only. It is not production PKI, broad manager
+  authentication, or authority for unrelated resident/manager endpoints.
 
 ## Required evidence
 
@@ -311,5 +595,13 @@ calls, or action execution is permitted.
   safely through the real router.
 - TypeScript no-anonymous-fallback and error-redaction tests; OpenAPI bearer,
   `401`, `WWW-Authenticate`, and mirror-deprecation checks.
+- Required remediation evidence: active-run raw grant/denial/expiry/revocation
+  rejection before gateway/trace/lifecycle; the exact waiting-run fail-closed
+  exception; target-instance+run audience rejection; physical typed-`NodeId`
+  digest binding with nonphysical v1 byte fixtures; physical v1 re-challenge;
+  grant-retain-revoke-retry with zero effect; concurrent revoke/claim with one
+  winner; wrong-node rejection followed by original-node success; dedicated-scope
+  and one-use-JTI enforcement; exact resident acknowledgement; and timeout/reset
+  uncertainty that never reports success.
 - Full daemon/workspace/API validation and secret/security scans. Gold remains
   `not_exercised`.

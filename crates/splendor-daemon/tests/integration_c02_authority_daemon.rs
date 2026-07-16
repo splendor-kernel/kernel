@@ -13,13 +13,16 @@ use splendor_daemon::{
     TickResponse, TracePageResponse,
 };
 use splendor_gateway::{ActionOutcome, ActionStatus};
+use splendor_kernel::LocalAuthorityObligationReceiptConfig;
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
-    Action, AgentId, AuditAttribution, AuthorityDecisionStatus, CallerCredential, ClientPrincipal,
-    CredentialAudience, CredentialBinding, EndpointScope, InstanceId, NodeId, QuotaUsage,
-    RevocationStatus, RunId, SideEffectClass, TenantId, TickId, TraceEvent, TraceEventKind,
-    TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
-    FORBIDDEN_PHYSICAL_ACTION_PATTERNS, WORK_ORDER_SCHEMA_VERSION,
+    Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
+    AuditAttribution, AuthorityDecisionStatus, CallerCredential, ClientPrincipal,
+    CredentialAudience, CredentialBinding, EndpointScope, InstanceId, NodeId, PrincipalId,
+    QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TickId, TraceEvent,
+    TraceEventId, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
+    WorkOrderPlacement, WorkOrderQuotaPolicy, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
+    WORK_ORDER_SCHEMA_VERSION,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -270,6 +273,7 @@ fn create_request(
                 adapter: Some(ADAPTER.to_string()),
                 quota_usage: Some(QuotaUsage::single_action()),
                 satisfied_preconditions: Vec::new(),
+                requested_at: None,
                 authority_obligation_receipts: Vec::new(),
             })
             .into_iter()
@@ -364,9 +368,23 @@ fn device_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile 
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
-        safety_constraints: json!({"min_battery_percent": 0.25}),
+        safety_constraints: json!({
+            "min_battery_percent": 0.25,
+            "max_altitude_m": 30.0,
+            "allowed_zones": ["zone_a"]
+        }),
         runtime_mode: "resident".to_string(),
-        safety_status: json!({"emergency_stop_clear": true}),
+        safety_status: json!({
+            "battery_percent": 0.80,
+            "emergency_stop_clear": true,
+            "collision_risk": "low",
+            "current_zone": "zone_a",
+            "altitude_m": 10.0,
+            "privacy_clear": true,
+            "human_proximity_clear": true,
+            "offline": false,
+            "cloud_helper_direct_authority": false
+        }),
         policy_cache: DevicePolicyCacheStatus {
             policy_id: "policy_c02_concurrency".to_string(),
             loaded: true,
@@ -404,6 +422,7 @@ fn physical_submit_request(
             adapter: Some("device-sim".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
             approval_evidence: None,
             authority_obligation_receipts: Vec::new(),
         },
@@ -424,6 +443,17 @@ fn physical_submit_request(
         },
         operator_intervention_evidence: None,
     }
+}
+
+fn local_approval_receipt_config() -> LocalAuthorityObligationReceiptConfig {
+    LocalAuthorityObligationReceiptConfig::trusted_local(
+        PrincipalId::parse("00000000-0000-4000-8000-0000000004c0").expect("local receipt issuer"),
+        "splendor.daemon.run",
+        "approval-receipt-local-key",
+        "splendor-local-approval-receipt-secret-v1",
+        "local-approval-receipts",
+    )
+    .expect("local approval receipt config")
 }
 
 async fn call_json<T: DeserializeOwned>(
@@ -580,6 +610,7 @@ async fn submit_request(
         adapter: Some(adapter.to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     }
@@ -695,6 +726,7 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
             audit_attribution: Some(audit()),
             reason: Some("C02 scheduler path".to_string()),
             approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         },
     )
     .await;
@@ -1272,6 +1304,7 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         audit_attribution: Some(credential_audit(&start_signed.credential)),
         reason: None,
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, tick): (StatusCode, TickResponse) = call_json_with_token(
         app.clone(),
@@ -1330,6 +1363,7 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         adapter: Some(ADAPTER.to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
         authority_obligation_receipts: Vec::new(),
     };
@@ -1444,6 +1478,153 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
     }
 }
 
+#[tokio::test]
+async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
+    let _device_sim_env = DeviceSimEnvGuard::disabled();
+    let app = router(DaemonState::local_dev());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let node_id = NodeId::new();
+    let mut create = physical_create_request(
+        "wo_c02_physical_approval",
+        tenant_id.clone(),
+        agent_id.clone(),
+    );
+    let mut approval_policy = ApprovalPolicy::new(
+        "physical-waypoint-approval",
+        tenant_id.clone(),
+        "physical waypoint requires exact approval receipt",
+    );
+    approval_policy.agent_id = Some(agent_id.clone());
+    approval_policy.action_name = Some("move_to_waypoint".to_string());
+    approval_policy.adapter = Some("device-sim".to_string());
+    approval_policy.required_permission = Some("device.motion".to_string());
+    approval_policy.side_effect_class =
+        Some(SideEffectClass::Custom("physical.high_level".to_string()));
+    approval_policy.risk_level = Some("physical".to_string());
+    create.approval_policies = vec![approval_policy];
+    let (status, created): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", create).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(node_id.clone(), tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("physical approval causal trace");
+    let action_id = ActionId::new();
+    let requested_at = OffsetDateTime::now_utc();
+    let mut submit = physical_submit_request(
+        &created,
+        tenant_id.clone(),
+        agent_id.clone(),
+        causal_trace_id,
+    );
+    submit.action_request.action_id = Some(action_id.clone());
+    submit.action_request.requested_at = Some(requested_at);
+    let uri = format!("/devices/{node_id}/actions");
+    let (status, required): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, submit.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(required.status, ActionStatus::NeedsApproval);
+    let challenge = required
+        .approval_challenge
+        .clone()
+        .expect("physical exact approval challenge");
+    assert_eq!(challenge.action_id, action_id);
+    assert_eq!(challenge.requested_at, requested_at);
+    assert_eq!(
+        challenge
+            .physical_action_resource_coordinate
+            .as_ref()
+            .map(|coordinate| &coordinate.node_id),
+        Some(&node_id)
+    );
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+
+    let mut legacy = ApprovalEvidence::new(
+        ApprovalId::new(),
+        tenant_id,
+        agent_id,
+        created.run_id.clone(),
+        ApprovalDecision::Granted,
+        OffsetDateTime::now_utc() + Duration::minutes(5),
+    )
+    .with_action_name("move_to_waypoint")
+    .with_adapter("device-sim");
+    legacy.action_id = Some(action_id);
+    let mut forged_legacy = submit.clone();
+    forged_legacy.action_request.approval_evidence = Some(legacy);
+    let trace_count_before_raw_grant = traces(app.clone(), &created.run_id).await.records.len();
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, &uri, forged_legacy).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "legacy_approval_evidence_non_authorizing");
+    let after_raw_grant = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(after_raw_grant.status, RunStatus::WaitingForApproval);
+    assert_eq!(after_raw_grant.adapter_executions, 0);
+    assert_eq!(
+        traces(app.clone(), &created.run_id).await.records.len(),
+        trace_count_before_raw_grant,
+        "transport-rejected raw grant must not append daemon/runtime trace"
+    );
+
+    let receipt = local_approval_receipt_config()
+        .issue_approval_receipt(&challenge, TraceEventId::new(), OffsetDateTime::now_utc())
+        .expect("physical approval receipt");
+    let mut altered = submit.clone();
+    altered.action_request.action.params = json!({"zone_ref": "zone_b"});
+    altered.action_request.authority_obligation_receipts = vec![receipt.clone()];
+    let (status, error): (StatusCode, ApiErrorBody) =
+        call_json(app.clone(), Method::POST, &uri, altered).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "approval_challenge_retry_mismatch");
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+
+    submit.action_request.authority_obligation_receipts = vec![receipt];
+    let (status, executed): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, submit.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(executed.status, ActionStatus::Executed);
+    let inspected = inspect(app.clone(), &created.run_id).await;
+    assert_eq!(inspected.status, RunStatus::Running);
+    assert_eq!(inspected.adapter_executions, 1);
+
+    let (status, replayed): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, submit).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replayed.status, ActionStatus::Denied);
+    assert!(replayed
+        .verification
+        .reasons
+        .contains(&"authority_obligation_receipt_replayed".to_string()));
+    assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
+}
+
 async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: bool) {
     let (simulator_url, entered, release, simulator) = spawn_blocking_device_sim();
     let _device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
@@ -1537,6 +1718,7 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
                 adapter: Some(ADAPTER.to_string()),
                 quota_usage: Some(QuotaUsage::single_action()),
                 satisfied_preconditions: Vec::new(),
+                requested_at: None,
                 approval_evidence: None,
                 authority_obligation_receipts: Vec::new(),
             })
@@ -1571,6 +1753,7 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
                 audit_attribution: Some(audit()),
                 reason: Some("blocked adapter lifecycle closure".to_string()),
                 approval_evidence: None,
+                authority_obligation_receipts: Vec::new(),
             },
         )
         .await

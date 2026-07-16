@@ -7,10 +7,12 @@
 use crate::{
     AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
     AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, DeviceId, FleetId,
-    PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId, WorkloadId,
+    NodeId, PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId,
+    WorkloadId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use time::OffsetDateTime;
 
 /// Canonical schema identifier for typed authority operations.
@@ -37,6 +39,38 @@ pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation
 /// Canonical schema identifier for delegated child result contracts.
 pub const DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION: &str =
     "splendor.authority.delegation_result_contract.v1";
+
+/// Trusted resource kind carried by a physical gateway action binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalActionResourceKind {
+    /// One registered physical/edge node.
+    PhysicalNode,
+}
+
+/// Server-derived physical resource coordinate bound into an action digest.
+///
+/// This behavior-free value is not authority by itself. The kernel constructs it
+/// only after matching the authenticated device path, registered profile, and
+/// admitted run scope.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalActionResourceCoordinate {
+    /// Closed resource-kind discriminator.
+    pub resource_kind: PhysicalActionResourceKind,
+    /// Exact registered physical node identity.
+    pub node_id: NodeId,
+}
+
+impl PhysicalActionResourceCoordinate {
+    /// Builds the only physical resource coordinate supported by this slice.
+    pub fn physical_node(node_id: NodeId) -> Self {
+        Self {
+            resource_kind: PhysicalActionResourceKind::PhysicalNode,
+            node_id,
+        }
+    }
+}
 
 /// Namespace that owns a typed operation verb.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -394,7 +428,7 @@ pub enum AuthorityObligationKind {
 /// This contract is not authorizing by itself. `splendor-authority` must validate
 /// it against trusted owning-service context before any receipt can satisfy an
 /// obligation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityObligationReceiptValidation {
     /// Validation mode for this bounded slice.
@@ -407,6 +441,19 @@ pub struct AuthorityObligationReceiptValidation {
     pub digest: String,
     /// Deterministic local signature/MAC for this bounded slice.
     pub signature: String,
+}
+
+impl fmt::Debug for AuthorityObligationReceiptValidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorityObligationReceiptValidation")
+            .field("validation_kind", &self.validation_kind)
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("digest", &self.digest)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Authority obligation receipt validation mode.

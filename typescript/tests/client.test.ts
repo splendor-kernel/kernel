@@ -8,6 +8,7 @@ import type {
   CreateRunRequest,
   LifecycleRequest,
   Percept,
+  ResidentApprovalReceiptRevocationRequest,
   SubmitActionRequest,
   TraceRecord,
   WorkOrderEnvelope
@@ -400,6 +401,65 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
   await assert.rejects(() => client.submitAction({ ...request, causal_trace_id: null }), /trace linkage/);
   await assert.rejects(() => client.submitAction({ ...request, audit_attribution: null }), /audit attribution/);
   await assert.rejects(() => client.submitAction({ ...request, credential: null }), /caller credential/);
+});
+
+test("revokeApprovalReceipt posts the exact retained receipt to the owning run", async () => {
+  const receiptId = "00000000-0000-4000-8000-000000000020";
+  const approvalId = "00000000-0000-4000-8000-000000000021";
+  const request: ResidentApprovalReceiptRevocationRequest = {
+    schema_version: "splendor.resident.approval_receipt_revocation.v1",
+    authority_obligation_receipt: {
+      schema_version: "splendor.authority.obligation_receipt.v1",
+      receipt_id: receiptId,
+      issuer: "00000000-0000-4000-8000-000000000022",
+      audience: `splendor.daemon.approval_receipt.v2:instance:00000000-0000-4000-8000-000000000023:run:${runId}`,
+      obligation_id: "00000000-0000-4000-8000-000000000024",
+      kind: "approval_required",
+      subject: "00000000-0000-4000-8000-000000000025",
+      authority_decision_id: "00000000-0000-4000-8000-000000000026",
+      canonical_request_digest: "blake3:request",
+      evidence_digest: "blake3:evidence",
+      issued_at: "2026-07-12T00:00:00Z",
+      expires_at: "2026-07-12T00:05:00Z",
+      revocation: "active",
+      revocation_ref: "revocation:receipt",
+      approval_id: approvalId,
+      approval_trace_event_id: "00000000-0000-4000-8000-000000000027",
+      validation: {
+        validation_kind: "local_signature",
+        algorithm: "local-obligation-receipt-v1",
+        key_id: "receipt-key",
+        digest: "blake3:receipt",
+        signature: "signature"
+      }
+    },
+    reason: "operator revoked approval"
+  };
+  const acknowledgement = {
+    schema_version: "splendor.resident.approval_receipt_revocation_ack.v1",
+    receipt_id: receiptId,
+    approval_id: approvalId,
+    target_instance_id: "00000000-0000-4000-8000-000000000023",
+    run_id: runId,
+    receipt_audience: request.authority_obligation_receipt.audience,
+    status: "revoked",
+    effect_certainty: "known",
+    acknowledged_at: "2026-07-12T00:01:00Z"
+  };
+  const { fetcher, calls } = makeFetch(acknowledgement);
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+
+  assert.equal((await client.revokeApprovalReceipt(runId, receiptId, request)).status, "revoked");
+  assert.equal(
+    new URL(calls[0].url).pathname,
+    `/runs/${runId}/approval-receipts/${receiptId}/revoke`
+  );
+  assert.deepEqual(calls[0].jsonBody, request);
+  await assert.rejects(
+    () => client.revokeApprovalReceipt(runId, "00000000-0000-4000-8000-000000000099", request),
+    /identities to match/
+  );
+  assert.equal(calls.length, 1);
 });
 
 test("readTraces requires redaction policy and preserves event order", async () => {

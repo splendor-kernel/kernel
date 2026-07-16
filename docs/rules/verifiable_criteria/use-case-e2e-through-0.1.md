@@ -10,6 +10,11 @@
 - [`docs/reference/management-communication-api-acceptance-contract.md`](../../reference/management-communication-api-acceptance-contract.md)
 - [`docs/development/containerized-use-case-e2e-harness.md`](../../development/containerized-use-case-e2e-harness.md)
 
+**Resident approval amendment status:** The raw-evidence, physical binding,
+target-resident receipt audience, and acknowledged revocation criteria added on
+2026-07-15 are required contract targets. They are not passing or implemented
+until the corresponding code, public contracts, and retained E2E evidence land.
+
 This pack defines acceptance-level use-case sprints for Splendor. The tests are intentionally neither toy smoke tests nor sprawling product demos: each sprint validates one bounded, realistic runtime use case while exercising the real Splendor kernel boundaries, public API/client paths, state graph, trace store, gateway, verifiers, replay, governance, fleet, and physical/edge safety surfaces that exist by the end of the implementation milestones.
 
 The suite must be treated as a **post-implementation acceptance gate**. Sprint-local tests can prove isolated implementation behavior; this pack proves that the completed product direction still holds when all components are used together.
@@ -49,6 +54,15 @@ The acceptance suite must fail if it observes any of the following:
 - a shared/specialist agent inherits broad caller permissions instead of scoped delegated authority;
 - daemon, sidecar, SDK, CLI, central manager, adapter, or control-plane calls are accepted as anonymous callers outside explicit local development mode;
 - a daemon API token is treated as permission to execute arbitrary agent actions;
+- raw `ApprovalEvidence` reaches a gateway, runtime trace, or lifecycle mutation
+  outside the exact stored `WaitingForApproval` `/actions` denial/expiry/
+  revocation exception, or a raw grant pauses or authorizes an active run;
+- a secure resident approval receipt is not bound to exact target `InstanceId`
+  plus `RunId`, or a physical approval digest accepts a caller-supplied node/
+  resource coordinate;
+- a manager reports post-grant approval revocation success without an
+  authenticated exact-target resident acknowledgement from the authority-owned
+  atomic claim/revoke ledger;
 - a health, capabilities, telemetry, or placement response becomes authority to run or act;
 - a physical/edge adapter accepts raw motor writes, firmware safety bypasses, hard real-time control, or low-level actuator commands as Splendor direct actions;
 - tests validate a chat-first agent UX, enterprise SaaS admin product, marketplace, broad low-code builder, universal distributed memory, or bare-metal OS direction as if it were Splendor kernel scope.
@@ -612,7 +626,7 @@ A central manager dispatches a signed data-local work order to a resident VPC no
 - Capability mismatch gives a deterministic rejection reason.
 - Duplicate remote message with same idempotency marker is not double-applied.
 - Remote message delivery failure is trace-linked and does not mutate remote state directly.
-- Hash-valid fabricated and hash-tampered handoffs cannot bypass the missing-source-proof denial; a wrong-run request is rejected before mutation.
+- Hash-valid fabricated and hash-tampered handoffs cannot bypass the missing-source-proof denial; a valid exact-profile unknown-run request receives the same proof-unavailable denial before mutation and does not expose run existence.
 - Telemetry cannot authorize work-order dispatch, action execution, or placement.
 
 ## Required trace evidence
@@ -681,6 +695,7 @@ A report agent generates an internal artifact and requests external publication.
 
 - policy bundle publish/revoke/read
 - approval request/grant/deny/expire/revoke
+- resident approval-receipt revoke acknowledgement
 - run pause/resume/cancel
 - circuit breaker create/clear/status
 - kill switch activate/status
@@ -695,8 +710,9 @@ A report agent generates an internal artifact and requests external publication.
 4. Agent proposes `artifact.publish_external`.
 5. Approval verifier returns `action.needs_approval`; adapter is not called.
 6. Run pauses with trace-linked approval request.
-7. Governance plane grants scoped approval with action ID, tenant, agent, adapter, expiry, audience, and approval ID.
-8. Run resumes and executes the approved action exactly once.
+7. Governance plane grants scoped approval with action ID, tenant, agent, adapter, expiry, audience, and approval ID. The request uses a fresh fleet-bound central-manager bearer with exact `splendor.approvals.manage` scope; body credential/audit fields are matching non-authoritative mirrors. A secure resident receipt audience is versioned and binds the server-derived target `InstanceId` plus exact `RunId`.
+8. The exact receipt-bearing `/actions` retry executes once, then the run records
+   its post-effect resumed transition without a lifecycle-resume tick.
 9. Audit export explains approval request, grant, resume, execution, and state commit.
 
 ## Required negative paths
@@ -710,6 +726,24 @@ A report agent generates an internal artifact and requests external publication.
 - Clearing circuit breaker requires scoped caller authority and trace evidence.
 - Kill switch propagates to matching node/instance/run and fails closed when propagation acknowledgement is missing.
 - External governance adapter cannot mutate runtime internals directly or issue broad action authority.
+- Missing, forged, expired, revoked, wrong-manager, wrong-fleet, wrong-scope, or replayed manager approval bearer cannot mutate approval/audit state or issue a trusted receipt.
+- Raw granted approval evidence, and raw denial/expiry/revocation on an active run,
+  is rejected before gateway, runtime trace, pause, or lifecycle mutation. Only
+  exact fail-closed evidence on the stored `WaitingForApproval` `/actions` retry
+  is admitted; mixed raw evidence plus receipts is rejected.
+- Grant and retain an exact resident receipt/target, revoke it through the
+  dedicated `splendor.approval_receipts.revoke` resident endpoint, require an
+  authenticated `revoked`/`already_revoked` acknowledgement, then retry the exact
+  action and prove zero adapter effects.
+- Concurrent resident revoke and gateway claim produces one winner. Revoke-first
+  prevents the effect; claim-first returns resident `already_claimed` and manager
+  `too_late`. Neither timeout nor both outcomes may be reported as success.
+- Send the retained receipt to a wrong node/instance with a fresh exact-scope JTI:
+  it rejects without receipt/semantic tombstones. A second fresh-JTI request to
+  the original target succeeds.
+- Missing dedicated scope, wrong bearer audience, reused JTI, TLS/hostname or
+  exact-origin failure, malformed/oversized acknowledgement, reset, or timeout
+  cannot produce manager revocation success. Post-send uncertainty is explicit.
 
 ## Required governance trace evidence
 
@@ -730,6 +764,8 @@ A report agent generates an internal artifact and requests external publication.
 - Replay explains why each action was allowed, denied, paused, escalated, resumed, or cancelled.
 - Replay never publishes artifacts or re-calls external systems.
 - Audit export links caller, work order, policy bundle, approval, circuit breaker, kill switch, run, action, and trace IDs.
+- Audit/API evidence distinguishes resident `revoked`/`already_revoked`, resident
+  `already_claimed` mapped to manager `too_late`, and transport/effect uncertainty.
 
 ## Container command
 
@@ -809,8 +845,18 @@ A simulated inspection drone receives a work order to inspect a zone. A cloud he
 - Low battery forces `return_to_base`, `dock`, pause, or intervention according to policy.
 - Expired policy cache denies high-risk action while offline.
 - Cloud helper direct action attempt is denied.
-- Operator approval outside scope or after expiry is rejected.
-- Trace sync tamper or reordering is detected.
+- Operator intervention outside exact tenant/agent/run/node/action scope, reused
+  on another device, extended beyond authoritative expiry, or used after the
+  authoritative record expires is rejected.
+- A physical approval challenge binds the path/profile-derived typed `NodeId` in
+  the domain-separated physical v2 gateway authority action digest. Supplying a
+  different node through action params, metadata, body fields, mirrors, or an
+  otherwise valid receipt cannot override the server resource coordinate.
+- Nonphysical digest fixtures remain byte-for-byte v1. An outstanding physical
+  v1 challenge/receipt cannot execute and must be re-challenged under physical
+  v2; no translation or permissive fallback is accepted.
+- Trace sync empty, cross-run, payload/event-hash tamper, gap, or reordering is
+  detected and the whole batch reports zero accepted records.
 
 ## Required trace evidence
 
@@ -884,14 +930,29 @@ Two tenants use a shared document/analysis specialist. Tenant A asks for a board
 ## Positive path
 
 1. Register two tenants with separate data refs.
-2. Submit signed Tenant A work order with explicit data refs and allowed actions.
-3. Dispatch to data-local node.
-4. Shared specialist receives scoped delegation for Tenant A only.
-5. Specialist reads allowed data fixture, returns typed message, and commits state.
-6. Orchestrator creates internal artifact.
-7. External publish requires approval and executes only after scoped approval.
-8. Trace export with redaction policy excludes protected raw data while preserving IDs and reason codes.
-9. Replay reconstructs data refs, messages, approvals, artifacts, and denials.
+2. Submit per-instance signed Tenant A work orders with separate exact profiles
+   for specialist data read, internal artifact creation, external publication,
+   request messaging, and response messaging.
+3. Reuse the canonical VPC node/instance identity, refresh both health records,
+   place exact profiles on the data-local node, and dispatch only profiles
+   supported by manager dispatch.
+4. Drive every resident request over verified TLS with a fresh scoped bearer and
+   matching caller/audit projection fields.
+5. Shared specialist receives a typed request whose payload is non-authorizing;
+   its separately signed data-read work order is the only action authority.
+6. Specialist reads the allowed data fixture, returns a typed response bound to
+   its child run, and commits state.
+7. Orchestrator creates an internal artifact under its separate exact run.
+8. A publish-only run is created directly with one exact policy action and
+   approval policy, starts in `NeedsApproval`, and records the full exact
+   challenge with the manager through fresh one-use `splendor.approvals.manage`
+   bearers. One manager-issued, trace-linked authority receipt then retries the
+   exact pending action through `POST /actions`, producing one execution and a
+   `run.resumed` transition to `running` without another tick or state-head
+   advance. Raw grant evidence and lifecycle `/resume` are not execution
+   authority.
+9. Trace export with redaction policy excludes protected raw data while preserving IDs and reason codes.
+10. Replay reconstructs data refs, messages, approvals, artifacts, and denials.
 
 ## Required negative paths
 
@@ -910,6 +971,7 @@ Two tenants use a shared document/analysis specialist. Tenant A asks for a board
 - message.sent / received / denied
 - artifact.created
 - artifact.publish.needs_approval / executed / denied
+- run.resumed after the exact receipt-bearing publish retry
 - trace.exported.redacted
 - state.committed
 - replay.explained
@@ -1165,16 +1227,16 @@ All available components in the acceptance topology:
 1. Validate API contracts and generated type parity.
 2. Register all nodes and instances.
 3. Publish policy bundle with TTL.
-4. Submit signed work order with bounded allowed actions, adapters, permissions, data refs, quotas, placement requirements, and expiry.
+4. Submit target-instance-signed work orders with exact allowed action, adapter, permission, data-ref, quota, placement, and expiry profiles. Every resident call uses verified TLS and a fresh exact-scope, target-instance bearer; mutating JTIs are not reused.
 5. Place data-local analysis on VPC node.
 6. Delegate document/data analysis to shared specialist with scoped authority.
 7. Send remote proposal request to cloud helper.
 8. Send physical inspection request to edge node.
 9. Edge node validates cloud proposal locally, performs bounded high-level inspection through device simulator, buffers traces during a network partition, and syncs after reconnect.
-10. Orchestrator collects typed messages, commits state, and creates internal artifact.
-11. External publication pauses for approval, receives scoped approval, and executes once.
-12. Export state, prove resident import denial before mutation, then resume the receiver from its own committed state.
-13. Aggregate traces and telemetry centrally.
+10. Orchestrator collects typed messages, commits state, and creates an internal artifact under an internal-create-only work order.
+11. A separate publish-only VPC run is created with one exact approval-policy action and pauses with a daemon-issued approval challenge. The manager records that exact challenge and issues one authority obligation receipt whose v2 audience binds the server-derived target `InstanceId` and exact `RunId`. The exact challenged action is then retried once through canonical `POST /actions` (`submitAction`; the retained traffic labels this specific evidence row `submitApprovedExactAction`). The retry contains the unchanged action payload, effective adapter, request time, quota, and preconditions; contains no raw approval evidence; executes once; leaves the tick and state head unchanged; and emits `run.resumed` only after `action.executed`. No publish-run lifecycle resume call is allowed. Every manager approval mutation uses a fresh exact-audience, fleet-bound, one-scope bearer and matching non-authoritative request mirrors.
+12. Export state, create a receiver run with a cloud-signed envelope, use that exact admitted envelope for import and resume, prove resident import denies with `state_handoff_proof_unavailable` before mutation, then resume only the receiver's own committed state.
+13. Aggregate hash-verifiable VPC/cloud traces and telemetry centrally, sync the edge trace buffer through its resident reconnect boundary, and prove redacted edge exports are not resubmitted or rehashed to manufacture central acceptance.
 14. Export audit package and run inspect-only replay.
 
 ## Required controlled negative branches
@@ -1187,6 +1249,21 @@ Each branch must be independent so the positive path can still complete:
 - remote message duplicate not double-applied;
 - raw physical actuator action rejected;
 - expired approval rejected;
+- missing/forged/replayed manager approval authentication rejected before approval/audit mutation or receipt issuance;
+- raw grant and active-run raw evidence rejected before gateway/trace/lifecycle,
+  with unchanged active run status and no new approval pause;
+- a separate granted receipt is retained, revoked through the authenticated exact-
+  target resident endpoint, acknowledged as `revoked`/`already_revoked`, and then
+  rejected on exact action retry with zero adapter effect;
+- concurrent revoke/claim records exactly one winner and maps claim-first to
+  resident `already_claimed`/manager `too_late`;
+- wrong-node receipt revocation rejects without poisoning the original target,
+  then succeeds at the original node with a fresh one-use JTI;
+- dedicated-scope/JTI/TLS/exact-origin failure and timeout/reset uncertainty never
+  become manager revocation success;
+- physical challenge binds the server-derived typed `NodeId` under physical v2,
+  rejects caller override, and requires re-challenge for physical v1 while
+  nonphysical v1 digest bytes remain unchanged;
 - circuit breaker blocks matching publish attempt;
 - kill switch cancels a separate matching run;
 - tampered trace/state import rejected;
@@ -1203,6 +1280,16 @@ The final report must include:
 - run, action, state, trace, message, work-order, approval, node, instance, policy, circuit-breaker, kill-switch, and artifact IDs;
 - trace/state export paths;
 - replay/audit explanation path;
+- token-free manager approval authentication evidence and API-traffic correlation;
+- retained publish API traffic, artifact report, approval challenge, manager grant response, authority obligation receipt, action response, and ordered traces that independently prove the exact AUTH-004c retry;
+- exactly one receipt-bearing publish evidence row mapped to public `POST /actions`, with matching subject, audience, decision, obligation, request/evidence digests, approval trace linkage, satisfied verification/post-verification, one execution, unchanged tick/state head, post-effect `run.resumed`, and no publish-run lifecycle resume;
+- token-free resident receipt-revocation request/ack evidence proving exact scope,
+  fresh JTIs, TLS/hostname, exact origin, target instance/run audience, receipt and
+  semantic tombstones, zero-effect revoke-before-retry, one concurrent winner,
+  wrong-node rejection then original-node success, and explicit no-success
+  transport/effect uncertainty;
+- physical digest fixtures proving trusted typed-`NodeId` binding, caller override
+  rejection, physical v1 re-challenge, and byte-identical nonphysical v1 digests;
 - anti-drift gate results;
 - FR and primitive coverage matrix.
 

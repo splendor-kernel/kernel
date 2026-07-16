@@ -89,6 +89,25 @@ The central index validates a batch before accepting any record:
 
 The sync path never repairs, renumbers, or rewrites trace records.
 
+### Resident device reconnect endpoint
+
+`POST /devices/{node_id}/trace-buffer/sync` is a narrow local resident
+acknowledgement boundary. It requires the dedicated mutating caller scope
+`splendor.device.trace_sync`; read-only `splendor.device.read` is insufficient.
+Because this endpoint does not own a central cursor, it accepts only a complete
+non-empty local batch beginning at sequence `0`. Every following sequence must be
+exactly contiguous, every `TraceRecord.run_id` (and root payload `run_id` when
+present) must equal the request run, each previous hash must link internally, and
+each `event_hash` is recomputed with `compute_trace_event_hash` before the batch
+is acknowledged. Any failure rejects the whole batch with
+`accepted_records = 0`.
+
+An exact valid full-batch reconnect retry is revalidated and returns the same
+accepted count. This preserves safe retry of the local acknowledgement boundary;
+it does not insert records, advance a durable central cursor, or make an
+exactly-once claim. Central duplicate suppression remains the responsibility of
+`CentralTraceIndex::sync_batch`.
+
 ## Duplicate sync
 
 Duplicate sync attempts are idempotent. If the central index already has a
@@ -168,6 +187,8 @@ default and can use the same record payloads and hash-chain metadata after sync.
 ## Security and failure notes
 
 - Sync failure never authorizes a side effect.
+- Empty, cross-run, gapped, reordered, previous-hash-tampered, payload-tampered,
+  or event-hash-tampered resident batches are rejected atomically.
 - Local buffer-full failure never authorizes a side effect when trace durability
   is required.
 - A runtime that requires central trace durability must wrap its action gateway

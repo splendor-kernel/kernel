@@ -24,6 +24,7 @@
 //! assert_eq!(event.sequence, 0);
 //! ```
 
+pub mod authority_obligation_receipts;
 mod escalation;
 mod fleet_telemetry;
 mod local_delegation;
@@ -40,6 +41,10 @@ mod tenancy;
 mod trace;
 mod trace_durability;
 
+pub use authority_obligation_receipts::{
+    AuthorityObligationReceiptFacadeError, AuthorityObligationReceiptRevocation,
+    AuthorityObligationReceiptVerifier, LocalAuthorityObligationReceiptConfig,
+};
 pub use escalation::{
     apply_escalation_to_outcome, escalations_require_intervention, observations_for_outcome,
     EscalationEvaluator, EscalationOutcomeInput, ESCALATION_ENGINE_SOURCE,
@@ -79,7 +84,10 @@ pub use remote_message_transport::{
     send_remote_message, InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault,
     RemoteMessageReceiver, RemoteMessageTransport, RemoteMessageTransportError,
 };
-pub use run_authority::{KernelPreEffectAuthorityRecorder, RunAuthorityHandle};
+pub use run_authority::{
+    KernelPreEffectAuthorityRecorder, RunActionAdmissionError, RunActionAdmissionState,
+    RunAuthorityHandle,
+};
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};
 pub use splendor_types::{

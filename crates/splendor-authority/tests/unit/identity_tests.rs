@@ -6,7 +6,7 @@ use splendor_store::{
 };
 use splendor_types::{
     AgentId, FleetId, IdentityLookupKey, IdentityQuery, InstanceId, NodeId, PrincipalProofRefId,
-    TenantId,
+    RunId, TenantId,
 };
 
 const REGISTRATION_DIGEST: &str =
@@ -73,6 +73,103 @@ fn nil_principal_id() -> PrincipalId {
 
 fn nil_tenant_id() -> TenantId {
     TenantId::parse("00000000-0000-0000-0000-000000000000").expect("nil tenant id parses")
+}
+
+#[test]
+fn identity_validation_helpers_cover_all_typed_fail_closed_boundaries() {
+    const NIL_ID: &str = "00000000-0000-0000-0000-000000000000";
+    let registry = registry();
+    assert!(std::ptr::eq(registry.store(), registry.store()));
+
+    for lookup in [
+        IdentityLookupKey::OwnerTenant {
+            owner_tenant_id: nil_tenant_id(),
+        },
+        IdentityLookupKey::OwnerFleet {
+            owner_fleet_id: FleetId::parse(NIL_ID).expect("nil fleet id"),
+        },
+    ] {
+        assert!(matches!(
+            registry.query(IdentityQuery {
+                lookup,
+                expected_revision: None,
+            }),
+            Err(IdentityRegistryError::InvalidBinding { .. })
+        ));
+    }
+
+    assert!(validate_owner_ids(Some(&nil_tenant_id()), None).is_err());
+    assert!(
+        validate_owner_ids(None, Some(&FleetId::parse(NIL_ID).expect("nil fleet id"))).is_err()
+    );
+    for binding in [
+        PrincipalBinding::Fleet {
+            fleet_id: FleetId::parse(NIL_ID).expect("nil fleet id"),
+        },
+        PrincipalBinding::Node {
+            node_id: NodeId::parse(NIL_ID).expect("nil node id"),
+        },
+        PrincipalBinding::Instance {
+            instance_id: InstanceId::parse(NIL_ID).expect("nil instance id"),
+        },
+        PrincipalBinding::Agent {
+            agent_id: AgentId::parse(NIL_ID).expect("nil agent id"),
+        },
+        PrincipalBinding::Run {
+            run_id: RunId::parse(NIL_ID).expect("nil run id"),
+        },
+    ] {
+        assert!(matches!(
+            validate_bindings(&[binding]),
+            Err(IdentityRegistryError::InvalidBinding { .. })
+        ));
+    }
+    assert!(matches!(
+        validate_external_subject_part("provider", " "),
+        Err(IdentityRegistryError::InvalidExternalSubject { .. })
+    ));
+
+    assert!(validate_metadata_value(&json!([
+        {"safe": ["descriptive value", 1, true]},
+        null
+    ]))
+    .is_ok());
+    let mut invalid_proof = proof(REGISTRATION_DIGEST);
+    invalid_proof.proof_ref_id = PrincipalProofRefId::parse(NIL_ID).expect("nil proof id");
+    assert!(matches!(
+        validate_proofs(&[invalid_proof]),
+        Err(IdentityRegistryError::InvalidProofRef {
+            field: "proof_ref_id"
+        })
+    ));
+    assert!(validate_optional_safe_proof_descriptor("provider", Some("oidc")).is_ok());
+    assert!(validate_proof_digest("sha512", &"a".repeat(128)).is_ok());
+    assert!(matches!(
+        validate_proof_digest("unsupported", "a"),
+        Err(IdentityRegistryError::InvalidProofRef {
+            field: "digest_algorithm"
+        })
+    ));
+
+    let registered = registry
+        .register(registration(PrincipalKind::Service))
+        .expect("register revocation fixture");
+    let revoked = registry
+        .revoke(
+            &registered.principal.principal_id,
+            registered.principal.revision,
+            "revoke",
+        )
+        .expect("revoke fixture");
+    assert!(matches!(
+        registry.rotate_proof(
+            &revoked.principal.principal_id,
+            revoked.principal.revision,
+            proof(ROTATED_DIGEST),
+            "rotate_after_revoke",
+        ),
+        Err(IdentityRegistryError::RevokedPrincipal { .. })
+    ));
 }
 
 struct PanicOnLookupStore;
