@@ -404,7 +404,12 @@ Validation evidence required for future implementation:
 
 Proposed title: `RFC: vNext secret broker with refs, leases, scoped delivery, and redaction`.
 
-Issue link: `[#154](https://github.com/splendor-kernel/kernel/issues/154)`.
+Historical planning issue: `[#154](https://github.com/splendor-kernel/kernel/issues/154)`.
+Current implementation tracking is aggregate
+`[#183](https://github.com/splendor-kernel/kernel/issues/183)` with task issues
+[#245](https://github.com/splendor-kernel/kernel/issues/245) through
+[#250](https://github.com/splendor-kernel/kernel/issues/250). The proposed
+implementation contract is [RFC 0012](0012-secret-broker-contract.md).
 
 Milestone fit: 0.2/v2 RFC first; implementation only after accepted RFC.
 Related criteria: `0.02-S0`, `0.03-S3`, `0.04-S5`.
