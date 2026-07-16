@@ -1,5 +1,10 @@
 use super::*;
-use crate::TASK_RESPONSE_SCHEMA;
+use crate::{
+    EffectCertainty, InstanceId, ResidentApprovalReceiptRevocationAck,
+    ResidentApprovalReceiptRevocationRequest, ResidentApprovalReceiptRevocationStatus,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION, TASK_RESPONSE_SCHEMA,
+};
 
 fn round_trip<T>(value: &T)
 where
@@ -32,6 +37,21 @@ fn authority_operation_contract_is_typed_and_schema_versioned() {
     assert_eq!(json["verb"], "invoke");
     assert_eq!(json["name"], "artifact.create");
     round_trip(&operation);
+}
+
+#[test]
+fn authority_obligation_legacy_default_uses_current_schema() {
+    let obligation: AuthorityObligation = serde_json::from_value(serde_json::json!({
+        "obligation_id": AuthorityObligationId::new(),
+        "kind": "human_review",
+        "description": "review",
+        "parameters": {}
+    }))
+    .expect("legacy obligation defaults schema");
+    assert_eq!(
+        obligation.schema_version,
+        AUTHORITY_OBLIGATION_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -228,6 +248,44 @@ fn authority_obligations_and_receipts_are_typed_and_schema_versioned() {
     assert_eq!(json["authority_decision_id"], decision_id.to_string());
     assert_eq!(json["validation"]["validation_kind"], "local_signature");
     assert_eq!(json["validation"]["key_id"], "receipt-key-1");
+    let debug = format!("{receipt:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(
+        !debug.contains("blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+    );
+    let mut unknown_receipt = json.clone();
+    unknown_receipt["allowed_permissions"] = serde_json::json!(["admin"]);
+    assert!(serde_json::from_value::<AuthorityObligationReceipt>(unknown_receipt).is_err());
+    let mut unknown_validation = json.clone();
+    unknown_validation["validation"]["credential"] = serde_json::json!("secret");
+    assert!(serde_json::from_value::<AuthorityObligationReceipt>(unknown_validation).is_err());
+    let instance_id = InstanceId::new();
+    let run_id = RunId::new();
+    let approval_id = receipt.approval_id.clone().expect("approval id");
+    let revocation_request = ResidentApprovalReceiptRevocationRequest {
+        schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION.to_string(),
+        authority_obligation_receipt: receipt.clone(),
+        reason: "operator revoked approval".to_string(),
+    };
+    round_trip(&revocation_request);
+    let mut unknown_request =
+        serde_json::to_value(&revocation_request).expect("revocation request");
+    unknown_request["target_instance_id"] = serde_json::json!(instance_id.clone());
+    assert!(
+        serde_json::from_value::<ResidentApprovalReceiptRevocationRequest>(unknown_request)
+            .is_err()
+    );
+    round_trip(&ResidentApprovalReceiptRevocationAck {
+        schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION.to_string(),
+        receipt_id: receipt.receipt_id.clone(),
+        approval_id,
+        target_instance_id: instance_id,
+        run_id,
+        receipt_audience: receipt.audience.clone(),
+        status: ResidentApprovalReceiptRevocationStatus::Revoked,
+        effect_certainty: EffectCertainty::Known,
+        acknowledged_at: now,
+    });
     assert_eq!(
         serde_json::to_value(&statuses).expect("statuses json"),
         serde_json::json!([
@@ -310,6 +368,7 @@ fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
     };
     let delegation_grant = DelegationGrant {
         schema_version: DELEGATION_GRANT_SCHEMA_VERSION.to_string(),
+        binding_digest: "blake3:test-binding".to_string(),
         parent_grant_id: parent_grant_id.clone(),
         parent_run_id,
         parent_agent_id,
@@ -325,6 +384,7 @@ fn delegation_grant_and_chain_contracts_round_trip_without_behavior() {
         expires_at: now + time::Duration::minutes(10),
         remaining_delegation_depth: 0,
         max_fan_out: 1,
+        cleanup_obligations: DelegationCleanupObligations::default(),
         child_capability_grant,
     };
     let chain = DelegationChain {

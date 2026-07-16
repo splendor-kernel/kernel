@@ -25,7 +25,8 @@ FROM rust-builder AS acceptance-builder
 ARG RUST_TOOLCHAIN=1.88.0
 
 RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" cargo build --locked --release \
-    -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation
+    -p splendor-kernel --example uc_e2e_s3_multi_agent_delegation \
+    -p splendor-daemon --example resident_auth_key_tool
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-builder
 
@@ -92,9 +93,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nodejs \
         npm \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=acceptance-builder /src/target/release/examples/uc_e2e_s3_multi_agent_delegation /usr/local/bin/uc_e2e_s3_multi_agent_delegation
+COPY --from=acceptance-builder /src/target/release/examples/resident_auth_key_tool /usr/local/bin/resident_auth_key_tool
 
 WORKDIR /opt/splendor
 COPY package.json package-lock.json ./

@@ -7,10 +7,12 @@
 use crate::{
     AgentId, ApprovalId, ArtifactId, AuthorityDecisionId, AuthorityObligationId,
     AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, DeviceId, FleetId,
-    PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId, WorkloadId,
+    NodeId, PrincipalId, RevocationStatus, RunId, StatePartitionId, TenantId, TraceEventId,
+    WorkloadId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use time::OffsetDateTime;
 
 /// Canonical schema identifier for typed authority operations.
@@ -31,12 +33,44 @@ pub const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION: &str =
 /// Canonical schema identifier for authority revocation records.
 pub const REVOCATION_RECORD_SCHEMA_VERSION: &str = "splendor.authority.revocation_record.v1";
 /// Canonical schema identifier for behavior-free delegation grants.
-pub const DELEGATION_GRANT_SCHEMA_VERSION: &str = "splendor.authority.delegation_grant.v1";
+pub const DELEGATION_GRANT_SCHEMA_VERSION: &str = "splendor.authority.delegation_grant.v2";
 /// Canonical schema identifier for behavior-free delegation chains.
-pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation_chain.v1";
+pub const DELEGATION_CHAIN_SCHEMA_VERSION: &str = "splendor.authority.delegation_chain.v2";
 /// Canonical schema identifier for delegated child result contracts.
 pub const DELEGATION_RESULT_CONTRACT_SCHEMA_VERSION: &str =
     "splendor.authority.delegation_result_contract.v1";
+
+/// Trusted resource kind carried by a physical gateway action binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalActionResourceKind {
+    /// One registered physical/edge node.
+    PhysicalNode,
+}
+
+/// Server-derived physical resource coordinate bound into an action digest.
+///
+/// This behavior-free value is not authority by itself. The kernel constructs it
+/// only after matching the authenticated device path, registered profile, and
+/// admitted run scope.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalActionResourceCoordinate {
+    /// Closed resource-kind discriminator.
+    pub resource_kind: PhysicalActionResourceKind,
+    /// Exact registered physical node identity.
+    pub node_id: NodeId,
+}
+
+impl PhysicalActionResourceCoordinate {
+    /// Builds the only physical resource coordinate supported by this slice.
+    pub fn physical_node(node_id: NodeId) -> Self {
+        Self {
+            resource_kind: PhysicalActionResourceKind::PhysicalNode,
+            node_id,
+        }
+    }
+}
 
 /// Namespace that owns a typed operation verb.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -394,7 +428,8 @@ pub enum AuthorityObligationKind {
 /// This contract is not authorizing by itself. `splendor-authority` must validate
 /// it against trusted owning-service context before any receipt can satisfy an
 /// obligation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityObligationReceiptValidation {
     /// Validation mode for this bounded slice.
     pub validation_kind: AuthorityObligationReceiptValidationKind,
@@ -406,6 +441,19 @@ pub struct AuthorityObligationReceiptValidation {
     pub digest: String,
     /// Deterministic local signature/MAC for this bounded slice.
     pub signature: String,
+}
+
+impl fmt::Debug for AuthorityObligationReceiptValidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorityObligationReceiptValidation")
+            .field("validation_kind", &self.validation_kind)
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("digest", &self.digest)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Authority obligation receipt validation mode.
@@ -423,6 +471,7 @@ pub enum AuthorityObligationReceiptValidationKind {
 /// unless `splendor-authority` wraps them as validated receipts using a trusted
 /// owning-service context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityObligationReceipt {
     /// Receipt schema version.
     pub schema_version: String,
@@ -544,6 +593,37 @@ pub struct DelegationResultContract {
     pub max_result_bytes: Option<u64>,
 }
 
+/// Authority-owned cleanup requirements attached to every delegated child.
+///
+/// The strict default is also used when reading older v1 delegation records
+/// that predate this additive field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DelegationCleanupObligations {
+    /// Cancelling or revoking an ancestor must cancel all active descendants.
+    pub cancel_descendants: bool,
+    /// Descendant grant authority must be invalidated with the ancestor.
+    pub revoke_descendant_grants: bool,
+    /// A reservation may be released only before routing has produced effects.
+    pub release_before_routing_failure: bool,
+    /// Routing/start uncertainty consumes the reservation fail-safe.
+    pub consume_after_routing_uncertainty: bool,
+}
+
+impl Default for DelegationCleanupObligations {
+    fn default() -> Self {
+        Self {
+            cancel_descendants: true,
+            revoke_descendant_grants: true,
+            release_before_routing_failure: true,
+            consume_after_routing_uncertainty: true,
+        }
+    }
+}
+
+fn cleanup_obligations_are_default(value: &DelegationCleanupObligations) -> bool {
+    value == &DelegationCleanupObligations::default()
+}
+
 /// Behavior-free delegation edge that embeds the narrowed child capability grant.
 ///
 /// This record is a serializable contract only. Authority validation, parent-edge
@@ -553,6 +633,8 @@ pub struct DelegationResultContract {
 pub struct DelegationGrant {
     /// Delegation-grant schema version.
     pub schema_version: String,
+    /// Canonical digest binding every semantic field on this exact edge.
+    pub binding_digest: String,
     /// Parent capability grant that the child grant narrows from.
     pub parent_grant_id: CapabilityGrantId,
     /// Parent run that requested delegated work.
@@ -585,6 +667,9 @@ pub struct DelegationGrant {
     pub remaining_delegation_depth: u32,
     /// Maximum children this parent edge may fan out to.
     pub max_fan_out: u32,
+    /// Mandatory child cleanup and descendant propagation requirements.
+    #[serde(default, skip_serializing_if = "cleanup_obligations_are_default")]
+    pub cleanup_obligations: DelegationCleanupObligations,
     /// Embedded behavior-free child capability grant.
     pub child_capability_grant: CapabilityGrant,
 }
@@ -600,6 +685,108 @@ pub struct DelegationChain {
     pub grants: Vec<DelegationGrant>,
     /// Maximum allowed chain depth for the recorded chain evidence.
     pub max_depth: u32,
+}
+
+/// Lifecycle state of one atomic authority-owned delegation budget reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationReservationStatus {
+    /// Budget/fan-out was atomically reserved before routing.
+    Reserved,
+    /// Routing and child start succeeded and the immutable edge is active.
+    Committed,
+    /// A pre-routing failure released budget and fan-out.
+    Released,
+    /// Routing may have occurred, so budget/fan-out was consumed fail-safe.
+    ConsumedAfterRoutingFailure,
+    /// The child reached terminal cleanup and released its active reservation.
+    Cleaned,
+    /// Revocation/cancellation invalidated the edge and descendants.
+    Revoked,
+}
+
+/// Replay-safe evidence for an authority-owned delegation ledger transition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationLedgerEvidence {
+    /// Complete immutable ordered chain through the affected child edge.
+    pub chain: DelegationChain,
+    /// Budget reserved component-wise for this edge.
+    pub budget: AuthorityBudgetScope,
+    /// Immutable authority-owned fan-out cap of the parent edge.
+    pub parent_fan_out_limit: u32,
+    /// Reservation lifecycle state represented by this trace transition.
+    pub status: DelegationReservationStatus,
+    /// Stable reason for release, fail-safe consumption, cleanup, or revocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Default redacted trace projection for an authority-owned delegation ledger
+/// transition. Complete grants, scopes, obligations, objectives, message
+/// allowlists, and result parameters remain inside the authority owner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationLedgerTraceSummary {
+    pub schema_version: String,
+    pub root_grant_id: CapabilityGrantId,
+    pub parent_grant_id: CapabilityGrantId,
+    pub child_grant_id: CapabilityGrantId,
+    pub chain_digest: String,
+    pub chain_depth: u32,
+    pub reserved_budget_dimensions: Vec<String>,
+    pub status: DelegationReservationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DelegationLedgerEvidence {
+    /// Produces the policy-independent default trace projection.
+    pub fn redacted_trace_summary(&self) -> DelegationLedgerTraceSummary {
+        let last = self.chain.grants.last();
+        let parent_grant_id = last
+            .map(|edge| edge.parent_grant_id.clone())
+            .unwrap_or_else(|| self.chain.root_grant_id.clone());
+        let child_grant_id = last
+            .map(|edge| edge.child_capability_grant.grant_id.clone())
+            .unwrap_or_else(|| self.chain.root_grant_id.clone());
+        let bytes = serde_json::to_vec(&self.chain).unwrap_or_default();
+        DelegationLedgerTraceSummary {
+            schema_version: "splendor.trace.delegation_ledger_summary.v2".to_string(),
+            root_grant_id: self.chain.root_grant_id.clone(),
+            parent_grant_id,
+            child_grant_id,
+            chain_digest: crate::ContentHash::blake3(bytes).to_string(),
+            chain_depth: self.chain.grants.len() as u32,
+            reserved_budget_dimensions: budget_dimension_names(&self.budget),
+            status: self.status,
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+fn budget_dimension_names(budget: &AuthorityBudgetScope) -> Vec<String> {
+    let mut names = Vec::new();
+    if budget.max_actions_per_tick.is_some() {
+        names.push("max_actions_per_tick".to_string());
+    }
+    if budget.max_action_duration_ms.is_some() {
+        names.push("max_action_duration_ms".to_string());
+    }
+    if budget.max_filesystem_read_bytes.is_some() {
+        names.push("max_filesystem_read_bytes".to_string());
+    }
+    if budget.max_filesystem_write_bytes.is_some() {
+        names.push("max_filesystem_write_bytes".to_string());
+    }
+    if budget.max_network_read_bytes.is_some() {
+        names.push("max_network_read_bytes".to_string());
+    }
+    if budget.max_network_write_bytes.is_some() {
+        names.push("max_network_write_bytes".to_string());
+    }
+    if budget.max_http_requests_per_minute.is_some() {
+        names.push("max_http_requests_per_minute".to_string());
+    }
+    names
 }
 
 /// Authority evaluation request.

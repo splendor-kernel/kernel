@@ -23,6 +23,11 @@ export type InterventionId = string;
 export type CircuitBreakerId = string;
 export type KillSwitchId = string;
 export type PolicyBundleId = string;
+export type PrincipalId = string;
+export type AuthorityDecisionId = string;
+export type CapabilityGrantId = string;
+export type AuthorityObligationId = string;
+export type AuthorityObligationReceiptId = string;
 
 export const CIRCUIT_BREAKER_SCHEMA_VERSION = "splendor.circuit_breaker.v1" as const;
 
@@ -242,6 +247,7 @@ export interface ApprovalPolicy {
   expires_at: ISODateTime | null;
 }
 
+/** Legacy compatibility/replay fact. A Granted value is never effect authority. */
 export interface ApprovalEvidence {
   schema_version: string;
   approval_id: ApprovalId;
@@ -259,9 +265,120 @@ export interface ApprovalEvidence {
   trace_event_id: TraceEventId | null;
 }
 
+export const APPROVAL_CHALLENGE_SCHEMA_VERSION =
+  "splendor.approval_challenge.v1" as const;
+
+/** Closed server-derived physical target kind. This coordinate is not authority by itself. */
+export type PhysicalActionResourceKind = "physical_node";
+
+/** Trusted physical target emitted in a challenge after kernel-side binding. */
+export interface PhysicalActionResourceCoordinate {
+  resource_kind: PhysicalActionResourceKind;
+  node_id: NodeId;
+}
+
+/** Exact non-authorizing daemon challenge that a trusted approval manager must satisfy. */
+export interface ApprovalChallenge {
+  schema_version: typeof APPROVAL_CHALLENGE_SCHEMA_VERSION;
+  approval_id: ApprovalId;
+  tenant_id: TenantId;
+  agent_id: AgentId;
+  run_id: RunId;
+  action_id: ActionId;
+  action_name: string;
+  adapter: string;
+  policy_id: string;
+  risk_level?: string | null;
+  subject: PrincipalId;
+  authority_decision_id: AuthorityDecisionId;
+  obligation_id: AuthorityObligationId;
+  receipt_audience: string;
+  canonical_request_digest: string;
+  gateway_action_request_digest: string;
+  physical_action_resource_coordinate?: PhysicalActionResourceCoordinate | null;
+  authority_decision_digest: string;
+  requested_at: ISODateTime;
+  expires_at: ISODateTime;
+}
+
 export interface GatewayAuthorityObligationEvidence {
   decision: JsonValue;
-  receipts: JsonValue[];
+  receipts: AuthorityObligationReceipt[];
+}
+
+export type AuthorityObligationKind =
+  | "approval_required"
+  | "mfa_assurance"
+  | "dedicated_isolation"
+  | "network_deny"
+  | "human_review"
+  | "independent_evaluator"
+  | "local_safety_verifier"
+  | "postcondition_check"
+  | "maximum_blast_radius"
+  | "redaction_required"
+  | "local_only"
+  | "simulation_only"
+  | "evidence_required";
+
+export interface AuthorityObligationReceiptValidation {
+  validation_kind: "local_signature";
+  algorithm: string;
+  key_id: string;
+  digest: string;
+  signature: string;
+}
+
+export const AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION =
+  "splendor.authority.obligation_receipt.v1" as const;
+
+export interface AuthorityObligationReceipt {
+  schema_version: typeof AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION;
+  receipt_id: AuthorityObligationReceiptId;
+  issuer: PrincipalId;
+  audience: string;
+  obligation_id: AuthorityObligationId;
+  kind: AuthorityObligationKind;
+  subject: PrincipalId;
+  authority_decision_id: AuthorityDecisionId;
+  canonical_request_digest: string;
+  evidence_digest: string;
+  evidence_ref?: string | null;
+  issued_at: ISODateTime;
+  expires_at: ISODateTime;
+  revocation: RevocationStatus;
+  revocation_ref: string;
+  approval_id?: ApprovalId | null;
+  approval_trace_event_id?: TraceEventId | null;
+  validation: AuthorityObligationReceiptValidation;
+}
+
+export const RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION =
+  "splendor.resident.approval_receipt_revocation.v1" as const;
+export const RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION =
+  "splendor.resident.approval_receipt_revocation_ack.v1" as const;
+
+/** Closed manager-to-resident request for revoking one exact retained receipt. */
+export interface ResidentApprovalReceiptRevocationRequest {
+  schema_version: typeof RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION;
+  authority_obligation_receipt: AuthorityObligationReceipt;
+  reason: string;
+}
+
+export type ResidentApprovalReceiptRevocationStatus = "revoked" | "already_revoked";
+export type EffectCertainty = "none" | "known" | "uncertain";
+
+/** Resident acknowledgement of a known exact or semantic receipt revocation. */
+export interface ResidentApprovalReceiptRevocationAck {
+  schema_version: typeof RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION;
+  receipt_id: AuthorityObligationReceiptId;
+  approval_id: ApprovalId;
+  target_instance_id: InstanceId;
+  run_id: RunId;
+  receipt_audience: string;
+  status: ResidentApprovalReceiptRevocationStatus;
+  effect_certainty: EffectCertainty;
+  acknowledged_at: ISODateTime;
 }
 
 export interface ApprovalTraceContext {
@@ -338,7 +455,7 @@ export interface Message {
   created_at: ISODateTime;
 }
 
-export type MessageSchemaVersion = "v1";
+export type MessageSchemaVersion = "v1" | "v2";
 export type MessageDeliveryStatus = "pending" | "queued" | "delivered" | "rejected" | "expired" | "consumed";
 
 export interface MessageTraceLinks {
@@ -383,6 +500,56 @@ export interface LocalDelegationTraceContext {
   source_agent_id: AgentId;
   target_agent_id: AgentId;
   objective: string;
+  authority_evidence?: {
+    schema_version: "splendor.message.local_delegation_authority_evidence.v1";
+    parent_capability_grant_id: CapabilityGrantId;
+    child_capability_grant_id: CapabilityGrantId;
+    authority_reason?: string;
+  };
+  /** v2 redacted projection; full grants/chains remain authority-owned. */
+  delegation_ledger?: DelegationLedgerTraceSummary;
+}
+
+export type DelegationReservationStatus =
+  | "reserved"
+  | "committed"
+  | "released"
+  | "consumed_after_routing_failure"
+  | "cleaned"
+  | "revoked";
+
+export interface DelegationLedgerTraceSummary {
+  schema_version: "splendor.trace.delegation_ledger_summary.v2";
+  root_grant_id: CapabilityGrantId;
+  parent_grant_id: CapabilityGrantId;
+  child_grant_id: CapabilityGrantId;
+  chain_digest: string;
+  chain_depth: number;
+  reserved_budget_dimensions: string[];
+  status: DelegationReservationStatus;
+  reason?: string;
+}
+
+export interface DelegatedAuthority {
+  allowed_actions: string[];
+  allowed_adapters: string[];
+  allowed_permissions: string[];
+}
+
+/** Live delegated workload/message contract. v1 is replay/migration-only. */
+export interface TaskRequestV2 {
+  parent_run_id: RunId;
+  child_run_id: RunId;
+  target_agent_id: AgentId;
+  objective: string;
+  delegated_authority: DelegatedAuthority;
+  capability_grant_id: CapabilityGrantId;
+  authority_evidence?: {
+    schema_version: "splendor.message.local_delegation_authority_evidence.v1";
+    parent_capability_grant_id: CapabilityGrantId;
+    child_capability_grant_id: CapabilityGrantId;
+    authority_reason?: string;
+  };
 }
 
 export interface TaskFailure {
@@ -922,6 +1089,7 @@ export interface ActionRequest {
   tenant_id: TenantId;
   agent_id: AgentId;
   run_id: RunId;
+  tick_id?: TickId;
   action: Action;
   adapter: string | null;
   quota_usage: QuotaUsage;
@@ -929,6 +1097,7 @@ export interface ActionRequest {
   requested_at: ISODateTime;
   approval_evidence: ApprovalEvidence | null;
   authority_obligation_evidence: GatewayAuthorityObligationEvidence | null;
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface ActionOutcome {
@@ -938,6 +1107,7 @@ export interface ActionOutcome {
   post_verification: VerificationResult | null;
   output: JsonValue | null;
   error: string | null;
+  approval_challenge?: ApprovalChallenge | null;
   completed_at: ISODateTime;
 }
 
@@ -976,15 +1146,19 @@ export interface RunConfig {
 }
 
 export interface DaemonActionCandidate {
+  action_id?: ActionId | null;
   action: Action;
   adapter: string | null;
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
+  requested_at?: ISODateTime | null;
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface RegisteredAction {
   name: string;
   adapter: string;
+  required_permissions?: string[];
 }
 
 export interface TenantConfig {
@@ -1087,9 +1261,11 @@ export type EndpointScope =
   | "policies_publish"
   | "policies_revoke"
   | "approvals_manage"
+  | "approval_receipts_revoke"
   | "governance_control"
   | "device_register"
   | "device_read"
+  | "device_trace_sync"
   | "operator_intervene"
   | "nodes_register"
   | "instances_register"
@@ -1185,6 +1361,51 @@ export interface AuditAttribution {
   requested_at: ISODateTime;
 }
 
+export interface ManagerSecurityFields {
+  credential: CallerCredential;
+  audit_attribution: AuditAttribution;
+}
+
+export interface ApprovalRequestPayload extends ManagerSecurityFields {
+  approval_id: ApprovalId;
+  tenant_id: TenantId;
+  agent_id: AgentId;
+  run_id: RunId;
+  action_id: ActionId;
+  action_name: string;
+  adapter: string;
+  policy_id: string;
+  risk_level?: string | null;
+  audience: string;
+  expires_at: ISODateTime;
+  reason: string;
+  challenge?: ApprovalChallenge | null;
+}
+
+export interface GovernanceApprovalRecord {
+  approval_id: ApprovalId;
+  tenant_id: TenantId;
+  agent_id: AgentId;
+  run_id: RunId;
+  action_id: ActionId;
+  action_name: string;
+  adapter: string;
+  policy_id: string;
+  risk_level: string | null;
+  audience: string;
+  status: Extract<ApprovalStatus, "requested" | "granted" | "denied" | "revoked">;
+  reason: string;
+  issued_by: AuditAttribution;
+  requested_by: AuditAttribution;
+  decided_by?: AuditAttribution | null;
+  expires_at: ISODateTime;
+  trace_event_id: TraceEventId;
+  evidence: ApprovalEvidence | null;
+  challenge?: ApprovalChallenge | null;
+  authority_obligation_receipt?: AuthorityObligationReceipt | null;
+  resident_receipt_revocation_ack?: ResidentApprovalReceiptRevocationAck | null;
+}
+
 export interface CreateRunRequest {
   request_id: string;
   idempotency_key: string;
@@ -1223,6 +1444,7 @@ export interface LifecycleRequest {
   audit_attribution: AuditAttribution | null;
   reason: string | null;
   approval_evidence: ApprovalEvidence | null;
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface RunInspectResponse {
@@ -1294,6 +1516,74 @@ export interface ReplayResponse {
   event_count: number;
   action_event_count: number;
   approval_events: ApprovalReplayEvent[];
+  authority_decisions: AuthorityDecisionReplayEvent[];
+}
+
+export const AUTHORITY_OPERATION_NAMESPACE_VALUES = [
+  "agent",
+  "workload",
+  "gateway",
+  "data",
+  "artifact",
+  "state",
+  "driver",
+  "network",
+  "device",
+  "change",
+  "compatibility"
+] as const;
+export type AuthorityOperationNamespace = (typeof AUTHORITY_OPERATION_NAMESPACE_VALUES)[number];
+
+export const AUTHORITY_RESOURCE_KIND_VALUES = [
+  "agent",
+  "workload",
+  "action",
+  "adapter",
+  "permission",
+  "data",
+  "artifact",
+  "state_partition",
+  "driver_operation",
+  "network",
+  "device",
+  "change"
+] as const;
+export type AuthorityResourceKind = (typeof AUTHORITY_RESOURCE_KIND_VALUES)[number];
+
+export const AUTHORITY_VERB_VALUES = [
+  "invoke",
+  "use",
+  "read",
+  "write",
+  "publish",
+  "train",
+  "evaluate",
+  "admit",
+  "delegate",
+  "egress",
+  "actuate",
+  "propose",
+  "activate"
+] as const;
+export type AuthorityVerb = (typeof AUTHORITY_VERB_VALUES)[number];
+
+export interface GatewayAuthorityDecisionSummary {
+  decision_id: string;
+  status: "allowed" | "denied" | "conditional" | "needs_approval" | "needs_intervention";
+  namespace: AuthorityOperationNamespace;
+  resource_kind: AuthorityResourceKind;
+  verb: AuthorityVerb;
+  decision_digest: string;
+  reason_codes: string[];
+  matched_grant_ids: string[];
+  obligation_ids: string[];
+}
+
+export interface AuthorityDecisionReplayEvent {
+  trace_event_id: TraceId;
+  sequence: number;
+  action_id: ActionId | null;
+  decisions: GatewayAuthorityDecisionSummary[];
 }
 
 export interface ApprovalReplayEvent {
@@ -1337,7 +1627,9 @@ export interface SubmitActionRequest {
   adapter: string | null;
   quota_usage: QuotaUsage | null;
   satisfied_preconditions: string[];
+  requested_at?: ISODateTime | null;
   approval_evidence: ApprovalEvidence | null;
+  authority_obligation_receipts?: AuthorityObligationReceipt[];
 }
 
 export interface HealthResponse {
@@ -1384,6 +1676,26 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "requires_response",
     "created_at"
   ],
+  task_request_v2: [
+    "parent_run_id",
+    "child_run_id",
+    "target_agent_id",
+    "objective",
+    "delegated_authority",
+    "capability_grant_id",
+    "authority_evidence"
+  ],
+  delegation_ledger_trace_summary: [
+    "schema_version",
+    "root_grant_id",
+    "parent_grant_id",
+    "child_grant_id",
+    "chain_digest",
+    "chain_depth",
+    "reserved_budget_dimensions",
+    "status",
+    "reason"
+  ],
   run_config: [
     "trace_db",
     "state_db",
@@ -1401,15 +1713,17 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "tenant_id",
     "agent_id",
     "run_id",
+    "tick_id",
     "action",
     "adapter",
     "quota_usage",
     "satisfied_preconditions",
     "requested_at",
     "approval_evidence",
-    "authority_obligation_evidence"
+    "authority_obligation_evidence",
+    "authority_obligation_receipts"
   ],
-  action_outcome: ["action_id", "status", "verification", "post_verification", "output", "error", "completed_at"],
+  action_outcome: ["action_id", "status", "verification", "post_verification", "output", "error", "approval_challenge", "completed_at"],
   external_governance_reference: ["provider", "reference_id", "endpoint"],
   external_governance_endpoints: [
     "work_orders",
@@ -1482,7 +1796,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "initial_state",
     "snapshot_interval"
   ],
-  lifecycle_request: ["credential", "work_order", "audit_attribution", "reason", "approval_evidence"],
+  lifecycle_request: ["credential", "work_order", "audit_attribution", "reason", "approval_evidence", "authority_obligation_receipts"],
   run_inspect_response: [
     "run_id",
     "tenant_id",
@@ -1509,7 +1823,7 @@ export const CANONICAL_SCHEMA_FIELDS = {
   trace_page_response: ["run_id", "records"],
   trace_export_request: ["credential", "audit_attribution", "redaction_policy", "start", "end"],
   trace_export_response: ["run_id", "records", "record_count", "redaction_policy", "integrity_hash"],
-  replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events"],
+  replay_response: ["replay_id", "run_id", "mode", "event_count", "action_event_count", "approval_events", "authority_decisions"],
   submit_action_request: [
     "action_id",
     "run_id",
@@ -1522,13 +1836,17 @@ export const CANONICAL_SCHEMA_FIELDS = {
     "adapter",
     "quota_usage",
     "satisfied_preconditions",
-    "approval_evidence"
+    "requested_at",
+    "approval_evidence",
+    "authority_obligation_receipts"
   ],
   health_response: ["status", "local_only", "runtime_available"],
   version_response: ["daemon_api_version", "compatibility_line", "openapi_version", "local_only", "schema_versions"],
   capabilities_response: ["daemon_api_version", "local_only", "replay_modes", "endpoints", "service_profiles"]
 } as const satisfies {
   message: readonly (keyof Message)[];
+  task_request_v2: readonly (keyof TaskRequestV2)[];
+  delegation_ledger_trace_summary: readonly (keyof DelegationLedgerTraceSummary)[];
   run_config: readonly (keyof RunConfig)[];
   percept: readonly (keyof Percept)[];
   action_request: readonly (keyof ActionRequest)[];
@@ -1686,9 +2004,11 @@ export const ENDPOINT_SCOPE_VALUES = [
   "PoliciesPublish",
   "PoliciesRevoke",
   "ApprovalsManage",
+  "ApprovalReceiptsRevoke",
   "GovernanceControl",
   "DeviceRegister",
   "DeviceRead",
+  "DeviceTraceSync",
   "OperatorIntervene"
 ] as const;
 
@@ -1717,9 +2037,11 @@ export const ENDPOINT_SCOPE_LABELS: Record<EndpointScope, string> = {
   policies_publish: "splendor.policies.publish",
   policies_revoke: "splendor.policies.revoke",
   approvals_manage: "splendor.approvals.manage",
+  approval_receipts_revoke: "splendor.approval_receipts.revoke",
   governance_control: "splendor.governance.control",
   device_register: "splendor.device.register",
   device_read: "splendor.device.read",
+  device_trace_sync: "splendor.device.trace_sync",
   operator_intervene: "splendor.operator.intervene",
   nodes_register: "splendor.nodes.register",
   instances_register: "splendor.instances.register",

@@ -8,6 +8,7 @@ import type {
   CreateRunRequest,
   LifecycleRequest,
   Percept,
+  ResidentApprovalReceiptRevocationRequest,
   SubmitActionRequest,
   TraceRecord,
   WorkOrderEnvelope
@@ -166,6 +167,37 @@ test("client refuses unauthenticated fallback", () => {
   assert.throws(() => new SplendorClient({ baseUrl: "   ", token: "token" }), /baseUrl/);
 });
 
+test("client restricts bearer transport to HTTPS or explicit loopback HTTP", () => {
+  const fetcher = makeRawFetch("{}", 200);
+  for (const baseUrl of [
+    "https://daemon.example",
+    "https://daemon.example:8443/v1",
+    "http://localhost:8077",
+    "http://127.0.0.1:8077",
+    "http://[::1]:8077"
+  ]) {
+    assert.doesNotThrow(() => new SplendorClient({ baseUrl, token: "token", fetch: fetcher }), baseUrl);
+  }
+  for (const baseUrl of [
+    "http://daemon.example",
+    "http://192.0.2.1:8077",
+    "ftp://daemon.example",
+    "ws://daemon.example",
+    "daemon.example",
+    "https://user:password@daemon.example",
+    "https://daemon.example?",
+    "https://daemon.example?redirect=https://attacker.invalid",
+    "https://daemon.example#",
+    "https://daemon.example#fragment"
+  ]) {
+    assert.throws(
+      () => new SplendorClient({ baseUrl, token: "token", fetch: fetcher }),
+      /HTTPS or explicit loopback HTTP/,
+      baseUrl
+    );
+  }
+});
+
 test("client reports unavailable fetch implementation", () => {
   const originalFetch = globalThis.fetch;
   try {
@@ -180,7 +212,7 @@ test("createRun posts run config with work-order envelope and audit attribution"
   const { fetcher, calls } = makeFetch({
     request_id: "req_test_create_run",
     idempotency_key: "idem_test_create_run",
-    idempotency_receipt_id: "create_run:fnv64:test",
+    idempotency_receipt_id: "create_run:blake3:test",
     duplicate: false,
     run_id: runId,
     status: "pending"
@@ -194,10 +226,24 @@ test("createRun posts run config with work-order envelope and audit attribution"
   assert.equal(calls.length, 1);
   assert.equal(new URL(calls[0].url).pathname, "/v1/runs");
   assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.redirect, "error");
   const headers = new Headers(calls[0].init.headers);
   assert.equal(headers.get("authorization"), "Bearer token");
   assert.equal(headers.get("x-splendor-api-version"), "0.02-dev");
   assert.deepEqual(calls[0].jsonBody, createRunRequest);
+});
+
+test("every credentialed request rejects redirects at fetch", async () => {
+  const { fetcher, calls } = makeFetch({ status: "ok" });
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+
+  await client.getHealth();
+  await client.inspectRun(runId);
+  await client.startRun(runId, lifecycleRequest);
+
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.init.redirect === "error"));
+  assert.ok(calls.every((call) => new Headers(call.init.headers).get("authorization") === "Bearer token"));
 });
 
 test("createRun fails closed when work order or audit attribution is absent", async () => {
@@ -355,6 +401,65 @@ test("submitAction stays trace-linked and audit-attributed", async () => {
   await assert.rejects(() => client.submitAction({ ...request, causal_trace_id: null }), /trace linkage/);
   await assert.rejects(() => client.submitAction({ ...request, audit_attribution: null }), /audit attribution/);
   await assert.rejects(() => client.submitAction({ ...request, credential: null }), /caller credential/);
+});
+
+test("revokeApprovalReceipt posts the exact retained receipt to the owning run", async () => {
+  const receiptId = "00000000-0000-4000-8000-000000000020";
+  const approvalId = "00000000-0000-4000-8000-000000000021";
+  const request: ResidentApprovalReceiptRevocationRequest = {
+    schema_version: "splendor.resident.approval_receipt_revocation.v1",
+    authority_obligation_receipt: {
+      schema_version: "splendor.authority.obligation_receipt.v1",
+      receipt_id: receiptId,
+      issuer: "00000000-0000-4000-8000-000000000022",
+      audience: `splendor.daemon.approval_receipt.v2:instance:00000000-0000-4000-8000-000000000023:run:${runId}`,
+      obligation_id: "00000000-0000-4000-8000-000000000024",
+      kind: "approval_required",
+      subject: "00000000-0000-4000-8000-000000000025",
+      authority_decision_id: "00000000-0000-4000-8000-000000000026",
+      canonical_request_digest: "blake3:request",
+      evidence_digest: "blake3:evidence",
+      issued_at: "2026-07-12T00:00:00Z",
+      expires_at: "2026-07-12T00:05:00Z",
+      revocation: "active",
+      revocation_ref: "revocation:receipt",
+      approval_id: approvalId,
+      approval_trace_event_id: "00000000-0000-4000-8000-000000000027",
+      validation: {
+        validation_kind: "local_signature",
+        algorithm: "local-obligation-receipt-v1",
+        key_id: "receipt-key",
+        digest: "blake3:receipt",
+        signature: "signature"
+      }
+    },
+    reason: "operator revoked approval"
+  };
+  const acknowledgement = {
+    schema_version: "splendor.resident.approval_receipt_revocation_ack.v1",
+    receipt_id: receiptId,
+    approval_id: approvalId,
+    target_instance_id: "00000000-0000-4000-8000-000000000023",
+    run_id: runId,
+    receipt_audience: request.authority_obligation_receipt.audience,
+    status: "revoked",
+    effect_certainty: "known",
+    acknowledged_at: "2026-07-12T00:01:00Z"
+  };
+  const { fetcher, calls } = makeFetch(acknowledgement);
+  const client = new SplendorClient({ baseUrl: "https://daemon.example", token: "token", fetch: fetcher });
+
+  assert.equal((await client.revokeApprovalReceipt(runId, receiptId, request)).status, "revoked");
+  assert.equal(
+    new URL(calls[0].url).pathname,
+    `/runs/${runId}/approval-receipts/${receiptId}/revoke`
+  );
+  assert.deepEqual(calls[0].jsonBody, request);
+  await assert.rejects(
+    () => client.revokeApprovalReceipt(runId, "00000000-0000-4000-8000-000000000099", request),
+    /identities to match/
+  );
+  assert.equal(calls.length, 1);
 });
 
 test("readTraces requires redaction policy and preserves event order", async () => {
@@ -515,6 +620,92 @@ test("network and malformed daemon responses become structured client errors", a
       assert.equal(error.code, "invalid_json");
       assert.equal(error.requestId, "corr_1");
       assert.equal(error.responseBody, "not-json");
+      return true;
+    }
+  );
+});
+
+test("client errors never expose bearer token bytes", async () => {
+  const token = "resident-secret-token-material";
+  const networkClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: async () => {
+      throw new Error(`transport rejected Authorization: Bearer ${token}`);
+    }
+  });
+  await assert.rejects(
+    () => networkClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      assert.doesNotMatch(JSON.stringify(error.details), new RegExp(token));
+      assert.match(JSON.stringify(error.details), /\[REDACTED\]/);
+      return true;
+    }
+  );
+
+  const reflectedClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: makeRawFetch(
+      JSON.stringify({
+        code: "invalid_token",
+        message: `rejected ${token}`,
+        details: { authorization: `Bearer ${token}` }
+      }),
+      401
+    )
+  });
+  await assert.rejects(
+    () => reflectedClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      const rendered = JSON.stringify({
+        message: error.message,
+        details: error.details,
+        responseBody: error.responseBody
+      });
+      assert.doesNotMatch(rendered, new RegExp(token));
+      assert.match(rendered, /\[REDACTED\]/);
+      return true;
+    }
+  );
+
+  const malformedClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: makeRawFetch(`not-json:${token}`, 200)
+  });
+  await assert.rejects(
+    () => malformedClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      assert.doesNotMatch(JSON.stringify(error.responseBody), new RegExp(token));
+      return true;
+    }
+  );
+
+  const reflectedTextClient = new SplendorClient({
+    baseUrl: "https://daemon.example",
+    token,
+    fetch: async () => new Response(`plain:${token}`, {
+      status: 500,
+      statusText: `failure:${token}`,
+      headers: { "x-request-id": `request:${token}` }
+    })
+  });
+  await assert.rejects(
+    () => reflectedTextClient.getHealth(),
+    (error: unknown) => {
+      assert.ok(error instanceof SplendorClientError);
+      const rendered = JSON.stringify({
+        message: error.message,
+        requestId: error.requestId,
+        details: error.details,
+        responseBody: error.responseBody
+      });
+      assert.doesNotMatch(rendered, new RegExp(token));
+      assert.match(rendered, /\[REDACTED\]/);
       return true;
     }
   );

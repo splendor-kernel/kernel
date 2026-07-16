@@ -31,7 +31,30 @@ Every non-dev request to a daemon, sidecar, resident node, or central manager mu
 - revocation path;
 - trace/audit attribution for mutating calls.
 
+Credentialed resident acceptance clients must disable redirects without
+disabling CA/hostname verification. They must return every 3xx as an error
+response and never forward Authorization to a redirected origin or HTTPS-to-HTTP
+target. Acceptance security summaries are derived from token-free per-call
+events and matching API traffic; a top-level passing boolean is not evidence.
+
 Local development mode is valid only when explicitly enabled, loopback/Unix-socket bound, warning-logged, and excluded from fleet/remote/resident/production operation.
+
+Accepted RFC 0011 supplies one concrete manager→resident reference path. The
+manager mints a fresh closed-profile Ed25519 bearer for each create/start call;
+the resident verifies it over TLS and derives the caller projection. Body/header
+credential objects are non-authoritative mirrors. Mutating JTIs are one-use,
+raw JTI is reduced to a domain-separated correlation digest, and resident audit
+time is server-owned. Manager egress requires a configured exact-origin
+allowlist and immutable work-order/placement/node/instance binding. This does **not** authenticate
+the manager API generally. Only approval request/grant/deny/revoke additionally
+reuse the closed verifier profile with an exact central-manager audience,
+configured fleet binding, exact client subject, exact
+`splendor.approvals.manage` scope, and one-use
+mutating JTI. Their request credential and audit principal/credential identity
+are non-authoritative mirrors. Approval caller trust and outbound resident
+dispatch must use distinct signing keys. The `splendor-manager` binary remains explicit
+local acceptance/dev infrastructure without manager TLS and must not be exposed
+or claimed as a production-authenticated central manager.
 
 ---
 
@@ -62,9 +85,11 @@ Scopes should be stable string values so clients and generated tests can reason 
 | `splendor.policies.publish` | publish governance/safety policy bundle. |
 | `splendor.policies.revoke` | revoke policy bundle. |
 | `splendor.approvals.manage` | grant/deny/revoke approval under scoped authority. |
+| `splendor.approval_receipts.revoke` | revoke one exact retained approval receipt at its owning resident ledger. |
 | `splendor.governance.control` | create/clear circuit breakers and activate kill switches. |
 | `splendor.device.register` | register physical/edge device profiles. |
 | `splendor.device.read` | read device safety status and policy cache status. |
+| `splendor.device.trace_sync` | mutate reconnect trace-sync acknowledgement after full batch integrity validation. |
 | `splendor.operator.intervene` | grant/deny local intervention requests. |
 
 ---
@@ -80,14 +105,15 @@ Scopes should be stable string values so clients and generated tests can reason 
 | `inspectRun` | `/runs/{run_id}` | `GET` | `splendor.runs.read` | No, but tenant binding required | Returns run state, tenant/agent/run IDs, current status, work-order linkage, and redacted metadata. |
 | `startRun` | `/runs/{run_id}/start` | `POST` | `splendor.runs.control` | Existing run must be work-order authorized | Starts scheduler loop; mutating call trace-attributed. |
 | `pauseRun` | `/runs/{run_id}/pause` | `POST` | `splendor.runs.control` | Existing run | Pauses run with reason and trace event. |
-| `resumeRun` | `/runs/{run_id}/resume` | `POST` | `splendor.runs.control` | Existing run plus valid approval/intervention token when required | Resumes only when runtime state and governance conditions allow. |
+| `resumeRun` | `/runs/{run_id}/resume` | `POST` | `splendor.runs.control` | Existing run and original bound work order | Resumes a normally paused run only. `waiting_for_approval` must progress through an exact receipt-bearing `submitAction`; raw approval evidence and receipt-bearing lifecycle requests are rejected without a tick. |
 | `cancelRun` | `/runs/{run_id}/cancel` | `POST` | `splendor.runs.control` | Existing run | Cancels/denies safely with trace/audit reason. |
 | `stopRun` | `/runs/{run_id}/stop` | `POST` | `splendor.runs.control` | Existing run | Stops local execution without deleting trace/state evidence. |
 | `appendPercept` | `/percepts` or `/runs/{run_id}/percepts` | `POST` | `splendor.percepts.append` | Existing run/context | Appends structured percept and emits trace; does not execute side effects directly. |
-| `submitAction` | `/actions` or `/runs/{run_id}/actions` | `POST` | `splendor.actions.submit` | Existing run/action must be work-order-compatible | Submits action request to runtime gateway; API handler cannot self-attest verifier completion. |
+| `submitAction` | `/actions` or `/runs/{run_id}/actions` | `POST` | `splendor.actions.submit` | Existing run/action must be work-order-compatible | Submits action request to runtime gateway; API handler cannot self-attest verifier completion. A waiting approval run accepts only its exact challenged action with a trusted owning-service obligation receipt. |
+| `revokeApprovalReceipt` | `/runs/{run_id}/approval-receipts/{receipt_id}/revoke` | `POST` | `splendor.approval_receipts.revoke` | Existing run and exact retained signed receipt | Resident validates path/receipt/approval/audience bindings and atomically revokes before claim, or returns `approval_receipt_revocation_too_late` when execution already claimed it. Success requires a typed `known` acknowledgement. |
 | `getStateHead` | `/state-head` or `/runs/{run_id}/state-head` | `GET` | `splendor.state.read` | No, but tenant binding required | Returns current state node ID/hash/parent/linkage; no hidden state. |
-| `exportStateSnapshot` | `/state-snapshots/export` | `POST` | `splendor.state.handoff` | Existing run/context | Exports explicit state reference for replay/handoff. |
-| `importStateSnapshot` | `/state-snapshots/import` | `POST` | `splendor.state.handoff` | Existing target context | Validates tenant/run/hash/version before import. |
+| `exportStateSnapshot` | `/state-snapshots/export` | `POST` | `splendor.state.handoff` | Existing run plus its admitted signed work order | Exports the current state owner head as an explicit v0 handoff; binds source/receiver instance, expected receiver head, work-order ID, and source trace. |
+| `importStateSnapshot` | `/state-snapshots/import` | `POST` | `splendor.state.handoff` | Exact signed work-order envelope admitted for the target run; necessary but insufficient in resident mode | Resident mode validates caller scope and the exact target work order, then returns `503 state_handoff_proof_unavailable`/`needs_intervention` before store/state/trace mutation because v0 has no accepted source-authenticated proof. Successful import is experimental loopback `local_dev` compatibility only. |
 | `getRunTraces` | `/traces` or `/runs/{run_id}/traces` | `GET` | `splendor.traces.read` | No, but redaction policy required | Returns append-only trace records with required redaction. |
 | `exportTraces` | `/traces/export` | `POST` | `splendor.traces.read` | No, but redaction policy required | Exports trace package and integrity metadata. |
 | `replayRun` | `/replay` or `/runs/{run_id}/replay` | `POST` | `splendor.replay.run` | Existing trace/state evidence | Runs inspect-only by default; side-effectful modes separately gated and off by default. |
@@ -100,13 +126,14 @@ Scopes should be stable string values so clients and generated tests can reason 
 | --- | --- | --- | --- | --- |
 | `registerNode` | `/fleet/nodes` | `POST` | `splendor.fleet.register` | Registers stable `fleet_id`/`node_id`, node kind, trust level, locality, health endpoint, version, supported features. |
 | `registerInstance` | `/fleet/instances` | `POST` | `splendor.fleet.register` | Registers `instance_id` distinct from node/agent/run; binds tenant/fleet/runtime mode. |
-| `heartbeatNode` | `/fleet/nodes/{node_id}/heartbeat` | `POST` | `splendor.fleet.register` | Updates health without authorizing placement/actions by itself. |
+| `heartbeatNode` | `/fleet/nodes/{node_id}/heartbeat` | `POST` | `splendor.fleet.register` | Updates health without authorizing placement/actions by itself; freshness uses manager receipt time, not sender timestamps. |
+| `heartbeatInstance` | `/fleet/instances/{instance_id}/heartbeat` | `POST` | `splendor.instances.heartbeat` | Uses the existing typed registry owner to refresh mutable instance health only; path/body identity, parent node, scope, expiry/revocation, and audit attribution are checked. Freshness uses monotonic manager receipt time. |
 | `advertiseCapabilities` | `/fleet/nodes/{node_id}/capabilities` | `POST` | `splendor.fleet.register` | Publishes capability set, quotas, adapter levels, locality, safety status. |
 | `listNodes` | `/fleet/nodes` | `GET` | `splendor.fleet.read` | Reads registry; cannot dispatch or authorize by itself. |
 | `evaluatePlacement` | `/fleet/placement/evaluate` | `POST` | `splendor.fleet.read` | Explains valid target or rejection based on explicit capability/work-order rules. |
-| `submitWorkOrder` | `/work-orders` | `POST` | `splendor.work_orders.submit` | Validates signature, tenant, expiry, revocation, allowed actions/adapters/permissions/data refs/quotas/audience. |
+| `submitWorkOrder` | `/work-orders` | `POST` | `splendor.work_orders.submit` | Validates signature, tenant, expiry, revocation, allowed actions/adapters/permissions/data refs/quotas/audience. An additive default-empty `approval_policies` list is closed, bounded, narrowing-only, and digest-bound immutably beside the accepted signed envelope; it is not work-order authority. Same-ID policy replacement fails. |
 | `revokeWorkOrder` | `/work-orders/{work_order_id}/revoke` | `POST` | `splendor.work_orders.revoke` | Prevents create/resume/authorize for revoked work order. |
-| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. Resident daemon create-run payloads carry deterministic request and idempotency keys derived from dispatch scope. |
+| `dispatchWorkOrder` | `/work-orders/{work_order_id}/dispatch` | `POST` | `splendor.fleet.dispatch` | Dispatches to selected node only after validation and placement; trace-linked. Requires a signed run-bound work order, a current typed locality class, and one unambiguous work-order-v1 adapter profile. Dispatch has no approval-policy override: it integrity-checks and forwards only the immutable manager-admitted policy set, keeps the first `policy_actions` list empty, and cannot widen signed authority. A per-work-order async gate is allocated atomically only for accepted work orders and linearizes revocation across create/start; unknown IDs allocate no gate, tombstone, or dispatch terminal state. Revocation/expiry are rechecked immediately before each send. Manager transport validates TLS CA/hostname, disables redirects, bounds time/response bytes, sends fresh one-scope caller tokens, checks exact typed create/start identities, records partial/unknown-effect failure, never reports non-2xx as running, and never auto-retries an unknown-effect start. A provisional unknown-effect quarantine survives cancellation after start may have been sent and is cleared only with authoritative success-report storage. Exact duplicates reuse stored terminal results. Accepted records remain process-local acceptance-manager lifecycle state; this is not a production retention service. |
 | `getFleetTelemetry` | `/fleet/telemetry` | `GET` | `splendor.fleet.read` | Reports health/run/quota/trace-sync status; non-authoritative. |
 | `syncTraceBuffer` | `/fleet/traces/sync` | `POST` | `splendor.traces.read` or node sync credential | Aggregates trace buffers with ordering/integrity validation. |
 
@@ -137,14 +164,20 @@ Message operations must reject unsupported schemas, unauthorized recipients, cro
 | `publishPolicyBundle` | `/policies` | `POST` | `splendor.policies.publish` | Publishes policy with version, TTL, tenant/fleet scope, risk rules, revocation metadata. |
 | `revokePolicyBundle` | `/policies/{policy_id}/revoke` | `POST` | `splendor.policies.revoke` | Revoked policy denies high-risk side effects or requests intervention. |
 | `getPolicyStatus` | `/policies/{policy_id}` | `GET` | `splendor.fleet.read` | Reads status only; cannot authorize action. |
-| `requestApproval` | `/approvals` | `POST` | Runtime or governance bridge credential | Creates approval request tied to action/run/work order; adapter not called. |
-| `grantApproval` | `/approvals/{approval_id}/grant` | `POST` | `splendor.approvals.manage` | Grants scoped, expiring approval for exact action/risk/context. |
-| `denyApproval` | `/approvals/{approval_id}/deny` | `POST` | `splendor.approvals.manage` | Denies pending action/run and trace-links reason. |
-| `revokeApproval` | `/approvals/{approval_id}/revoke` | `POST` | `splendor.approvals.manage` | Prevents future resume/authorization. |
+| `requestApproval` | `/approvals` | `POST` | `splendor.approvals.manage` | Requires a fresh exact-audience, fleet-bound, one-scope manager bearer before recording the complete daemon-issued `ApprovalChallenge`; legacy scalar coordinates must match it exactly. The challenge is non-authorizing and the adapter is not called. |
+| `grantApproval` | `/approvals/{approval_id}/grant` | `POST` | `splendor.approvals.manage` | Immutably grants the recorded exact challenge and returns one raw `AuthorityObligationReceipt` issued from trusted process configuration. The compatibility `ApprovalEvidence` projection is non-authorizing. Exact duplicate grants are idempotent; changed or terminal decisions conflict. |
+| `denyApproval` | `/approvals/{approval_id}/deny` | `POST` | `splendor.approvals.manage` | Immutably denies the recorded challenge and trace-links reason; a later grant conflicts. |
+| `revokeApproval` | `/approvals/{approval_id}/revoke` | `POST` | `splendor.approvals.manage` | For a pre-grant approval, marks the manager record revoked. For a granted approval, retains the immutable resident target and exact raw receipt, blocks concurrent dispatch through the approval gate, sends the dedicated resident revocation request over validated TLS with a fresh one-scope bearer, and commits manager revocation only after an exact `known` acknowledgement. Uncertain transport/acknowledgement fails closed. Revocation state is not restart-durable in this slice. |
 | `createCircuitBreaker` | `/governance/circuit-breakers` | `POST` | `splendor.governance.control` | Blocks matching tenant/agent/adapter/action/node/fleet/global scope. |
 | `clearCircuitBreaker` | `/governance/circuit-breakers/{breaker_id}/clear` | `POST` | `splendor.governance.control` | Clears only with scoped authority and trace event. |
 | `activateKillSwitch` | `/governance/kill-switches` | `POST` | `splendor.governance.control` | Cancels/blocks matching runs/actions fail-closed. |
 | `exportGovernanceAudit` | `/governance/audit/export` | `POST` | `splendor.traces.read` | Exports approval/denial/circuit/kill/policy explanations. |
+
+The four approval mutations consume a fresh verified bearer before approval
+state, audit, or receipt mutation. Missing/stale trust, missing/forged/replayed
+proof, wrong audience/fleet/scope, or credential/audit identity mirror mismatch
+fails closed. This bounded profile does not authenticate the other governance or
+fleet operations in the acceptance manager.
 
 ---
 
@@ -159,7 +192,7 @@ Message operations must reject unsupported schemas, unauthorized recipients, cro
 | `requestOperatorIntervention` | `/operator/interventions` | `POST` | Runtime or edge credential | Requests local/manual approval for ambiguous/high-risk action. |
 | `grantOperatorIntervention` | `/operator/interventions/{intervention_id}/grant` | `POST` | `splendor.operator.intervene` | Grants scoped local intervention with expiry. |
 | `denyOperatorIntervention` | `/operator/interventions/{intervention_id}/deny` | `POST` | `splendor.operator.intervene` | Denies and trace-links reason. |
-| `syncDeviceTraceBuffer` | `/devices/{node_id}/trace-buffer/sync` | `POST` | Node sync credential | Syncs buffered offline traces with ordering/integrity checks. |
+| `syncDeviceTraceBuffer` | `/devices/{node_id}/trace-buffer/sync` | `POST` | `splendor.device.trace_sync` | Requires a dedicated mutating resident credential and exact path node/tenant binding. Rejects the entire batch unless it is non-empty, starts at sequence zero, is contiguous, has exact request/record run identity and internal previous-hash continuity, and every event hash recomputes from its payload and previous hash. Exact valid full-batch retries are revalidated and accepted; this local acknowledgement endpoint does not claim central persistence or exactly-once delivery. |
 
 Allowed high-level physical actions for acceptance fixtures:
 
@@ -198,6 +231,13 @@ hard_real_time_stabilization
 Every schema below must be exposed in the OpenAPI contract or referenced from canonical schema files with generated/parity-checked Rust, Python, and TypeScript models.
 
 ### `CallerCredential`
+
+On the resident daemon this object is a deprecated compatibility projection of
+verified bearer claims, not proof. If supplied in a body/header it must exactly
+match the verified projection and cannot add identity, scope, binding, lifetime,
+audience, or revocation facts. The accepted proof contract is documented in RFC
+0011 and OpenAPI `ResidentCallerBearer`. Its resident `credential_id` value is a
+bounded `sha256:` correlation digest, not the raw bearer JTI.
 
 Required fields:
 
@@ -340,11 +380,13 @@ Required fields:
 - `run_id`
 - `action_id`
 - `policy_id`
-- `risk_level`
+- `risk_level` (nullable/optional on manager approval request; exact-match when present)
 - `status`
 - `granted_permissions`
 - `scope`
 - `issued_by`
+- `requested_by`
+- `decided_by` (nullable until a decision)
 - `issued_at`
 - `expires_at`
 - `revocation_ref`
@@ -428,3 +470,8 @@ Block acceptance if any of these occur:
 - A physical endpoint accepts low-level actuator commands.
 - The API schema allows replay side effects by default.
 - Generated Rust/Python/TypeScript schema parity fails.
+- Manager dispatch follows a redirect, accepts an untrusted TLS chain/hostname,
+  accepts malformed/oversized success, reports non-2xx as running, retries an
+  unknown-effect start, or allows duplicate dispatch to start a second tick.
+- Documentation implies the current manager inbound metadata is production
+  caller authentication.

@@ -24,6 +24,27 @@ const BAD_SIGNATURE: &str = "detached-signature-that-must-not-leak";
 const DIGEST: &str = "blake3:2222222222222222222222222222222222222222222222222222222222222222";
 
 #[test]
+fn issuance_reason_taxonomy_covers_all_principal_roles_without_leaking_details() {
+    for status in [
+        PrincipalStatus::Pending,
+        PrincipalStatus::Suspended,
+        PrincipalStatus::Revoked,
+        PrincipalStatus::Active,
+    ] {
+        assert!(!principal_status_reason(status, "issuer").is_empty());
+        assert!(!principal_status_reason(status, "subject").is_empty());
+    }
+    assert_eq!(
+        principal_status_reason(PrincipalStatus::Active, "unknown"),
+        "principal_not_active"
+    );
+    let error = WorkOrderGrantIssuanceError::GrantBuildFailed {
+        reason_code: "bounded_reason".to_string(),
+    };
+    assert_eq!(error.reason_code(), "bounded_reason");
+}
+
+#[test]
 fn valid_signed_work_order_issues_signed_grant_for_listed_allowlists_only() {
     let now = OffsetDateTime::now_utc();
     let tenant_id = TenantId::new();
@@ -80,6 +101,7 @@ fn valid_signed_work_order_issues_signed_grant_for_listed_allowlists_only() {
     );
 
     let grant = result.issued_grant().clone();
+    assert_eq!(result.clone().into_issued_grant(), grant);
     let scope = issued_grant_scope(tenant_id, agent_id, run_id);
     let allowed_action = decision_for_issued_grant(
         &grant,
@@ -382,6 +404,12 @@ fn inactive_principals_and_binding_mismatches_fail_closed() {
         }),
         "issuer_signature_binding_mismatch",
     );
+    let mut unsigned_envelope = envelope.clone();
+    unsigned_envelope.signature = None;
+    assert!(matches!(
+        require_issuer_signature_binding(&active_issuer, &unsigned_envelope, AUDIENCE),
+        Err(WorkOrderGrantIssuanceError::IssuerSignatureBindingMismatch)
+    ));
 
     let mut wrong_proof_kind_issuer =
         issuer_principal(tenant_id.clone(), PrincipalStatus::Active, KEY_ID);

@@ -515,6 +515,7 @@ fn local_delegation_trace_events_round_trip() {
             CapabilityGrantId::new(),
             CapabilityGrantId::new(),
         )),
+        delegation_ledger: None,
     };
     let failure = TaskFailure::new("child_failed", "specialist failed", false)
         .with_trace_id(TraceId::from_run_sequence(&child_run_id, 2));

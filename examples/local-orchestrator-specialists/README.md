@@ -19,7 +19,8 @@ service is involved.
    - explicit target specialist agent;
    - objective `summarize receivables`;
    - delegated authority limited to `query`/`sql`/`finance.read`;
-   - trusted `LocalDelegationAuthority` from a parent `ValidatedCapabilityGrant`.
+   - manager-derived `LocalDelegationAuthority` from the sealed root-run grant
+     binding.
 5. Pass the returned scoped child `AgentContext` to the child loop engine.
 6. If the child proposes `publish`, or proposes `query` without explicitly naming
    the delegated `sql` adapter, the loop engine records an action denial and does
@@ -51,12 +52,12 @@ let specialist = AgentContext::new(
     AgentRuntimeConfig::default(),
 );
 
-manager.register_agent_with_principal(orchestrator.clone(), orchestrator_principal, DelegatedAuthority {
+manager.register_agent_with_principal(orchestrator.clone(), orchestrator_principal.clone(), DelegatedAuthority {
     allowed_actions: vec!["query".into(), "publish".into()],
     allowed_adapters: vec!["sql".into(), "artifact".into()],
     allowed_permissions: vec!["finance.read".into(), "artifact.publish".into()],
 })?;
-manager.register_agent_with_principal(specialist.clone(), specialist_principal, DelegatedAuthority {
+manager.register_agent_with_principal(specialist.clone(), specialist_principal.clone(), DelegatedAuthority {
     allowed_actions: vec!["query".into()],
     allowed_adapters: vec!["sql".into()],
     allowed_permissions: vec!["finance.read".into()],
@@ -89,16 +90,22 @@ let mut request = LocalDelegationRequest::new(
 );
 request.child_run_id = child_run_id;
 
-// Build LocalDelegationAuthority from a trusted parent ValidatedCapabilityGrant
-// issued by the authority/work-order path. The TaskRequest grant refs are
-// replay evidence only and do not authorize the child by themselves.
-let authority = build_local_delegation_authority(&request)?;
+// Obtain a trusted parent ValidatedCapabilityGrant from the authority/work-order
+// path. The TaskRequest grant refs are replay evidence only and do not authorize
+// the child by themselves.
+let parent_grant = issue_parent_capability_grant(&request)?;
 manager.bind_root_run_capability_grant(
     &request.parent_run_id,
-    &authority.parent_capability_grant,
+    &parent_grant,
+)?;
+let authority = manager.child_authority_for_run(
+    &request.parent_run_id,
+    specialist_principal,
+    "daemon:local",
+    time::OffsetDateTime::now_utc(),
 )?;
 let child = manager.create_child_run(&parent_runtime, &child_runtime, request, authority)?;
-assert!(child.child_agent.delegated_authority.is_some());
+assert!(child.child_agent.delegated_authority().is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -107,7 +114,7 @@ assert!(child.child_agent.delegated_authority.is_some());
 Parent run trace includes:
 
 - `DelegationRequested`
-- `MessageQueued` / `MessageDelivered` for `task_request.v1` with authority refs
+- `MessageQueued` / `MessageDelivered` for `task_request.v2` with authority refs
 - `ChildRunCompleted` or `ChildRunFailed` after response
 
 Child run trace includes:
@@ -116,9 +123,9 @@ Child run trace includes:
 - normal tick/action/state events for the child loop
 - `ChildRunCompleted` or `ChildRunFailed`
 
-Replay through `replay_local_delegations(events)` reconstructs the parent/child
-edge, authority grant refs, and task request/response messages without executing
-policies, gateways, adapters, child runs, or live authority evaluation.
+Replay through `replay_local_delegations(events)` reconstructs complete chains,
+authority reservation/cleanup/revocation transitions, and task messages without
+routing, starting children, executing adapters, or live authority evaluation.
 
 ## What is intentionally not allowed
 
@@ -126,16 +133,25 @@ policies, gateways, adapters, child runs, or live authority evaluation.
   explicitly delegated and allowed by the specialist's own authority.
 - The child must name an explicitly delegated adapter for proposed actions;
   adapter omission fails closed before gateway submission.
+- Every child action carries the exact issued child capability grant ID. The
+  legacy `DelegatedAuthority` value can narrow an allow but cannot create one.
 - Parent cancellation rejects new child delegation and records
   `DelegationRejected`.
 - Child run IDs are single-use within the local manager; duplicate child IDs are
   rejected before a second task request is routed.
 - Child completion/failure is terminal; repeated finish attempts are rejected
   without duplicate response messages or terminal traces.
-- Recursive local delegation is unsupported. Child records retain issued grant
-  IDs for evidence/revocation only; a broader replacement grant fails the
-  immutable run binding, and the exact child scope cannot cover a distinct
-  grandchild agent/run.
+- Recursive local delegation is allowed only through the exact issued child grant,
+  remaining depth, an explicit parent-to-child runtime edge, and authority-owned
+  aggregate fan-out/budget. A child cannot delegate to a direct root sibling; a
+  broader replacement or nested escalation fails closed.
+- Delegated action liveness and HTTP minute quotas use authority-owned service
+  time. Clock rollback and latched expiry deny; old minute buckets do not reopen.
+- Cleanup and revocation close admission first and wait only for the bounded local
+  quiescence interval. A child cleanup timeout terminally fails the manager-owned
+  child lifecycle, emits parent/child failure evidence, and remains fail-closed
+  after the in-flight permit drops; a completion retry is rejected as already
+  finished.
 - Root binding retains the exact validated grant privately in one local manager;
   the public run-record grant ID is evidence only. Binding setup itself has no
   durable trace event in this bounded local example.

@@ -6,7 +6,12 @@
 
 use crate::loop_engine::{LoopEngine, LoopError, TickOutcome};
 use crate::tenancy::TenantRegistry;
-use splendor_types::{AgentId, TenantId, TraceEvent, TraceEventKind};
+use crate::{StateCommit, StateHandoffExportRequest, StateHandoffScope};
+use splendor_store::StateMetadata;
+use splendor_types::{
+    ActionId, AgentId, StateHandoff, TenantId, TraceEvent, TraceEventKind, WorkOrderEnvelope,
+    WorkOrderKeyring,
+};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -120,6 +125,62 @@ impl Scheduler {
             .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
         engine
             .record_runtime_event(kind)
+            .map_err(SchedulerError::Loop)
+    }
+
+    /// Records a non-tick action event with complete run/tenant/agent/action
+    /// identity through the target agent's shared trace cursor.
+    pub fn record_action_event_for_agent(
+        &self,
+        agent_id: &AgentId,
+        action_id: &ActionId,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, SchedulerError> {
+        let engine = self
+            .queue
+            .iter()
+            .find(|engine| engine.agent_id() == agent_id)
+            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        engine
+            .record_runtime_action_event(action_id, kind)
+            .map_err(SchedulerError::Loop)
+    }
+
+    /// Exports the target agent's current state through its owning loop engine.
+    pub fn export_state_handoff_for_agent(
+        &self,
+        agent_id: &AgentId,
+        request: StateHandoffExportRequest,
+    ) -> Result<(StateHandoff, TraceEvent), SchedulerError> {
+        let engine = self
+            .queue
+            .iter()
+            .find(|engine| engine.agent_id() == agent_id)
+            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        engine
+            .export_state_handoff(request)
+            .map_err(SchedulerError::Loop)
+    }
+
+    /// Imports a handoff through the target agent's owning loop engine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_state_handoff_for_agent(
+        &mut self,
+        agent_id: &AgentId,
+        handoff: &StateHandoff,
+        work_order: &WorkOrderEnvelope,
+        keyring: &WorkOrderKeyring,
+        scope: &StateHandoffScope,
+        now: OffsetDateTime,
+        metadata: StateMetadata,
+    ) -> Result<(StateCommit, TraceEvent), SchedulerError> {
+        let engine = self
+            .queue
+            .iter_mut()
+            .find(|engine| engine.agent_id() == agent_id)
+            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        engine
+            .import_state_handoff(handoff, work_order, keyring, scope, now, metadata)
             .map_err(SchedulerError::Loop)
     }
 

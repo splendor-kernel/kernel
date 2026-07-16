@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Splendor Runtime Daemon API
   version: 0.03-dev
-  description: Local-only runtime daemon API with 0.03 signed work-order authority and kernel E2E schema coverage. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
+  description: Runtime daemon API with explicit local-development and TLS resident profiles. Resident/non-dev requests require the accepted Ed25519 caller bearer profile; mutating bearer JTIs are one-use while read-only requests may reuse an unexpired token. Caller metadata fields remain non-authoritative compatibility mirrors, raw JTIs are replaced by bounded correlation digests, and audit timestamps are server-owned. Signed work orders authorize runs, while C02 and the gateway separately authorize effects. The 0.1 SDK/API stability docs define compatibility expectations, but the current daemon implementation does not actively negotiate unsupported X-Splendor-API-Version headers.
   x-splendor-compatibility:
     stable_docs: docs/spec/0.1/api-stability.md
     compatibility_line: '0.1'
@@ -10,11 +10,16 @@ info:
 servers:
   - url: http://127.0.0.1:8077
     description: Explicit local development listener only.
+  - url: https://resident.example.invalid
+    description: Resident TLS listener; deployments replace this example with the exact instance endpoint and trust chain.
 paths:
   /runs:
     post:
       summary: Create a local run from a signed work order.
+      description: A resident bearer JTI is consumed once before mutation. A retry must use a fresh bearer; durable create idempotency remains scoped to the caller principal and request authority, not the ephemeral JTI correlation digest.
       operationId: createRun
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -30,6 +35,8 @@ paths:
                 $ref: '#/components/schemas/CreateRunResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
@@ -40,6 +47,8 @@ paths:
     get:
       summary: Inspect a local run.
       operationId: inspectRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -50,6 +59,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -57,7 +68,10 @@ paths:
   /runs/{run_id}/start:
     post:
       summary: Execute one local scheduler tick.
+      description: The resident bearer JTI is consumed once before the tick can mutate state or reach the gateway. Reuse is rejected before run mutation.
       operationId: startRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -73,6 +87,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TickResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -85,6 +101,8 @@ paths:
     post:
       summary: Pause a local run.
       operationId: pauseRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -100,6 +118,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -108,6 +128,8 @@ paths:
     post:
       summary: Resume a paused run and execute one tick.
       operationId: resumeRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -123,6 +145,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TickResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -133,6 +157,8 @@ paths:
     post:
       summary: Stop a local run.
       operationId: stopRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -148,6 +174,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -158,6 +186,8 @@ paths:
     post:
       summary: Cancel a local run without deleting trace or state evidence.
       operationId: cancelRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -173,6 +203,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunInspectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -183,6 +215,8 @@ paths:
     post:
       summary: Append a percept to the daemon queue for the next tick.
       operationId: appendPercept
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -200,6 +234,8 @@ paths:
                 $ref: '#/components/schemas/AppendPerceptResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -208,6 +244,8 @@ paths:
     post:
       summary: Sync or record failure for a run policy bundle cache.
       operationId: syncPolicy
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -223,6 +261,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PolicySyncResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '400':
           $ref: '#/components/responses/BadRequest'
         '403':
@@ -233,6 +273,8 @@ paths:
     post:
       summary: Sync manager-issued circuit breakers into one run gateway evaluator.
       operationId: syncCircuitBreakers
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -248,14 +290,58 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CircuitBreakerSyncResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+  /runs/{run_id}/approval-receipts/{receipt_id}/revoke:
+    post:
+      summary: Revoke one exact retained approval receipt at its owning resident ledger.
+      description: Requires the dedicated splendor.approval_receipts.revoke scope. A successful response acknowledges a known exact or semantic revocation; a receipt already claimed for execution returns approval_receipt_revocation_too_late and is never represented as successful revocation.
+      operationId: revokeApprovalReceipt
+      security:
+        - ResidentCallerBearer: []
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - name: receipt_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResidentApprovalReceiptRevocationRequest'
+      responses:
+        '200':
+          description: Receipt revocation acknowledged by the owning resident ledger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResidentApprovalReceiptRevocationAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /runs/{run_id}/state-head:
     get:
       summary: Read the latest committed state node metadata.
       operationId: getStateHead
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -266,6 +352,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StateHeadResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -274,6 +362,8 @@ paths:
     get:
       summary: Read ordered trace records.
       operationId: getRunTraces
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
@@ -299,6 +389,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TracePageResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -307,6 +399,8 @@ paths:
     post:
       summary: Export ordered trace records with explicit redaction policy and integrity metadata.
       operationId: exportTraces
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -324,6 +418,8 @@ paths:
                 $ref: '#/components/schemas/TraceExportResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -332,6 +428,8 @@ paths:
     post:
       summary: Start inspect-only replay.
       operationId: replayRun
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
@@ -347,6 +445,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReplayResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -357,6 +457,8 @@ paths:
     post:
       summary: Submit an action through the local run gateway.
       operationId: submitAction
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -370,6 +472,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ActionOutcome'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -380,6 +484,8 @@ paths:
     get:
       summary: Read daemon health.
       operationId: getHealth
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -395,6 +501,8 @@ paths:
     get:
       summary: Read daemon/runtime/schema compatibility metadata.
       operationId: getVersion
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -412,6 +520,8 @@ paths:
     get:
       summary: Read local daemon capabilities.
       operationId: getCapabilities
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
@@ -427,6 +537,8 @@ paths:
     post:
       summary: Export an explicit state handoff snapshot.
       operationId: exportStateSnapshot
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -440,12 +552,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExportStateSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
   /state-snapshots/import:
     post:
-      summary: Import an explicit state handoff snapshot.
+      summary: Import an explicit state handoff snapshot in experimental loopback local-dev mode; resident mode fails closed without source proof.
       operationId: importStateSnapshot
+      security:
+        - ResidentCallerBearer: []
       requestBody:
         required: true
         content:
@@ -454,13 +570,28 @@ paths:
               $ref: '#/components/schemas/ImportStateSnapshotRequest'
       responses:
         '200':
-          description: State handoff snapshot imported.
+          description: State handoff snapshot imported by the explicit loopback local-dev compatibility path.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportStateSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '503':
+          description: Resident import cannot proceed because v0 has no accepted source-authenticated signed handoff manifest or source event/evidence proof. Caller scope and exact target work-order authority are necessary but insufficient. No state-store, state-head, or run-trace mutation occurs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: state_handoff_proof_unavailable
+                message: resident state handoff import requires source-authenticated signed handoff proof
+                details:
+                  disposition: needs_intervention
+                  retryable: false
+                  required_proof: signed_source_handoff_manifest
   /fleet/nodes:
     post:
       summary: Register a fleet node.
@@ -484,6 +615,20 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterInstanceRequest' } } } }
       responses:
         '200': { description: Instance registered., content: { application/json: { schema: { $ref: '#/components/schemas/InstanceRegistration' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /fleet/instances/{instance_id}/heartbeat:
+    post:
+      summary: Record runtime instance heartbeat through the typed registry owner.
+      operationId: heartbeatInstance
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatInstanceRequest' } } } }
+      responses:
+        '200': { description: Instance heartbeat recorded., content: { application/json: { schema: { $ref: '#/components/schemas/AcceptedTraceResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /fleet/nodes/{node_id}/heartbeat:
     post:
@@ -527,6 +672,7 @@ paths:
       responses:
         '200': { description: Work order accepted., content: { application/json: { schema: { $ref: '#/components/schemas/WorkOrderValidationReport' } } } }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /work-orders/{work_order_id}/revoke:
     post:
       summary: Revoke a submitted work order.
@@ -543,6 +689,7 @@ paths:
   /work-orders/{work_order_id}/dispatch:
     post:
       summary: Dispatch an accepted work order to a resident daemon.
+      description: Dispatch is immutably bound to the accepted signed payload, placement decision, selected node, and exactly one healthy compatible resident instance. The resident origin must match the manager's configured exact-origin allowlist. Any post-send start result without authoritative success is quarantined as effect-unknown and is never retried automatically.
       operationId: dispatchWorkOrder
       parameters:
         - name: work_order_id
@@ -552,7 +699,11 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchWorkOrderRequest' } } } }
       responses:
         '200': { description: Dispatch report., content: { application/json: { schema: { $ref: '#/components/schemas/DispatchReport' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
   /fleet/telemetry/read:
     post:
       summary: Read observational fleet telemetry.
@@ -714,14 +865,19 @@ paths:
     post:
       summary: Record a trace-linked approval request from runtime evidence.
       operationId: requestApproval
+      security:
+        - ManagerApprovalCallerBearer: []
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalRequestPayload' } } } }
       responses:
         '200': { description: Approval requested., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /approvals/{approval_id}/grant:
     post:
       summary: Grant scoped approval evidence for one action.
       operationId: grantApproval
+      security:
+        - ManagerApprovalCallerBearer: []
       parameters:
         - name: approval_id
           in: path
@@ -730,11 +886,14 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
       responses:
         '200': { description: Approval granted., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /approvals/{approval_id}/deny:
     post:
       summary: Deny a pending approval request.
       operationId: denyApproval
+      security:
+        - ManagerApprovalCallerBearer: []
       parameters:
         - name: approval_id
           in: path
@@ -743,11 +902,14 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
       responses:
         '200': { description: Approval denied., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /approvals/{approval_id}/revoke:
     post:
       summary: Revoke approval evidence before it authorizes execution.
       operationId: revokeApproval
+      security:
+        - ManagerApprovalCallerBearer: []
       parameters:
         - name: approval_id
           in: path
@@ -756,6 +918,7 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
       responses:
         '200': { description: Approval revoked., content: { application/json: { schema: { $ref: '#/components/schemas/GovernanceApprovalRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /governance/circuit-breakers:
     post:
@@ -806,57 +969,74 @@ paths:
     post:
       summary: Register a resident physical/edge device profile.
       operationId: registerDeviceProfile
+      security:
+        - ResidentCallerBearer: []
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileRequest' } } } }
       responses:
         '200': { description: Device profile registered., content: { application/json: { schema: { $ref: '#/components/schemas/RegisterDeviceProfileResponse' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /devices/{node_id}/status:
     get:
       summary: Read device safety and runtime status; never authorizes actions.
       operationId: getDeviceStatus
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200': { description: Device status., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceRuntimeProfile' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/policy-cache:
     get:
       summary: Read local policy cache status; expired high-risk offline actions fail closed.
       operationId: getPolicyCacheStatus
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
         - $ref: '#/components/parameters/CallerCredentialHeader'
       responses:
         '200': { description: Policy cache status., content: { application/json: { schema: { $ref: '#/components/schemas/DevicePolicyCacheStatus' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/actions:
     post:
       summary: Submit a high-level bounded physical action through gateway and safety verification.
       operationId: submitPhysicalAction
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmitPhysicalActionRequest' } } } }
       responses:
         '200': { description: Physical action outcome., content: { application/json: { schema: { $ref: '#/components/schemas/ActionOutcome' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /operator/interventions:
     post:
       summary: Request local operator intervention for an ambiguous physical action.
       operationId: requestOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRequest' } } } }
       responses:
         '200': { description: Operator intervention requested., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
   /operator/interventions/{intervention_id}/grant:
     post:
       summary: Grant scoped expiring local operator intervention.
       operationId: grantOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - name: intervention_id
           in: path
@@ -865,12 +1045,15 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
       responses:
         '200': { description: Operator intervention granted., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /operator/interventions/{intervention_id}/deny:
     post:
       summary: Deny scoped local operator intervention.
       operationId: denyOperatorIntervention
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - name: intervention_id
           in: path
@@ -879,20 +1062,55 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OperatorDecisionRequest' } } } }
       responses:
         '200': { description: Operator intervention denied., content: { application/json: { schema: { $ref: '#/components/schemas/OperatorInterventionRecord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
   /devices/{node_id}/trace-buffer/sync:
     post:
       summary: Sync an offline device trace buffer with ordering and tamper checks.
       operationId: syncDeviceTraceBuffer
+      description: Requires the dedicated mutating scope `splendor.device.trace_sync`; `splendor.device.read` is insufficient.
+      security:
+        - ResidentCallerBearer: []
       parameters:
         - $ref: '#/components/parameters/NodeId'
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncRequest' } } } }
       responses:
         '200': { description: Device trace sync result., content: { application/json: { schema: { $ref: '#/components/schemas/DeviceTraceBufferSyncResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 components:
+  securitySchemes:
+    ResidentCallerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: splendor-caller+jwt (Ed25519)
+      description: >-
+        Authoritative resident caller proof defined by accepted RFC 0011. The
+        daemon verifies the fixed Ed25519 profile, exact issuer and instance
+        audience, tenant binding, endpoint scope, lifetime, trust freshness,
+        key status, and JTI revocation before consulting compatibility mirrors.
+        A verified JTI is atomically one-use for mutating requests; reads may
+        reuse it until expiry. Replay denial occurs before handler mutation and
+        records only a domain-separated SHA-256 correlation digest. Resident
+        middleware passes verified context internally; compatibility body/header
+        mirrors may be omitted, but any supplied mirror must match exactly.
+        This bearer authenticates the app only; it does not replace a signed
+        work order, C02 run authority, verifiers, or gateway authorization.
+    ManagerApprovalCallerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: splendor-caller+jwt (Ed25519)
+      description: >-
+        Bounded local-acceptance caller proof for approval request, grant, deny,
+        and revoke only. The manager verifies the fixed Ed25519 profile against
+        process-owned trust, exact central-manager audience, one exact fleet
+        binding, approvals_manage scope, lifetime, revocation, and one-use JTI,
+        then requires the body credential and audit identity mirrors to match.
+        It does not
+        authenticate other manager endpoints and is not a production manager or
+        TLS claim.
   parameters:
     RunId:
       name: run_id
@@ -905,7 +1123,13 @@ components:
       name: X-Splendor-Caller-Credential
       in: header
       required: false
-      description: JSON-encoded CallerCredential for non-dev health/capability reads. Explicit local-dev mode may omit it only on loopback or Unix-socket transports.
+      deprecated: true
+      description: >-
+        Non-authoritative JSON compatibility mirror of the caller identity
+        projected from a verified bearer. In resident mode it cannot authenticate
+        a caller and, when supplied, must exactly match the verified projection.
+        Explicit local-dev mode may omit it only on loopback or Unix-socket
+        transports.
       schema:
         type: string
     NodeId:
@@ -923,7 +1147,14 @@ components:
           schema:
             $ref: '#/components/schemas/ApiError'
     Unauthorized:
-      description: Missing authenticated caller outside explicit local dev mode.
+      description: Missing or invalid authenticated caller outside explicit local dev mode. The response includes a bounded RFC 6750 challenge and never echoes token or key bytes.
+      headers:
+        WWW-Authenticate:
+          description: Bounded bearer challenge for missing or invalid resident caller proof.
+          required: true
+          schema:
+            type: string
+            example: 'Bearer realm="splendor-resident", error="invalid_token"'
       content:
         application/json:
           schema:
@@ -942,6 +1173,18 @@ components:
             $ref: '#/components/schemas/ApiError'
     Conflict:
       description: Run state, duplicate ID, or trace ordering conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    BadGateway:
+      description: Resident transport or create response failed before a valid dispatch result was available.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    GatewayTimeout:
+      description: Resident start was sent but no authoritative success was available; effect certainty is unknown and automatic retry is forbidden.
       content:
         application/json:
           schema:
@@ -1013,13 +1256,41 @@ components:
         buffered_records: { type: integer, minimum: 0 }
         integrity: { type: string }
     SubmitPhysicalActionRequest:
-      allOf:
-        - $ref: '#/components/schemas/SubmitActionRequest'
-        - type: object
-          required: [safety_context]
-          properties:
-            safety_context: { $ref: '#/components/schemas/SafetyContext' }
-            operator_intervention_evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
+      type: object
+      additionalProperties: false
+      required: [run_id, tenant_id, agent_id, credential, audit_attribution, causal_trace_id, action, adapter, quota_usage, satisfied_preconditions, approval_evidence, safety_context]
+      properties:
+        action_id: { type: [string, 'null'], format: uuid }
+        run_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        credential:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CallerCredential'
+        audit_attribution:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AuditAttribution'
+        causal_trace_id: { type: [string, 'null'], format: uuid }
+        action: { $ref: '#/components/schemas/Action' }
+        adapter: { type: [string, 'null'] }
+        quota_usage:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/QuotaUsage'
+        satisfied_preconditions: { type: array, items: { type: string } }
+        requested_at: { type: [string, 'null'], format: date-time }
+        approval_evidence:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ApprovalEvidence'
+        authority_obligation_receipts:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/AuthorityObligationReceipt' }
+        safety_context: { $ref: '#/components/schemas/SafetyContext' }
+        operator_intervention_evidence: { $ref: '#/components/schemas/OperatorInterventionEvidence' }
     SafetyContext:
       type: object
       required: [allowed_zone_refs, privacy_clear, human_proximity_clear, emergency_stop_clear, offline, policy_cache_expired, high_risk, cloud_helper_direct_authority]
@@ -1104,7 +1375,7 @@ components:
         trace_event_id: { type: string, format: uuid }
         reason_code:
           type: string
-          enum: [trace_sync_hash_chain_mismatch, trace_sync_order_mismatch, trace_sync_tamper_simulated, run_not_found, node_not_found]
+          enum: [trace_sync_empty_batch, trace_sync_run_mismatch, trace_sync_sequence_mismatch, trace_sync_hash_chain_mismatch, trace_sync_event_hash_mismatch, trace_sync_hash_unavailable, trace_sync_sequence_overflow, trace_sync_tampered, trace_sync_order_mismatch, trace_sync_tamper_simulated, run_not_found, node_not_found]
     ApiError:
       type: object
       required: [code, message, details]
@@ -1155,9 +1426,11 @@ components:
         - policies_publish
         - policies_revoke
         - approvals_manage
+        - approval_receipts_revoke
         - governance_control
         - device_register
         - device_read
+        - device_trace_sync
         - operator_intervene
         - nodes_register
         - instances_register
@@ -1194,6 +1467,12 @@ components:
                 reason:
                   type: string
     CallerCredential:
+      description: >-
+        Caller identity projection. On the resident daemon this object is a
+        deprecated/non-authoritative mirror derived from the verified bearer and
+        cannot supply proof or widen token facts. For resident bearer projection,
+        credential_id is a `sha256:`-prefixed domain-separated correlation digest,
+        never the raw token JTI.
       type: object
       required: [credential_id, principal, scopes, binding, audience, expires_at, revocation]
       properties:
@@ -1287,6 +1566,7 @@ components:
           type: string
         data_locality:
           type: [string, 'null']
+          enum: [cloud, vpc, on_prem, device, null]
         requires_gpu:
           type: [boolean, 'null']
         dedicated_instance:
@@ -1366,6 +1646,7 @@ components:
             - type: 'null'
             - $ref: '#/components/schemas/WorkOrderSignature'
     AuditAttribution:
+      description: Attribution mirror that must name the authenticated principal and credential correlation ID; it is not authentication proof. In resident mode, any caller-supplied requested_at value is ignored and replaced with the server authentication timestamp before trace/audit recording.
       type: object
       required: [principal, credential_id, requested_at]
       properties:
@@ -1377,6 +1658,10 @@ components:
           type: string
           format: date-time
     ManagerSecurityFields:
+      description: >-
+        Acceptance-manager metadata checks only. The current manager inbound API
+        has no production caller proof verifier and is not covered by
+        ResidentCallerBearer; it must not be exposed as a production remote API.
       type: object
       required: [credential, audit_attribution]
       properties:
@@ -1433,7 +1718,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
         - type: object
-          required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, expires_at, reason]
+          required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, audience, expires_at, reason]
           properties:
             approval_id: { type: string, format: uuid }
             tenant_id: { type: string, format: uuid }
@@ -1443,10 +1728,15 @@ components:
             action_name: { type: string }
             adapter: { type: string }
             policy_id: { type: string }
-            risk_level: { type: string }
+            risk_level: { type: [string, 'null'] }
             audience: { type: string }
             expires_at: { type: string, format: date-time }
             reason: { type: string }
+            challenge:
+              description: Required by the current trusted receipt-issuance path. Optional wire presence is retained only for legacy decode/fail-closed compatibility.
+              oneOf:
+                - type: 'null'
+                - $ref: '#/components/schemas/ApprovalChallenge'
     ApprovalDecisionRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -1457,7 +1747,7 @@ components:
             expires_at: { type: [string, 'null'], format: date-time }
     GovernanceApprovalRecord:
       type: object
-      required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, status, reason, issued_by, expires_at, trace_event_id, evidence]
+      required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, risk_level, audience, status, reason, issued_by, requested_by, expires_at, trace_event_id, evidence]
       properties:
         approval_id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -1467,18 +1757,37 @@ components:
         action_name: { type: string }
         adapter: { type: string }
         policy_id: { type: string }
-        risk_level: { type: string }
+        risk_level: { type: [string, 'null'] }
         audience: { type: string }
         status: { type: string, enum: [requested, granted, denied, revoked] }
         reason: { type: string }
         issued_by:
           $ref: '#/components/schemas/AuditAttribution'
+        requested_by:
+          $ref: '#/components/schemas/AuditAttribution'
+        decided_by:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AuditAttribution'
         expires_at: { type: string, format: date-time }
         trace_event_id: { type: string, format: uuid }
         evidence:
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/ApprovalEvidence'
+        challenge:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ApprovalChallenge'
+        authority_obligation_receipt:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AuthorityObligationReceipt'
+        resident_receipt_revocation_ack:
+          description: Exact resident acknowledgement retained after a granted receipt is successfully revoked. Optional wire presence preserves pre-revocation records.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ResidentApprovalReceiptRevocationAck'
     CircuitBreakerRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -1631,6 +1940,15 @@ components:
         health:
           $ref: '#/components/schemas/NodeHealth'
         recorded_at: { type: string, format: date-time }
+    InstanceHeartbeat:
+      type: object
+      required: [node_id, instance_id, health, recorded_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        instance_id: { type: string, format: uuid }
+        health:
+          $ref: '#/components/schemas/NodeHealth'
+        recorded_at: { type: string, format: date-time }
     CapabilityDocument:
       type: object
       required: [schema, capabilities, constraints]
@@ -1655,7 +1973,9 @@ components:
         required_capabilities:
           type: array
           items: { type: string }
-        data_locality: { type: [string, 'null'] }
+        data_locality:
+          type: [string, 'null']
+          enum: [cloud, vpc, on_prem, device, null]
         dedicated_instance: { type: boolean }
         required_runtime_version: { type: [string, 'null'] }
         max_runtime_ms: { type: [integer, 'null'], minimum: 0 }
@@ -2137,6 +2457,14 @@ components:
           properties:
             heartbeat:
               $ref: '#/components/schemas/NodeHeartbeat'
+    HeartbeatInstanceRequest:
+      allOf:
+        - $ref: '#/components/schemas/ManagerSecurityFields'
+        - type: object
+          required: [heartbeat]
+          properties:
+            heartbeat:
+              $ref: '#/components/schemas/InstanceHeartbeat'
     AdvertiseCapabilitiesRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -2165,6 +2493,13 @@ components:
               $ref: '#/components/schemas/WorkOrderEnvelope'
             expected_audience:
               type: string
+            approval_policies:
+              type: array
+              default: []
+              maxItems: 64
+              description: Manager-owned non-authorizing governance configuration admitted and stored immutably with the accepted signed work order. Dispatch cannot replace it; every scope must narrow to the signed work-order allowlists.
+              items:
+                $ref: '#/components/schemas/ApprovalPolicy'
     RevokeWorkOrderRequest:
       allOf:
         - $ref: '#/components/schemas/ManagerSecurityFields'
@@ -2220,22 +2555,17 @@ components:
         audit_attribution:
           $ref: '#/components/schemas/AuditAttribution'
         work_order_id: { type: string }
-        source_instance_id: { type: string, format: uuid }
-        receiver_instance_id: { type: string, format: uuid }
+        source_instance_id: { type: [string, 'null'], format: uuid }
+        receiver_instance_id: { type: [string, 'null'], format: uuid }
+        previous_state_node_id: { type: [string, 'null'] }
     ImportStateSnapshotRequest:
       type: object
-      required: [handoff, credential, audit_attribution]
+      required: [handoff, work_order, credential, audit_attribution]
       properties:
         handoff:
-          type: object
-          required: [authority, snapshot]
-          properties:
-            authority:
-              type: object
-              required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
-            snapshot:
-              type: object
-              required: [state_node_id, state_hash]
+          $ref: '#/components/schemas/StateHandoff'
+        work_order:
+          $ref: '#/components/schemas/WorkOrderEnvelope'
         credential:
           $ref: '#/components/schemas/CallerCredential'
         audit_attribution:
@@ -2259,25 +2589,50 @@ components:
         accepted: { type: boolean }
     StateHandoff:
       type: object
-      required: [authority, snapshot]
+      required: [schema_version, handoff_id, mode, authority, source_instance_id, receiver_instance_id, previous_state_node_id, snapshot, source_trace_id, created_at]
       properties:
+        schema_version:
+          type: string
+          const: splendor.state_handoff.v0
+        handoff_id: { type: string }
+        mode:
+          type: string
+          enum: [snapshot_import, read_only_reference]
         authority:
           type: object
-          required: [tenant_id, agent_id, run_id, work_order_id, source_instance_id, receiver_instance_id]
+          required: [tenant_id, agent_id, run_id, work_order_id]
           properties:
             tenant_id: { type: string, format: uuid }
             agent_id: { type: string, format: uuid }
             run_id: { type: string, format: uuid }
             work_order_id: { type: string }
-            source_instance_id: { type: string, format: uuid }
-            receiver_instance_id: { type: string, format: uuid }
+        source_instance_id: { type: [string, 'null'], format: uuid }
+        receiver_instance_id: { type: [string, 'null'], format: uuid }
+        previous_state_node_id: { type: [string, 'null'] }
         snapshot:
           type: object
-          required: [state_node_id, state_hash]
+          required: [snapshot_id, state_node_id, parent_state_node_ids, state_hash, state_bytes, content_type]
           properties:
+            snapshot_id: { type: string }
             state_node_id: { type: string }
-            state_hash: { type: string }
+            parent_state_node_ids:
+              type: array
+              items: { type: string }
+            state_hash:
+              type: object
+              required: [algorithm, value]
+              properties:
+                algorithm:
+                  type: string
+                  enum: [Blake3, Sha256]
+                value: { type: string }
+            state_bytes:
+              type: array
+              items: { type: integer, minimum: 0, maximum: 255 }
+            content_type: { type: [string, 'null'] }
           additionalProperties: true
+        source_trace_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
     Percept:
       type: object
       required: [schema, payload, provenance, timestamp]
@@ -2305,7 +2660,8 @@ components:
           type: string
         params:
           $ref: '#/components/schemas/JsonValue'
-        side_effect_class: true
+        side_effect_class:
+          $ref: '#/components/schemas/SideEffectClass'
         cost_estimate: true
         required_permissions:
           type: array
@@ -2359,14 +2715,28 @@ components:
     ApprovalDecision:
       type: string
       enum: [Granted, Denied]
+    SideEffectClass:
+      oneOf:
+        - type: string
+          enum: [ReadOnly, Filesystem, Network, External]
+        - type: object
+          additionalProperties: false
+          required: [Custom]
+          properties:
+            Custom:
+              type: string
     ApprovalPolicy:
       type: object
+      additionalProperties: false
       required: [schema_version, policy_id, tenant_id, agent_id, action_name, adapter, required_permission, side_effect_class, risk_level, reason, expires_at]
       properties:
         schema_version:
           type: string
+          enum: [splendor.approval_policy.v1]
         policy_id:
           type: string
+          minLength: 1
+          maxLength: 128
         tenant_id:
           type: string
           format: uuid
@@ -2379,20 +2749,30 @@ components:
           type: [string, 'null']
         required_permission:
           type: [string, 'null']
-        side_effect_class: true
+        side_effect_class:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/SideEffectClass'
         risk_level:
           type: [string, 'null']
+          minLength: 1
+          maxLength: 128
         reason:
           type: string
+          minLength: 1
+          maxLength: 1024
         expires_at:
           type: [string, 'null']
           format: date-time
     ApprovalEvidence:
       type: object
+      additionalProperties: false
+      description: Legacy compatibility, fail-closed, trace, and replay fact. A Granted value is non-authorizing and cannot replace a trusted exact-challenge obligation receipt.
       required: [schema_version, approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, decision, reason, issued_at, expires_at, revoked, trace_event_id]
       properties:
         schema_version:
           type: string
+          enum: [splendor.approval_evidence.v1]
         approval_id:
           type: string
           format: uuid
@@ -2427,6 +2807,37 @@ components:
         trace_event_id:
           type: [string, 'null']
           format: uuid
+    ApprovalChallenge:
+      type: object
+      additionalProperties: false
+      description: Exact non-authorizing daemon challenge that a trusted approval manager must satisfy before it can issue an authority obligation receipt.
+      required: [schema_version, approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, policy_id, subject, authority_decision_id, obligation_id, receipt_audience, canonical_request_digest, gateway_action_request_digest, authority_decision_digest, requested_at, expires_at]
+      properties:
+        schema_version:
+          type: string
+          enum: [splendor.approval_challenge.v1]
+        approval_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        agent_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        action_id: { type: string, format: uuid }
+        action_name: { type: string, minLength: 1 }
+        adapter: { type: string, minLength: 1 }
+        policy_id: { type: string, minLength: 1 }
+        risk_level: { type: [string, 'null'] }
+        subject: { type: string, format: uuid }
+        authority_decision_id: { type: string, format: uuid }
+        obligation_id: { type: string, format: uuid }
+        receipt_audience: { type: string, minLength: 1 }
+        canonical_request_digest: { type: string, minLength: 1 }
+        gateway_action_request_digest: { type: string, minLength: 1 }
+        physical_action_resource_coordinate:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/PhysicalActionResourceCoordinate'
+        authority_decision_digest: { type: string, minLength: 1 }
+        requested_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
     ApprovalTraceContext:
       type: object
       required: [approval_id, tenant_id, agent_id, run_id, action_id, action_name, adapter, decision, reason, policy_id, risk_level, issued_at, expires_at, revoked]
@@ -2488,6 +2899,10 @@ components:
           $ref: '#/components/schemas/JsonValue'
         error:
           type: [string, 'null']
+        approval_challenge:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ApprovalChallenge'
         completed_at:
           type: string
           format: date-time
@@ -2510,14 +2925,169 @@ components:
           type: array
           items:
             type: string
+        requested_at:
+          type: [string, 'null']
+          format: date-time
+        authority_obligation_receipts:
+          type: array
+          maxItems: 64
+          description: Raw non-authorizing receipts validated only against a regenerated live C02 conditional decision.
+          items:
+            $ref: '#/components/schemas/AuthorityObligationReceipt'
     RegisteredAction:
       type: object
+      additionalProperties: false
       required: [name, adapter]
       properties:
         name:
           type: string
         adapter:
           type: string
+        required_permissions:
+          type: array
+          uniqueItems: true
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+    AuthorityObligationReceiptValidation:
+      type: object
+      additionalProperties: false
+      required: [validation_kind, algorithm, key_id, digest, signature]
+      properties:
+        validation_kind:
+          type: string
+          enum: [local_signature]
+        algorithm:
+          type: string
+          minLength: 1
+        key_id:
+          type: string
+          minLength: 1
+        digest:
+          type: string
+          minLength: 1
+        signature:
+          type: string
+          minLength: 1
+    AuthorityObligationReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema_version, receipt_id, issuer, audience, obligation_id, kind, subject, authority_decision_id, canonical_request_digest, evidence_digest, issued_at, expires_at, revocation, revocation_ref, validation]
+      properties:
+        schema_version:
+          type: string
+          enum: [splendor.authority.obligation_receipt.v1]
+        receipt_id:
+          type: string
+          format: uuid
+        issuer:
+          type: string
+          format: uuid
+        audience:
+          type: string
+          minLength: 1
+        obligation_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [approval_required, mfa_assurance, dedicated_isolation, network_deny, human_review, independent_evaluator, local_safety_verifier, postcondition_check, maximum_blast_radius, redaction_required, local_only, simulation_only, evidence_required]
+        subject:
+          type: string
+          format: uuid
+        authority_decision_id:
+          type: string
+          format: uuid
+        canonical_request_digest:
+          type: string
+          minLength: 1
+        evidence_digest:
+          type: string
+          minLength: 1
+        evidence_ref:
+          type: [string, 'null']
+          minLength: 1
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revocation:
+          $ref: '#/components/schemas/RevocationStatus'
+        revocation_ref:
+          type: string
+          minLength: 1
+        approval_id:
+          type: [string, 'null']
+          format: uuid
+        approval_trace_event_id:
+          type: [string, 'null']
+          format: uuid
+        validation:
+          $ref: '#/components/schemas/AuthorityObligationReceiptValidation'
+    PhysicalActionResourceCoordinate:
+      type: object
+      additionalProperties: false
+      required: [resource_kind, node_id]
+      properties:
+        resource_kind:
+          type: string
+          enum: [physical_node]
+        node_id:
+          type: string
+          format: uuid
+    ResidentApprovalReceiptRevocationRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, authority_obligation_receipt, reason]
+      properties:
+        schema_version:
+          type: string
+          enum: [splendor.resident.approval_receipt_revocation.v1]
+        authority_obligation_receipt:
+          $ref: '#/components/schemas/AuthorityObligationReceipt'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+    ResidentApprovalReceiptRevocationStatus:
+      type: string
+      enum: [revoked, already_revoked]
+    EffectCertainty:
+      type: string
+      enum: [none, known, uncertain]
+    ResidentApprovalReceiptRevocationAck:
+      type: object
+      additionalProperties: false
+      required: [schema_version, receipt_id, approval_id, target_instance_id, run_id, receipt_audience, status, effect_certainty, acknowledged_at]
+      properties:
+        schema_version:
+          type: string
+          enum: [splendor.resident.approval_receipt_revocation_ack.v1]
+        receipt_id:
+          type: string
+          format: uuid
+        approval_id:
+          type: string
+          format: uuid
+        target_instance_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        receipt_audience:
+          type: string
+          minLength: 1
+        status:
+          $ref: '#/components/schemas/ResidentApprovalReceiptRevocationStatus'
+        effect_certainty:
+          $ref: '#/components/schemas/EffectCertainty'
+        acknowledged_at:
+          type: string
+          format: date-time
     TraceRecord:
       type: object
       required: [run_id, sequence, payload, recorded_at, event_hash, prev_event_hash]
@@ -2655,6 +3225,7 @@ components:
             type: string
         allowed_permissions:
           type: array
+          description: Empty selects the complete signed compatibility profile; non-empty must exactly equal it.
           items:
             type: string
         policy_actions:
@@ -2728,9 +3299,16 @@ components:
         reason:
           type: [string, 'null']
         approval_evidence:
+          description: Legacy non-authorizing compatibility field. Waiting-for-approval lifecycle requests carrying it are rejected without a tick.
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/ApprovalEvidence'
+        authority_obligation_receipts:
+          type: array
+          maxItems: 64
+          description: Raw non-authorizing receipts. Lifecycle resume does not consume them; retry the exact challenged action through /actions.
+          items:
+            $ref: '#/components/schemas/AuthorityObligationReceipt'
     RunInspectResponse:
       type: object
       required: [run_id, tenant_id, agent_id, status, state_head, ticks, adapter_executions, policy_bundle, created_at, updated_at]
@@ -2969,7 +3547,7 @@ components:
           description: Must remain false for default inspect-only replay; side-effectful replay modes are not exposed by the local daemon contract.
     ReplayResponse:
       type: object
-      required: [replay_id, run_id, mode, event_count, action_event_count, approval_events]
+      required: [replay_id, run_id, mode, event_count, action_event_count, approval_events, authority_decisions]
       properties:
         replay_id:
           type: string
@@ -2989,6 +3567,104 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ApprovalReplayEvent'
+        authority_decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthorityDecisionReplayEvent'
+    AuthorityDecisionReplayEvent:
+      type: object
+      required: [trace_event_id, sequence, action_id, decisions]
+      properties:
+        trace_event_id:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          minimum: 0
+        action_id:
+          type: [string, 'null']
+          format: uuid
+        decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/GatewayAuthorityDecisionSummary'
+    AuthorityOperationNamespace:
+      type: string
+      enum:
+        - agent
+        - workload
+        - gateway
+        - data
+        - artifact
+        - state
+        - driver
+        - network
+        - device
+        - change
+        - compatibility
+    AuthorityResourceKind:
+      type: string
+      enum:
+        - agent
+        - workload
+        - action
+        - adapter
+        - permission
+        - data
+        - artifact
+        - state_partition
+        - driver_operation
+        - network
+        - device
+        - change
+    AuthorityVerb:
+      type: string
+      enum:
+        - invoke
+        - use
+        - read
+        - write
+        - publish
+        - train
+        - evaluate
+        - admit
+        - delegate
+        - egress
+        - actuate
+        - propose
+        - activate
+    GatewayAuthorityDecisionSummary:
+      type: object
+      required: [decision_id, status, namespace, resource_kind, verb, decision_digest, reason_codes, matched_grant_ids, obligation_ids]
+      properties:
+        decision_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [allowed, denied, conditional, needs_approval, needs_intervention]
+        namespace:
+          $ref: '#/components/schemas/AuthorityOperationNamespace'
+        resource_kind:
+          $ref: '#/components/schemas/AuthorityResourceKind'
+        verb:
+          $ref: '#/components/schemas/AuthorityVerb'
+        decision_digest:
+          type: string
+        reason_codes:
+          type: array
+          items:
+            type: string
+        matched_grant_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        obligation_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
     ApprovalReplayEvent:
       type: object
       required: [lifecycle, approval, reason, trace_event_id, sequence]
@@ -3008,6 +3684,7 @@ components:
           minimum: 0
     SubmitActionRequest:
       type: object
+      additionalProperties: false
       required: [run_id, tenant_id, agent_id, credential, audit_attribution, causal_trace_id, action, adapter, quota_usage, satisfied_preconditions, approval_evidence]
       properties:
         action_id:
@@ -3045,10 +3722,20 @@ components:
           type: array
           items:
             type: string
+        requested_at:
+          type: [string, 'null']
+          format: date-time
         approval_evidence:
+          description: Legacy non-authorizing compatibility field. A Granted value cannot authorize adapter execution.
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/ApprovalEvidence'
+        authority_obligation_receipts:
+          type: array
+          maxItems: 64
+          description: Raw non-authorizing receipts validated against the exact regenerated live C02 decision. A waiting run accepts only the action ID, payload, adapter, quota, preconditions, and requested_at bound by its pending challenge.
+          items:
+            $ref: '#/components/schemas/AuthorityObligationReceipt'
     HealthResponse:
       type: object
       required: [status, local_only, runtime_available]

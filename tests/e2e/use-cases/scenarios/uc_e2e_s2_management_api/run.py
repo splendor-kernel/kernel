@@ -528,7 +528,6 @@ def main() -> int:
     operation_ids.extend(["getHealth", "getVersion", "getCapabilities"])
 
     envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID, "primary"))
-    resume_envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID, "resume"))
     create_req = create_run_request(envelope, caller_credential(["runs_create"], credential_id="cred_uc_e2e_s2_create"), RUN_ID)
     _, created = client.request("POST", "/runs", body=create_req, expected=200)
     operation_ids.append("createRun")
@@ -710,7 +709,7 @@ def main() -> int:
     _, resumed = client.request(
         "POST",
         f"/runs/{RUN_ID}/resume",
-        body=lifecycle(resume_cred, "resume-for-contract", resume_envelope),
+        body=lifecycle(resume_cred, "resume-for-contract", envelope),
         expected=200,
     )
     operation_ids.append("resumeRun")
@@ -738,7 +737,7 @@ def main() -> int:
     audit_report = {
         "schema_version": "splendor.uc_e2e_s2.audit.v1",
         "credential_ids": sorted({entry.get("request_credential_id") or entry.get("header_credential_id") for entry in [json.loads(line) for line in traffic.read_text(encoding="utf-8").splitlines() if line.strip()] if entry.get("request_credential_id") or entry.get("header_credential_id")}),
-        "work_order_ids": [envelope.get("work_order_id"), resume_envelope.get("work_order_id")],
+        "work_order_ids": [envelope.get("work_order_id")],
         "denials": negative_cases,
         "audit_trace_events": [trace_event_id(record) for record in final_records if event_type(record) == "daemon.audit"],
     }
@@ -906,7 +905,7 @@ def main() -> int:
         "state_node_ids": [state_head.get("state_node_id")],
         "state_hashes": [state_head.get("data_hash")],
         "message_ids": [],
-        "work_order_ids": [envelope.get("work_order_id"), resume_envelope.get("work_order_id"), ts_envelope.get("work_order_id"), py_envelope.get("work_order_id"), cli_envelope.get("work_order_id")],
+        "work_order_ids": [envelope.get("work_order_id"), ts_envelope.get("work_order_id"), py_envelope.get("work_order_id"), cli_envelope.get("work_order_id")],
         "approval_ids": [],
         "node_ids": [],
         "action_ids": action_ids,

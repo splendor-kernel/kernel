@@ -4,7 +4,8 @@ use splendor_gateway::{
     SimulatedSafetyVerifier, VerifiedActionGateway,
 };
 use splendor_types::{
-    Action, ActionId, AgentId, QuotaUsage, RunId, SideEffectClass, TenantId, VerificationResult,
+    Action, ActionId, AgentId, NodeId, PhysicalActionResourceCoordinate, QuotaUsage, RunId,
+    SideEffectClass, TenantId, VerificationResult,
 };
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -39,6 +40,7 @@ fn request(name: &str) -> splendor_gateway::ActionRequest {
         tenant_id: TenantId::new(),
         agent_id: AgentId::new(),
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params: serde_json::json!({"physical_action": true, "target_ref": "zone:A"}),
@@ -52,8 +54,12 @@ fn request(name: &str) -> splendor_gateway::ActionRequest {
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: vec![],
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: Some(PhysicalActionResourceCoordinate::physical_node(
+            NodeId::new(),
+        )),
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 

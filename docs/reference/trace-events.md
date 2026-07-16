@@ -94,7 +94,7 @@ or replay inspection. Mutating daemon calls also emit `DaemonAudit` before the
 mutation so caller attribution is persisted in the run trace.
 
 0.04-S2 approval lifecycle events are emitted by the gateway/daemon approval path
-when an action requires approval, a grant is presented, evidence is denied,
+when an action requires approval, a trusted receipt is validated, legacy evidence is denied,
 evidence is expired, or evidence is revoked. They are ordered in the same run
 trace and do not authorize adapter execution outside the gateway.
 
@@ -147,6 +147,23 @@ trace and do not authorize adapter execution outside the gateway.
 - `MessageExpired { message: MessageTraceContext, reason: Option<String> }`
 - `MessageConsumed { message: MessageTraceContext }`
 - `RemoteMessageSent { remote_message: RemoteMessageTraceContext }`
+
+On the production-local C02 daemon path, an allowed
+`ActionVerificationCompleted` is the mandatory pre-effect authority evidence
+record. The gateway appends it after live typed action/adapter/permission
+authority plus existing pre-effect verifiers allow, and after the atomic final
+authority permit re-check, but before adapter execution. The permit is held
+through this durable append and adapter execution. Revocation closes new permit
+admission and waits for earlier permitted effects; expiry or revocation observed
+before permit acquisition denies without adapter execution.
+`result.artifacts.authority` contains redacted decision summaries/digests and
+`pre_effect_recorded: true`. Append failure prevents the adapter call. Outer
+daemon/loop code emits this event only for denied/unrecorded paths, so it does not
+mislabel a post-effect append as pre-effect evidence or duplicate an allowed
+completion event.
+Scheduler actions retain one `tick_id` on verification-started, the single
+pre-effect verification-completed event, and the terminal action event. Direct
+daemon action submissions do not invent a scheduler tick identity.
 - `RemoteMessageAccepted { remote_message: RemoteMessageTraceContext }`
 - `RemoteMessageRejected { remote_message: RemoteMessageTraceContext, reason: String }`
 - `RemoteMessageDelivered { remote_message: RemoteMessageTraceContext }`
@@ -159,6 +176,12 @@ trace and do not authorize adapter execution outside the gateway.
 - `ChildRunStarted { delegation: LocalDelegationTraceContext }`
 - `ChildRunCompleted { delegation: LocalDelegationTraceContext }`
 - `ChildRunFailed { delegation: LocalDelegationTraceContext, failure: TaskFailure }`
+- Local delegation contexts may include additive `delegation_ledger` evidence:
+  a redacted v2 summary with grant IDs, chain digest/depth, bounded reserved
+  budget-dimension names, lifecycle status, and stable reason. Complete grants,
+  scopes, objectives, allowlists, obligations, result parameters, and budget
+  values remain authority-owned. Replay uses the summary to rebuild reservation,
+  release/fail-safe consume, cleanup, and revocation without effects.
 - `ChildRunLinked { parent_run_id, child_run_id, parent_agent_id, child_agent_id, causal_parent, source_message_id }`
 - `GovernanceApprovalRequested { transition: GovernanceTransition }`
 - `GovernanceApprovalGranted { transition: GovernanceTransition }`
@@ -337,7 +360,7 @@ gateway/verifier path.
 | --- | --- | --- |
 | `ActionNeedsApproval` | `action.needs_approval` | The approval verifier paused the action before adapter execution. |
 | `ApprovalRequested` | `approval.requested` | A policy-created approval request was recorded. |
-| `ApprovalGranted` | `approval.granted` | Scoped approval grant evidence was presented. |
+| `ApprovalGranted` | `approval.granted` | A trusted approval-obligation receipt was validated and matched to the exact current challenge. |
 | `ApprovalDenied` | `approval.denied` | Approval denial, unsupported schema, or wrong-scope evidence was rejected. |
 | `ApprovalExpired` | `approval.expired` | Expired approval evidence was rejected. |
 | `ApprovalRevoked` | `approval.revoked` | Revoked approval evidence was rejected. |
@@ -453,7 +476,7 @@ State handoff event variants correspond to these canonical event classes:
 | Rust variant | Canonical event class | Purpose |
 | --- | --- | --- |
 | `StateHandoffExported` | `state.handoff.exported` | Source exported a snapshot handoff. |
-| `StateHandoffImported` | `state.handoff.imported` | Receiver imported a validated snapshot. |
+| `StateHandoffImported` | `state.handoff.imported` | Explicit local-dev/lower-level receiver imported a validated snapshot. |
 | `StateHandoffImportFailed` | `state.handoff.import_failed` | Receiver failed closed before changing state head. |
 | `ReadOnlyStateReferenced` | `state.reference.read_only` | Receiver attached an immutable state reference. |
 
@@ -469,7 +492,12 @@ All state handoff events carry `StateHandoffTraceContext`:
 | `previous_state_node_id` | Receiver head expected before import/reference. |
 | `receiver_state_node_id` | Receiver-owned node after successful import. |
 | `snapshot_id` | Snapshot ID verified from state bytes. |
-| `source_trace_id` | Source event proving the export/reference boundary. |
+| `source_trace_id` | Source-declared export/reference linkage; v0 does not authenticate source-event existence. |
+
+Resident/non-dev daemon import does not emit `StateHandoffImported` or
+`StateHandoffImportFailed`: it returns `state_handoff_proof_unavailable` before
+the state owner or run trace is mutated. Accepted source event/evidence proof is a
+future EVT-005/EVID-005 dependency.
 
 ### TraceIntegrity
 

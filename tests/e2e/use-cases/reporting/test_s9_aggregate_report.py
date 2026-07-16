@@ -8,6 +8,8 @@ import aggregate_report as ar
 
 
 RUN_ID = "44444444-4444-4444-8444-444444449903"
+PRE_EFFECT_TRACE_RUN_ID = "44444444-4444-4444-8444-444444449909"
+POST_EFFECT_TRACE_RUN_ID = "44444444-4444-4444-8444-444444449911"
 ACTION_ID = "55555555-5555-4555-8555-555555559903"
 MESSAGE_ID = "66666666-6666-4666-8666-666666669903"
 
@@ -24,6 +26,9 @@ def runtime_record(
     action_id: str = ACTION_ID,
     reasons: list[str] | None = None,
     artifacts: dict | None = None,
+    run_id: str = RUN_ID,
+    failed_event: str = "ActionVerificationStarted",
+    side_effect_executed: bool = False,
 ) -> dict:
     body: dict = {}
     if kind in {"ActionDenied", "ActionNeedsIntervention", "ActionFailed"}:
@@ -32,7 +37,7 @@ def runtime_record(
         if kind == "ActionFailed":
             body["error"] = "adapter_failed"
     elif kind == "TraceWriteFailed":
-        body = {"failed_event": "ActionVerificationStarted", "side_effect_executed": False}
+        body = {"failed_event": failed_event, "side_effect_executed": side_effect_executed}
     elif kind == "StateCommitFailed":
         body = {"reason": "injected_state_commit_failure", "next_tick_advanced": False}
     elif kind == "RunPaused":
@@ -44,10 +49,10 @@ def runtime_record(
     return {
         "payload": {
             "trace_event_id": trace_id,
-            "identity": {"run_id": RUN_ID, "action_id": action_id},
+            "identity": {"run_id": run_id, "action_id": action_id},
             "kind": {kind: body},
         },
-        "run_id": RUN_ID,
+        "run_id": run_id,
     }
 
 
@@ -114,7 +119,22 @@ def valid_fixture() -> tuple[dict, dict, dict, list[dict], list[dict], dict[str,
         },
     )
     add_runtime("quota.exceeded", "action.denied", runtime_record(uuid_for(3), "ActionDenied", reasons=["quota_exceeded"]))
-    add_runtime("trace.write_failed", "trace.write_failed", runtime_record(uuid_for(4), "TraceWriteFailed", action_id=""), details={"http_counter_before": 0, "http_counter_after": 0})
+    add_runtime(
+        "trace.write_failed",
+        "trace.write_failed",
+        runtime_record(uuid_for(4), "TraceWriteFailed", action_id="", run_id=PRE_EFFECT_TRACE_RUN_ID),
+        details={"failed_event": "ActionVerificationStarted", "side_effect_executed": False, "http_counter_before": 0, "http_counter_after": 0},
+    )
+    trace_records.extend([
+        runtime_record(uuid_for(40), "LoopTickStarted", action_id="", run_id=POST_EFFECT_TRACE_RUN_ID),
+        runtime_record(uuid_for(41), "ActionExecuted", action_name="write_file", run_id=POST_EFFECT_TRACE_RUN_ID),
+    ])
+    add_runtime(
+        "trace.write_failed",
+        "trace.write_failed",
+        runtime_record(uuid_for(42), "TraceWriteFailed", action_id="", run_id=POST_EFFECT_TRACE_RUN_ID, failed_event="OutcomeRecorded", side_effect_executed=True),
+        details={"failed_event": "OutcomeRecorded", "side_effect_executed": True, "effect_exists": True, "effect_contents": "executed-once\n", "events": ["tick.started", "action.executed", "trace.write_failed"]},
+    )
     add_runtime("state.commit_failed", "state.commit_failed", runtime_record(uuid_for(5), "StateCommitFailed", action_id=""), details={"events": ["tick.started", "state.commit_failed"]})
     add_runtime("run.paused", "run.paused", runtime_record(uuid_for(6), "RunPaused", action_id=""))
     add_runtime("run.denied", "action.denied", runtime_record(uuid_for(7), "ActionDenied", reasons=["approval_denied"]))
@@ -188,6 +208,22 @@ class S9AggregateEvidenceTests(unittest.TestCase):
             source_trace_records=source_records,
         )
         self.assertIn("s9_required_event_forbidden_source:verifier.unavailable:scenario_report", failures)
+
+    def test_rejects_missing_post_effect_trace_failure_evidence(self) -> None:
+        scenario, fault, audit, trace_records, manager_events, source_records = valid_fixture()
+        for container in [scenario, fault, audit]:
+            container["required_event_evidence"]["trace.write_failed"] = container["required_event_evidence"]["trace.write_failed"][:1]
+        scenario["required_trace_event_ids"]["trace.write_failed"] = scenario["required_trace_event_ids"]["trace.write_failed"][:1]
+        trace_records = [record for record in trace_records if ar.trace_record_run_id(record) != POST_EFFECT_TRACE_RUN_ID]
+        failures = ar.validate_s9_required_event_evidence(
+            scenario=scenario,
+            fault=fault,
+            audit=audit,
+            trace_records=trace_records,
+            manager_events=manager_events,
+            source_trace_records=source_records,
+        )
+        self.assertIn("s9_trace_write_failure_after_effect_evidence_missing", failures)
 
 
 if __name__ == "__main__":

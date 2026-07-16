@@ -12,6 +12,8 @@ after reconnect.
 - Writes offline/sync markers as canonical `TraceEvent` records.
 - Adds central index queries for offline intervals and sync boundaries.
 - Adds storage-pressure fail-closed signal for side-effectful actions.
+- Hardens the resident reconnect endpoint with a dedicated mutating scope,
+  exact run binding, complete contiguous sequence, and recomputed event hashes.
 
 ## Non-goals
 
@@ -64,6 +66,8 @@ counts, and quarantined corruption without re-executing side effects.
 ## Failure behavior
 
 - Duplicate sync is idempotent.
+- The local resident acknowledgement endpoint revalidates exact complete-batch
+  retries; central duplicate insertion remains owned by `CentralTraceIndex`.
 - Missing segments are rejected clearly.
 - Hash/chain/payload conflicts are quarantined.
 - Buffer-full appends do not drop records and must fail closed for side effects.

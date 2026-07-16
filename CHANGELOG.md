@@ -4,6 +4,180 @@
 
 ### Added
 
+- Hardened physical/edge resident boundaries without changing intervention or
+  trace-record schemas. Operator intervention evidence is now checked against
+  the authoritative tenant, agent, run, node, action, granted status, and expiry,
+  preventing caller-extended grants and cross-device reuse. Device reconnect
+  trace sync now requires the dedicated mutating scope
+  `splendor.device.trace_sync`, rejects empty/non-zero-start/gapped/cross-run
+  batches, and recomputes every event hash before acknowledging any record.
+  Exact valid full-batch retries remain revalidated and accepted; this local
+  endpoint does not claim central persistence or exactly-once delivery.
+- Corrected resident state-handoff import to fail closed before store, state-head,
+  or run-trace mutation. Caller bearer authentication, endpoint scope, and the
+  exact signed target work order remain required but cannot authenticate the v0
+  handoff source or prove the caller-carried source trace exists. Resident import
+  now returns `503 state_handoff_proof_unavailable` with `needs_intervention`;
+  valid exact-profile unknown-run imports receive the same response instead of a
+  run-existence oracle. Denials record only bounded redacted resident security
+  audit facts and no run trace; successful import remains experimental loopback
+  `local_dev` compatibility.
+  Signed source manifests, source event/evidence verification, and durable replay
+  remain downstream STA-005/EVT-005/EVID-005 work. Gold was not exercised.
+- Hardened the bounded non-gold, production-local AUTH-003 delegation slice:
+  the Authority Service now stores and validates immutable ordered chains,
+  atomically reserves authority-owned fan-out and component-wise subtree budgets,
+  supports exact-grant nested children, binds every child action to its issued
+  grant, propagates cancellation/revocation, enforces cleanup obligations, and
+  records reservation release/fail-safe consumption for inspect-only replay.
+  Runtime callers now receive opaque live caller/child handles rather than
+  validated grants; child actions recheck lifecycle, exact grant/run/agent
+  binding, and cumulative per-tick budget, then retain a final permit through
+  gateway entry. Exact semantic edge digests reject chain mutation, and exact
+  agent/run bindings reject Cartesian identity recombination. Explicit rooted
+  runtime edges prevent a direct child from delegating to a root sibling while
+  preserving assigned nested descendants. Delegated action expiry and HTTP
+  minute windows use maximum-observed authority service time, so rollback cannot
+  reactivate a grant or old quota bucket. Cleanup and subtree revocation close
+  admission before a bounded typed quiescence wait rather than waiting forever.
+  A child cleanup timeout now terminally fails the manager-owned child lifecycle,
+  emits structured parent/child replay evidence, and rejects completion retry
+  after the earlier permit drops. Trusted runtime trees reject root identity reuse
+  in descendant scope, and nested role escalation names the exact failing edge.
+  Legacy
+  `DelegatedAuthority` is narrowing-only. Live task requests, delegation
+  edge/chain contracts, and redacted ledger trace summaries are v2; task v1 is
+  replay/migration-only and full authority parameters remain ledger-owned.
+  Remote Message Service/Agent Controller
+  adoption and G18/G70/G71 remain deferred/not exercised; no gold was run.
+- Integrated current daemon run admission/effects with one opaque live C02 grant
+  admitted only from the verified signed-work-order wrapper. Scheduler, direct,
+  and run-bound physical gateway paths now evaluate typed action/adapter/
+  permission operations, fail closed on live expiry/revocation, persist redacted
+  authority allow evidence before adapter execution, and expose inspect-only
+  replay summaries. Gold evidence remains `not_exercised`.
+- Corrected the bounded AUTH-004 approval path so raw `ApprovalEvidence` is
+  compatibility/replay data and can never authorize an effect. Approval-required
+  outcomes now expose an exact non-authorizing challenge; the local manager can
+  immutably record that challenge and issue one trusted approval-obligation
+  receipt, and waiting runs progress only by retrying the exact action through
+  `/actions`. Receipt-bearing or raw-evidence lifecycle resumes do not tick,
+  while an exact receipt-free `/actions` retry can now carry a raw denial through
+  the policy verifier to terminal trace/replay evidence without adapter execution.
+  Changed action bindings fail closed, one-use and semantic-reissue replay are
+  denied, and trace failure cannot produce a second adapter effect. Physical
+  approval digests now bind the exact server-derived node under a separate v2
+  digest domain while nonphysical v1 bytes remain unchanged. Granted receipt
+  revocation is sent to the exact resident over validated TLS and commits at the
+  manager only after a typed known acknowledgement; claim/revoke races are atomic
+  and uncertainty blocks dispatch. Receipt trust and replay/revocation state
+  remain process-local; no production PKI, restart-durable ledger, full AUTH-004,
+  or gold completion is claimed. Rust process composition obtains receipt
+  configuration and the single per-run shared verifier/ledger through the opaque
+  `splendor-kernel` facade, removing the daemon's normal `splendor-authority`
+  dependency. OpenAPI and TypeScript expose the additive closed revocation and
+  physical challenge contracts.
+- Closed the remaining local manager approval signing oracle: approval request,
+  grant, deny, and revoke now require a fresh one-use Ed25519 caller bearer bound
+  to the exact central-manager audience, configured fleet, and
+  `splendor.approvals.manage` scope. Approval trust now binds the exact caller
+  subject, must use a key distinct from outbound resident dispatch, permits an
+  exactly matching optional/null risk label, and records separate requester and
+  decider attribution with hashed credential correlation. Request credential/audit
+  objects are exact non-authoritative mirrors; forged, stale, wrong-target, wrong-scope, or replayed
+  proof fails before approval/audit mutation or receipt issuance. This remains a
+  bounded `local_acceptance` profile with process-local trust/replay state; it
+  does not add manager TLS, general inbound manager authentication,
+  restart-durable revocation propagation, or gold completion.
+- Added a bounded manager-owned approval-policy admission seam for real resident
+  dispatch. `POST /work-orders` accepts a default-empty closed and bounded policy
+  list only when every selector narrows to the signed work-order scope, then
+  digest-binds that exact list to the process-local accepted record. Same-ID
+  replacement and out-of-scope/expired policies fail closed; dispatch cannot
+  override policies, forwards only the retained list over the existing TLS
+  resident create path, and keeps policy actions empty. Approval policies can
+  pause an otherwise authorized action but cannot add actions, adapters,
+  permissions, or bypass C02/gateway verification. This does not authenticate
+  the remaining manager inbound API, add durable policy storage, or claim gold
+  completion.
+- Made resident physical safety snapshots process-owned: stored device status,
+  constraints, policy expiry/current time, node identity, and action parameters
+  are authoritative, while request safety fields can only narrow/deny. Forged
+  safe battery, geofence, altitude, emergency-stop, collision, privacy,
+  proximity, offline-policy, and cloud-authority inputs cannot reach the adapter.
+  Safety completion traces now derive only from actual gateway safety evidence.
+- Integrated `splendorctl run` with the same signed-work-order C02 enforcement:
+  the CLI now preserves `ValidatedWorkOrder`, privately derives a live per-run
+  authority handle, enforces exact action/adapter/permission and identity scope,
+  rechecks expiry/revocation, and durably records authority allow evidence before
+  filesystem or HTTP adapter calls. Evidence failure blocks the effect, replay
+  remains inspect-only, and configured work orders never fall back to explicit
+  unsigned-local compatibility mode. Ambiguous multi-adapter profiles fail
+  closed because the current work-order schema does not bind actions to adapters.
+- Added the accepted RFC 0011 resident security correction: resident mode now
+  requires Rustls TLS, a closed Ed25519 caller bearer verified against explicit
+  trust/revocation state, explicit owner-only work-order/policy keyrings, and
+  exact non-authoritative credential mirrors. Mutating bearer JTIs are now
+  atomically one-use, audit correlation is a bounded domain-separated digest,
+  audit time is server-owned, and safe create idempotency remains stable across
+  fresh JTIs. Manager→resident dispatch now uses bounded no-redirect/no-proxy
+  HTTPS, an exact-origin allowlist, immutable work-order/placement/node/instance
+  binding, eligible-instance checks, strict typed responses, terminal
+  unknown-effect outcomes without automatic retry, and real resident-router plus
+  adversarial fault evidence. The UC-E2E-S4 composition generates acceptance-only
+  key/TLS material in separate role volumes with per-instance work-order v1
+  secrets; v1 remains a scoped shared-secret residual rather than asymmetric
+  verifier separation.
+- Closed the final resident-auth dispatch races: consumed mutating JTIs now live
+  through expiry leeway; work-order revocation is serialized across full
+  create/start dispatch with last-moment authority checks; start cancellation
+  retains an unknown-effect quarantine until an authoritative success report is
+  stored; signed locality rejects unknown classes; and the existing typed
+  registry now backs an authenticated instance-heartbeat manager route. The
+  TypeScript bearer client rejects redirects, create/idempotency fingerprints use
+  domain-separated BLAKE3, verifier debug output redacts consumed JTIs, and the
+  one-shot acceptance auth fixture runs only in an explicit Compose setup phase.
+  Resident trace views retain only bounded `sha256:` caller-correlation digests,
+  allowing central sync to verify original hash chains without exposing bearer
+  or JTI material. State snapshot export/import now enforce their documented
+  `splendor.state.handoff` scope plus exact signed run work-order authority,
+  receiver identity/head binding, replay denial, and scheduler/loop/state-owner
+  mutation. Registry freshness now uses monotonic manager receipt time rather
+  than sender timestamps, and unknown work-order revoke/dispatch IDs allocate no
+  revocation gate, tombstone, reservation, or terminal dispatch state.
+- Corrected CLI run-level trace composition so agents sharing one configured
+  `run_id` also share one runtime cursor, producing a contiguous sequence/hash
+  chain with distinct agent identities. Signed resume retains that cursor and
+  live pre-effect authority. Authority-profile admission rejection now records
+  bounded sanitized audit evidence before state or adapter effects.
+- Completed the non-gold production-local C02 service path for current local and
+  resident-mode daemon run effects: immutable action/adapter/exact-
+  permission profiles prevent permission omission and adapter recombination;
+  a final owned effect permit closes expiry/revocation TOCTOU races; revocation
+  waits for earlier permitted adapter calls; monotonic time latches observed
+  expiry; scheduler traces retain one tick identity; direct/physical traces retain
+  one action identity; and conditional receipts reject globally duplicated or
+  unknown extras, validate after blocking verifiers, and atomically claim an owned
+  one-use effect permit before evidence/adapter. Trace failure burns the claim.
+  The shared receipt ledger is process-local and does not claim restart durability.
+  Registered and non-empty request profiles require the complete signed permission set and ambiguous
+  multi-adapter work orders fail admission. Closed Rust/OpenAPI objects and exact
+  TypeScript authority unions have parity tests. The bounded resident caller
+  verifier is the accepted RFC 0011 compatibility adapter; full C01/IDR-002,
+  future privileged planes, and all gold cases remain downstream/not exercised.
+- Hardened the daemon C02 lifecycle boundary: only pending/running runs admit
+  direct or run-bound physical gateway work; terminal transitions close new
+  effect permits before status publication and wait outside the broad run lock;
+  resume requires the original work-order identity and canonical bound payload;
+  untrusted direct/physical quota estimates have server-owned action/duration
+  minima; and resident run traces retain the configured `instance_id`.
+- Corrected daemon lifecycle ownership so blocked direct/physical adapters no
+  longer retain the global run registry or per-run lifecycle lock. Stop/cancel
+  can close admission, publish terminal status, and keep unrelated runs
+  inspectable while waiting for an earlier final permit. Resident process startup
+  now rejects missing, malformed, blank, or nil `SPLENDOR_INSTANCE_ID` instead of
+  silently generating one. Omitted and explicit-zero duration estimates are
+  covered on both direct and physical endpoints.
 - Added bounded AUTH-007d exact-family current-v1 positive and v0/v2 denial
   matrices for authority operation/scope/grant/request/revocation/policy
   contracts, plus trusted authority cache/snapshot freshness, offline-TTL, and
@@ -43,15 +217,25 @@
 
 ### Explicitly not included
 
-- No new authorizing schema version, TypeScript/OpenAPI parity change, policy
-  cache persistence/fleet redesign, resident persistence/watch, canonical
+- No policy cache persistence/fleet redesign,
+  resident persistence/watch, canonical
   historical-signature migration seam, or broad rolling-version compatibility
-  claim. The in-memory cache state and public Rust mutation API did change.
+  claim. The additive exact receipt/profile/tick contract fields and parity tests
+  are limited to the current C02 daemon effect path. AUTH-003 intentionally adds
+  v2 task-request, delegation edge/chain, and redacted trace-summary contracts as
+  described above. The in-memory cache state and
+  public Rust mutation API did change.
 - No all-plane AUTH-007, #244, or gold completion claim; Driver, Artifact
   Registry, physical helper-plan, remote/fleet, typed-instance, and independent
   response-recipient confused-deputy paths remain deferred or unexpressible.
-- No recursive local delegation: child records retain issued grant IDs only for
-  evidence/revocation, and broader replacement grants fail the immutable binding.
+- No generic OAuth/OIDC/PKI provider, full Principal Registry, manager inbound
+  production authentication, hot trust watch/refresh, mTLS enrollment, or
+  request proof-of-possession. `splendor-manager` remains explicit acceptance
+  infrastructure even though its outbound resident dispatch is authenticated.
+- No remote/cross-instance delegation ledger, Message Service or Agent Controller
+  adoption, or durable authority reservation store; recursive support is local
+  and only through exact authority-issued child grants plus explicit runtime
+  edges. This bounded slice is not a catalog-wide AUTH-003 completion claim.
 - No cross-manager or cross-instance grant binding and no durable trace event for
   trusted local root-binding setup; the binding API remains local run admission.
 - No FND-012, #231, #180, G29, G66, G68, or G74 completion/pass claim; no 24/7

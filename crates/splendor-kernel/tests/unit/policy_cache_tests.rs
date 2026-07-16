@@ -112,6 +112,7 @@ impl ActionGateway for CountingGateway {
             post_verification: Some(VerificationResult::allow()),
             output: Some(serde_json::json!({"ok": true})),
             error: None,
+            approval_challenge: None,
             completed_at: OffsetDateTime::now_utc(),
         })
     }
@@ -251,6 +252,7 @@ fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionReques
         tenant_id: cache_owner().tenant_id,
         agent_id: cache_owner().agent_id,
         run_id: RunId::new(),
+        tick_id: None,
         action: Action {
             name: name.to_string(),
             params: serde_json::json!({}),
@@ -264,8 +266,10 @@ fn named_request(name: &str, side_effect_class: SideEffectClass) -> ActionReques
         quota_usage: QuotaUsage::single_action(),
         satisfied_preconditions: vec![],
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 

@@ -15,21 +15,21 @@ use splendor_types::{
 const DIGEST: &str = "blake3:3333333333333333333333333333333333333333333333333333333333333333";
 
 #[derive(Clone)]
-struct Fixture {
-    now: OffsetDateTime,
-    root_issuer: PrincipalId,
-    parent_subject: PrincipalId,
-    child_subject: PrincipalId,
-    tenant_id: TenantId,
-    parent_agent_id: AgentId,
-    child_agent_id: AgentId,
-    parent_run_id: RunId,
-    child_run_id: RunId,
-    audience: String,
+pub(crate) struct Fixture {
+    pub(crate) now: OffsetDateTime,
+    pub(crate) root_issuer: PrincipalId,
+    pub(crate) parent_subject: PrincipalId,
+    pub(crate) child_subject: PrincipalId,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) parent_agent_id: AgentId,
+    pub(crate) child_agent_id: AgentId,
+    pub(crate) parent_run_id: RunId,
+    pub(crate) child_run_id: RunId,
+    pub(crate) audience: String,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             now: OffsetDateTime::now_utc(),
             root_issuer: PrincipalId::new(),
@@ -138,7 +138,7 @@ fn parent_grant_with(
     })
 }
 
-fn parent_grant(fixture: &Fixture) -> ValidatedCapabilityGrant {
+pub(crate) fn parent_grant(fixture: &Fixture) -> ValidatedCapabilityGrant {
     parent_grant_with(
         fixture,
         vec![gateway_action_operation("artifact.create")],
@@ -207,7 +207,7 @@ fn result_contract() -> DelegationResultContract {
     }
 }
 
-fn request_for(
+pub(crate) fn request_for(
     fixture: &Fixture,
     parent: &ValidatedCapabilityGrant,
 ) -> DelegationChildGrantRequest {
@@ -703,6 +703,14 @@ fn delegation_denies_exhausted_depth_and_fan_out_cap() {
 
 #[test]
 fn delegation_reason_mappers_cover_remaining_stable_codes() {
+    let mut malformed_result = result_contract();
+    malformed_result.result_schema = "invalid".to_string();
+    assert_eq!(
+        validate_result_contract(&malformed_result)
+            .expect_err("unversioned result schema denied")
+            .reason_code(),
+        "bad_result_contract"
+    );
     assert_eq!(
         DelegationGrantError::BadResultContract {
             reason: "invalid_result_contract_schema".to_string(),
@@ -742,6 +750,10 @@ fn delegation_reason_mappers_cover_remaining_stable_codes() {
             "overbroad_budget",
         ),
         (vec!["run_ids_not_granted".to_string()], "overbroad_scope"),
+        (
+            vec!["tenant_id_missing_from_request".to_string()],
+            "overbroad_scope",
+        ),
         (Vec::new(), "parent_grant_invalid"),
     ] {
         assert_eq!(map_parent_denial(&reasons).reason_code(), expected);
@@ -827,6 +839,22 @@ fn delegation_external_effect_classifier_covers_role_restriction_surface() {
         verb: AuthorityVerb::Publish,
         name: None,
         resource_schema_version: Some("splendor.artifact.v1".to_string()),
+    }));
+    assert!(is_external_effect_operation(&AuthorityOperation {
+        schema_version: splendor_types::AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Artifact,
+        resource_kind: AuthorityResourceKind::Artifact,
+        verb: AuthorityVerb::Activate,
+        name: None,
+        resource_schema_version: Some("splendor.artifact.v1".to_string()),
+    }));
+    assert!(is_external_effect_operation(&AuthorityOperation {
+        schema_version: splendor_types::AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
+        namespace: AuthorityOperationNamespace::Agent,
+        resource_kind: AuthorityResourceKind::Agent,
+        verb: AuthorityVerb::Invoke,
+        name: None,
+        resource_schema_version: Some("splendor.agent.v1".to_string()),
     }));
     assert!(is_external_effect_operation(&AuthorityOperation {
         schema_version: splendor_types::AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),

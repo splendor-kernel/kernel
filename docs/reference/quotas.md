@@ -30,6 +30,26 @@ its local per-agent quota.
 4. Allowed usage is accumulated for that agent and the aggregate tenant view.
 5. Denied usage is not accumulated and the adapter is not called.
 
+### Daemon-submitted estimate floor
+
+`POST /actions` and run-bound physical action requests are untrusted daemon
+inputs. Before gateway quota verification, the daemon normalizes their
+`QuotaUsage` to at least:
+
+- `actions = 1`;
+- `action_duration_ms = 1`.
+
+This prevents an omitted or explicitly all-zero estimate from bypassing
+`max_actions_per_tick` and the duration floor. The daemon does not invent
+filesystem, network, or HTTP usage that it cannot know before execution.
+
+Current limitation: these compatibility adapters do not yet return trusted
+post-execution resource receipts, so filesystem/network/HTTP estimates are not
+reconciled to measured actual usage. Adapter-specific metering and trusted
+receipt reconciliation remain required before those dimensions can be treated
+as actual accounting. The pre-effect quota decision remains conservative only
+for the server-owned action-count and minimum-duration dimensions.
+
 ## Trace behavior
 
 Quota denials are recorded in the existing action-denial trace path. The

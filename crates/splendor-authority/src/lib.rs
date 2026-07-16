@@ -12,12 +12,14 @@
 
 mod capability;
 mod delegation;
+mod delegation_ledger;
 mod evidence;
 mod identity;
 mod issuance;
 mod obligations;
 mod renewal;
 mod revocation;
+mod run_authority;
 
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
@@ -28,8 +30,16 @@ pub use capability::{
     ValidatedCapabilityGrant,
 };
 pub use delegation::{
-    issue_delegation_child_grant, DelegationChildGrant, DelegationChildGrantRequest,
-    DelegationGrantError, DelegationValidationContext,
+    delegation_edge_binding_digest, issue_delegation_child_grant, DelegationChildGrant,
+    DelegationChildGrantRequest, DelegationGrantError, DelegationValidationContext,
+};
+pub use delegation_ledger::{
+    validate_delegation_chain, CommittedDelegation, DelegatedActionAuthorizationError,
+    DelegatedActionAuthorizationRequest, DelegatedActionPermit, DelegatedRuntimeAuthorityHandle,
+    DelegationCallerHandle, DelegationChainValidationError, DelegationChildRequestDefaults,
+    DelegationCleanupOutcome, DelegationLedgerError, DelegationQuiescence, DelegationReservation,
+    DelegationRevocationOutcome, DelegationRuntimeEdge, InMemoryDelegationAuthorityLedger,
+    LOCAL_DELEGATION_FAN_OUT_LIMIT, LOCAL_DELEGATION_QUIESCENCE_TIMEOUT,
 };
 pub use evidence::{
     authority_decision_evidence, authority_reason_category, compare_authority_evidence,
@@ -50,10 +60,17 @@ pub use issuance::{
     WorkOrderGrantIssuanceResult,
 };
 pub use obligations::{
-    canonical_authority_request_digest, issue_local_authority_obligation_receipt,
-    validate_authority_obligation_receipt, verify_obligation_receipts,
-    AuthorityObligationReceiptValidationContext, ObligationReceiptError,
-    ObligationReceiptVerification, ValidatedAuthorityObligationReceipt,
+    apply_approval_policy_obligation, canonical_authority_request_digest,
+    issue_local_authority_obligation_receipt, validate_authority_obligation_receipt,
+    verify_obligation_receipts, ApprovalObligationContext, AuthorityObligationEffectPermit,
+    AuthorityObligationReceiptClock, AuthorityObligationReceiptLedger,
+    AuthorityObligationReceiptRevocationOutcome, AuthorityObligationReceiptValidationContext,
+    InMemoryAuthorityObligationReceiptLedger, LocalAuthorityObligationReceiptConfig,
+    ObligationReceiptError, ObligationReceiptLedgerError, ObligationReceiptVerification,
+    ValidatedAuthorityObligationReceipt, APPROVAL_OBLIGATION_ACTION_DIGEST,
+    APPROVAL_OBLIGATION_ACTION_ID, APPROVAL_OBLIGATION_ACTION_NAME, APPROVAL_OBLIGATION_ADAPTER,
+    APPROVAL_OBLIGATION_APPROVAL_ID, APPROVAL_OBLIGATION_EXPIRES_AT, APPROVAL_OBLIGATION_POLICY_ID,
+    APPROVAL_OBLIGATION_RECEIPT_AUDIENCE, APPROVAL_OBLIGATION_RISK_LEVEL,
 };
 pub use renewal::{
     renew_cached_authority_grant, AuthorityGrantRenewalContextError, AuthorityGrantRenewalPolicy,
@@ -88,6 +105,10 @@ pub use revocation::{
     REASON_AUTHORITY_REVOCATION_SNAPSHOT_FUTURE_DATED,
     REASON_AUTHORITY_REVOCATION_SNAPSHOT_MISSING, REASON_AUTHORITY_REVOCATION_SNAPSHOT_STALE,
     REASON_AUTHORITY_SCOPE_MISMATCH,
+};
+pub use run_authority::{
+    LocalRunAuthorityAdmissionError, LocalRunAuthorityEffectPermit,
+    LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
 };
 
 #[cfg(test)]

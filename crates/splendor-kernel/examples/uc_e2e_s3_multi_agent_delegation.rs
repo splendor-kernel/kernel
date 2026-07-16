@@ -7,9 +7,8 @@ use splendor_gateway::{
 };
 use splendor_kernel::{
     AgentContext, AgentIsolationPolicy, AgentRuntimeConfig, KernelRuntime, KernelRuntimeConfig,
-    LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest, MessageRouter,
-    QuotaPolicy, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
-    TraceStoreSink,
+    LocalDelegationManager, LocalDelegationRequest, MessageRouter, QuotaPolicy, SnapshotPolicy,
+    StateGraph, TenantContext, TenantPolicy, TenantRegistry, TraceStoreSink,
 };
 use splendor_store::{
     SqliteStateStore, SqliteTraceStore, StateData, StateMetadata, StateStore, TraceStore,
@@ -290,15 +289,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(causal_parent.trace_event_id.clone()),
     );
     request.child_run_id = child_run_id.clone();
-    let child_authority = local_delegation_authority(
+    let parent_grant = local_delegation_parent_grant(
         orchestrator_principal.clone(),
         specialist_principal.clone(),
         &tenant_id,
         &request,
     )?;
-    let bound_parent_grant = child_authority.parent_capability_grant.clone();
-    manager
-        .bind_root_run_capability_grant(&parent_run_id, &child_authority.parent_capability_grant)?;
+    manager.bind_root_run_capability_grant(&parent_run_id, &parent_grant)?;
+    let mut child_authority = manager.child_authority_for_run(
+        &parent_run_id,
+        specialist_principal.clone(),
+        AUTHORITY_AUDIENCE,
+        OffsetDateTime::now_utc(),
+    )?;
+    child_authority.max_fan_out = 3;
     let child_run =
         manager.create_child_run(&parent_runtime, &child_runtime, request, child_authority)?;
     let consumed_request = manager.router().consume(
@@ -436,7 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_id: &parent_run_id,
         schema: TASK_RESPONSE_SCHEMA,
     })?);
-    negatives.push(invalid_schema_negative(
+    negatives.push(invalid_v2_payload_negative(
         &parent_runtime,
         manager.router(),
         trace_store.as_ref(),
@@ -460,12 +464,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     overbroad.child_run_id = RunId::parse("12121212-1212-4121-8121-121212121212")?;
     let overbroad_child_run_id = overbroad.child_run_id.clone();
     let overbroad_runtime = runtime(overbroad.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut overbroad_authority = LocalDelegationAuthority::new(
-        bound_parent_grant.clone(),
+    let mut overbroad_authority = manager.child_authority_for_run(
+        &parent_run_id,
         specialist_principal.clone(),
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     overbroad_authority.max_fan_out = 4;
     let before_events = manager
         .router()
@@ -509,12 +513,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cross_tenant.child_run_id = RunId::parse("34343434-3434-4343-8343-343434343434")?;
     let cross_child_run_id = cross_tenant.child_run_id.clone();
     let cross_runtime = runtime(cross_tenant.child_run_id.clone(), Arc::clone(&trace_store));
-    let mut cross_authority = LocalDelegationAuthority::new(
-        bound_parent_grant,
+    let mut cross_authority = manager.child_authority_for_run(
+        &parent_run_id,
         other_specialist_principal,
         AUTHORITY_AUDIENCE,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     cross_authority.max_fan_out = 4;
     let cross_result = manager.create_child_run(
         &parent_runtime,
@@ -670,12 +674,12 @@ fn authority(actions: &[&str], adapters: &[&str], permissions: &[&str]) -> Deleg
     }
 }
 
-fn local_delegation_authority(
+fn local_delegation_parent_grant(
     parent_principal: PrincipalId,
     child_principal: PrincipalId,
     tenant_id: &TenantId,
     request: &LocalDelegationRequest,
-) -> Result<LocalDelegationAuthority, Box<dyn std::error::Error>> {
+) -> Result<splendor_authority::ValidatedCapabilityGrant, Box<dyn std::error::Error>> {
     let parent_grant = grant_from_legacy_allowlists(
         CompatibilityGrantContext {
             grant_id: CapabilityGrantId::new(),
@@ -704,14 +708,8 @@ fn local_delegation_authority(
         RevocationStatus::Active,
         Some("local_delegation:example".to_string()),
     )?;
-    let mut authority = LocalDelegationAuthority::new(
-        parent_grant,
-        child_principal,
-        AUTHORITY_AUDIENCE,
-        OffsetDateTime::now_utc(),
-    );
-    authority.max_fan_out = 3;
-    Ok(authority)
+    let _ = child_principal;
+    Ok(parent_grant)
 }
 
 fn gateway(
@@ -767,6 +765,7 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         tenant_id: input.tenant_id,
         agent_id: input.agent_id,
         run_id: input.run_id,
+        tick_id: None,
         action: Action {
             name: input.name.to_string(),
             params: serde_json::json!({"ref": format!("fixture:{}", input.name)}),
@@ -784,8 +783,10 @@ fn action_request(input: ActionRequestInput<'_>) -> ActionRequest {
         quota_usage: input.quota_usage,
         satisfied_preconditions: Vec::new(),
         requested_at: OffsetDateTime::now_utc(),
+        physical_action_resource_coordinate: None,
         approval_evidence: None,
         authority_obligation_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     }
 }
 
@@ -963,7 +964,7 @@ fn router_negative(
     })
 }
 
-fn invalid_schema_negative(
+fn invalid_v2_payload_negative(
     runtime: &KernelRuntime,
     router: &splendor_kernel::LocalMessageRouter,
     trace_store: &SqliteTraceStore,
@@ -984,24 +985,31 @@ fn invalid_schema_negative(
             requires_response: true,
             created_at: OffsetDateTime::now_utc(),
         },
-        schema_version: MessageSchemaVersion::V1,
+        schema_version: MessageSchemaVersion::V2,
         delivery_status: MessageDeliveryStatus::Pending,
         trace_links: MessageTraceLinks::default(),
     };
     let err = router
         .send(runtime, envelope)
         .expect_err("invalid schema denied");
-    let trace_id =
-        find_message_rejection_trace_id(trace_store, run_id, &message_id, "unsupported")?;
+    let trace_id = find_message_rejection_trace_id(
+        trace_store,
+        run_id,
+        &message_id,
+        "message payload validation failed for `splendor.message.task_request.v2`: missing field `parent_run_id`",
+    )?;
     Ok(NegativeEvidence {
-        case: "unsupported_message_schema_rejected_before_delivery".to_string(),
+        case: "invalid_v2_task_request_payload_rejected_before_delivery".to_string(),
         status: format!("{err}"),
-        reason_codes: vec!["unsupported_schema_version".to_string()],
+        reason_codes: vec!["task_request_v2_payload_validation_failed".to_string()],
         trace_event_ids: vec![trace_id.to_string()],
         message_id: Some(message_id.to_string()),
         adapter_executions_before: 0,
         adapter_executions_after: 0,
-        artifacts: serde_json::json!({"delivery_status": "rejected"}),
+        artifacts: serde_json::json!({
+            "delivery_status": "rejected",
+            "router_error": err.to_string()
+        }),
     })
 }
 

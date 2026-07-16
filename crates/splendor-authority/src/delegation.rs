@@ -101,12 +101,13 @@ impl DelegationChildGrant {
     }
 
     /// Authority-owned validated child grant for later evaluator calls.
-    pub fn child_grant(&self) -> &ValidatedCapabilityGrant {
+    pub(crate) fn child_grant(&self) -> &ValidatedCapabilityGrant {
         &self.child_grant
     }
 
     /// Consumes the result and returns the validated child grant.
-    pub fn into_child_grant(self) -> ValidatedCapabilityGrant {
+    #[cfg(test)]
+    pub(crate) fn into_child_grant(self) -> ValidatedCapabilityGrant {
         self.child_grant
     }
 }
@@ -180,6 +181,9 @@ pub enum DelegationGrantError {
     /// Parent grant is not valid yet at decision time.
     #[error("parent grant is not yet valid")]
     ParentNotYetValid,
+    /// Immediate delegated routing cannot start before the requested child window.
+    #[error("child grant is not yet valid")]
+    ChildNotYetValid,
     /// Critic/evaluator roles tried to carry actuation or external-effect authority.
     #[error("critic/evaluator delegation cannot carry external-effect operations")]
     CriticEvaluatorExternalEffectOperation,
@@ -223,6 +227,7 @@ impl DelegationGrantError {
             Self::ParentRevoked => "parent_revoked",
             Self::ParentExpired => "parent_expired",
             Self::ParentNotYetValid => "parent_not_yet_valid",
+            Self::ChildNotYetValid => "child_grant_not_yet_valid",
             Self::CriticEvaluatorExternalEffectOperation => {
                 "critic_evaluator_external_effect_operation"
             }
@@ -270,8 +275,9 @@ pub fn issue_delegation_child_grant(
             reason_code: error.reason_code(),
         }
     })?;
-    let delegation_grant = DelegationGrant {
+    let mut delegation_grant = DelegationGrant {
         schema_version: DELEGATION_GRANT_SCHEMA_VERSION.to_string(),
+        binding_digest: String::new(),
         parent_grant_id,
         parent_run_id: request.parent_run_id,
         parent_agent_id: request.parent_agent_id,
@@ -287,13 +293,26 @@ pub fn issue_delegation_child_grant(
         expires_at: raw_child_grant.expires_at,
         remaining_delegation_depth: raw_child_grant.max_delegation_depth,
         max_fan_out: request.max_fan_out,
+        cleanup_obligations: splendor_types::DelegationCleanupObligations::default(),
         child_capability_grant: raw_child_grant,
     };
+    delegation_grant.binding_digest = delegation_edge_binding_digest(&delegation_grant)
+        .map_err(|reason_code| DelegationGrantError::ChildGrantInvalid { reason_code })?;
 
     Ok(DelegationChildGrant {
         delegation_grant,
         child_grant,
     })
+}
+
+/// Canonical digest over every semantic delegation-edge field except the digest
+/// itself. This binds replay evidence against field-by-field substitution.
+pub fn delegation_edge_binding_digest(edge: &DelegationGrant) -> Result<String, String> {
+    let mut canonical = edge.clone();
+    canonical.binding_digest.clear();
+    let bytes =
+        serde_json::to_vec(&canonical).map_err(|_| "edge_digest_unavailable".to_string())?;
+    Ok(splendor_types::ContentHash::blake3(bytes).to_string())
 }
 
 fn validate_parent_edge(
@@ -396,6 +415,9 @@ fn validate_request_shape(
             reason: "child_not_before_must_precede_expires_at".to_string(),
         });
     }
+    if context.now < request.not_before {
+        return Err(DelegationGrantError::ChildNotYetValid);
+    }
     if request.max_fan_out == 0 || request.max_fan_out > context.parent_fan_out_limit {
         return Err(DelegationGrantError::OverbroadFanOut);
     }
@@ -451,6 +473,11 @@ fn validate_result_contract(
             reason: reason.to_string(),
         }
     })?;
+    if contract.result_schema != splendor_types::TASK_RESPONSE_SCHEMA {
+        return Err(DelegationGrantError::BadResultContract {
+            reason: "unsupported_result_schema".to_string(),
+        });
+    }
     if contract.max_result_bytes == Some(0) {
         return Err(DelegationGrantError::BadResultContract {
             reason: "max_result_bytes_must_be_positive".to_string(),
@@ -459,7 +486,7 @@ fn validate_result_contract(
     Ok(())
 }
 
-fn validate_role_operations(
+pub(crate) fn validate_role_operations(
     role: DelegationRoleProfile,
     operations: &[AuthorityOperation],
 ) -> Result<(), DelegationGrantError> {
@@ -665,4 +692,4 @@ fn is_external_effect_operation(operation: &AuthorityOperation) -> bool {
 
 #[cfg(test)]
 #[path = "../tests/unit/delegation_tests.rs"]
-mod tests;
+pub(crate) mod tests;

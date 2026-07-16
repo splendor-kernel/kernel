@@ -21,12 +21,13 @@
 
 use crate::{
     Action, AgentId, ApprovalTraceContext, AuditAttribution, CircuitBreakerTraceContext,
-    Constraint, ContentHash, EscalationContext, Feedback, GovernanceObjectKind, GovernanceScope,
-    GovernanceState, GovernanceTransition, GovernanceTransitionError,
-    GovernanceTransitionRejection, IdentityValidationError, LocalDelegationAuthorityEvidence,
-    MessageId, MessageTraceContext, PolicyBundleId, PolicyBundleTraceContext,
-    RemoteMessageTraceContext, Reward, RunId, SnapshotId, StateHandoffTraceContext, TaskFailure,
-    TenantId, TickId, TraceEventId, TraceId, TraceIdentityContext, VerificationResult, WorkOrderId,
+    Constraint, ContentHash, DelegationLedgerTraceSummary, EscalationContext, Feedback,
+    GovernanceObjectKind, GovernanceScope, GovernanceState, GovernanceTransition,
+    GovernanceTransitionError, GovernanceTransitionRejection, IdentityValidationError,
+    LocalDelegationAuthorityEvidence, MessageId, MessageTraceContext, PolicyBundleId,
+    PolicyBundleTraceContext, RemoteMessageTraceContext, Reward, RunId, SnapshotId,
+    StateHandoffTraceContext, TaskFailure, TenantId, TickId, TraceEventId, TraceId,
+    TraceIdentityContext, VerificationResult, WorkOrderId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -934,7 +935,7 @@ pub enum GovernanceTraceEventKindError {
 }
 
 /// Trace context for local parent/child delegation events.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LocalDelegationTraceContext {
     /// Parent run that requested scoped local work.
     pub parent_run_id: RunId,
@@ -956,6 +957,9 @@ pub struct LocalDelegationTraceContext {
     /// local child-run routing or replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_evidence: Option<LocalDelegationAuthorityEvidence>,
+    /// Redacted authority-ledger chain and budget-reservation transition summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_ledger: Option<DelegationLedgerTraceSummary>,
 }
 
 impl LocalDelegationTraceContext {
@@ -983,6 +987,12 @@ impl LocalDelegationTraceContext {
         authority_evidence: LocalDelegationAuthorityEvidence,
     ) -> Self {
         self.authority_evidence = Some(authority_evidence);
+        self
+    }
+
+    /// Returns a copy with redacted authority-ledger trace evidence.
+    pub fn with_delegation_ledger(mut self, evidence: DelegationLedgerTraceSummary) -> Self {
+        self.delegation_ledger = Some(evidence);
         self
     }
 }

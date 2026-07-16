@@ -24,6 +24,7 @@
 //! assert_eq!(event.sequence, 0);
 //! ```
 
+pub mod authority_obligation_receipts;
 mod escalation;
 mod fleet_telemetry;
 mod local_delegation;
@@ -32,6 +33,7 @@ mod message_router;
 mod node_registry;
 mod policy_cache;
 mod remote_message_transport;
+mod run_authority;
 mod runtime;
 mod scheduler;
 mod state;
@@ -39,6 +41,10 @@ mod tenancy;
 mod trace;
 mod trace_durability;
 
+pub use authority_obligation_receipts::{
+    AuthorityObligationReceiptFacadeError, AuthorityObligationReceiptRevocation,
+    AuthorityObligationReceiptVerifier, LocalAuthorityObligationReceiptConfig,
+};
 pub use escalation::{
     apply_escalation_to_outcome, escalations_require_intervention, observations_for_outcome,
     EscalationEvaluator, EscalationOutcomeInput, ESCALATION_ENGINE_SOURCE,
@@ -47,8 +53,9 @@ pub use fleet_telemetry::{FleetTelemetryCollector, TelemetryThresholds};
 pub use local_delegation::{
     replay_local_delegations, LocalAgentRegistration, LocalChildRun, LocalDelegationAuthority,
     LocalDelegationError, LocalDelegationManager, LocalDelegationRejection, LocalDelegationReplay,
-    LocalDelegationRequest, LocalRunRecord, LocalRunStatus, LocalTaskResponse,
-    REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION, REASON_MISSING_PARENT_RUN_GRANT_BINDING,
+    LocalDelegationRequest, LocalDelegationRuntimeEdge, LocalRunRecord, LocalRunStatus,
+    LocalTaskResponse, REASON_CHILD_CAPABILITY_GRANT_ID_COLLISION,
+    REASON_DELEGATION_QUIESCENCE_TIMEOUT, REASON_MISSING_PARENT_RUN_GRANT_BINDING,
     REASON_PARENT_RUN_GRANT_MISMATCH,
 };
 pub use loop_engine::{
@@ -76,6 +83,10 @@ pub use policy_cache::{
 pub use remote_message_transport::{
     send_remote_message, InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault,
     RemoteMessageReceiver, RemoteMessageTransport, RemoteMessageTransportError,
+};
+pub use run_authority::{
+    KernelPreEffectAuthorityRecorder, RunActionAdmissionError, RunActionAdmissionState,
+    RunAuthorityHandle,
 };
 pub use runtime::{KernelRuntime, KernelRuntimeConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerStep};

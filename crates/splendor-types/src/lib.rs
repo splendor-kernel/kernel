@@ -58,8 +58,12 @@ mod trace;
 mod work_order;
 
 pub use approval::{
-    ApprovalActionScope, ApprovalDecision, ApprovalEvidence, ApprovalPolicy, ApprovalTraceContext,
-    APPROVAL_EVIDENCE_SCHEMA_VERSION, APPROVAL_POLICY_SCHEMA_VERSION,
+    ApprovalActionScope, ApprovalChallenge, ApprovalDecision, ApprovalEvidence, ApprovalPolicy,
+    ApprovalTraceContext, ResidentApprovalReceiptRevocationAck,
+    ResidentApprovalReceiptRevocationRequest, ResidentApprovalReceiptRevocationStatus,
+    APPROVAL_CHALLENGE_SCHEMA_VERSION, APPROVAL_EVIDENCE_SCHEMA_VERSION,
+    APPROVAL_POLICY_SCHEMA_VERSION, RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
 };
 pub use authority::{
     AuthorityBudgetScope, AuthorityDecision, AuthorityDecisionStatus, AuthorityObligation,
@@ -67,8 +71,10 @@ pub use authority::{
     AuthorityObligationReceiptValidationKind, AuthorityOperation, AuthorityOperationNamespace,
     AuthorityResourceKind, AuthorityTimeScope, AuthorityVerb, CapabilityGrant,
     CapabilityGrantValidation, CapabilityGrantValidationKind, CapabilityRequest, CapabilityScope,
-    DataPurpose, DelegationChain, DelegationGrant, DelegationResultContract, DelegationRoleProfile,
-    DriverOperationRef, LocalityScope, NetworkScope, RevocationRecord,
+    DataPurpose, DelegationChain, DelegationCleanupObligations, DelegationGrant,
+    DelegationLedgerEvidence, DelegationLedgerTraceSummary, DelegationReservationStatus,
+    DelegationResultContract, DelegationRoleProfile, DriverOperationRef, LocalityScope,
+    NetworkScope, PhysicalActionResourceCoordinate, PhysicalActionResourceKind, RevocationRecord,
     AUTHORITY_DECISION_SCHEMA_VERSION, AUTHORITY_OBLIGATION_RECEIPT_SCHEMA_VERSION,
     AUTHORITY_OBLIGATION_SCHEMA_VERSION, AUTHORITY_OPERATION_SCHEMA_VERSION,
     CAPABILITY_GRANT_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
@@ -156,7 +162,8 @@ pub use message::{
     MessageValidationError, RemoteMessageEnvelope, RemoteMessageEnvelopeVersion,
     RemoteMessageRetryPolicy, RemoteMessageTraceContext, RemoteMessageValidationError, TaskFailure,
     TaskRequest, TaskResponse, TaskResponseStatus,
-    LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA, TASK_RESPONSE_SCHEMA,
+    LOCAL_DELEGATION_AUTHORITY_EVIDENCE_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
+    TASK_REQUEST_SCHEMA_V1, TASK_RESPONSE_SCHEMA,
 };
 pub use node_registry::{
     HealthStatus, InstanceHealth, InstanceHeartbeat, InstanceRegistration, ManagementAuditEvent,

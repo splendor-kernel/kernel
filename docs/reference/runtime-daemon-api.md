@@ -4,8 +4,9 @@ The runtime daemon API is the local control boundary for Splendor runs. In the
 0.1 compatibility line, the stable endpoint names and request/response shapes are
 documented here. The OpenAPI document remains versioned to the current runtime
 daemon API metadata and carries a separate 0.1 compatibility note.
-The implementation remains local/foundation-oriented; it is not a fleet manager
-or production auth provider.
+The implementation remains foundation-oriented and is not a fleet manager or
+generic auth provider. Accepted RFC 0011 adds one production-real resident caller
+profile; explicit local development remains a separate loopback-only mode.
 
 Historically this surface was introduced in 0.02-S5. 0.1 stabilizes the public
 daemon boundary without promising private handler internals.
@@ -75,8 +76,23 @@ transport security -> caller authentication -> endpoint scopes -> signed work or
 ```
 
 A caller token authenticates the app. A signed work order authorizes run creation
-or resume. The Action Gateway authorizes side effects. No layer replaces the
+or resume. Production-local run admission converts the already validated signed
+work order into one opaque live C02 authority handle through the kernel facade.
+The Action Gateway authorizes side effects only after that handle allows the
+typed action, effective adapter, and every required permission. Existing copied
+allowlists may narrow but cannot independently allow. No layer replaces the
 others.
+
+Run admission also derives one immutable trusted action profile per action. The
+profile binds the action to its effective adapter and exact permission set before
+any requester or policy candidate reaches live authority evaluation. An omitted
+`RegisteredAction.required_permissions` field means the full signed work-order
+permission set. When present, the field must contain that same complete set,
+without duplicates and with at most 64 entries; it cannot narrow authority
+operations. Because the current work-order schema has independent action and
+adapter lists but no signed exact pairing, a work order allowing multiple adapters
+is rejected with `ambiguous_work_order_action_adapter_profile` rather than trusting
+a caller-selected Cartesian pair.
 
 The runtime daemon API was originally the 0.02-S5 local control boundary for
 Splendor runs.
@@ -101,7 +117,10 @@ foundation-oriented; it is not a fleet manager or production auth provider.
 | `POST` | `/runs/{run_id}/cancel` | Cancel a local run while preserving trace/state evidence | `splendor.runs.stop` |
 | `POST` | `/runs/{run_id}/percepts` | Append a daemon-submitted percept queue entry | `splendor.percepts.append` |
 | `POST` | `/runs/{run_id}/policies/sync` | Sync or mark failure for the run policy bundle cache | `splendor.policies.sync` |
+| `POST` | `/runs/{run_id}/approval-receipts/{receipt_id}/revoke` | Revoke one exact retained approval receipt at its owning resident ledger | `splendor.approval_receipts.revoke` |
 | `GET` | `/runs/{run_id}/state-head` | Return latest committed state node metadata | `splendor.state.read` |
+| `POST` | `/state-snapshots/export` | Export the current state head as a trace-linked v0 handoff | `splendor.state.handoff` |
+| `POST` | `/state-snapshots/import` | Experimental loopback-local import; resident mode denies until source proof exists | `splendor.state.handoff` |
 | `GET` | `/runs/{run_id}/traces` | Read ordered trace records; requires `redaction_policy` | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/traces/export` | Export ordered trace records with redaction policy and integrity metadata | `splendor.traces.read` |
 | `POST` | `/runs/{run_id}/replay` | Start inspect-only replay summary | `splendor.replay.create` |
@@ -130,10 +149,41 @@ the daemon security contract from
 identity, endpoint scope, tenant binding, audience binding, expiry, revocation,
 and mutating-call audit attribution.
 
-Run creation and run resume require signed, unexpired, unrevoked, scoped work
-orders. The daemon checks work-order tenant, run scope where applicable, and
-agent compatibility for run creation. Caller credentials never authorize actions
-directly; `/actions` always submits to the `VerifiedActionGateway` path with
+Resident startup is explicit. `SPLENDOR_DAEMON_MODE=resident` requires a valid
+non-nil `SPLENDOR_INSTANCE_ID`, `SPLENDOR_CALLER_TRUST_FILE`, owner-only
+`SPLENDOR_WORK_ORDER_KEYRING_FILE` and `SPLENDOR_POLICY_KEYRING_FILE`, plus
+`SPLENDOR_TLS_CERT_FILE` and owner-only `SPLENDOR_TLS_KEY_FILE`. It serves TLS and
+does not inherit local-development caller, work-order, or policy trust. Missing,
+empty, malformed, stale, or unsafe inputs abort/fail closed. `local_dev` is
+explicit, warning-logged, and loopback-only; unknown mode values fail startup.
+
+Resident requests use `Authorization: Bearer` with the accepted closed Ed25519
+profile from [RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md). The
+body/header `CallerCredential` and `AuditAttribution` objects are compatibility
+mirrors only. They must exactly match the verified projection and cannot supply
+proof. Resident middleware carries verified context internally and can supply
+the compatibility projection when wire mirrors are omitted; supplied mirrors
+remain equality checks only. `401` responses include the bounded `WWW-Authenticate` Bearer challenge;
+scope, tenant, and mirror mismatches return `403`.
+For mutating requests, the verified JTI is atomically consumed before handler
+mutation; reuse returns `caller_token_replayed`. Reads may reuse an unexpired
+token. The projected `credential_id` is a bounded domain-separated `sha256:`
+correlation digest, never raw JTI, and middleware replaces caller-supplied audit
+time with its server authentication timestamp before trace recording.
+
+Run creation, run resume, and state handoff require signed, unexpired, unrevoked,
+scoped work orders. The daemon checks work-order tenant, run scope where
+applicable, and agent compatibility for run creation. Resume and state import
+additionally require the original `work_order_id` and the exact canonical
+work-order payload admitted at creation, normalized to the resolved `run_id`; a
+newly signed broader or otherwise changed work order is rejected. Caller
+credentials and the exact target work order are still insufficient for resident
+state import: resident mode requires source-authenticated handoff proof that v0
+does not provide and returns `state_handoff_proof_unavailable`. Caller credentials
+never authorize actions directly. A cryptographically valid exact-profile import
+for an unknown run receives the same proof-unavailable response rather than a
+run-not-found oracle;
+`/actions` always submits to the `VerifiedActionGateway` path with
 `GatewayVerificationState::Required`.
 
 When `CreateRunRequest.policy_bundle_required` is true, the daemon also requires
@@ -166,7 +216,22 @@ prepared/non-authorizing trace may remain and does not by itself prove commit.
 - a queued perceptor for daemon-submitted percepts;
 - a scheduler containing one loop engine;
 - a `VerifiedActionGateway` with explicitly registered local adapters;
+- immutable action/adapter/exact-permission profiles derived from the validated
+  work order and explicit registrations;
+- one opaque live C02 run-authority handle admitted only from
+  `ValidatedWorkOrder` (not a raw request payload);
+- the admitted work-order identity and a domain-separated digest of its canonical
+  payload bound to the resolved run, used only to prevent authority substitution
+  on resume;
+- one shared-runtime pre-effect authority evidence recorder;
 - optional `approval_policies` evaluated by the gateway approval verifier.
+
+The global run registry stores only shared references to per-run synchronized
+state. Request handlers clone the reference and release the registry lock before
+inspecting or mutating a run. Direct and physical action handlers also release
+the per-run state lock before gateway verification, pre-effect evidence, and
+adapter execution; the live final authority permit, not a broad daemon lock,
+linearizes an effect against terminal closure.
 
 `CreateRunRequest` also requires non-blank `request_id` and `idempotency_key`.
 The request ID is correlation only and remains distinct from `run_id` and
@@ -178,15 +243,27 @@ same run and receipt with `duplicate: true` and does not create another run slot
 Reusing an idempotency key for a different scope fails closed with
 `create_run_idempotency_scope_mismatch`; public error details intentionally omit
 raw attempted/existing scope fields and caller identifiers.
+The stable caller scope contains principal identity but not ephemeral bearer
+credential/JTI correlation ID, so a safe retry can present a fresh one-use token
+without changing the durable idempotency scope.
+Create-run request fingerprints and idempotency receipt hashes use
+domain-separated BLAKE3. The earlier FNV representation is not emitted.
 
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
-carry scoped approval evidence into the verifier chain. Evidence is never treated
-as direct action authority.
+remain decodable for compatibility and fail-closed trace/replay handling, but a
+raw grant is never action authority. `SubmitActionRequest.authority_obligation_receipts`
+carries raw owning-service receipts to trusted daemon-side validation; lifecycle
+resume cannot consume them.
 
 `start` and `resume` execute exactly one scheduler tick. This keeps the local
 daemon deterministic while proving the daemon boundary. Continuous/background
-scheduling is not introduced here.
+scheduling is not introduced here. `start` accepts only `pending` or `running`;
+it cannot be used to bypass signed-work-order checks for a paused run. `resume`
+executes a tick only from `paused` and requires the original bound work-order
+payload described above. Requests targeting `waiting_for_approval` are migration-
+safe rejections and do not tick; that state progresses only through an exact
+receipt-bearing `/actions` retry.
 
 Run statuses are:
 
@@ -201,12 +278,58 @@ stopped
 failed
 ```
 
-When a tick returns an approval-required action, the daemon records
-`RunPaused { reason: "waiting_for_approval" }`, stores the pending approval
-context for inspection/replay, and returns `waiting_for_approval`. Resume from
-that state requires a signed resume work order and
-`LifecycleRequest.approval_evidence`; missing evidence returns
-`403 approval_required` before a tick is run.
+When a tick returns an approval-required action, its `ActionOutcome` includes a
+full `splendor.approval_challenge.v1` challenge. The daemon records
+`RunPaused { reason: "waiting_for_approval" }`, stores that exact challenge, and
+returns `waiting_for_approval`. A trusted manager records the challenge and may
+issue one `AuthorityObligationReceipt`. The caller must retry the exact pending
+action through `/actions`, preserving action ID, tenant/agent/run, payload,
+effective adapter, quota, preconditions, and original `requested_at` while adding
+the receipt and causal trace link. Changed coordinates return
+`409 approval_challenge_retry_mismatch`. Successful execution records
+`RunResumed`, clears the challenge, and returns the run to `running` without a
+new scheduler tick or state-head advance.
+
+`/runs/{run_id}/resume` rejects raw evidence with
+`legacy_approval_evidence_non_authorizing`, rejects receipts with
+`approval_receipt_resume_not_supported`, and otherwise returns
+`approval_exact_action_retry_required` while waiting. These are deliberate
+fail-closed migration errors.
+
+Direct `/actions` and run-bound physical action submissions normally admit
+gateway work only while the run is `pending` or `running`. `waiting_for_approval`
+admits only the exact pending receipt-bearing retry described above or an exact
+receipt-free retry carrying raw `Denied` evidence for fail-closed verifier
+tracing; missing raw
+challenge state fails closed. Other actions in that state and effects while
+paused, interrupted, resuming, completed, failed, cancelled, denied, or expired
+return a `409` lifecycle/approval code before adapter execution. Terminal transitions close live authority
+admission before publishing terminal status. A final permit acquired before that
+closure may complete, but no later permit can be acquired; stop/cancel release
+per-run state before waiting for those earlier permits to quiesce. Unrelated runs
+remain inspectable while an earlier effect or lifecycle wait is blocked. Action
+completion records cannot overwrite a terminal lifecycle status published while
+the effect was in flight.
+
+Raw approval evidence is admitted by the kernel before daemon audit, runtime
+trace, lifecycle, or gateway mutation. Active runs reject all raw grants and
+denials at that boundary. The only raw-evidence exception is the exact pending
+`waiting_for_approval` retry carrying a fail-closed `Denied`, expired, or revoked
+decision with no obligation receipts; it can record a terminal denial but cannot
+reach adapter execution.
+
+The resident receipt-revocation endpoint accepts a closed versioned request with
+the exact retained raw receipt and a bounded reason. It requires an authenticated
+caller bound to the run tenant and the dedicated
+`splendor.approval_receipts.revoke` scope. The path receipt ID, receipt signature,
+resident instance/run audience, approval ID, and ledger coordinate must match.
+The process-local ledger atomically linearizes claim versus revoke: `revoked` or
+`already_revoked` returns a typed acknowledgement with `effect_certainty=known`;
+an already claimed receipt returns `409 approval_receipt_revocation_too_late`.
+After scope and audience authentication, an unknown run and an existing run
+outside the caller's tenant both return the same `404 invalid_run` shape; wrong
+scope remains `403` and wrong caller-token audience remains `401`.
+This endpoint does not claim restart-durable revocation storage.
 
 ## Percept ingestion
 
@@ -232,6 +355,47 @@ Response fields include:
 - commit timestamp;
 - optional state label.
 
+## State handoff behavior
+
+`POST /state-snapshots/export` is a trace-recorded export boundary. Import is a
+mutating boundary only on explicit loopback `local_dev`; resident import is
+fail-closed before mutation. Both endpoints require authenticated caller scope
+`splendor.state.handoff`, matching tenant/run binding, audit attribution, and
+signed run-bound work-order authority. Export revalidates the envelope retained
+from run admission and rejects a request-level work-order ID or resident source
+instance mismatch.
+
+Export accepts `receiver_instance_id` and `previous_state_node_id`; the latter
+is the receiver head expected before import (`null` requires no receiver head).
+The source scheduler/loop/state-graph owner snapshots its current head and emits
+`splendor.state_handoff.v0` plus `state.handoff.exported`.
+
+Import request bodies include both `handoff` and the signed `work_order`
+envelope. The envelope must cryptographically validate and exactly match the
+target run's admitted work-order identity and canonical payload. In resident
+mode those necessary checks are followed by a stable
+`503 state_handoff_proof_unavailable` response with
+`details.disposition = needs_intervention`. The v0 payload has no accepted source
+signature/evidence proof, and its source trace ID is only caller-carried linkage.
+The denial occurs before schema/hash/head/replay processing and before any state
+store, state head, or run trace mutation. It records a bounded resident-only
+`state_handoff.proof_denied` security audit fact containing the fixed endpoint,
+method, server time, and redacted credential correlation; the diagnostic buffer
+retains at most 1,024 facts and contains no raw bearer or JTI.
+
+Only explicit loopback `local_dev` compatibility routes import through the target
+scheduler and loop engine; the daemon does not mutate the backing state store
+directly. A successful local-dev import records
+`state.handoff.imported` before publishing the new daemon state head. Validation,
+store, or trace failure fails closed. Trace failure restores the prior live graph,
+agent head, and state bytes; a replayed import leaves the imported head unchanged.
+
+This is a security compatibility correction to the earlier incomplete import
+request. Clients must still send the exact signed target `work_order`, but that
+does not authorize resident import. Successful resident import remains unavailable
+until STA-005/EVT-005/EVID-005 supply accepted source-authenticated manifest,
+source event/evidence verification, and durable replay semantics.
+
 ## Trace behavior
 
 Trace responses return `TraceRecord` values from the run's trace store. Records
@@ -240,6 +404,12 @@ are returned in monotonic sequence order. Range reads use `start` inclusive and
 and `POST /runs/{run_id}/traces/export` both require an explicit
 `redaction_policy`; the export response also includes a deterministic
 `integrity_hash` summary over the returned trace chain.
+Resident audit records retain only the bounded domain-separated `sha256:`
+`credential_id` correlation digest described above; arbitrary credential IDs
+and credential material remain redacted. This permits central trace sync to
+verify the resident's original hash chain without exposing bearer or JTI bytes.
+For resident daemon configuration, run trace identities carry the configured
+`instance_id`; local development retains the existing unset placement identity.
 
 Lifecycle and daemon-specific events added for 0.02-S5:
 
@@ -253,7 +423,9 @@ PerceptsAppended
 
 `DaemonAudit { endpoint, audit }` is emitted for accepted mutating daemon calls
 after S0 security validation and before the runtime mutation, preserving caller
-identity and credential attribution in the run trace.
+identity and credential correlation attribution in the run trace. Resident audit
+timestamps are server-owned; caller-supplied compatibility timestamps are not
+persisted.
 
 Trace export is a POST audit boundary even though it uses the trace-read scope:
 its request body must include non-null `credential` and `audit_attribution`, and
@@ -283,6 +455,57 @@ ActionNeedsApproval | ActionNeedsIntervention | ActionExecuted | ActionDenied | 
 OutcomeRecorded
 ```
 
+For an allowed C02-protected effect, `ActionVerificationCompleted` is durably
+appended by the gateway after all pre-effect verifiers allow, after an atomic
+final authority permit re-check, and after final receipt validation plus atomic
+one-use claim, but before the adapter is called. The permits are
+held through evidence recording and adapter execution. Expiry or revocation
+before permit acquisition denies; revocation closes new admission and waits for
+earlier permitted effects to leave the adapter boundary. Its
+`result.artifacts.authority` contains only redacted typed
+decision summaries/digests and `pre_effect_recorded: true`. Append failure returns
+`NeedsIntervention` and the adapter count remains unchanged. The loop and daemon
+do not append a second post-effect completion event for that action.
+
+Scheduler actions copy the scheduler `tick_id` into the gateway request. Their
+verification-started, exactly one verification-completed, and terminal action
+events therefore retain one tick identity in order. Direct `/actions` requests
+remain outside a scheduler tick and do not fabricate a tick ID. Direct and
+run-bound physical requests allocate the effective action ID before verification;
+their started, single completed, terminal, and outcome records share the exact
+run/tenant/agent/action identity through the run's common trace cursor.
+Their caller-supplied quota estimate is untrusted: the daemon normalizes it to at
+least one action and one millisecond before quota verification. See
+[`quotas.md`](quotas.md) for the current reconciliation limitation.
+
+`SubmitActionRequest.authority_obligation_receipts` and daemon policy candidates
+accept raw owning-service receipts only. A requester-supplied authority decision
+is not current authority. When the live C02 evaluation is conditional, the
+gateway regenerates the current action decision and passes it with the raw
+receipts to `LocalAuthorityObligationVerifier`; missing, forged, stale, revoked,
+replayed, extra/missing per-decision, or mismatched receipts fail closed. Raw
+receipts are first checked against the complete current conditional-decision set;
+no unknown decision receipt is ignored. They are then partitioned by exact
+decision ID only after receipt IDs have been checked for global uniqueness, capped
+at 64 per action request, validated only after all blocking verifiers and the final
+authority check, and claimed atomically as one collection. Claim is the receipt
+effect linearization point: expiry after claim does not cancel that exact in-flight
+effect, while durable trace failure burns the receipt and still prevents adapter
+execution. Trusted time is monotonic and observed expiry is latched, so clock
+rollback cannot reactivate an unclaimed receipt. The current authority-owned
+ledger is shared by verifier instances within one process-local run; it is
+in-memory and does not claim process-restart durability.
+They are not fresh authority. For a matching approval policy, the daemon narrows
+the already-allowed live run decision to one exact `ApprovalRequired` obligation;
+it never accepts a requester-supplied decision. The local manager can issue that
+one receipt from the recorded challenge. Other owning-service receipt workflows,
+production trust, and durable revocation/replay storage remain downstream work.
+
+For create-run compatibility admission, a non-empty request-level
+`allowed_permissions` list must equal the complete signed work-order permission
+profile. Subset narrowing is rejected because the executable trusted action
+profile is exact; omission continues to select the complete signed profile.
+
 Approval flows may also emit `ApprovalRequested`, `ApprovalGranted`,
 `ApprovalDenied`, `ApprovalExpired`, and `ApprovalRevoked`. These are verifier
 facts only; they do not authorize adapter execution outside the gateway.
@@ -291,8 +514,13 @@ facts only; they do not authorize adapter execution outside the gateway.
 
 `POST /runs/{run_id}/replay` is inspect-only. It reads trace records, validates
 that sequence numbers are contiguous and run-scoped, and returns a replay summary
-with event counts and `approval_events`. It does not invoke perceptors, policies,
-gateways, verifiers, or adapters, and cannot repeat filesystem, network,
+with event counts, `approval_events`, and `authority_decisions` reconstructed from
+durable verification records. Allowed decisions are recorded before the effect;
+denials are recorded without any adapter effect. Authority summaries contain typed operation
+classification, status, normalized reason codes, matched grant/obligation IDs,
+and redacted decision digests; they omit concrete operation names and grant
+payloads. Replay does not invoke perceptors, policies, authority evaluators,
+receipt issuers/validators, gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
 
 Replay request bodies must include non-null `credential` and
@@ -320,14 +548,28 @@ Required 0.02-S5 failures include:
 
 | Condition | HTTP | Code |
 | --- | --- | --- |
+| Missing/invalid resident bearer, key/JTI revocation, stale trust, or clock rollback | `401` | bounded caller-auth reason code plus `WWW-Authenticate` |
+| Reused resident bearer JTI on a mutating request | `401` | `caller_token_replayed` before handler mutation |
+| Verified bearer has wrong endpoint scope/tenant or mismatched metadata mirror | `403` | daemon security or mirror mismatch code |
 | Invalid run | `404` | `invalid_run` |
 | Malformed percept body | `400` | `malformed_percept` |
 | Invalid policy bundle | `400` or `403` | policy validation reason code |
 | Unauthorized or missing scope/action trace link | `403` | daemon security error code |
 | Runtime unavailable | `503` | `runtime_unavailable` |
-| Resume from `waiting_for_approval` without evidence | `403` | `approval_required` |
+| Resume from `waiting_for_approval` with raw `ApprovalEvidence` | `409` | `legacy_approval_evidence_non_authorizing` |
+| Resume from `waiting_for_approval` with obligation receipts | `409` | `approval_receipt_resume_not_supported` |
+| Resume from `waiting_for_approval` without approval material | `409` | `approval_exact_action_retry_required` |
+| Non-exact `/actions` retry while waiting for approval | `409` | `approval_exact_action_retry_required` or `approval_challenge_retry_mismatch` |
+| Pending challenge unavailable while retrying | `503` | `approval_challenge_unavailable` |
+| Direct/physical effect from another non-capable lifecycle state | `409` | `run_not_effect_capable` |
+| Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
+| Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
+| Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |
 | Gateway denial | `200` with `ActionOutcome.status = Denied` | action outcome |
 | Governance intervention required | `200` with `ActionOutcome.status = NeedsIntervention` | action outcome |
+| Multiple unsigned action/adapter pairings | `400` | `ambiguous_work_order_action_adapter_profile` |
+| Narrowed registered permission profile | `400` | `trusted_action_profile_permission_mismatch` |
+| Duplicate/oversized registered permissions | `400` | `registered_action_required_permissions_duplicate` / `registered_action_required_permissions_limit_exceeded` |
 
 Gateway denials are action outcomes, not HTTP transport failures, because the
 gateway successfully evaluated and denied the requested action.
@@ -337,6 +579,8 @@ Stable client handling rules:
 - parse `code` as the programmatic daemon error discriminator;
 - treat `message` as human-readable diagnostics, not an authorization fact;
 - treat `details` as structured diagnostics whose exact keys may vary by code;
+- never include bearer bytes in logs or client errors; `@splendor/client` redacts
+  the exact configured token even if a transport or hostile response reflects it;
 - handle HTTP `503 runtime_unavailable` as fail-closed runtime unavailability;
 - handle gateway `Denied`, `NeedsApproval`, and `NeedsIntervention` as action
   outcomes where adapter execution did not occur;
@@ -355,8 +599,25 @@ Conformance failures use the report shape documented in
 
 This reference is part of the 0.1 stable compatibility surface for documented
 daemon endpoints and error shapes. It does not stabilize private Rust internals,
-production authentication infrastructure, native Node bindings, browser runtime
-behavior, fleet scheduling, or undocumented API fields.
+generic production authentication infrastructure, native Node bindings, browser
+runtime behavior, fleet scheduling, or undocumented API fields. The closed
+resident caller profile and mirror migration are governed by accepted RFC 0011.
+
+The additive exact raw-receipt, registered-action permission profile, optional
+gateway `tick_id`, and replay-authority-summary fields are the bounded v2 C02
+production-local integration. Receipt and registered-action profile objects are
+closed in Rust/OpenAPI, and TypeScript/OpenAPI contract tests retain field parity.
+The current compatibility admission uses
+synthetic opaque local principal IDs because daemon admission does not yet receive
+C01 issuer/subject proof facts. A downstream C01 provider must replace this seam
+with `issue_work_order_capability_grant`; no full OAuth/PKI, remote revocation
+watch, future Artifact/Driver/Data-Use/Evidence/Fleet plane, physical helper-plan
+adoption, or gold completion is claimed here. The current local run-effect path
+and resident-mode cryptographic caller, TLS, scope/trace-identity, and
+manager-dispatch composition are bounded non-gold component evidence under
+accepted RFC 0011. This is an `IDR-002a` compatibility profile, not full
+C01/IDR-002 or production manager inbound authentication. C02 and C01 gold
+targets remain explicitly `not_exercised`.
 
 Run 0.1 conformance validation from the repository root:
 

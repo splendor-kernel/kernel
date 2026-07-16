@@ -7,6 +7,7 @@
     "suite_id",
     "suite_version",
     "source_revision",
+    "source_tree",
     "started_at",
     "completed_at",
     "container_topology_hash",
@@ -25,6 +26,68 @@
     "suite_id": {"const": "splendor-use-case-e2e-through-0.1"},
     "suite_version": {"type": "string"},
     "source_revision": {"type": "string"},
+    "source_tree": {
+      "type": "object",
+      "required": [
+        "status",
+        "source",
+        "head_revision",
+        "dirty",
+        "digest",
+        "digest_algorithm",
+        "tracked_change_count",
+        "staged_change_count",
+        "unstaged_change_count",
+        "untracked_file_count",
+        "reason"
+      ],
+      "properties": {
+        "status": {"enum": ["known", "unknown"]},
+        "source": {"enum": ["git", "environment_override", "unknown"]},
+        "head_revision": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]},
+        "digest": {
+          "anyOf": [
+            {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "digest_algorithm": {"const": "splendor-e2e-source-tree-v1"},
+        "tracked_change_count": {"type": ["integer", "null"], "minimum": 0},
+        "staged_change_count": {"type": ["integer", "null"], "minimum": 0},
+        "unstaged_change_count": {"type": ["integer", "null"], "minimum": 0},
+        "untracked_file_count": {"type": ["integer", "null"], "minimum": 0},
+        "reason": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "known"}}},
+          "then": {
+            "properties": {
+              "source": {"enum": ["git", "environment_override"]},
+              "head_revision": {"type": "string", "minLength": 1},
+              "dirty": {"type": "boolean"},
+              "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "unknown"}}},
+          "then": {
+            "properties": {
+              "source": {"const": "unknown"},
+              "head_revision": {"type": "null"},
+              "dirty": {"type": "null"},
+              "digest": {"type": "null"},
+              "tracked_change_count": {"type": "null"},
+              "staged_change_count": {"type": "null"},
+              "unstaged_change_count": {"type": "null"},
+              "untracked_file_count": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
     "started_at": {"type": "string"},
     "completed_at": {"type": "string"},
     "container_topology_hash": {"type": "string", "pattern": "^sha256:"},

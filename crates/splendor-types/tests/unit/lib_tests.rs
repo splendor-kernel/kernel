@@ -218,4 +218,84 @@ fn approval_policy_matching_is_scoped_and_evidence_builders_round_trip() {
     assert_eq!(evidence.adapter.as_deref(), Some("artifact-store"));
     assert_eq!(evidence.trace_event_id.as_ref(), Some(&trace_event_id));
     round_trip(&evidence);
+
+    let challenge = ApprovalChallenge {
+        schema_version: APPROVAL_CHALLENGE_SCHEMA_VERSION.to_string(),
+        approval_id: ApprovalId::new(),
+        tenant_id: TenantId::new(),
+        agent_id: AgentId::new(),
+        run_id: RunId::new(),
+        action_id: ActionId::new(),
+        action_name: "artifact.publish".to_string(),
+        adapter: "artifact-store".to_string(),
+        policy_id: "publish_policy".to_string(),
+        risk_level: Some("high".to_string()),
+        subject: PrincipalId::new(),
+        authority_decision_id: AuthorityDecisionId::new(),
+        obligation_id: AuthorityObligationId::new(),
+        receipt_audience: "splendor.daemon.run:test".to_string(),
+        canonical_request_digest: format!("blake3:{}", "1".repeat(64)),
+        gateway_action_request_digest: format!("blake3:{}", "2".repeat(64)),
+        physical_action_resource_coordinate: None,
+        authority_decision_digest: format!("blake3:{}", "3".repeat(64)),
+        requested_at: now,
+        expires_at: now + time::Duration::minutes(5),
+    };
+    let serialized = serde_json::to_value(&challenge).expect("serialize approval challenge");
+    assert_eq!(
+        serialized["schema_version"],
+        APPROVAL_CHALLENGE_SCHEMA_VERSION
+    );
+    let fields = serialized
+        .as_object()
+        .expect("approval challenge object")
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        fields,
+        [
+            "action_id",
+            "action_name",
+            "adapter",
+            "agent_id",
+            "approval_id",
+            "authority_decision_digest",
+            "authority_decision_id",
+            "canonical_request_digest",
+            "expires_at",
+            "gateway_action_request_digest",
+            "obligation_id",
+            "policy_id",
+            "receipt_audience",
+            "requested_at",
+            "risk_level",
+            "run_id",
+            "schema_version",
+            "subject",
+            "tenant_id",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    round_trip(&challenge);
+}
+
+#[test]
+fn approval_policy_rejects_unknown_wire_fields() {
+    let policy = ApprovalPolicy::new(
+        "closed_policy",
+        TenantId::new(),
+        "approval policy wire contract is closed",
+    );
+    let mut value = serde_json::to_value(policy).expect("approval policy JSON");
+    value
+        .as_object_mut()
+        .expect("approval policy object")
+        .insert("allowed_actions".to_string(), serde_json::json!(["admin"]));
+
+    let error = serde_json::from_value::<ApprovalPolicy>(value)
+        .expect_err("unknown approval policy fields must fail closed");
+    assert!(error.to_string().contains("unknown field"));
 }

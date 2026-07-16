@@ -350,6 +350,22 @@ def run_self_test() -> int:
             "splendor-adapter-http -> splendor-kernel",
         ),
         (
+            "daemon_depends_on_authority",
+            metadata_fixture(
+                {
+                    "splendor-types": [],
+                    "splendor-authority": ["splendor-types"],
+                    "splendor-kernel": ["splendor-types", "splendor-authority"],
+                    "splendor-daemon": [
+                        "splendor-types",
+                        "splendor-kernel",
+                        "splendor-authority",
+                    ],
+                }
+            ),
+            "splendor-daemon -> splendor-authority",
+        ),
+        (
             "types_depends_on_store",
             metadata_fixture(
                 {

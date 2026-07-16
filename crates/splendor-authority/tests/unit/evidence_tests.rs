@@ -394,6 +394,31 @@ fn explanation_categories_cover_current_authority_reason_classes() {
             AuthorityExplanationCategory::ObligationsGate,
         ),
         (
+            "approval_required",
+            "approval_required",
+            AuthorityExplanationCategory::ObligationsGate,
+        ),
+        (
+            "approval_policy_schema_unsupported",
+            "approval_policy_schema_unsupported",
+            AuthorityExplanationCategory::IdentityValidation,
+        ),
+        (
+            "approval_policy_expired",
+            "approval_policy_expired",
+            AuthorityExplanationCategory::ExpiryTime,
+        ),
+        (
+            "approval_obligation_conflict",
+            "approval_obligation_conflict",
+            AuthorityExplanationCategory::ObligationsGate,
+        ),
+        (
+            "approval_challenge_binding_unavailable",
+            "approval_challenge_binding_unavailable",
+            AuthorityExplanationCategory::ObligationsGate,
+        ),
+        (
             "invalid_schema:capability_request.schema_version",
             "invalid_schema",
             AuthorityExplanationCategory::IdentityValidation,

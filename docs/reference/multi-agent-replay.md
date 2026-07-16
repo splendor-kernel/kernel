@@ -55,7 +55,7 @@ adds one final `causal_graph` record:
       "source_agent_id": "00000000-0000-0000-0000-000000000200",
       "target_agent_id": "00000000-0000-0000-0000-000000000201",
       "run_id": "00000000-0000-0000-0000-000000000100",
-      "schema": "splendor.message.task_request.v1",
+      "schema": "splendor.message.task_request.v2",
       "causal_parent": "...",
       "reason": null
     }

@@ -22,9 +22,9 @@ use splendor_kernel::{
     replay_local_delegations, ActionCandidate, AgentContext, AgentIsolationPolicy,
     AgentRuntimeConfig, FleetTelemetryCollector, InMemoryNodeRegistry,
     InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault, KernelRuntime,
-    KernelRuntimeConfig, LocalDelegationAuthority, LocalDelegationManager, LocalDelegationRequest,
-    LocalRunStatus, LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision,
-    QuotaPolicy, RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
+    KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest, LocalRunStatus,
+    LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision, QuotaPolicy,
+    RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
     StateHandoffScope, TelemetryThresholds, TenantContext, TenantPolicy, TenantRegistry,
     TraceError, TraceEvent, TraceEventKind, TraceSink,
 };
@@ -680,6 +680,24 @@ fn resign_daemon_work_order(envelope: &mut WorkOrderEnvelope) {
         .expect("resigned work order");
 }
 
+fn daemon_run_work_order(
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    run_id: Option<RunId>,
+) -> WorkOrderEnvelope {
+    let mut envelope =
+        daemon_work_order(tenant_id, agent_id, run_id, vec![EndpointScope::RunsCreate]);
+    envelope.work_order.allowed_actions = vec![
+        "allowed_action".to_string(),
+        "failing_action".to_string(),
+        "denied_action".to_string(),
+    ];
+    envelope.work_order.allowed_adapters = vec!["daemon.local".to_string()];
+    envelope.work_order.allowed_permissions.clear();
+    resign_daemon_work_order(&mut envelope);
+    envelope
+}
+
 fn daemon_work_order_authorization(
     tenant_id: TenantId,
     agent_id: AgentId,
@@ -711,6 +729,40 @@ fn daemon_action(name: &str) -> Action {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
     }
+}
+
+fn daemon_registered_actions() -> Vec<RegisteredAction> {
+    [
+        ("allowed_action", "daemon.local", Vec::new()),
+        ("failing_action", "daemon.local", Vec::new()),
+        ("denied_action", "daemon.local", Vec::new()),
+        ("finance.query", "sql", vec!["finance.read".to_string()]),
+        (
+            "artifact.create",
+            "artifact-store",
+            vec!["artifact.create".to_string()],
+        ),
+        ("message.send", "remote.message", Vec::new()),
+        ("state.handoff", "state", vec!["state.read".to_string()]),
+    ]
+    .into_iter()
+    .map(|(name, adapter, required_permissions)| RegisteredAction {
+        name: name.to_string(),
+        adapter: adapter.to_string(),
+        required_permissions: Some(required_permissions),
+    })
+    .collect()
+}
+
+fn daemon_run_registered_actions() -> Vec<RegisteredAction> {
+    ["allowed_action", "failing_action", "denied_action"]
+        .into_iter()
+        .map(|name| RegisteredAction {
+            name: name.to_string(),
+            adapter: "daemon.local".to_string(),
+            required_permissions: Some(Vec::new()),
+        })
+        .collect()
 }
 
 fn daemon_percept(schema: &str) -> Percept {
@@ -779,12 +831,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         idempotency_key: "idem_kernel_e2e_daemon".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
-        work_order: daemon_work_order(
-            tenant_id.clone(),
-            agent_id.clone(),
-            None,
-            vec![EndpointScope::RunsCreate],
-        ),
+        work_order: daemon_run_work_order(tenant_id.clone(), agent_id.clone(), None),
         credential: None,
         audit_attribution: Some(attribution(false)),
         allowed_actions: vec!["allowed_action".to_string(), "failing_action".to_string()],
@@ -796,10 +843,12 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.kernel_e2e.v1".to_string()],
@@ -837,6 +886,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         audit_attribution: Some(attribution(false)),
         reason: Some("kernel-e2e".to_string()),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, tick): (StatusCode, TickResponse) = call_json(
         app.clone(),
@@ -875,7 +925,9 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, unlinked_error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
@@ -901,7 +953,9 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -927,7 +981,9 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, failed_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -998,9 +1054,11 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         expected_audience: CredentialAudience::Daemon {
             daemon_id: "daemon_local".to_string(),
         },
+        caller_token_verifier: None,
         insecure_dev_mode: None,
         policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
         work_order_keyring: daemon_work_order_keyring(),
+        authority_obligation_receipt_config: None,
     }));
     let locked_tenant = TenantId::parse("00000000-0000-0000-0000-000000000211")?;
     let locked_agent = AgentId::parse("00000000-0000-0000-0000-000000000212")?;
@@ -1009,12 +1067,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         idempotency_key: "idem_kernel_e2e_locked".to_string(),
         tenant_id: locked_tenant.clone(),
         agent_id: locked_agent.clone(),
-        work_order: daemon_work_order(
-            locked_tenant.clone(),
-            locked_agent.clone(),
-            None,
-            vec![EndpointScope::RunsCreate],
-        ),
+        work_order: daemon_run_work_order(locked_tenant.clone(), locked_agent.clone(), None),
         credential: Some(credential(
             locked_tenant.clone(),
             vec![EndpointScope::RunsCreate],
@@ -1026,7 +1079,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
         policy_actions: Vec::new(),
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: Vec::new(),
@@ -1213,12 +1266,12 @@ fn delegated_authority(actions: &[&str], permissions: &[&str]) -> DelegatedAutho
     }
 }
 
-fn local_delegation_authority(
+fn local_delegation_parent_grant(
     parent_principal: PrincipalId,
     child_principal: PrincipalId,
     tenant_id: &TenantId,
     request: &LocalDelegationRequest,
-) -> TestResult<LocalDelegationAuthority> {
+) -> TestResult<splendor_authority::ValidatedCapabilityGrant> {
     let parent_grant = grant_from_legacy_allowlists(
         CompatibilityGrantContext {
             grant_id: CapabilityGrantId::new(),
@@ -1249,14 +1302,8 @@ fn local_delegation_authority(
         RevocationStatus::Active,
         Some("local_delegation:e2e".to_string()),
     )?;
-    let mut authority = LocalDelegationAuthority::new(
-        parent_grant,
-        child_principal,
-        "daemon:local",
-        OffsetDateTime::now_utc(),
-    );
-    authority.max_fan_out = 4;
-    Ok(authority)
+    let _ = child_principal;
+    Ok(parent_grant)
 }
 
 fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
@@ -1350,13 +1397,18 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["parse.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 1)),
     };
-    let mut child_a_authority = LocalDelegationAuthority::new(
-        parent_grant.clone(),
+    let mut child_a_authority = manager.child_authority_for_run(
+        &parent_run,
         specialist_a_principal.clone(),
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     child_a_authority.max_fan_out = 4;
+    child_a_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
     let child_a = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -1367,8 +1419,7 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
     assert_eq!(
         child_a
             .child_agent
-            .delegated_authority
-            .as_ref()
+            .delegated_authority()
             .unwrap()
             .allowed_actions,
         vec!["parse.document".to_string()]
@@ -1384,19 +1435,43 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority: delegated_authority(&["summarize.document"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&parent_run, 2)),
     };
-    let mut child_b_authority = LocalDelegationAuthority::new(
-        parent_grant,
+    let mut child_b_authority = manager.child_authority_for_run(
+        &parent_run,
         specialist_b_principal,
         "daemon:local",
         OffsetDateTime::now_utc(),
-    );
+    )?;
     child_b_authority.max_fan_out = 4;
+    child_b_authority.budget = AuthorityBudgetScope {
+        max_actions_per_tick: Some(2),
+        max_action_duration_ms: Some(500),
+        ..AuthorityBudgetScope::default()
+    };
     let child_b = manager.create_child_run(
         &parent_runtime,
         &child_b_runtime,
         child_b_request,
         child_b_authority,
     )?;
+
+    let laundering_denial = child_a
+        .child_agent
+        .verify_delegated_action_with_grant(
+            &action(
+                "summarize.document",
+                SideEffectClass::External,
+                &["doc.read"],
+            ),
+            Some("fixture"),
+            &child_a_run,
+            child_a.run.capability_grant_id.as_ref(),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        )
+        .verification
+        .reasons;
+    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
 
     let response = manager.complete_child_run(
         &parent_runtime,
@@ -1424,18 +1499,12 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         splendor_types::TaskResponseStatus::Failed
     );
 
-    let laundering_denial = child_a
-        .child_agent
-        .verify_delegated_action(
-            &action(
-                "summarize.document",
-                SideEffectClass::External,
-                &["doc.read"],
-            ),
-            Some("fixture"),
-        )
-        .reasons;
-    assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
+    let cancelled_authority = manager.child_authority_for_run(
+        &parent_run,
+        specialist_a_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    )?;
     manager.cancel_parent_run(&parent_runtime, &parent_run, "done")?;
     let cancelled_request = LocalDelegationRequest::new(
         parent_run.clone(),
@@ -1445,12 +1514,6 @@ fn run_local_multi_agent(artifacts: &Path) -> TestResult<MessageEvidence> {
         delegated_authority(&["parse.document"], &["doc.read"]),
         None,
     );
-    let cancelled_authority = local_delegation_authority(
-        orchestrator_principal,
-        specialist_a_principal,
-        &tenant_id,
-        &cancelled_request,
-    )?;
     let cancelled_attempt = manager.create_child_run(
         &parent_runtime,
         &child_a_runtime,
@@ -2145,6 +2208,7 @@ fn run_trace_state_handoff(artifacts: &Path) -> TestResult<StateSyncEvidence> {
         tenant_id: tenant_id.clone(),
         agent_id: agent_id.clone(),
         run_id: run_id.clone(),
+        receiver_instance_id: None,
     };
     let mut receiver = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
@@ -2541,15 +2605,18 @@ fn run_cross_tenant_specialist(artifacts: &Path) -> TestResult<DomainEvidence> {
         delegated_authority: delegated_authority(&["document.parse"], &["doc.read"]),
         parent_causal_trace_id: Some(TraceId::from_run_sequence(&run_id, 1)),
     };
-    let tenant_mismatch_authority = local_delegation_authority(
+    let tenant_mismatch_parent_grant = local_delegation_parent_grant(
         orchestrator_principal,
-        shared_principal,
+        shared_principal.clone(),
         &tenant_a,
         &tenant_mismatch_request,
     )?;
-    manager.bind_root_run_capability_grant(
+    manager.bind_root_run_capability_grant(&run_id, &tenant_mismatch_parent_grant)?;
+    let tenant_mismatch_authority = manager.child_authority_for_run(
         &run_id,
-        &tenant_mismatch_authority.parent_capability_grant,
+        shared_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
     )?;
     let tenant_mismatch = manager
         .create_child_run(
@@ -2594,15 +2661,11 @@ fn run_remote_helper_non_authority(
     let tenant_id = TenantId::parse("00000000-0000-0000-0000-000000001101")?;
     let helper_agent = AgentId::parse("00000000-0000-0000-0000-000000001102")?;
     let run_id = RunId::parse("00000000-0000-0000-0000-000000001103")?;
-    let helper = AgentContext::new(helper_agent, tenant_id, AgentRuntimeConfig::default())
-        .with_delegated_authority(DelegatedAuthority::empty());
-    let escalation = helper.verify_delegated_action(
-        &action(
-            "origin.adapter.execute",
-            SideEffectClass::External,
-            &["origin.write"],
-        ),
+    let _helper = AgentContext::new(helper_agent, tenant_id, AgentRuntimeConfig::default());
+    let escalation = DelegatedAuthority::empty().verify_action(
+        "origin.adapter.execute",
         Some("fixture"),
+        &["origin.write".to_string()],
     );
     assert!(!escalation.allowed);
     let state_store = Arc::new(InMemoryStateStore::default());
@@ -3010,11 +3073,10 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         idempotency_key: "idem_final_cross_primitive_journey".to_string(),
         tenant_id: tenant_id.clone(),
         agent_id: orchestrator.clone(),
-        work_order: daemon_work_order(
+        work_order: daemon_run_work_order(
             tenant_id.clone(),
             orchestrator.clone(),
             Some(run_id.clone()),
-            vec![EndpointScope::RunsCreate],
         ),
         credential: None,
         audit_attribution: Some(attribution(false)),
@@ -3027,10 +3089,12 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             adapter: Some("daemon.local".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
-        registered_actions: Vec::new(),
+        registered_actions: daemon_run_registered_actions(),
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
         allowed_percept_schemas: vec!["splendor.percept.final_journey.v1".to_string()],
@@ -3080,6 +3144,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         audit_attribution: Some(attribution(false)),
         reason: Some("final journey start".to_string()),
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, tick): (StatusCode, TickResponse) = call_json(
         app.clone(),
@@ -3117,7 +3182,9 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
+        requested_at: None,
         approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
     };
     let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
         app.clone(),
@@ -3172,13 +3239,19 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
         delegated_authority: delegated_authority(&["summarize.local"], &[]),
         parent_causal_trace_id: causal_trace_id.clone(),
     };
-    let child_authority = local_delegation_authority(
+    let child_parent_grant = local_delegation_parent_grant(
         orchestrator_principal,
-        local_specialist_principal,
+        local_specialist_principal.clone(),
         &tenant_id,
         &child_request,
     )?;
-    delegation.bind_root_run_capability_grant(&run_id, &child_authority.parent_capability_grant)?;
+    delegation.bind_root_run_capability_grant(&run_id, &child_parent_grant)?;
+    let child_authority = delegation.child_authority_for_run(
+        &run_id,
+        local_specialist_principal,
+        "daemon:local",
+        OffsetDateTime::now_utc(),
+    )?;
     let child = delegation.create_child_run(
         &parent_runtime,
         &child_runtime,
@@ -3187,7 +3260,16 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     )?;
     let laundering_denial = child
         .child_agent
-        .verify_delegated_action(&daemon_action("denied_action"), Some("daemon.local"))
+        .verify_delegated_action_with_grant(
+            &daemon_action("denied_action"),
+            Some("daemon.local"),
+            &child_run_id,
+            child.run.capability_grant_id.as_ref(),
+            QuotaUsage::single_action(),
+            OffsetDateTime::now_utc(),
+            1,
+        )
+        .verification
         .reasons;
     assert!(laundering_denial.contains(&"delegated_action_not_allowed".to_string()));
 
@@ -3266,14 +3348,13 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             },
             source_instance_id: Some("instance_journey_a".to_string()),
             receiver_instance_id: Some("instance_journey_c".to_string()),
-            previous_state_node_id: Some(source_commit.node_id.to_string()),
+            previous_state_node_id: None,
             source_trace_id: Some(TraceId::from_run_sequence(&run_id, 2)),
             created_at: now,
         },
     )?;
-    let mut receiver_graph = StateGraph::with_head(
+    let mut receiver_graph = StateGraph::new(
         Arc::new(InMemoryStateStore::default()),
-        Some(source_commit.node_id.clone()),
         SnapshotPolicy::default(),
     );
     let imported = receiver_graph.import_handoff(
@@ -3289,6 +3370,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             tenant_id: tenant_id.clone(),
             agent_id: orchestrator.clone(),
             run_id: run_id.clone(),
+            receiver_instance_id: None,
         },
         now,
         StateMetadata::new(now, Some("final_journey_import".to_string())),
@@ -3309,6 +3391,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
             audit_attribution: Some(replay_audit),
             reason: Some("final journey replay".to_string()),
             approval_evidence: None,
+            authority_obligation_receipts: Vec::new(),
         })?,
     )
     .await?;
@@ -3726,12 +3809,15 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             adapter: Some("fixture".to_string()),
             quota_usage: Some(QuotaUsage::single_action()),
             satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
         }],
         policy_bundle_required: false,
         policy_bundle: None,
         registered_actions: vec![RegisteredAction {
             name: "fixture.allowed".to_string(),
             adapter: "fixture".to_string(),
+            required_permissions: Some(Vec::new()),
         }],
         approval_policies: Vec::new(),
         circuit_breakers: Vec::new(),
@@ -3756,7 +3842,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
     let create_response_shape = serde_json::to_value(CreateRunResponse {
         request_id: "req_openapi_shape".to_string(),
         idempotency_key: "idem_openapi_shape".to_string(),
-        idempotency_receipt_id: "create_run:fnv64:0000000000000000".to_string(),
+        idempotency_receipt_id: format!("create_run:blake3:{}", "0".repeat(64)),
         duplicate: false,
         run_id: run_id.clone(),
         status: DaemonRunStatus::Pending,
@@ -3776,6 +3862,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
             "event_count",
             "action_event_count",
             "approval_events",
+            "authority_decisions",
         ],
     )?;
     let replay_shape = serde_json::to_value(ReplayResponse {
@@ -3785,6 +3872,7 @@ fn validate_openapi_contract(artifacts: &Path) -> TestResult<OpenApiEvidence> {
         event_count: 1,
         action_event_count: 0,
         approval_events: Vec::new(),
+        authority_decisions: Vec::new(),
     })?;
     assert_json_has_keys(&replay_shape, &replay_response_required, "ReplayResponse");
     let package_json: Value =

@@ -12,12 +12,13 @@ use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig, HttpMethod};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, CircuitBreakerEvaluator, ResourceBoundaryVerifier,
-    StaticCircuitBreakerEvaluator, VerifiedActionGateway,
+    StaticCircuitBreakerEvaluator, TrustedActionProfile, VerifiedActionGateway,
 };
 use splendor_kernel::{
     ActionCandidate, AdapterQuota, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
-    LoopEngine, Perceptor, Policy, PolicyDecision, QuotaPolicy, RunTraceContext, Scheduler,
-    SchedulerConfig, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
+    KernelPreEffectAuthorityRecorder, KernelRuntime, LoopEngine, Perceptor, Policy, PolicyDecision,
+    QuotaPolicy, RunAuthorityHandle, RunTraceContext, Scheduler, SchedulerConfig, SnapshotPolicy,
+    StateGraph, TenantContext, TenantPolicy, TenantRegistry,
 };
 use splendor_store::{
     compute_trace_event_hash, SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord,
@@ -28,11 +29,11 @@ use splendor_types::{
     CircuitBreakerState, CircuitBreakerTraceContext, ContentHash, FleetId, GovernanceScope,
     HashAlgorithm, InstanceId, MessageId, NodeId, Percept, PerceptProvenance, QuotaUsage, RunId,
     RuntimeIdentityContext, SideEffectClass, SnapshotId, StateHandoffTraceContext, TenantId,
-    TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext, WorkOrder,
-    WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderValidationContext,
+    TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext, ValidatedWorkOrder,
+    WorkOrder, WorkOrderEnvelope, WorkOrderId, WorkOrderKeyring, WorkOrderValidationContext,
     WorkOrderValidationError,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -3814,22 +3815,79 @@ fn append_failure_evidence_event(
     Ok(())
 }
 
+fn side_effect_executed_before_trace_failure(
+    store: &dyn TraceStore,
+    run_id: &str,
+    failed_payload: &serde_json::Value,
+) -> Result<bool, TraceStoreError> {
+    let failed_identity: TraceIdentityContext = serde_json::from_value(
+        failed_payload
+            .get("identity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )?;
+    let Some(failed_tick_id) = failed_identity.tick_id else {
+        return Ok(false);
+    };
+    if non_read_only_action_executed_for_tick(failed_payload, failed_tick_id)? {
+        return Ok(true);
+    }
+
+    match store.read(run_id) {
+        Ok(records) => {
+            for record in records {
+                if non_read_only_action_executed_for_tick(&record.payload, failed_tick_id)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(TraceStoreError::RunNotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn non_read_only_action_executed_for_tick(
+    payload: &serde_json::Value,
+    expected_tick_id: splendor_types::TickId,
+) -> Result<bool, TraceStoreError> {
+    if trace_payload_kind(payload).as_deref() != Some("ActionExecuted") {
+        return Ok(false);
+    }
+
+    let event: TraceEvent = serde_json::from_value(payload.clone())?;
+    Ok(event.identity.tick_id == Some(expected_tick_id)
+        && matches!(
+            event.kind,
+            TraceEventKind::ActionExecuted { action, .. }
+                if action.side_effect_class != SideEffectClass::ReadOnly
+        ))
+}
+
 impl TraceStore for FailingTraceStore {
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
         if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
             let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
             if !*failed {
                 *failed = true;
-                append_failure_evidence_event(
-                    &self.inner,
-                    run_id,
-                    "TraceWriteFailed",
-                    serde_json::json!({
-                        "failed_event": self.fail_on_event,
-                        "side_effect_executed": false,
-                        "failure_injection": "splendorctl_public_run_config",
-                    }),
-                )?;
+                // A failed mandatory pre-effect append must leave the runtime
+                // cursor unchanged so the normal fail-closed completion record
+                // can use that sequence. Other injected failures terminate the
+                // loop immediately and retain the existing standalone evidence.
+                if self.fail_on_event != "ActionVerificationCompleted" {
+                    let side_effect_executed =
+                        side_effect_executed_before_trace_failure(&self.inner, run_id, &payload)?;
+                    append_failure_evidence_event(
+                        &self.inner,
+                        run_id,
+                        "TraceWriteFailed",
+                        serde_json::json!({
+                            "failed_event": self.fail_on_event,
+                            "side_effect_executed": side_effect_executed,
+                            "failure_injection": "splendorctl_public_run_config",
+                        }),
+                    )?;
+                }
                 return Err(TraceStoreError::InvalidTimestamp(format!(
                     "injected_trace_write_failure:{}",
                     self.fail_on_event
@@ -4011,6 +4069,45 @@ fn run_from_config(
     forever: bool,
 ) -> Result<(), String> {
     let config = load_run_config(config_path)?;
+    run_loaded_config(
+        config,
+        cycles_override,
+        forever,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum RunAuthorityTestTransition {
+    Delay(std::time::Duration),
+    Revoke,
+}
+
+#[cfg(test)]
+struct RunTestOverrides {
+    adapters: std::collections::HashMap<String, Arc<dyn ActionAdapter>>,
+    authority_transition: Option<RunAuthorityTestTransition>,
+}
+
+#[cfg(test)]
+fn run_from_config_with_test_overrides(
+    config_path: &Path,
+    cycles_override: Option<u64>,
+    forever: bool,
+    overrides: &RunTestOverrides,
+) -> Result<(), String> {
+    let config = load_run_config(config_path)?;
+    run_loaded_config(config, cycles_override, forever, Some(overrides))
+}
+
+fn run_loaded_config(
+    config: RunConfig,
+    cycles_override: Option<u64>,
+    forever: bool,
+    #[cfg(test)] test_overrides: Option<&RunTestOverrides>,
+) -> Result<(), String> {
     if config.tenants.is_empty() {
         return Err("config must include at least one tenant".to_string());
     }
@@ -4039,7 +4136,25 @@ fn run_from_config(
     } else {
         Arc::new(sqlite_trace_store)
     };
-    let work_order = validate_config_work_order(&config, trace_store.as_ref())?;
+    let validated_work_order = validate_config_work_order(&config, trace_store.as_ref())?;
+    let work_order = validated_work_order
+        .as_ref()
+        .map(ValidatedWorkOrder::work_order);
+    let signed_action_profiles = match work_order {
+        Some(work_order) => match trusted_action_profiles(work_order) {
+            Ok(profiles) => Some(profiles),
+            Err(error) => {
+                record_authority_profile_rejection(
+                    &config,
+                    trace_store.as_ref(),
+                    work_order,
+                    error.reason_code(),
+                )?;
+                return Err(error.reason_code().to_string());
+            }
+        },
+        None => None,
+    };
 
     if let Some(parent) = config.state_db.parent() {
         if !parent.as_os_str().is_empty() {
@@ -4064,7 +4179,7 @@ fn run_from_config(
         Arc::new(sqlite_state_store)
     };
 
-    let registry = build_registry_with_work_order(&config, work_order.as_ref())?;
+    let registry = build_registry_with_work_order(&config, work_order)?;
     let circuit_breaker_trace_contexts =
         build_circuit_breaker_trace_contexts(config.circuit_breakers.as_deref())?;
     let mut scheduler = Scheduler::with_registry(
@@ -4078,12 +4193,61 @@ fn run_from_config(
     );
 
     let adapters = build_adapters(config.adapters.as_ref())?;
-    let gateway = build_gateway(&adapters, &registry, &config)?;
+    #[cfg(test)]
+    let adapters = test_overrides
+        .map(|overrides| overrides.adapters.clone())
+        .unwrap_or(adapters);
+    let unsigned_local_gateway = if validated_work_order.is_none() {
+        Some(build_gateway(&adapters, &registry, &config)?)
+    } else {
+        None
+    };
+    let mut trace_runtimes = HashMap::<RunId, Arc<KernelRuntime>>::new();
 
     for agent_config in &config.agents {
         let tenant_id = parse_tenant_id(&agent_config.tenant_id)?;
-        let agent_id = resolve_agent_id(agent_config, work_order.as_ref())?;
-        let run_id = resolve_run_id(&config, agent_config, work_order.as_ref())?;
+        let agent_id = resolve_agent_id(agent_config, work_order)?;
+        let run_id = resolve_run_id(&config, agent_config, work_order)?;
+        let trace_runtime = match trace_runtimes.get(&run_id) {
+            Some(runtime) => Arc::clone(runtime),
+            None => {
+                let runtime = Arc::new(
+                    KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+                        .map_err(|error| format!("Failed to create trace runtime: {error}"))?,
+                );
+                trace_runtimes.insert(run_id.clone(), Arc::clone(&runtime));
+                runtime
+            }
+        };
+        let gateway = match validated_work_order.as_ref() {
+            Some(validated) => {
+                let configured = build_authorized_run_gateway(
+                    &adapters,
+                    &registry,
+                    &config,
+                    validated,
+                    run_id.clone(),
+                    tenant_id.clone(),
+                    agent_id.clone(),
+                    Arc::clone(&trace_runtime),
+                    signed_action_profiles
+                        .as_deref()
+                        .ok_or_else(|| "signed action profiles are not configured".to_string())?,
+                )?;
+                #[cfg(test)]
+                if let Some(transition) =
+                    test_overrides.and_then(|overrides| overrides.authority_transition)
+                {
+                    configured.apply_test_transition(transition);
+                }
+                configured.gateway
+            }
+            None => Arc::clone(
+                unsigned_local_gateway
+                    .as_ref()
+                    .ok_or_else(|| "unsigned local gateway is not configured".to_string())?,
+            ),
+        };
         let snapshot_interval = agent_config.snapshot_interval;
         let snapshot_policy = SnapshotPolicy {
             interval: snapshot_interval,
@@ -4116,30 +4280,31 @@ fn run_from_config(
             policy: agent_config.policy.clone(),
         };
         let mut engine = if agent_config.resume.unwrap_or(false) {
-            LoopEngine::resume_from_trace_store_with_work_order(
+            LoopEngine::resume_from_shared_trace_runtime_and_work_order(
                 agent,
                 graph,
                 Box::new(policy),
                 Arc::clone(&gateway),
                 trace_store.clone(),
+                trace_runtime,
                 run_id,
-                work_order.as_ref(),
+                work_order,
             )
             .map_err(|error| format!("Failed to resume agent: {error}"))?
         } else {
-            let context = match work_order.as_ref() {
+            let context = match work_order {
                 Some(work_order) => {
                     RunTraceContext::new(Some(run_id)).with_work_order(work_order.clone())
                 }
                 None => RunTraceContext::new(Some(run_id)),
             };
-            LoopEngine::with_trace_store_and_work_order(
+            LoopEngine::with_shared_trace_runtime_and_work_order(
                 agent,
                 graph,
                 initial_state,
                 Box::new(policy),
                 Arc::clone(&gateway),
-                trace_store.clone(),
+                trace_runtime,
                 context,
             )
             .map_err(|error| format!("Failed to create engine: {error}"))?
@@ -4169,7 +4334,7 @@ fn run_from_config(
             .unwrap_or(false)
         {
             for agent_config in &config.agents {
-                let run_id = resolve_run_id(&config, agent_config, work_order.as_ref())?;
+                let run_id = resolve_run_id(&config, agent_config, work_order)?;
                 let run_id_string = run_id.to_string();
                 append_failure_evidence_event(
                     trace_store.as_ref(),
@@ -4242,7 +4407,7 @@ fn resolve_config_path(path: &Path) -> Result<PathBuf, String> {
 fn validate_config_work_order(
     config: &RunConfig,
     trace_store: &dyn TraceStore,
-) -> Result<Option<WorkOrder>, String> {
+) -> Result<Option<ValidatedWorkOrder>, String> {
     let Some(work_order_config) = &config.work_order else {
         if config.allow_unsigned_local_run.unwrap_or(false) {
             eprintln!(
@@ -4297,7 +4462,7 @@ fn validate_config_work_order(
     };
 
     match validate_work_order(&work_order_config.envelope, &context, &keyring) {
-        Ok(validated) => Ok(Some(validated.into_work_order())),
+        Ok(validated) => Ok(Some(validated)),
         Err(error) => {
             record_work_order_rejection(trace_store, run_id, order, &error)?;
             Err(format!("Work order rejected: {}", error.reason_code()))
@@ -4349,6 +4514,28 @@ fn record_work_order_rejection(
         Some(work_order.agent_id.clone()),
         work_order.run_id.clone(),
         error.reason_code().to_string(),
+    )
+}
+
+fn record_authority_profile_rejection(
+    config: &RunConfig,
+    trace_store: &dyn TraceStore,
+    work_order: &WorkOrder,
+    reason: &str,
+) -> Result<(), String> {
+    let agent = config
+        .agents
+        .first()
+        .ok_or_else(|| "config must include at least one agent".to_string())?;
+    let run_id = resolve_run_id(config, agent, Some(work_order))?;
+    append_work_order_rejection(
+        trace_store,
+        run_id.clone(),
+        Some(work_order.work_order_id.clone()),
+        Some(work_order.tenant_id.clone()),
+        Some(work_order.agent_id.clone()),
+        Some(run_id),
+        reason.to_string(),
     )
 }
 
@@ -4518,6 +4705,128 @@ fn build_gateway(
     registry: &TenantRegistry,
     config: &RunConfig,
 ) -> Result<Arc<dyn ActionGateway>, String> {
+    Ok(Arc::new(build_verified_gateway(
+        adapters, registry, config,
+    )?))
+}
+
+struct AuthorizedRunGateway {
+    gateway: Arc<dyn ActionGateway>,
+    #[cfg(test)]
+    run_authority: RunAuthorityHandle,
+}
+
+#[cfg(test)]
+impl AuthorizedRunGateway {
+    fn apply_test_transition(&self, transition: RunAuthorityTestTransition) {
+        match transition {
+            RunAuthorityTestTransition::Delay(duration) => std::thread::sleep(duration),
+            RunAuthorityTestTransition::Revoke => self.run_authority.revoke(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_authorized_run_gateway(
+    adapters: &std::collections::HashMap<String, Arc<dyn ActionAdapter>>,
+    registry: &TenantRegistry,
+    config: &RunConfig,
+    validated_work_order: &ValidatedWorkOrder,
+    run_id: RunId,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    trace_runtime: Arc<KernelRuntime>,
+    trusted_action_profiles: &[TrustedActionProfile],
+) -> Result<AuthorizedRunGateway, String> {
+    let run_authority = RunAuthorityHandle::admit_signed_work_order_compatibility(
+        validated_work_order,
+        run_id.clone(),
+        format!("splendor.cli.run:{run_id}"),
+    )
+    .map_err(|error| format!("Work order authority rejected: {}", error.reason_code()))?;
+    let mut gateway = build_verified_gateway(adapters, registry, config)?;
+    gateway.set_action_authority_evaluator(Arc::new(run_authority.clone()));
+    gateway.set_pre_effect_authority_recorder(Arc::new(KernelPreEffectAuthorityRecorder::new(
+        trace_runtime,
+        tenant_id,
+        agent_id,
+    )));
+    gateway.set_trusted_action_profiles(trusted_action_profiles.to_vec())?;
+    Ok(AuthorizedRunGateway {
+        gateway: Arc::new(gateway),
+        #[cfg(test)]
+        run_authority,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustedActionProfileAdmissionError {
+    AmbiguousAdapter,
+    Invalid,
+    PermissionLimitExceeded,
+    DuplicatePermission,
+    DuplicateAction,
+}
+
+impl TrustedActionProfileAdmissionError {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::AmbiguousAdapter => "ambiguous_work_order_action_adapter_profile",
+            Self::Invalid => "trusted_action_profile_invalid",
+            Self::PermissionLimitExceeded => "trusted_action_profile_permission_limit_exceeded",
+            Self::DuplicatePermission => "trusted_action_profile_permission_duplicate",
+            Self::DuplicateAction => "trusted_action_profile_duplicate",
+        }
+    }
+}
+
+fn trusted_action_profiles(
+    work_order: &WorkOrder,
+) -> Result<Vec<TrustedActionProfile>, TrustedActionProfileAdmissionError> {
+    let adapter = match work_order.allowed_adapters.as_slice() {
+        [adapter] if !adapter.trim().is_empty() => adapter.clone(),
+        [_] => return Err(TrustedActionProfileAdmissionError::Invalid),
+        _ => return Err(TrustedActionProfileAdmissionError::AmbiguousAdapter),
+    };
+    if work_order.allowed_permissions.len() > 64 {
+        return Err(TrustedActionProfileAdmissionError::PermissionLimitExceeded);
+    }
+    let required_permissions = work_order
+        .allowed_permissions
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if required_permissions.len() != work_order.allowed_permissions.len() {
+        return Err(TrustedActionProfileAdmissionError::DuplicatePermission);
+    }
+    let required_permissions = required_permissions.into_iter().collect::<Vec<_>>();
+    let action_names = work_order
+        .allowed_actions
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if action_names.len() != work_order.allowed_actions.len() {
+        return Err(TrustedActionProfileAdmissionError::DuplicateAction);
+    }
+    if action_names.is_empty() || action_names.iter().any(|action| action.trim().is_empty()) {
+        return Err(TrustedActionProfileAdmissionError::Invalid);
+    }
+    let profiles = action_names
+        .into_iter()
+        .map(|action_name| TrustedActionProfile {
+            action_name,
+            adapter: adapter.clone(),
+            required_permissions: required_permissions.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(profiles)
+}
+
+fn build_verified_gateway(
+    adapters: &std::collections::HashMap<String, Arc<dyn ActionAdapter>>,
+    registry: &TenantRegistry,
+    config: &RunConfig,
+) -> Result<VerifiedActionGateway, String> {
     let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
     let runtime_identity = build_runtime_identity(config.runtime_identity.as_ref())?;
     let circuit_breakers = build_circuit_breakers(config.circuit_breakers.as_deref())?;
@@ -4548,7 +4857,7 @@ fn build_gateway(
             .ok_or_else(|| format!("Adapter not configured: {adapter_id}"))?;
         gateway.register_adapter(&action.name, &adapter_id, Arc::clone(adapter));
     }
-    Ok(Arc::new(gateway))
+    Ok(gateway)
 }
 
 #[derive(Clone, Debug, Default)]

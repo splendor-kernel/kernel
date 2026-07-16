@@ -31,6 +31,7 @@ fn denied_outcome(reason: &str, artifacts: serde_json::Value) -> ActionOutcome {
         post_verification: None,
         output: None,
         error: Some(reason.to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
 }
@@ -173,6 +174,7 @@ fn failed_adapter_outcome_keeps_failed_status_after_escalation() {
         post_verification: None,
         output: None,
         error: Some("adapter failed".to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     };
     let input = EscalationOutcomeInput {
@@ -398,6 +400,7 @@ fn observations_consume_post_verification_uncertainty_and_nested_counts() {
         }),
         output: None,
         error: Some("postcondition verifier unavailable".to_string()),
+        approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     };
     let input = EscalationOutcomeInput {

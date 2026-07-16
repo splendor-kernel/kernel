@@ -1,32 +1,39 @@
 //! Minimal central manager API for UC-E2E-S4 acceptance.
 
+use crate::caller_auth::{CallerAuthError, CallerTokenSigner, CallerTokenVerifier};
+use crate::{ActionOutcome, ApiErrorBody};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use splendor_kernel::{
-    FleetTelemetryCollector, InMemoryNodeRegistry, NodeRegistry, NodeRegistryError,
+    FleetTelemetryCollector, InMemoryNodeRegistry, LocalAuthorityObligationReceiptConfig,
+    NodeRegistry, NodeRegistryError,
 };
 use splendor_store::{
     CentralTraceIndex, InMemoryCentralTraceIndex, TraceSyncBatch, TraceSyncReport,
 };
 use splendor_types::{
-    select_placement, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, AuditAttribution,
-    CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, CredentialAudience,
-    CredentialBinding, DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus,
+    select_placement, AgentId, ApprovalChallenge, ApprovalDecision, ApprovalEvidence, ApprovalId,
+    ApprovalPolicy, AuditAttribution, AuthorityObligationReceipt, CallerCredential, CircuitBreaker,
+    CircuitBreakerId, CircuitBreakerScope, ContentHash, CredentialAudience, CredentialBinding,
+    DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus, InstanceHeartbeat,
     InstanceId, InstanceRegistration, InstanceTelemetry, Message, MessageEnvelope, MessageId,
     NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
     PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
-    PolicyBundle, PolicyBundleEnvelope, RevocationStatus, RunId, RunStatus, RunTelemetry,
-    TaskRequest, TelemetryRuntimeMode, TenantId, TraceSyncTelemetry, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, TASK_REQUEST_SCHEMA,
+    PolicyBundle, PolicyBundleEnvelope, ResidentApprovalReceiptRevocationAck,
+    ResidentApprovalReceiptRevocationRequest, ResidentApprovalReceiptRevocationStatus,
+    RevocationStatus, RunId, RunStatus, RunTelemetry, RuntimeMode, TaskRequest,
+    TelemetryRuntimeMode, TenantId, TraceEventId, TraceSyncTelemetry, WorkOrderEnvelope,
+    WorkOrderKeyring, WorkOrderValidationContext, APPROVAL_POLICY_SCHEMA_VERSION,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+    RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
@@ -40,10 +47,17 @@ struct ManagerInner {
     fleet_id: FleetId,
     registry: InMemoryNodeRegistry,
     work_order_keyring: WorkOrderKeyring,
-    work_orders: Mutex<HashMap<String, WorkOrderEnvelope>>,
+    authority_obligation_receipt_config: Option<LocalAuthorityObligationReceiptConfig>,
+    approval_caller_verifier: Option<CallerTokenVerifier>,
+    work_orders: Mutex<HashMap<String, AcceptedWorkOrder>>,
+    accepted_work_order_bindings: Mutex<HashMap<String, AcceptedWorkOrderBinding>>,
     revoked_work_orders: Mutex<HashSet<String>>,
+    work_order_revocation_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     placements: Mutex<HashMap<String, PlacementDecision>>,
-    dispatches: Mutex<HashMap<String, DispatchReport>>,
+    placement_bindings: Mutex<HashMap<String, BoundPlacementBinding>>,
+    dispatch_bindings: Mutex<HashMap<String, DispatchBinding>>,
+    dispatch_state: Mutex<DispatchLifecycleState>,
+    resident_dispatch: ResidentDispatchClient,
     messages: Mutex<HashMap<String, MessageStatusReport>>,
     message_idempotency: Mutex<HashMap<String, String>>,
     trace_index: InMemoryCentralTraceIndex,
@@ -51,8 +65,147 @@ struct ManagerInner {
     audit: Mutex<Vec<ManagerAuditEvent>>,
     policies: Mutex<HashMap<String, PolicyBundleEnvelope>>,
     approvals: Mutex<HashMap<String, GovernanceApprovalRecord>>,
+    approval_resident_targets: Mutex<HashMap<String, ApprovalResidentTarget>>,
+    approval_revocation_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     circuit_breakers: Mutex<HashMap<String, GovernanceCircuitBreakerRecord>>,
     kill_switches: Mutex<HashMap<String, KillSwitchReport>>,
+}
+
+#[derive(Clone)]
+struct ResidentDispatchClient {
+    http: reqwest::Client,
+    signer: CallerTokenSigner,
+    allow_loopback_http: bool,
+    create_timeout: StdDuration,
+    start_timeout: StdDuration,
+    maximum_response_bytes: usize,
+    allowed_origins: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct AcceptedWorkOrder {
+    envelope: WorkOrderEnvelope,
+    approval_policies: Vec<ApprovalPolicy>,
+    payload_digest: String,
+    envelope_digest: String,
+    approval_policies_digest: String,
+}
+
+#[derive(Clone)]
+struct AcceptedWorkOrderBinding {
+    payload_digest: String,
+    envelope_digest: String,
+    approval_policies_digest: String,
+}
+
+#[derive(Clone)]
+struct BoundPlacement {
+    request: PlacementRequest,
+    decision: PlacementDecision,
+    decision_digest: String,
+}
+
+#[derive(Clone)]
+struct BoundPlacementBinding {
+    work_order_payload_digest: String,
+    request: PlacementRequest,
+    decision_digest: String,
+}
+
+#[derive(Clone)]
+struct DispatchBinding {
+    work_order_payload_digest: String,
+    placement_decision_digest: String,
+    node_id: NodeId,
+    instance_id: InstanceId,
+    resident_daemon_url: String,
+    resident_origin: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApprovalResidentTarget {
+    instance_id: InstanceId,
+    run_id: RunId,
+    resident_daemon_url: String,
+    resident_origin: String,
+}
+
+struct AcknowledgedApprovalRevocation {
+    approval_id: ApprovalId,
+    record: GovernanceApprovalRecord,
+    receipt: AuthorityObligationReceipt,
+    acknowledgement: ResidentApprovalReceiptRevocationAck,
+    target: ApprovalResidentTarget,
+    reason: String,
+    decided_by: AuditAttribution,
+}
+
+#[derive(Default)]
+struct DispatchLifecycleState {
+    completed: HashMap<String, DispatchReport>,
+    terminal_failures: HashMap<String, ManagerApiError>,
+    in_flight: HashSet<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ResidentCreateRunResponse {
+    request_id: String,
+    idempotency_key: String,
+    #[serde(rename = "idempotency_receipt_id")]
+    _idempotency_receipt_id: String,
+    #[serde(rename = "duplicate")]
+    _duplicate: bool,
+    run_id: RunId,
+    #[serde(rename = "status")]
+    _status: crate::RunStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ResidentTickResponse {
+    run_id: RunId,
+    status: crate::RunStatus,
+    #[serde(rename = "tick_id")]
+    _tick_id: u64,
+    #[serde(rename = "state_node_id")]
+    _state_node_id: String,
+    #[serde(rename = "action_outcomes")]
+    _action_outcomes: Vec<ActionOutcome>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidentDispatchOptions {
+    pub allow_loopback_http: bool,
+    pub connect_timeout: StdDuration,
+    pub create_timeout: StdDuration,
+    pub start_timeout: StdDuration,
+    pub maximum_response_bytes: usize,
+    pub root_ca_pem: Option<Vec<u8>>,
+    /// Exact resident origins allowed to receive manager bearer credentials.
+    /// Values must be origin-only URLs such as `https://resident.example:8443`.
+    pub allowed_origins: Vec<String>,
+}
+
+impl ResidentDispatchOptions {
+    pub fn production() -> Self {
+        Self {
+            allow_loopback_http: false,
+            connect_timeout: StdDuration::from_secs(2),
+            create_timeout: StdDuration::from_secs(10),
+            start_timeout: StdDuration::from_secs(35),
+            maximum_response_bytes: 1024 * 1024,
+            root_ca_pem: None,
+            allowed_origins: Vec::new(),
+        }
+    }
+
+    pub fn loopback_test() -> Self {
+        Self {
+            allow_loopback_http: true,
+            ..Self::production()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +223,21 @@ struct MessageIdempotencyScope {
 
 impl ManagerState {
     pub fn local_acceptance() -> Self {
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "resident-dispatch-client",
+            "manager-resident-local-acceptance",
+        )
+        .expect("local acceptance caller signer");
+        Self::local_acceptance_with_dispatch(signer, ResidentDispatchOptions::loopback_test())
+            .expect("local acceptance dispatch client")
+    }
+
+    pub fn local_acceptance_with_dispatch(
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+    ) -> Result<Self, String> {
         let fleet_id = std::env::var("SPLENDOR_FLEET_ID")
             .ok()
             .and_then(|raw| FleetId::parse(&raw).ok())
@@ -78,17 +246,147 @@ impl ManagerState {
         work_order_keyring
             .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
             .expect("local work-order keyring");
-        Self {
+        Self::acceptance_with_dispatch_and_receipt_config(
+            std::env::var("SPLENDOR_MANAGER_ID").unwrap_or_else(|_| "central-manager".to_string()),
+            fleet_id,
+            work_order_keyring,
+            signer,
+            options,
+            local_manager_authority_receipt_config(),
+        )
+    }
+
+    /// Builds the acceptance manager with explicit outbound resident trust.
+    ///
+    /// This makes manager-to-resident dispatch production-real, but does not
+    /// authenticate callers of the manager's own inbound acceptance API.
+    pub fn acceptance_with_dispatch_config(
+        manager_id: impl Into<String>,
+        fleet_id: FleetId,
+        work_order_keyring: WorkOrderKeyring,
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+    ) -> Result<Self, String> {
+        Self::acceptance_with_dispatch_config_internal(
+            manager_id.into(),
+            fleet_id,
+            work_order_keyring,
+            signer,
+            options,
+            None,
+            None,
+        )
+    }
+
+    /// Builds the manager with explicit trusted local approval receipt issuance
+    /// configuration supplied only by process composition.
+    pub fn acceptance_with_dispatch_and_receipt_config(
+        manager_id: impl Into<String>,
+        fleet_id: FleetId,
+        work_order_keyring: WorkOrderKeyring,
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+        receipt_config: LocalAuthorityObligationReceiptConfig,
+    ) -> Result<Self, String> {
+        Self::acceptance_with_dispatch_config_internal(
+            manager_id.into(),
+            fleet_id,
+            work_order_keyring,
+            signer,
+            options,
+            Some(receipt_config),
+            None,
+        )
+    }
+
+    /// Builds the acceptance manager with both process-owned receipt issuance
+    /// and inbound caller trust for the four approval mutation endpoints.
+    pub fn acceptance_with_dispatch_receipt_and_approval_auth(
+        manager_id: impl Into<String>,
+        fleet_id: FleetId,
+        work_order_keyring: WorkOrderKeyring,
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+        receipt_config: LocalAuthorityObligationReceiptConfig,
+        approval_caller_verifier: CallerTokenVerifier,
+    ) -> Result<Self, String> {
+        Self::acceptance_with_dispatch_config_internal(
+            manager_id.into(),
+            fleet_id,
+            work_order_keyring,
+            signer,
+            options,
+            Some(receipt_config),
+            Some(approval_caller_verifier),
+        )
+    }
+
+    fn acceptance_with_dispatch_config_internal(
+        manager_id: String,
+        fleet_id: FleetId,
+        work_order_keyring: WorkOrderKeyring,
+        signer: CallerTokenSigner,
+        options: ResidentDispatchOptions,
+        authority_obligation_receipt_config: Option<LocalAuthorityObligationReceiptConfig>,
+        approval_caller_verifier: Option<CallerTokenVerifier>,
+    ) -> Result<Self, String> {
+        if manager_id.trim().is_empty()
+            || options.connect_timeout.is_zero()
+            || options.create_timeout.is_zero()
+            || options.start_timeout.is_zero()
+            || options.maximum_response_bytes == 0
+        {
+            return Err("resident dispatch configuration is invalid".to_string());
+        }
+        if approval_caller_verifier
+            .as_ref()
+            .is_some_and(|verifier| verifier.trusts_public_key(&signer.public_key_bytes()))
+        {
+            return Err(
+                "approval caller trust must not include the outbound resident dispatch signing key"
+                    .to_string(),
+            );
+        }
+        let mut client = reqwest::Client::builder()
+            .connect_timeout(options.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if let Some(root_ca_pem) = options.root_ca_pem.as_ref() {
+            let certificate = reqwest::Certificate::from_pem(root_ca_pem)
+                .map_err(|_| "resident root CA PEM is invalid".to_string())?;
+            client = client.add_root_certificate(certificate);
+        }
+        let resident_dispatch = ResidentDispatchClient {
+            http: client
+                .build()
+                .map_err(|_| "resident HTTP client could not be built".to_string())?,
+            signer,
+            allow_loopback_http: options.allow_loopback_http,
+            create_timeout: options.create_timeout,
+            start_timeout: options.start_timeout,
+            maximum_response_bytes: options.maximum_response_bytes,
+            allowed_origins: canonical_allowed_origins(
+                &options.allowed_origins,
+                options.allow_loopback_http,
+            )?,
+        };
+        Ok(Self {
             inner: Arc::new(ManagerInner {
-                manager_id: std::env::var("SPLENDOR_MANAGER_ID")
-                    .unwrap_or_else(|_| "central-manager".to_string()),
+                manager_id,
                 fleet_id: fleet_id.clone(),
                 registry: InMemoryNodeRegistry::new(),
                 work_order_keyring,
+                authority_obligation_receipt_config,
+                approval_caller_verifier,
                 work_orders: Mutex::new(HashMap::new()),
+                accepted_work_order_bindings: Mutex::new(HashMap::new()),
                 revoked_work_orders: Mutex::new(HashSet::new()),
+                work_order_revocation_gates: Mutex::new(HashMap::new()),
                 placements: Mutex::new(HashMap::new()),
-                dispatches: Mutex::new(HashMap::new()),
+                placement_bindings: Mutex::new(HashMap::new()),
+                dispatch_bindings: Mutex::new(HashMap::new()),
+                dispatch_state: Mutex::new(DispatchLifecycleState::default()),
+                resident_dispatch,
                 messages: Mutex::new(HashMap::new()),
                 message_idempotency: Mutex::new(HashMap::new()),
                 trace_index: InMemoryCentralTraceIndex::default(),
@@ -96,10 +394,12 @@ impl ManagerState {
                 audit: Mutex::new(Vec::new()),
                 policies: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                approval_resident_targets: Mutex::new(HashMap::new()),
+                approval_revocation_gates: Mutex::new(HashMap::new()),
                 circuit_breakers: Mutex::new(HashMap::new()),
                 kill_switches: Mutex::new(HashMap::new()),
             }),
-        }
+        })
     }
 
     fn validate_security(
@@ -164,6 +464,49 @@ impl ManagerState {
         Ok(())
     }
 
+    fn verify_approval_caller(
+        &self,
+        headers: &HeaderMap,
+        security: &ManagerSecurityFields,
+    ) -> Result<CallerCredential, ManagerApiError> {
+        let verifier = self
+            .inner
+            .approval_caller_verifier
+            .as_ref()
+            .ok_or_else(|| {
+                ManagerApiError::unavailable(
+                    "manager_approval_caller_verifier_unavailable",
+                    "manager approval caller verification is unavailable",
+                )
+            })?;
+        let token = manager_bearer_token(headers)?;
+        let verified = verifier
+            .verify_and_consume_mutation(token, OffsetDateTime::now_utc())
+            .map_err(manager_caller_auth_error)?;
+        if verified.scopes != vec![EndpointScope::ApprovalsManage] {
+            return Err(ManagerApiError::forbidden(
+                "approval_caller_scope_mismatch",
+                "approval caller bearer must contain only the approval management scope",
+            ));
+        }
+        if verified != security.credential {
+            return Err(ManagerApiError::forbidden(
+                "caller_credential_mirror_mismatch",
+                "approval caller credential mirror did not match verified bearer claims",
+            ));
+        }
+        if security.audit_attribution.principal != verified.principal
+            || security.audit_attribution.credential_id.as_deref()
+                != Some(verified.credential_id.as_str())
+        {
+            return Err(ManagerApiError::forbidden(
+                "caller_audit_mirror_mismatch",
+                "approval caller audit mirror did not match verified bearer claims",
+            ));
+        }
+        Ok(verified)
+    }
+
     fn audit(
         &self,
         event_type: &str,
@@ -182,6 +525,192 @@ impl ManagerState {
             });
         Ok(event_id)
     }
+
+    fn accepted_work_order_revocation_gate(
+        &self,
+        work_order_id: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ManagerApiError> {
+        let gates = self.inner.work_order_revocation_gates.lock().map_err(|_| {
+            ManagerApiError::internal(
+                "work_order_revocation_gate_unavailable",
+                "work-order revocation gate unavailable",
+            )
+        })?;
+        gates.get(work_order_id).cloned().ok_or_else(|| {
+            ManagerApiError::not_found(
+                "work_order_not_found",
+                "work order must be accepted before revocation or dispatch",
+            )
+        })
+    }
+
+    fn approval_revocation_gate(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ManagerApiError> {
+        self.inner
+            .approval_revocation_gates
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "approval_revocation_gate_unavailable",
+                    "approval revocation gate unavailable",
+                )
+            })?
+            .get(&approval_id.to_string())
+            .cloned()
+            .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))
+    }
+}
+
+fn approval_resident_target_for_run(
+    state: &ManagerState,
+    run_id: &RunId,
+) -> Result<Option<ApprovalResidentTarget>, ManagerApiError> {
+    let report = {
+        let dispatch_state = state.inner.dispatch_state.lock().map_err(|_| {
+            ManagerApiError::internal(
+                "dispatch_lock",
+                "resident approval target could not be resolved",
+            )
+        })?;
+        let mut matches = dispatch_state
+            .completed
+            .values()
+            .filter(|report| &report.run_id == run_id);
+        let report = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(ManagerApiError::conflict(
+                "approval_resident_target_ambiguous",
+                "run has more than one completed resident target",
+            ));
+        }
+        report
+    };
+    let Some(report) = report else {
+        return Ok(None);
+    };
+    let binding = state
+        .inner
+        .dispatch_bindings
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "dispatch_binding_lock",
+                "resident approval target binding is unavailable",
+            )
+        })?
+        .get(&report.work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::unavailable(
+                "approval_resident_target_unavailable",
+                "completed resident dispatch has no immutable target binding",
+            )
+        })?;
+    if binding.instance_id != report.selected_instance_id
+        || binding.resident_daemon_url != report.resident_daemon_url
+    {
+        return Err(ManagerApiError::conflict(
+            "approval_resident_target_mismatch",
+            "resident dispatch report did not match its immutable target binding",
+        ));
+    }
+    Ok(Some(ApprovalResidentTarget {
+        instance_id: binding.instance_id,
+        run_id: run_id.clone(),
+        resident_daemon_url: binding.resident_daemon_url,
+        resident_origin: binding.resident_origin,
+    }))
+}
+
+fn receipt_config_for_approval_target(
+    config: &LocalAuthorityObligationReceiptConfig,
+    target: Option<&ApprovalResidentTarget>,
+) -> Result<LocalAuthorityObligationReceiptConfig, ManagerApiError> {
+    match target {
+        Some(target) => config
+            .for_resident_instance(&target.instance_id)
+            .map_err(|error| {
+                ManagerApiError::unavailable(
+                    error.reason_code(),
+                    "resident approval receipt audience could not be constructed",
+                )
+            }),
+        None => Ok(config.clone()),
+    }
+}
+
+fn local_manager_authority_receipt_config() -> LocalAuthorityObligationReceiptConfig {
+    LocalAuthorityObligationReceiptConfig::trusted_local(
+        splendor_types::PrincipalId::parse("00000000-0000-4000-8000-0000000004c0")
+            .expect("local receipt issuer"),
+        "splendor.daemon.run",
+        "approval-receipt-local-key",
+        "splendor-local-approval-receipt-secret-v1",
+        "local-approval-receipts",
+    )
+    .expect("local authority receipt config")
+}
+
+fn manager_bearer_token(headers: &HeaderMap) -> Result<&str, ManagerApiError> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values
+        .next()
+        .ok_or_else(|| manager_caller_auth_error(CallerAuthError::MissingToken))?;
+    if values.next().is_some() {
+        return Err(manager_caller_auth_error(CallerAuthError::MalformedToken));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| manager_caller_auth_error(CallerAuthError::MalformedToken))?;
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| manager_caller_auth_error(CallerAuthError::MalformedToken))?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return Err(manager_caller_auth_error(CallerAuthError::MalformedToken));
+    }
+    Ok(token)
+}
+
+fn safe_approval_actor(attribution: &AuditAttribution) -> serde_json::Value {
+    let credential_correlation = attribution.credential_id.as_deref().filter(|value| {
+        value.len() == 71
+            && value.starts_with("sha256:")
+            && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    serde_json::json!({
+        "principal": &attribution.principal,
+        "credential_correlation": credential_correlation,
+    })
+}
+
+fn manager_caller_auth_error(error: CallerAuthError) -> ManagerApiError {
+    let code = match error {
+        CallerAuthError::MissingToken => "missing_manager_caller_token",
+        CallerAuthError::MalformedToken => "invalid_manager_caller_token",
+        CallerAuthError::UnsupportedProfile => "unsupported_manager_caller_token_profile",
+        CallerAuthError::UntrustedKey => "untrusted_manager_caller_token_key",
+        CallerAuthError::InvalidSignature => "invalid_manager_caller_token_signature",
+        CallerAuthError::WrongIssuer => "wrong_manager_caller_token_issuer",
+        CallerAuthError::WrongAudience => "wrong_manager_caller_token_audience",
+        CallerAuthError::WrongSubject => "wrong_manager_caller_token_subject",
+        CallerAuthError::InvalidLifetime => "invalid_manager_caller_token_lifetime",
+        CallerAuthError::InvalidScope => "invalid_manager_caller_token_scope",
+        CallerAuthError::InvalidTenant
+        | CallerAuthError::InvalidFleet
+        | CallerAuthError::InvalidBinding => "invalid_manager_caller_token_binding",
+        CallerAuthError::RevokedToken => "revoked_manager_caller_token",
+        CallerAuthError::ReplayedToken => "manager_caller_token_replayed",
+        CallerAuthError::InvalidTrustSnapshot
+        | CallerAuthError::ClockRollback
+        | CallerAuthError::InvalidSigner
+        | CallerAuthError::KeyLoad => "manager_caller_auth_unavailable",
+    };
+    ManagerApiError::unauthorized(code, "manager approval caller authentication failed")
 }
 
 pub fn router(state: ManagerState) -> Router {
@@ -190,6 +719,10 @@ pub fn router(state: ManagerState) -> Router {
         .route("/fleet/nodes", post(register_node))
         .route("/fleet/nodes/list", post(list_nodes))
         .route("/fleet/instances", post(register_instance))
+        .route(
+            "/fleet/instances/:instance_id/heartbeat",
+            post(heartbeat_instance),
+        )
         .route("/fleet/nodes/:node_id/heartbeat", post(heartbeat_node))
         .route(
             "/fleet/nodes/:node_id/capabilities",
@@ -269,6 +802,13 @@ pub struct HeartbeatNodeRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatInstanceRequest {
+    #[serde(flatten)]
+    pub security: ManagerSecurityFields,
+    pub heartbeat: InstanceHeartbeat,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdvertiseCapabilitiesRequest {
     #[serde(flatten)]
     pub security: ManagerSecurityFields,
@@ -289,6 +829,10 @@ pub struct SubmitWorkOrderRequest {
     pub security: ManagerSecurityFields,
     pub work_order: WorkOrderEnvelope,
     pub expected_audience: String,
+    /// Manager-owned, non-authorizing governance configuration admitted with
+    /// the signed work order and retained immutably for resident dispatch.
+    #[serde(default)]
+    pub approval_policies: Vec<ApprovalPolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -507,11 +1051,16 @@ pub struct ApprovalRequestPayload {
     pub action_name: String,
     pub adapter: String,
     pub policy_id: String,
-    pub risk_level: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
     pub audience: String,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub reason: String,
+    /// Exact daemon-issued behavior-free challenge. Legacy scalar fields remain
+    /// for wire compatibility and must match this object exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ApprovalChallenge>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -533,15 +1082,31 @@ pub struct GovernanceApprovalRecord {
     pub action_name: String,
     pub adapter: String,
     pub policy_id: String,
-    pub risk_level: String,
+    pub risk_level: Option<String>,
     pub audience: String,
     pub status: String,
     pub reason: String,
+    /// Compatibility attribution retained for existing clients. Equal to
+    /// `requested_by` for newly created records.
     pub issued_by: AuditAttribution,
+    pub requested_by: AuditAttribution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<AuditAttribution>,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub trace_event_id: String,
     pub evidence: Option<ApprovalEvidence>,
+    /// Exact recorded challenge used for trusted receipt issuance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ApprovalChallenge>,
+    /// Raw local receipt returned for daemon-side trusted validation. It is not
+    /// authorizing by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_obligation_receipt: Option<AuthorityObligationReceipt>,
+    /// Exact resident acknowledgement required before a granted approval can be
+    /// reported as revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_receipt_revocation_ack: Option<ResidentApprovalReceiptRevocationAck>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -670,6 +1235,7 @@ pub struct DispatchReport {
 pub struct ManagerApiErrorBody {
     pub code: String,
     pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -685,6 +1251,7 @@ impl ManagerApiError {
             body: ManagerApiErrorBody {
                 code: code.into(),
                 message: message.into(),
+                details: None,
             },
         }
     }
@@ -694,6 +1261,17 @@ impl ManagerApiError {
             body: ManagerApiErrorBody {
                 code: code.into(),
                 message: message.into(),
+                details: None,
+            },
+        }
+    }
+    fn unauthorized(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details: None,
             },
         }
     }
@@ -703,6 +1281,47 @@ impl ManagerApiError {
             body: ManagerApiErrorBody {
                 code: code.into(),
                 message: message.into(),
+                details: None,
+            },
+        }
+    }
+    fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details: None,
+            },
+        }
+    }
+    fn bad_gateway(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details: None,
+            },
+        }
+    }
+    fn gateway_timeout(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details: None,
+            },
+        }
+    }
+    fn unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ManagerApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details: None,
             },
         }
     }
@@ -712,14 +1331,30 @@ impl ManagerApiError {
             body: ManagerApiErrorBody {
                 code: code.into(),
                 message: message.into(),
+                details: None,
             },
         }
+    }
+
+    fn details(mut self, details: serde_json::Value) -> Self {
+        self.body.details = Some(details);
+        self
     }
 }
 
 impl IntoResponse for ManagerApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let unauthorized = self.status == StatusCode::UNAUTHORIZED;
+        let mut response = (self.status, Json(self.body)).into_response();
+        if unauthorized {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(
+                    "Bearer realm=\"splendor-manager-approvals\", error=\"invalid_token\"",
+                ),
+            );
+        }
+        response
     }
 }
 
@@ -765,7 +1400,12 @@ async fn register_node(
         true,
     )?;
     let requested = request.registration;
-    let (record, registered_new) = match state.inner.registry.register_node(requested.clone()) {
+    let received_at = OffsetDateTime::now_utc();
+    let (record, registered_new) = match state
+        .inner
+        .registry
+        .register_node_received_at(requested.clone(), received_at)
+    {
         Ok(record) => (record, true),
         Err(NodeRegistryError::DuplicateNode(node_id)) => {
             let record = state.inner.registry.node(&node_id).map_err(|e| {
@@ -819,7 +1459,12 @@ async fn register_instance(
         true,
     )?;
     let requested = request.registration;
-    let (record, registered_new) = match state.inner.registry.register_instance(requested.clone()) {
+    let received_at = OffsetDateTime::now_utc();
+    let (record, registered_new) = match state
+        .inner
+        .registry
+        .register_instance_received_at(requested.clone(), received_at)
+    {
         Ok(record) => (record, true),
         Err(NodeRegistryError::DuplicateInstance(instance_id)) => {
             let record = state.inner.registry.instance(&instance_id).map_err(|e| {
@@ -883,10 +1528,11 @@ async fn heartbeat_node(
             "path node_id does not match heartbeat",
         ));
     }
+    let received_at = OffsetDateTime::now_utc();
     let record = state
         .inner
         .registry
-        .record_node_heartbeat(request.heartbeat)
+        .record_node_heartbeat_received_at(request.heartbeat, received_at)
         .map_err(|e| ManagerApiError::bad_request("heartbeat_rejected", e.to_string()))?;
     state
         .inner
@@ -897,6 +1543,57 @@ async fn heartbeat_node(
     let trace_event_id = state.audit(
         "heartbeat.received",
         serde_json::json!({"node_id": node_id, "status": record.health.status}),
+    )?;
+    Ok(Json(
+        serde_json::json!({"accepted": true, "trace_event_id": trace_event_id}),
+    ))
+}
+
+async fn heartbeat_instance(
+    Path(instance_id): Path<InstanceId>,
+    State(state): State<ManagerState>,
+    Json(request): Json<HeartbeatInstanceRequest>,
+) -> Result<Json<serde_json::Value>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::InstancesHeartbeat,
+        true,
+    )?;
+    if instance_id != request.heartbeat.instance_id {
+        return Err(ManagerApiError::bad_request(
+            "instance_id_mismatch",
+            "path instance_id does not match heartbeat",
+        ));
+    }
+    let received_at = OffsetDateTime::now_utc();
+    let record = state
+        .inner
+        .registry
+        .record_instance_heartbeat_received_at(request.heartbeat, received_at)
+        .map_err(|error| {
+            ManagerApiError::bad_request("instance_heartbeat_rejected", error.to_string())
+        })?;
+    state
+        .inner
+        .telemetry
+        .lock()
+        .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
+        .upsert_instance(InstanceTelemetry::new(
+            record.registration.node_id.clone(),
+            record.registration.instance_id.clone(),
+            record.registration.runtime_version.clone(),
+            TelemetryRuntimeMode::Resident,
+            record.registration.supported_features.clone(),
+            record.last_heartbeat_at,
+        ));
+    let trace_event_id = state.audit(
+        "instance.heartbeat_recorded",
+        serde_json::json!({
+            "node_id": record.registration.node_id,
+            "instance_id": record.registration.instance_id,
+            "status": record.health.status,
+        }),
     )?;
     Ok(Json(
         serde_json::json!({"accepted": true, "trace_event_id": trace_event_id}),
@@ -965,6 +1662,7 @@ async fn submit_work_order(
             "work order audience does not match central manager",
         ));
     }
+    let now = OffsetDateTime::now_utc();
     let validation = splendor_types::validate_work_order(
         &request.work_order,
         &WorkOrderValidationContext {
@@ -972,24 +1670,116 @@ async fn submit_work_order(
             agent_id: request.work_order.work_order.agent_id.clone(),
             run_id: request.work_order.work_order.run_id.clone(),
             expected_placement_target: None,
-            now: OffsetDateTime::now_utc(),
+            now,
         },
         &state.inner.work_order_keyring,
     );
     match validation {
         Ok(_) => {
-            let trace_event_id = state.audit(
-                "work_order.accepted",
-                serde_json::json!({"work_order_id": work_order_id}),
-            )?;
-            state
-                .inner
-                .work_orders
-                .lock()
-                .map_err(|_| {
+            if let Err(error) = validate_work_order_approval_policies(
+                &request.work_order,
+                &request.approval_policies,
+                now,
+            ) {
+                state.audit(
+                    "work_order.rejected",
+                    serde_json::json!({"work_order_id": work_order_id, "reason": error.body.code.as_str()}),
+                )?;
+                return Err(error);
+            }
+            let accepted = accepted_work_order(
+                request.work_order.clone(),
+                request.approval_policies.clone(),
+            )
+            .map_err(|_| {
+                ManagerApiError::bad_request(
+                    "work_order_digest_unavailable",
+                    "work order admission record could not be bound to immutable canonical bytes",
+                )
+            })?;
+            let idempotent = {
+                let mut gates = state
+                    .inner
+                    .work_order_revocation_gates
+                    .lock()
+                    .map_err(|_| {
+                        ManagerApiError::internal(
+                            "work_order_revocation_gate_unavailable",
+                            "work-order revocation gate unavailable",
+                        )
+                    })?;
+                let mut work_orders = state.inner.work_orders.lock().map_err(|_| {
                     ManagerApiError::internal("work_order_lock", "work order lock unavailable")
-                })?
-                .insert(work_order_id.clone(), request.work_order);
+                })?;
+                let mut bindings =
+                    state
+                        .inner
+                        .accepted_work_order_bindings
+                        .lock()
+                        .map_err(|_| {
+                            ManagerApiError::internal(
+                                "work_order_lock",
+                                "work order binding unavailable",
+                            )
+                        })?;
+                if let Some(existing) = bindings.get(&work_order_id) {
+                    if existing.envelope_digest != accepted.envelope_digest
+                        || existing.payload_digest != accepted.payload_digest
+                    {
+                        state.audit(
+                            "work_order.rejected",
+                            serde_json::json!({"work_order_id": work_order_id, "reason": "work_order_payload_replacement"}),
+                        )?;
+                        return Err(ManagerApiError::conflict(
+                            "work_order_payload_replacement",
+                            "an accepted work-order ID cannot be replaced with different signed bytes",
+                        ));
+                    }
+                    if existing.approval_policies_digest != accepted.approval_policies_digest {
+                        state.audit(
+                            "work_order.rejected",
+                            serde_json::json!({"work_order_id": work_order_id, "reason": "work_order_approval_policies_replacement"}),
+                        )?;
+                        return Err(ManagerApiError::conflict(
+                            "work_order_approval_policies_replacement",
+                            "an accepted work-order ID cannot replace its immutable approval policies",
+                        ));
+                    }
+                    if !gates.contains_key(&work_order_id) {
+                        return Err(ManagerApiError::conflict(
+                            "work_order_gate_missing",
+                            "accepted work order is missing its revocation gate",
+                        ));
+                    }
+                    true
+                } else {
+                    gates.insert(work_order_id.clone(), Arc::new(tokio::sync::Mutex::new(())));
+                    work_orders.insert(work_order_id.clone(), accepted.clone());
+                    bindings.insert(
+                        work_order_id.clone(),
+                        AcceptedWorkOrderBinding {
+                            payload_digest: accepted.payload_digest.clone(),
+                            envelope_digest: accepted.envelope_digest.clone(),
+                            approval_policies_digest: accepted.approval_policies_digest.clone(),
+                        },
+                    );
+                    false
+                }
+            };
+            let trace_event_id = state.audit(
+                if idempotent {
+                    "work_order.acceptance_idempotent"
+                } else {
+                    "work_order.accepted"
+                },
+                serde_json::json!({
+                    "work_order_id": work_order_id,
+                    "payload_digest": accepted.payload_digest,
+                    "approval_policy_count": accepted.approval_policies.len(),
+                    "approval_policies_digest": accepted.approval_policies_digest,
+                    "approval_policies_authority": "non_authorizing_governance_only",
+                }),
+            )?;
             Ok(Json(WorkOrderValidationReport {
                 work_order_id,
                 accepted: true,
@@ -1023,6 +1813,14 @@ async fn revoke_work_order(
         EndpointScope::WorkOrdersRevoke,
         true,
     )?;
+    let revocation_gate = state.accepted_work_order_revocation_gate(&work_order_id)?;
+    let _revocation_guard = revocation_gate.lock_owned().await;
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::WorkOrdersRevoke,
+        true,
+    )?;
     state
         .inner
         .revoked_work_orders
@@ -1048,16 +1846,138 @@ async fn evaluate_placement(
         EndpointScope::FleetRead,
         false,
     )?;
-    let candidates = placement_candidates(&state)?;
+    let bound_work_order = if let Some(work_order_id) = request.work_order_id.as_ref() {
+        Some(load_accepted_work_order(&state, work_order_id)?)
+    } else {
+        None
+    };
+    if let Some(work_order) = bound_work_order.as_ref() {
+        validate_placement_request_against_work_order(&request.request, &work_order.envelope)?;
+        if let Some(existing) = state
+            .inner
+            .placement_bindings
+            .lock()
+            .map_err(|_| ManagerApiError::internal("placement_lock", "placement lock unavailable"))?
+            .get(
+                request
+                    .work_order_id
+                    .as_deref()
+                    .expect("bound work-order ID"),
+            )
+            .cloned()
+        {
+            if existing.work_order_payload_digest != work_order.payload_digest
+                || existing.request != request.request
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_replacement",
+                    "an accepted work order already has a different immutable placement binding",
+                ));
+            }
+            let decision = state
+                .inner
+                .placements
+                .lock()
+                .map_err(|_| {
+                    ManagerApiError::internal("placement_lock", "placement decision unavailable")
+                })?
+                .get(
+                    request
+                        .work_order_id
+                        .as_deref()
+                        .expect("bound work-order ID"),
+                )
+                .cloned()
+                .ok_or_else(|| {
+                    ManagerApiError::conflict(
+                        "placement_binding_incomplete",
+                        "placement binding is missing its immutable decision",
+                    )
+                })?;
+            if stable_manager_digest(b"splendor.manager.placement-decision.v1\0", &decision)
+                .map_err(|_| {
+                    ManagerApiError::internal(
+                        "placement_digest_unavailable",
+                        "placement decision could not be bound to immutable bytes",
+                    )
+                })?
+                != existing.decision_digest
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_mismatch",
+                    "stored placement decision no longer matches its immutable binding",
+                ));
+            }
+            return Ok(Json(decision));
+        }
+    }
+    let candidates = placement_candidates(
+        &state,
+        bound_work_order
+            .as_ref()
+            .map(|work_order| &work_order.envelope.work_order.tenant_id),
+    )?;
     let decision = select_placement(&request.request, &candidates);
     let work_order_id = request.work_order_id.clone();
     if let Some(work_order_id) = work_order_id.clone() {
-        state
-            .inner
-            .placements
-            .lock()
-            .map_err(|_| ManagerApiError::internal("placement_lock", "placement lock unavailable"))?
-            .insert(work_order_id, decision.clone());
+        let work_order = bound_work_order.as_ref().expect("bound work order");
+        let decision_digest =
+            stable_manager_digest(b"splendor.manager.placement-decision.v1\0", &decision).map_err(
+                |_| {
+                    ManagerApiError::internal(
+                        "placement_digest_unavailable",
+                        "placement decision could not be bound to immutable bytes",
+                    )
+                },
+            )?;
+        let mut placements = state.inner.placements.lock().map_err(|_| {
+            ManagerApiError::internal("placement_lock", "placement decision unavailable")
+        })?;
+        let mut bindings = state.inner.placement_bindings.lock().map_err(|_| {
+            ManagerApiError::internal("placement_lock", "placement binding unavailable")
+        })?;
+        if let Some(existing) = bindings.get(&work_order_id) {
+            if existing.work_order_payload_digest != work_order.payload_digest
+                || existing.request != request.request
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_replacement",
+                    "an accepted work order was concurrently bound to a different immutable placement",
+                ));
+            }
+            let existing_decision = placements.get(&work_order_id).cloned().ok_or_else(|| {
+                ManagerApiError::conflict(
+                    "placement_binding_incomplete",
+                    "placement binding is missing its immutable decision",
+                )
+            })?;
+            if stable_manager_digest(
+                b"splendor.manager.placement-decision.v1\0",
+                &existing_decision,
+            )
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "placement_digest_unavailable",
+                    "placement decision could not be bound to immutable bytes",
+                )
+            })? != existing.decision_digest
+            {
+                return Err(ManagerApiError::conflict(
+                    "placement_binding_mismatch",
+                    "stored placement decision no longer matches its immutable binding",
+                ));
+            }
+            return Ok(Json(existing_decision));
+        }
+        placements.insert(work_order_id.clone(), decision.clone());
+        bindings.insert(
+            work_order_id,
+            BoundPlacementBinding {
+                work_order_payload_digest: work_order.payload_digest.clone(),
+                request: request.request.clone(),
+                decision_digest,
+            },
+        );
     }
     state.audit("placement.evaluated", serde_json::json!({"work_order_id": work_order_id, "status": decision.status, "candidate_id": decision.candidate_id, "reasons": decision.reasons}))?;
     Ok(Json(decision))
@@ -1068,6 +1988,14 @@ async fn dispatch_work_order(
     State(state): State<ManagerState>,
     Json(request): Json<DispatchWorkOrderRequest>,
 ) -> Result<Json<DispatchReport>, ManagerApiError> {
+    state.validate_security(
+        &request.security.credential,
+        Some(&request.security.audit_attribution),
+        EndpointScope::FleetDispatch,
+        true,
+    )?;
+    let revocation_gate = state.accepted_work_order_revocation_gate(&work_order_id)?;
+    let _revocation_guard = revocation_gate.lock_owned().await;
     state.validate_security(
         &request.security.credential,
         Some(&request.security.audit_attribution),
@@ -1090,22 +2018,19 @@ async fn dispatch_work_order(
             "work order was revoked",
         ));
     }
-    let work_order = state
-        .inner
-        .work_orders
-        .lock()
-        .map_err(|_| ManagerApiError::internal("work_order_lock", "work order lock unavailable"))?
-        .get(&work_order_id)
-        .cloned()
-        .ok_or_else(|| {
-            ManagerApiError::not_found("work_order_not_found", "work order not submitted")
-        })?;
+    let work_order = load_accepted_work_order(&state, &work_order_id)?;
     let run_id = work_order
+        .envelope
         .work_order
         .run_id
         .clone()
-        .unwrap_or_else(RunId::new);
-    let placement = state
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "resident_dispatch_run_id_required",
+                "resident dispatch requires a signed work order bound to a run id",
+            )
+        })?;
+    let placement_decision = state
         .inner
         .placements
         .lock()
@@ -1118,18 +2043,53 @@ async fn dispatch_work_order(
                 "placement must be evaluated before dispatch",
             )
         })?;
-    if placement.status != PlacementDecisionStatus::Selected {
+    let placement_binding = state
+        .inner
+        .placement_bindings
+        .lock()
+        .map_err(|_| ManagerApiError::internal("placement_lock", "placement binding unavailable"))?
+        .get(&work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::conflict(
+                "placement_binding_missing",
+                "placement is missing its immutable work-order binding",
+            )
+        })?;
+    if placement_binding.work_order_payload_digest != work_order.payload_digest
+        || stable_manager_digest(
+            b"splendor.manager.placement-decision.v1\0",
+            &placement_decision,
+        )
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "placement_digest_unavailable",
+                "placement decision could not be bound to immutable bytes",
+            )
+        })? != placement_binding.decision_digest
+    {
+        return Err(ManagerApiError::conflict(
+            "dispatch_work_order_binding_mismatch",
+            "placement is not bound to the accepted signed work-order payload",
+        ));
+    }
+    let placement = BoundPlacement {
+        request: placement_binding.request,
+        decision: placement_decision,
+        decision_digest: placement_binding.decision_digest,
+    };
+    if placement.decision.status != PlacementDecisionStatus::Selected {
         return Err(ManagerApiError::forbidden(
             "placement_rejected",
             "cannot dispatch rejected placement",
         ));
     }
-    let expected_target = work_order.work_order.placement.target.clone();
+    let expected_target = work_order.envelope.work_order.placement.target.clone();
     let dispatch_validation = splendor_types::validate_work_order(
-        &work_order,
+        &work_order.envelope,
         &WorkOrderValidationContext {
-            tenant_id: work_order.work_order.tenant_id.clone(),
-            agent_id: work_order.work_order.agent_id.clone(),
+            tenant_id: work_order.envelope.work_order.tenant_id.clone(),
+            agent_id: work_order.envelope.work_order.agent_id.clone(),
             run_id: Some(run_id.clone()),
             expected_placement_target: Some(expected_target.clone()),
             now: OffsetDateTime::now_utc(),
@@ -1150,6 +2110,7 @@ async fn dispatch_work_order(
         .target_node_id
         .or_else(|| {
             placement
+                .decision
                 .candidate_id
                 .as_deref()
                 .and_then(|raw| NodeId::parse(raw).ok())
@@ -1158,6 +2119,7 @@ async fn dispatch_work_order(
             ManagerApiError::bad_request("missing_target_node", "dispatch requires selected node")
         })?;
     let placement_node_id = placement
+        .decision
         .candidate_id
         .as_deref()
         .and_then(|raw| NodeId::parse(raw).ok())
@@ -1177,58 +2139,174 @@ async fn dispatch_work_order(
             "dispatch target does not match evaluated placement",
         ));
     }
-    let node = state
-        .inner
-        .registry
-        .node(&selected_node_id)
-        .map_err(|e| ManagerApiError::not_found("node_not_found", e.to_string()))?;
-    let instance_id = node.instances.first().cloned().ok_or_else(|| {
-        ManagerApiError::bad_request(
-            "node_has_no_instance",
-            "selected node has no registered instance",
-        )
-    })?;
-    let instance = state
-        .inner
-        .registry
-        .instance(&instance_id)
-        .map_err(|e| ManagerApiError::not_found("instance_not_found", e.to_string()))?;
-    if node.health.status != HealthStatus::Healthy
-        || node.last_heartbeat_at + Duration::seconds(60) <= OffsetDateTime::now_utc()
-    {
-        return Err(ManagerApiError::forbidden(
-            "stale_or_unhealthy_node",
-            "selected node heartbeat is stale or unhealthy",
+    if work_order.envelope.work_order.allowed_adapters.len() != 1 {
+        return Err(ManagerApiError::bad_request(
+            "resident_dispatch_profile_unsupported",
+            "work-order v1 resident dispatch requires exactly one allowed adapter",
         ));
     }
-    let daemon_url = node
-        .registration
-        .capability_document
-        .constraints
-        .get("resident_daemon_url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            ManagerApiError::bad_request(
-                "missing_resident_daemon_url",
-                "node capability constraints must include resident_daemon_url",
-            )
-        })?
-        .to_string();
-    let resident_credential = resident_credential(
-        &request.security.credential,
+    if let Some(existing) = stored_dispatch_outcome(&state, &work_order_id)? {
+        return existing.map(Json);
+    }
+    let mut reservation = reserve_dispatch(&state, &work_order_id)?;
+    // A dispatch may have completed between the optimistic lookup above and
+    // reservation acquisition. Recheck while this caller owns the reservation
+    // so a delayed concurrent duplicate cannot start a second tick.
+    if let Some(existing) = stored_dispatch_outcome(&state, &work_order_id)? {
+        return existing.map(Json);
+    }
+    let dispatch_binding = resolve_dispatch_binding(
+        &state,
         &work_order_id,
-        &instance.registration.instance_id,
-        &work_order.work_order.tenant_id,
-    );
-    let resident_audit = resident_audit(&resident_credential);
-    let create =
-        resident_create_run_payload(&work_order, &run_id, resident_credential, resident_audit)?;
-    let create_response = post_json(&daemon_url, "/runs", &create)
-        .map_err(|e| ManagerApiError::internal("resident_http_error", e))?;
-    let start = serde_json::json!({"credential": create["credential"], "audit_attribution": create["audit_attribution"], "reason":"uc_e2e_s4_dispatch"});
-    let start_response = post_json(&daemon_url, &format!("/runs/{run_id}/start"), &start)
-        .map_err(|e| ManagerApiError::internal("resident_http_error", e))?;
-    let trace_event_id = state.audit("run.dispatched", serde_json::json!({"work_order_id": work_order_id, "node_id": selected_node_id, "instance_id": instance_id, "run_id": run_id}))?;
+        &work_order,
+        &placement,
+        &selected_node_id,
+    )?;
+    state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&dispatch_binding.resident_daemon_url)?;
+    let instance_id = dispatch_binding.instance_id.clone();
+    let daemon_url = dispatch_binding.resident_daemon_url.clone();
+    let create_auth = resident_credential(
+        &state.inner.resident_dispatch,
+        &instance_id,
+        &work_order.envelope.work_order.tenant_id,
+    )?;
+    let create_audit = resident_audit(&create_auth.credential);
+    let create = resident_create_run_payload(
+        &work_order.envelope,
+        &work_order.approval_policies,
+        &run_id,
+        serde_json::to_value(&create_auth.credential).map_err(|_| {
+            ManagerApiError::internal(
+                "resident_caller_projection_unavailable",
+                "resident caller projection could not be serialized",
+            )
+        })?,
+        create_audit,
+    )?;
+    revalidate_dispatch_authority(&state, &work_order, &run_id, &expected_target, "create")?;
+    let create_response: ResidentHttpResponse<ResidentCreateRunResponse> = state
+        .inner
+        .resident_dispatch
+        .post_json(
+            &daemon_url,
+            "/runs",
+            &create_auth.encoded,
+            &create,
+            state.inner.resident_dispatch.create_timeout,
+            reqwest::StatusCode::OK,
+        )
+        .await
+        .map_err(|error| {
+            let _ = state.audit(
+                "dispatch.failed",
+                serde_json::json!({
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "phase": "create",
+                    "reason": resident_http_error_reason(&error),
+                    "effect_certainty": "not_started_or_idempotently_reconcilable",
+                }),
+            );
+            resident_http_error("create", error, false)
+        })?;
+    if create_response.value.run_id != run_id
+        || create_response.value.request_id != create["request_id"].as_str().unwrap_or_default()
+        || create_response.value.idempotency_key
+            != create["idempotency_key"].as_str().unwrap_or_default()
+    {
+        state.audit(
+            "dispatch.failed",
+            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "create", "reason": "resident_identity_mismatch"}),
+        )?;
+        return Err(ManagerApiError::bad_gateway(
+            "resident_create_identity_mismatch",
+            "resident create response did not match dispatched identities",
+        ));
+    }
+
+    let start_auth = state.inner.resident_dispatch.signed_caller(
+        &work_order.envelope.work_order.tenant_id,
+        &instance_id,
+        EndpointScope::RunsStart,
+    )?;
+    let start_audit = resident_audit(&start_auth.credential);
+    let start = serde_json::json!({
+        "credential": &start_auth.credential,
+        "audit_attribution": start_audit,
+        "reason":"manager_resident_dispatch"
+    });
+    revalidate_dispatch_authority(&state, &work_order, &run_id, &expected_target, "start")?;
+    persist_provisional_start_quarantine(&state, &work_order_id)?;
+    let start_result: Result<ResidentHttpResponse<ResidentTickResponse>, ResidentHttpError> = state
+        .inner
+        .resident_dispatch
+        .post_json(
+            &daemon_url,
+            &format!("/runs/{run_id}/start"),
+            &start_auth.encoded,
+            &start,
+            state.inner.resident_dispatch.start_timeout,
+            reqwest::StatusCode::OK,
+        )
+        .await;
+    let start_response = match start_result {
+        Ok(response) => response,
+        Err(error) => {
+            let effect_unknown = error.effect_may_have_occurred();
+            let _ = state.audit(
+                if effect_unknown {
+                    "dispatch.effect_unknown"
+                } else {
+                    "dispatch.partial_failure"
+                },
+                serde_json::json!({
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "phase": "start",
+                    "reason": resident_http_error_reason(&error),
+                    "effect_certainty": if effect_unknown { "unknown" } else { "not_started" },
+                    "automatic_retry": false,
+                }),
+            );
+            let api_error = resident_http_error("start", error, effect_unknown);
+            return Err(persist_terminal_dispatch_failure(
+                &state,
+                &work_order_id,
+                api_error,
+                &mut reservation,
+            ));
+        }
+    };
+    if start_response.value.run_id != run_id {
+        let _ = state.audit(
+            "dispatch.effect_unknown",
+            serde_json::json!({"work_order_id": work_order_id, "run_id": run_id, "phase": "start", "reason": "resident_identity_mismatch", "effect_certainty": "unknown", "automatic_retry": false}),
+        );
+        let error = ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start returned a mismatched run identity after request send; effect certainty is unknown and automatic retry is forbidden",
+        );
+        return Err(persist_terminal_dispatch_failure(
+            &state,
+            &work_order_id,
+            error,
+            &mut reservation,
+        ));
+    }
+    let trace_event_id = match state.audit("run.dispatched", serde_json::json!({"work_order_id": work_order_id, "node_id": selected_node_id, "instance_id": instance_id, "run_id": run_id})) {
+        Ok(trace_event_id) => trace_event_id,
+        Err(error) => {
+            return Err(persist_terminal_dispatch_failure(
+                &state,
+                &work_order_id,
+                error,
+                &mut reservation,
+            ))
+        }
+    };
     let report = DispatchReport {
         work_order_id: work_order_id.clone(),
         selected_node_id: selected_node_id.clone(),
@@ -1236,35 +2314,31 @@ async fn dispatch_work_order(
         run_id: run_id.clone(),
         create_run_status: create_response.status,
         start_run_status: start_response.status,
-        create_run_body: create_response.body,
-        start_run_body: start_response.body,
+        create_run_body: Some(create_response.body),
+        start_run_body: Some(start_response.body),
         trace_event_id,
         resident_daemon_url: daemon_url,
     };
-    state
-        .inner
-        .dispatches
-        .lock()
-        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?
-        .insert(work_order_id, report.clone());
+    if let Err(error) = store_authoritative_dispatch_success(&state, &work_order_id, &report) {
+        return Err(persist_terminal_dispatch_failure(
+            &state,
+            &work_order_id,
+            error,
+            &mut reservation,
+        ));
+    }
     state
         .inner
         .telemetry
         .lock()
         .map_err(|_| ManagerApiError::internal("telemetry_lock", "telemetry lock unavailable"))?
         .upsert_run(RunTelemetry {
-            tenant_id: create["tenant_id"]
-                .as_str()
-                .and_then(|raw| TenantId::parse(raw).ok())
-                .unwrap_or_default(),
-            agent_id: create["agent_id"]
-                .as_str()
-                .and_then(|raw| splendor_types::AgentId::parse(raw).ok())
-                .unwrap_or_default(),
+            tenant_id: work_order.envelope.work_order.tenant_id,
+            agent_id: work_order.envelope.work_order.agent_id,
             run_id,
             node_id: selected_node_id,
             instance_id,
-            status: RunStatus::Running,
+            status: telemetry_run_status(&start_response.value.status),
             updated_at: OffsetDateTime::now_utc(),
         });
     Ok(Json(report))
@@ -1272,6 +2346,7 @@ async fn dispatch_work_order(
 
 fn resident_create_run_payload(
     work_order: &WorkOrderEnvelope,
+    approval_policies: &[ApprovalPolicy],
     run_id: &RunId,
     resident_credential: serde_json::Value,
     resident_audit: serde_json::Value,
@@ -1279,94 +2354,26 @@ fn resident_create_run_payload(
     let allowed_actions = &work_order.work_order.allowed_actions;
     let allowed_adapters = &work_order.work_order.allowed_adapters;
     let allowed_permissions = &work_order.work_order.allowed_permissions;
-    let mut registered_actions = Vec::new();
-    let mut policy_actions = Vec::new();
-    let mut approval_policies = Vec::new();
-    for (action, adapter, permission, side_effect_class, params) in [
-        (
-            "data.read_fixture",
-            "fixture-data-store",
-            "data.read_fixture",
-            "ReadOnly",
-            serde_json::json!({"data_ref": work_order.work_order.data_refs.first().cloned().unwrap_or_else(|| "dataset:missing".to_string())}),
-        ),
-        (
-            "sql.read_fixture",
-            "fixture-sql",
-            "fixture.sql.read",
-            "ReadOnly",
-            serde_json::json!({"dataset":"fixture.eu_west"}),
-        ),
-        (
-            "artifact.create_internal",
-            "artifact-store",
-            "artifact.create_internal",
-            "External",
-            serde_json::json!({"artifact":"internal-proposal", "artifact_path": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
-        ),
-        (
-            "artifact.publish_external",
-            "artifact-store",
-            "artifact.publish_external",
-            "External",
-            serde_json::json!({"publish_ref": format!("artifact://{}/dispatch/internal-proposal.md", work_order.work_order.tenant_id)}),
-        ),
-    ] {
-        let action_allowed = allowed_actions.iter().any(|item| item == action);
-        let adapter_allowed = allowed_adapters.iter().any(|item| item == adapter);
-        let permission_allowed = allowed_permissions.iter().any(|item| item == permission);
-        if action_allowed || permission_allowed {
-            if !(action_allowed && adapter_allowed && permission_allowed) {
-                return Err(ManagerApiError::forbidden(
-                    "work_order_authority_incomplete",
-                    format!(
-                        "work order must explicitly authorize action `{action}`, adapter `{adapter}`, and permission `{permission}`"
-                    ),
-                ));
-            }
-            registered_actions.push(serde_json::json!({"name": action, "adapter": adapter}));
-            policy_actions.push(serde_json::json!({
-                "action": {"name": action, "params": params, "side_effect_class": side_effect_class, "cost_estimate": null, "required_permissions": [permission], "preconditions": [], "postconditions": []},
-                "adapter": adapter,
-                "quota_usage": {"actions": 1, "action_duration_ms": 0, "filesystem_read_bytes": 0, "filesystem_write_bytes": 0, "network_read_bytes": 0, "network_write_bytes": 0, "http_requests": 0},
-                "satisfied_preconditions": []
-            }));
-            if action == "artifact.publish_external" {
-                approval_policies.push(serde_json::json!({
-                    "schema_version": "splendor.approval_policy.v1",
-                    "policy_id": format!("policy_{work_order_id}_artifact_publish_external", work_order_id = work_order.work_order.work_order_id),
-                    "tenant_id": work_order.work_order.tenant_id,
-                    "agent_id": work_order.work_order.agent_id,
-                    "action_name": "artifact.publish_external",
-                    "adapter": "artifact-store",
-                    "required_permission": "artifact.publish_external",
-                    "side_effect_class": "External",
-                    "risk_level": "high",
-                    "reason": "external artifact publication requires scoped approval",
-                    "expires_at": null
-                }));
-            }
+    let adapter = match allowed_adapters.as_slice() {
+        [adapter] if !adapter.trim().is_empty() => adapter,
+        _ => {
+            return Err(ManagerApiError::bad_request(
+                "resident_dispatch_profile_unsupported",
+                "work-order v1 resident dispatch requires exactly one allowed adapter",
+            ))
         }
-    }
-    if allowed_actions
+    };
+    let registered_actions = allowed_actions
         .iter()
-        .any(|item| item == "message.remote.proposal")
-    {
-        if !allowed_adapters.iter().any(|item| item == "remote-message")
-            || !allowed_permissions
-                .iter()
-                .any(|item| item.starts_with("message.remote.proposal"))
-        {
-            return Err(ManagerApiError::forbidden(
-                "work_order_authority_incomplete",
-                "remote proposal action requires remote-message adapter and route permission",
-            ));
-        }
-        registered_actions.push(
-            serde_json::json!({"name": "message.remote.proposal", "adapter": "remote-message"}),
-        );
-    }
-    let mut create = serde_json::json!({
+        .map(|action| {
+            serde_json::json!({
+                "name": action,
+                "adapter": adapter,
+                "required_permissions": allowed_permissions,
+            })
+        })
+        .collect::<Vec<_>>();
+    let create = serde_json::json!({
         "request_id": format!("req-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
         "idempotency_key": format!("idem-manager-dispatch-{work_order_id}-{run_id}", work_order_id = work_order.work_order.work_order_id),
         "tenant_id": work_order.work_order.tenant_id,
@@ -1378,14 +2385,19 @@ fn resident_create_run_payload(
         "allowed_adapters": allowed_adapters,
         "allowed_permissions": allowed_permissions,
         "registered_actions": registered_actions,
-        "policy_actions": policy_actions,
+        "policy_actions": [],
         "approval_policies": approval_policies,
         "allowed_percept_schemas": [],
         "allowed_percept_sources": [],
         "initial_state": {"dispatch":"uc-e2e-s4"},
         "snapshot_interval": 1
     });
-    create["work_order"]["run_id"] = serde_json::json!(run_id);
+    if work_order.work_order.run_id.as_ref() != Some(run_id) {
+        return Err(ManagerApiError::bad_request(
+            "resident_dispatch_run_id_required",
+            "resident dispatch requires a signed work order bound to the run id",
+        ));
+    }
     Ok(create)
 }
 
@@ -1439,9 +2451,10 @@ async fn sync_trace_buffer(
 fn supported_message_schemas() -> Vec<SupportedMessageSchema> {
     vec![
         SupportedMessageSchema {
-            schema: "splendor.message.task_request.v1".to_string(),
-            version: "v1".to_string(),
-            description: "Scoped task/delegation request between agents".to_string(),
+            schema: TASK_REQUEST_SCHEMA.to_string(),
+            version: "v2".to_string(),
+            description: "Scoped task/delegation request with mandatory grant reference"
+                .to_string(),
             delivery_authority_granted: false,
         },
         SupportedMessageSchema {
@@ -1836,16 +2849,8 @@ fn load_current_message_work_order(
             "work order was revoked",
         ));
     }
-    let work_order = state
-        .inner
-        .work_orders
-        .lock()
-        .map_err(|_| ManagerApiError::internal("work_order_lock", "work order lock unavailable"))?
-        .get(work_order_id)
-        .cloned()
-        .ok_or_else(|| {
-            ManagerApiError::not_found("work_order_not_found", "work order not submitted")
-        })?;
+    let accepted = load_accepted_work_order(state, work_order_id)?;
+    let work_order = accepted.envelope;
     splendor_types::validate_work_order(
         &work_order,
         &WorkOrderValidationContext {
@@ -2648,56 +3653,192 @@ async fn revoke_policy_bundle(
 
 async fn request_approval(
     State(state): State<ManagerState>,
+    headers: HeaderMap,
     Json(request): Json<ApprovalRequestPayload>,
 ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    let verified = state.verify_approval_caller(&headers, &request.security)?;
     state.validate_security(
-        &request.security.credential,
+        &verified,
         Some(&request.security.audit_attribution),
         EndpointScope::ApprovalsManage,
         true,
     )?;
-    let trace_event_id = state.audit(
-        "approval.requested",
-        serde_json::json!({"approval_id": request.approval_id, "run_id": request.run_id, "action_id": request.action_id, "policy_id": request.policy_id}),
-    )?;
-    let record = GovernanceApprovalRecord {
-        approval_id: request.approval_id.clone(),
-        tenant_id: request.tenant_id,
-        agent_id: request.agent_id,
-        run_id: request.run_id,
-        action_id: request.action_id,
-        action_name: request.action_name,
-        adapter: request.adapter,
-        policy_id: request.policy_id,
-        risk_level: request.risk_level,
-        audience: request.audience,
-        status: "requested".to_string(),
-        reason: request.reason,
-        issued_by: request.security.audit_attribution,
-        expires_at: request.expires_at,
-        trace_event_id,
-        evidence: None,
-    };
-    state
+    let receipt_config = state
+        .inner
+        .authority_obligation_receipt_config
+        .as_ref()
+        .ok_or_else(|| {
+            ManagerApiError::unavailable(
+                "authority_obligation_receipt_config_unavailable",
+                "trusted approval receipt configuration is unavailable",
+            )
+        })?;
+    let challenge = request.challenge.as_ref().ok_or_else(|| {
+        ManagerApiError::bad_request(
+            "approval_challenge_required",
+            "successful approval migration requires the exact daemon approval challenge",
+        )
+    })?;
+    let resident_target = approval_resident_target_for_run(&state, &challenge.run_id)?;
+    let receipt_config =
+        receipt_config_for_approval_target(receipt_config, resident_target.as_ref())?;
+    if request.approval_id != challenge.approval_id
+        || request.tenant_id != challenge.tenant_id
+        || request.agent_id != challenge.agent_id
+        || request.run_id != challenge.run_id
+        || request.action_id != challenge.action_id
+        || request.action_name != challenge.action_name
+        || request.adapter != challenge.adapter
+        || request.policy_id != challenge.policy_id
+        || request.risk_level != challenge.risk_level
+        || request.audience != challenge.receipt_audience
+        || request.expires_at != challenge.expires_at
+    {
+        return Err(ManagerApiError::bad_request(
+            "approval_challenge_mismatch",
+            "legacy approval request coordinates must exactly match the recorded challenge",
+        ));
+    }
+    let mut approvals = state
         .inner
         .approvals
         .lock()
-        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?
-        .insert(record.approval_id.to_string(), record.clone());
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?;
+    if let Some(existing) = approvals.get(&challenge.approval_id.to_string()) {
+        let existing_target = state
+            .inner
+            .approval_resident_targets
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "approval_target_lock",
+                    "approval resident target lock unavailable",
+                )
+            })?
+            .get(&challenge.approval_id.to_string())
+            .cloned();
+        let exact_retry = existing.challenge.as_ref() == Some(challenge)
+            && existing.reason == request.reason
+            && existing.requested_by.principal == request.security.audit_attribution.principal
+            && existing.expires_at == challenge.expires_at
+            && existing_target == resident_target;
+        if !exact_retry {
+            return Err(ManagerApiError::conflict(
+                "approval_request_conflict",
+                "approval identity is already bound to a different challenge or request",
+            ));
+        }
+        if matches!(existing.status.as_str(), "denied" | "revoked") {
+            return Err(ManagerApiError::conflict(
+                "approval_terminal_conflict",
+                "denied or revoked approval state is immutable",
+            ));
+        }
+        return Ok(Json(existing.clone()));
+    }
+    receipt_config
+        .validate_approval_challenge(challenge, OffsetDateTime::now_utc())
+        .map_err(|error| {
+            ManagerApiError::bad_request(error.reason_code(), "approval challenge is invalid")
+        })?;
+    let trace_event_id = state.audit(
+        "approval.requested",
+        serde_json::json!({"approval_id": request.approval_id, "run_id": request.run_id, "action_id": request.action_id, "policy_id": request.policy_id, "requested_by": safe_approval_actor(&request.security.audit_attribution)}),
+    )?;
+    let requested_by = request.security.audit_attribution;
+    let record = GovernanceApprovalRecord {
+        approval_id: challenge.approval_id.clone(),
+        tenant_id: challenge.tenant_id.clone(),
+        agent_id: challenge.agent_id.clone(),
+        run_id: challenge.run_id.clone(),
+        action_id: challenge.action_id.clone(),
+        action_name: challenge.action_name.clone(),
+        adapter: challenge.adapter.clone(),
+        policy_id: challenge.policy_id.clone(),
+        risk_level: challenge.risk_level.clone(),
+        audience: challenge.receipt_audience.clone(),
+        status: "requested".to_string(),
+        reason: request.reason,
+        issued_by: requested_by.clone(),
+        requested_by,
+        decided_by: None,
+        expires_at: challenge.expires_at,
+        trace_event_id,
+        evidence: None,
+        challenge: Some(challenge.clone()),
+        authority_obligation_receipt: None,
+        resident_receipt_revocation_ack: None,
+    };
+    if let Some(target) = resident_target {
+        state
+            .inner
+            .approval_resident_targets
+            .lock()
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "approval_target_lock",
+                    "approval resident target lock unavailable",
+                )
+            })?
+            .insert(record.approval_id.to_string(), target);
+    }
+    state
+        .inner
+        .approval_revocation_gates
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "approval_revocation_gate_unavailable",
+                "approval revocation gate unavailable",
+            )
+        })?
+        .insert(
+            record.approval_id.to_string(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+    approvals.insert(record.approval_id.to_string(), record.clone());
     Ok(Json(record))
 }
 
 async fn grant_approval(
     Path(approval_id): Path<ApprovalId>,
     State(state): State<ManagerState>,
+    headers: HeaderMap,
     Json(request): Json<ApprovalDecisionRequest>,
 ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    let verified = state.verify_approval_caller(&headers, &request.security)?;
     state.validate_security(
-        &request.security.credential,
+        &verified,
         Some(&request.security.audit_attribution),
         EndpointScope::ApprovalsManage,
         true,
     )?;
+    let decided_by = request.security.audit_attribution.clone();
+    let receipt_config = state
+        .inner
+        .authority_obligation_receipt_config
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::unavailable(
+                "authority_obligation_receipt_config_unavailable",
+                "trusted approval receipt configuration is unavailable",
+            )
+        })?;
+    let resident_target = state
+        .inner
+        .approval_resident_targets
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "approval_target_lock",
+                "approval resident target lock unavailable",
+            )
+        })?
+        .get(&approval_id.to_string())
+        .cloned();
+    let receipt_config =
+        receipt_config_for_approval_target(&receipt_config, resident_target.as_ref())?;
     let mut approvals = state
         .inner
         .approvals
@@ -2707,7 +3848,52 @@ async fn grant_approval(
         .get(&approval_id.to_string())
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))?;
-    let expires_at = request.expires_at.unwrap_or(record.expires_at);
+    let challenge = record.challenge.clone().ok_or_else(|| {
+        ManagerApiError::forbidden(
+            "approval_challenge_required",
+            "legacy approval records cannot produce an authorizing receipt",
+        )
+    })?;
+    if record.status == "granted" {
+        let exact_retry = request.reason == record.reason
+            && request
+                .expires_at
+                .is_none_or(|expires_at| expires_at == challenge.expires_at)
+            && record.authority_obligation_receipt.is_some()
+            && record
+                .decided_by
+                .as_ref()
+                .is_some_and(|attribution| attribution.principal == decided_by.principal);
+        if exact_retry {
+            return Ok(Json(record));
+        }
+        return Err(ManagerApiError::conflict(
+            "approval_grant_conflict",
+            "approval was already granted with different immutable grant coordinates",
+        ));
+    }
+    if matches!(record.status.as_str(), "denied" | "revoked") {
+        return Err(ManagerApiError::conflict(
+            "approval_terminal_conflict",
+            "a denied or revoked approval cannot later be granted",
+        ));
+    }
+    if record.status != "requested" {
+        return Err(ManagerApiError::conflict(
+            "approval_state_conflict",
+            "approval is not in a grantable state",
+        ));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at != challenge.expires_at)
+    {
+        return Err(ManagerApiError::bad_request(
+            "approval_challenge_expiry_mismatch",
+            "approval expiry cannot differ from the recorded challenge",
+        ));
+    }
+    let expires_at = challenge.expires_at;
     let mut evidence = ApprovalEvidence::new(
         approval_id.clone(),
         record.tenant_id.clone(),
@@ -2720,15 +3906,40 @@ async fn grant_approval(
     .with_adapter(record.adapter.clone());
     evidence.action_id = Some(record.action_id.clone());
     evidence.reason = Some(request.reason.clone());
+    let issued_at = OffsetDateTime::now_utc();
+    receipt_config
+        .validate_approval_challenge(&challenge, issued_at)
+        .map_err(|error| {
+            ManagerApiError::forbidden(
+                error.reason_code(),
+                "approval obligation receipt could not be issued",
+            )
+        })?;
     let trace_event_id = state.audit(
         "approval.granted",
-        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "audience": record.audience}),
+        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "audience": record.audience, "requested_by": safe_approval_actor(&record.requested_by), "decided_by": safe_approval_actor(&decided_by)}),
     )?;
+    let trace_event_id_typed = TraceEventId::parse(&trace_event_id).map_err(|_| {
+        ManagerApiError::internal(
+            "approval_trace_identity_invalid",
+            "approval audit trace identity was invalid",
+        )
+    })?;
+    let receipt = receipt_config
+        .issue_approval_receipt(&challenge, trace_event_id_typed, issued_at)
+        .map_err(|error| {
+            ManagerApiError::forbidden(
+                error.reason_code(),
+                "approval obligation receipt could not be issued",
+            )
+        })?;
     record.status = "granted".to_string();
     record.reason = request.reason;
     record.expires_at = expires_at;
     record.trace_event_id = trace_event_id;
     record.evidence = Some(evidence);
+    record.decided_by = Some(decided_by);
+    record.authority_obligation_receipt = Some(receipt);
     approvals.insert(approval_id.to_string(), record.clone());
     Ok(Json(record))
 }
@@ -2736,11 +3947,13 @@ async fn grant_approval(
 async fn deny_approval(
     Path(approval_id): Path<ApprovalId>,
     State(state): State<ManagerState>,
+    headers: HeaderMap,
     Json(request): Json<ApprovalDecisionRequest>,
 ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
     decide_approval(
         state,
         approval_id,
+        headers,
         request,
         "denied",
         ApprovalDecision::Denied,
@@ -2752,33 +3965,345 @@ async fn deny_approval(
 async fn revoke_approval(
     Path(approval_id): Path<ApprovalId>,
     State(state): State<ManagerState>,
+    headers: HeaderMap,
     Json(request): Json<ApprovalDecisionRequest>,
 ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
-    decide_approval(
-        state,
-        approval_id,
-        request,
-        "revoked",
-        ApprovalDecision::Denied,
+    let verified = state.verify_approval_caller(&headers, &request.security)?;
+    state.validate_security(
+        &verified,
+        Some(&request.security.audit_attribution),
+        EndpointScope::ApprovalsManage,
         true,
+    )?;
+    let decided_by = request.security.audit_attribution.clone();
+    let gate = state.approval_revocation_gate(&approval_id)?;
+    let _guard = gate.lock().await;
+    let record = state
+        .inner
+        .approvals
+        .lock()
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?
+        .get(&approval_id.to_string())
+        .cloned()
+        .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))?;
+    let requested_expiry = request.expires_at.unwrap_or(record.expires_at);
+
+    if record.status == "revoked" {
+        let exact_retry = record.reason == request.reason
+            && record.expires_at == requested_expiry
+            && record.resident_receipt_revocation_ack.is_some()
+            && record
+                .decided_by
+                .as_ref()
+                .is_some_and(|attribution| attribution.principal == decided_by.principal);
+        if exact_retry {
+            return Ok(Json(record));
+        }
+        return Err(ManagerApiError::conflict(
+            "approval_decision_conflict",
+            "approval revocation is immutable and the repeated decision differs",
+        ));
+    }
+
+    if record.status == "requested" {
+        let mut evidence = ApprovalEvidence::new(
+            approval_id.clone(),
+            record.tenant_id.clone(),
+            record.agent_id.clone(),
+            record.run_id.clone(),
+            ApprovalDecision::Denied,
+            requested_expiry,
+        )
+        .with_action_name(record.action_name.clone())
+        .with_adapter(record.adapter.clone());
+        evidence.action_id = Some(record.action_id.clone());
+        evidence.reason = Some(request.reason.clone());
+        evidence.revoked = true;
+        let trace_event_id = state.audit(
+            "approval.revoked",
+            serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "reason": request.reason, "requested_by": safe_approval_actor(&record.requested_by), "decided_by": safe_approval_actor(&decided_by), "resident_receipt_revocation_required": false}),
+        )?;
+        let mut updated = record;
+        updated.status = "revoked".to_string();
+        updated.reason = request.reason;
+        updated.expires_at = requested_expiry;
+        updated.trace_event_id = trace_event_id;
+        updated.evidence = Some(evidence);
+        updated.decided_by = Some(decided_by);
+        state
+            .inner
+            .approvals
+            .lock()
+            .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?
+            .insert(approval_id.to_string(), updated.clone());
+        return Ok(Json(updated));
+    }
+
+    if record.status != "granted" {
+        return Err(ManagerApiError::conflict(
+            "approval_terminal_conflict",
+            "approval is not in a revocable state",
+        ));
+    }
+    if requested_expiry != record.expires_at {
+        return Err(ManagerApiError::bad_request(
+            "approval_challenge_expiry_mismatch",
+            "approval revocation cannot change the granted receipt expiry",
+        ));
+    }
+    let receipt = record.authority_obligation_receipt.clone().ok_or_else(|| {
+        ManagerApiError::unavailable(
+            "approval_obligation_receipt_unavailable",
+            "granted approval does not retain its exact raw receipt",
+        )
+    })?;
+    let target = state
+        .inner
+        .approval_resident_targets
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal(
+                "approval_target_lock",
+                "approval resident target lock unavailable",
+            )
+        })?
+        .get(&approval_id.to_string())
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::unavailable(
+                "approval_resident_target_unavailable",
+                "granted approval has no immutable resident target",
+            )
+        })?;
+    if target.run_id != record.run_id
+        || receipt.approval_id.as_ref() != Some(&approval_id)
+        || receipt.audience != record.audience
+    {
+        return Err(ManagerApiError::conflict(
+            "approval_resident_target_mismatch",
+            "retained approval receipt did not match its immutable resident target",
+        ));
+    }
+    let validated_origin = state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&target.resident_daemon_url)
+        .map_err(|_| {
+            approval_receipt_revocation_transport_failed(
+                "retained resident origin is no longer an allowed transport target",
+            )
+        })?;
+    if validated_origin != target.resident_origin {
+        return Err(approval_receipt_revocation_transport_failed(
+            "retained resident origin did not match its immutable grant target",
+        ));
+    }
+    let caller = state.inner.resident_dispatch.signed_caller(
+        &record.tenant_id,
+        &target.instance_id,
+        EndpointScope::ApprovalReceiptsRevoke,
+    )?;
+    let revocation = ResidentApprovalReceiptRevocationRequest {
+        schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION.to_string(),
+        authority_obligation_receipt: receipt.clone(),
+        reason: request.reason.clone(),
+    };
+    let body = serde_json::to_value(&revocation).map_err(|_| {
+        ManagerApiError::internal(
+            "approval_receipt_revocation_request_unavailable",
+            "resident revocation request could not be serialized",
+        )
+    })?;
+    let path = format!(
+        "/runs/{}/approval-receipts/{}/revoke",
+        record.run_id, receipt.receipt_id
+    );
+    let response: ResidentHttpResponse<ResidentApprovalReceiptRevocationAck> = match state
+        .inner
+        .resident_dispatch
+        .post_json(
+            &target.resident_daemon_url,
+            &path,
+            &caller.encoded,
+            &body,
+            state.inner.resident_dispatch.start_timeout,
+            reqwest::StatusCode::OK,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(ResidentHttpError::UnexpectedStatus {
+            status: 409,
+            upstream_code: Some(code),
+        }) if code == "approval_receipt_revocation_too_late" => {
+            return Err(approval_receipt_revocation_too_late())
+        }
+        Err(error) if error.effect_may_have_occurred() => {
+            return Err(approval_receipt_revocation_effect_unknown(
+                "resident revocation may have been applied without an exact acknowledgement",
+            ))
+        }
+        Err(_) => {
+            return Err(approval_receipt_revocation_transport_failed(
+                "resident revocation was not delivered",
+            ))
+        }
+    };
+    let ack = response.value;
+    if ack.schema_version != RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION
+        || ack.receipt_id != receipt.receipt_id
+        || ack.approval_id != approval_id
+        || ack.target_instance_id != target.instance_id
+        || ack.run_id != target.run_id
+        || ack.receipt_audience != receipt.audience
+        || ack.effect_certainty != splendor_types::EffectCertainty::Known
+        || !matches!(
+            ack.status,
+            ResidentApprovalReceiptRevocationStatus::Revoked
+                | ResidentApprovalReceiptRevocationStatus::AlreadyRevoked
+        )
+    {
+        return Err(approval_receipt_revocation_effect_unknown(
+            "resident revocation acknowledgement did not match the retained grant target",
+        ));
+    }
+
+    let updated = complete_acknowledged_approval_revocation(
+        &state,
+        &AcknowledgedApprovalRevocation {
+            approval_id,
+            record,
+            receipt,
+            acknowledgement: ack,
+            target,
+            reason: request.reason,
+            decided_by,
+        },
+    )?;
+    Ok(Json(updated))
+}
+
+fn complete_acknowledged_approval_revocation(
+    state: &ManagerState,
+    completion: &AcknowledgedApprovalRevocation,
+) -> Result<GovernanceApprovalRecord, ManagerApiError> {
+    complete_acknowledged_approval_revocation_with_audit(state, completion, |event, details| {
+        state.audit(event, details)
+    })
+}
+
+fn complete_acknowledged_approval_revocation_with_audit<F>(
+    state: &ManagerState,
+    completion: &AcknowledgedApprovalRevocation,
+    audit: F,
+) -> Result<GovernanceApprovalRecord, ManagerApiError>
+where
+    F: FnOnce(&str, serde_json::Value) -> Result<String, ManagerApiError>,
+{
+    let mut evidence = ApprovalEvidence::new(
+        completion.approval_id.clone(),
+        completion.record.tenant_id.clone(),
+        completion.record.agent_id.clone(),
+        completion.record.run_id.clone(),
+        ApprovalDecision::Denied,
+        completion.record.expires_at,
     )
-    .await
+    .with_action_name(completion.record.action_name.clone())
+    .with_adapter(completion.record.adapter.clone());
+    evidence.action_id = Some(completion.record.action_id.clone());
+    evidence.reason = Some(completion.reason.clone());
+    evidence.revoked = true;
+    let mut updated = completion.record.clone();
+    updated.status = "revoked".to_string();
+    updated.reason = completion.reason.clone();
+    updated.evidence = Some(evidence);
+    updated.decided_by = Some(completion.decided_by.clone());
+    updated.authority_obligation_receipt = Some(completion.receipt.clone());
+    updated.resident_receipt_revocation_ack = Some(completion.acknowledgement.clone());
+    let mut approvals = state
+        .inner
+        .approvals
+        .lock()
+        .map_err(|_| ManagerApiError::internal("approval_lock", "approval lock unavailable"))?;
+    let current = approvals
+        .get(&completion.approval_id.to_string())
+        .ok_or_else(|| {
+            ManagerApiError::internal(
+                "approval_state_unavailable",
+                "approval disappeared after resident acknowledgement",
+            )
+        })?;
+    if current.status != "granted"
+        || current.authority_obligation_receipt.as_ref()
+            != updated.authority_obligation_receipt.as_ref()
+    {
+        return Err(ManagerApiError::conflict(
+            "approval_state_conflict",
+            "approval changed while resident revocation was in flight",
+        ));
+    }
+    // Acquire and compare the manager state before the audit append. Once the
+    // append succeeds, insertion below is infallible while this lock is held;
+    // an audit failure therefore leaves the granted record retryable, and a
+    // fresh exact-target retry can converge from resident `already_revoked`.
+    let trace_event_id = audit(
+        "approval.revoked",
+        serde_json::json!({"approval_id": completion.approval_id, "run_id": completion.record.run_id, "action_id": completion.record.action_id, "reason": completion.reason, "target_instance_id": completion.target.instance_id, "receipt_id": completion.receipt.receipt_id, "resident_status": completion.acknowledgement.status, "requested_by": safe_approval_actor(&completion.record.requested_by), "decided_by": safe_approval_actor(&completion.decided_by)}),
+    )?;
+    updated.trace_event_id = trace_event_id;
+    approvals.insert(completion.approval_id.to_string(), updated.clone());
+    Ok(updated)
+}
+
+fn approval_receipt_revocation_too_late() -> ManagerApiError {
+    ManagerApiError::conflict(
+        "approval_receipt_revocation_too_late",
+        "resident receipt claim completed before revocation",
+    )
+    .details(serde_json::json!({
+        "outcome": "too_late",
+        "effect_certainty": "known",
+        "revocation_applied": false,
+    }))
+}
+
+fn approval_receipt_revocation_transport_failed(message: &'static str) -> ManagerApiError {
+    ManagerApiError::bad_gateway("approval_receipt_revocation_transport_failed", message).details(
+        serde_json::json!({
+            "outcome": "transport_failed",
+            "effect_certainty": "known",
+            "revocation_applied": false,
+        }),
+    )
+}
+
+fn approval_receipt_revocation_effect_unknown(message: &'static str) -> ManagerApiError {
+    ManagerApiError::gateway_timeout("approval_receipt_revocation_effect_unknown", message).details(
+        serde_json::json!({
+            "outcome": "effect_unknown",
+            "effect_certainty": "unknown",
+            "revocation_applied": serde_json::Value::Null,
+        }),
+    )
 }
 
 async fn decide_approval(
     state: ManagerState,
     approval_id: ApprovalId,
+    headers: HeaderMap,
     request: ApprovalDecisionRequest,
     status: &'static str,
     decision: ApprovalDecision,
     revoked: bool,
 ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+    let verified = state.verify_approval_caller(&headers, &request.security)?;
     state.validate_security(
-        &request.security.credential,
+        &verified,
         Some(&request.security.audit_attribution),
         EndpointScope::ApprovalsManage,
         true,
     )?;
+    let decided_by = request.security.audit_attribution.clone();
     let mut approvals = state
         .inner
         .approvals
@@ -2788,13 +4313,52 @@ async fn decide_approval(
         .get(&approval_id.to_string())
         .cloned()
         .ok_or_else(|| ManagerApiError::not_found("approval_not_found", "approval not found"))?;
+    let requested_expiry = request.expires_at.unwrap_or(record.expires_at);
+    if record.status == status {
+        let exact_retry = record.reason == request.reason
+            && record.expires_at == requested_expiry
+            && record.evidence.is_some()
+            && record
+                .decided_by
+                .as_ref()
+                .is_some_and(|attribution| attribution.principal == decided_by.principal);
+        if exact_retry {
+            return Ok(Json(record));
+        }
+        return Err(ManagerApiError::conflict(
+            "approval_decision_conflict",
+            "approval decision is immutable and the repeated decision differs",
+        ));
+    }
+    match record.status.as_str() {
+        "requested" => {}
+        "granted" if status == "revoked" => {}
+        "granted" => {
+            return Err(ManagerApiError::conflict(
+                "approval_decision_conflict",
+                "a granted approval may only be revoked, not replaced by another decision",
+            ))
+        }
+        "denied" | "revoked" => {
+            return Err(ManagerApiError::conflict(
+                "approval_terminal_conflict",
+                "denied or revoked approval state is immutable",
+            ))
+        }
+        _ => {
+            return Err(ManagerApiError::conflict(
+                "approval_state_conflict",
+                "approval is not in a mutable decision state",
+            ))
+        }
+    }
     let mut evidence = ApprovalEvidence::new(
         approval_id.clone(),
         record.tenant_id.clone(),
         record.agent_id.clone(),
         record.run_id.clone(),
         decision,
-        request.expires_at.unwrap_or(record.expires_at),
+        requested_expiry,
     )
     .with_action_name(record.action_name.clone())
     .with_adapter(record.adapter.clone());
@@ -2803,12 +4367,15 @@ async fn decide_approval(
     evidence.revoked = revoked;
     let trace_event_id = state.audit(
         &format!("approval.{status}"),
-        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "reason": request.reason}),
+        serde_json::json!({"approval_id": approval_id, "run_id": record.run_id, "action_id": record.action_id, "reason": request.reason, "requested_by": safe_approval_actor(&record.requested_by), "decided_by": safe_approval_actor(&decided_by)}),
     )?;
     record.status = status.to_string();
     record.reason = request.reason;
+    record.expires_at = requested_expiry;
     record.trace_event_id = trace_event_id;
     record.evidence = Some(evidence);
+    record.decided_by = Some(decided_by);
+    record.authority_obligation_receipt = None;
     approvals.insert(approval_id.to_string(), record.clone());
     Ok(Json(record))
 }
@@ -2951,26 +4518,37 @@ async fn activate_kill_switch(
     if let (Some(target), Some(run_id), Some(tenant_id)) =
         (&target, &request.run_id, &request.tenant_id)
     {
-        let credential = kill_switch_credential(
-            &request.security.credential,
-            &request.kill_switch_id,
-            &target.instance_id,
+        state
+            .inner
+            .resident_dispatch
+            .validate_base_url(&target.daemon_url)?;
+        let caller = state.inner.resident_dispatch.signed_caller(
             tenant_id,
-        );
+            &target.instance_id,
+            EndpointScope::RunsStop,
+        )?;
+        let audit = resident_audit(&caller.credential);
         let payload = serde_json::json!({
-            "credential": credential,
-            "audit_attribution": resident_audit(&credential),
+            "credential": caller.credential,
+            "audit_attribution": audit,
             "reason": request.reason,
         });
         cancel_payload_schema = Some("splendor.daemon.lifecycle_request.v1".to_string());
-        let response = post_json(
-            &target.daemon_url,
-            &format!("/runs/{run_id}/cancel"),
-            &payload,
-        )
-        .map_err(|e| ManagerApiError::internal("kill_switch_http_error", e))?;
+        let response: ResidentHttpResponse<crate::RunInspectResponse> = state
+            .inner
+            .resident_dispatch
+            .post_json(
+                &target.daemon_url,
+                &format!("/runs/{run_id}/cancel"),
+                &caller.encoded,
+                &payload,
+                state.inner.resident_dispatch.create_timeout,
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .map_err(|error| resident_http_error("cancel", error, false))?;
         cancel_status = Some(response.status);
-        acknowledged = (200..300).contains(&response.status);
+        acknowledged = response.value.run_id == *run_id;
     }
     let fail_closed = request.propagation_ack_required && !acknowledged;
     let trace_event_id = state.audit(
@@ -3171,7 +4749,341 @@ async fn audit_events(
     ))
 }
 
-fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>, ManagerApiError> {
+const MAX_WORK_ORDER_APPROVAL_POLICIES: usize = 64;
+const MAX_APPROVAL_POLICY_ID_BYTES: usize = 128;
+const MAX_APPROVAL_POLICY_REASON_BYTES: usize = 1024;
+const MAX_APPROVAL_POLICY_RISK_LEVEL_BYTES: usize = 128;
+
+fn validate_work_order_approval_policies(
+    envelope: &WorkOrderEnvelope,
+    approval_policies: &[ApprovalPolicy],
+    now: OffsetDateTime,
+) -> Result<(), ManagerApiError> {
+    if approval_policies.len() > MAX_WORK_ORDER_APPROVAL_POLICIES {
+        return Err(ManagerApiError::bad_request(
+            "approval_policy_count_exceeded",
+            "work-order admission approval policy count exceeds the supported bound",
+        ));
+    }
+    let work_order = &envelope.work_order;
+    let mut policy_ids = HashSet::with_capacity(approval_policies.len());
+    for policy in approval_policies {
+        if policy.schema_version != APPROVAL_POLICY_SCHEMA_VERSION {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_schema_unsupported",
+                "work-order admission approval policy schema is unsupported",
+            ));
+        }
+        validate_approval_policy_text(
+            &policy.policy_id,
+            MAX_APPROVAL_POLICY_ID_BYTES,
+            "approval_policy_id_invalid",
+            "approval policy ID must be non-empty, bounded, trimmed, and control-free",
+        )?;
+        if !policy_ids.insert(policy.policy_id.as_str()) {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_id_duplicate",
+                "work-order admission approval policy IDs must be unique",
+            ));
+        }
+        validate_approval_policy_text(
+            &policy.reason,
+            MAX_APPROVAL_POLICY_REASON_BYTES,
+            "approval_policy_reason_invalid",
+            "approval policy reason must be non-empty, bounded, trimmed, and control-free",
+        )?;
+        if let Some(risk_level) = policy.risk_level.as_deref() {
+            validate_approval_policy_text(
+                risk_level,
+                MAX_APPROVAL_POLICY_RISK_LEVEL_BYTES,
+                "approval_policy_risk_level_invalid",
+                "approval policy risk level must be non-empty, bounded, trimmed, and control-free",
+            )?;
+        }
+        if policy.tenant_id != work_order.tenant_id {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_tenant_mismatch",
+                "approval policy tenant must exactly match the signed work-order tenant",
+            ));
+        }
+        if policy
+            .agent_id
+            .as_ref()
+            .is_some_and(|agent_id| agent_id != &work_order.agent_id)
+        {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_agent_mismatch",
+                "approval policy agent must be absent or exactly match the signed work-order agent",
+            ));
+        }
+        if policy.action_name.as_ref().is_some_and(|action| {
+            !work_order
+                .allowed_actions
+                .iter()
+                .any(|allowed| allowed == action)
+        }) {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_action_out_of_scope",
+                "approval policy action must be absent or present in signed allowed_actions",
+            ));
+        }
+        if policy.adapter.as_ref().is_some_and(|adapter| {
+            !work_order
+                .allowed_adapters
+                .iter()
+                .any(|allowed| allowed == adapter)
+        }) {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_adapter_out_of_scope",
+                "approval policy adapter must be absent or present in signed allowed_adapters",
+            ));
+        }
+        if policy
+            .required_permission
+            .as_ref()
+            .is_some_and(|permission| {
+                !work_order
+                    .allowed_permissions
+                    .iter()
+                    .any(|allowed| allowed == permission)
+            })
+        {
+            return Err(ManagerApiError::bad_request(
+                "approval_policy_permission_out_of_scope",
+                "approval policy permission must be absent or present in signed allowed_permissions",
+            ));
+        }
+        if let Some(expires_at) = policy.expires_at {
+            if expires_at <= now {
+                return Err(ManagerApiError::bad_request(
+                    "approval_policy_expired",
+                    "approval policy expiry must be in the future at admission",
+                ));
+            }
+            if expires_at > work_order.expires_at {
+                return Err(ManagerApiError::bad_request(
+                    "approval_policy_expiry_exceeds_work_order",
+                    "approval policy expiry cannot exceed signed work-order expiry",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_approval_policy_text(
+    value: &str,
+    maximum_bytes: usize,
+    reason_code: &'static str,
+    message: &'static str,
+) -> Result<(), ManagerApiError> {
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(ManagerApiError::bad_request(reason_code, message));
+    }
+    Ok(())
+}
+
+fn accepted_work_order(
+    envelope: WorkOrderEnvelope,
+    approval_policies: Vec<ApprovalPolicy>,
+) -> Result<AcceptedWorkOrder, ()> {
+    let payload = envelope
+        .work_order
+        .signing_payload_bytes()
+        .map_err(|_| ())?;
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|_| ())?;
+    let mut payload_input = b"splendor.manager.accepted-work-order-payload.v1\0".to_vec();
+    payload_input.extend_from_slice(&payload);
+    let mut envelope_input = b"splendor.manager.accepted-work-order-envelope.v1\0".to_vec();
+    envelope_input.extend_from_slice(&envelope_bytes);
+    let approval_policies_digest = stable_manager_digest(
+        b"splendor.manager.accepted-work-order-approval-policies.v1\0",
+        &approval_policies,
+    )
+    .map_err(|_| ())?;
+    Ok(AcceptedWorkOrder {
+        envelope,
+        approval_policies,
+        payload_digest: ContentHash::blake3(payload_input).to_string(),
+        envelope_digest: ContentHash::blake3(envelope_input).to_string(),
+        approval_policies_digest,
+    })
+}
+
+fn load_accepted_work_order(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<AcceptedWorkOrder, ManagerApiError> {
+    let stored = state
+        .inner
+        .work_orders
+        .lock()
+        .map_err(|_| ManagerApiError::internal("work_order_lock", "work order lock unavailable"))?
+        .get(work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::not_found("work_order_not_found", "work order not submitted")
+        })?;
+    let binding = state
+        .inner
+        .accepted_work_order_bindings
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal("work_order_lock", "work order binding unavailable")
+        })?
+        .get(work_order_id)
+        .cloned()
+        .ok_or_else(|| {
+            ManagerApiError::conflict(
+                "work_order_binding_missing",
+                "accepted work order is missing its immutable binding",
+            )
+        })?;
+    let reconstructed =
+        accepted_work_order(stored.envelope.clone(), stored.approval_policies.clone()).map_err(
+            |_| {
+                ManagerApiError::internal(
+                    "work_order_digest_unavailable",
+                    "accepted work-order admission binding could not be reconstructed",
+                )
+            },
+        )?;
+    if stored.payload_digest != reconstructed.payload_digest
+        || stored.envelope_digest != reconstructed.envelope_digest
+        || stored.approval_policies_digest != reconstructed.approval_policies_digest
+        || binding.payload_digest != reconstructed.payload_digest
+        || binding.envelope_digest != reconstructed.envelope_digest
+        || binding.approval_policies_digest != reconstructed.approval_policies_digest
+    {
+        return Err(ManagerApiError::conflict(
+            "work_order_binding_mismatch",
+            "accepted work order or its approval policies no longer match their immutable binding",
+        ));
+    }
+    Ok(stored)
+}
+
+fn stable_manager_digest(
+    domain: &[u8],
+    value: &impl Serialize,
+) -> Result<String, serde_json::Error> {
+    let mut input = domain.to_vec();
+    input.extend_from_slice(&serde_json::to_vec(value)?);
+    Ok(ContentHash::blake3(input).to_string())
+}
+
+fn revalidate_dispatch_authority(
+    state: &ManagerState,
+    work_order: &AcceptedWorkOrder,
+    run_id: &RunId,
+    expected_target: &str,
+    phase: &str,
+) -> Result<(), ManagerApiError> {
+    let work_order_id = work_order.envelope.work_order.work_order_id.to_string();
+    if state
+        .inner
+        .revoked_work_orders
+        .lock()
+        .map_err(|_| ManagerApiError::internal("revocation_lock", "revocation lock unavailable"))?
+        .contains(&work_order_id)
+    {
+        state.audit(
+            "work_order.rejected",
+            serde_json::json!({
+                "work_order_id": work_order_id,
+                "reason": "revoked_work_order",
+                "phase": phase,
+            }),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            "revoked_work_order",
+            "work order was revoked before resident dispatch",
+        ));
+    }
+    if let Err(error) = splendor_types::validate_work_order(
+        &work_order.envelope,
+        &WorkOrderValidationContext {
+            tenant_id: work_order.envelope.work_order.tenant_id.clone(),
+            agent_id: work_order.envelope.work_order.agent_id.clone(),
+            run_id: Some(run_id.clone()),
+            expected_placement_target: Some(expected_target.to_string()),
+            now: OffsetDateTime::now_utc(),
+        },
+        &state.inner.work_order_keyring,
+    ) {
+        state.audit(
+            "work_order.rejected",
+            serde_json::json!({
+                "work_order_id": work_order_id,
+                "reason": error.reason_code(),
+                "phase": phase,
+            }),
+        )?;
+        return Err(ManagerApiError::forbidden(
+            error.reason_code(),
+            error.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_signed_data_locality(
+    value: Option<&str>,
+) -> Result<Option<DataLocality>, ManagerApiError> {
+    value
+        .map(|value| match value {
+            "cloud" => Ok(DataLocality::Cloud),
+            "vpc" => Ok(DataLocality::Vpc),
+            "on_prem" => Ok(DataLocality::OnPrem),
+            "device" => Ok(DataLocality::Device),
+            _ => Err(ManagerApiError::forbidden(
+                "unsupported_work_order_data_locality",
+                "signed work-order data_locality must use the current typed locality class vocabulary",
+            )),
+        })
+        .transpose()
+}
+
+fn validate_placement_request_against_work_order(
+    request: &PlacementRequest,
+    work_order: &WorkOrderEnvelope,
+) -> Result<(), ManagerApiError> {
+    let signed = &work_order.work_order.placement;
+    let mut requested_capabilities = request.required_capabilities.clone();
+    requested_capabilities.sort();
+    requested_capabilities.dedup();
+    let mut signed_capabilities = signed.required_capabilities.clone();
+    signed_capabilities.sort();
+    signed_capabilities.dedup();
+    let signed_locality = parse_signed_data_locality(signed.data_locality.as_deref())?;
+    let gpu_requirement_satisfied = !signed.requires_gpu.unwrap_or(false)
+        || requested_capabilities
+            .iter()
+            .any(|capability| capability == "gpu" || capability.starts_with("gpu."));
+    if request.target.as_str() != signed.target
+        || requested_capabilities != signed_capabilities
+        || signed_locality.is_some_and(|locality| request.data_locality != Some(locality))
+        || request.dedicated_instance != signed.dedicated_instance.unwrap_or(false)
+        || request.max_runtime_ms != signed.max_runtime_ms
+        || request.execution_mode != signed.execution_mode
+        || !gpu_requirement_satisfied
+    {
+        return Err(ManagerApiError::forbidden(
+            "placement_request_work_order_mismatch",
+            "placement request does not exactly preserve the signed work-order placement constraints",
+        ));
+    }
+    Ok(())
+}
+
+fn placement_candidates(
+    state: &ManagerState,
+    tenant_id: Option<&TenantId>,
+) -> Result<Vec<PlacementCandidate>, ManagerApiError> {
     let audit = state
         .inner
         .audit
@@ -3199,6 +5111,22 @@ fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>,
             .registry
             .node(&node_id)
             .map_err(|e| ManagerApiError::not_found("node_not_found", e.to_string()))?;
+        if node
+            .registration
+            .scope
+            .fleet_id
+            .as_ref()
+            .is_some_and(|fleet_id| fleet_id != &state.inner.fleet_id)
+            || tenant_id.is_some_and(|tenant_id| {
+                node.registration
+                    .scope
+                    .tenant_id
+                    .as_ref()
+                    .is_some_and(|node_tenant| node_tenant != tenant_id)
+            })
+        {
+            continue;
+        }
         let target = match node
             .registration
             .capability_document
@@ -3242,93 +5170,681 @@ fn placement_candidates(state: &ManagerState) -> Result<Vec<PlacementCandidate>,
     Ok(candidates)
 }
 
-#[derive(Debug)]
-struct HttpResponse {
-    status: u16,
-    body: Option<String>,
+fn resolve_dispatch_binding(
+    state: &ManagerState,
+    work_order_id: &str,
+    work_order: &AcceptedWorkOrder,
+    placement: &BoundPlacement,
+    selected_node_id: &NodeId,
+) -> Result<DispatchBinding, ManagerApiError> {
+    if let Some(existing) = state
+        .inner
+        .dispatch_bindings
+        .lock()
+        .map_err(|_| {
+            ManagerApiError::internal("dispatch_binding_lock", "dispatch binding unavailable")
+        })?
+        .get(work_order_id)
+        .cloned()
+    {
+        if existing.work_order_payload_digest != work_order.payload_digest
+            || existing.placement_decision_digest != placement.decision_digest
+            || &existing.node_id != selected_node_id
+        {
+            return Err(ManagerApiError::conflict(
+                "dispatch_binding_replacement",
+                "resident dispatch is already immutably bound to different authority or placement",
+            ));
+        }
+        ensure_bound_instance_eligible(state, work_order, placement, &existing)?;
+        return Ok(existing);
+    }
+
+    let node = state
+        .inner
+        .registry
+        .node(selected_node_id)
+        .map_err(|error| ManagerApiError::not_found("node_not_found", error.to_string()))?;
+    let now = OffsetDateTime::now_utc();
+    if node.health.status != HealthStatus::Healthy
+        || node.last_heartbeat_at + Duration::seconds(60) <= now
+    {
+        return Err(ManagerApiError::forbidden(
+            "stale_or_unhealthy_node",
+            "selected node heartbeat is stale or unhealthy",
+        ));
+    }
+    if node
+        .registration
+        .scope
+        .fleet_id
+        .as_ref()
+        .is_some_and(|fleet_id| fleet_id != &state.inner.fleet_id)
+        || node
+            .registration
+            .scope
+            .tenant_id
+            .as_ref()
+            .is_some_and(|tenant_id| tenant_id != &work_order.envelope.work_order.tenant_id)
+    {
+        return Err(ManagerApiError::forbidden(
+            "resident_node_scope_mismatch",
+            "selected node is outside the signed fleet or tenant scope",
+        ));
+    }
+
+    let mut eligible = Vec::new();
+    for instance_id in &node.instances {
+        let instance = state
+            .inner
+            .registry
+            .instance(instance_id)
+            .map_err(|error| ManagerApiError::not_found("instance_not_found", error.to_string()))?;
+        if instance_is_eligible(
+            &instance,
+            &node.registration.runtime_version,
+            &work_order.envelope.work_order.tenant_id,
+            &placement.request,
+            now,
+        ) {
+            eligible.push(instance.registration.instance_id);
+        }
+    }
+    let instance_id = match eligible.as_slice() {
+        [instance_id] => instance_id.clone(),
+        [] => {
+            return Err(ManagerApiError::forbidden(
+                "no_eligible_resident_instance",
+                "selected node has no healthy resident instance supporting the signed tenant and placement requirements",
+            ))
+        }
+        _ => {
+            return Err(ManagerApiError::conflict(
+                "ambiguous_eligible_resident_instances",
+                "selected node has multiple eligible resident instances; exact instance selection is required",
+            ))
+        }
+    };
+    let resident_daemon_url = node
+        .registration
+        .capability_document
+        .constraints
+        .get("resident_daemon_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ManagerApiError::bad_request(
+                "missing_resident_daemon_url",
+                "node capability constraints must include resident_daemon_url",
+            )
+        })?
+        .to_string();
+    let resident_origin = state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&resident_daemon_url)?;
+    let binding = DispatchBinding {
+        work_order_payload_digest: work_order.payload_digest.clone(),
+        placement_decision_digest: placement.decision_digest.clone(),
+        node_id: selected_node_id.clone(),
+        instance_id,
+        resident_daemon_url,
+        resident_origin,
+    };
+    let mut bindings = state.inner.dispatch_bindings.lock().map_err(|_| {
+        ManagerApiError::internal("dispatch_binding_lock", "dispatch binding unavailable")
+    })?;
+    match bindings.get(work_order_id) {
+        Some(existing)
+            if existing.work_order_payload_digest == binding.work_order_payload_digest
+                && existing.placement_decision_digest == binding.placement_decision_digest
+                && existing.node_id == binding.node_id
+                && existing.instance_id == binding.instance_id
+                && existing.resident_daemon_url == binding.resident_daemon_url
+                && existing.resident_origin == binding.resident_origin =>
+        {
+            Ok(existing.clone())
+        }
+        Some(_) => Err(ManagerApiError::conflict(
+            "dispatch_binding_replacement",
+            "resident dispatch was concurrently bound to a different instance",
+        )),
+        None => {
+            bindings.insert(work_order_id.to_string(), binding.clone());
+            Ok(binding)
+        }
+    }
 }
 
-fn post_json(base_url: &str, path: &str, body: &serde_json::Value) -> Result<HttpResponse, String> {
-    let base = base_url
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// URLs are supported in local acceptance".to_string())?;
-    let (host_port, prefix) = base.split_once('/').unwrap_or((base, ""));
-    let full_path = if prefix.is_empty() {
-        path.to_string()
+fn ensure_bound_instance_eligible(
+    state: &ManagerState,
+    work_order: &AcceptedWorkOrder,
+    placement: &BoundPlacement,
+    binding: &DispatchBinding,
+) -> Result<(), ManagerApiError> {
+    let node = state
+        .inner
+        .registry
+        .node(&binding.node_id)
+        .map_err(|error| ManagerApiError::not_found("node_not_found", error.to_string()))?;
+    let instance = state
+        .inner
+        .registry
+        .instance(&binding.instance_id)
+        .map_err(|error| ManagerApiError::not_found("instance_not_found", error.to_string()))?;
+    let now = OffsetDateTime::now_utc();
+    if node.health.status != HealthStatus::Healthy
+        || node.last_heartbeat_at + Duration::seconds(60) <= now
+        || !instance_is_eligible(
+            &instance,
+            &node.registration.runtime_version,
+            &work_order.envelope.work_order.tenant_id,
+            &placement.request,
+            now,
+        )
+    {
+        return Err(ManagerApiError::forbidden(
+            "bound_resident_instance_no_longer_eligible",
+            "the immutably selected resident instance is no longer healthy or compatible",
+        ));
+    }
+    let current_origin = state
+        .inner
+        .resident_dispatch
+        .validate_base_url(&binding.resident_daemon_url)?;
+    if current_origin != binding.resident_origin {
+        return Err(ManagerApiError::forbidden(
+            "resident_origin_binding_mismatch",
+            "resident origin no longer matches the immutable dispatch binding",
+        ));
+    }
+    Ok(())
+}
+
+fn instance_is_eligible(
+    instance: &splendor_kernel::InstanceRecord,
+    node_runtime_version: &str,
+    tenant_id: &TenantId,
+    placement: &PlacementRequest,
+    now: OffsetDateTime,
+) -> bool {
+    let features = instance
+        .registration
+        .supported_features
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    instance.registration.runtime_mode == RuntimeMode::Resident
+        && instance.health.status == HealthStatus::Healthy
+        && instance.last_heartbeat_at + Duration::seconds(60) > now
+        && instance.registration.hosted_tenants.contains(tenant_id)
+        && instance.registration.runtime_version == node_runtime_version
+        && placement
+            .required_runtime_version
+            .as_ref()
+            .is_none_or(|required| required == &instance.registration.runtime_version)
+        && features.contains("runtime.resident")
+        && features.contains("gateway.verified")
+        && placement
+            .required_capabilities
+            .iter()
+            .all(|required| features.contains(required.as_str()))
+}
+
+#[derive(Debug)]
+struct ResidentHttpResponse<T> {
+    status: u16,
+    body: String,
+    value: T,
+}
+
+struct DispatchReservation {
+    inner: Arc<ManagerInner>,
+    work_order_id: String,
+    release_on_drop: bool,
+}
+
+impl DispatchReservation {
+    fn retain_fail_closed(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        if let Ok(mut state) = self.inner.dispatch_state.lock() {
+            state.in_flight.remove(&self.work_order_id);
+        }
+    }
+}
+
+fn stored_dispatch_outcome(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<Option<Result<DispatchReport, ManagerApiError>>, ManagerApiError> {
+    let dispatch_state = state
+        .inner
+        .dispatch_state
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?;
+    if let Some(report) = dispatch_state.completed.get(work_order_id) {
+        return Ok(Some(Ok(report.clone())));
+    }
+    Ok(dispatch_state
+        .terminal_failures
+        .get(work_order_id)
+        .cloned()
+        .map(Err))
+}
+
+fn reserve_dispatch(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<DispatchReservation, ManagerApiError> {
+    let mut dispatch_state = state
+        .inner
+        .dispatch_state
+        .lock()
+        .map_err(|_| ManagerApiError::internal("dispatch_lock", "dispatch lock unavailable"))?;
+    if !dispatch_state.in_flight.insert(work_order_id.to_string()) {
+        return Err(ManagerApiError::conflict(
+            "dispatch_in_progress",
+            "a resident dispatch is already in progress for this work order",
+        ));
+    }
+    Ok(DispatchReservation {
+        inner: Arc::clone(&state.inner),
+        work_order_id: work_order_id.to_string(),
+        release_on_drop: true,
+    })
+}
+
+fn persist_provisional_start_quarantine(
+    state: &ManagerState,
+    work_order_id: &str,
+) -> Result<(), ManagerApiError> {
+    let mut dispatch_state = state.inner.dispatch_state.lock().map_err(|_| {
+        ManagerApiError::internal(
+            "dispatch_terminal_state_unavailable",
+            "resident start quarantine could not be persisted; start was not sent",
+        )
+    })?;
+    if dispatch_state.completed.contains_key(work_order_id) {
+        return Err(ManagerApiError::conflict(
+            "dispatch_already_completed",
+            "resident dispatch already has an authoritative success report",
+        ));
+    }
+    dispatch_state.terminal_failures.insert(
+        work_order_id.to_string(),
+        ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start may have been sent; effect certainty is unknown and automatic retry is forbidden",
+        ),
+    );
+    Ok(())
+}
+
+fn store_authoritative_dispatch_success(
+    state: &ManagerState,
+    work_order_id: &str,
+    report: &DispatchReport,
+) -> Result<(), ManagerApiError> {
+    let mut dispatch_state = state.inner.dispatch_state.lock().map_err(|_| {
+        ManagerApiError::internal(
+            "dispatch_lock",
+            "completed resident dispatch could not be persisted",
+        )
+    })?;
+    dispatch_state
+        .completed
+        .insert(work_order_id.to_string(), report.clone());
+    dispatch_state.terminal_failures.remove(work_order_id);
+    Ok(())
+}
+
+fn persist_terminal_dispatch_failure(
+    state: &ManagerState,
+    work_order_id: &str,
+    error: ManagerApiError,
+    reservation: &mut DispatchReservation,
+) -> ManagerApiError {
+    match state.inner.dispatch_state.lock() {
+        Ok(mut dispatch_state) => {
+            dispatch_state
+                .terminal_failures
+                .insert(work_order_id.to_string(), error.clone());
+            error
+        }
+        Err(_) => {
+            reservation.retain_fail_closed();
+            ManagerApiError::internal(
+                "dispatch_terminal_state_unavailable",
+                "resident dispatch result could not be persisted; dispatch remains quarantined",
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResidentHttpError {
+    InvalidUrl,
+    Transport {
+        timeout: bool,
+        request_sent: bool,
+    },
+    ResponseTooLarge,
+    UnexpectedStatus {
+        status: u16,
+        upstream_code: Option<String>,
+    },
+    InvalidResponse,
+}
+
+impl ResidentHttpError {
+    fn effect_may_have_occurred(&self) -> bool {
+        match self {
+            Self::InvalidUrl => false,
+            Self::Transport { request_sent, .. } => *request_sent,
+            Self::ResponseTooLarge | Self::UnexpectedStatus { .. } | Self::InvalidResponse => true,
+        }
+    }
+}
+
+impl ResidentDispatchClient {
+    fn validate_base_url(&self, base_url: &str) -> Result<String, ManagerApiError> {
+        let url = reqwest::Url::parse(base_url).map_err(|_| {
+            ManagerApiError::bad_request(
+                "invalid_resident_daemon_url",
+                "resident daemon URL must be an allowlisted exact origin",
+            )
+        })?;
+        validate_resident_url(&url, self.allow_loopback_http, &self.allowed_origins).map_err(|_| {
+            ManagerApiError::bad_request(
+                "resident_origin_not_allowed",
+                "resident daemon URL origin is not in the configured exact-origin allowlist",
+            )
+        })
+    }
+
+    async fn post_json<T: for<'de> Deserialize<'de> + Serialize>(
+        &self,
+        base_url: &str,
+        path: &str,
+        token: &str,
+        body: &serde_json::Value,
+        timeout: StdDuration,
+        expected_status: reqwest::StatusCode,
+    ) -> Result<ResidentHttpResponse<T>, ResidentHttpError> {
+        let mut url = reqwest::Url::parse(base_url).map_err(|_| ResidentHttpError::InvalidUrl)?;
+        validate_resident_url(&url, self.allow_loopback_http, &self.allowed_origins)?;
+        let base_path = url.path().trim_end_matches('/');
+        url.set_path(&format!("{base_path}{path}"));
+        url.set_query(None);
+        url.set_fragment(None);
+        tokio::time::timeout(timeout, async {
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .header("x-splendor-api-version", "0.1")
+                .header("x-splendor-client", "splendor-manager")
+                .json(body)
+                .send()
+                .await
+                .map_err(|error| ResidentHttpError::Transport {
+                    timeout: error.is_timeout(),
+                    request_sent: !error.is_connect(),
+                })?;
+            let status = response.status();
+            let bytes = read_bounded_response(response, self.maximum_response_bytes).await?;
+            if status != expected_status {
+                let upstream_code = serde_json::from_slice::<ApiErrorBody>(&bytes)
+                    .ok()
+                    .and_then(|error| bounded_upstream_code(error.code));
+                return Err(ResidentHttpError::UnexpectedStatus {
+                    status: status.as_u16(),
+                    upstream_code,
+                });
+            }
+            let value =
+                serde_json::from_slice(&bytes).map_err(|_| ResidentHttpError::InvalidResponse)?;
+            let body =
+                serde_json::to_string(&value).map_err(|_| ResidentHttpError::InvalidResponse)?;
+            Ok(ResidentHttpResponse {
+                status: status.as_u16(),
+                body,
+                value,
+            })
+        })
+        .await
+        .map_err(|_| ResidentHttpError::Transport {
+            timeout: true,
+            request_sent: true,
+        })?
+    }
+
+    fn signed_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+        scope: EndpointScope,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signer
+            .sign(
+                tenant_id,
+                instance_id,
+                vec![scope],
+                OffsetDateTime::now_utc(),
+                Duration::seconds(60),
+            )
+            .map_err(|_| {
+                ManagerApiError::internal(
+                    "resident_caller_token_unavailable",
+                    "resident caller token could not be issued",
+                )
+            })
+    }
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    maximum_response_bytes: usize,
+) -> Result<Vec<u8>, ResidentHttpError> {
+    if maximum_response_bytes == 0
+        || response
+            .content_length()
+            .is_some_and(|length| length > maximum_response_bytes as u64)
+    {
+        return Err(ResidentHttpError::ResponseTooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| ResidentHttpError::Transport {
+                timeout: error.is_timeout(),
+                request_sent: true,
+            })?
+    {
+        if body.len().saturating_add(chunk.len()) > maximum_response_bytes {
+            return Err(ResidentHttpError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn validate_resident_url(
+    url: &reqwest::Url,
+    allow_loopback_http: bool,
+    allowed_origins: &HashSet<String>,
+) -> Result<String, ResidentHttpError> {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    if url.scheme() != "https" && (url.scheme() != "http" || !allow_loopback_http) {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    if url.scheme() == "http"
+        && !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    let origin = url.origin().ascii_serialization();
+    if !allowed_origins.contains(&origin) {
+        return Err(ResidentHttpError::InvalidUrl);
+    }
+    Ok(origin)
+}
+
+fn canonical_allowed_origins(
+    origins: &[String],
+    allow_loopback_http: bool,
+) -> Result<HashSet<String>, String> {
+    let mut canonical = HashSet::new();
+    for raw in origins {
+        let url = reqwest::Url::parse(raw)
+            .map_err(|_| "resident allowed origin is invalid".to_string())?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+            || (url.scheme() != "https" && (url.scheme() != "http" || !allow_loopback_http))
+            || (url.scheme() == "http"
+                && !url.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                }))
+        {
+            return Err("resident allowed origin is invalid".to_string());
+        }
+        let origin = url.origin().ascii_serialization();
+        if !canonical.insert(origin) {
+            return Err("resident allowed origins must be unique".to_string());
+        }
+    }
+    Ok(canonical)
+}
+
+fn bounded_upstream_code(code: String) -> Option<String> {
+    if !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Some(code)
     } else {
-        format!("/{prefix}{path}")
-    };
-    let payload = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-    let mut stream = TcpStream::connect(host_port).map_err(|e| e.to_string())?;
-    write!(stream, "POST {full_path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).map_err(|e| e.to_string())?;
-    stream.write_all(&payload).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    let status = response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|raw| raw.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .filter(|body| !body.trim().is_empty())
-        .map(ToString::to_string);
-    Ok(HttpResponse { status, body })
+        None
+    }
+}
+
+fn resident_http_error_reason(error: &ResidentHttpError) -> &'static str {
+    match error {
+        ResidentHttpError::InvalidUrl => "invalid_resident_url",
+        ResidentHttpError::Transport { timeout: true, .. } => "resident_timeout",
+        ResidentHttpError::Transport { timeout: false, .. } => "resident_transport_failure",
+        ResidentHttpError::ResponseTooLarge => "resident_response_too_large",
+        ResidentHttpError::UnexpectedStatus { .. } => "resident_rejected_request",
+        ResidentHttpError::InvalidResponse => "resident_invalid_response",
+    }
+}
+
+fn resident_http_error(
+    phase: &str,
+    error: ResidentHttpError,
+    effect_unknown: bool,
+) -> ManagerApiError {
+    if effect_unknown {
+        return ManagerApiError::gateway_timeout(
+            "resident_start_effect_unknown",
+            "resident start completed without authoritative success; effect certainty is unknown and automatic retry is forbidden",
+        );
+    }
+    match error {
+        ResidentHttpError::InvalidUrl => ManagerApiError::bad_request(
+            "invalid_resident_daemon_url",
+            "resident daemon URL must use HTTPS, except explicit loopback tests",
+        ),
+        ResidentHttpError::Transport { timeout: true, .. } => ManagerApiError::gateway_timeout(
+            format!("resident_{phase}_timeout"),
+            format!("resident {phase} request timed out"),
+        ),
+        ResidentHttpError::Transport { timeout: false, .. } => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_transport_error"),
+            format!("resident {phase} request failed before a valid response"),
+        ),
+        ResidentHttpError::ResponseTooLarge => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_response_too_large"),
+            format!("resident {phase} response exceeded the configured limit"),
+        ),
+        ResidentHttpError::UnexpectedStatus {
+            status,
+            upstream_code,
+        } => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_rejected"),
+            format!(
+                "resident {phase} rejected the request with status {status} and code {}",
+                upstream_code.as_deref().unwrap_or("unknown")
+            ),
+        ),
+        ResidentHttpError::InvalidResponse => ManagerApiError::bad_gateway(
+            format!("resident_{phase}_invalid_response"),
+            format!("resident {phase} returned an invalid success response"),
+        ),
+    }
+}
+
+fn telemetry_run_status(status: &crate::RunStatus) -> RunStatus {
+    match status {
+        crate::RunStatus::Pending => RunStatus::Pending,
+        crate::RunStatus::Running => RunStatus::Running,
+        crate::RunStatus::Paused => RunStatus::Paused,
+        crate::RunStatus::WaitingForApproval => RunStatus::WaitingForApproval,
+        crate::RunStatus::Interrupted => RunStatus::Interrupted,
+        crate::RunStatus::Resuming => RunStatus::Resuming,
+        crate::RunStatus::Completed => RunStatus::Completed,
+        crate::RunStatus::Failed => RunStatus::Failed,
+        crate::RunStatus::Cancelled => RunStatus::Cancelled,
+        crate::RunStatus::Denied => RunStatus::Denied,
+        crate::RunStatus::Expired => RunStatus::Expired,
+    }
 }
 
 fn resident_credential(
-    manager_credential: &CallerCredential,
-    work_order_id: &str,
+    signer: &ResidentDispatchClient,
     instance_id: &InstanceId,
     tenant_id: &TenantId,
-) -> serde_json::Value {
-    let mut credential = manager_credential.clone();
-    credential.credential_id = format!("resident-dispatch-{work_order_id}");
-    credential.audience = CredentialAudience::Instance {
-        instance_id: instance_id.clone(),
-    };
-    credential.binding = CredentialBinding::Tenant {
-        tenant_id: tenant_id.clone(),
-    };
-    credential.scopes = vec![
-        EndpointScope::RunsCreate,
-        EndpointScope::RunsStart,
-        EndpointScope::RunsRead,
-        EndpointScope::StateRead,
-        EndpointScope::TracesRead,
-        EndpointScope::ReplayCreate,
-    ];
-    serde_json::to_value(credential).expect("credential serializes")
+) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+    signer.signed_caller(tenant_id, instance_id, EndpointScope::RunsCreate)
 }
 
-fn kill_switch_credential(
-    manager_credential: &CallerCredential,
-    kill_switch_id: &str,
-    instance_id: &InstanceId,
-    tenant_id: &TenantId,
-) -> serde_json::Value {
-    let mut credential = manager_credential.clone();
-    credential.credential_id = format!("kill-switch-{kill_switch_id}");
-    credential.audience = CredentialAudience::Instance {
-        instance_id: instance_id.clone(),
-    };
-    credential.binding = CredentialBinding::Tenant {
-        tenant_id: tenant_id.clone(),
-    };
-    credential.scopes = vec![EndpointScope::RunsStop];
-    serde_json::to_value(credential).expect("credential serializes")
-}
-
-fn resident_audit(credential: &serde_json::Value) -> serde_json::Value {
+fn resident_audit(credential: &CallerCredential) -> serde_json::Value {
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current timestamp formats as RFC3339");
     serde_json::json!({
-        "principal": credential.get("principal").cloned().unwrap_or(serde_json::Value::Null),
-        "credential_id": credential.get("credential_id").and_then(serde_json::Value::as_str),
+        "principal": &credential.principal,
+        "credential_id": &credential.credential_id,
         "requested_at": requested_at,
     })
 }
@@ -3343,7 +5859,18 @@ mod tests {
         AgentId, ClientPrincipal, FleetId, TelemetryAuthority, WorkOrder, WorkOrderId,
         WorkOrderPlacement, WorkOrderQuotaPolicy,
     };
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
     use tower::ServiceExt;
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        future.poll(&mut context)
+    }
 
     fn credential(fleet_id: FleetId, scopes: Vec<EndpointScope>) -> CallerCredential {
         CallerCredential {
@@ -3373,6 +5900,155 @@ mod tests {
             .expect("timestamp formats")
     }
 
+    fn manager_with_allowed_origins(allowed_origins: Vec<String>) -> ManagerState {
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "resident-dispatch-client",
+            "manager-resident-unit-test",
+        )
+        .expect("unit-test caller signer");
+        let mut options = ResidentDispatchOptions::loopback_test();
+        options.allowed_origins = allowed_origins;
+        ManagerState::local_acceptance_with_dispatch(signer, options).expect("unit-test manager")
+    }
+
+    fn manager_with_approval_auth(
+        allowed_origins: Vec<String>,
+    ) -> (ManagerState, CallerTokenSigner) {
+        let mut options = ResidentDispatchOptions::loopback_test();
+        options.allowed_origins = allowed_origins;
+        manager_with_approval_auth_options(options)
+    }
+
+    fn manager_with_approval_auth_options(
+        options: ResidentDispatchOptions,
+    ) -> (ManagerState, CallerTokenSigner) {
+        let outbound_signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:central-manager",
+            "central-manager",
+            "resident-dispatch-client",
+            "manager-resident-unit-test",
+        )
+        .expect("outbound unit-test signer");
+        let approval_signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:approval-test-issuer",
+            "approval-control-plane",
+            "approval-test-client",
+            "manager-approval-unit-test",
+        )
+        .expect("approval unit-test signer");
+        let now = OffsetDateTime::now_utc();
+        let trust = crate::caller_auth::CallerTokenTrustSnapshot::single_key(
+            approval_signer.issuer(),
+            approval_signer.app_principal_id(),
+            approval_signer.kid(),
+            &approval_signer.public_key_bytes(),
+            vec![EndpointScope::ApprovalsManage, EndpointScope::FleetRead],
+            now - Duration::seconds(1),
+        )
+        .with_expected_client_principal_id("approval-test-client");
+        let fleet_id = FleetId::parse("00000000-0000-4000-8000-000000000104").expect("test fleet");
+        let verifier = CallerTokenVerifier::for_manager(trust, "central-manager", fleet_id.clone())
+            .expect("approval unit-test verifier");
+        let mut keyring = WorkOrderKeyring::new();
+        keyring
+            .insert_shared_secret("work-order-local-key", b"splendor-local-work-order-secret")
+            .expect("work-order keyring");
+        let state = ManagerState::acceptance_with_dispatch_receipt_and_approval_auth(
+            "central-manager",
+            fleet_id,
+            keyring,
+            outbound_signer,
+            options,
+            local_manager_authority_receipt_config(),
+            verifier,
+        )
+        .expect("approval-authenticated unit-test manager");
+        (state, approval_signer)
+    }
+
+    fn approval_security(
+        state: &ManagerState,
+        signer: &CallerTokenSigner,
+        scopes: Vec<EndpointScope>,
+    ) -> (HeaderMap, ManagerSecurityFields) {
+        let signed = signer
+            .sign_for_manager(
+                &state.inner.fleet_id,
+                &state.inner.manager_id,
+                scopes,
+                OffsetDateTime::now_utc(),
+                Duration::seconds(60),
+            )
+            .expect("approval caller token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", signed.encoded))
+                .expect("authorization header"),
+        );
+        let audit_attribution = audit_for(&signed.credential);
+        (
+            headers,
+            ManagerSecurityFields {
+                credential: signed.credential,
+                audit_attribution,
+            },
+        )
+    }
+
+    fn approval_request_fixture(security: ManagerSecurityFields) -> ApprovalRequestPayload {
+        let approval_id =
+            ApprovalId::parse("66666666-6666-4666-8666-666666666661").expect("approval");
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let agent_id = AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent");
+        let run_id = RunId::parse("44444444-4444-4444-8444-444444444441").expect("run");
+        let action_id = splendor_types::ActionId::parse("55555555-5555-4555-8555-555555555551")
+            .expect("action");
+        let requested_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        let expires_at = OffsetDateTime::now_utc() + Duration::minutes(10);
+        let receipt_audience = format!("splendor.daemon.run:{run_id}");
+        let challenge = ApprovalChallenge {
+            schema_version: splendor_types::APPROVAL_CHALLENGE_SCHEMA_VERSION.to_string(),
+            approval_id: approval_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            action_id: action_id.clone(),
+            action_name: "artifact.publish_external".to_string(),
+            adapter: "artifact-store".to_string(),
+            policy_id: "policy_approval_auth_unit".to_string(),
+            risk_level: Some("high".to_string()),
+            subject: splendor_types::PrincipalId::new(),
+            authority_decision_id: splendor_types::AuthorityDecisionId::new(),
+            obligation_id: splendor_types::AuthorityObligationId::new(),
+            receipt_audience: receipt_audience.clone(),
+            canonical_request_digest: format!("blake3:{}", "1".repeat(64)),
+            gateway_action_request_digest: format!("blake3:{}", "2".repeat(64)),
+            physical_action_resource_coordinate: None,
+            authority_decision_digest: format!("blake3:{}", "3".repeat(64)),
+            requested_at,
+            expires_at,
+        };
+        ApprovalRequestPayload {
+            security,
+            approval_id,
+            tenant_id,
+            agent_id,
+            run_id,
+            action_id,
+            action_name: challenge.action_name.clone(),
+            adapter: challenge.adapter.clone(),
+            policy_id: challenge.policy_id.clone(),
+            risk_level: Some("high".to_string()),
+            audience: receipt_audience,
+            expires_at,
+            reason: "approval auth endpoint fixture".to_string(),
+            challenge: Some(challenge),
+        }
+    }
+
     fn test_work_order(target_agent: &str) -> WorkOrderEnvelope {
         test_work_order_with(
             "wo_test_remote",
@@ -3380,6 +6056,68 @@ mod tests {
             RunId::parse("44444444-4444-4444-8444-444444444444").expect("run"),
             OffsetDateTime::now_utc() + Duration::minutes(10),
         )
+    }
+
+    fn dispatch_test_work_order() -> WorkOrderEnvelope {
+        let now = OffsetDateTime::now_utc();
+        WorkOrderEnvelope::signed_with_shared_secret(
+            WorkOrder {
+                schema_version: splendor_types::WORK_ORDER_SCHEMA_VERSION.to_string(),
+                work_order_id: WorkOrderId::try_new("wo_test_dispatch").expect("work order id"),
+                tenant_id: TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant"),
+                agent_id: AgentId::parse("22222222-2222-4222-8222-222222222222").expect("agent"),
+                run_id: Some(RunId::parse("44444444-4444-4444-8444-444444444445").expect("run")),
+                objective: "admit a resident run without synthesizing policy actions".to_string(),
+                allowed_actions: vec!["daemon.record".to_string()],
+                allowed_adapters: vec!["daemon.recording".to_string()],
+                allowed_permissions: vec!["fixture.execute".to_string()],
+                data_refs: Vec::new(),
+                quotas: WorkOrderQuotaPolicy::default(),
+                placement: WorkOrderPlacement {
+                    target: "customer_vpc".to_string(),
+                    data_locality: Some("vpc".to_string()),
+                    requires_gpu: Some(false),
+                    dedicated_instance: Some(false),
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+                issued_at: now - Duration::minutes(1),
+                expires_at: now + Duration::minutes(10),
+                revocation: RevocationStatus::Active,
+            },
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("signed dispatch work order")
+    }
+
+    fn dispatch_approval_policy(work_order: &WorkOrderEnvelope) -> ApprovalPolicy {
+        ApprovalPolicy {
+            schema_version: APPROVAL_POLICY_SCHEMA_VERSION.to_string(),
+            policy_id: "resident-dispatch-approval".to_string(),
+            tenant_id: work_order.work_order.tenant_id.clone(),
+            agent_id: Some(work_order.work_order.agent_id.clone()),
+            action_name: Some("daemon.record".to_string()),
+            adapter: Some("daemon.recording".to_string()),
+            required_permission: Some("fixture.execute".to_string()),
+            side_effect_class: None,
+            risk_level: Some("high".to_string()),
+            reason: "resident dispatch requires exact approval".to_string(),
+            expires_at: Some(work_order.work_order.expires_at - Duration::seconds(1)),
+        }
+    }
+
+    fn dispatch_placement_request() -> PlacementRequest {
+        PlacementRequest {
+            target: PlacementTarget::CustomerVpc,
+            required_capabilities: vec!["runtime.resident".to_string()],
+            data_locality: Some(DataLocality::Vpc),
+            dedicated_instance: false,
+            required_runtime_version: None,
+            max_runtime_ms: Some(30_000),
+            execution_mode: PlacementExecutionMode::Live,
+        }
     }
 
     fn test_work_order_with(
@@ -3423,7 +6161,7 @@ mod tests {
                 quotas: WorkOrderQuotaPolicy::default(),
                 placement: WorkOrderPlacement {
                     target: "customer_vpc".to_string(),
-                    data_locality: Some("eu-west".to_string()),
+                    data_locality: Some("vpc".to_string()),
                     requires_gpu: Some(false),
                     dedicated_instance: Some(false),
                     required_capabilities: vec!["message.remote.proposal".to_string()],
@@ -3508,6 +6246,7 @@ mod tests {
                 security: security.clone(),
                 work_order,
                 expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
             }),
         )
         .await
@@ -3520,7 +6259,14 @@ mod tests {
             "node_id": node_id,
             "runtime_mode": "resident",
             "hosted_tenants": [tenant_id],
-            "supported_features": ["message.remote"],
+            "supported_features": [
+                "runtime.resident",
+                "gateway.verified",
+                "message.remote",
+                "message.remote.proposal",
+                "sql.read_fixture",
+                "artifact.create_internal"
+            ],
             "runtime_version": "0.1-test",
             "health": {"status": "healthy", "observed_at": now_rfc3339(), "metadata": {}},
             "registered_at": now_rfc3339()
@@ -3612,21 +6358,45 @@ mod tests {
         assert!(after.payload_preserved);
     }
 
-    fn spawn_resident_mock() -> String {
+    fn spawn_fixed_status_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind resident mock");
         let addr = listener.local_addr().expect("resident mock addr");
         std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..1 {
                 let (mut stream, _) = listener.accept().expect("accept resident request");
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_millis(200)))
                     .expect("set resident read timeout");
                 let mut request = Vec::new();
                 let _ = stream.read_to_end(&mut request);
-                let body = r#"{"accepted":true}"#;
+                let request_text = String::from_utf8_lossy(&request);
+                let run_id = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|path| path.strip_prefix("/runs/"))
+                    .and_then(|path| path.strip_suffix("/cancel"))
+                    .unwrap_or("00000000-0000-4000-8000-000000000001");
+                let observed_at = OffsetDateTime::from_unix_timestamp(1_783_900_800)
+                    .expect("fixed resident timestamp");
+                let body = serde_json::to_string(&crate::RunInspectResponse {
+                    run_id: RunId::parse(run_id).expect("cancel request run id"),
+                    tenant_id: TenantId::parse("11111111-1111-4111-8111-111111111111")
+                        .expect("fixed tenant"),
+                    agent_id: AgentId::parse("22222222-2222-4222-8222-222222222222")
+                        .expect("fixed agent"),
+                    status: crate::RunStatus::Cancelled,
+                    state_head: None,
+                    ticks: 0,
+                    adapter_executions: 0,
+                    policy_bundle: None,
+                    created_at: observed_at,
+                    updated_at: observed_at,
+                })
+                .expect("fixed resident response serializes");
                 write!(
                     stream,
-                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -3634,6 +6404,276 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ApprovalRevocationFault {
+        ExecuteThenReset,
+        PostSendTimeout,
+        MalformedResponse,
+        OversizedResponse,
+        WrongTargetAck,
+        NonSuccessResponse,
+        AlreadyRevoked,
+    }
+
+    fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(StdDuration::from_secs(1)))
+            .expect("set fault-server read timeout");
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).expect("read manager request");
+            assert_ne!(read, 0, "manager closed before sending the request body");
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .unwrap_or_default();
+            if bytes.len() >= header_end + 4 + content_length {
+                return String::from_utf8(bytes).expect("manager request is UTF-8");
+            }
+        }
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write fault-server response");
+    }
+
+    fn spawn_approval_revocation_fault_server(
+        listener: std::net::TcpListener,
+        faults: Vec<ApprovalRevocationFault>,
+        acknowledgement: ResidentApprovalReceiptRevocationAck,
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_count = Arc::clone(&request_count);
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            for fault in faults {
+                let (mut stream, _) = listener.accept().expect("accept manager revocation");
+                let request = read_complete_http_request(&mut stream);
+                server_count.fetch_add(1, Ordering::SeqCst);
+                server_requests
+                    .lock()
+                    .expect("fault requests")
+                    .push(request);
+                match fault {
+                    ApprovalRevocationFault::ExecuteThenReset => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 256\r\nConnection: close\r\n\r\n{\"schema_version\":",
+                            )
+                            .expect("write truncated acknowledgement");
+                        stream.flush().expect("flush truncated acknowledgement");
+                        stream
+                            .shutdown(std::net::Shutdown::Both)
+                            .expect("reset fault connection");
+                    }
+                    ApprovalRevocationFault::PostSendTimeout => {
+                        std::thread::sleep(StdDuration::from_millis(250));
+                    }
+                    ApprovalRevocationFault::MalformedResponse => {
+                        write_http_response(&mut stream, "200 OK", "not-json");
+                    }
+                    ApprovalRevocationFault::OversizedResponse => {
+                        write_http_response(&mut stream, "200 OK", &"x".repeat(4096));
+                    }
+                    ApprovalRevocationFault::WrongTargetAck => {
+                        let mut wrong = acknowledgement.clone();
+                        wrong.target_instance_id =
+                            InstanceId::parse("00000000-0000-4000-8000-000000000999")
+                                .expect("wrong target instance");
+                        assert_ne!(
+                            wrong.target_instance_id, acknowledgement.target_instance_id,
+                            "fixture target must differ"
+                        );
+                        let body = serde_json::to_string(&wrong).expect("wrong ack serializes");
+                        write_http_response(&mut stream, "200 OK", &body);
+                    }
+                    ApprovalRevocationFault::NonSuccessResponse => write_http_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        r#"{"code":"resident_revocation_unavailable","message":"injected fault","details":null}"#,
+                    ),
+                    ApprovalRevocationFault::AlreadyRevoked => {
+                        let mut duplicate = acknowledgement.clone();
+                        duplicate.status = ResidentApprovalReceiptRevocationStatus::AlreadyRevoked;
+                        let body =
+                            serde_json::to_string(&duplicate).expect("duplicate ack serializes");
+                        write_http_response(&mut stream, "200 OK", &body);
+                    }
+                }
+            }
+        });
+        (request_count, requests, server)
+    }
+
+    async fn grant_resident_targeted_approval(
+        state: &ManagerState,
+        signer: &CallerTokenSigner,
+        resident_origin: &str,
+        instance_id: &InstanceId,
+    ) -> GovernanceApprovalRecord {
+        let (headers, security) =
+            approval_security(state, signer, vec![EndpointScope::ApprovalsManage]);
+        let mut request = approval_request_fixture(security);
+        let run_id = request.run_id.clone();
+        let work_order_id = "wo-approval-revocation-fault";
+        let node_id = NodeId::new();
+        state
+            .inner
+            .dispatch_state
+            .lock()
+            .expect("dispatch state")
+            .completed
+            .insert(
+                work_order_id.to_string(),
+                DispatchReport {
+                    work_order_id: work_order_id.to_string(),
+                    selected_node_id: node_id.clone(),
+                    selected_instance_id: instance_id.clone(),
+                    run_id: run_id.clone(),
+                    create_run_status: 201,
+                    start_run_status: 200,
+                    create_run_body: None,
+                    start_run_body: None,
+                    trace_event_id: TraceEventId::new().to_string(),
+                    resident_daemon_url: resident_origin.to_string(),
+                },
+            );
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .insert(
+                work_order_id.to_string(),
+                DispatchBinding {
+                    work_order_payload_digest: format!("blake3:{}", "1".repeat(64)),
+                    placement_decision_digest: format!("blake3:{}", "2".repeat(64)),
+                    node_id,
+                    instance_id: instance_id.clone(),
+                    resident_daemon_url: resident_origin.to_string(),
+                    resident_origin: resident_origin.to_string(),
+                },
+            );
+        let audience = local_manager_authority_receipt_config()
+            .for_resident_instance(instance_id)
+            .expect("resident receipt config")
+            .audience_for_run(&run_id);
+        request.audience = audience.clone();
+        request
+            .challenge
+            .as_mut()
+            .expect("approval challenge")
+            .receipt_audience = audience;
+        let requested = request_approval(State(state.clone()), headers, Json(request))
+            .await
+            .expect("approval requested")
+            .0;
+        let (headers, security) =
+            approval_security(state, signer, vec![EndpointScope::ApprovalsManage]);
+        grant_approval(
+            Path(requested.approval_id),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant before fault-server revocation".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("approval granted")
+        .0
+    }
+
+    fn revocation_acknowledgement(
+        granted: &GovernanceApprovalRecord,
+        instance_id: InstanceId,
+        status: ResidentApprovalReceiptRevocationStatus,
+    ) -> ResidentApprovalReceiptRevocationAck {
+        let receipt = granted
+            .authority_obligation_receipt
+            .as_ref()
+            .expect("granted receipt");
+        ResidentApprovalReceiptRevocationAck {
+            schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION.to_string(),
+            receipt_id: receipt.receipt_id.clone(),
+            approval_id: granted.approval_id.clone(),
+            target_instance_id: instance_id,
+            run_id: granted.run_id.clone(),
+            receipt_audience: receipt.audience.clone(),
+            status,
+            effect_certainty: splendor_types::EffectCertainty::Known,
+            acknowledged_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn assert_exact_revocation_request(request: &str, granted: &GovernanceApprovalRecord) {
+        let receipt = granted
+            .authority_obligation_receipt
+            .as_ref()
+            .expect("granted receipt");
+        let expected_path = format!(
+            "POST /runs/{}/approval-receipts/{}/revoke HTTP/1.1",
+            granted.run_id, receipt.receipt_id
+        );
+        assert_eq!(request.lines().next(), Some(expected_path.as_str()));
+        let body = request.split_once("\r\n\r\n").expect("HTTP request body").1;
+        let revocation: ResidentApprovalReceiptRevocationRequest =
+            serde_json::from_str(body).expect("typed revocation request");
+        assert_eq!(revocation.authority_obligation_receipt, receipt.clone());
+        assert_eq!(revocation.reason, "revoke through fault server");
+    }
+
+    fn assert_no_alternate_target_connection(listener: &std::net::TcpListener) {
+        listener
+            .set_nonblocking(true)
+            .expect("set alternate listener nonblocking");
+        let error = listener
+            .accept()
+            .expect_err("manager must not retarget revocation");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    async fn revoke_through_fault_server(
+        state: &ManagerState,
+        signer: &CallerTokenSigner,
+        approval_id: ApprovalId,
+    ) -> Result<Json<GovernanceApprovalRecord>, ManagerApiError> {
+        let (headers, security) =
+            approval_security(state, signer, vec![EndpointScope::ApprovalsManage]);
+        revoke_approval(
+            Path(approval_id),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "revoke through fault server".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
     }
 
     fn send_request(
@@ -3694,13 +6734,14 @@ mod tests {
                         "child_run_id": child_run_id,
                         "target_agent_id": target_agent,
                         "objective": "scoped task request",
-                        "delegated_authority": delegated_authority
+                        "delegated_authority": delegated_authority,
+                        "capability_grant_id": "77777777-7777-4777-8777-777777777777"
                     },
                     "causal_parent": null,
                     "requires_response": true,
                     "created_at": now_rfc3339()
                 },
-                "schema_version": "v1",
+                "schema_version": "v2",
                 "delivery_status": "pending",
                 "trace_links": {}
             },
@@ -3718,7 +6759,22 @@ mod tests {
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, T) {
+        manager_call_with_headers(app, method, uri, body, HeaderMap::new()).await
+    }
+
+    async fn manager_call_with_headers<T: serde::de::DeserializeOwned>(
+        app: Router,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        headers: HeaderMap,
+    ) -> (StatusCode, T) {
         let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            if let Some(name) = name {
+                builder = builder.header(name, value);
+            }
+        }
         let request = if let Some(body) = body {
             builder = builder.header("content-type", "application/json");
             builder
@@ -3752,6 +6808,1429 @@ mod tests {
         assert_eq!(body["component"], "splendor-manager");
     }
 
+    #[tokio::test]
+    async fn approval_endpoints_require_verified_one_use_manager_bearer_before_mutation() {
+        let no_verifier = manager_with_allowed_origins(Vec::new());
+        let missing_verifier_payload = approval_request_fixture(manager_security(
+            &no_verifier,
+            vec![EndpointScope::ApprovalsManage],
+        ));
+        let (status, error): (StatusCode, ManagerApiErrorBody) = manager_call(
+            router(no_verifier.clone()),
+            Method::POST,
+            "/approvals",
+            Some(serde_json::to_value(missing_verifier_payload).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "manager_approval_caller_verifier_unavailable");
+        assert!(no_verifier
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .is_empty());
+        assert!(no_verifier.inner.audit.lock().expect("audit").is_empty());
+
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let app = router(state.clone());
+
+        let (_unused_headers, missing_token_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let missing_token_payload = approval_request_fixture(missing_token_security);
+        let (status, _): (StatusCode, ManagerApiErrorBody) = manager_call(
+            app.clone(),
+            Method::POST,
+            "/approvals",
+            Some(serde_json::to_value(missing_token_payload).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(state.inner.approvals.lock().expect("approvals").is_empty());
+        assert!(state.inner.audit.lock().expect("audit").is_empty());
+
+        let forged_signer = CallerTokenSigner::generate_for_test(
+            signer.issuer(),
+            signer.app_principal_id(),
+            "forged-approval-client",
+            "forged-approval-key",
+        )
+        .expect("forged signer");
+        let (forged_headers, forged_security) =
+            approval_security(&state, &forged_signer, vec![EndpointScope::ApprovalsManage]);
+        let forged_payload = approval_request_fixture(forged_security);
+        let (status, _): (StatusCode, ManagerApiErrorBody) = manager_call_with_headers(
+            app.clone(),
+            Method::POST,
+            "/approvals",
+            Some(serde_json::to_value(forged_payload).expect("request JSON")),
+            forged_headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(state.inner.approvals.lock().expect("approvals").is_empty());
+        assert!(state.inner.audit.lock().expect("audit").is_empty());
+
+        let (broad_headers, broad_security) = approval_security(
+            &state,
+            &signer,
+            vec![EndpointScope::ApprovalsManage, EndpointScope::FleetRead],
+        );
+        let broad_payload = approval_request_fixture(broad_security);
+        let (status, error): (StatusCode, ManagerApiErrorBody) = manager_call_with_headers(
+            app.clone(),
+            Method::POST,
+            "/approvals",
+            Some(serde_json::to_value(broad_payload).expect("request JSON")),
+            broad_headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "approval_caller_scope_mismatch");
+        assert!(state.inner.approvals.lock().expect("approvals").is_empty());
+        assert!(state.inner.audit.lock().expect("audit").is_empty());
+
+        let (mismatch_headers, mismatch_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut mismatch_payload = approval_request_fixture(mismatch_security);
+        mismatch_payload.security.credential.credential_id = format!("sha256:{}", "0".repeat(64));
+        mismatch_payload.security.audit_attribution.credential_id =
+            Some(mismatch_payload.security.credential.credential_id.clone());
+        let (status, error): (StatusCode, ManagerApiErrorBody) = manager_call_with_headers(
+            app.clone(),
+            Method::POST,
+            "/approvals",
+            Some(serde_json::to_value(mismatch_payload).expect("request JSON")),
+            mismatch_headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "caller_credential_mirror_mismatch");
+        assert!(state.inner.approvals.lock().expect("approvals").is_empty());
+        assert!(state.inner.audit.lock().expect("audit").is_empty());
+
+        let (request_headers, request_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let request_payload =
+            serde_json::to_value(approval_request_fixture(request_security)).expect("request JSON");
+        let (status, requested): (StatusCode, GovernanceApprovalRecord) =
+            manager_call_with_headers(
+                app.clone(),
+                Method::POST,
+                "/approvals",
+                Some(request_payload.clone()),
+                request_headers.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(requested.status, "requested");
+        assert_eq!(requested.issued_by, requested.requested_by);
+        assert!(requested.decided_by.is_none());
+        assert_eq!(state.inner.approvals.lock().expect("approvals").len(), 1);
+        assert_eq!(state.inner.audit.lock().expect("audit").len(), 1);
+
+        let (status, replay_error): (StatusCode, ManagerApiErrorBody) = manager_call_with_headers(
+            app.clone(),
+            Method::POST,
+            "/approvals",
+            Some(request_payload),
+            request_headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(replay_error.code, "manager_caller_token_replayed");
+        assert_eq!(state.inner.approvals.lock().expect("approvals").len(), 1);
+        assert_eq!(state.inner.audit.lock().expect("audit").len(), 1);
+
+        let (grant_headers, grant_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let grant_payload = serde_json::to_value(ApprovalDecisionRequest {
+            security: grant_security,
+            reason: "approved through verified manager caller".to_string(),
+            expires_at: None,
+        })
+        .expect("grant JSON");
+        let grant_path = format!("/approvals/{}/grant", requested.approval_id);
+        let (status, granted): (StatusCode, GovernanceApprovalRecord) = manager_call_with_headers(
+            app.clone(),
+            Method::POST,
+            &grant_path,
+            Some(grant_payload.clone()),
+            grant_headers.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(granted.status, "granted");
+        assert!(granted.authority_obligation_receipt.is_some());
+        assert_eq!(granted.requested_by, requested.requested_by);
+        assert!(granted.decided_by.is_some());
+        assert_eq!(state.inner.audit.lock().expect("audit").len(), 2);
+        for event in state.inner.audit.lock().expect("audit").iter() {
+            let rendered = serde_json::to_string(&event.details).expect("audit details JSON");
+            assert!(rendered.contains("credential_correlation"));
+            assert!(!rendered.contains("Bearer "));
+            assert!(!rendered.contains("\"jti\""));
+        }
+        let receipt = granted.authority_obligation_receipt.clone();
+
+        let (status, replay_error): (StatusCode, ManagerApiErrorBody) = manager_call_with_headers(
+            app,
+            Method::POST,
+            &grant_path,
+            Some(grant_payload),
+            grant_headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(replay_error.code, "manager_caller_token_replayed");
+        assert_eq!(state.inner.audit.lock().expect("audit").len(), 2);
+        let stored = state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get(&requested.approval_id.to_string())
+            .cloned()
+            .expect("stored approval");
+        assert_eq!(stored.status, "granted");
+        assert_eq!(stored.authority_obligation_receipt, receipt);
+    }
+
+    #[tokio::test]
+    async fn approval_request_risk_is_optional_and_must_match_challenge_exactly() {
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut payload = approval_request_fixture(security);
+        payload.risk_level = None;
+        payload.challenge.as_mut().expect("challenge").risk_level = None;
+
+        let requested = request_approval(State(state), headers, Json(payload))
+            .await
+            .expect("risk-less approval request")
+            .0;
+        assert_eq!(requested.risk_level, None);
+        assert_eq!(requested.challenge.expect("challenge").risk_level, None);
+    }
+
+    #[test]
+    fn manager_approval_auth_helpers_reject_malformed_bearers_and_map_all_failures() {
+        let mut missing = HeaderMap::new();
+        assert_eq!(
+            manager_bearer_token(&missing)
+                .expect_err("missing bearer")
+                .body
+                .code,
+            "missing_manager_caller_token"
+        );
+        missing.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        missing.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert_eq!(
+            manager_bearer_token(&missing)
+                .expect_err("duplicate bearer")
+                .body
+                .code,
+            "invalid_manager_caller_token"
+        );
+        for raw in ["Basic token", "Bearer", "Bearer token with-space"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(raw).expect("header"),
+            );
+            assert_eq!(
+                manager_bearer_token(&headers)
+                    .expect_err("malformed bearer")
+                    .body
+                    .code,
+                "invalid_manager_caller_token"
+            );
+        }
+
+        for (error, expected) in [
+            (
+                CallerAuthError::MissingToken,
+                "missing_manager_caller_token",
+            ),
+            (
+                CallerAuthError::MalformedToken,
+                "invalid_manager_caller_token",
+            ),
+            (
+                CallerAuthError::UnsupportedProfile,
+                "unsupported_manager_caller_token_profile",
+            ),
+            (
+                CallerAuthError::UntrustedKey,
+                "untrusted_manager_caller_token_key",
+            ),
+            (
+                CallerAuthError::InvalidSignature,
+                "invalid_manager_caller_token_signature",
+            ),
+            (
+                CallerAuthError::WrongIssuer,
+                "wrong_manager_caller_token_issuer",
+            ),
+            (
+                CallerAuthError::WrongAudience,
+                "wrong_manager_caller_token_audience",
+            ),
+            (
+                CallerAuthError::WrongSubject,
+                "wrong_manager_caller_token_subject",
+            ),
+            (
+                CallerAuthError::InvalidLifetime,
+                "invalid_manager_caller_token_lifetime",
+            ),
+            (
+                CallerAuthError::InvalidScope,
+                "invalid_manager_caller_token_scope",
+            ),
+            (
+                CallerAuthError::InvalidTenant,
+                "invalid_manager_caller_token_binding",
+            ),
+            (
+                CallerAuthError::InvalidFleet,
+                "invalid_manager_caller_token_binding",
+            ),
+            (
+                CallerAuthError::InvalidBinding,
+                "invalid_manager_caller_token_binding",
+            ),
+            (
+                CallerAuthError::RevokedToken,
+                "revoked_manager_caller_token",
+            ),
+            (
+                CallerAuthError::ReplayedToken,
+                "manager_caller_token_replayed",
+            ),
+            (
+                CallerAuthError::InvalidTrustSnapshot,
+                "manager_caller_auth_unavailable",
+            ),
+            (
+                CallerAuthError::ClockRollback,
+                "manager_caller_auth_unavailable",
+            ),
+            (
+                CallerAuthError::InvalidSigner,
+                "manager_caller_auth_unavailable",
+            ),
+            (CallerAuthError::KeyLoad, "manager_caller_auth_unavailable"),
+        ] {
+            assert_eq!(manager_caller_auth_error(error).body.code, expected);
+        }
+
+        let mut audit = audit_for(&credential(
+            FleetId::new(),
+            vec![EndpointScope::ApprovalsManage],
+        ));
+        audit.credential_id = Some("raw-credential-id".to_string());
+        assert!(safe_approval_actor(&audit)["credential_correlation"].is_null());
+
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let (headers, mut security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        security.audit_attribution.principal.client_principal_id = "different-client".to_string();
+        assert_eq!(
+            state
+                .verify_approval_caller(&headers, &security)
+                .expect_err("audit mirror mismatch")
+                .body
+                .code,
+            "caller_audit_mirror_mismatch"
+        );
+    }
+
+    #[test]
+    fn approval_receipt_revocation_errors_expose_structured_effect_certainty() {
+        for (error, outcome, certainty) in [
+            (approval_receipt_revocation_too_late(), "too_late", "known"),
+            (
+                approval_receipt_revocation_transport_failed(
+                    "resident revocation was not delivered",
+                ),
+                "transport_failed",
+                "known",
+            ),
+            (
+                approval_receipt_revocation_effect_unknown(
+                    "resident revocation may have been applied",
+                ),
+                "effect_unknown",
+                "unknown",
+            ),
+        ] {
+            let details = error.body.details.expect("structured outcome details");
+            assert_eq!(details["outcome"], outcome);
+            assert_eq!(details["effect_certainty"], certainty);
+            assert_ne!(error.status, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_revocation_handler_faults_remain_granted_and_effect_unknown_without_retarget()
+    {
+        for (case, fault) in [
+            (
+                "execute_then_reset",
+                ApprovalRevocationFault::ExecuteThenReset,
+            ),
+            (
+                "post_send_timeout",
+                ApprovalRevocationFault::PostSendTimeout,
+            ),
+            (
+                "malformed_response",
+                ApprovalRevocationFault::MalformedResponse,
+            ),
+            (
+                "oversized_response",
+                ApprovalRevocationFault::OversizedResponse,
+            ),
+            ("wrong_target_ack", ApprovalRevocationFault::WrongTargetAck),
+            (
+                "non_success_response",
+                ApprovalRevocationFault::NonSuccessResponse,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fault resident");
+            let resident_origin = format!(
+                "http://{}",
+                listener.local_addr().expect("fault resident address")
+            );
+            let alternate_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind alternate resident");
+            let alternate_origin = format!(
+                "http://{}",
+                alternate_listener
+                    .local_addr()
+                    .expect("alternate resident address")
+            );
+            let mut options = ResidentDispatchOptions::loopback_test();
+            options.start_timeout = StdDuration::from_millis(75);
+            options.maximum_response_bytes = 2048;
+            options.allowed_origins = vec![resident_origin.clone(), alternate_origin];
+            let (state, signer) = manager_with_approval_auth_options(options);
+            let instance_id = InstanceId::parse("00000000-0000-4000-8000-000000000101")
+                .expect("fault target instance");
+            let granted =
+                grant_resident_targeted_approval(&state, &signer, &resident_origin, &instance_id)
+                    .await;
+            let acknowledgement = revocation_acknowledgement(
+                &granted,
+                instance_id,
+                ResidentApprovalReceiptRevocationStatus::Revoked,
+            );
+            let (request_count, requests, server) =
+                spawn_approval_revocation_fault_server(listener, vec![fault], acknowledgement);
+            let audit_count = state.inner.audit.lock().expect("audit").len();
+            let error =
+                match revoke_through_fault_server(&state, &signer, granted.approval_id.clone())
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("fault reported revocation success: {case}"),
+                };
+
+            assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT, "case={case}");
+            assert_eq!(
+                error.body.code, "approval_receipt_revocation_effect_unknown",
+                "case={case}"
+            );
+            let details = error.body.details.expect("structured uncertainty");
+            assert_eq!(details["outcome"], "effect_unknown", "case={case}");
+            assert_eq!(details["effect_certainty"], "unknown", "case={case}");
+            assert!(details["revocation_applied"].is_null(), "case={case}");
+            server.join().expect("fault server");
+            assert_eq!(request_count.load(Ordering::SeqCst), 1, "case={case}");
+            let requests = requests.lock().expect("fault requests");
+            assert_eq!(requests.len(), 1, "case={case}");
+            assert_exact_revocation_request(&requests[0], &granted);
+            drop(requests);
+
+            let retained = state
+                .inner
+                .approvals
+                .lock()
+                .expect("approvals")
+                .get(&granted.approval_id.to_string())
+                .cloned()
+                .expect("retained approval");
+            assert_eq!(retained.status, "granted", "case={case}");
+            assert!(
+                retained.resident_receipt_revocation_ack.is_none(),
+                "case={case}"
+            );
+            let audit = state.inner.audit.lock().expect("audit");
+            assert_eq!(audit.len(), audit_count, "case={case}");
+            assert!(
+                !audit
+                    .iter()
+                    .any(|event| event.event_type == "approval.revoked"),
+                "case={case}"
+            );
+            drop(audit);
+            assert_no_alternate_target_connection(&alternate_listener);
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_revocation_handler_same_target_retry_converges_via_already_revoked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind retry resident");
+        let resident_origin = format!(
+            "http://{}",
+            listener.local_addr().expect("retry resident address")
+        );
+        let alternate_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind alternate resident");
+        let alternate_origin = format!(
+            "http://{}",
+            alternate_listener
+                .local_addr()
+                .expect("alternate resident address")
+        );
+        let mut options = ResidentDispatchOptions::loopback_test();
+        options.start_timeout = StdDuration::from_millis(75);
+        options.maximum_response_bytes = 2048;
+        options.allowed_origins = vec![resident_origin.clone(), alternate_origin];
+        let (state, signer) = manager_with_approval_auth_options(options);
+        let instance_id = InstanceId::parse("00000000-0000-4000-8000-000000000102")
+            .expect("retry target instance");
+        let granted =
+            grant_resident_targeted_approval(&state, &signer, &resident_origin, &instance_id).await;
+        let acknowledgement = revocation_acknowledgement(
+            &granted,
+            instance_id,
+            ResidentApprovalReceiptRevocationStatus::Revoked,
+        );
+        let (request_count, requests, server) = spawn_approval_revocation_fault_server(
+            listener,
+            vec![
+                ApprovalRevocationFault::ExecuteThenReset,
+                ApprovalRevocationFault::AlreadyRevoked,
+            ],
+            acknowledgement,
+        );
+        let audit_count = state.inner.audit.lock().expect("audit").len();
+        let uncertain = revoke_through_fault_server(&state, &signer, granted.approval_id.clone())
+            .await
+            .expect_err("truncated first acknowledgement is uncertain");
+        assert_eq!(
+            uncertain.body.code,
+            "approval_receipt_revocation_effect_unknown"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .inner
+                .approvals
+                .lock()
+                .expect("approvals")
+                .get(&granted.approval_id.to_string())
+                .expect("approval")
+                .status,
+            "granted"
+        );
+        assert_eq!(state.inner.audit.lock().expect("audit").len(), audit_count);
+
+        let retried = revoke_through_fault_server(&state, &signer, granted.approval_id.clone())
+            .await
+            .expect("explicit same-target retry observes already_revoked")
+            .0;
+        server.join().expect("retry fault server");
+        assert_eq!(retried.status, "revoked");
+        assert_eq!(
+            retried
+                .resident_receipt_revocation_ack
+                .as_ref()
+                .map(|ack| ack.status),
+            Some(ResidentApprovalReceiptRevocationStatus::AlreadyRevoked)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let requests = requests.lock().expect("retry requests");
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_exact_revocation_request(request, &granted);
+        }
+        let authorization = requests
+            .iter()
+            .map(|request| {
+                request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .expect("outbound authorization header")
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            authorization[0], authorization[1],
+            "explicit retry must use a fresh exact-target JTI"
+        );
+        drop(requests);
+        let audit = state.inner.audit.lock().expect("audit");
+        assert_eq!(audit.len(), audit_count + 1);
+        assert_eq!(
+            audit.last().expect("revocation audit").event_type,
+            "approval.revoked"
+        );
+        drop(audit);
+        assert_no_alternate_target_connection(&alternate_listener);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_revocation_retry_converges_after_audit_failure_without_partial_state() {
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let (request_headers, request_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let requested = request_approval(
+            State(state.clone()),
+            request_headers,
+            Json(approval_request_fixture(request_security)),
+        )
+        .await
+        .expect("approval requested")
+        .0;
+        let (grant_headers, grant_security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let granted = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            grant_headers,
+            Json(ApprovalDecisionRequest {
+                security: grant_security.clone(),
+                reason: "grant before revocation".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("approval granted")
+        .0;
+        let receipt = granted
+            .authority_obligation_receipt
+            .clone()
+            .expect("granted receipt");
+        let target = ApprovalResidentTarget {
+            instance_id: InstanceId::new(),
+            run_id: granted.run_id.clone(),
+            resident_daemon_url: "http://127.0.0.1:1".to_string(),
+            resident_origin: "http://127.0.0.1:1".to_string(),
+        };
+        let completion = AcknowledgedApprovalRevocation {
+            approval_id: granted.approval_id.clone(),
+            record: granted.clone(),
+            receipt: receipt.clone(),
+            acknowledgement: ResidentApprovalReceiptRevocationAck {
+                schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION.to_string(),
+                receipt_id: receipt.receipt_id,
+                approval_id: granted.approval_id.clone(),
+                target_instance_id: target.instance_id.clone(),
+                run_id: target.run_id.clone(),
+                receipt_audience: receipt.audience,
+                status: ResidentApprovalReceiptRevocationStatus::AlreadyRevoked,
+                effect_certainty: splendor_types::EffectCertainty::Known,
+                acknowledged_at: OffsetDateTime::now_utc(),
+            },
+            target,
+            reason: "retry exact resident revocation".to_string(),
+            decided_by: grant_security.audit_attribution,
+        };
+
+        let error = complete_acknowledged_approval_revocation_with_audit(
+            &state,
+            &completion,
+            |_event, _details| {
+                Err(ManagerApiError::internal(
+                    "audit_lock",
+                    "injected audit failure",
+                ))
+            },
+        )
+        .expect_err("audit failure leaves manager state uncommitted");
+        assert_eq!(error.body.code, "audit_lock");
+        assert_eq!(
+            state
+                .inner
+                .approvals
+                .lock()
+                .expect("approvals")
+                .get(&completion.approval_id.to_string())
+                .expect("approval")
+                .status,
+            "granted"
+        );
+
+        let removed = state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .remove(&completion.approval_id.to_string())
+            .expect("approval before disappearance injection");
+        let disappeared = complete_acknowledged_approval_revocation_with_audit(
+            &state,
+            &completion,
+            |_event, _details| Ok("must-not-audit-disappeared-state".to_string()),
+        )
+        .expect_err("resident acknowledgement cannot recreate missing manager state");
+        assert_eq!(disappeared.body.code, "approval_state_unavailable");
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .insert(completion.approval_id.to_string(), removed);
+
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&completion.approval_id.to_string())
+            .expect("approval")
+            .status = "denied".to_string();
+        let raced = complete_acknowledged_approval_revocation_with_audit(
+            &state,
+            &completion,
+            |_event, _details| Ok("must-not-audit-raced-state".to_string()),
+        )
+        .expect_err("concurrent terminal mutation wins over stale acknowledgement");
+        assert_eq!(raced.body.code, "approval_state_conflict");
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&completion.approval_id.to_string())
+            .expect("approval")
+            .status = "granted".to_string();
+
+        let retried = complete_acknowledged_approval_revocation_with_audit(
+            &state,
+            &completion,
+            |_event, _details| Ok("audit-retry-success".to_string()),
+        )
+        .expect("same acknowledged completion retry converges");
+        assert_eq!(retried.status, "revoked");
+        assert_eq!(retried.trace_event_id, "audit-retry-success");
+        assert_eq!(
+            retried
+                .resident_receipt_revocation_ack
+                .as_ref()
+                .map(|ack| ack.status),
+            Some(ResidentApprovalReceiptRevocationStatus::AlreadyRevoked)
+        );
+        assert_eq!(
+            state
+                .inner
+                .approvals
+                .lock()
+                .expect("approvals")
+                .get(&completion.approval_id.to_string())
+                .expect("approval")
+                .status,
+            "revoked"
+        );
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let exact_retry = revoke_approval(
+            Path(completion.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: completion.reason.clone(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("exact acknowledged revocation retry is idempotent")
+        .0;
+        assert_eq!(exact_retry.trace_event_id, "audit-retry-success");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let conflict = revoke_approval(
+            Path(completion.approval_id.clone()),
+            State(state),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "changed revocation coordinates".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("acknowledged revocation coordinates are immutable");
+        assert_eq!(conflict.body.code, "approval_decision_conflict");
+    }
+
+    #[tokio::test]
+    async fn requested_approval_revocation_is_terminal_without_resident_egress() {
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let requested = request_approval(
+            State(state.clone()),
+            headers,
+            Json(approval_request_fixture(security)),
+        )
+        .await
+        .expect("approval requested")
+        .0;
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let revoked = revoke_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "withdraw before grant".to_string(),
+                expires_at: Some(requested.expires_at - Duration::seconds(1)),
+            }),
+        )
+        .await
+        .expect("ungranted request revokes locally")
+        .0;
+
+        assert_eq!(revoked.status, "revoked");
+        assert!(revoked
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.revoked));
+        assert!(revoked.authority_obligation_receipt.is_none());
+        assert!(revoked.resident_receipt_revocation_ack.is_none());
+        assert!(state
+            .inner
+            .approval_resident_targets
+            .lock()
+            .expect("targets")
+            .is_empty());
+        assert_eq!(
+            state
+                .inner
+                .audit
+                .lock()
+                .expect("audit")
+                .last()
+                .expect("revocation audit")
+                .details["resident_receipt_revocation_required"],
+            false
+        );
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let conflict = revoke_approval(
+            Path(requested.approval_id),
+            State(state),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "withdraw before grant".to_string(),
+                expires_at: Some(revoked.expires_at),
+            }),
+        )
+        .await
+        .expect_err("local pre-grant revocation has no resident acknowledgement to replay");
+        assert_eq!(conflict.body.code, "approval_decision_conflict");
+    }
+
+    #[tokio::test]
+    async fn granted_revocation_rejects_changed_or_missing_immutable_resident_coordinates() {
+        let resident_origin = "http://127.0.0.1:1";
+        let (state, signer) = manager_with_approval_auth(vec![resident_origin.to_string()]);
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let requested = request_approval(
+            State(state.clone()),
+            headers,
+            Json(approval_request_fixture(security)),
+        )
+        .await
+        .expect("approval requested")
+        .0;
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let granted = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant before immutable target checks".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect("approval granted")
+        .0;
+
+        async fn attempt(
+            state: &ManagerState,
+            signer: &CallerTokenSigner,
+            approval_id: ApprovalId,
+            expires_at: Option<OffsetDateTime>,
+        ) -> ManagerApiError {
+            let (headers, security) =
+                approval_security(state, signer, vec![EndpointScope::ApprovalsManage]);
+            revoke_approval(
+                Path(approval_id),
+                State(state.clone()),
+                headers,
+                Json(ApprovalDecisionRequest {
+                    security,
+                    reason: "revoke exact grant".to_string(),
+                    expires_at,
+                }),
+            )
+            .await
+            .expect_err("revocation attempt must fail closed")
+        }
+
+        let changed_expiry = attempt(
+            &state,
+            &signer,
+            granted.approval_id.clone(),
+            Some(granted.expires_at + Duration::seconds(1)),
+        )
+        .await;
+        assert_eq!(
+            changed_expiry.body.code,
+            "approval_challenge_expiry_mismatch"
+        );
+
+        let retained_receipt = {
+            let mut approvals = state.inner.approvals.lock().expect("approvals");
+            approvals
+                .get_mut(&granted.approval_id.to_string())
+                .expect("approval")
+                .authority_obligation_receipt
+                .take()
+                .expect("retained receipt")
+        };
+        let missing_receipt = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(
+            missing_receipt.body.code,
+            "approval_obligation_receipt_unavailable"
+        );
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&granted.approval_id.to_string())
+            .expect("approval")
+            .authority_obligation_receipt = Some(retained_receipt);
+
+        let missing_target = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(
+            missing_target.body.code,
+            "approval_resident_target_unavailable"
+        );
+
+        let target = ApprovalResidentTarget {
+            instance_id: InstanceId::new(),
+            run_id: RunId::new(),
+            resident_daemon_url: resident_origin.to_string(),
+            resident_origin: resident_origin.to_string(),
+        };
+        state
+            .inner
+            .approval_resident_targets
+            .lock()
+            .expect("targets")
+            .insert(granted.approval_id.to_string(), target.clone());
+        let wrong_run = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(wrong_run.body.code, "approval_resident_target_mismatch");
+
+        {
+            let mut targets = state
+                .inner
+                .approval_resident_targets
+                .lock()
+                .expect("targets");
+            let target = targets
+                .get_mut(&granted.approval_id.to_string())
+                .expect("target");
+            target.run_id = granted.run_id.clone();
+            target.resident_daemon_url = "https://resident-not-allowlisted.invalid".to_string();
+            target.resident_origin = "https://resident-not-allowlisted.invalid".to_string();
+        }
+        let invalid_origin = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(
+            invalid_origin.body.code,
+            "approval_receipt_revocation_transport_failed"
+        );
+
+        {
+            let mut targets = state
+                .inner
+                .approval_resident_targets
+                .lock()
+                .expect("targets");
+            let target = targets
+                .get_mut(&granted.approval_id.to_string())
+                .expect("target");
+            target.resident_daemon_url = resident_origin.to_string();
+            target.resident_origin = "http://127.0.0.1:2".to_string();
+        }
+        let changed_origin = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(
+            changed_origin.body.code,
+            "approval_receipt_revocation_transport_failed"
+        );
+
+        state
+            .inner
+            .approval_resident_targets
+            .lock()
+            .expect("targets")
+            .get_mut(&granted.approval_id.to_string())
+            .expect("target")
+            .resident_origin = resident_origin.to_string();
+        let transport_failure = attempt(&state, &signer, granted.approval_id.clone(), None).await;
+        assert_eq!(
+            transport_failure.body.code,
+            "approval_receipt_revocation_transport_failed"
+        );
+        assert_eq!(
+            state
+                .inner
+                .approvals
+                .lock()
+                .expect("approvals")
+                .get(&granted.approval_id.to_string())
+                .expect("approval")
+                .status,
+            "granted"
+        );
+    }
+
+    #[test]
+    fn resident_approval_target_resolution_rejects_ambiguous_or_mutated_dispatch_state() {
+        let state = manager_with_allowed_origins(vec!["http://127.0.0.1:1".to_string()]);
+        let run_id = RunId::new();
+        let instance_id = InstanceId::new();
+        let node_id = NodeId::new();
+        let report = |work_order_id: &str| DispatchReport {
+            work_order_id: work_order_id.to_string(),
+            selected_node_id: node_id.clone(),
+            selected_instance_id: instance_id.clone(),
+            run_id: run_id.clone(),
+            create_run_status: 201,
+            start_run_status: 200,
+            create_run_body: None,
+            start_run_body: None,
+            trace_event_id: TraceEventId::new().to_string(),
+            resident_daemon_url: "http://127.0.0.1:1".to_string(),
+        };
+        {
+            let mut dispatch = state.inner.dispatch_state.lock().expect("dispatch state");
+            dispatch
+                .completed
+                .insert("wo-target-a".to_string(), report("wo-target-a"));
+            dispatch
+                .completed
+                .insert("wo-target-b".to_string(), report("wo-target-b"));
+        }
+        let ambiguous = approval_resident_target_for_run(&state, &run_id)
+            .expect_err("multiple completed targets are ambiguous");
+        assert_eq!(ambiguous.body.code, "approval_resident_target_ambiguous");
+
+        state
+            .inner
+            .dispatch_state
+            .lock()
+            .expect("dispatch state")
+            .completed
+            .remove("wo-target-b");
+        let missing = approval_resident_target_for_run(&state, &run_id)
+            .expect_err("completed dispatch requires its immutable binding");
+        assert_eq!(missing.body.code, "approval_resident_target_unavailable");
+
+        let mut binding = DispatchBinding {
+            work_order_payload_digest: format!("blake3:{}", "1".repeat(64)),
+            placement_decision_digest: format!("blake3:{}", "2".repeat(64)),
+            node_id,
+            instance_id: InstanceId::new(),
+            resident_daemon_url: "http://127.0.0.1:1".to_string(),
+            resident_origin: "http://127.0.0.1:1".to_string(),
+        };
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("bindings")
+            .insert("wo-target-a".to_string(), binding.clone());
+        let mismatch = approval_resident_target_for_run(&state, &run_id)
+            .expect_err("dispatch report cannot substitute a different instance");
+        assert_eq!(mismatch.body.code, "approval_resident_target_mismatch");
+
+        binding.instance_id = instance_id.clone();
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("bindings")
+            .insert("wo-target-a".to_string(), binding);
+        let exact = approval_resident_target_for_run(&state, &run_id)
+            .expect("exact dispatch target")
+            .expect("resident target");
+        assert_eq!(exact.instance_id, instance_id);
+        assert_eq!(exact.run_id, run_id);
+
+        let nil_instance = InstanceId::parse("00000000-0000-0000-0000-000000000000")
+            .expect("nil instance parses for validation");
+        let invalid_target = ApprovalResidentTarget {
+            instance_id: nil_instance,
+            run_id: RunId::new(),
+            resident_daemon_url: "http://127.0.0.1:1".to_string(),
+            resident_origin: "http://127.0.0.1:1".to_string(),
+        };
+        let error = receipt_config_for_approval_target(
+            state
+                .inner
+                .authority_obligation_receipt_config
+                .as_ref()
+                .expect("receipt config"),
+            Some(&invalid_target),
+        )
+        .expect_err("nil immutable instance identity fails closed");
+        assert_eq!(
+            error.body.code,
+            "obligation_receipt_resident_instance_invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_state_machine_fail_closed_branches_are_explicit() {
+        let (state, signer) = manager_with_approval_auth(Vec::new());
+        let no_receipt_state = ManagerState::acceptance_with_dispatch_config_internal(
+            state.inner.manager_id.clone(),
+            state.inner.fleet_id.clone(),
+            state.inner.work_order_keyring.clone(),
+            state.inner.resident_dispatch.signer.clone(),
+            ResidentDispatchOptions::loopback_test(),
+            None,
+            state.inner.approval_caller_verifier.clone(),
+        )
+        .expect("approval-authenticated manager without receipt config");
+
+        let (headers, security) = approval_security(
+            &no_receipt_state,
+            &signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let error = request_approval(
+            State(no_receipt_state.clone()),
+            headers,
+            Json(approval_request_fixture(security)),
+        )
+        .await
+        .expect_err("receipt configuration required before approval request");
+        assert_eq!(
+            error.body.code,
+            "authority_obligation_receipt_config_unavailable"
+        );
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut missing_challenge = approval_request_fixture(security);
+        missing_challenge.challenge = None;
+        let error = request_approval(State(state.clone()), headers, Json(missing_challenge))
+            .await
+            .expect_err("challenge required");
+        assert_eq!(error.body.code, "approval_challenge_required");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut mismatch = approval_request_fixture(security);
+        mismatch.risk_level = None;
+        let error = request_approval(State(state.clone()), headers, Json(mismatch))
+            .await
+            .expect_err("risk mismatch rejected");
+        assert_eq!(error.body.code, "approval_challenge_mismatch");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut expired = approval_request_fixture(security);
+        let expired_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        expired.expires_at = expired_at;
+        expired.challenge.as_mut().expect("challenge").expires_at = expired_at;
+        let error = request_approval(State(state.clone()), headers, Json(expired))
+            .await
+            .expect_err("expired challenge rejected");
+        assert_eq!(error.body.code, "approval_challenge_expired_or_future");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let payload = approval_request_fixture(security);
+        let requested = request_approval(State(state.clone()), headers, Json(payload.clone()))
+            .await
+            .expect("valid request")
+            .0;
+
+        no_receipt_state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .insert(requested.approval_id.to_string(), requested.clone());
+        let (headers, security) = approval_security(
+            &no_receipt_state,
+            &signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let error = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(no_receipt_state),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("receipt configuration required before approval grant");
+        assert_eq!(
+            error.body.code,
+            "authority_obligation_receipt_config_unavailable"
+        );
+
+        {
+            let mut approvals = state.inner.approvals.lock().expect("approvals");
+            approvals
+                .get_mut(&requested.approval_id.to_string())
+                .expect("record")
+                .status = "denied".to_string();
+        }
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let mut terminal_retry = payload.clone();
+        terminal_retry.security = security;
+        let error = request_approval(State(state.clone()), headers, Json(terminal_retry))
+            .await
+            .expect_err("terminal request immutable");
+        assert_eq!(error.body.code, "approval_terminal_conflict");
+
+        {
+            let mut approvals = state.inner.approvals.lock().expect("approvals");
+            let record = approvals
+                .get_mut(&requested.approval_id.to_string())
+                .expect("record");
+            record.status = "requested".to_string();
+            record.challenge = None;
+        }
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("challenge-less record rejected");
+        assert_eq!(error.body.code, "approval_challenge_required");
+
+        {
+            let mut approvals = state.inner.approvals.lock().expect("approvals");
+            let record = approvals
+                .get_mut(&requested.approval_id.to_string())
+                .expect("record");
+            record.challenge = requested.challenge.clone();
+            record.status = "paused".to_string();
+        }
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("non-grantable state rejected");
+        assert_eq!(error.body.code, "approval_state_conflict");
+
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&requested.approval_id.to_string())
+            .expect("record")
+            .status = "requested".to_string();
+        {
+            let mut approvals = state.inner.approvals.lock().expect("approvals");
+            approvals
+                .get_mut(&requested.approval_id.to_string())
+                .expect("record")
+                .challenge
+                .as_mut()
+                .expect("challenge")
+                .expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        }
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("expired stored challenge rejected");
+        assert_eq!(error.body.code, "approval_challenge_expired_or_future");
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&requested.approval_id.to_string())
+            .expect("record")
+            .challenge = requested.challenge.clone();
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = grant_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "grant".to_string(),
+                expires_at: Some(requested.expires_at + Duration::seconds(1)),
+            }),
+        )
+        .await
+        .expect_err("changed expiry rejected");
+        assert_eq!(error.body.code, "approval_challenge_expiry_mismatch");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let decision = ApprovalDecisionRequest {
+            security,
+            reason: "deny exact".to_string(),
+            expires_at: None,
+        };
+        let denied = deny_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(decision.clone()),
+        )
+        .await
+        .expect("denial")
+        .0;
+        assert_eq!(denied.status, "denied");
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let repeated = deny_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                ..decision.clone()
+            }),
+        )
+        .await
+        .expect("exact denial retry")
+        .0;
+        assert_eq!(repeated.trace_event_id, denied.trace_event_id);
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = deny_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "changed denial".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("changed denial conflicts");
+        assert_eq!(error.body.code, "approval_decision_conflict");
+
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&requested.approval_id.to_string())
+            .expect("record")
+            .status = "paused".to_string();
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = deny_approval(
+            Path(requested.approval_id.clone()),
+            State(state.clone()),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "deny paused".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("unknown approval state fails closed");
+        assert_eq!(error.body.code, "approval_state_conflict");
+        state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get_mut(&requested.approval_id.to_string())
+            .expect("record")
+            .status = "denied".to_string();
+
+        let (headers, security) =
+            approval_security(&state, &signer, vec![EndpointScope::ApprovalsManage]);
+        let error = revoke_approval(
+            Path(requested.approval_id),
+            State(state),
+            headers,
+            Json(ApprovalDecisionRequest {
+                security,
+                reason: "revoke denied".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("denied approval remains terminal");
+        assert_eq!(error.body.code, "approval_terminal_conflict");
+    }
+
     #[test]
     fn manager_read_endpoints_require_scope_audience_binding_expiry_and_revocation() {
         let state = ManagerState::local_acceptance();
@@ -3776,7 +8255,13 @@ mod tests {
         let error = state
             .validate_security(&missing_scope, None, EndpointScope::FleetRead, false)
             .expect_err("missing scope rejected");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.status,
+            StatusCode::FORBIDDEN,
+            "unexpected rejection: {} {}",
+            error.body.code,
+            error.body.message
+        );
         assert_eq!(error.body.code, "missing_scope");
 
         let mut wrong_audience = valid.clone();
@@ -3870,6 +8355,29 @@ mod tests {
         .expect_err("heartbeat requires heartbeat scope");
         assert_eq!(heartbeat_error.body.code, "missing_scope");
 
+        let instance_heartbeat_error = heartbeat_instance(
+            Path(InstanceId::parse("00000000-0000-4000-8000-000000000604").expect("instance")),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: missing_scope.clone(),
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id.clone(),
+                    instance_id: InstanceId::parse("00000000-0000-4000-8000-000000000604")
+                        .expect("instance"),
+                    health: instance(
+                        "00000000-0000-4000-8000-000000000504",
+                        "00000000-0000-4000-8000-000000000604",
+                        &tenant_id,
+                    )
+                    .health,
+                    recorded_at: OffsetDateTime::now_utc(),
+                },
+            }),
+        )
+        .await
+        .expect_err("instance heartbeat requires instance heartbeat scope");
+        assert_eq!(instance_heartbeat_error.body.code, "missing_scope");
+
         let advertise_error = advertise_capabilities(
             Path(node.node_id.clone()),
             State(state.clone()),
@@ -3881,6 +8389,137 @@ mod tests {
         .await
         .expect_err("capability advertisement requires node scope");
         assert_eq!(advertise_error.body.code, "missing_scope");
+    }
+
+    #[tokio::test]
+    async fn authenticated_instance_heartbeat_refreshes_stale_instance_without_static_mutation() {
+        let state = ManagerState::local_acceptance();
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000714",
+            "http://127.0.0.1:1",
+            "resident_cloud_pool",
+            "cloud",
+            vec!["runtime.resident"],
+        );
+        let instance_id =
+            InstanceId::parse("00000000-0000-4000-8000-000000000715").expect("instance");
+        let registration_security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+            ],
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: registration_security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("node registered");
+        let mut registration = instance(
+            &node.node_id.to_string(),
+            &instance_id.to_string(),
+            &tenant_id,
+        );
+        registration.health.observed_at = OffsetDateTime::now_utc() - Duration::seconds(61);
+        registration.registered_at = registration.health.observed_at;
+        state
+            .inner
+            .registry
+            .register_instance_received_at(
+                registration.clone(),
+                OffsetDateTime::now_utc() - Duration::seconds(61),
+            )
+            .expect("stale instance registered at manager-observed time");
+
+        let placement = PlacementRequest::new(PlacementTarget::ResidentCloudPool);
+        let stale = state
+            .inner
+            .registry
+            .instance(&instance_id)
+            .expect("stale instance record");
+        assert!(!instance_is_eligible(
+            &stale,
+            &node.runtime_version,
+            &tenant_id,
+            &placement,
+            OffsetDateTime::now_utc(),
+        ));
+
+        let heartbeat_security = manager_security(&state, vec![EndpointScope::InstancesHeartbeat]);
+        let received_before = OffsetDateTime::now_utc();
+        let reported_future = received_before + Duration::days(365);
+        let response = heartbeat_instance(
+            Path(instance_id.clone()),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: heartbeat_security.clone(),
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id.clone(),
+                    instance_id: instance_id.clone(),
+                    health: splendor_types::InstanceHealth {
+                        status: HealthStatus::Healthy,
+                        observed_at: reported_future,
+                        metadata: serde_json::json!({"queue_depth": 0}),
+                    },
+                    recorded_at: reported_future,
+                },
+            }),
+        )
+        .await
+        .expect("authenticated instance heartbeat accepted");
+        assert_eq!(response.0["accepted"], true);
+
+        let refreshed = state
+            .inner
+            .registry
+            .instance(&instance_id)
+            .expect("refreshed instance record");
+        assert_eq!(refreshed.registration, registration);
+        assert_eq!(
+            refreshed.health.metadata,
+            serde_json::json!({"queue_depth": 0})
+        );
+        let received_after = OffsetDateTime::now_utc();
+        assert!(refreshed.last_heartbeat_at >= received_before);
+        assert!(refreshed.last_heartbeat_at <= received_after);
+        assert_ne!(refreshed.last_heartbeat_at, reported_future);
+        assert!(instance_is_eligible(
+            &refreshed,
+            &node.runtime_version,
+            &tenant_id,
+            &placement,
+            received_after,
+        ));
+
+        let mismatched = heartbeat_instance(
+            Path(InstanceId::new()),
+            State(state.clone()),
+            Json(HeartbeatInstanceRequest {
+                security: heartbeat_security,
+                heartbeat: InstanceHeartbeat {
+                    node_id: node.node_id,
+                    instance_id,
+                    health: refreshed.health,
+                    recorded_at: reported_future + Duration::seconds(1),
+                },
+            }),
+        )
+        .await
+        .expect_err("path/body instance mismatch rejected before registry mutation");
+        assert_eq!(mismatched.body.code, "instance_id_mismatch");
+        assert!(state
+            .inner
+            .audit
+            .lock()
+            .expect("manager audit")
+            .iter()
+            .any(|event| event.event_type == "instance.heartbeat_recorded"));
     }
 
     #[tokio::test]
@@ -3979,6 +8618,260 @@ mod tests {
         assert_eq!(error.body.code, "instance_registration_rejected");
     }
 
+    #[tokio::test]
+    async fn accepted_work_order_ids_are_immutable_and_matching_resubmission_is_idempotent() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+        let original = dispatch_test_work_order();
+        let first = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: original.clone(),
+                expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect("first work order accepted")
+        .0;
+        let duplicate = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: original.clone(),
+                expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect("matching signed bytes accepted idempotently")
+        .0;
+        assert!(first.accepted && duplicate.accepted);
+
+        let mut replacement_payload = original.work_order.clone();
+        replacement_payload.objective = "same ID with replacement authority".to_string();
+        let replacement = WorkOrderEnvelope::signed_with_shared_secret(
+            replacement_payload,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("valid replacement signature");
+        let denied = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security,
+                work_order: replacement,
+                expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("same ID cannot replace accepted signed bytes");
+        assert_eq!(denied.status, StatusCode::CONFLICT);
+        assert_eq!(denied.body.code, "work_order_payload_replacement");
+        let stored = state
+            .inner
+            .work_orders
+            .lock()
+            .expect("work-order lock")
+            .get("wo_test_dispatch")
+            .cloned()
+            .expect("original remains stored");
+        assert_eq!(stored.envelope, original);
+        assert!(stored.approval_policies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepted_work_order_approval_policies_are_validated_and_immutable() {
+        let work_order = dispatch_test_work_order();
+        let valid_policy = dispatch_approval_policy(&work_order);
+        let invalid_cases = vec![
+            (
+                "approval_policy_schema_unsupported",
+                ApprovalPolicy {
+                    schema_version: "splendor.approval_policy.v2".to_string(),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_tenant_mismatch",
+                ApprovalPolicy {
+                    tenant_id: TenantId::new(),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_agent_mismatch",
+                ApprovalPolicy {
+                    agent_id: Some(AgentId::new()),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_action_out_of_scope",
+                ApprovalPolicy {
+                    action_name: Some("daemon.delete".to_string()),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_adapter_out_of_scope",
+                ApprovalPolicy {
+                    adapter: Some("daemon.other".to_string()),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_permission_out_of_scope",
+                ApprovalPolicy {
+                    required_permission: Some("fixture.admin".to_string()),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_expired",
+                ApprovalPolicy {
+                    expires_at: Some(OffsetDateTime::now_utc() - Duration::seconds(1)),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_expiry_exceeds_work_order",
+                ApprovalPolicy {
+                    expires_at: Some(work_order.work_order.expires_at + Duration::seconds(1)),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_id_invalid",
+                ApprovalPolicy {
+                    policy_id: " ".to_string(),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_reason_invalid",
+                ApprovalPolicy {
+                    reason: String::new(),
+                    ..valid_policy.clone()
+                },
+            ),
+            (
+                "approval_policy_risk_level_invalid",
+                ApprovalPolicy {
+                    risk_level: Some(String::new()),
+                    ..valid_policy.clone()
+                },
+            ),
+        ];
+        for (expected_code, policy) in invalid_cases {
+            let state = ManagerState::local_acceptance();
+            let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+            let error = submit_work_order(
+                State(state.clone()),
+                Json(SubmitWorkOrderRequest {
+                    security,
+                    work_order: work_order.clone(),
+                    expected_audience: "central-manager".to_string(),
+                    approval_policies: vec![policy],
+                }),
+            )
+            .await
+            .expect_err("invalid approval policy must fail before storage");
+            assert_eq!(error.body.code, expected_code);
+            assert!(state
+                .inner
+                .work_orders
+                .lock()
+                .expect("work-order lock")
+                .is_empty());
+        }
+
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+        let duplicate_id = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security,
+                work_order: work_order.clone(),
+                expected_audience: "central-manager".to_string(),
+                approval_policies: vec![valid_policy.clone(), valid_policy.clone()],
+            }),
+        )
+        .await
+        .expect_err("duplicate policy IDs must fail before storage");
+        assert_eq!(duplicate_id.body.code, "approval_policy_id_duplicate");
+
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+        let too_many_policies = (0..=MAX_WORK_ORDER_APPROVAL_POLICIES)
+            .map(|index| ApprovalPolicy {
+                policy_id: format!("policy_{index}"),
+                ..valid_policy.clone()
+            })
+            .collect();
+        let count_error = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security,
+                work_order: work_order.clone(),
+                expected_audience: "central-manager".to_string(),
+                approval_policies: too_many_policies,
+            }),
+        )
+        .await
+        .expect_err("approval policy count must be bounded before storage");
+        assert_eq!(count_error.body.code, "approval_policy_count_exceeded");
+
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]);
+        let submit = |approval_policies| SubmitWorkOrderRequest {
+            security: security.clone(),
+            work_order: work_order.clone(),
+            expected_audience: "central-manager".to_string(),
+            approval_policies,
+        };
+        let _ = submit_work_order(
+            State(state.clone()),
+            Json(submit(vec![valid_policy.clone()])),
+        )
+        .await
+        .expect("valid narrowing policy accepted");
+        let _ = submit_work_order(
+            State(state.clone()),
+            Json(submit(vec![valid_policy.clone()])),
+        )
+        .await
+        .expect("same envelope and policies are idempotent");
+        let mut replacement_policy = valid_policy.clone();
+        replacement_policy.reason = "different immutable policy".to_string();
+        let replacement =
+            submit_work_order(State(state.clone()), Json(submit(vec![replacement_policy])))
+                .await
+                .expect_err("same envelope cannot replace accepted policies");
+        assert_eq!(
+            replacement.body.code,
+            "work_order_approval_policies_replacement"
+        );
+        let stored = load_accepted_work_order(&state, "wo_test_dispatch")
+            .expect("immutable accepted work-order record");
+        assert_eq!(stored.approval_policies, vec![valid_policy]);
+        state
+            .inner
+            .work_orders
+            .lock()
+            .expect("work-order lock")
+            .get_mut("wo_test_dispatch")
+            .expect("accepted work order")
+            .approval_policies[0]
+            .reason = "tampered after admission".to_string();
+        let corruption = load_accepted_work_order(&state, "wo_test_dispatch")
+            .err()
+            .expect("approval policy digest mismatch must fail closed");
+        assert_eq!(corruption.body.code, "work_order_binding_mismatch");
+    }
+
     #[test]
     fn manager_mutating_endpoints_require_matching_audit_attribution() {
         let state = ManagerState::local_acceptance();
@@ -4068,7 +8961,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_governance_handlers_cover_s5_authority_and_audit_paths() {
-        let state = ManagerState::local_acceptance();
+        let resident_url = spawn_fixed_status_server();
+        let (state, approval_signer) = manager_with_approval_auth(vec![resident_url.clone()]);
         let security = manager_security(
             &state,
             vec![
@@ -4147,75 +9041,232 @@ mod tests {
 
         let approval_id =
             ApprovalId::parse("66666666-6666-4666-8666-666666666666").expect("approval");
+        let requested_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        let approval_expires_at = OffsetDateTime::now_utc() + Duration::minutes(10);
+        let approval_audience = format!("splendor.daemon.run:{run_id}");
+        let challenge = ApprovalChallenge {
+            schema_version: splendor_types::APPROVAL_CHALLENGE_SCHEMA_VERSION.to_string(),
+            approval_id: approval_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            action_id: action_id.clone(),
+            action_name: "artifact.publish_external".to_string(),
+            adapter: "artifact-store".to_string(),
+            policy_id: "policy_s5_unit".to_string(),
+            risk_level: Some("high".to_string()),
+            subject: splendor_types::PrincipalId::new(),
+            authority_decision_id: splendor_types::AuthorityDecisionId::new(),
+            obligation_id: splendor_types::AuthorityObligationId::new(),
+            receipt_audience: approval_audience.clone(),
+            canonical_request_digest: format!("blake3:{}", "1".repeat(64)),
+            gateway_action_request_digest: format!("blake3:{}", "2".repeat(64)),
+            physical_action_resource_coordinate: None,
+            authority_decision_digest: format!("blake3:{}", "3".repeat(64)),
+            requested_at,
+            expires_at: approval_expires_at,
+        };
+        let (approval_headers, approval_request_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let approval_request_payload = ApprovalRequestPayload {
+            security: approval_request_security,
+            approval_id: approval_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            action_id: action_id.clone(),
+            action_name: "artifact.publish_external".to_string(),
+            adapter: "artifact-store".to_string(),
+            policy_id: "policy_s5_unit".to_string(),
+            risk_level: Some("high".to_string()),
+            audience: approval_audience,
+            expires_at: approval_expires_at,
+            reason: "unit approval request".to_string(),
+            challenge: Some(challenge.clone()),
+        };
         let requested = request_approval(
             State(state.clone()),
-            Json(ApprovalRequestPayload {
-                security: security.clone(),
-                approval_id: approval_id.clone(),
-                tenant_id: tenant_id.clone(),
-                agent_id: agent_id.clone(),
-                run_id: run_id.clone(),
-                action_id: action_id.clone(),
-                action_name: "artifact.publish_external".to_string(),
-                adapter: "artifact-store".to_string(),
-                policy_id: "policy_s5_unit".to_string(),
-                risk_level: "high".to_string(),
-                audience: "daemon_local".to_string(),
-                expires_at: OffsetDateTime::now_utc() + Duration::minutes(10),
-                reason: "unit approval request".to_string(),
-            }),
+            approval_headers,
+            Json(approval_request_payload.clone()),
         )
         .await
         .expect("approval requested")
         .0;
         assert_eq!(requested.status, "requested");
+        let (duplicate_headers, duplicate_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let mut duplicate_payload = approval_request_payload.clone();
+        duplicate_payload.security = duplicate_security;
+        let duplicate_request = request_approval(
+            State(state.clone()),
+            duplicate_headers,
+            Json(duplicate_payload),
+        )
+        .await
+        .expect("exact approval request is idempotent")
+        .0;
+        assert_eq!(duplicate_request.trace_event_id, requested.trace_event_id);
 
+        let (grant_headers, grant_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let grant_request = ApprovalDecisionRequest {
+            security: grant_security,
+            reason: "grant unit".to_string(),
+            expires_at: None,
+        };
         let granted = grant_approval(
             Path(approval_id.clone()),
             State(state.clone()),
-            Json(ApprovalDecisionRequest {
-                security: security.clone(),
-                reason: "grant unit".to_string(),
-                expires_at: Some(OffsetDateTime::now_utc() + Duration::minutes(5)),
-            }),
+            grant_headers,
+            Json(grant_request.clone()),
         )
         .await
         .expect("approval granted")
         .0;
         assert_eq!(granted.status, "granted");
+        assert!(granted.authority_obligation_receipt.is_some());
         assert_eq!(
             granted.evidence.expect("grant evidence").decision,
             ApprovalDecision::Granted
         );
-
-        let denied = deny_approval(
+        let (duplicate_grant_headers, duplicate_grant_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let duplicate_grant = grant_approval(
             Path(approval_id.clone()),
             State(state.clone()),
+            duplicate_grant_headers,
             Json(ApprovalDecisionRequest {
-                security: security.clone(),
+                security: duplicate_grant_security,
+                ..grant_request
+            }),
+        )
+        .await
+        .expect("exact approval grant is idempotent")
+        .0;
+        assert_eq!(duplicate_grant.trace_event_id, granted.trace_event_id);
+        assert_eq!(
+            duplicate_grant.authority_obligation_receipt,
+            granted.authority_obligation_receipt
+        );
+        let (changed_grant_headers, changed_grant_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let changed_grant = grant_approval(
+            Path(approval_id.clone()),
+            State(state.clone()),
+            changed_grant_headers,
+            Json(ApprovalDecisionRequest {
+                security: changed_grant_security,
+                reason: "changed grant".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("changed repeated grant conflicts");
+        assert_eq!(changed_grant.body.code, "approval_grant_conflict");
+
+        let (deny_headers, deny_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let denied_after_grant = deny_approval(
+            Path(approval_id.clone()),
+            State(state.clone()),
+            deny_headers,
+            Json(ApprovalDecisionRequest {
+                security: deny_security,
                 reason: "deny unit".to_string(),
                 expires_at: None,
             }),
         )
         .await
-        .expect("approval denied")
-        .0;
-        assert_eq!(denied.status, "denied");
+        .expect_err("grant decision cannot be replaced by denial");
+        assert_eq!(denied_after_grant.body.code, "approval_decision_conflict");
 
-        let revoked = revoke_approval(
-            Path(approval_id),
+        let (revoke_headers, revoke_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let revoke_without_resident = revoke_approval(
+            Path(approval_id.clone()),
             State(state.clone()),
+            revoke_headers,
             Json(ApprovalDecisionRequest {
-                security: security.clone(),
+                security: revoke_security,
                 reason: "revoke unit".to_string(),
                 expires_at: None,
             }),
         )
         .await
-        .expect("approval revoked")
-        .0;
-        assert_eq!(revoked.status, "revoked");
-        assert!(revoked.evidence.expect("revoked evidence").revoked);
+        .expect_err("granted approval requires resident receipt acknowledgement");
+        assert_eq!(
+            revoke_without_resident.body.code,
+            "approval_resident_target_unavailable"
+        );
+        let retained_grant = state
+            .inner
+            .approvals
+            .lock()
+            .expect("approvals")
+            .get(&approval_id.to_string())
+            .cloned()
+            .expect("retained grant");
+        assert_eq!(retained_grant.status, "granted");
+        assert!(retained_grant.authority_obligation_receipt.is_some());
+        let (after_revoke_headers, after_revoke_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        let grant_after_revoke = grant_approval(
+            Path(approval_id.clone()),
+            State(state.clone()),
+            after_revoke_headers,
+            Json(ApprovalDecisionRequest {
+                security: after_revoke_security,
+                reason: "grant after revoke".to_string(),
+                expires_at: None,
+            }),
+        )
+        .await
+        .expect_err("changed repeated grant conflicts");
+        assert_eq!(grant_after_revoke.body.code, "approval_grant_conflict");
+        let mut changed_request = approval_request_payload;
+        changed_request.challenge = Some(ApprovalChallenge {
+            action_name: "artifact.publish_changed".to_string(),
+            ..challenge
+        });
+        changed_request.action_name = "artifact.publish_changed".to_string();
+        let (changed_request_headers, changed_request_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
+        changed_request.security = changed_request_security;
+        let changed_request = request_approval(
+            State(state.clone()),
+            changed_request_headers,
+            Json(changed_request),
+        )
+        .await
+        .expect_err("changed challenge cannot replace granted record");
+        assert_eq!(changed_request.body.code, "approval_request_conflict");
 
         let breaker = create_circuit_breaker(
             State(state.clone()),
@@ -4416,7 +9467,6 @@ mod tests {
 
         let target_node_id = "00000000-0000-4000-8000-000000000905";
         let target_instance_id = "00000000-0000-4000-8000-000000000906";
-        let resident_url = spawn_resident_mock();
         let registered_node = register_node(
             State(state.clone()),
             Json(RegisterNodeRequest {
@@ -4463,7 +9513,7 @@ mod tests {
         assert_eq!(propagated_kill.status, "activated");
         assert!(propagated_kill.propagation_acknowledged);
         assert!(!propagated_kill.fail_closed);
-        assert_eq!(propagated_kill.cancel_status, Some(201));
+        assert_eq!(propagated_kill.cancel_status, Some(200));
         assert_eq!(
             propagated_kill.target_daemon_url.as_deref(),
             Some(resident_url.as_str())
@@ -4591,11 +9641,17 @@ mod tests {
         .expect_err("missing revoke rejected");
         assert_eq!(missing_revoke.body.code, "policy_not_found");
 
+        let (missing_approval_headers, missing_approval_security) = approval_security(
+            &state,
+            &approval_signer,
+            vec![EndpointScope::ApprovalsManage],
+        );
         let missing_approval = grant_approval(
             Path(ApprovalId::parse("77777777-7777-4777-8777-777777777777").expect("approval")),
             State(state.clone()),
+            missing_approval_headers,
             Json(ApprovalDecisionRequest {
-                security: security.clone(),
+                security: missing_approval_security,
                 reason: "missing approval grant".to_string(),
                 expires_at: None,
             }),
@@ -4640,78 +9696,23 @@ mod tests {
         .await
         .expect_err("missing governance scope rejected");
         assert_eq!(missing_scope.body.code, "missing_scope");
-
-        let bad_url = post_json(
-            "https://example.invalid",
-            "/runs/x/cancel",
-            &serde_json::json!({}),
-        )
-        .expect_err("non-local test post_json rejects unsupported URL schemes");
-        assert!(bad_url.contains("only http://"));
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind post_json mock");
-        let addr = listener.local_addr().expect("mock addr");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept post_json request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .expect("set post_json read timeout");
-            let mut request = Vec::new();
-            let _ = stream.read_to_end(&mut request);
-            let body = r#"{"cancelled":true}"#;
-            write!(
-                stream,
-                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write post_json response");
-        });
-        let response = post_json(
-            &format!("http://{addr}"),
-            "/runs/unit/cancel",
-            &serde_json::json!({"reason":"unit"}),
-        )
-        .expect("post_json success");
-        assert_eq!(response.status, 202);
-        assert!(response.body.expect("response body").contains("cancelled"));
-        handle.join().expect("post_json mock joined");
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind prefixed mock");
-        let addr = listener.local_addr().expect("prefixed mock addr");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept prefixed request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .expect("set prefixed read timeout");
-            let mut request = Vec::new();
-            let _ = stream.read_to_end(&mut request);
-            write!(
-                stream,
-                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .expect("write prefixed response");
-        });
-        let response = post_json(
-            &format!("http://{addr}/daemon"),
-            "/runs/unit/cancel",
-            &serde_json::json!({"reason":"unit"}),
-        )
-        .expect("post_json prefixed success");
-        assert_eq!(response.status, 204);
-        assert!(response.body.is_none());
-        handle.join().expect("prefixed mock joined");
     }
 
     #[test]
     fn resident_dispatch_payload_is_derived_from_signed_work_order_authority() {
-        let target_agent = "33333333-3333-4333-8333-333333333333";
-        let work_order = test_work_order(target_agent);
+        let work_order = dispatch_test_work_order();
+        let approval_policy = dispatch_approval_policy(&work_order);
         let run_id = work_order.work_order.run_id.clone().expect("run id");
         let credential = serde_json::json!({"credential_id":"resident-test"});
         let audit = serde_json::json!({"credential_id":"resident-test"});
-        let payload = resident_create_run_payload(&work_order, &run_id, credential, audit)
-            .expect("payload derives from work order");
+        let payload = resident_create_run_payload(
+            &work_order,
+            std::slice::from_ref(&approval_policy),
+            &run_id,
+            credential,
+            audit,
+        )
+        .expect("payload derives from work order");
 
         assert_eq!(
             payload["allowed_actions"],
@@ -4741,6 +9742,7 @@ mod tests {
         );
         let repeated = resident_create_run_payload(
             &work_order,
+            std::slice::from_ref(&approval_policy),
             &run_id,
             serde_json::json!({"credential_id":"resident-test"}),
             serde_json::json!({"credential_id":"resident-test"}),
@@ -4749,63 +9751,114 @@ mod tests {
         assert_eq!(repeated["request_id"], payload["request_id"]);
         assert_eq!(repeated["idempotency_key"], payload["idempotency_key"]);
         let distinct_run = RunId::new();
-        let distinct = resident_create_run_payload(
+        let error = resident_create_run_payload(
             &work_order,
+            &[],
             &distinct_run,
             serde_json::json!({"credential_id":"resident-test"}),
             serde_json::json!({"credential_id":"resident-test"}),
         )
-        .expect("distinct run payload derives from distinct run id");
-        assert_ne!(distinct["request_id"], payload["request_id"]);
-        assert_ne!(distinct["idempotency_key"], payload["idempotency_key"]);
-        assert!(payload["registered_actions"]
+        .expect_err("unsigned run substitution is rejected");
+        assert_eq!(error.body.code, "resident_dispatch_run_id_required");
+        let profile = payload["registered_actions"]
             .as_array()
             .expect("registered actions")
-            .iter()
-            .any(|entry| entry["name"] == "message.remote.proposal"));
+            .first()
+            .expect("profile");
+        assert_eq!(profile["name"], "daemon.record");
+        assert_eq!(profile["adapter"], "daemon.recording");
+        assert_eq!(
+            profile["required_permissions"],
+            serde_json::json!(["fixture.execute"])
+        );
         assert!(payload["policy_actions"]
             .as_array()
             .expect("policy actions")
-            .iter()
-            .all(|entry| work_order.work_order.allowed_actions.contains(
-                &entry["action"]["name"]
-                    .as_str()
-                    .expect("action name")
-                    .to_string()
-            )));
+            .is_empty());
+        assert_eq!(
+            payload["approval_policies"],
+            serde_json::json!([approval_policy])
+        );
+        assert_eq!(
+            payload["allowed_actions"],
+            serde_json::json!(["daemon.record"]),
+            "approval governance cannot broaden signed action authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_rejects_unknown_signed_locality_class_instead_of_ignoring_it() {
+        let state = ManagerState::local_acceptance();
+        let mut work_order = dispatch_test_work_order().work_order;
+        work_order.work_order_id =
+            WorkOrderId::try_new("wo_unknown_locality").expect("work-order id");
+        work_order.placement.data_locality = Some("eu-west".to_string());
+        let envelope = WorkOrderEnvelope::signed_with_shared_secret(
+            work_order,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("signed unknown-locality work order");
+        submit_test_work_order(
+            &state,
+            &manager_security(&state, vec![EndpointScope::WorkOrdersSubmit]),
+            envelope,
+        )
+        .await;
+
+        let error = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: manager_security(&state, vec![EndpointScope::FleetRead]),
+                work_order_id: Some("wo_unknown_locality".to_string()),
+                request: PlacementRequest {
+                    target: PlacementTarget::CustomerVpc,
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    data_locality: Some(DataLocality::Vpc),
+                    dedicated_instance: false,
+                    required_runtime_version: None,
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+            }),
+        )
+        .await
+        .expect_err("region-like locality cannot be reinterpreted as a typed class");
+        assert_eq!(error.body.code, "unsupported_work_order_data_locality");
+        assert!(state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .get("wo_unknown_locality")
+            .is_none());
     }
 
     #[test]
-    fn resident_dispatch_payload_rejects_incomplete_internal_authority() {
-        let mut work_order = test_work_order("33333333-3333-4333-8333-333333333333");
-        work_order
-            .work_order
-            .allowed_permissions
-            .retain(|permission| permission != "artifact.create_internal");
+    fn resident_dispatch_payload_rejects_ambiguous_work_order_v1_profiles() {
+        let work_order = test_work_order("33333333-3333-4333-8333-333333333333");
         let run_id = work_order.work_order.run_id.clone().expect("run id");
         let error = resident_create_run_payload(
             &work_order,
+            &[],
             &run_id,
             serde_json::json!({}),
             serde_json::json!({}),
         )
-        .expect_err("incomplete authority rejected");
-        assert_eq!(error.body.code, "work_order_authority_incomplete");
+        .expect_err("multi-adapter work-order v1 profile rejected");
+        assert_eq!(error.body.code, "resident_dispatch_profile_unsupported");
 
-        let mut remote_incomplete = test_work_order("33333333-3333-4333-8333-333333333333");
-        remote_incomplete
-            .work_order
-            .allowed_adapters
-            .retain(|adapter| adapter != "remote-message");
-        let run_id = remote_incomplete.work_order.run_id.clone().expect("run id");
+        let mut missing_run = dispatch_test_work_order();
+        let run_id = missing_run.work_order.run_id.take().expect("run id");
         let error = resident_create_run_payload(
-            &remote_incomplete,
+            &missing_run,
+            &[],
             &run_id,
             serde_json::json!({}),
             serde_json::json!({}),
         )
-        .expect_err("incomplete remote authority rejected");
-        assert_eq!(error.body.code, "work_order_authority_incomplete");
+        .expect_err("run binding required");
+        assert_eq!(error.body.code, "resident_dispatch_run_id_required");
     }
 
     #[test]
@@ -4921,7 +9974,7 @@ mod tests {
                 run_id: run_id.clone(),
                 source_agent_id: source_agent.clone(),
                 target_agent_id: target_agent.clone(),
-                schema: "splendor.message.task_request.v1".to_string(),
+                schema: TASK_REQUEST_SCHEMA.to_string(),
                 causal_parent: None,
                 delivery_status: "delivered".to_string(),
                 trace_event_id: delivery_trace_event_id.clone(),
@@ -4986,7 +10039,7 @@ mod tests {
         assert!(schemas
             .schemas
             .iter()
-            .any(|schema| schema.schema == "splendor.message.task_request.v1"));
+            .any(|schema| schema.schema == TASK_REQUEST_SCHEMA));
 
         let envelope: MessageEnvelope = serde_json::from_value(serde_json::json!({
             "message": {
@@ -5402,7 +10455,7 @@ mod tests {
         ];
         let security = manager_security(&state, all_scopes);
         let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
-        let resident_url = spawn_resident_mock();
+        let resident_url = spawn_fixed_status_server();
         let vpc_node = node(
             &state.inner.fleet_id,
             "00000000-0000-4000-8000-000000000204",
@@ -5510,17 +10563,14 @@ mod tests {
                 security: security.clone(),
                 work_order: work_order.clone(),
                 expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
             }),
         )
         .await
         .expect("work order accepted");
         let placement_request = PlacementRequest {
             target: PlacementTarget::CustomerVpc,
-            required_capabilities: vec![
-                "sql.read_fixture".to_string(),
-                "artifact.create_internal".to_string(),
-                "message.remote.proposal".to_string(),
-            ],
+            required_capabilities: vec!["message.remote.proposal".to_string()],
             data_locality: Some(DataLocality::Vpc),
             dedicated_instance: false,
             required_runtime_version: None,
@@ -5537,7 +10587,7 @@ mod tests {
         )
         .await
         .expect("placement evaluated");
-        let dispatch = dispatch_work_order(
+        let dispatch_error = dispatch_work_order(
             Path("wo_test_remote".to_string()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
@@ -5546,9 +10596,11 @@ mod tests {
             }),
         )
         .await
-        .expect("dispatch accepted");
-        assert_eq!(dispatch.0.create_run_status, 201);
-        assert_eq!(dispatch.0.start_run_status, 201);
+        .expect_err("multi-adapter work-order v1 dispatch is rejected before network I/O");
+        assert_eq!(
+            dispatch_error.body.code,
+            "resident_dispatch_profile_unsupported"
+        );
 
         let credential = security.credential.clone();
         let run_id = work_order.work_order.run_id.clone().expect("run id");
@@ -5733,12 +10785,27 @@ mod tests {
         );
         let tenant_id = expired_work_order.work_order.tenant_id.clone();
         register_message_route(&state, &security, &tenant_id).await;
+        let accepted = accepted_work_order(expired_work_order, Vec::new())
+            .expect("expired work-order admission fixture");
         state
             .inner
             .work_orders
             .lock()
             .expect("work order lock")
-            .insert("wo_test_remote_expired".to_string(), expired_work_order);
+            .insert("wo_test_remote_expired".to_string(), accepted.clone());
+        state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order binding lock")
+            .insert(
+                "wo_test_remote_expired".to_string(),
+                AcceptedWorkOrderBinding {
+                    payload_digest: accepted.payload_digest,
+                    envelope_digest: accepted.envelope_digest,
+                    approval_policies_digest: accepted.approval_policies_digest,
+                },
+            );
 
         let mut request = send_request(security.credential.clone(), target_agent, run_id);
         request.work_order_id = "wo_test_remote_expired".to_string();
@@ -5871,7 +10938,13 @@ mod tests {
         let error = send_message(State(state.clone()), Json(permission_smuggle))
             .await
             .expect_err("extra nested permission rejected");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.status,
+            StatusCode::FORBIDDEN,
+            "unexpected rejection: {} {}",
+            error.body.code,
+            error.body.message
+        );
         assert_eq!(error.body.code, "message_payload_scope_smuggling");
         assert!(!state
             .inner
@@ -6070,6 +11143,7 @@ mod tests {
                 security: security.clone(),
                 work_order: test_work_order("33333333-3333-4333-8333-333333333333"),
                 expected_audience: "wrong-manager".to_string(),
+                approval_policies: Vec::new(),
             }),
         )
         .await
@@ -6085,6 +11159,7 @@ mod tests {
                     security: security.clone(),
                     work_order: envelope,
                     expected_audience: "central-manager".to_string(),
+                    approval_policies: Vec::new(),
                 }),
             )
             .await
@@ -6096,7 +11171,7 @@ mod tests {
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("rejected-placement".to_string()),
+                work_order_id: None,
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
                     required_capabilities: vec!["missing.capability".to_string()],
@@ -6137,6 +11212,7 @@ mod tests {
                 security: security.clone(),
                 work_order,
                 expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
             }),
         )
         .await
@@ -6188,9 +11264,6 @@ mod tests {
         .await
         .expect_err("missing message rejected");
         assert_eq!(missing_message.body.code, "message_not_found");
-
-        assert!(post_json("https://example.test", "/runs", &serde_json::json!({})).is_err());
-        assert!(post_json("http://127.0.0.1:1", "/runs", &serde_json::json!({})).is_err());
     }
 
     #[tokio::test]
@@ -6329,6 +11402,7 @@ mod tests {
                 "sql.read_fixture",
                 "artifact.create_internal",
                 "message.remote.proposal",
+                "runtime.resident",
             ],
         );
         let cloud_node = node(
@@ -6372,7 +11446,7 @@ mod tests {
             .expect("node registered");
         }
 
-        let candidates = placement_candidates(&state).expect("placement candidates");
+        let candidates = placement_candidates(&state, None).expect("placement candidates");
         assert!(candidates.iter().any(|candidate| {
             candidate.candidate_id == edge_node.node_id.to_string()
                 && candidate.target == PlacementTarget::EdgeDevice
@@ -6384,23 +11458,25 @@ mod tests {
                 && candidate.data_locality == Some(DataLocality::OnPrem)
         }));
 
-        let work_order = test_work_order("33333333-3333-4333-8333-333333333333");
+        let work_order = dispatch_test_work_order();
+        let work_order_id = work_order.work_order.work_order_id.to_string();
         let _ = submit_work_order(
             State(state.clone()),
             Json(SubmitWorkOrderRequest {
                 security: security.clone(),
                 work_order,
                 expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
             }),
         )
         .await
         .expect("work order submitted");
 
-        let rejected = evaluate_placement(
+        let mismatched_placement = evaluate_placement(
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("wo_test_remote".to_string()),
+                work_order_id: Some(work_order_id.clone()),
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
                     required_capabilities: vec!["capability.not.present".to_string()],
@@ -6413,10 +11489,13 @@ mod tests {
             }),
         )
         .await
-        .expect("rejected placement decision");
-        assert_eq!(rejected.0.status, PlacementDecisionStatus::Rejected);
+        .expect_err("placement cannot weaken or replace signed constraints");
+        assert_eq!(
+            mismatched_placement.body.code,
+            "placement_request_work_order_mismatch"
+        );
         let error = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6424,17 +11503,17 @@ mod tests {
             }),
         )
         .await
-        .expect_err("rejected placement cannot dispatch");
-        assert_eq!(error.body.code, "placement_rejected");
+        .expect_err("unbound placement cannot dispatch");
+        assert_eq!(error.body.code, "placement_required");
 
         let selected = evaluate_placement(
             State(state.clone()),
             Json(PlacementEvaluationRequest {
                 security: security.clone(),
-                work_order_id: Some("wo_test_remote".to_string()),
+                work_order_id: Some(work_order_id.clone()),
                 request: PlacementRequest {
                     target: PlacementTarget::CustomerVpc,
-                    required_capabilities: vec!["sql.read_fixture".to_string()],
+                    required_capabilities: vec!["runtime.resident".to_string()],
                     data_locality: Some(DataLocality::Vpc),
                     dedicated_instance: false,
                     required_runtime_version: None,
@@ -6448,7 +11527,7 @@ mod tests {
         assert_eq!(selected.0.status, PlacementDecisionStatus::Selected);
 
         let mismatch = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6459,8 +11538,21 @@ mod tests {
         .expect_err("target mismatch rejected");
         assert_eq!(mismatch.body.code, "dispatch_target_mismatch");
 
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(
+                    &vpc_node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000301",
+                    &TenantId::new(),
+                ),
+            }),
+        )
+        .await
+        .expect("wrong-tenant instance registered");
         let no_instance = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6468,19 +11560,32 @@ mod tests {
             }),
         )
         .await
-        .expect_err("node without instance rejected");
-        assert_eq!(no_instance.body.code, "node_has_no_instance");
+        .expect_err("instance that does not host the signed tenant is ineligible");
+        assert_eq!(no_instance.body.code, "no_eligible_resident_instance");
 
         let mut invalid_candidate = selected.0.clone();
         invalid_candidate.candidate_id = Some("not-a-node-id".to_string());
+        let invalid_candidate_digest = stable_manager_digest(
+            b"splendor.manager.placement-decision.v1\0",
+            &invalid_candidate,
+        )
+        .expect("invalid candidate decision digest");
         state
             .inner
             .placements
             .lock()
             .expect("placement lock")
-            .insert("wo_test_remote".to_string(), invalid_candidate.clone());
+            .insert(work_order_id.clone(), invalid_candidate.clone());
+        state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement binding lock")
+            .get_mut(&work_order_id)
+            .expect("placement binding")
+            .decision_digest = invalid_candidate_digest;
         let missing_target = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6488,11 +11593,11 @@ mod tests {
             }),
         )
         .await
-        .expect_err("invalid placement candidate cannot infer target");
+        .expect_err("invalid selected candidate cannot supply an implicit target");
         assert_eq!(missing_target.body.code, "missing_target_node");
 
         let missing_candidate = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6500,7 +11605,7 @@ mod tests {
             }),
         )
         .await
-        .expect_err("invalid placement candidate rejected");
+        .expect_err("invalid selected candidate remains fail closed with explicit target");
         assert_eq!(missing_candidate.body.code, "placement_candidate_missing");
 
         state
@@ -6508,7 +11613,17 @@ mod tests {
             .placements
             .lock()
             .expect("placement lock")
-            .insert("wo_test_remote".to_string(), selected.0.clone());
+            .insert(work_order_id.clone(), selected.0.clone());
+        state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement binding lock")
+            .get_mut(&work_order_id)
+            .expect("placement binding")
+            .decision_digest =
+            stable_manager_digest(b"splendor.manager.placement-decision.v1\0", &selected.0)
+                .expect("selected decision digest");
 
         let _ = register_instance(
             State(state.clone()),
@@ -6524,52 +11639,8 @@ mod tests {
         .await
         .expect("instance registered");
 
-        let no_url_node: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "node_id": "00000000-0000-4000-8000-000000000704",
-            "kind": "vpc.worker",
-            "scope": {"fleet_id": state.inner.fleet_id, "tenant_id": null},
-            "capability_document": {
-                "schema": "splendor.capabilities.v1",
-                "capabilities": ["sql.read_fixture"],
-                "constraints": {"placement_target": "customer_vpc", "data_locality": "vpc"}
-            },
-            "runtime_version": "0.1-test",
-            "health": {"status": "healthy", "observed_at": now_rfc3339(), "metadata": {}},
-            "registered_at": now_rfc3339()
-        }))
-        .expect("no url node");
-        let _ = register_node(
-            State(state.clone()),
-            Json(RegisterNodeRequest {
-                security: security.clone(),
-                registration: no_url_node.clone(),
-            }),
-        )
-        .await
-        .expect("no url node registered");
-        let _ = register_instance(
-            State(state.clone()),
-            Json(RegisterInstanceRequest {
-                security: security.clone(),
-                registration: instance(
-                    &no_url_node.node_id.to_string(),
-                    "00000000-0000-4000-8000-000000000704",
-                    &tenant_id,
-                ),
-            }),
-        )
-        .await
-        .expect("no url instance registered");
-        let mut no_url_placement = selected.0.clone();
-        no_url_placement.candidate_id = Some(no_url_node.node_id.to_string());
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), no_url_placement);
-        let missing_url = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+        let blocked_egress = dispatch_work_order(
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6577,55 +11648,24 @@ mod tests {
             }),
         )
         .await
-        .expect_err("missing resident url rejected");
-        assert_eq!(missing_url.body.code, "missing_resident_daemon_url");
+        .expect_err("unallowlisted resident origin is rejected before network I/O");
+        assert_eq!(blocked_egress.body.code, "resident_origin_not_allowed");
 
-        let offline_node: NodeRegistration = serde_json::from_value(serde_json::json!({
-            "node_id": "00000000-0000-4000-8000-000000000804",
-            "kind": "vpc.worker",
-            "scope": {"fleet_id": state.inner.fleet_id, "tenant_id": null},
-            "capability_document": {
-                "schema": "splendor.capabilities.v1",
-                "capabilities": ["sql.read_fixture"],
-                "constraints": {"placement_target": "customer_vpc", "data_locality": "vpc", "resident_daemon_url": "http://127.0.0.1:1"}
-            },
-            "runtime_version": "0.1-test",
-            "health": {"status": "offline", "observed_at": now_rfc3339(), "metadata": {}},
-            "registered_at": now_rfc3339()
-        }))
-        .expect("offline node");
-        let _ = register_node(
-            State(state.clone()),
-            Json(RegisterNodeRequest {
-                security: security.clone(),
-                registration: offline_node.clone(),
-            }),
-        )
-        .await
-        .expect("offline node registered");
         let _ = register_instance(
             State(state.clone()),
             Json(RegisterInstanceRequest {
                 security: security.clone(),
                 registration: instance(
-                    &offline_node.node_id.to_string(),
-                    "00000000-0000-4000-8000-000000000804",
+                    &vpc_node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000303",
                     &tenant_id,
                 ),
             }),
         )
         .await
-        .expect("offline instance registered");
-        let mut offline_placement = selected.0.clone();
-        offline_placement.candidate_id = Some(offline_node.node_id.to_string());
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), offline_placement);
-        let stale = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+        .expect("second eligible instance registered");
+        let ambiguous = dispatch_work_order(
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6633,27 +11673,21 @@ mod tests {
             }),
         )
         .await
-        .expect_err("offline node rejected");
-        assert_eq!(stale.body.code, "stale_or_unhealthy_node");
-
-        state
-            .inner
-            .placements
-            .lock()
-            .expect("placement lock")
-            .insert("wo_test_remote".to_string(), selected.0);
+        .expect_err("multiple eligible resident instances are rejected before egress");
+        assert_eq!(ambiguous.body.code, "ambiguous_eligible_resident_instances");
 
         state
             .inner
             .work_orders
             .lock()
             .expect("work order lock")
-            .get_mut("wo_test_remote")
+            .get_mut(&work_order_id)
             .expect("work order")
+            .envelope
             .work_order
             .objective = "tampered after signature".to_string();
         let bad_signature = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
+            Path(work_order_id.clone()),
             State(state.clone()),
             Json(DispatchWorkOrderRequest {
                 security: security.clone(),
@@ -6662,25 +11696,927 @@ mod tests {
         )
         .await
         .expect_err("tampered dispatch work order rejected");
-        assert_eq!(bad_signature.body.code, "bad_signature");
+        assert_eq!(bad_signature.body.code, "work_order_binding_mismatch");
+    }
 
-        let refreshed = test_work_order("33333333-3333-4333-8333-333333333333");
-        state
-            .inner
-            .work_orders
-            .lock()
-            .expect("work order lock")
-            .insert("wo_test_remote".to_string(), refreshed);
-        let resident_http = dispatch_work_order(
-            Path("wo_test_remote".to_string()),
-            State(state),
-            Json(DispatchWorkOrderRequest {
-                security,
-                target_node_id: None,
+    #[tokio::test]
+    async fn revocation_gate_queues_revoke_before_dispatch_and_prevents_egress() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::FleetRead,
+                EndpointScope::FleetDispatch,
+                EndpointScope::WorkOrdersSubmit,
+                EndpointScope::WorkOrdersRevoke,
+            ],
+        );
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000814",
+            "http://127.0.0.1:1",
+            "customer_vpc",
+            "vpc",
+            vec!["runtime.resident"],
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node.clone(),
             }),
         )
         .await
-        .expect_err("unavailable resident daemon rejected");
-        assert_eq!(resident_http.body.code, "resident_http_error");
+        .expect("node registered");
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance(
+                    &node.node_id.to_string(),
+                    "00000000-0000-4000-8000-000000000815",
+                    &tenant_id,
+                ),
+            }),
+        )
+        .await
+        .expect("instance registered");
+        submit_test_work_order(&state, &security, dispatch_test_work_order()).await;
+        let _ = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some("wo_test_dispatch".to_string()),
+                request: PlacementRequest {
+                    target: PlacementTarget::CustomerVpc,
+                    required_capabilities: vec!["runtime.resident".to_string()],
+                    data_locality: Some(DataLocality::Vpc),
+                    dedicated_instance: false,
+                    required_runtime_version: None,
+                    max_runtime_ms: Some(30_000),
+                    execution_mode: PlacementExecutionMode::Live,
+                },
+            }),
+        )
+        .await
+        .expect("placement selected");
+
+        let gate = state
+            .accepted_work_order_revocation_gate("wo_test_dispatch")
+            .expect("revocation gate");
+        let barrier = Arc::clone(&gate).lock_owned().await;
+        let mut revoke = Box::pin(revoke_work_order(
+            Path("wo_test_dispatch".to_string()),
+            State(state.clone()),
+            Json(RevokeWorkOrderRequest {
+                security: security.clone(),
+                reason: "revoke wins race".to_string(),
+            }),
+        ));
+        assert!(poll_once(revoke.as_mut()).is_pending());
+        let mut dispatch = Box::pin(dispatch_work_order(
+            Path("wo_test_dispatch".to_string()),
+            State(state.clone()),
+            Json(DispatchWorkOrderRequest {
+                security,
+                target_node_id: Some(node.node_id),
+            }),
+        ));
+        assert!(poll_once(dispatch.as_mut()).is_pending());
+        drop(barrier);
+
+        let _ = revoke.await.expect("queued revocation committed");
+        let error = dispatch
+            .await
+            .expect_err("dispatch queued behind revocation is denied");
+        assert_eq!(error.body.code, "revoked_work_order");
+        assert!(state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .get("wo_test_dispatch")
+            .is_none());
+        assert!(state
+            .inner
+            .dispatch_state
+            .lock()
+            .expect("dispatch state")
+            .in_flight
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_work_order_ids_do_not_allocate_revocation_or_dispatch_state() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::FleetDispatch,
+                EndpointScope::WorkOrdersRevoke,
+            ],
+        );
+
+        for index in 0..128 {
+            let work_order_id = format!("wo_unknown_{index}");
+            let revoke_error = revoke_work_order(
+                Path(work_order_id.clone()),
+                State(state.clone()),
+                Json(RevokeWorkOrderRequest {
+                    security: security.clone(),
+                    reason: "unknown ID must not create a tombstone".to_string(),
+                }),
+            )
+            .await
+            .expect_err("unknown revoke denied");
+            assert_eq!(revoke_error.body.code, "work_order_not_found");
+
+            let dispatch_error = dispatch_work_order(
+                Path(work_order_id),
+                State(state.clone()),
+                Json(DispatchWorkOrderRequest {
+                    security: security.clone(),
+                    target_node_id: None,
+                }),
+            )
+            .await
+            .expect_err("unknown dispatch denied");
+            assert_eq!(dispatch_error.body.code, "work_order_not_found");
+        }
+
+        assert!(state
+            .inner
+            .work_order_revocation_gates
+            .lock()
+            .expect("gate state")
+            .is_empty());
+        assert!(state
+            .inner
+            .revoked_work_orders
+            .lock()
+            .expect("revocation state")
+            .is_empty());
+        let dispatch = state.inner.dispatch_state.lock().expect("dispatch state");
+        assert!(dispatch.completed.is_empty());
+        assert!(dispatch.terminal_failures.is_empty());
+        assert!(dispatch.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepted_work_order_and_placement_bindings_fail_closed_on_replacement_or_corruption() {
+        let state = ManagerState::local_acceptance();
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::FleetRead,
+                EndpointScope::WorkOrdersSubmit,
+            ],
+        );
+        let registration = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000914",
+            "http://127.0.0.1:1",
+            "customer_vpc",
+            "vpc",
+            vec!["runtime.resident"],
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration,
+            }),
+        )
+        .await
+        .expect("placement node registered");
+
+        let envelope = dispatch_test_work_order();
+        let work_order_id = envelope.work_order.work_order_id.to_string();
+        submit_test_work_order(&state, &security, envelope.clone()).await;
+        let idempotent = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: envelope.clone(),
+                expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect("exact work-order resubmission is idempotent");
+        assert!(idempotent.0.accepted);
+
+        let mut replacement_payload = envelope.work_order.clone();
+        replacement_payload.objective = "same ID with different signed bytes".to_string();
+        let replacement = WorkOrderEnvelope::signed_with_shared_secret(
+            replacement_payload,
+            "work-order-local-key",
+            b"splendor-local-work-order-secret",
+        )
+        .expect("replacement envelope signs");
+        let replacement_error = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: replacement,
+                expected_audience: "central-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("accepted ID cannot be replaced");
+        assert_eq!(
+            replacement_error.body.code,
+            "work_order_payload_replacement"
+        );
+
+        let wrong_audience = submit_work_order(
+            State(state.clone()),
+            Json(SubmitWorkOrderRequest {
+                security: security.clone(),
+                work_order: envelope.clone(),
+                expected_audience: "other-manager".to_string(),
+                approval_policies: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("manager audience mismatch rejected");
+        assert_eq!(wrong_audience.body.code, "wrong_audience");
+
+        let request = dispatch_placement_request();
+        let first = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect("placement bound");
+        let repeated = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect("exact placement replay returns immutable decision");
+        assert_eq!(repeated.0, first.0);
+
+        let original_work_order_binding = state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order bindings")
+            .get(&work_order_id)
+            .cloned()
+            .expect("work-order binding");
+        state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order bindings")
+            .remove(&work_order_id);
+        let missing_binding = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect_err("missing immutable work-order binding rejected");
+        assert_eq!(missing_binding.body.code, "work_order_binding_missing");
+        state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order bindings")
+            .insert(work_order_id.clone(), original_work_order_binding.clone());
+
+        state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order bindings")
+            .get_mut(&work_order_id)
+            .expect("work-order binding")
+            .payload_digest = "blake3:tampered".to_string();
+        let mismatched_binding = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect_err("mismatched immutable work-order binding rejected");
+        assert_eq!(mismatched_binding.body.code, "work_order_binding_mismatch");
+        state
+            .inner
+            .accepted_work_order_bindings
+            .lock()
+            .expect("work-order bindings")
+            .insert(work_order_id.clone(), original_work_order_binding);
+
+        let original_placement_binding = state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement bindings")
+            .get(&work_order_id)
+            .cloned()
+            .expect("placement binding");
+        state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement bindings")
+            .get_mut(&work_order_id)
+            .expect("placement binding")
+            .request
+            .required_capabilities
+            .push("tampered.capability".to_string());
+        let replaced_placement = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect_err("placement binding replacement rejected");
+        assert_eq!(
+            replaced_placement.body.code,
+            "placement_binding_replacement"
+        );
+        state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement bindings")
+            .insert(work_order_id.clone(), original_placement_binding.clone());
+
+        let original_decision = state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .remove(&work_order_id)
+            .expect("placement decision");
+        let incomplete_placement = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect_err("binding without decision rejected");
+        assert_eq!(
+            incomplete_placement.body.code,
+            "placement_binding_incomplete"
+        );
+        state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .insert(work_order_id.clone(), original_decision.clone());
+
+        state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .get_mut(&work_order_id)
+            .expect("placement decision")
+            .reasons
+            .push("tampered after binding".to_string());
+        let mismatched_placement = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security,
+                work_order_id: Some(work_order_id.clone()),
+                request,
+            }),
+        )
+        .await
+        .expect_err("decision digest mismatch rejected");
+        assert_eq!(mismatched_placement.body.code, "placement_binding_mismatch");
+        state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .insert(work_order_id.clone(), original_decision);
+        state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement bindings")
+            .insert(work_order_id, original_placement_binding);
+    }
+
+    #[tokio::test]
+    async fn resolved_dispatch_binding_is_immutable_and_rechecks_live_eligibility() {
+        let resident_url = "http://127.0.0.1:18091";
+        let state = manager_with_allowed_origins(vec![resident_url.to_string()]);
+        let security = manager_security(
+            &state,
+            vec![
+                EndpointScope::NodesRegister,
+                EndpointScope::InstancesRegister,
+                EndpointScope::FleetRead,
+                EndpointScope::WorkOrdersSubmit,
+            ],
+        );
+        let tenant_id = TenantId::parse("11111111-1111-4111-8111-111111111111").expect("tenant");
+        let node = node(
+            &state.inner.fleet_id,
+            "00000000-0000-4000-8000-000000000924",
+            resident_url,
+            "customer_vpc",
+            "vpc",
+            vec!["runtime.resident"],
+        );
+        let instance = instance(
+            &node.node_id.to_string(),
+            "00000000-0000-4000-8000-000000000925",
+            &tenant_id,
+        );
+        let _ = register_node(
+            State(state.clone()),
+            Json(RegisterNodeRequest {
+                security: security.clone(),
+                registration: node.clone(),
+            }),
+        )
+        .await
+        .expect("node registered");
+        let _ = register_instance(
+            State(state.clone()),
+            Json(RegisterInstanceRequest {
+                security: security.clone(),
+                registration: instance.clone(),
+            }),
+        )
+        .await
+        .expect("instance registered");
+        let envelope = dispatch_test_work_order();
+        let work_order_id = envelope.work_order.work_order_id.to_string();
+        submit_test_work_order(&state, &security, envelope).await;
+        let request = dispatch_placement_request();
+        let _ = evaluate_placement(
+            State(state.clone()),
+            Json(PlacementEvaluationRequest {
+                security: security.clone(),
+                work_order_id: Some(work_order_id.clone()),
+                request: request.clone(),
+            }),
+        )
+        .await
+        .expect("placement selected");
+
+        let accepted =
+            load_accepted_work_order(&state, &work_order_id).expect("accepted work-order record");
+        state
+            .inner
+            .revoked_work_orders
+            .lock()
+            .expect("revocations")
+            .insert(work_order_id.clone());
+        let revoked = revalidate_dispatch_authority(
+            &state,
+            &accepted,
+            accepted.envelope.work_order.run_id.as_ref().expect("run"),
+            "customer_vpc",
+            "unit",
+        )
+        .expect_err("revocation is rechecked before egress");
+        assert_eq!(revoked.body.code, "revoked_work_order");
+        state
+            .inner
+            .revoked_work_orders
+            .lock()
+            .expect("revocations")
+            .remove(&work_order_id);
+        let mut expired_payload = accepted.envelope.work_order.clone();
+        expired_payload.expires_at = OffsetDateTime::now_utc() - Duration::seconds(1);
+        let expired = accepted_work_order(
+            WorkOrderEnvelope::signed_with_shared_secret(
+                expired_payload,
+                "work-order-local-key",
+                b"splendor-local-work-order-secret",
+            )
+            .expect("expired envelope signs"),
+            Vec::new(),
+        )
+        .expect("expired binding");
+        let expired_error = revalidate_dispatch_authority(
+            &state,
+            &expired,
+            expired.envelope.work_order.run_id.as_ref().expect("run"),
+            "customer_vpc",
+            "unit",
+        )
+        .expect_err("expiry is rechecked before egress");
+        assert_eq!(expired_error.body.code, "expired_work_order");
+        let decision = state
+            .inner
+            .placements
+            .lock()
+            .expect("placements")
+            .get(&work_order_id)
+            .cloned()
+            .expect("placement decision");
+        let placement_binding = state
+            .inner
+            .placement_bindings
+            .lock()
+            .expect("placement bindings")
+            .get(&work_order_id)
+            .cloned()
+            .expect("placement binding");
+        let placement = BoundPlacement {
+            request,
+            decision,
+            decision_digest: placement_binding.decision_digest,
+        };
+        let first =
+            resolve_dispatch_binding(&state, &work_order_id, &accepted, &placement, &node.node_id)
+                .expect("dispatch binding resolves");
+        let repeated =
+            resolve_dispatch_binding(&state, &work_order_id, &accepted, &placement, &node.node_id)
+                .expect("bound instance remains eligible");
+        assert_eq!(repeated.instance_id, first.instance_id);
+        assert_eq!(repeated.resident_origin, first.resident_origin);
+
+        let mut origin_mismatch = first.clone();
+        origin_mismatch.resident_origin = "http://127.0.0.1:18092".to_string();
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .insert(work_order_id.clone(), origin_mismatch.clone());
+        let origin_error =
+            ensure_bound_instance_eligible(&state, &accepted, &placement, &origin_mismatch)
+                .expect_err("resident origin substitution rejected");
+        assert_eq!(origin_error.body.code, "resident_origin_binding_mismatch");
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .insert(work_order_id.clone(), first.clone());
+
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .get_mut(&work_order_id)
+            .expect("dispatch binding")
+            .work_order_payload_digest = "blake3:tampered".to_string();
+        let replacement = match resolve_dispatch_binding(
+            &state,
+            &work_order_id,
+            &accepted,
+            &placement,
+            &node.node_id,
+        ) {
+            Ok(_) => panic!("dispatch binding replacement accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(replacement.body.code, "dispatch_binding_replacement");
+        state
+            .inner
+            .dispatch_bindings
+            .lock()
+            .expect("dispatch bindings")
+            .insert(work_order_id.clone(), first.clone());
+
+        let mut offline_health = instance.health;
+        offline_health.status = HealthStatus::Offline;
+        state
+            .inner
+            .registry
+            .record_instance_heartbeat_received_at(
+                InstanceHeartbeat {
+                    node_id: node.node_id.clone(),
+                    instance_id: instance.instance_id,
+                    health: offline_health,
+                    recorded_at: OffsetDateTime::now_utc(),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .expect("unhealthy heartbeat recorded");
+        let ineligible = match resolve_dispatch_binding(
+            &state,
+            &work_order_id,
+            &accepted,
+            &placement,
+            &node.node_id,
+        ) {
+            Ok(_) => panic!("bound unhealthy instance accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            ineligible.body.code,
+            "bound_resident_instance_no_longer_eligible"
+        );
+    }
+
+    #[test]
+    fn resident_dispatch_error_and_status_taxonomy_is_total_and_fail_closed() {
+        let cases = [
+            (ResidentHttpError::InvalidUrl, "invalid_resident_url", false),
+            (
+                ResidentHttpError::Transport {
+                    timeout: true,
+                    request_sent: false,
+                },
+                "resident_timeout",
+                false,
+            ),
+            (
+                ResidentHttpError::Transport {
+                    timeout: false,
+                    request_sent: true,
+                },
+                "resident_transport_failure",
+                true,
+            ),
+            (
+                ResidentHttpError::ResponseTooLarge,
+                "resident_response_too_large",
+                true,
+            ),
+            (
+                ResidentHttpError::UnexpectedStatus {
+                    status: 403,
+                    upstream_code: Some("resident_scope_denied".to_string()),
+                },
+                "resident_rejected_request",
+                true,
+            ),
+            (
+                ResidentHttpError::InvalidResponse,
+                "resident_invalid_response",
+                true,
+            ),
+        ];
+        for (error, reason, effect_may_have_occurred) in cases {
+            assert_eq!(resident_http_error_reason(&error), reason);
+            assert_eq!(error.effect_may_have_occurred(), effect_may_have_occurred);
+            assert_ne!(
+                resident_http_error("create", error, false).status,
+                StatusCode::OK
+            );
+        }
+        let effect_unknown = resident_http_error(
+            "start",
+            ResidentHttpError::Transport {
+                timeout: true,
+                request_sent: true,
+            },
+            true,
+        );
+        assert_eq!(effect_unknown.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(effect_unknown.body.code, "resident_start_effect_unknown");
+
+        for (status, expected) in [
+            (crate::RunStatus::Pending, RunStatus::Pending),
+            (crate::RunStatus::Running, RunStatus::Running),
+            (crate::RunStatus::Paused, RunStatus::Paused),
+            (
+                crate::RunStatus::WaitingForApproval,
+                RunStatus::WaitingForApproval,
+            ),
+            (crate::RunStatus::Interrupted, RunStatus::Interrupted),
+            (crate::RunStatus::Resuming, RunStatus::Resuming),
+            (crate::RunStatus::Completed, RunStatus::Completed),
+            (crate::RunStatus::Failed, RunStatus::Failed),
+            (crate::RunStatus::Cancelled, RunStatus::Cancelled),
+            (crate::RunStatus::Denied, RunStatus::Denied),
+            (crate::RunStatus::Expired, RunStatus::Expired),
+        ] {
+            assert_eq!(telemetry_run_status(&status), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_transport_disables_redirects_and_bounds_response_bodies() {
+        assert_eq!(
+            bounded_upstream_code("resident_scope_denied".to_string()).as_deref(),
+            Some("resident_scope_denied")
+        );
+        assert!(bounded_upstream_code("x".repeat(129)).is_none());
+        assert!(bounded_upstream_code("unsafe code\n".to_string()).is_none());
+        let app = Router::new()
+            .route(
+                "/redirect",
+                post(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "http://127.0.0.1:1/never")],
+                        Json(serde_json::json!({"redirect": true})),
+                    )
+                }),
+            )
+            .route(
+                "/large",
+                post(|| async { (StatusCode::OK, "x".repeat(1024)) }),
+            )
+            .route(
+                "/malformed",
+                post(|| async { (StatusCode::OK, "not-json") }),
+            )
+            .route(
+                "/extra",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "request_id": "request",
+                        "idempotency_key": "idempotency",
+                        "idempotency_receipt_id": "receipt",
+                        "duplicate": false,
+                        "run_id": "44444444-4444-4444-8444-444444444444",
+                        "status": "pending",
+                        "reflected_authorization": "must-not-be-retained"
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("transport listener");
+        let address = listener.local_addr().expect("transport address");
+        let base_url = format!("http://{address}");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("transport server remains available");
+        });
+
+        let signer = CallerTokenSigner::generate_for_test(
+            "urn:splendor:manager:transport-test",
+            "transport-manager",
+            "transport-client",
+            "transport-key",
+        )
+        .expect("transport signer");
+        let state = ManagerState::local_acceptance_with_dispatch(
+            signer,
+            ResidentDispatchOptions {
+                maximum_response_bytes: 512,
+                allowed_origins: vec![base_url.clone()],
+                ..ResidentDispatchOptions::loopback_test()
+            },
+        )
+        .expect("transport manager");
+        let tenant_id = TenantId::new();
+        let instance_id = InstanceId::new();
+        let caller = state
+            .inner
+            .resident_dispatch
+            .signed_caller(&tenant_id, &instance_id, EndpointScope::RunsCreate)
+            .expect("transport caller");
+        let redirected = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/redirect",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("redirect is returned, never followed");
+        assert!(matches!(
+            redirected,
+            ResidentHttpError::UnexpectedStatus { status: 307, .. }
+        ));
+
+        let oversized = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/large",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("large response rejected before decoding");
+        assert!(matches!(oversized, ResidentHttpError::ResponseTooLarge));
+        let malformed = state
+            .inner
+            .resident_dispatch
+            .post_json::<serde_json::Value>(
+                &base_url,
+                "/malformed",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("malformed success is never accepted");
+        assert!(matches!(malformed, ResidentHttpError::InvalidResponse));
+        let unknown_field = state
+            .inner
+            .resident_dispatch
+            .post_json::<ResidentCreateRunResponse>(
+                &base_url,
+                "/extra",
+                &caller.encoded,
+                &serde_json::json!({}),
+                StdDuration::from_secs(1),
+                reqwest::StatusCode::OK,
+            )
+            .await
+            .expect_err("unknown success fields are never accepted or retained");
+        assert!(matches!(unknown_field, ResidentHttpError::InvalidResponse));
+        assert!(matches!(
+            validate_resident_url(
+                &reqwest::Url::parse("http://192.0.2.1:8077").expect("url"),
+                true,
+                &HashSet::new(),
+            ),
+            Err(ResidentHttpError::InvalidUrl)
+        ));
+        let allowed = &state.inner.resident_dispatch.allowed_origins;
+        for hostile in [
+            format!("http://user@{address}"),
+            format!("{base_url}/path"),
+            format!("{base_url}?next=https://attacker.invalid"),
+            format!("{base_url}#fragment"),
+            "http://127.0.0.1:1".to_string(),
+        ] {
+            assert!(matches!(
+                validate_resident_url(
+                    &reqwest::Url::parse(&hostile).expect("syntactically valid hostile URL"),
+                    true,
+                    allowed,
+                ),
+                Err(ResidentHttpError::InvalidUrl)
+            ));
+        }
+        assert!(canonical_allowed_origins(&["http://127.0.0.1:8077".to_string()], false).is_err());
+        assert!(canonical_allowed_origins(
+            &[
+                "https://resident.example:8443".to_string(),
+                "https://resident.example:8443/".to_string()
+            ],
+            false
+        )
+        .is_err());
+        server.abort();
+    }
+
+    #[test]
+    fn terminal_dispatch_storage_failure_quarantines_duplicate_execution() {
+        let state = ManagerState::local_acceptance();
+        let mut reservation = reserve_dispatch(&state, "wo_quarantined").expect("reservation");
+        let poison_state = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_state
+                .inner
+                .dispatch_state
+                .lock()
+                .expect("terminal failure lock");
+            panic!("poison terminal dispatch storage for fail-closed test");
+        })
+        .join();
+
+        let error = persist_terminal_dispatch_failure(
+            &state,
+            "wo_quarantined",
+            ManagerApiError::bad_gateway("resident_start_rejected", "start rejected"),
+            &mut reservation,
+        );
+        assert_eq!(error.body.code, "dispatch_terminal_state_unavailable");
+        assert!(!reservation.release_on_drop);
+        drop(reservation);
+        let duplicate = match reserve_dispatch(&state, "wo_quarantined") {
+            Err(error) => error,
+            Ok(_) => panic!("quarantined dispatch must remain in flight"),
+        };
+        assert_eq!(duplicate.body.code, "dispatch_lock");
     }
 }

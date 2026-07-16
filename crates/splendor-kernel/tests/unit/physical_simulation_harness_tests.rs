@@ -149,13 +149,20 @@ impl PhysicalSimulationHarness {
                 tenant_id: self.tenant_id.clone(),
                 agent_id: self.agent_id.clone(),
                 run_id: self.run_id.clone(),
+                tick_id: None,
                 action: action.clone(),
                 adapter: Some(ROBOTICS_ADAPTER_ID.to_string()),
                 quota_usage: QuotaUsage::single_action(),
                 satisfied_preconditions,
                 requested_at: OffsetDateTime::now_utc(),
+                physical_action_resource_coordinate: Some(
+                    splendor_types::PhysicalActionResourceCoordinate::physical_node(
+                        splendor_types::NodeId::new(),
+                    ),
+                ),
                 approval_evidence: None,
                 authority_obligation_evidence: None,
+                authority_obligation_receipts: Vec::new(),
             })
             .expect("gateway outcome");
         self.record_gateway_outcome(action, &outcome);

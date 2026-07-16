@@ -27,12 +27,21 @@ silently falls back to unauthenticated communication. Explicit insecure local
 development mode remains a daemon-side security-boundary contract; this client does not
 turn it on implicitly.
 
+Bearer transport requires an absolute HTTPS base URL. Plain HTTP is accepted
+only for explicit `localhost`, `127.0.0.1`, or `[::1]` local development. The
+constructor rejects remote HTTP, relative URLs, unsupported schemes, URL
+userinfo/passwords, query, and fragment before any request. URL path prefixes
+such as `/v1` remain supported.
+
 Every request includes:
 
 - `Authorization: Bearer <token>`
 - `Accept: application/json`
 - `X-Splendor-API-Version: <apiVersion>`
 - `X-Splendor-Client: @splendor/client`
+
+Every credentialed Fetch call also sets `redirect: "error"`; bearer headers are
+never forwarded by an automatic redirect.
 
 Stable 0.1 clients should send `apiVersion: "0.1"` when targeting a daemon that
 documents 0.1 compatibility. Current implementation limitation: the daemon does
@@ -80,6 +89,11 @@ not authorize a run by itself. The client uses the Rust daemon's flattened
 `POST /runs` work within the daemon's create-run idempotency scope. A retry with
 the same key and scope receives the same run/receipt with `duplicate: true`; key
 reuse for a different scope fails closed.
+
+Resident mutating bearer JTIs are one-use. A safe create retry therefore uses a
+fresh bearer while preserving the same request/idempotency keys and authority;
+the daemon deliberately excludes the ephemeral JTI correlation digest from the
+durable create scope. Read-only requests may reuse an unexpired token.
 
 The client performs only structural fail-closed checks before sending the
 request: signature metadata must be present, `schema_version`, `work_order_id`,
