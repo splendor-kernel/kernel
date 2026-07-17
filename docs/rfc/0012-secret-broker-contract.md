@@ -1947,6 +1947,12 @@ checkpoint,
 local fence revision, truthful `completed_at`, owner identity/audience/expiry,
 and receipt digest plus authentication evidence.
 
+For each completion receipt, the owner's `revision_before` must equal the exact
+matching command `expected_revision`, and `revision_after` must equal
+`revision_before + 1`. A receipt that merely advances some other current revision,
+or whose command expected revision differs, is stale/conflicting and leaves every
+publication fence closed.
+
 Authority validates every arm-applicable complete receipt, every expected
 revision, all terminal and projection facts, and the exact response-set digest.
 In one Authority-only expected-revision CAS it stores the immutable
@@ -3600,7 +3606,9 @@ index key, not authority or a public correlation value.
 `splendor.secret.action_submission_hot_index.v1` contains exactly its schema,
 trusted-partition digest, `secret_action_submission_id`,
 `state: SecretActionSubmissionState`,
-submission semantic digest, optional terminal-intent digest, and, only after
+submission semantic digest, required
+`publication_history: PublicationHistoryV1`, optional terminal-intent digest,
+and, only after
 private outer-receipt commit, receipt ID/digest, final status, and outer certainty,
 or, for cancellation, the exact cancellation event/intent binding with explicit
 receipt/status `not_applicable`.
@@ -3695,7 +3703,13 @@ state_then_agent {
 `state_then_agent` is legal only for ordinary/challenge tick episodes. In either
 tag, a receipt-present binding requires its matching command-present binding,
 identical command ID/digest, and successor revision exactly one greater than its
-positive predecessor. In `state_then_agent`, Agent command-present additionally
+positive predecessor. Every completion receipt additionally requires
+`revision_before` equal to its matching command's `expected_revision`; therefore
+`state_service_revision_before == expected_state_service_revision`, or
+`agent_instance_controller_revision_before` equals
+`expected_agent_instance_controller_revision`, as applicable, and
+`revision_after == revision_before + 1`. In `state_then_agent`, Agent
+command-present additionally
 requires State receipt-present with exactly the repeated State receipt ID/digest.
 Thus legal completion prefixes are empty, State command, State receipt, Agent
 command, Agent receipt for `state_then_agent`, and empty, Agent command, Agent
@@ -3744,7 +3758,7 @@ command. `not_started` is legal only before that owner's arm command. An arm is
 forbidden before preparation and prepare receipt are both present and every
 applicable completion receipt is present. There is no generic owner map.
 
-The one `publication_binding` is exactly:
+The closed `PublicationEpisodeBindingV1` is exactly:
 
 ```text
 not_started {kind="not_started",owner_profile="agent_only"|"state_then_agent"}
@@ -3789,21 +3803,74 @@ retains every known prefix field exactly, the overflow and digest of the last
 complete progress object, and an absent final authorization forever. It cannot
 discard a known command/receipt/arm pointer or accept a later one.
 
-The state-to-publication matrix is exact:
+`PublicationHistoryV1` is the one reusable closed publication-history type. The
+hot index and direct/tick outer tombstone use this exact type byte-for-byte; a
+tombstone cannot define a shorter alias. It has exactly these three disjoint
+tags:
 
-| Submission state | Required ordered episode publication bindings | Forbidden |
+```text
+single_episode {
+  kind="single_episode", episode_ordinal=1,
+  episode: PublicationEpisodeBindingV1
+}
+
+approval_challenge_only {
+  kind="approval_challenge_only", challenge_episode_ordinal=1,
+  challenge_episode: PublicationEpisodeBindingV1
+}
+
+approval_challenge_and_final {
+  kind="approval_challenge_and_final", challenge_episode_ordinal=1,
+  challenge_episode: PublicationEpisodeBindingV1,
+  final_episode_ordinal=2,
+  final_episode: PublicationEpisodeBindingV1
+}
+```
+
+In both approval tags, `challenge_episode` is a complete `released` episode with
+`released_submission_state="awaiting_approval"`. In
+`approval_challenge_and_final`, it is byte-for-byte identical to the immutable
+challenge episode previously stored in `approval_challenge_only`, including the
+same preparation, prepare-receipt, completion, arm, authorization, and response-
+set bindings. The final episode uses fresh episode-scoped IDs and authorization;
+it cannot reorder, replace, or reuse the challenge authorization. No tag permits
+an open array, null, an omitted episode, a generic ID/digest, ordinal zero, an
+ordinal other than the literals above, a third episode, or reused authorization.
+
+The named `publication_episode_digest` is the common C03 digest of exact closed
+projection `splendor.secret.publication_episode_digest.v1`, containing its schema,
+literal episode ordinal, and the complete `PublicationEpisodeBindingV1`; the
+digest output is external. The named `publication_history_digest` similarly uses
+exact closed projection `splendor.secret.publication_history_digest.v1`, containing
+its schema and the complete `PublicationHistoryV1`; its output is external. Once
+an approval challenge is released, every later hot-index CAS preserves the exact
+challenge bytes and extends only by changing the history tag once from
+`approval_challenge_only` to `approval_challenge_and_final` with the final episode
+initially `not_started`.
+
+The state-to-history matrix is total and disjoint:
+
+| Submission state and challenge history | Required `PublicationHistoryV1` tag and episode arm | Forbidden |
 | --- | --- | --- |
-| `accepted|in_progress|uncertain|reconciling` without a released challenge | One `not_started`. | `progress`, `released`, `permanently_withheld`. |
-| `terminalizing` | One `progress` for the current episode. | `not_started`, `released`, `permanently_withheld`. |
-| `awaiting_approval` | One released challenge entry. | A final-episode entry. |
-| `continuing|uncertain|reconciling` after a released challenge | Released challenge first, then one `not_started` final entry. | Reordered/reused challenge authorization or final progress. |
-| `terminalizing` after a released challenge | Released challenge first, then one `progress` final entry. | Reordered entries or a third episode. |
-| `terminal|cancelled` | One released final entry, or released challenge then released final entry. | `not_started`, `progress`, `permanently_withheld`. |
-| `publication_withheld` | One permanently-withheld entry, or released challenge then permanently-withheld final entry. | Present final authorization in the withheld entry, later progress, or a third episode. |
+| `accepted|in_progress` without a released challenge | `single_episode`; episode 1 `not_started`. | Either approval tag or any progress/release/withheld arm. |
+| `uncertain|reconciling` without a released challenge | `single_episode`; episode 1 `not_started`. | Either approval tag or discarding an already-known episode prefix. |
+| `uncertain|reconciling` with a released challenge | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `not_started` at ordinal 2. | Challenge-only, replacement/reordering, final progress, or a third episode. |
+| `terminalizing` without a released challenge | `single_episode`; episode 1 `progress`. | `not_started`, `released`, or `permanently_withheld`. |
+| `terminalizing` with a released challenge | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `progress` at ordinal 2. | Challenge-only, replacement/reordering, or a third episode. |
+| `awaiting_approval` | `approval_challenge_only`; immutable released challenge at ordinal 1. | A final episode or any non-released challenge. |
+| `continuing` | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `not_started` at ordinal 2. | Challenge-only, final progress/release/withholding, or a third episode. |
+| `terminal` without a released challenge | `single_episode`; episode 1 `released` with `released_submission_state="terminal"`. | Either approval tag or any non-released arm. |
+| `terminal` with a released challenge | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `released` with `released_submission_state="terminal"` at ordinal 2. | Challenge-only, replacement/reordering, or any non-released final. |
+| `cancelled` without a released challenge | `single_episode`; episode 1 `released` with `released_submission_state="cancelled"`. | Either approval tag or any non-released arm. |
+| `cancelled` with a released challenge | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `released` with `released_submission_state="cancelled"` at ordinal 2. | Challenge-only, replacement/reordering, or any non-released final. |
+| `publication_withheld` without a released challenge | `single_episode`; episode 1 `permanently_withheld`. | A final authorization, later progress/release, or either approval tag. |
+| `publication_withheld` with a released challenge | `approval_challenge_and_final`; immutable released challenge at ordinal 1 and final `permanently_withheld` at ordinal 2. | Challenge-only, replacement/reordering, a final authorization, later progress/release, or a third episode. |
 
 A preparation pointer or arm acknowledgement never satisfies a released read.
-No state permits null, a generic ID/digest, an open map, an omitted required tag,
-or a field belonging to another publication arm.
+No state permits null, a generic ID/digest, an open map/array, an omitted required
+tag, or a field belonging to another publication arm or history tag. Validation
+selects exactly one matrix row; rows cannot be unioned to discard a released
+challenge or weaken the final episode.
 The hot index contains no use summary, event list, evidence, output, provider/node detail,
 or error text and is never itself terminal evidence. The complete immutable
 receipt, terminal intent, and pending/outcome record live in quota-controlled
@@ -5624,7 +5691,7 @@ The tagged `domain_binding` union is complete:
 | --- | --- | --- | --- | --- |
 | `direct_outer` | `trusted_partition_digest` from `splendor.secret.action_submission_partition_digest.v1`; direct idempotency key and submission ID | exact direct ingress digest, direct semantic request digest, outer-idempotency digest, wrapper digest, and submission digest | original closed action-or-invocation effect coordinate | `terminal|effect_uncertain|cancelled|publication_withheld`; `splendor.secret.outer_tombstone_disposition_digest.v1` |
 | `tick_outer` | the same submission partition profile; observation ID, submission ID, run/tick/ordinal | policy-output digest, retained-candidate digest, candidate-semantic digest, tick-key digest, observation-link-receipt digest, outer-idempotency digest, wrapper digest, and submission digest | original closed action-or-invocation effect coordinate | `terminal|effect_uncertain|cancelled|publication_withheld`; `splendor.secret.outer_tombstone_disposition_digest.v1` |
-| `approval_challenge_continuation` | original submission partition digest; continuation, submission, approval, obligation, and authority-decision IDs plus `receipt_id_binding`, exactly `absent {kind="absent"}` or `present {kind="present",receipt_id}` | approval-challenge digest, approval-continuation semantic digest, original wrapper digest, original submission digest, and `continuation_receipt_digest_binding`, exactly `absent {kind="absent"}` or `present {kind="present",continuation_receipt_digest}` matching the receipt-ID tag | complete original action/invocation coordinate plus exact challenge/obligation coordinate | `terminal|effect_uncertain|cancelled|denied|expired|revoked`; `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` |
+| `approval_challenge_continuation` | original submission partition digest; continuation, submission, approval, obligation, and authority-decision IDs plus `receipt_id_binding`, exactly `absent {kind="absent"}` or `present {kind="present",receipt_id}` | approval-challenge digest, approval-continuation semantic digest, original wrapper digest, original submission digest, and `continuation_receipt_digest_binding`, exactly `absent {kind="absent"}` or `present {kind="present",continuation_receipt_digest}` matching the receipt-ID tag | complete original action/invocation coordinate plus exact challenge/obligation coordinate | `terminal|effect_uncertain|cancelled|denied|expired|revoked|publication_withheld`; `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` |
 | `provider_control` | `splendor.secret.provider_control_partition_digest.v1`; provider-control invocation ID | provider-control plan digest and trusted partition digest | provider trust scope, provider ID, route ID/revision, operation, and complete target-scope digest | `terminal|effect_uncertain|reconciliation_exhausted`; `splendor.secret.provider_control_tombstone_disposition_digest.v1` |
 | `node_control_target_generation` | `splendor.secret.node_control_partition_digest.v1`; node-control invocation ID, exposure-lineage ID, and target generation | node-control plan digest, target-binding digest, and trusted partition digest | tenant/node/instance, exposure-lineage ID, target generation, operation, and target-binding digest | `terminal|effect_uncertain|reconciliation_exhausted`; `splendor.secret.node_control_tombstone_disposition_digest.v1` |
 | `tick_observation` | `splendor.secret.tick_candidate_observation_partition_digest.v1`; observation ID and run/tick/ordinal | policy-output, retained-candidate, and candidate-semantic digests | `observation {run_id,tick_id,candidate_ordinal}`; never an action/invocation | `expired_unclaimed|linked_submission_terminal|linked_submission_uncertain`; `splendor.secret.tick_observation_tombstone_disposition_digest.v1` |
@@ -5731,8 +5798,8 @@ Omission, null, a generic `id` or `digest` field name, and cross-tag fields reje
 
 | Projection schema | Exact top-level fields in addition to `schema_version` |
 | --- | --- |
-| `splendor.secret.outer_tombstone_disposition_digest.v1` | `secret_action_submission_id`, `disposition`, `final_status_binding`, `outer_effect_certainty`, `terminal_intent_binding`, `delivery_receipt_binding`, `outer_terminal_event_binding`, `cancellation_binding`, `publication_binding` |
-| `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` | `secret_approval_continuation_id`, `secret_action_submission_id`, `approval_id`, `obligation_id`, `authority_decision_id`, `disposition`, `challenge_binding`, `receipt_claim_binding`, `final_delivery_receipt_binding`, `final_outer_event_binding`, `completion_time_binding`, `cancellation_event_binding` |
+| `splendor.secret.outer_tombstone_disposition_digest.v1` | `secret_action_submission_id`, `disposition`, `final_status_binding`, `outer_effect_certainty`, `terminal_intent_binding`, `delivery_receipt_binding`, `outer_terminal_event_binding`, `cancellation_binding`, `publication_history`, `exposure_binding`, `approval_continuation_tombstone_binding` |
+| `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` | `secret_approval_continuation_id`, `secret_action_submission_id`, `approval_id`, `obligation_id`, `authority_decision_id`, `disposition`, `challenge_binding`, `receipt_claim_binding`, `final_delivery_receipt_binding`, `final_outer_event_binding`, `completion_time_binding`, `cancellation_event_binding`, `publication_causality_binding` |
 | `splendor.secret.provider_control_tombstone_disposition_digest.v1` | `provider_control_invocation_id`, `disposition`, `result_binding`, `provider_audit_binding`, `post_evidence_binding`, `terminal_intent_binding`, `completed_event_binding`, `reconciliation_exhausted_binding`, `authority_lifecycle_event_refs`, `reconciliation_event_refs` |
 | `splendor.secret.node_control_tombstone_disposition_digest.v1` | `node_control_invocation_id`, `secret_exposure_lineage_id`, `target_generation`, `retry_profile`, `disposition`, `result_binding`, `post_evidence_binding`, `terminal_intent_binding`, `node_control_receipt_binding`, `completed_event_binding`, `reconciliation_exhausted_binding`, `authority_lifecycle_event_refs`, `reconciliation_event_refs` |
 | `splendor.secret.tick_observation_tombstone_disposition_digest.v1` | `secret_tick_candidate_observation_id`, `owner_partition_digest`, `policy_output_digest`, `retained_candidate_digest`, `candidate_semantic_digest`, `disposition`, `terminal_binding` |
@@ -5754,26 +5821,15 @@ The exact tagged nested objects and state rules are:
   `released {kind="released",cancellation_event_ref,cancellation_intent_digest,
   cancellation_state_revision,secret_publication_authorization_id,
   publication_authorization_digest}`. The released authorization IDs/digests
-  must equal the cancellation-profile publication binding; the `intent` tag
-  contains no authorization field and is legal only for a permanently withheld
-  cancellation profile. `publication_binding` is exactly
-  `unreleased {kind="unreleased"}`, exactly
-  `released {kind="released",secret_publication_preparation_id,
-  publication_preparation_digest,secret_publication_prepare_receipt_id,
-  publication_prepare_receipt_digest,secret_publication_authorization_id,
-  publication_authorization_digest,terminal_retry_decision_digest,
-  owner_completion_bindings,owner_arm_progress,exposure_binding}`, or exactly
-  `permanently_withheld {kind="permanently_withheld",
-  preparation_binding,prepare_receipt_binding,response_set_digest_binding,
-  terminal_retry_decision_digest_binding,owner_completion_bindings,
-  owner_arm_progress,terminalization_overflow_ref,
-  terminalization_overflow_digest,last_publication_progress_digest,
-  final_authorization_binding={kind="absent"}}`. Every nested preparation,
-  prepare-receipt, response-set, retry-decision, owner-completion, and owner-arm
-  value is the exact closed hot-index type above; a tombstone does not define a
-  shorter alias. Receipt-present requires matching preparation-present, and every
-  owner prefix/order/revision invariant still applies.
-  The released `exposure_binding` is exactly
+  must equal the cancellation-profile released final episode in
+  `publication_history`; the `intent` tag contains no authorization field and is
+  legal only for a permanently withheld cancellation profile.
+
+  `publication_history` is exactly `PublicationHistoryV1` from the hot index,
+  with no tombstone-specific alias, omission, compression, or reordered episode.
+  It retains `absorbing_withheld_revision` inside every
+  `permanently_withheld` episode. `exposure_binding` is exactly
+  `unreleased {kind="unreleased"}` or
   `pre_effect {kind="pre_effect",disposition="no_effect",empty_use_projection_digest}`,
   exactly `trusted_injection {kind="trusted_injection",
   disposition="publishable",sealed_output_digest_binding}`, where the nested
@@ -5782,14 +5838,27 @@ The exact tagged nested objects and state rules are:
   disposition="target_publication_suppressed",
   material_exposure_suppressed_projection_digest}`. Cross-tag fields are
   forbidden and the exposure tag must equal the generated terminal profile's
-  exposure arm. The outer field matrix is exact:
+  exposure arm. `approval_continuation_tombstone_binding` is exactly
+  `not_applicable {kind="not_applicable"}` when the history has no released
+  challenge or exactly
+  `present {kind="present",secret_approval_continuation_id,
+  secret_consumed_effect_tombstone_id,
+  approval_continuation_tombstone_integrity_digest,publication_history_digest}`.
+  The present ID/digest must resolve to the already-committed and re-read
+  `approval_challenge_continuation` tombstone for the same submission, and its
+  history digest must equal the complete `publication_history` carried here.
+  The outer field matrix is exact:
 
-  | Outer disposition | Required exact bindings | Forbidden exact bindings |
+  | Outer disposition and challenge history | Required exact bindings | Forbidden exact bindings |
   | --- | --- | --- |
-  | `terminal` | Present final status, terminal intent, delivery receipt, outer terminal event, and profile-matching released publication; `cancellation_binding={kind="absent"}`. | Unreleased/permanently-withheld publication and every cancellation field. |
-  | `effect_uncertain` | `outer_effect_certainty="uncertain"`; every known final-status/intent/receipt/event pointer preserved under its exact absent/present tag; `publication_binding={kind="unreleased"}` and cancellation absent. | Released or permanently-withheld publication, cancellation intent/release, and invented known pointers. |
-  | `cancelled` | `outer_effect_certainty="none"`; final status, delivery receipt, outer effect-terminal event, and ordinary terminal intent all absent; cancellation binding released; profile-matching released cancellation publication. | Action final result/receipt/effect-terminal event, an ordinary terminal intent, unreleased/withheld publication, or a second authorization. |
-  | `publication_withheld` | `outer_effect_certainty="uncertain"`; final status, delivery receipt, and outer terminal event absent; exact permanently-withheld publication with overflow/last-progress and absent final authorization; terminal intent present only when its private non-result digest was durable; cancellation binding absent for non-cancellation profiles or exact `intent` for a withheld cancellation profile. | Released publication, cancellation `released`, final authorization/result/receipt/status, or relabeling as `terminal|effect_uncertain|cancelled`. |
+  | `terminal` without released challenge | Present final status, terminal intent, delivery receipt, outer terminal event, `single_episode` with released terminal episode, profile-matching released exposure, cancellation absent, and continuation tombstone `not_applicable`. | Approval history, unreleased/withheld episode or exposure, and every cancellation field. |
+  | `terminal` with released challenge | The same terminal fields plus `approval_challenge_and_final` with immutable released challenge and released terminal final, profile-matching released exposure, and present verified continuation-tombstone binding with the identical history digest. | Challenge-only history, substituted/reordered challenge, unreleased/withheld final, absent continuation tombstone, or cancellation fields. |
+  | `effect_uncertain` without released challenge | `outer_effect_certainty="uncertain"`; every known final-status/intent/receipt/event pointer preserved, `single_episode` with final `not_started`, exposure unreleased, cancellation absent, and continuation tombstone `not_applicable`. | Released/withheld episode or exposure, approval history, cancellation, and invented known pointers. |
+  | `effect_uncertain` with released challenge | The same uncertainty fields plus `approval_challenge_and_final` with immutable released challenge and final `not_started`, exposure unreleased, and present verified continuation-tombstone binding with the identical history digest. | Challenge-only history, final progress/release/withholding, absent continuation tombstone, cancellation, or invented known pointers. |
+  | `cancelled` without released challenge | `outer_effect_certainty="none"`; final status, delivery receipt, outer effect-terminal event, and ordinary terminal intent absent; cancellation released; `single_episode` with released cancelled episode, pre-effect no-effect exposure, and continuation tombstone `not_applicable`. | Action final result/receipt/effect-terminal event, ordinary intent, approval history, unreleased/withheld episode, or a second authorization. |
+  | `cancelled` with released challenge | The same cancellation fields plus `approval_challenge_and_final` with immutable released challenge and released cancelled final, pre-effect no-effect exposure, and present verified continuation-tombstone binding with the identical history digest. | Challenge-only/substituted history, absent continuation tombstone, action final fields, unreleased/withheld final, or a second authorization. |
+  | `publication_withheld` without released challenge | `outer_effect_certainty="uncertain"`; final status, delivery receipt, and outer terminal event absent; `single_episode` with exact permanently-withheld final including overflow/last-progress, absent authorization, and absorbing revision; exposure unreleased; continuation tombstone `not_applicable`; terminal intent present only when its private non-result digest was durable; cancellation absent or exact withheld `intent` as profile requires. | Released episode/exposure, cancellation `released`, final authorization/result/receipt/status, approval history, or relabeling. |
+  | `publication_withheld` with released challenge | The same withheld fields plus `approval_challenge_and_final` with immutable released challenge and exact permanently-withheld final, exposure unreleased, and present verified continuation-tombstone binding with the identical history digest. | Challenge-only/substituted history, absent continuation tombstone, released final/exposure, cancellation `released`, final authorization/result/receipt/status, or relabeling. |
 
   `cancelled` preserves the original direct/tick key, submission, semantic,
   wrapper, effect coordinate, and original direct/tick origin from the enclosing
@@ -5805,11 +5874,55 @@ The exact tagged nested objects and state rules are:
   `present {kind="present",delivery_receipt_id,receipt_digest}`;
   `final_outer_event_binding` and `cancellation_event_binding` are each `absent`
   or `present {kind="present",causal_ref}`; and `completion_time_binding` is
-  `absent` or `present {kind="present",completed_at}`. `cancelled` requires cancellation event
-  and completion time and forbids receipt/final-pair bindings. `denied|expired|
-  revoked` require the exact no-effect final receipt/event and completion time.
-  `terminal|effect_uncertain` preserve the exact claim and every known final or
-  uncertain pointer; terminal requires all final bindings.
+  `absent` or `present {kind="present",completed_at}`.
+
+  `publication_causality_binding` is the named closed
+  `ApprovalContinuationPublicationCausalityBindingV1` and is exactly one of:
+
+  ```text
+  final_released {
+    kind="final_released",publication_history_digest,
+    challenge_episode_ordinal=1,challenge_episode_digest,
+    final_episode_ordinal=2,final_episode_digest,
+    continuation_disposition="terminal"|"cancelled"|"denied"|"expired"|"revoked",
+    released_submission_state="terminal"|"cancelled",
+    secret_publication_authorization_id,publication_authorization_digest
+  }
+
+  final_not_started {
+    kind="final_not_started",publication_history_digest,
+    challenge_episode_ordinal=1,challenge_episode_digest,
+    final_episode_ordinal=2,final_episode_digest,owner_profile
+  }
+
+  final_permanently_withheld {
+    kind="final_permanently_withheld",publication_history_digest,
+    challenge_episode_ordinal=1,challenge_episode_digest,
+    final_episode_ordinal=2,final_episode_digest,
+    terminalization_overflow_ref,terminalization_overflow_digest,
+    last_publication_progress_digest,absorbing_withheld_revision
+  }
+  ```
+
+  Every tag binds the frozen complete
+  `approval_challenge_and_final` history digest, the exact released challenge
+  episode digest at ordinal 1, and the exact final episode digest at ordinal 2.
+  `final_released` is required for `terminal|cancelled|denied|expired|revoked`;
+  its continuation disposition equals the enclosing tombstone disposition,
+  `cancelled` alone uses released state `cancelled`, and the other four use
+  released state `terminal`. `final_not_started` is required only for
+  `effect_uncertain`. `final_permanently_withheld` is required only for
+  `publication_withheld` and repeats exactly the final episode's overflow,
+  last-progress, and positive absorbing revision. No continuation tombstone
+  contains an outer-tombstone ID or integrity digest.
+
+  `cancelled` requires cancellation event and completion time and forbids
+  receipt/final-pair bindings. `denied|expired|revoked` require the exact no-effect
+  final receipt/event and completion time. `terminal|effect_uncertain` preserve
+  the exact claim and every known final or uncertain pointer; terminal requires
+  all final bindings. `publication_withheld` preserves every exact known pointer,
+  requires the final permanently-withheld causality tag, and forbids a final
+  receipt/event/completion invented after overflow.
 - Provider `result_binding` is `absent` or
   `present {kind="present",outcome,retry_count,effect_certainty,
   provider_audit_id,provider_control_result_digest}`. Terminal intent uses
@@ -5919,7 +6032,16 @@ protected output, target-controlled status/error, action params, complete secret
 requirements, ref/lease/handle/provider metadata beyond the minimum closed
 route/effect coordinate, evidence body, raw receipt, credential, material,
 endpoint, locator, or error. Maximum canonical size is 2 KiB and V1 pins every
-maximum tag.
+maximum tag. The maximum direct/tick outer fixture includes the complete largest
+legal `PublicationHistoryV1`, present approval-continuation tombstone binding, and
+largest other legal outer fields and must remain at or below 2 KiB; cap-plus-one
+rejects. The history is nested in the already-counted outer tombstone, not retained
+as a second record or marker. The continuation causality binding is likewise
+nested in its already-counted continuation tombstone. Consequently these richer
+bindings consume no additional hot, record, bundle, tombstone, or marker slot and
+the generated `67/1,278/17,596/22,624/66` vector remains unchanged; failure of
+either exact maximum fixture invalidates that vector and blocks activation rather
+than permitting truncation or an implicit retained copy.
 
 `tombstone_integrity_digest` is the output of closed projection
 `splendor.secret.consumed_effect_tombstone_integrity_digest.v1`, containing
@@ -5976,6 +6098,37 @@ separate retirement pool; it never masquerades as a normal or emergency marker.
 Full or uncertain capacity rejects the new identity before acceptance/effect; it
 never deletes an existing marker or borrows another pool.
 
+Approval-parent tombstone publication causality is acyclic and exact. For every
+terminal, cancelled, denied, expired, revoked, effect-uncertain, or
+publication-withheld approval final eligible for protected deletion, Authority:
+
+1. freezes and re-reads the complete `approval_challenge_and_final`
+   `PublicationHistoryV1` from the hot index and computes both episode digests and
+   `publication_history_digest`; no later CAS may change either episode;
+2. insert-or-verifies and re-reads the `approval_challenge_continuation` tombstone
+   first. Its named `publication_causality_binding` commits that frozen history
+   digest and the exact final episode disposition but contains no future outer-
+   tombstone ID or integrity digest;
+3. only then insert-or-verifies the direct/tick outer tombstone. Its disposition
+   contains the complete byte-identical publication history and binds the already-
+   verified continuation tombstone ID/integrity digest plus the identical history
+   digest; and
+4. re-reads both tombstones and cross-checks original submission, continuation,
+   approval, obligation, authority-decision, challenge outcome/event,
+   challenge/final episode ordinals and digests, final disposition, immutable
+   original origin/effect coordinate, partition, and authority domain before any
+   protected byte is deleted.
+
+The digest dependency direction is frozen episode bytes -> episode/history
+digests -> continuation disposition -> continuation tombstone integrity -> outer
+disposition -> outer tombstone integrity. Construction follows that order. No
+edge points from the continuation tombstone to a future outer tombstone, so no ID,
+placeholder, integrity digest, or transitive field can form a cycle. A missing,
+changed, reordered, differently disposed, or ambiguously acknowledged member of
+the pair leaves both protected rows pinned and rejects compaction. Lost write
+acknowledgement always resolves by same-ID exact-byte lookup and re-read; it never
+allocates a replacement tombstone or weakens the pair.
+
 The lookup rule is fail closed and precedes coordinate allocation, current
 attempt derivation, policy/provider/node work, or effect:
 
@@ -6001,9 +6154,32 @@ attempt derivation, policy/provider/node work, or effect:
 - missing, corrupt, unavailable, stale, or ambiguously replicated tombstone state
   denies every new effect in that partition. It is never treated as a miss.
 
+The existence-authorized retired terminal/cancelled lookup profile is exact. It
+returns HTTP `410`, response media type `application/json`, and the unchanged
+stable daemon `ApiError` object with `code="consumed_effect_retired"`,
+`message="consumed effect record retired"`, and `details={}`. Its RFC 8785
+canonical body is exactly these 90 unpadded ASCII bytes:
+
+```json
+{"code":"consumed_effect_retired","details":{},"message":"consumed effect record retired"}
+```
+
+The canonical fixture digest uses the common C03 rule with exact prefix
+`splendor.daemon.consumed_effect_retired_api_error.v1`, one zero byte, and those
+90 body bytes; it is exactly
+`blake3:94e1452820a671204c17e32a1ca018b4733b36c35bacce919e15ff697ca675c4`.
+The body has no C03 submission object, state, certainty, retry, receipt,
+authorization, or deleted dynamic member and is never reconstructed from one.
+An existence-hidden lookup still returns the existing padded 256-byte `404
+secret_not_available` profile. A visible same identity/effect coordinate with any
+changed accepted key, semantic field, or digest returns the existing privacy-safe
+`409` conflict with `details={}`. Neither 404 nor 409 is replaced by 410.
+
 After protected/full records are deleted, equality is exactly the complete
 domain binding, disposition digest, effect coordinate, authority domain, marker-
-slot binding, and integrity-chain position above. An incoming exact duplicate
+slot binding, integrity-chain position, complete publication-history digest, and,
+for an approval parent, both tombstone IDs/integrity digests and the continuation
+publication-causality binding above. An incoming exact duplicate
 must reproduce every required accepted binding digest and returns only the same
 restricted disposition. Any changed accepted field or digest is the domain's
 idempotency conflict. A different identity with the same effect coordinate is
@@ -6015,13 +6191,15 @@ This behavior is identical before and after restart, concurrent compaction, and
 hot-index eviction. An exact duplicate POST or GET performs lookup only and zero
 provider/node/adapter/target work; a nominally new creating POST with an already-
 consumed effect coordinate conflicts before allocation/effect. Export reports the
-verified tombstone disposition and integrity provenance but exports no deleted
+verified tombstone disposition, publication-history digest, paired-tombstone
+causality when applicable, and integrity provenance but exports no deleted
 protected member. Inspect-only replay reports the same historical disposition,
-never calls a live owner, and cannot fill a missing publication prefix or dynamic
-body. A changed key, semantic digest, wrapper, origin, effect coordinate,
-cancellation binding, publication prefix, or overflow/last-progress digest is a
-conflict, not a new request. A missing/corrupt comparator or tombstone is a
-fail-closed denial, never a miss.
+never calls a live owner, and cannot fill a missing publication history/episode
+or dynamic body. A changed key, semantic digest, wrapper, origin, effect coordinate,
+cancellation binding, publication history/episode digest, challenge/final
+ordinal, paired tombstone binding, or overflow/last-progress/absorbing revision is
+a conflict, not a new request. A missing/corrupt comparator or either required
+tombstone is a fail-closed denial, never a miss.
 
 Outer direct/tick submissions retain both key and action/invocation coordinates;
 approval tombstones retain challenge and semantic receipt coordinates; provider
@@ -6062,15 +6240,20 @@ Compaction order is deterministic and transactional:
    event integrity.
 3. Insert-or-verify the exact tombstone under unique domain/identity/effect keys
    and durably append `secret.retention.tombstone_committed` with owner, policy
-   revision, source record digest, and no protected payload. A cancelled approval
-   parent requires two distinct committed/re-read records before deletion: its
-   original direct/tick outer tombstone and its
-   `approval_challenge_continuation` tombstone. They use distinct nominal IDs,
-   domain tags, disposition projections, markers, and chains; neither satisfies,
-   aliases, or substitutes for the other.
+   revision, source record digest, and no protected payload. Every approval parent
+   in a terminal, cancelled, denied, expired, revoked, effect-uncertain, or
+   publication-withheld final disposition requires the acyclic two-tombstone
+   protocol above: continuation tombstone first, then the original direct/tick
+   outer tombstone that binds it. They use distinct nominal IDs, domain tags,
+   disposition projections, markers, and chains; neither satisfies, aliases, or
+   substitutes for the other.
 4. Re-read and verify the tombstone from the authoritative store. Only then may
-   configured retention remove protected output, full plan/result/intent/
-   evidence, observation candidate bytes, or the hot pointer, in that order.
+   configured retention remove protected response-member/output BLOBs, full
+   continuation plan/result/intent/evidence, the continuation protected row, full
+   outer plan/result/intent/evidence, the outer protected row, observation
+   candidate bytes, and finally the hot pointer, in that order. For an approval
+   parent both tombstones are committed and re-read before the first deletion;
+   each deletion restart resumes only the next item under the same pair.
 5. Append `secret.retention.full_record_deleted`; append failure leaves the
    tombstone and conservative deletion-pending state and cannot rearm work.
 
@@ -6314,7 +6497,10 @@ array to reject old IDs;
 deleted leaves and source markers are never required for lookup. The domain-
 deny lookup always precedes identity/tombstone lookup, allocation, policy,
 provider/node work, or effect. Once the verified head exists, old IDs always
-return `consumed_effect_retired`; the domain can never reopen or be reassigned.
+resolve as retired; an existence-authorized exact terminal/cancelled lookup uses
+the pinned 410 `consumed_effect_retired` profile, hidden scope remains the padded
+404 profile, and changed accepted bytes remain privacy-safe conflict. The domain
+can never reopen or be reassigned.
 
 Capacity is closed. One domain has at most 4,096 leaves; admission denies creation
 of a 4,097th distinct chain key or a 4,294,967,296th marker in one chain before
@@ -6359,7 +6545,46 @@ retirement reservation is exactly 528 KiB durable scratch: 64 * 4 KiB chunks +
 16 KiB manifest header + 4,096 * 64 bytes = 256 KiB release journal. Its hot
 scratch is exactly 448 KiB: 4,096 * 32-byte leaf digests + two 128-KiB leaf-
 serialization buffers + one 64-KiB count/release map of 4,096 fixed 16-byte
-`{leaf_index,pool_ordinal,slot_class_ordinal,marker_count,slot_count}` entries.
+entries. Each active entry has exactly this packed network-order layout and no
+other byte:
+
+```text
+byte 0..3    leaf_index:u32be
+byte 4       pool_ordinal:u8
+byte 5       slot_class_ordinal:u8
+byte 6..7    reserved_zero:u16be
+byte 8..11   marker_count:u32be
+byte 12..15  slot_count:u32be
+```
+
+`leaf_index` is zero-based and must equal the entry's array index in `0..4095`;
+entry `i` begins at byte offset `16*i` in the one exact 65,536-byte map. Active
+entries are exactly indexes `0..leaf_count-1` in canonical leaf order, have
+positive counts equal to their leaf, and require `marker_count == slot_count`.
+Every entry from `leaf_count` through 4,095 is all-zero, not an encoded active
+index. `pool_ordinal` is pinned to `0=containment_emergency`, `1=normal`.
+`slot_class_ordinal` is pool-local and zero-based. Containment-emergency ordinals
+`0..23` are, in order,
+`agent_publication_arm_acknowledgement`, `agent_publication_arm_command`,
+`agent_publication_completion_command`,
+`agent_publication_completion_receipt`, `approval_continuation`,
+`cleanup_command`, `completed_challenge_tick_receipt`,
+`containment_reserve_tombstone`, `control_row_tombstone`,
+`delivery_control_attestation`, `incident`,
+`material_exposure_isolation_preparation`, `node_control_invocation`,
+`provider_control_invocation`, `publication_authorization`,
+`publication_preparation`, `publication_prepare_receipt`,
+`reconciliation_claim`, `secret_terminalization_lease`,
+`state_publication_arm_acknowledgement`, `state_publication_arm_command`,
+`state_publication_completion_command`,
+`state_publication_completion_receipt`, and `terminal_delivery_receipt`.
+Normal ordinals `0..5` are, in order, `approval_continuation`, `direct_outer`,
+`node_control`, `provider_control`, `tick_observation`, and `tick_outer`.
+`reserved_zero` must be exactly two zero bytes. There is no padding, native
+alignment, host-endian form, alternate index base, global class ordinal, or
+class-count-dependent layout. Any wrong width, byte order, offset, reserved bit,
+index, pool/class ordinal, count, or nonzero unused entry is corruption and
+releases nothing.
 Nodes reserve four such in-flight units and each active
 tenant/node reserves one as a node suballocation. Permanent head minima are 4,096
 node and 1,024 per active tenant/node at 8 KiB each: 32 MiB and 8 MiB. Neither
@@ -7086,7 +7311,7 @@ or minimum v1 conformance bounds; deployments may be stricter but not looser:
 | Streaming/backpressure | At most 1 MiB unscanned queued bytes per invocation; 16 MiB node / 4 MiB tenant ceiling; producers block or the output quarantines, never bypasses scanning. |
 | Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node completed and reconciliation-exhausted hot schemas are at most 2 KiB. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 1,920 KiB, has at most 6,096 event refs and 2,320 trusted-send evidence refs. A dynamic publication simultaneously stores the exact 4,096-KiB four-member response set; material stores only its exact 4-KiB fixed-false member. Retention never deletes a tombstone or active uncertainty to admit work. |
 | Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per tombstone, non-borrowable normal floors are exactly 8 MiB node / 2 MiB tenant. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency or retirement slots. |
-| Emergency permanent-marker store | The generated maximum is exactly 66 typed slots: 13 for the completed tick challenge and 53 for its continuation. Challenge slots are preparation, prepare receipt, final authorization, four State command/receipt/arm/ack identities, four Agent command/receipt/arm/ack identities, completed-challenge receipt, and the primary approval-continuation identity. Continuation slots are 44 exact operational identities plus delivery attestation, terminal receipt, preparation, prepare receipt, final authorization, and four Agent command/receipt/arm/ack identities; it emits no new State identity. Every occupied slot is covered by the generated ordinal/pool/class/primary-or-auxiliary/nominal-kind/owner/release-rule bijection. There are 24 distinct emergency slot classes and 30 normal-plus-emergency retirement count entries; class-schema capacity is regenerated independently from the still-66 occupied-slot maximum. A narrower profile reserves its exact generated classes and cannot widen. For 64 node/16 tenant maximum units the floors are 4,224/1,056 slots and 8,448/2,112 KiB at 2 KiB each. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
+| Emergency permanent-marker store | The generated maximum is exactly 66 typed slots: 13 for the completed tick challenge and 53 for its continuation. Challenge slots are preparation, prepare receipt, final authorization, four State command/receipt/arm/ack identities, four Agent command/receipt/arm/ack identities, completed-challenge receipt, and the primary approval-continuation identity. Continuation slots are 44 exact operational identities plus delivery attestation, terminal receipt, preparation, prepare receipt, final authorization, and four Agent command/receipt/arm/ack identities; it emits no new State identity. Every occupied slot is covered by the generated ordinal/pool/class/primary-or-auxiliary/nominal-kind/allocator-or-issuer/durable-record-owner/privileged-mutation-owner-or-consumer/permanent-marker-writer/release-authority/release-rule bijection. There are 24 distinct emergency slot classes and 30 normal-plus-emergency retirement count entries; class-schema capacity is regenerated independently from the still-66 occupied-slot maximum. A narrower profile reserves its exact generated classes and cannot widen. For 64 node/16 tenant maximum units the floors are 4,224/1,056 slots and 8,448/2,112 KiB at 2 KiB each. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
 | Tick observation durability | At most 16 C03 observations per policy output and 1 MiB canonical candidate bytes per observation, hence at most 16 MiB candidate bytes in one atomic batch. The Event/Evidence writer streams the quota-controlled durable batch without retaining a second hot copy. Unclaimed expiry is exactly 5 minutes minimum, `tick_deadline + 60 seconds`, and 24 hours maximum under the recorded policy revision. Link and expiry CAS the same owner row; at/after expiry only the winning digest tombstone remains effect-ineligible, while a winning exact link receipt pins candidate bytes through outer terminal/retention. This durable budget is excluded from the in-memory equation below and storage uncertainty rejects the whole batch before outer claim. |
 | Fixed restricted metadata | At most 8 MiB node / 2 MiB tenant for lineage indexes, control plans, and admission bookkeeping. |
 | Non-borrowable containment hot reserve | Preprovision 64 maximum `SecretContainmentReserve` units per node and 16 per active tenant/node. Each approval-capable unit owns 67 entries at at most 2 KiB; exact pools are 8,576 KiB node and 2,144 KiB tenant. A narrower non-approval profile may commit only its generated exact smaller vector and cannot later widen. Normal work cannot consume either pool. |
@@ -7411,7 +7636,11 @@ classes, ordinals, and roots are fixed; no generic remainder exists.
 One generated profile-identity bijection is the only marker-slot oracle. Its key
 is the complete generated profile tuple plus episode tag, identity-family tag,
 and family index. Its value contains exactly `{ordinal,pool_class,slot_class,
-primary_or_auxiliary_tag,nominal_id_kind,owner,release_rule}`. The closed
+primary_or_auxiliary_tag,nominal_id_kind,
+nominal_id_allocator_or_command_issuer,durable_record_owner,
+privileged_mutation_owner_or_consumer,permanent_marker_writer,
+release_authority,release_rule}`. These role columns are independent; no generic
+`owner` field or inferred role is legal. The closed
 `primary_or_auxiliary_tag` is either `primary_consumed_effect_tombstone` or one
 exact `permanent_auxiliary_identity_marker` tag listed above. For an occupied
 row, `release_rule=R(profile)`, where `R(profile)` is exactly
@@ -7419,41 +7648,41 @@ row, `release_rule=R(profile)`, where `R(profile)` is exactly
 `verified_trusted_domain_retirement_only` otherwise; reserve closure alone never
 releases an occupied marker. The maximum-profile expansion is exactly:
 
-| Ordinal(s) and profile identity selector | Pool | Slot class | Primary/auxiliary tag | Nominal ID kind | Owner | Release rule |
-| --- | --- | --- | --- | --- | --- | --- |
-| `1` challenge publication preparation | `containment_emergency` | `publication_preparation` | `publication_preparation` | `SecretPublicationPreparationId` | Authority | `R(profile)` |
-| `2` challenge publication prepare receipt | `containment_emergency` | `publication_prepare_receipt` | `publication_prepare_receipt` | `SecretPublicationPrepareReceiptId` | Authority | `R(profile)` |
-| `3` challenge publication authorization | `containment_emergency` | `publication_authorization` | `publication_authorization` | `SecretPublicationAuthorizationId` | Authority | `R(profile)` |
-| `4` challenge State completion command | `containment_emergency` | `state_publication_completion_command` | `state_publication_completion_command` | `StatePublicationCommandId` | State Service | `R(profile)` |
-| `5` challenge State completion receipt | `containment_emergency` | `state_publication_completion_receipt` | `state_publication_completion_receipt` | `StatePublicationCompletionReceiptId` | State Service | `R(profile)` |
-| `6` challenge State arm command | `containment_emergency` | `state_publication_arm_command` | `state_publication_arm_command` | `StatePublicationArmCommandId` | State Service | `R(profile)` |
-| `7` challenge State arm acknowledgement | `containment_emergency` | `state_publication_arm_acknowledgement` | `state_publication_arm_acknowledgement` | `StatePublicationArmAcknowledgementId` | State Service | `R(profile)` |
-| `8` challenge Agent completion command | `containment_emergency` | `agent_publication_completion_command` | `agent_publication_completion_command` | `AgentLifecyclePublicationCommandId` | Agent Instance Controller | `R(profile)` |
-| `9` challenge Agent completion receipt | `containment_emergency` | `agent_publication_completion_receipt` | `agent_publication_completion_receipt` | `AgentLifecyclePublicationCompletionReceiptId` | Agent Instance Controller | `R(profile)` |
-| `10` challenge Agent arm command | `containment_emergency` | `agent_publication_arm_command` | `agent_publication_arm_command` | `AgentLifecyclePublicationArmCommandId` | Agent Instance Controller | `R(profile)` |
-| `11` challenge Agent arm acknowledgement | `containment_emergency` | `agent_publication_arm_acknowledgement` | `agent_publication_arm_acknowledgement` | `AgentLifecyclePublicationArmAcknowledgementId` | Agent Instance Controller | `R(profile)` |
-| `12` completed challenge-tick receipt | `containment_emergency` | `completed_challenge_tick_receipt` | `completed_challenge_tick_receipt` | `CompletedChallengeTickReceiptId` | Agent Instance Controller | `R(profile)` |
-| `13` approval-continuation identity | `containment_emergency` | `approval_continuation` | `primary_consumed_effect_tombstone` | `SecretApprovalContinuationId` | Authority | `R(profile)` |
-| `14..15` provider-control invocation `[0..1]` | `containment_emergency` | `provider_control_invocation` | `primary_consumed_effect_tombstone` | `SecretProviderControlInvocationId` | Authority | `R(profile)` |
-| `16..26` node-control invocation `[0..10]` in displayed node-operation order | `containment_emergency` | `node_control_invocation` | `primary_consumed_effect_tombstone` | `SecretNodeControlInvocationId` | Authority | `R(profile)` |
-| `27..28` provider reconciliation claim `[0..1]` | `containment_emergency` | `reconciliation_claim` | `provider_reconciliation_claim` | `SecretReconciliationClaimId` | Authority | `R(profile)` |
-| `29..39` node reconciliation claim `[0..10]` | `containment_emergency` | `reconciliation_claim` | `node_reconciliation_claim` | `SecretReconciliationClaimId` | Authority | `R(profile)` |
-| `40..41` provider control-row tombstone `[0..1]` | `containment_emergency` | `control_row_tombstone` | `consumed_tombstone` | `SecretConsumedEffectTombstoneId` | Authority | `R(profile)` |
-| `42..52` node control-row tombstone `[0..10]` | `containment_emergency` | `control_row_tombstone` | `consumed_tombstone` | `SecretConsumedEffectTombstoneId` | Authority | `R(profile)` |
-| `53` cleanup command | `containment_emergency` | `cleanup_command` | `cleanup_command` | `SecretCleanupCommandId` | Authority | `R(profile)` |
-| `54` containment-reserve identity/tombstone | `containment_emergency` | `containment_reserve_tombstone` | `primary_consumed_effect_tombstone` | `SecretContainmentReserveId` | Authority | `R(profile)` |
-| `55` incident | `containment_emergency` | `incident` | `incident` | `IncidentId` | Incident owner | `R(profile)` |
-| `56` material-exposure isolation preparation | `containment_emergency` | `material_exposure_isolation_preparation` | `material_exposure_isolation_preparation` | `MaterialExposureIsolationPreparationId` | Node/Sandbox owner | `R(profile)` |
-| `57` terminalization lease | `containment_emergency` | `secret_terminalization_lease` | `secret_terminalization_lease` | `SecretTerminalizationLeaseId` | Authority | `R(profile)` |
-| `58` continuation delivery-control attestation | `containment_emergency` | `delivery_control_attestation` | `delivery_control_attestation` | `SecretDeliveryControlAttestationId` | Gateway | `R(profile)` |
-| `59` continuation terminal delivery receipt | `containment_emergency` | `terminal_delivery_receipt` | `terminal_delivery_receipt` | `SecretDeliveryReceiptId` | Gateway | `R(profile)` |
-| `60` continuation publication preparation | `containment_emergency` | `publication_preparation` | `publication_preparation` | `SecretPublicationPreparationId` | Authority | `R(profile)` |
-| `61` continuation publication prepare receipt | `containment_emergency` | `publication_prepare_receipt` | `publication_prepare_receipt` | `SecretPublicationPrepareReceiptId` | Authority | `R(profile)` |
-| `62` continuation publication authorization | `containment_emergency` | `publication_authorization` | `publication_authorization` | `SecretPublicationAuthorizationId` | Authority | `R(profile)` |
-| `63` continuation Agent completion command | `containment_emergency` | `agent_publication_completion_command` | `agent_publication_completion_command` | `AgentLifecyclePublicationCommandId` | Agent Instance Controller | `R(profile)` |
-| `64` continuation Agent completion receipt | `containment_emergency` | `agent_publication_completion_receipt` | `agent_publication_completion_receipt` | `AgentLifecyclePublicationCompletionReceiptId` | Agent Instance Controller | `R(profile)` |
-| `65` continuation Agent arm command | `containment_emergency` | `agent_publication_arm_command` | `agent_publication_arm_command` | `AgentLifecyclePublicationArmCommandId` | Agent Instance Controller | `R(profile)` |
-| `66` continuation Agent arm acknowledgement | `containment_emergency` | `agent_publication_arm_acknowledgement` | `agent_publication_arm_acknowledgement` | `AgentLifecyclePublicationArmAcknowledgementId` | Agent Instance Controller | `R(profile)` |
+| Ordinal(s) and profile identity selector | Pool | Slot class | Primary/auxiliary tag | Nominal ID kind | Nominal-ID allocator / command issuer | Durable record owner | Privileged mutation owner / consumer | Permanent marker writer | Release authority | Release rule |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `1` challenge publication preparation | `containment_emergency` | `publication_preparation` | `publication_preparation` | `SecretPublicationPreparationId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `2` challenge publication prepare receipt | `containment_emergency` | `publication_prepare_receipt` | `publication_prepare_receipt` | `SecretPublicationPrepareReceiptId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `3` challenge publication authorization | `containment_emergency` | `publication_authorization` | `publication_authorization` | `SecretPublicationAuthorizationId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `4` challenge State completion command | `containment_emergency` | `state_publication_completion_command` | `state_publication_completion_command` | `StatePublicationCommandId` | Authority command issuer | State Service | State Service command consumer and state/head mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `5` challenge State completion receipt | `containment_emergency` | `state_publication_completion_receipt` | `state_publication_completion_receipt` | `StatePublicationCompletionReceiptId` | State Service | State Service | State Service | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `6` challenge State arm command | `containment_emergency` | `state_publication_arm_command` | `state_publication_arm_command` | `StatePublicationArmCommandId` | Authority command issuer | State Service | State Service command consumer and state/head-fence mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `7` challenge State arm acknowledgement | `containment_emergency` | `state_publication_arm_acknowledgement` | `state_publication_arm_acknowledgement` | `StatePublicationArmAcknowledgementId` | State Service | State Service | State Service | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `8` challenge Agent completion command | `containment_emergency` | `agent_publication_completion_command` | `agent_publication_completion_command` | `AgentLifecyclePublicationCommandId` | Authority command issuer | Agent Instance Controller | Agent Instance Controller command consumer and run/tick mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `9` challenge Agent completion receipt | `containment_emergency` | `agent_publication_completion_receipt` | `agent_publication_completion_receipt` | `AgentLifecyclePublicationCompletionReceiptId` | Agent Instance Controller | Agent Instance Controller | Agent Instance Controller | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `10` challenge Agent arm command | `containment_emergency` | `agent_publication_arm_command` | `agent_publication_arm_command` | `AgentLifecyclePublicationArmCommandId` | Authority command issuer | Agent Instance Controller | Agent Instance Controller command consumer and run/tick-fence mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `11` challenge Agent arm acknowledgement | `containment_emergency` | `agent_publication_arm_acknowledgement` | `agent_publication_arm_acknowledgement` | `AgentLifecyclePublicationArmAcknowledgementId` | Agent Instance Controller | Agent Instance Controller | Agent Instance Controller | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `12` completed challenge-tick receipt | `containment_emergency` | `completed_challenge_tick_receipt` | `completed_challenge_tick_receipt` | `CompletedChallengeTickReceiptId` | Agent Instance Controller | Agent Instance Controller owner copy + Authority consumed copy | Agent Instance Controller | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `13` approval-continuation identity | `containment_emergency` | `approval_continuation` | `primary_consumed_effect_tombstone` | `SecretApprovalContinuationId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `14..15` provider-control invocation `[0..1]` | `containment_emergency` | `provider_control_invocation` | `primary_consumed_effect_tombstone` | `SecretProviderControlInvocationId` | Authority | Authority | Authority lifecycle mutation owner; Gateway effect consumer | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `16..26` node-control invocation `[0..10]` in displayed node-operation order | `containment_emergency` | `node_control_invocation` | `primary_consumed_effect_tombstone` | `SecretNodeControlInvocationId` | Authority command issuer | Authority invocation ledger | NODE/SBX mutation owner through Gateway | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `27..28` provider reconciliation claim `[0..1]` | `containment_emergency` | `reconciliation_claim` | `provider_reconciliation_claim` | `SecretReconciliationClaimId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `29..39` node reconciliation claim `[0..10]` | `containment_emergency` | `reconciliation_claim` | `node_reconciliation_claim` | `SecretReconciliationClaimId` | Authority | Authority | Authority claim owner; NODE/SBX remains state mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `40..41` provider control-row tombstone `[0..1]` | `containment_emergency` | `control_row_tombstone` | `consumed_tombstone` | `SecretConsumedEffectTombstoneId` | Authority retention owner | Authority | Authority retention owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `42..52` node control-row tombstone `[0..10]` | `containment_emergency` | `control_row_tombstone` | `consumed_tombstone` | `SecretConsumedEffectTombstoneId` | Authority retention owner | Authority | Authority retention owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `53` cleanup command | `containment_emergency` | `cleanup_command` | `cleanup_command` | `SecretCleanupCommandId` | Authority command issuer | Authority command ledger | NODE/SBX cleanup mutation owner through Gateway | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `54` containment-reserve identity/tombstone | `containment_emergency` | `containment_reserve_tombstone` | `primary_consumed_effect_tombstone` | `SecretContainmentReserveId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `55` incident | `containment_emergency` | `incident` | `incident` | `IncidentId` | Incident owner | Incident owner | Incident owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `56` material-exposure isolation preparation | `containment_emergency` | `material_exposure_isolation_preparation` | `material_exposure_isolation_preparation` | `MaterialExposureIsolationPreparationId` | NODE/SBX owner | NODE/SBX owner | NODE/SBX owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `57` terminalization lease | `containment_emergency` | `secret_terminalization_lease` | `secret_terminalization_lease` | `SecretTerminalizationLeaseId` | Event/Evidence | Event/Evidence | Event/Evidence cursor/fence owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `58` continuation delivery-control attestation | `containment_emergency` | `delivery_control_attestation` | `delivery_control_attestation` | `SecretDeliveryControlAttestationId` | Gateway | Gateway | Gateway | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `59` continuation terminal delivery receipt | `containment_emergency` | `terminal_delivery_receipt` | `terminal_delivery_receipt` | `SecretDeliveryReceiptId` | Gateway | Authority stores Gateway-sealed receipt bytes | Gateway receipt semantics; Authority pointer CAS | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `60` continuation publication preparation | `containment_emergency` | `publication_preparation` | `publication_preparation` | `SecretPublicationPreparationId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `61` continuation publication prepare receipt | `containment_emergency` | `publication_prepare_receipt` | `publication_prepare_receipt` | `SecretPublicationPrepareReceiptId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `62` continuation publication authorization | `containment_emergency` | `publication_authorization` | `publication_authorization` | `SecretPublicationAuthorizationId` | Authority | Authority | Authority | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `63` continuation Agent completion command | `containment_emergency` | `agent_publication_completion_command` | `agent_publication_completion_command` | `AgentLifecyclePublicationCommandId` | Authority command issuer | Agent Instance Controller | Agent Instance Controller command consumer and run/tick mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `64` continuation Agent completion receipt | `containment_emergency` | `agent_publication_completion_receipt` | `agent_publication_completion_receipt` | `AgentLifecyclePublicationCompletionReceiptId` | Agent Instance Controller | Agent Instance Controller | Agent Instance Controller | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `65` continuation Agent arm command | `containment_emergency` | `agent_publication_arm_command` | `agent_publication_arm_command` | `AgentLifecyclePublicationArmCommandId` | Authority command issuer | Agent Instance Controller | Agent Instance Controller command consumer and run/tick-fence mutation owner | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
+| `66` continuation Agent arm acknowledgement | `containment_emergency` | `agent_publication_arm_acknowledgement` | `agent_publication_arm_acknowledgement` | `AgentLifecyclePublicationArmAcknowledgementId` | Agent Instance Controller | Agent Instance Controller | Agent Instance Controller | Authority retention owner | Authority + Agent Instance Controller | `R(profile)` |
 
 Every range expands to one row per displayed index; it is not one shared slot.
 For a narrower profile, the generator filters only inapplicable identities in the
@@ -7461,8 +7690,10 @@ same canonical family order and assigns contiguous ordinals `1..marker_slot_coun
 The emitted reserve closure and marker-root leaf at each ordinal contain that
 row's exact pool/class and matching nominal identity. Generation fails on a
 missing profile identity, duplicate key or ordinal, noncontiguous ordinal, wrong
-pool/class, wrong primary/auxiliary representation, wrong nominal kind/owner/
-release rule, multiply mapped identity, unlisted claimed identity, or a claimed
+pool/class, wrong primary/auxiliary representation, wrong nominal kind, allocator/
+issuer, durable-record owner, privileged mutation owner/consumer, permanent-marker
+writer, release authority, or release rule, multiply mapped identity, unlisted
+claimed identity, or a claimed
 slot absent from the root. The reverse map from
 `{profile,ordinal,pool_class,slot_class,primary_or_auxiliary_tag,
 nominal_identity}` must return exactly the original profile identity, making the
@@ -7476,7 +7707,12 @@ owner object, Authority CASes the matching slot from `unused` to
 `claimed {nominal_identity,authority_domain,owner_receipt_digest}`; a command slot
 instead binds the issued command digest. Same-class replacement, a normal
 identity, or another class rejects. Tombstone commit moves
-the slot to `charged {permanent_marker_id,marker_integrity_digest}`. Verified
+the slot to `charged {permanent_marker_id,marker_integrity_digest}`. Authority is
+the named retention owner and permanent marker writer for every maximum-profile
+row above; it never thereby becomes the State, Agent, NODE/SBX, Gateway,
+Event/Evidence, or Incident mutation owner. Release requires both Authority and
+the current authority-domain owner, which is Agent Instance Controller for this
+run-scoped maximum profile, plus the row's exact release rule. Verified
 trusted retirement preserves charged markers under the separate retirement head;
 material slots are permanently charged/non-retirable.
 
@@ -8165,9 +8401,9 @@ postcondition trace; the non-secret path is unchanged.
 | Work orders/capabilities | Remain required and may only narrow. C03 fields are not smuggled through extensions. |
 | Trace/state | Historical bytes and IDs remain unchanged. The eight exact externally tagged `TraceEventKind` variants land only on the 0.2 compatibility line; exhaustive Rust consumers require source migration with explicit new match arms, and older privileged consumers reject unknown kinds. Existing `TraceEvent.timestamp`, `ActionFailed`, `OutcomeRecorded`, `StateCommitted`, `LoopTickCompleted`, `StateMetadata.created_at`, physical `recorded_at`, and run `updated_at` meanings remain truthful and unchanged. Stable event IDs and state refs are allocated only under the bounded short terminalization lease from current sequence/hash state; no pre-exposure reservation, placeholder, gap, alternate ID derivation, backdating, or future-dating exists. Timing-safe material trace/state/run/audit objects are explicit additive payloads inside signed `TimingSafeProjectionEnvelopeV1` records, use detached `TimingSafeProjectionSignatureInputV1`, a separate projection chain with opaque source correspondence, and never masquerade as or expose the raw integrity chain of stable records. The state/head/run suffix remains unreadable until origin-specific final publication authorization. This is the explicit C03 specialization of FND-009 for timing-sensitive source hashes. |
 | Material-exposed results | Stable 0.1 `ActionOutcome` schema is unchanged and its internal `completed_at` is truthful. The C03 wrapper uses existing `Failed`, absent output, and bounded error semantics while returning only the fixed suppression projection; it never serializes target-selected output/error/artifact/state/trace/result or raw timing data. A future declassifier or forensic raw-timing owner requires a separate accepted versioned contract. |
-| Tombstones/retirement | Additive C03-only closed domain tags, named disposition/integrity digests, and lineage-scoped node domains preserve exact duplicate/conflict meaning after full-record deletion; they do not rewrite stable store records. A committed material domain is permanently `non_retirable_v1`; ordinary trusted-injection retirement cannot absorb or release it. |
+| Tombstones/retirement | Additive C03-only closed domain tags, named disposition/integrity digests, lineage-scoped node domains, byte-identical hot/outer publication history, and the continuation-first/outer-second approval tombstone DAG preserve exact duplicate/conflict meaning after full-record deletion; they do not rewrite stable store records. A committed material domain is permanently `non_retirable_v1`; ordinary trusted-injection retirement cannot absorb or release it. |
 | Node retry | `SecretNodeControlRetryProfile` is additive C03/NODE owner ABI with exactly `no_retry|one_no_send_retry_100ms`; it appears in plan/result/intent/receipt canonical bytes and never changes stable adapter retry behavior. |
-| Publication | Immutable `SecretPublicationPreparationV1`, prepare receipt, immutable final `SecretPublicationAuthorizationV1`, `terminalizing`, and `publication_withheld` are additive C03 wrapper records/states. Stable 0.1 outcomes, state heads, and trace bytes are not rewritten; the C03 daemon/SDK/read fences simply withhold them until the complete direct/tick suffix is finally authorized. |
+| Publication | Immutable `SecretPublicationPreparationV1`, prepare receipt, immutable final `SecretPublicationAuthorizationV1`, exact `PublicationEpisodeBindingV1`/`PublicationHistoryV1`, `terminalizing`, and `publication_withheld` are additive C03 wrapper records/states. Stable 0.1 outcomes, state heads, and trace bytes are not rewritten; the C03 daemon/SDK/read fences simply withhold them until the complete direct/tick suffix is finally authorized. |
 | Rust | `splendor-types` is canonical for serialized records; authority owns behavior and private validated wrappers. |
 | OpenAPI/TS/Python | Added only with mechanical parity and no material-returning API. The response full/restricted matrices and dedicated result-inspection scope are generated from Rust. Old clients may ignore inspection-only records but cannot authorize unknown versions. |
 | Stores | New C03 Authority records and Event/Evidence-owned preclaim observations/projection chains/terminal append acknowledgements are separate and versioned. Existing arbitrary payload stores are not C03-safe until the pre-persistence barrier is wired. Authority cannot shadow-own tick observations/events and Event/Evidence cannot claim submissions/effects. |
@@ -8326,7 +8562,7 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Approval parent awaiting exact receipt | Original `NeedsApproval` category | Return the immutable challenge/awaiting view. Exact receipt retry alone may claim the one continuation after current checks; no new parent/key/tick exists. |
 | Approval receipt duplicate or changed continuation | Original category or `conflict` | Exact duplicate returns continuing/final state with zero second claim/effect; competing receipt or any changed bound field is `not_retryable` and effect `none`. Raw grant never executes. |
 | Missing/corrupt terminal receipt or intent | `uncertain` | `not_retryable`; outer certainty `uncertain`, same-submission lookup/reconciliation only. |
-| Full record compacted with exact tombstone | `expired` or original `uncertain` | Return restricted `consumed_effect_retired`/original uncertainty; never treat as miss, recreate protected output, or authorize an effect. Changed digest remains conflict. |
+| Full record compacted with exact tombstone | `expired` or original `uncertain` | For an existence-authorized exact terminal/cancelled lookup, return HTTP 410, `application/json`, and the exact 90-byte canonical `ApiError`/digest pinned above; uncertainty remains original uncertainty and withheld remains its fixed control body. Hidden scope remains padded 404 and a visible changed digest remains privacy-safe 409. Never treat as miss, recreate protected output, add C03 certainty/retry fields, or authorize an effect. |
 | Tombstone or retired authority-domain deny head unavailable/corrupt, or an in-flight retired partition-chain commitment unavailable/corrupt before release completes | `unavailable` or `integrity_failure` | Fail closed before allocation/effect; `not_retryable` until authoritative storage is repaired. Quota cannot delete a live tombstone/commitment or permanent deny head. After verified release completion, intentional manifest/leaf deletion is valid and the deny head alone rejects the domain. |
 | Expired or revoked authority/work-order/data-use/lease | `expired` or `revoked` | `retry_with_new_authorization` only for a new request/attempt, `none` |
 | Stale ref/placement/fencing/refresh/concurrent CAS | `stale_head` or `conflict` | exact same-ID retry returns the first denial; changed expected values require a fresh command ID, and any reserved/crossed use requires a fresh use-attempt ID; only the proved prepared/unreserved exception may retain the use-attempt ID, `none` |
@@ -8566,24 +8802,37 @@ large-output artifact/data reference. They serialize every complete `ActionFaile
   `67/1,278/17,596/22,624/66` fail V1.
   Separate publication-progress goldens cover direct, ordinary tick, challenge
   tick, and continuation profiles at `not_started`, every legal completion/arm
-  prefix, `released`, and `permanently_withheld`. Positive/canonical maximum and
-  cap-plus-one vectors pin each <=2-KiB hot index and tombstone. Negatives cover
+  prefix, `released`, and `permanently_withheld`, plus all three exact
+  `PublicationHistoryV1` tags and every disjoint state/history row. They prove a
+  released challenge is byte-identical when the final episode is added, both
+  completion receipt revisions equal their command expected revisions before
+  advancing by one, and a withheld final retains its absorbing revision.
+  Positive/canonical maximum and cap-plus-one vectors pin each <=2-KiB hot index
+  and history-rich tombstone. Negatives cover
   receipt-present/preparation-absent, changed preparation repetition, Agent before
-  State, acknowledgement before command, skipped owner revision, wrong
-  agent-only/state-then-agent tag, null/generic ID or digest, cross-tag field,
+  State, acknowledgement before command, completion receipt before-revision not
+  equal to its command expected revision, skipped owner revision, wrong agent-
+  only/state-then-agent tag, null/generic ID or digest, cross-tag field,
   withheld final authorization, truncated last-progress, and substituted overflow.
-  Direct/tick outer tombstone vectors cover all four legal dispositions and the
-  exact required/forbidden matrix; cancellation requires both distinct outer and
-  continuation tombstones before deletion. Exact/changed duplicate POST, GET,
-  restart, concurrent compaction, export, and replay vectors prove zero effect,
-  never-a-miss behavior, no dynamic-byte reconstruction, and byte-identical fixed
-  withheld control status after protected deletion.
+  Direct/tick outer tombstone vectors cover all four legal dispositions, all eight
+  disjoint with/without-released-challenge rows, and the exact required/forbidden
+  matrix. Approval continuation vectors cover terminal, cancelled, denied,
+  expired, revoked, effect-uncertain, and publication-withheld finals; every one
+  requires the continuation-first/outer-second tombstone DAG before deletion.
+  Exact/changed duplicate POST, GET, restart, lost acknowledgement, concurrent
+  compaction, export, and replay vectors prove zero effect, never-a-miss behavior,
+  no dynamic-byte reconstruction, byte-identical fixed withheld control status,
+  and the exact 90-byte retired 410 body after protected deletion.
   The marker fixture expands the generated profile-identity bijection in both
   directions for every profile, all 66 maximum ordinals, all 24 emergency classes,
   and all 30 fixed retirement count entries including zero counts. Missing,
-  duplicate, wrong-class, cross-tag, wrong nominal kind/owner/release rule,
-  multiply mapped, unlisted, root-substituted, maximum-plus-one, and noncontiguous
-  ordinal vectors fail before reservation or marker commit.
+  duplicate, wrong-class, cross-tag, wrong nominal kind, allocator/issuer, durable
+  record owner, privileged mutation owner/consumer, permanent marker writer,
+  release authority/rule, multiply mapped, unlisted, root-substituted, maximum-
+  plus-one, and noncontiguous ordinal vectors fail before reservation or marker
+  commit. Command fixtures require Authority issuance while State/Agent own their
+  durable local command/receipt/acknowledgement records, mutate only local rows,
+  and allocate their receipts/acknowledgements; wrong-role substitutions fail.
   Terminal-retry fixtures enumerate every legal grammar row and every terminal-
   legal closed C03 reason for `Denied`, `Failed`, and `NeedsIntervention`, plus
   rejection of every pre-acceptance-only reason; exact authorization-
@@ -8704,8 +8953,11 @@ remains `not_exercised`.
   submission first commits the exact direct/tick outer tombstone, retains every
   field-specific preparation/receipt/completion/arm progress binding plus overflow/
   last-progress and absent-authorization proof, and can never gain a final
-  authorization. A cancelled approval parent commits both its original outer and
-  distinct continuation tombstones before either protected row is deleted.
+  authorization. Every terminal, cancelled, denied, expired, revoked, effect-
+  uncertain, or publication-withheld approval final freezes one complete history,
+  commits/re-reads its distinct continuation tombstone first, then commits/re-
+  reads the original outer tombstone binding the continuation ID/integrity digest
+  and identical history digest before either protected row is deleted.
   Material-exposure one-shot reserves remain permanently non-retirable; mixed
   retirement and every material-domain release attempt reject. Exact/changed
   duplicates across restart hit the tombstone
@@ -8720,8 +8972,12 @@ remains `not_exercised`.
   leaves, all 30 pool/slot count entries including zeros, the complete generated
   marker bijection and reverse map, Merkle root, deny-head
   bytes, manifest integrity/chunk digests, final-head reverse lookup, crash-
-  before/after-head recovery, release journal, and exact source-slot
-  release. A fork, corrupt marker, count mismatch, 4,097th leaf,
+  before/after-head recovery, release journal, exact 65,536-byte count/release map,
+  and exact source-slot release. The binary fixture pins zero-based offsets,
+  `u32be/u8/u8/u16be/u32be/u32be` widths, reserved zeros, pool-local class
+  ordinals, and all-zero unused entries. Wrong endian, native padding/alignment,
+  one-based/global ordinals, nonzero reserved/unused bytes, a fork, corrupt marker,
+  count mismatch, 4,097th leaf,
   4,294,967,296th marker in one chain, or interrupted release frees no
   uncommitted slot and never reopens an old ID.
 - Result-authorization tests use principals A and B in the same tenant/run. A
@@ -8870,8 +9126,10 @@ remains `not_exercised`.
   wrong owner/audience/expiry, substituted receipt, or cross-owner write leave all
   fences closed. State Service mutates only state/head rows, Agent Instance
   Controller only run/tick rows, and Authority only submission/authorization rows.
-  At each cut the hot index contains exactly the matching `not_started|progress|
-  released|permanently_withheld` publication arm and longest legal owner prefix.
+  At each cut the hot index contains exactly the matching
+  `PublicationHistoryV1` tag, `not_started|progress|released|
+  permanently_withheld` current episode arm, immutable prior challenge when
+  applicable, and longest legal owner prefix.
   Exhaustion commits the matching direct/tick withheld outer tombstone before
   protected deletion; restart cannot append a later prefix or authorization.
   Tick-challenge continuation fixtures validate the retained completed-challenge
@@ -9058,9 +9316,12 @@ remains `not_exercised`.
   complete/withheld receipt, split/
   outer certainty, content type, HTTP status, size cap, and unknown-field/enum
   negatives. Generated internal-contract parity additionally pins every closed
-  hot publication binding, owner prefix, direct/tick outer tombstone disposition,
-  permanent auxiliary marker tag, the 66-row maximum bijection, and the fixed
-  30-entry pool/class count array across Rust/OpenAPI/Python/TypeScript artifacts;
+  hot `PublicationEpisodeBindingV1` and `PublicationHistoryV1` tags, owner prefix,
+  direct/tick outer tombstone disposition, approval publication-causality binding,
+  permanent auxiliary marker tag, all exact marker-role columns in the 66-row
+  maximum bijection, the fixed 16-byte retirement count/release entry, and the
+  fixed 30-entry pool/class count array across Rust/OpenAPI/Python/TypeScript
+  artifacts;
   languages that do not expose a surface must still preserve the generated schema
   artifact without inventing an alias. For every dynamic terminal they persist and digest byte-distinct
   `full,false`, `full,true`, `restricted,false`, and `restricted,true` members,
@@ -9164,7 +9425,8 @@ remains `not_exercised`.
   floors, 81,792/20,448 record credits, 896/224 control-plus-containment
   tombstones, the complete generated profile table, every profile-identity
   bijection/reverse-map row, all 24 emergency classes and 30 fixed retirement
-  count entries, independent
+  count entries, every exact marker role, the packed 4,096-entry retirement map
+  with fixed pool-local ordinals and widths, independent
   67/1,278/17,596/22,624/66 maxima, 4,096/4-KiB response sets, the 6,096/2,320
   receipt ref maxima, and 71
   records per control row. The report is generated from the
@@ -9214,8 +9476,10 @@ remains `not_exercised`.
   receipts, or final terminal events. Full-record expiry throughout the soak
   retains exact tombstone/conflict behavior: withheld remains the byte-identical
   fixed restricted false non-polling control body, terminal/cancelled never
-  reconstruct deleted dynamic bytes, a cancelled approval parent retains both
-  distinct tombstones, and no deleted direct/tick key becomes a miss. Creating/
+  reconstruct deleted dynamic bytes and return the exact existence-authorized
+  90-byte HTTP 410 error, every approval final retains the acyclic continuation/
+  outer tombstone pair with identical history digest, and no deleted direct/tick
+  key becomes a miss. Creating/
   duplicate POST, GET, restart, compaction, export, and replay all remain zero-
   effect. Observation link-versus-expiry
   before/at/after the boundary is deterministic. Full normal-quota and normal-
@@ -9400,7 +9664,10 @@ Independent reviewers should recommend acceptance only if all are true:
   existence-authorized caller without result visibility receives only restricted
   non-retryable status. Permanent recovery exhaustion is the absorbing non-
   polling `publication_withheld` control state; duplicate/GET/replay expose no
-  final facts and cannot upgrade it.
+  final facts and cannot upgrade it. After protected terminal/cancelled bytes are
+  deleted, existence-authorized exact lookup is the pinned HTTP 410,
+  `application/json`, 90-byte canonical `consumed_effect_retired` `ApiError` and
+  digest; hidden and changed requests remain padded 404 and privacy-safe 409.
 - Every dynamic terminal authorization stores all four exact canonical response
   members (`full,false`, `full,true`, `restricted,false`, `restricted,true`) and
   selection never rewrites a byte after digest. Creating POST/GET choose false;
@@ -9417,6 +9684,13 @@ Independent reviewers should recommend acceptance only if all are true:
   cycles, placeholders, or any predecessor that binds the future authorization. A
   continuation from a completed tick challenge references that immutable receipt,
   emits no new State/tick suffix, and cannot be rewritten as direct.
+- The hot index requires exactly one `PublicationHistoryV1`. Its three tags are
+  `single_episode|approval_challenge_only|approval_challenge_and_final`, with
+  literal ordinals 1/2 and exact `PublicationEpisodeBindingV1` arms. The state/
+  history matrix is disjoint and total, a released challenge is immutable across
+  extension, completion receipts require before-revision equality to their
+  commands plus one successor revision, and withheld retains its absorbing
+  revision. The direct/tick outer tombstone carries the same history byte-for-byte.
 - State Service alone mutates state/head visibility, Agent Instance Controller
   alone mutates run/tick lifecycle, Event/Evidence alone appends events/
   projections, and Authority alone mutates submission/publication proofs.
@@ -9424,7 +9698,11 @@ Independent reviewers should recommend acceptance only if all are true:
   local arm acknowledgements, and immutable final Authority authorization form the
   read fence; no strict prefix exposes response,
   head, run completion, next tick, export, or replay final and no distributed or
-  shared-owner transaction is assumed.
+  shared-owner transaction is assumed. Marker fixtures distinguish nominal-ID
+  allocator/command issuer, durable record owner, privileged mutation owner/
+  consumer, permanent marker writer, and release authority; Authority-issued
+  commands never transfer State/Agent durable local command/receipt/
+  acknowledgement records or local mutation ownership.
 - One sealed `SecretTerminalRetryDecisionV1` is total over every legal profile and
   closed reason. It binds exact taxonomy/source retry/effect certainty and current
   policy; only an exact no-effect expired/revoked/unauthorized result may request
@@ -9618,9 +9896,11 @@ Independent reviewers should recommend acceptance only if all are true:
   accepted bindings, effect coordinates, named disposition digests, authority
   domains, slot sources, and per-partition/pool/slot-class integrity chains.
   Direct/tick outer tombstones admit exactly `terminal|effect_uncertain|cancelled|
-  publication_withheld`; their field-specific progress/cancellation/publication
-  matrices are total, and a cancelled approval parent requires both distinct
-  outer and continuation tombstones before protected deletion.
+  publication_withheld`; their field-specific progress/cancellation/publication-
+  history matrices are total. Every terminal, cancelled, denied, expired,
+  revoked, effect-uncertain, or publication-withheld approval final requires the
+  continuation-first/outer-second acyclic tombstone pair with identical frozen
+  history digest before protected deletion.
   Retired partition-chain commitment, Merkle root, manifest/chunk digests, final-
   head lookup, release journal, and permanent authority-domain deny-head fields/
   digests are exact. Full-record
@@ -9662,7 +9942,10 @@ Independent reviewers should recommend acceptance only if all are true:
   KiB per approval-capable parent;
   the 66 occupied slots map bijectively to their exact primary/auxiliary nominal
   identities across 24 emergency classes, while retirement manifests always carry
-  all 30 emergency-plus-normal pool/class counts;
+  all 30 emergency-plus-normal pool/class counts. Retirement scratch uses exactly
+  4,096 packed 16-byte entries with zero-based `u32be` leaf index, pinned `u8`
+  pool and pool-local class ordinals, reserved-zero `u16be`, and two `u32be`
+  counts at the fixed offsets; no native packing or endian variant is legal;
   normal identities cannot borrow those slots. Verified trusted-injection release
   returns the reusable unit after zero live debit and only unused marker slots;
   material ordinary retirement is forbidden. Charged material markers remain
