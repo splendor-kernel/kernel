@@ -687,13 +687,29 @@ deduplication cannot satisfy it:
 | Result-authorization audit / publication preparation / final publication authorization / Authority prepare receipt | 128 KiB / 16 KiB / 16 KiB / 8 KiB. The preparation contains only pre-arm facts. The final authorization adds only arm-applicable acknowledgements and release checks. |
 | Owner-local publication command, completion receipt, arm command, or arm acknowledgement | 8 KiB independently for every State Service or Agent Instance Controller object. No command embeds another owner's object bytes; it binds their digest. |
 | Tick prepared state-node/head objects | 2,048 KiB including patch bytes, metadata, pending/final head objects, and State Service recovery bindings. Agent Instance Controller run/tick objects and all cross-owner commands/receipts are separately budgeted; this is not a combined transaction. |
+| Complete `PublicationHistoryV1` | 12 KiB. The generated maximum legal two-episode released and permanently-withheld fixtures are 7,437 and 7,605 canonical bytes respectively under maximum-width v1 scalars. The cap is not permission for an unknown field, longer scalar, third episode, or another history arm. |
+| Complete `splendor.secret.action_submission_hot_index.v1` | 16 KiB. It contains the complete history inline and is the only v1 hot-index family wider than 2 KiB. Its generated non-history envelope is independently bounded at 4 KiB; no physical encoding or reference may replace the inline bytes. |
+| Complete direct/tick `splendor.secret.consumed_effect_tombstone.v1` | 16 KiB. The complete field-specific outer disposition, including byte-identical history, is inline and its generated non-history envelope is independently bounded at 4 KiB. Each such tombstone consumes four unique 4-KiB durable record credits. Approval-continuation, provider, node, observation, containment, and auxiliary compact marker records retain their separately generated 2-KiB maxima. |
 
-Canonical Rust maximum fixtures use bounded legal filler/reference values to hit
-each named length exactly and cap-plus-one fixtures to prove rejection. Rust,
+Canonical Rust maximum fixtures use maximum-width legal scalar/reference values.
+Where a closed shape cannot fill every byte up to its power-of-two cap, the
+fixture pins its exact largest legal length and the manifest separately pins the
+admission cap. A test-only schema-growth mutation produces cap-plus-one decoded
+bytes and must fail generation before any public artifact is emitted. Rust,
 OpenAPI, Python, and TypeScript must emit byte-identical RFC 8785 objects and the
 same measured lengths. The generated size manifest, not a hand estimate, is the
-oracle; CI rejects any schema whose maximum fixture differs from this table or
-whose legal fixture can exceed it.
+oracle; CI rejects any schema whose maximum fixture differs from this table,
+whose legal fixture can exceed it, or whose structural lower bound exceeds its
+declared cap.
+
+These are canonical payload limits, not claims about a database page or physical
+encoding. Every owner must provision at least the complete canonical maximum plus
+its separately declared physical key, length, checksum, index, allocator, and
+transaction metadata. Compression, page sharing, content deduplication, or an
+implementation-local reference cannot reduce either the canonical admission
+charge or that physical allocation requirement. Inline `PublicationHistoryV1`
+has no separate physical object or allocation; its bytes are part of each named
+enclosing hot index or tombstone allocation.
 
 The source of every terminal, publication, and resource variant is one closed
 generated grammar. Its axes are exactly:
@@ -820,7 +836,9 @@ projection_bundle_kib = 16 * projection_sources
 The generator emits a schema-path/source/copy/owner/slot ledger. Each row contains
 the exact schema path, grammar tuple, source ID kind, canonical-byte maximum,
 physical owner, retained-copy ordinal, record slot, bundle slot, hot slot when
-applicable, marker class or explicit `not_applicable`, and release rule. Generation
+applicable, exact hot canonical-byte charge, separately declared physical-
+metadata byte maximum, marker class or explicit `not_applicable`, and release
+rule. Generation
 fails on an unassigned legal schema path, unreachable variant, missing owner copy,
 missing stable-event metadata record, missing response member, missing command/
 receipt/acknowledgement, duplicate slot reuse, multiply charged copy, unbudgeted
@@ -866,6 +884,8 @@ The normative folded schema-path/source/copy/owner/slot ledger is:
 | `projection_sources[trace|state_head|run_inspect|audit][*]` | Exact `P` sources, separately cardinalized by view kind | Event/Evidence envelope and protected correspondence sidecar | `2*P` records and `16*P` KiB. Material uses `TimingSafeProjectionEnvelopeV1`; non-material uses its exact authorized source/view envelope and integrity sidecar, never an alias to raw bytes. |
 | `projection_chains[view_kind]` and checkpoints | Exact `V` non-empty chains | Event/Evidence chain head, checkpoint, and acknowledgement | `V` hot heads, `2*V` records, and `12*V` KiB. |
 | `projection_export_manifest` and acknowledgement | One publication episode | Event/Evidence manifest/root and acknowledgement | Two records and 20 KiB. |
+| `action_submission_hot_index` | One per outer submission, containing one complete `PublicationHistoryV1` | Authority hot index | One 16-KiB hot slot. Every other generated hot slot in the profile is 2 KiB. |
+| `direct_outer_tombstone` / `tick_outer_tombstone` | One per outer submission, not per publication episode | Authority complete consumed-effect tombstone with inline field-specific disposition/history | Four unique 4-KiB record credits and one tombstone ID/marker; the three extra extents add 12 durable KiB. The approval-continuation tombstone retains its separate one-record charge. |
 | `authority_terminal_objects[*]` | Exact pre-effect/challenge/post-reservation/cancelled arm | Authority owns each immutable object | `A` records and exact `A_kib`; forbidden cross-arm objects allocate nothing. |
 | `publication_preparation`, `publication_prepare_receipt`, and `publication_authorization` | One of each per episode | Authority owns all three | Three records, 40 KiB, one preparation and one final-authorization hot pointer, and three typed markers as folded by the profile. |
 | `authorized_response_members` | Four dynamic members or one material member | Authority stores every member BLOB exactly once | `D=3` dynamic extent records or zero material extent records, plus 4,096 or 4 KiB. |
@@ -3597,7 +3617,10 @@ delivery event embeds a mutable receipt or a promised terminal event ID.
 `splendor.secret.delivery_receipt.v1` record under projection schema
 `splendor.secret.delivery_receipt_digest.v1`; no receipt field is omitted.
 
-The <=2-KiB hot lookup record is separate from the full durable receipt.
+The at-most-16-KiB action-submission hot lookup record is separate from the full
+durable receipt. Provider-control, node-control, command, use-attempt, and other
+compact hot-index families retain their independent at-most-2-KiB limits; they
+cannot lend that capacity to the submission index.
 Its `trusted_partition_digest` uses the common prefix/JCS/BLAKE3 rule and closed
 projection `splendor.secret.action_submission_partition_digest.v1` containing
 exactly `schema_version`, authenticated `principal_id`, `tenant_id`, `run_id`,
@@ -3848,6 +3871,32 @@ challenge bytes and extends only by changing the history tag once from
 `approval_challenge_only` to `approval_challenge_and_final` with the final episode
 initially `not_started`.
 
+The generated canonical sizing fixture expands every field above with 36-byte
+canonical UUIDs, 71-byte `blake3:` digests, and the maximum 16-digit v1 positive
+revision. The largest legal challenge is the `state_then_agent` tick challenge;
+the continuation final is `agent_only`. The exact two-episode maxima are:
+
+| Complete `PublicationHistoryV1` fixture | RFC 8785 bytes | Result |
+| --- | ---: | --- |
+| Released challenge plus released final | 7,437 | Admitted under the 12-KiB history cap. |
+| Released challenge plus permanently withheld final, including `run_trace` overflow and maximum absorbing revision | 7,605 | Admitted; this is the v1 history maximum. |
+| Test-only schema-growth mutation of either arm | 12,289 | Generation fails; no runtime truncation, compression, alternate physical encoding, implicit indirection, or average-size waiver exists. |
+
+For each of the released and withheld rows, the generator also materializes the
+complete enclosing action-submission hot index and direct/tick outer tombstone
+with every remaining field at its legal maximum. Each must pass the 16-KiB cap;
+separate test-only 16,385-byte schema-growth mutations for each enclosure must
+fail. A maximum fixture is complete inline bytes, never a digest-only substitute.
+
+The prior review's 2,612-byte `approval_challenge_only` structural fixture, which
+uses illegal empty IDs/digests and therefore understates every legal object,
+remains a mandatory negative regression: it proves the former 2,048-byte cap
+impossible and is below the new 12-KiB bound. A second conservative legal fixture
+with 36-byte IDs and 71-byte digests remains 4,359 bytes. Whenever this inline
+closed type or any transitive field changes, generation must recompute the
+structural lower bound, every legal-arm maximum, both two-episode fixtures, each
+enclosing maximum, and cap-plus-one mutations before code generation can pass.
+
 The state-to-history matrix is total and disjoint:
 
 | Submission state and challenge history | Required `PublicationHistoryV1` tag and episode arm | Forbidden |
@@ -3874,7 +3923,7 @@ challenge or weaken the final episode.
 The hot index contains no use summary, event list, evidence, output, provider/node detail,
 or error text and is never itself terminal evidence. The complete immutable
 receipt, terminal intent, and pending/outcome record live in quota-controlled
-durable storage, have no 2-KiB claim, and remain authenticated/queryable after
+durable storage, have no compact-hot-size claim, and remain authenticated/queryable after
 hot-index eviction. A hot hit is only a pointer/state summary; current caller
 visibility and durable receipt integrity are revalidated before any result is
 returned.
@@ -5657,8 +5706,9 @@ retention. Before any such deletion, Authority, or Event/Evidence solely for its
 tick observation, writes one immutable compact
 `splendor.secret.consumed_effect_tombstone.v1`. The record contains exactly its
 schema, nominal `secret_consumed_effect_tombstone_id`, one complete closed
-`domain_binding` below, one domain-valid `disposition`, one named
-`disposition_digest`, one complete `authority_domain`, one
+`domain_binding` below, one complete field-specific `disposition` object below
+(not a bare enum), one named `disposition_digest` over that byte-identical
+object, one complete `authority_domain`, one
 `marker_slot_binding`, positive `marker_sequence`, `consumed_at`, `compacted_at`,
 and one `previous_marker_binding`. `compacted_at >= consumed_at`.
 `marker_slot_binding` is exactly
@@ -5751,7 +5801,7 @@ schema plus `secret_containment_reserve_id`, `secret_action_submission_id`,
 `projection_binding`, `closure_ordinal`, `closure_projected_at`, preallocated
 `closure_ref`,
 `generated_resource_profile`, `generated_resource_profile_digest`,
-`hot_entry_count`, `record_credit_count`, `bundle_byte_limit`,
+`hot_entry_count`, `hot_byte_limit`, `record_credit_count`, `bundle_byte_limit`,
 `durable_byte_limit`, `marker_slot_count`, `hot_entry_id_root`,
 `record_credit_id_root`, `incident_credit_id`, and
 `marker_slot_binding_root`. Its digest uses exact
@@ -5760,7 +5810,11 @@ its digest schema, the closure record schema as `closure_schema_version`, and
 every other closure field; the output is external. `generated_resource_profile`
 is the complete grammar tuple and approval-parent disposition from the generated
 inventory below. The three roots commit exactly the profile's printed counts in
-slot-ordinal order, at most 67 hot, 1,278 record, and 66 marker entries. Each hot leaf
+slot-ordinal order, at most 67 hot entries, 1,281 record entries, and 66 marker
+entries. The
+separate `hot_byte_limit` is at most 148 KiB and is authenticated by the profile
+digest because heterogeneous hot payload widths cannot be recovered from entry
+count alone. Each hot leaf
 is exactly `{schema_version,slot_ordinal,hot_entry_id}`, each record leaf is
 exactly `{schema_version,slot_ordinal,record_credit_id}`, and each marker leaf is
 exactly `{schema_version,slot_ordinal,marker_slot_binding}` under respectively
@@ -6031,22 +6085,33 @@ implementations cannot select one digest by convention. Tombstones contain no
 protected output, target-controlled status/error, action params, complete secret
 requirements, ref/lease/handle/provider metadata beyond the minimum closed
 route/effect coordinate, evidence body, raw receipt, credential, material,
-endpoint, locator, or error. Maximum canonical size is 2 KiB and V1 pins every
-maximum tag. The maximum direct/tick outer fixture includes the complete largest
-legal `PublicationHistoryV1`, present approval-continuation tombstone binding, and
-largest other legal outer fields and must remain at or below 2 KiB; cap-plus-one
-rejects. The history is nested in the already-counted outer tombstone, not retained
-as a second record or marker. The continuation causality binding is likewise
-nested in its already-counted continuation tombstone. Consequently these richer
-bindings consume no additional hot, record, bundle, tombstone, or marker slot and
-the generated `67/1,278/17,596/22,624/66` vector remains unchanged; failure of
-either exact maximum fixture invalidates that vector and blocks activation rather
-than permitting truncation or an implicit retained copy.
+endpoint, locator, or error. Direct/tick outer tombstones have a 16-KiB canonical
+maximum; every other tombstone/auxiliary compact-marker family retains its
+generated 2-KiB maximum. The maximum direct/tick outer fixtures cover both the
+7,437-byte released and 7,605-byte withheld two-episode histories, a present
+approval-continuation tombstone binding, and the largest legal remaining fields.
+Both complete enclosing records must remain at or below 16 KiB, and a test-only
+16,385-byte schema-growth mutation fails generation. The history is nested in the
+outer tombstone, not retained as a second object, ID, copy, marker, or implicit
+indirection. The continuation causality binding is likewise nested in its
+already-counted continuation tombstone.
+
+The physical record allocator charges each direct/tick outer tombstone exactly
+four unique 4-KiB record credits. The first is the existing logical tombstone
+record; three continuation extents add 12 durable KiB exactly once per outer
+submission, never once per publication episode. The four credits share one
+tombstone ID and integrity digest but have distinct generated record-credit IDs;
+none is a hot, bundle, or marker slot. Consequently the corrected independent
+maximum vector is `67 hot entries/148 hot KiB/1,281 records/17,596 bundle KiB/
+22,636 durable KiB/66 markers`. Failure of either exact maximum fixture invalidates
+that vector and blocks activation rather than permitting truncation, compression,
+physical-page sharing, or an implicit retained copy.
 
 `tombstone_integrity_digest` is the output of closed projection
 `splendor.secret.consumed_effect_tombstone_integrity_digest.v1`, containing
 exactly its digest schema, the record schema as `tombstone_schema_version`,
-tombstone ID, complete domain binding, disposition, disposition digest, complete
+tombstone ID, complete domain binding, complete field-specific disposition,
+disposition digest, complete
 authority domain, marker-slot binding, marker sequence, both times, and previous-
 marker binding.
 The digest output is external and excluded. The authoritative marker index stores
@@ -6086,8 +6151,12 @@ Long-term marker capacity is distinct from ordinary durable records and from the
 containment emergency marker pool defined by FND-012 below. Each node configures
 positive `max_unretired_consumed_identities_node` and each active tenant/node
 configures an equal-or-lower `max_unretired_consumed_identities_tenant`; normal-
-pool minima are 4,096 and 1,024. At 2 KiB per marker, normal non-borrowable floors
-are at least 8 MiB node and 2 MiB per tenant/node. Before accepting a normal
+pool minima are 4,096 and 1,024. At 2 KiB per compact marker-index slot, normal
+non-borrowable floors are at least 8 MiB node and 2 MiB per tenant/node. This is
+identity/digest/chain index capacity, not storage for the complete consumed-effect
+tombstone. A direct/tick outer tombstone separately reserves its four 4-KiB
+durable record credits; other tombstones use their generated record width. Before
+accepting a normal
 outer, continuation, provider-control, node-control, or observation identity, the
 owner reserves one physical node slot and attributes it to one tenant
 suballocation, satisfying both scope ledgers without double allocation. A containment identity instead
@@ -7309,15 +7378,15 @@ or minimum v1 conformance bounds; deployments may be stricter but not looser:
 | Concurrent invocation/overlap | At most 16 secret-aware invocations per node and 4 per tenant/node; at most 8 simultaneously open scanned sources per invocation; each source retains at most 256 KiB shared overlap across all detectors; 32 MiB node / 8 MiB tenant ceiling. |
 | Detector throughput | At least 100 MiB/s aggregate on the activation hardware for declared representations, measured with 4 KiB through 1 MiB chunks and the maximum active detector set. |
 | Streaming/backpressure | At most 1 MiB unscanned queued bytes per invocation; 16 MiB node / 4 MiB tenant ceiling; producers block or the output quarantines, never bypasses scanning. |
-| Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node completed and reconciliation-exhausted hot schemas are at most 2 KiB. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 1,920 KiB, has at most 6,096 event refs and 2,320 trusted-send evidence refs. A dynamic publication simultaneously stores the exact 4,096-KiB four-member response set; material stores only its exact 4-KiB fixed-false member. Retention never deletes a tombstone or active uncertainty to admit work. |
-| Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per tombstone, non-borrowable normal floors are exactly 8 MiB node / 2 MiB tenant. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency or retirement slots. |
-| Emergency permanent-marker store | The generated maximum is exactly 66 typed slots: 13 for the completed tick challenge and 53 for its continuation. Challenge slots are preparation, prepare receipt, final authorization, four State command/receipt/arm/ack identities, four Agent command/receipt/arm/ack identities, completed-challenge receipt, and the primary approval-continuation identity. Continuation slots are 44 exact operational identities plus delivery attestation, terminal receipt, preparation, prepare receipt, final authorization, and four Agent command/receipt/arm/ack identities; it emits no new State identity. Every occupied slot is covered by the generated ordinal/pool/class/primary-or-auxiliary/nominal-kind/allocator-or-issuer/durable-record-owner/privileged-mutation-owner-or-consumer/permanent-marker-writer/release-authority/release-rule bijection. There are 24 distinct emergency slot classes and 30 normal-plus-emergency retirement count entries; class-schema capacity is regenerated independently from the still-66 occupied-slot maximum. A narrower profile reserves its exact generated classes and cannot widen. For 64 node/16 tenant maximum units the floors are 4,224/1,056 slots and 8,448/2,112 KiB at 2 KiB each. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
+| Idempotency/replay state | At most 4,096 general compact hot command/use-attempt/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. The 16-KiB `action_submission_hot_index` is excluded from that homogeneous pool and charged once in its containment unit below. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node completed and reconciliation-exhausted hot schemas are at most 2 KiB. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the compact-hot size claim and use separately controlled durable storage. Each delivery receipt is at most 1,920 KiB, has at most 6,096 event refs and 2,320 trusted-send evidence refs. A dynamic publication simultaneously stores the exact 4,096-KiB four-member response set; material stores only its exact 4-KiB fixed-false member. Retention never deletes a tombstone or active uncertainty to admit work. |
+| Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per compact marker-index slot, non-borrowable normal floors are exactly 8 MiB node / 2 MiB tenant. Complete tombstone payload bytes are separate durable records: a direct/tick outer uses four unique 4-KiB record credits, while other tombstones use their generated widths. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency or retirement slots. |
+| Emergency permanent-marker store | The generated maximum is exactly 66 typed slots: 13 for the completed tick challenge and 53 for its continuation. Challenge slots are preparation, prepare receipt, final authorization, four State command/receipt/arm/ack identities, four Agent command/receipt/arm/ack identities, completed-challenge receipt, and the primary approval-continuation identity. Continuation slots are 44 exact operational identities plus delivery attestation, terminal receipt, preparation, prepare receipt, final authorization, and four Agent command/receipt/arm/ack identities; it emits no new State identity. Every occupied slot is covered by the generated ordinal/pool/class/primary-or-auxiliary/nominal-kind/allocator-or-issuer/durable-record-owner/privileged-mutation-owner-or-consumer/permanent-marker-writer/release-authority/release-rule bijection. There are 24 distinct emergency slot classes and 30 normal-plus-emergency retirement count entries; class-schema capacity is regenerated independently from the still-66 occupied-slot maximum. A narrower profile reserves its exact generated classes and cannot widen. For 64 node/16 tenant maximum units the floors are 4,224/1,056 compact identity/digest/chain slots and 8,448/2,112 KiB at 2 KiB each. Complete tombstone payloads remain in their separately charged durable record credits. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
 | Tick observation durability | At most 16 C03 observations per policy output and 1 MiB canonical candidate bytes per observation, hence at most 16 MiB candidate bytes in one atomic batch. The Event/Evidence writer streams the quota-controlled durable batch without retaining a second hot copy. Unclaimed expiry is exactly 5 minutes minimum, `tick_deadline + 60 seconds`, and 24 hours maximum under the recorded policy revision. Link and expiry CAS the same owner row; at/after expiry only the winning digest tombstone remains effect-ineligible, while a winning exact link receipt pins candidate bytes through outer terminal/retention. This durable budget is excluded from the in-memory equation below and storage uncertainty rejects the whole batch before outer claim. |
 | Fixed restricted metadata | At most 8 MiB node / 2 MiB tenant for lineage indexes, control plans, and admission bookkeeping. |
-| Non-borrowable containment hot reserve | Preprovision 64 maximum `SecretContainmentReserve` units per node and 16 per active tenant/node. Each approval-capable unit owns 67 entries at at most 2 KiB; exact pools are 8,576 KiB node and 2,144 KiB tenant. A narrower non-approval profile may commit only its generated exact smaller vector and cannot later widen. Normal work cannot consume either pool. |
-| Non-borrowable containment durable reserve | The maximum vector is 22,624 KiB durable bytes, 1,278 event/evidence/enforcement-record credits, 17,596 KiB non-record bundles, 66 emergency markers, and one incident credit. The byte/bundle maximum is tick-origin trusted approval continuation; the independent record maximum is tick-origin material approval continuation. Floors are 1,414 MiB/81,792 records/64 incident credits per node and 353.5 MiB/20,448 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to exact emergency slots. Material-exposed units and all owner-control/Authority-commit/terminalization/state/publication resources are permanently pinned regardless of physical cleanup. |
+| Non-borrowable containment hot reserve | Preprovision 64 maximum `SecretContainmentReserve` units per node and 16 per active tenant/node. Each approval-capable unit owns one 16-KiB action-submission index plus at most 66 compact entries at 2 KiB each: 67 entries and 148 KiB per unit. Exact pools are 9,472 KiB (9.25 MiB) node and 2,368 KiB (2.3125 MiB) tenant. Entry count and canonical payload bytes are independent admission dimensions. A narrower non-approval profile commits only its generated exact pair and cannot later widen. Normal work cannot consume either pool. |
+| Non-borrowable containment durable reserve | The maximum vector is 22,636 KiB durable bytes, 1,281 event/evidence/enforcement-record credits, 17,596 KiB non-record bundles, 66 emergency markers, and one incident credit. The byte/bundle maximum is tick-origin trusted approval continuation; the independent record maximum is tick-origin material approval continuation. Every complete profile charges one direct/tick outer tombstone as four record credits, adding exactly three records/12 durable KiB once per outer submission. Floors are 1,414.75 MiB/81,984 records/64 incident credits per node and 353.6875 MiB/20,496 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to exact emergency slots. Material-exposed units and all owner-control/Authority-commit/terminalization/state/publication resources are permanently pinned regardless of physical cleanup. |
 | Retirement capacity | Dedicated permanent deny-head minima are 4,096 node and 1,024 per active tenant/node at 8 KiB: 32/8 MiB. Four node and one per-tenant in-flight reservations each own 528 KiB durable manifest/release scratch and 448 KiB hot scratch, giving 2,112/528 KiB durable and 1,792/448 KiB hot floors. Retirement capacity is non-borrowable and separate from normal/emergency markers. |
-| Total restricted node/tenant memory | 106.125 MiB node and 26.53125 MiB per active tenant/node: 96/24 MiB normal, 8.375/2.09375 MiB containment hot reserve, and 1.75/0.4375 MiB retirement hot scratch. No category or tenant may borrow containment or retirement capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
+| Total restricted node/tenant memory | 107 MiB node and 26.75 MiB per active tenant/node: 96/24 MiB normal, 9.25/2.3125 MiB containment hot reserve, and 1.75/0.4375 MiB retirement hot scratch. No category or tenant may borrow containment or retirement capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
 | Output drain | 30 s maximum ending at the predeclared exposure deadline plus 30 seconds. Trusted-injection timeout quarantines and prevents terminal success/publication. Material-exposed bytes are never publishable; actual exit, timeout, and drain state alter only live non-exportable enforcement and retain byte/time-identical fixed suppression records. |
 | Local cleanup | 10 s maximum for FD/socket close, unlink/unmount, projection deletion acknowledgement, and detector finalization; timeout is cleanup uncertainty. |
 | Provider revoke acknowledgement | 5 s maximum; timeout remains effect-uncertain and cannot report revoked success. |
@@ -7333,9 +7402,10 @@ observed averages:
 + (4096 hot entries * 2 KiB)
 + 8 MiB fixed metadata
 = 96 MiB normal node maximum
-+ (64 containment units * 67 entries * 2 KiB = 8,576 KiB = 8.375 MiB)
++ (64 containment units * (1 * 16 KiB + 66 * 2 KiB)
+    = 9,472 KiB = 9.25 MiB)
 + (4 retirement scratch units * 448 KiB = 1,792 KiB = 1.75 MiB)
-= 106.125 MiB total node maximum
+= 107 MiB total node maximum
 
 (16 detectors * 512 KiB)
 + (4 invocations * 8 sources * 256 KiB overlap)
@@ -7343,24 +7413,25 @@ observed averages:
 + (1024 hot entries * 2 KiB)
 + 2 MiB fixed metadata
 = 24 MiB normal tenant/node maximum
-+ (16 containment units * 67 entries * 2 KiB = 2,144 KiB = 2.09375 MiB)
++ (16 containment units * (1 * 16 KiB + 66 * 2 KiB)
+    = 2,368 KiB = 2.3125 MiB)
 + (1 retirement scratch unit * 448 KiB = 0.4375 MiB)
-= 26.53125 MiB total tenant/node maximum
+= 26.75 MiB total tenant/node maximum
 
-64 node reserve units * 67 entries * 2 KiB = 8,576 KiB
-16 tenant reserve units * 67 entries * 2 KiB = 2,144 KiB
+64 node reserve units * 148 hot KiB = 9,472 KiB
+16 tenant reserve units * 148 hot KiB = 2,368 KiB
 
 64 node reserve units * 66 emergency marker slots * 2 KiB
   = 8,448 KiB emergency marker floor
 16 tenant reserve units * 66 emergency marker slots * 2 KiB
   = 2,112 KiB emergency marker floor
 
-64 node reserve units * 22,624 KiB durable = 1,414 MiB durable floor
-16 tenant reserve units * 22,624 KiB durable = 353.5 MiB durable floor
+64 node reserve units * 22,636 KiB durable = 1,414.75 MiB durable floor
+16 tenant reserve units * 22,636 KiB durable = 353.6875 MiB durable floor
 64 node reserve units * 17,596 KiB bundles = 1,099.75 MiB bundle floor
 16 tenant reserve units * 17,596 KiB bundles = 274.9375 MiB bundle floor
-64 node reserve units * 1,278 event/evidence/enforcement records = 81,792 credits
-16 tenant reserve units * 1,278 event/evidence/enforcement records = 20,448 credits
+64 node reserve units * 1,281 event/evidence/enforcement records = 81,984 credits
+16 tenant reserve units * 1,281 event/evidence/enforcement records = 20,496 credits
 64 node reserve units * 14 control/containment tombstones = 896 tombstones
 16 tenant reserve units * 14 control/containment tombstones = 224 tombstones
 
@@ -7376,11 +7447,17 @@ The bundle floor is an independently checked sublimit within, not additional to,
 the durable-byte floor. Likewise record credits constrain cardinality while their
 4-KiB bytes are already included in each profile's durable total. Admission must
 satisfy all three correlated profile dimensions without summing either one twice.
+These printed byte floors are canonical payload reservations. The generated
+backend report separately adds each ledger row's physical key/checksum/index/
+allocator/transaction metadata maximum; a store cannot hide metadata inside
+unused fixture bytes or claim the canonical floor alone as physical capacity.
 
 The 14 tombstones per unit are exactly one for each of the two provider and eleven
 node-control rows plus one containment-reserve tombstone. They are identities and
 record obligations already represented in the generated slots above, not an
-additional byte or record-credit pool.
+additional byte or record-credit pool. They do not count the one direct/tick
+outer tombstone: that distinct submission tombstone is already included as four
+record credits in every complete profile and has only one marker identity.
 
 Tenant capacity is a suballocation of configured node capacity, never an
 independent promise. For every dimension `D` in `{containment_units, normal_hot_
@@ -7401,8 +7478,8 @@ count as a retained tenant reservation until their authoritative retention rule
 permits release; deactivation cannot hide them from the sum. No dimension may be
 overcommitted, borrowed from another dimension, or satisfied by observed average
 use. At the stated floors, one tenant reservation is exactly 16 containment
-units and the corresponding 26.53125-MiB hot, 353.5-MiB containment durable,
-274.9375-MiB bundle-within-durable, 20,448-record, 16-incident, 1,024-normal-marker, 1,056-emergency-marker,
+units and the corresponding 26.75-MiB hot, 353.6875-MiB containment durable,
+274.9375-MiB bundle-within-durable, 20,496-record, 16-incident, 1,024-normal-marker, 1,056-emergency-marker,
 224-tombstone, 1,024-retirement-head, and one-retirement-scratch suballocation.
 Therefore the 64-unit node floor admits at most four simultaneous active tenant
 reservations.
@@ -7458,7 +7535,8 @@ it prevents a released challenge from promising an unbudgeted continuation.
 That binding is the closed nested outer-row object
 `splendor.secret.approval_parent_capacity_binding.v1`: schema, submission ID,
 immutable original origin, exact challenge profile, declared maximum final
-profile, complete combined vector, hot/record/bundle/marker slot roots, incident
+profile, complete combined vector including separate hot entry count and hot
+canonical-byte limit, hot/record/bundle/marker slot roots, incident
 credit, state `reserved|activated|released|permanently_pinned`, revision, and
 binding digest. At challenge it contains no use-attempt, exposure-lineage, target-
 generation, control-invocation, or effect ID. Exact continuation activation CASes
@@ -7501,6 +7579,10 @@ For one terminal episode, let `P` be its generated projection-source count and
 
 ```text
 episode_records = E + Q + 3*C + A + 3 + 4 + D + S + H
+  + outer_tombstone_extra_records
+
+outer_tombstone_extra_records = 3 when this episode owns the original direct/tick
+  outer submission | 0 for a continuation final episode
 ```
 
 `E`, `C`, `P`, and `V` come from the grammar table above. `A` is Authority
@@ -7513,7 +7595,11 @@ postcondition records; `H=2` only for the two retained completed-challenge-tick
 receipt copies. The three records per append command are Authority outbox,
 Event/Evidence inbox, and durable acknowledgement metadata. Each actual stable
 event independently consumes the `E` metadata record even when it is a common
-action terminal or `OutcomeRecorded`.
+action terminal or `OutcomeRecorded`. The direct/tick outer tombstone's first
+record credit is the existing logical slot; the explicit `+3` charges its other
+three 4-KiB extents. A continuation final owns an approval-continuation tombstone,
+not another outer tombstone, so an approval parent receives the `+3` exactly once
+from its challenge/outer-host episode.
 
 The exact non-record episode bundle is:
 
@@ -7553,10 +7639,10 @@ copy. Folding those equations gives the exact terminal-episode vectors:
 
 | Terminal episode only | Hot | Records | Bundle KiB | Markers |
 | --- | ---: | ---: | ---: | ---: |
-| Ordinary pre-effect direct / tick | 8 / 10 | 38 / 54 | 5,520 / 7,740 | 8 / 12 |
-| Approval challenge direct / tick | 9 / 11 | 42 / 60 | 5,888 / 8,124 | 8 / 13 |
-| Ordinary trusted terminal, excluding operational base, direct / tick | 9 / 11 | 72 / 88 | 7,376 / 9,596 | 9 / 13 |
-| Ordinary material terminal, excluding operational base, direct / tick | 8 / 10 | 60 / 76 | 3,668 / 5,888 | 9 / 13 |
+| Ordinary pre-effect direct / tick | 8 / 10 | 41 / 57 | 5,520 / 7,740 | 8 / 12 |
+| Approval challenge direct / tick | 9 / 11 | 45 / 63 | 5,888 / 8,124 | 8 / 13 |
+| Ordinary trusted terminal, excluding operational base, direct / tick | 9 / 11 | 75 / 91 | 7,376 / 9,596 | 9 / 13 |
+| Ordinary material terminal, excluding operational base, direct / tick | 8 / 10 | 63 / 79 | 3,668 / 5,888 | 9 / 13 |
 | Continuation pre-effect final episode | 8 | 41 | 5,696 | 8 |
 | Continuation trusted final episode, excluding operational base | 9 | 75 | 7,552 | 9 |
 | Continuation material final episode, excluding operational base | 8 | 63 | 3,844 | 9 |
@@ -7564,30 +7650,33 @@ copy. Folding those equations gives the exact terminal-episode vectors:
 
 The complete generated profiles, including a retained challenge when applicable,
 are normative. `Receipt` is `canonical KiB / maximum pre-receipt C03 refs /
-maximum trusted-send evidence refs`; `none` means no delivery receipt is legal:
+maximum trusted-send evidence refs`; `none` means no delivery receipt is legal.
+Every complete profile owns exactly one 16-KiB action-submission index; each other
+hot entry is 2 KiB, so `Hot KiB = 16 + 2 * (Hot entries - 1)`:
 
-| Complete profile | Hot | Records | Bundle KiB | Durable KiB | Markers | Receipt |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Pre-effect direct | 8 | 38 | 5,520 | 5,672 | 8 | `128/0/0` |
-| Pre-effect tick | 10 | 54 | 7,740 | 7,956 | 12 | `128/0/0` |
-| Trusted ordinary direct | 56 | 1,194 | 9,296 | 14,072 | 53 | `1,920/6,096/2,320` |
-| Trusted ordinary tick | 58 | 1,210 | 11,516 | 16,356 | 57 | `1,920/6,096/2,320` |
-| Material ordinary direct | 56 | 1,215 | 5,588 | 10,448 | 53 | `1,920/8/0` |
-| Material ordinary tick | 58 | 1,231 | 7,808 | 12,732 | 57 | `1,920/8/0` |
-| Approval challenge direct | 9 | 42 | 5,888 | 6,056 | 8 | `none` |
-| Approval challenge tick | 11 | 60 | 8,124 | 8,364 | 13 | `none` |
-| Direct parent, challenge plus pre-effect continuation | 17 | 83 | 11,584 | 11,916 | 16 | `128/0/0` |
-| Tick-origin parent, challenge plus pre-effect continuation | 19 | 101 | 13,820 | 14,224 | 21 | `128/0/0` |
-| Direct parent, challenge plus trusted continuation | 65 | 1,239 | 15,360 | 20,316 | 61 | `1,920/6,096/2,320` |
-| Tick-origin parent, challenge plus trusted continuation | **67** | 1,257 | **17,596** | **22,624** | **66** | `1,920/6,096/2,320` |
-| Direct parent, challenge plus material continuation | 65 | 1,260 | 11,652 | 16,692 | 61 | `1,920/8/0` |
-| Tick-origin parent, challenge plus material continuation | **67** | **1,278** | 13,888 | 19,000 | **66** | `1,920/8/0` |
-| Direct parent, challenge plus cancellation | 17 | 72 | 10,488 | 10,776 | 16 | `none` |
-| Tick-origin parent, challenge plus cancellation | 19 | 90 | 12,724 | 13,084 | 21 | `none` |
+| Complete profile | Hot entries | Hot KiB | Records | Bundle KiB | Durable KiB | Markers | Receipt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Pre-effect direct | 8 | 30 | 41 | 5,520 | 5,684 | 8 | `128/0/0` |
+| Pre-effect tick | 10 | 34 | 57 | 7,740 | 7,968 | 12 | `128/0/0` |
+| Trusted ordinary direct | 56 | 126 | 1,197 | 9,296 | 14,084 | 53 | `1,920/6,096/2,320` |
+| Trusted ordinary tick | 58 | 130 | 1,213 | 11,516 | 16,368 | 57 | `1,920/6,096/2,320` |
+| Material ordinary direct | 56 | 126 | 1,218 | 5,588 | 10,460 | 53 | `1,920/8/0` |
+| Material ordinary tick | 58 | 130 | 1,234 | 7,808 | 12,744 | 57 | `1,920/8/0` |
+| Approval challenge direct | 9 | 32 | 45 | 5,888 | 6,068 | 8 | `none` |
+| Approval challenge tick | 11 | 36 | 63 | 8,124 | 8,376 | 13 | `none` |
+| Direct parent, challenge plus pre-effect continuation | 17 | 48 | 86 | 11,584 | 11,928 | 16 | `128/0/0` |
+| Tick-origin parent, challenge plus pre-effect continuation | 19 | 52 | 104 | 13,820 | 14,236 | 21 | `128/0/0` |
+| Direct parent, challenge plus trusted continuation | 65 | 144 | 1,242 | 15,360 | 20,328 | 61 | `1,920/6,096/2,320` |
+| Tick-origin parent, challenge plus trusted continuation | **67** | **148** | 1,260 | **17,596** | **22,636** | **66** | `1,920/6,096/2,320` |
+| Direct parent, challenge plus material continuation | 65 | 144 | 1,263 | 11,652 | 16,704 | 61 | `1,920/8/0` |
+| Tick-origin parent, challenge plus material continuation | **67** | **148** | **1,281** | 13,888 | 19,012 | **66** | `1,920/8/0` |
+| Direct parent, challenge plus cancellation | 17 | 48 | 75 | 10,488 | 10,788 | 16 | `none` |
+| Tick-origin parent, challenge plus cancellation | 19 | 52 | 93 | 12,724 | 13,096 | 21 | `none` |
 
 The maximum admission vector takes each dimension independently:
-`hot=67`, `records=1,278`, `bundle=17,596 KiB`, `durable=22,624 KiB`,
-`markers=66`, and one incident credit. It is not a fictitious single path: the
+`hot_entries=67`, `hot=148 KiB`, `records=1,281`, `bundle=17,596 KiB`,
+`durable=22,636 KiB`, `markers=66`, and one incident credit. It is not a
+fictitious single path: the
 bundle/durable maximum is the tick-origin trusted-continuation parent, while the
 record maximum is the tick-origin material-continuation parent. Sixteen-request
 receipt maxima remain exactly `16*(13*27+16+12+2)=6,096` C03 refs and
@@ -7611,8 +7700,10 @@ eleven node profiles and two provider profiles. The 12 lease slots admit epoch 0
 two same-ID recoveries, and overflow. A generated schema-path/source/copy/owner/
 slot ledger expands every folded row above. Each entry names the closed schema
 path and union arm, source ID kind, canonical maximum, physical owner, retained-
-copy ordinal, record/bundle/hot slot, marker class or `not_applicable`, and release
-rule. Generation fails on an unassigned or unreachable arm, duplicate slot,
+copy ordinal, record/bundle/hot slot, exact hot canonical-byte charge, marker
+class or `not_applicable`, separately declared physical-metadata byte maximum,
+and release rule. Generation fails on an unassigned or unreachable arm,
+duplicate slot,
 missing copy, missing common-event metadata, missing owner command/receipt/
 acknowledgement, unbudgeted State object or projection source/checkpoint/export,
 wrong response-member cardinality, or a slot reachable from two arms.
@@ -7722,8 +7813,10 @@ tuples, two provider controls, eleven node-control variants, trusted sends, stab
 events, owner-local commands/receipts/acknowledgements, State objects, projection
 sources/copies/checkpoints/exports, publication arms, and exact response members.
 It then emits the unfolded ledger and recomputes every profile, parent sum,
-receipt bound, marker class, and node/tenant floor. CI fails unless it derives the
-complete profile table, maximum vector `67/1,278/17,596/22,624/66`, response sets
+receipt bound, marker class, canonical node/tenant floor, and separate physical-
+metadata/backend allocation floor. CI fails unless it derives the
+complete profile table, maximum vector `67 entries/148 hot KiB/1,281 records/
+17,596 bundle KiB/22,636 durable KiB/66 markers`, response sets
 `4,096/4 KiB`, receipt refs `6,096/2,320`, and equations above. OpenAPI, Python,
 TypeScript, and operator reports consume that one generated evidence artifact;
 none carries an independent oracle.
@@ -7776,8 +7869,8 @@ success.
 A material-exposed unit is never release-eligible or C03-retirable in v1. From
 the absorbing Authority one-shot commit onward, its complete accepted material
 profile and parent prefix remain charged; the allocator-wide ceilings are 67 hot
-slots, 1,278 record credits, 22,624 KiB durable bytes, one incident credit, and 66
-marker debits,
+slots/148 hot KiB, 1,281 record credits, 22,636 KiB durable bytes, one incident
+credit, and 66 marker debits,
 private scratch, execution resources, and tenant/node
 admission charge remain pinned identically. Actual return, revocation, fencing,
 drain, wipe, cleanup, reconciliation, tombstone completion, or zero live debit
@@ -8645,7 +8738,7 @@ closed source enum/list.
 | Duplicate or response-lost provider renew/revoke/audit/active probe | Resolve the Authority ledger; exact bytes return original state/result, changed bytes conflict, sent uncertainty never re-enters the method, and post-effect loss uses retained bytes or a new authorized read-only audit. |
 | Node fence/terminate/close/unmount/delete/attest/revocation acknowledgement outside node-control gateway profile | Reject; direct node/OS/orchestrator mutation count remains zero. |
 | Node-control retry after proved no-send versus after write-ahead send | Only `one_no_send_retry_100ms` permits one same-plan retry after exactly 100 ms with owner proof of zero bridge bytes/local mutation. `no_retry`, missing proof, changed bytes, or any `sent_uncertain|sent_known` state permits no resend or failover. |
-| Normal/uncertain quotas or normal marker slots filled after exposure | The accepted generated vector, bounded by independent maxima of 1,278 records, 17,596 bundle KiB, 22,624 durable KiB, 67 hot slots, and 66 typed emergency marker slots, admits its exact owner-control/Authority-commit/terminal/trace/state/publication/tombstone sequence. New challenge/exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. A material-exposed unit remains permanently pinned/non-retirable. |
+| Normal/uncertain quotas or normal marker slots filled after exposure | The accepted generated vector, bounded by independent maxima of 1,281 records, 17,596 bundle KiB, 22,636 durable KiB, 67 hot slots/148 hot KiB, and 66 typed emergency marker slots, admits its exact owner-control/Authority-commit/terminal/trace/state/publication/tombstone sequence. New challenge/exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. A material-exposed unit remains permanently pinned/non-retirable. |
 | Independent lineages share node/instance/generation number | Node domain, handle, plan, result, receipt, marker, cleanup, restart/migration, and retirement also bind the nominal exposure-lineage ID. Retirement of lineage A generation 1 cannot conflict with, compact, or deny lineage B generation 1. |
 | Lease not active/expired/revoked/max-use | Atomic deny before exposure/effect. |
 | Unknown/closed handle | Uniform deny; never attempt provider lookup from handle metadata. |
@@ -8778,7 +8871,8 @@ terminal goldens contain the nominal invocation ID plus explicit plan/partition
 digests and no inferred invocation digest. Node goldens include the exact retry
 profile in plan/result/intent/receipt. The 16-requirement maximum fixture
 separately pins the 902-byte completed provider hot index, generated exhausted
-provider/node hot indexes, every <=2-KiB hot index,
+provider/node hot indexes, every compact <=2-KiB hot index and the separate
+<=16-KiB action-submission hot index,
 complete larger durable receipt, 6,096 C03 event refs, 2,320 trusted-send evidence
 refs, summary/event order, uniqueness, and cardinality. Separate maximum fixtures
 pin a complete 32-KiB stable `Action`, 32-KiB-plus-one rejection, complete 64-KiB
@@ -8799,7 +8893,8 @@ large-output artifact/data reference. They serialize every complete `ActionFaile
   cycle, undeclared edge, placeholder, future-final-authorization dependency,
   missing/duplicate slot or copy, unreachable arm, a tick profile without the
   2,048-KiB State bundle, and any value other than maximum vector
-  `67/1,278/17,596/22,624/66` fail V1.
+  `67 entries/148 hot KiB/1,281 records/17,596 bundle KiB/22,636 durable KiB/
+  66 markers` fail V1.
   Separate publication-progress goldens cover direct, ordinary tick, challenge
   tick, and continuation profiles at `not_started`, every legal completion/arm
   prefix, `released`, and `permanently_withheld`, plus all three exact
@@ -8807,8 +8902,11 @@ large-output artifact/data reference. They serialize every complete `ActionFaile
   released challenge is byte-identical when the final episode is added, both
   completion receipt revisions equal their command expected revisions before
   advancing by one, and a withheld final retains its absorbing revision.
-  Positive/canonical maximum and cap-plus-one vectors pin each <=2-KiB hot index
-  and history-rich tombstone. Negatives cover
+  Positive/canonical maximum and cap-plus-one vectors pin each compact <=2-KiB
+  hot index, the <=12-KiB history, and the <=16-KiB action-submission hot index
+  and history-rich direct/tick outer tombstone. The 2,612-byte structural lower-
+  bound regression must fail the old cap, while the 7,437/7,605-byte maximum
+  histories pass the new cap. Negatives cover
   receipt-present/preparation-absent, changed preparation repetition, Agent before
   State, acknowledgement before command, completion receipt before-revision not
   equal to its command expected revision, skipped owner revision, wrong agent-
@@ -9241,8 +9339,8 @@ remains `not_exercised`.
   unmount/delete/attest, cleanup, terminal evidence, incident, reconciliation,
   and tombstone work from the non-borrowable reserve. Fixtures drive every
   complete generated single-episode and approval-parent profile, including the
-  independent 67-hot, 1,278-record, 17,596-bundle-KiB, 22,624-durable-KiB, and
-  66-marker maxima. They include the complete 71-record typed `prepare_delivery` profile,
+  independent 67-hot-entry/148-hot-KiB, 1,281-record, 17,596-bundle-KiB,
+  22,636-durable-KiB, and 66-marker maxima. They include the complete 71-record typed `prepare_delivery` profile,
   Authority commit/receipt, the complete 71-record typed `activate_delivery`
   profile, the complete 71-record typed `abort_delivery` profile, all four
   canonical event copies, every separately counted trace/state-head/run/audit
@@ -9274,7 +9372,8 @@ remains `not_exercised`.
   duplicate slot, missing stable-event metadata, owner copy, response member, or
   projection object. It recomputes all 13 reconciliation claims/tombstones, every
   single and approval-parent profile, maximum vector
-  `67/1,278/17,596/22,624/66`, tenant/node floors, and the 6,096/2,320 receipt
+  `67 entries/148 hot KiB/1,281 records/17,596 bundle KiB/22,636 durable KiB/
+  66 markers`, tenant/node floors, and the 6,096/2,320 receipt
   maxima from schemas rather than prose constants.
 - Terminalization pressure separately crashes after every one of ten direct and
   twelve tick stable appends, prepared state node, metadata write, pending-head
@@ -9339,9 +9438,10 @@ remains `not_exercised`.
   success, uncertainty, material suppression, challenge, cancellation, and
   changed taxonomy/retry substitution. Final same-key retry is lookup only. For
   canonical-byte limits, all four languages produce identical 32-KiB action,
-  64-KiB outcome, complete event/command/copy maxima, and cap-plus-one rejection
-  vectors; a large governed artifact/data-ref output succeeds without inline
-  expansion. For
+  64-KiB outcome, complete event/command/copy maxima, 7,437/7,605-byte maximum
+  two-episode histories, <=12-KiB history, <=16-KiB submission-index/outer-
+  tombstone envelopes, and cap-plus-one rejection vectors; a large governed
+  artifact/data-ref output succeeds without inline expansion. For
   material exposure, all four clients decode only the fixed terminal/restricted
   suppression envelope with no `ActionOutcome` or receipt; no helper can request
   or decode a target-derived projection. Separate generated
@@ -9416,18 +9516,19 @@ remains `not_exercised`.
   output-drain, cleanup, and 24-hour soak budget passes on the activation
   composition. Worst-case 64-KiB material with every enabled representation at
   the 64-detector/16-invocation node maxima and 16-detector/4-invocation tenant
-  maxima satisfies the 106.125-MiB node and 26.53125-MiB tenant equations,
-  including the 8.375/2.09375-MiB containment hot
+  maxima satisfies the 107-MiB node and 26.75-MiB tenant equations,
+  including the 9.25/2.3125-MiB containment hot
   pools and 1.75/0.4375-MiB retirement hot scratch. The report also proves the
-  1,414/353.5-MiB containment durable and 1,099.75/274.9375-MiB bundle floors,
+  1,414.75/353.6875-MiB containment durable and 1,099.75/274.9375-MiB bundle floors,
   2.0625/0.515625-MiB retirement durable scratch floors, normal 8/2-MiB marker
   stores, 8,448/2,112-KiB emergency marker floors, 32/8-MiB retirement deny-head
-  floors, 81,792/20,448 record credits, 896/224 control-plus-containment
+  floors, 81,984/20,496 record credits, 896/224 control-plus-containment
   tombstones, the complete generated profile table, every profile-identity
   bijection/reverse-map row, all 24 emergency classes and 30 fixed retirement
   count entries, every exact marker role, the packed 4,096-entry retirement map
   with fixed pool-local ordinals and widths, independent
-  67/1,278/17,596/22,624/66 maxima, 4,096/4-KiB response sets, the 6,096/2,320
+  67-entry/148-hot-KiB/1,281-record/17,596-bundle-KiB/22,636-durable-KiB/
+  66-marker maxima, 4,096/4-KiB response sets, the 6,096/2,320
   receipt ref maxima, and 71
   records per control row. The report is generated from the
   canonical Rust schemas and driver-manifest maxima and fails on any mismatch
@@ -9470,8 +9571,9 @@ remains `not_exercised`.
   the per-use 145-record reserve.
 - The 16-requirement maximum receipt/event fixture remains queryable after hot-
   index eviction, while every hot command/use-attempt/submission-index/provider-
-  control/node-control record is
-  <=2 KiB. Dropped responses and duplicate observations throughout the 24-hour
+  control/node-control record obeys its family cap: 16 KiB for the action-
+  submission index and 2 KiB for every compact family. Dropped responses and
+  duplicate observations throughout the 24-hour
   soak produce zero duplicate reservations, provider/node/adapter/target effects,
   receipts, or final terminal events. Full-record expiry throughout the soak
   retains exact tombstone/conflict behavior: withheld remains the byte-identical
@@ -9691,6 +9793,11 @@ Independent reviewers should recommend acceptance only if all are true:
   extension, completion receipts require before-revision equality to their
   commands plus one successor revision, and withheld retains its absorbing
   revision. The direct/tick outer tombstone carries the same history byte-for-byte.
+  Generated field-bound sizing pins the 2,612-byte old-cap structural regression,
+  exact 7,437/7,605-byte largest two-episode released/withheld histories, 12-KiB
+  history cap, and 16-KiB submission-index/outer-tombstone caps. Schema-growth
+  cap-plus-one fixtures fail before artifacts; physical encoding cannot satisfy a
+  canonical cap or replace inline history.
 - State Service alone mutates state/head visibility, Agent Instance Controller
   alone mutates run/tick lifecycle, Event/Evidence alone appends events/
   projections, and Authority alone mutates submission/publication proofs.
@@ -9937,9 +10044,9 @@ Independent reviewers should recommend acceptance only if all are true:
   exhausted-row quarantine/retirement policy; material-exposed units are never
   release-eligible and remain permanently pinned/non-retirable. The Authority-
   local allocator transaction reserves the exact generated profile and enforces
-  independent maxima of 67 hot slots, 66 typed emergency marker slots, 1,278
-  event/evidence/enforcement-record credits, 17,596 bundle KiB, and 22,624 durable
-  KiB per approval-capable parent;
+  independent maxima of 67 hot slots/148 hot KiB, 66 typed emergency marker
+  slots, 1,281 event/evidence/enforcement-record credits, 17,596 bundle KiB, and
+  22,636 durable KiB per approval-capable parent;
   the 66 occupied slots map bijectively to their exact primary/auxiliary nominal
   identities across 24 emergency classes, while retirement manifests always carry
   all 30 emergency-plus-normal pool/class counts. Retirement scratch uses exactly
@@ -9950,9 +10057,9 @@ Independent reviewers should recommend acceptance only if all are true:
   returns the reusable unit after zero live debit and only unused marker slots;
   material ordinary retirement is forbidden. Charged material markers remain
   permanently. FND-012 proves
-  106.125/26.53125-MiB restricted-memory totals,
-  1,414/353.5-MiB containment durable floors, 1,099.75/274.9375-MiB bundle
-  floors, 81,792/20,448 record-credit
+  107/26.75-MiB restricted-memory totals,
+  1,414.75/353.6875-MiB containment durable floors, 1,099.75/274.9375-MiB bundle
+  floors, 81,984/20,496 record-credit
   floors, 896/224 control-plus-containment tombstone floors, normal minimum
   8/2-MiB marker stores, emergency 8,448/2,112-KiB marker
   floors, and separate 32/8-MiB retirement deny-head floors. The report is
@@ -9969,12 +10076,12 @@ Independent reviewers should recommend acceptance only if all are true:
   follows explicit policy without fabricated success. Material
   exposure admits at most 16 sink attempts, then consumes the one
   pre-reserved overflow/termination record before any 17th sink operation.
-- The <=2-KiB hot submission/provider/node-control indexes contain only lookup/
-  state/digest/terminal pointers; active uncertainty cannot be evicted and full
-  immutable terminal intents/receipts/results use quota-controlled durable
-  storage. Summary and event order/uniqueness/cardinality are fixed and covered
-  by the 16-requirement, 6,096-event-ref and 2,320 trusted-send-evidence-ref
-  maximum fixtures.
+- The <=16-KiB hot submission index and <=2-KiB compact provider/node-control
+  indexes contain only lookup/state/digest/terminal pointers; active uncertainty
+  cannot be evicted and full immutable terminal intents/receipts/results use
+  quota-controlled durable storage. Summary and event order/uniqueness/
+  cardinality are fixed and covered by the 16-requirement, 6,096-event-ref and
+  2,320 trusted-send-evidence-ref maximum fixtures.
 - Tenant floors are node suballocations in every hot/durable/record/incident/
   marker/tombstone/retirement dimension. The 64-unit node floor admits four
   16-unit tenant reservations; a fifth denies before effect unless every deficient
