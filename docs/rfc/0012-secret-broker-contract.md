@@ -239,7 +239,7 @@ enters cleanup.
 
 For `material_exposed`, the proposed-public-projection argument is a sealed
 zero-capacity variant. The adapter may provide raw captured bytes only to the
-private detector/incident path described below; it cannot propose an output,
+private live detector/enforcement path described below; it cannot propose an output,
 error, postcondition value, artifact, state patch, trace payload, or result
 choice. Any adapter ABI that permits such a value for that exposure profile is
 incompatible and cannot register.
@@ -376,7 +376,8 @@ The following C03-owned IDs are UUID-backed nominal newtypes in
 | `secret_reconciliation_claim_id` | `SecretReconciliationClaimId` | One nominal provider/node reconciliation-claim identity; it is not permission to repeat an effect. |
 | `secret_consumed_effect_tombstone_id` | `SecretConsumedEffectTombstoneId` | One immutable permanent consumed-identity/effect marker. |
 | `secret_permanent_auxiliary_identity_marker_id` | `SecretPermanentAuxiliaryIdentityMarkerId` | One immutable permanent non-reuse marker for one containment auxiliary identity. |
-| `secret_retired_authority_domain_marker_id` | `SecretRetiredAuthorityDomainMarkerId` | One immutable permanent deny marker for one retired authority domain. |
+| `secret_retired_authority_domain_deny_head_id` | `SecretRetiredAuthorityDomainDenyHeadId` | One immutable permanent deny head for one retired authority domain, charged only to the dedicated retirement pool. |
+| `secret_retirement_manifest_id` | `SecretRetirementManifestId` | One bounded in-flight manifest for canonical multi-chain authority-domain retirement; never an identity lookup or authority token. |
 
 C03 consumes, but does not own, `PrincipalId`, `TenantId`, `AgentId`, `RunId`,
 `WorkloadId`, `FleetId`, `NodeId`, `InstanceId`, `ActionId`, `TraceEventId`,
@@ -839,7 +840,7 @@ binding:
 | --- | --- | --- |
 | `unclaimed` | none | link receipt and expiry tombstone |
 | `linked_to_exact_submission` | `link_receipt {secret_tick_candidate_observation_link_receipt_id, observation_link_receipt_digest}` | expiry tombstone |
-| `expired` | `expiry_tombstone {secret_consumed_effect_tombstone_id, tombstone_integrity_digest}` | link receipt |
+| `expired` | `expiry_tombstone` is exactly `pending_integrity {kind="pending_integrity",secret_consumed_effect_tombstone_id,pointer_revision=1}` or `verified {kind="verified",secret_consumed_effect_tombstone_id,tombstone_integrity_digest,pointer_revision=2}` | link receipt |
 
 Event/Evidence exposes one private owner command to race those terminal
 transitions. Link input contains the observation ID, owner partition digest,
@@ -868,15 +869,48 @@ is external and excluded. Exact duplicate link input returns the same receipt;
 any changed submission ID or digest is
 `secret_tick_candidate_observation_conflict` and cannot create another receipt.
 
-Expiry CASes the same `unclaimed` row. Its winner first inserts and verifies the
-exact observation-domain permanent tombstone defined below, then atomically
-advances the claim state to `expired` and appends restricted
-`secret.tick_candidate.expired`. Only after those durable facts may retained
-candidate bytes be deleted. An expiry winner permits no Authority outer row,
-reservation, provider/node/adapter/target work, or effect. A link winner prevents
-unclaimed expiry and pins the immutable payload, claim row, link receipt, and
-marker reservations through outer terminal/uncertain retention and permanent
-tombstone rules.
+Expiry CASes the same `unclaimed` row through one acyclic owner-serialized workflow. At
+or after the fixed boundary, while the owner serialization lock makes a link
+illegal, it durably preallocates exactly one tombstone ID and records an expiry-
+preparation row. A crash resumes that same ID; no replacement ID may be minted.
+It then CASes the claim to `expired`, records the winning terminal owner revision
+and transition sequence, and installs `pending_integrity` with that ID. No
+integrity digest exists yet. The owner computes the disposition digest only from
+the exact pre-integrity fields below, builds the tombstone, computes its one
+non-recursive integrity digest, commits and re-reads the tombstone, then CASes
+only the external pointer from `pending_integrity` revision 1 to `verified`
+revision 2. That pointer CAS does not revise the terminal claim revision or
+transition sequence. Finally it appends the fixed
+`secret.tick_candidate.expired` event and may delete retained candidate bytes.
+An expiry winner permits no Authority outer row, reservation, provider/node/
+adapter/target work, or effect. A link winner prevents expiry preparation and
+pins the immutable payload, claim row, link receipt, and marker reservations
+through outer terminal/uncertain retention and permanent tombstone rules.
+
+The exact expiry construction order is therefore:
+
+1. preallocate and durably bind the one tombstone ID;
+2. win the expiry CAS and write terminal revision/sequence plus
+   `pending_integrity {kind="pending_integrity",secret_consumed_effect_tombstone_id,pointer_revision=1}`,
+   with no digest;
+3. compute `tick_observation` disposition bytes from pre-integrity facts only;
+4. build the tombstone containing that disposition digest;
+5. compute tombstone integrity excluding the integrity output;
+6. commit and re-read the tombstone;
+7. CAS the external claim-row pointer to
+   `verified {kind="verified",secret_consumed_effect_tombstone_id,tombstone_integrity_digest,pointer_revision=2}`;
+8. append the fixed expiry event, verify it, then delete candidate bytes.
+
+Crash before step 1 has no expiry preparation. Crash after step 1 resumes the
+same prepared ID. Crash after step 2 resumes from the immutable terminal claim
+facts. Crash during steps 3-6 recomputes identical bytes. Crash after step 6
+re-reads the tombstone and performs only the pointer CAS. Crash after step 7
+appends only the unique fixed event. Crash after step 8 can only repeat deletion.
+Any changed ID, revision, sequence, expiry, digest input, pointer state, or
+committed bytes is corruption: quarantine the run domain, retain candidate bytes,
+and admit neither link nor outer effect. A zeroed digest, placeholder digest,
+mutable-after-hash record, second tombstone ID, or self-referential input is
+invalid.
 
 Authority may insert a tick outer row only after validating a durable winning
 link receipt against the current immutable observation and the exact proposed
@@ -1106,23 +1140,133 @@ stable `ActionStatus`; it therefore has no poll, outcome, or delivery receipt an
 cannot be mistaken for a completed adapter attempt.
 
 After any `material_exposed` delivery, creating POST, duplicate POST, and every
-GET return only one fixed `terminal/restricted` envelope at the predeclared
-publication boundary: `duplicate` follows only creating-versus-duplicate
-transport history, `retry_class=not_retryable`,
-`outer_effect_certainty=uncertain`, `receipt_disposition=withheld`, and
-`redaction_reason=material_exposed_target_publication_suppressed`. Outcome,
-receipt, split certainty, reason, poll, output, error, target timing, evidence,
-incident, and cleanup fields are forbidden. Even the original principal or a
-dedicated result reader cannot obtain a full result. The fixed internal stable
-`Failed` action outcome and restricted security/incident evidence remain owner
-records; ordinary result APIs, trace projections, state, artifacts, and SDKs do
-not expose them as target-selected data. A pre-exposure denial may still use its
-ordinary full/restricted rule because target code never received material.
+GET are held until the one predeclared release boundary and then return only the
+`MaterialExposureSuppressedProjectionV1` response projection below. The
+`duplicate` field is fixed `false`; transport retry history is not published.
+Outcome, receipt, split certainty, dynamic `reason_code`, poll, output, target
+error, target timing, evidence/incident refs, actual cleanup fields, and target-
+selected reference fields are forbidden.
+The only error field is the fixed `error_code` below.
+Even the original principal or a dedicated result reader cannot obtain a full
+result. A pre-exposure denial may still use its ordinary full/restricted rule
+because target code never received material.
+
+#### Target-independent material-exposure projection
+
+`MaterialExposureSuppressedProjectionV1` is the Rust contract name for closed
+schema `splendor.secret.material_exposure_suppressed_projection.v1`. It is the
+only caller-, workload-, tenant-, trace-, state-, evidence-, incident-,
+attestation-, telemetry-, export-, and replay-readable representation after
+material reaches target code. Every field is required; no field is optional or
+nullable:
+
+| Field | Exact value or owner rule |
+| --- | --- |
+| `schema_version` | `splendor.secret.material_exposure_suppressed_projection.v1` |
+| `secret_action_submission_id` | Server-preallocated submission ID, fixed before exposure. |
+| `origin_binding` | Exactly `{"kind":"direct","run_id":...}` or `{"kind":"tick","run_id":...,"tick_id":...}`; fixed before exposure. |
+| `projection_profile` | Literal `material_exposure_suppressed_v1`. |
+| `projection_revision` | Integer `1`. |
+| `material_exposure_deadline` | Immutable driver-declared deadline admitted before provider acquisition. |
+| `target_fence_at` | Exactly `material_exposure_deadline`. |
+| `drain_window_closes_at` | Exactly deadline plus 30 seconds. |
+| `cleanup_window_closes_at` | Exactly deadline plus 40 seconds. |
+| `projection_events_begin_at` | Exactly deadline plus 41 seconds. |
+| `outer_terminal_event_at` | Exactly deadline plus 41.008 seconds. |
+| `outcome_recorded_at` | Exactly deadline plus 41.009 seconds. |
+| `state_commit_binding` | Exactly `{"kind":"not_applicable"}` for direct origin or `{"kind":"scheduled","at":...}` with `at=deadline+41.010 seconds` for tick origin. |
+| `tick_complete_binding` | Exactly `{"kind":"not_applicable"}` for direct origin or `{"kind":"scheduled","at":...}` with `at=deadline+41.011 seconds` for tick origin. |
+| `response_release_at` | Exactly deadline plus 42 seconds. |
+| `state` | Literal `terminal`. |
+| `view` | Literal `restricted`. |
+| `duplicate` | Literal `false`. |
+| `retry_class` | Stable literal `not_retryable`. |
+| `final_action_status` | Stable literal `Failed`. |
+| `outer_effect_certainty` | Stable literal `uncertain`. |
+| `receipt_disposition` | Literal `withheld`. |
+| `error_code` | Literal `material_exposed_publication_suppressed`. |
+| `redaction_reason` | Literal `material_exposed_target_publication_suppressed`. |
+| `publication_disposition` | Literal `target_publication_suppressed`. |
+| `postcondition_status` | Literal `not_run`. |
+| `cleanup_projection` | Literal `quarantined`. |
+| `c03_projection_event_count` | Integer `8`. |
+
+The private unchanged stable `ActionOutcome` required by the outer terminal pair
+is also target-independent: it contains the already fixed action ID, `Failed`, the
+already sealed pre-exposure verification result, no post-verification, no output,
+error `material_exposed_publication_suppressed`, and `completed_at` equal to
+`outer_terminal_event_at`. Its canonical bytes and digest are sealed before
+exposure; they are never returned by the material-exposed response projector.
+
+Every timestamp is serialized in the fixed-six-digit C03 form. The projection
+digest uses schema `splendor.secret.material_exposure_suppressed_projection_digest.v1`
+and contains the digest schema plus every field above, with the record schema in
+`projection_schema_version`; the digest output is external. It is computed and
+sealed before exposure. Actual return, sink attempt, detector result, exit,
+crash, resource consumption, drain branch, cleanup result, certainty, or storage
+completion time is never an input and cannot alter a field or release time.
+
+The fixed C03 event profile contains exactly eight events of schema
+`splendor.secret.material_exposure_suppressed_event.v1`. Every event has exactly
+`schema_version`, the preallocated `secret_access_event_id`,
+`secret_action_submission_id`,
+`material_exposure_suppressed_projection_digest`, `event_ordinal`, `phase`,
+`occurred_at`, `recorded_at`, and one `causal_parent_ref: SecretCausalRef`. All use
+canonical event class
+`secret.material_exposure.suppressed`; ordinal, phase, and time are fixed:
+
+| Ordinal | Phase | `occurred_at` and `recorded_at` offset from exposure deadline |
+| --- | --- | --- |
+| 0 | `target_window_closed` | 41.000 seconds |
+| 1 | `drain_window_closed` | 41.001 seconds |
+| 2 | `cleanup_window_closed` | 41.002 seconds |
+| 3 | `egress_window_closed` | 41.003 seconds |
+| 4 | `publication_suppressed` | 41.004 seconds |
+| 5 | `quarantine_projected` | 41.005 seconds |
+| 6 | `terminal_evidence_projected` | 41.006 seconds |
+| 7 | `governed_path_completed` | 41.007 seconds |
+
+All eight IDs and ordinal-zero's pre-exposure causal parent are preallocated and
+sealed before exposure. Later events name only the preceding fixed event. The
+fixed stable `action.failed` and `outcome.recorded` records follow at the two
+times above; tick origin then emits its fixed projection-only state commit and
+tick completion. This sequence is mandatory trace evidence, not optional logging.
+The outer terminal event ID, outcome-record ID, tick-origin state-node/event ID,
+tick-completion event ID, and every causal parent are also preallocated before
+exposure. Their post-exposure payload is exactly the projection and its digest;
+their timestamps are exactly the table values, never append acknowledgement or
+target time.
+For tick origin, the state node has the pre-exposure state head as its sole
+parent and a patch containing exactly `secret_action_submission_id`,
+`material_exposure_suppressed_projection_digest`, and
+`final_action_status="Failed"`; its node ID, patch digest, state hash, and trace
+refs are
+precomputed before exposure. Direct origin commits no state. No target result,
+cleanup fact, incident ref, or resource value can enter either state path.
+It has identical kind, order, cardinality, values, bytes, and release schedule
+when the target returns early, delays, selects a sink, triggers or evades a
+detector, crashes, exhausts its attempt allowance, encounters cleanup failure, or
+times out.
+
+Once exposure is recorded, every generic C03 access-event, trace, state,
+evidence, incident, attestation, observability, audit-export, SDK, and replay
+projector must route the submission through this projection and fixed event
+profile. It must not fall back to `splendor.secret.access_event_projection.v1`
+or the complete `SecretAccessEvent`. Ordinary stores never retain actual driver-
+return time, sink/control kind, leak/no-leak, match status, target exit, counters,
+actual cleanup state, target-selected references, or captured bytes. Live
+enforcement may hold the minimum target-specific state needed to fence and clean
+inside non-exportable node-local scratch; it is wiped when enforcement closes, or
+remains inaccessible under the live fence without changing the fixed release.
+There is no retained richer record in v1. Retaining any richer fact requires a
+separately accepted forensic-confidentiality and declassification owner whose
+storage and API are inaccessible to the target, workload, caller, and tenant;
+this RFC neither defines nor authorizes that owner.
 
 Response media type is exactly `application/json`. The request body and retained
 candidate obey the daemon's 2-MiB request cap; the unchanged nested
 `ActionOutcome` canonical bytes are capped at 1 MiB for this new endpoint, the
-receipt is capped at 512 KiB, the complete full response is capped at 2 MiB, and
+receipt is capped at 2 MiB, the complete full response is capped at 4 MiB, and
 the restricted response is capped at 4 KiB. Scan/seal must produce a failed
 no-output outcome before terminal commit rather than truncate protected output
 to fit. Pre-commit serialization ambiguity or inability to prove the terminal
@@ -1571,6 +1715,14 @@ new use attempts, call provider/node/adapter/target, or manufacture success. A
 missing/corrupt intent, unavailable receipt, uncertain append, or ledger read
 fails closed as non-retryable uncertainty and quarantines affected exposure.
 
+For material exposure, every terminal-intent and completion-digest field is the
+corresponding fixed projection value: entry/start are `true`, all certainty is
+`uncertain`, cleanup is `quarantined`, postcondition is `not_run`, status is
+`Failed`, publication is suppressed, ordered C03 refs are the fixed eight, and
+Authority completion time is `outer_terminal_event_at`. Use summaries follow the
+fixed material-exposed receipt form. Actual target return, control, detector,
+cleanup, append acknowledgement, and resource facts are forbidden digest inputs.
+
 The `completion_digest` uses projection
 `splendor.secret.submit_completion_digest.v1` containing exactly its schema,
 `secret_action_submission_id`, `outer_idempotency_digest`, `wrapper_digest`,
@@ -1832,31 +1984,47 @@ wrapper, wrong-process record, or copied reference cannot authorize activation.
 
 The driver-to-gateway handoff is a non-serializable
 `SecretDeliveryControlAttestation<'session>`. The node creates a prepared control
-typestate before exposure; the driver consumes it during `resolve_and_deliver`;
-and, after the one target operation returns but before the adapter invocation
-returns, the gateway accepts the immutable terminal attestation before
-postcondition verification. It contains the attestation ID,
-lease/use-attempt/handle IDs, exposure-lineage ID, target/delivery generations,
-exact effect coordinate and execution
-binding, method and method-child revision, detector registration ID when
-installed, exact delivery exposure profile, enforcement-profile schema/revision/
-digest, ordered `SecretEgressEvidenceRef` values for every reached phase,
-driver-returned time,
-`target_effect_certainty`, and exactly one result per
-`SecretDeliveryControlKind` sorted by enum spelling. Each result contains only
-`kind`, `required`, `status`, and the
-typed restricted evidence ref when `status=applied`. It contains no final
-`ActionStatus`, outer terminal event ID, material, endpoint, output, error text,
-or platform diagnostic. A required control with `not_applicable`, `unsupported`,
-or `failed`, a missing/duplicate/stale result, or a wrong-binding evidence ref
-fails closed. No terminal receipt exists at `delivery_ready`,
-`delivery_activated`, driver return, or postcondition start.
+typestate before exposure; the driver consumes it during `resolve_and_deliver`.
+For `trusted_injection`, after the one target operation returns but before the
+adapter invocation returns, the gateway accepts the immutable terminal
+attestation before postcondition verification. That form contains the attestation
+ID, lease/use-attempt/handle IDs, exposure-lineage ID, target/delivery generations,
+exact effect coordinate and execution binding, method and method-child revision,
+detector registration ID when installed, exact delivery exposure profile,
+enforcement-profile schema/revision/digest, ordered `SecretEgressEvidenceRef`
+values for every reached phase, driver-returned time, target effect certainty,
+and exactly one result per `SecretDeliveryControlKind` sorted by enum spelling.
+Each result contains only `kind`, `required`, `status`, and the typed restricted
+evidence ref when `status=applied`.
 
-After the live handoff completes, the gateway may persist only the closed safe
-`splendor.secret.delivery_control_attestation_record.v1` projection containing
-the same IDs, statuses, typed evidence refs, times, and target effect certainty.
-The live borrowed typestate itself remains non-serializable. The terminal receipt
-may reference only an integrity-validated record ID.
+For `material_exposed`, the live handoff and persisted attestation use only the
+fixed suppression form. It contains exactly the attestation ID, submission ID,
+lease/use-attempt/handle/exposure-lineage IDs and preallocated generations,
+effect coordinate, execution and destination bindings, selected method and child
+revision, enforcement-profile schema/revision/digest, complete
+`MaterialExposureSuppressedProjectionV1`, its digest, and literal
+`target_publication_suppressed`. It omits actual driver-return time, sink/control
+kind, detector/match state, egress-attempt count, control-result array, actual
+effect certainty, actual cleanup state, leak/no-leak, target-selected evidence or
+incident refs, output, error, exit, and resource use. All identifiers and values
+in this form are broker-owned and fixed before exposure. The node may pass a
+private completion capability at any actual return solely to advance live
+fencing; no serialized field or event is emitted then.
+
+Neither form contains final `ActionStatus`, an outer terminal event ID, material,
+endpoint, output, error text, or platform diagnostic. A required pre-exposure
+control with `not_applicable`, `unsupported`, or `failed`, a missing/duplicate/
+stale result, or a wrong-binding evidence ref fails closed before exposure. No
+terminal receipt exists at `delivery_ready`, `delivery_activated`, actual driver
+return, or postcondition start.
+
+After the live handoff completes, the gateway may persist only the matching
+closed safe `splendor.secret.delivery_control_attestation_record.v1` tagged form.
+The trusted-injection tag contains its safe IDs, statuses, typed evidence refs,
+times, and target effect certainty. The material-exposed tag contains only the
+fixed suppression fields above. The live borrowed typestate itself remains non-
+serializable. The terminal receipt may reference only an integrity-validated
+record ID and, for material exposure, the same fixed projection digest.
 
 `SecretDeliveryReceipt` uses schema `splendor.secret.delivery_receipt.v1` and is
 the separate terminal receipt for one secret-aware outer action/invocation. The
@@ -1872,16 +2040,21 @@ unit as the one outer terminal `action.*` event. It contains exactly:
   lease ID, exposure-lineage ID, and the durable `use_claimed` event ref;
   selected method/method-child
   revision and unique handle/target/delivery generation are present exactly when
-  their child objects were created; it also contains optional provider audit ID, optional
+  their child objects were created. For `trusted_injection`, it also contains optional provider audit ID, optional
   final delivery status required exactly when a handle exists, required cleanup
   status, zero through 20 unique node-control receipt IDs in
   durable operation order, summary `node_effect_certainty`, attestation ID only
   after adapter target return, optional detector registration ID, exact exposure
   profile, enforcement-profile digest when material was staged, and ordered
-  egress evidence IDs for every reached exposure/send/terminal phase;
+  egress evidence IDs for every reached exposure/send/terminal phase for
+  `trusted_injection`. After the common pre-exposure identity/method/generation
+  fields, a `material_exposed` summary carries only the fixed suppression
+  projection digest and forbids detector, reached-phase,
+  sink-attempt, and target-selected evidence/incident refs;
 - `secret_aware_adapter_entered`, `target_operation_started`,
   batch-level `provider_effect_certainty`, `node_effect_certainty`,
-  `target_effect_certainty`,
+  `target_effect_certainty`, all three certainty fields fixed to `uncertain` for
+  `material_exposed`,
   `outer_cleanup_status: SecretCleanupStatus`, and
   `postcondition_status` from the closed set
   `not_run|allowed|denied|uncertain`;
@@ -1889,9 +2062,24 @@ unit as the one outer terminal `action.*` event. It contains exactly:
   `outer_effect_certainty`, optional bounded error code, and one closed
   `publication_binding`: `trusted_injection` carries `publishable` plus an exact
   `sealed_output_digest` present only when publishable; `material_exposed`
-  carries only `disposition=target_publication_suppressed` and forbids output,
-  error, artifact, state, trace, and result digests;
+  carries only `disposition=target_publication_suppressed` plus the fixed
+  suppression-projection digest, while the separate bounded error field is the
+  fixed suppression code; target-derived output, error, artifact, state, trace,
+  and result digests are forbidden;
 - `ordered_c03_event_refs`, `outer_terminal_event_id`, and `completed_at`.
+
+For a material-exposed receipt, both entry/start booleans are fixed `true`, outer
+cleanup is fixed `quarantined`, postcondition is fixed `not_run`, final status is
+fixed `Failed`, outer certainty is fixed `uncertain`, and the error/publication
+fields are the two suppression literals in
+`MaterialExposureSuppressedProjectionV1`. `ordered_c03_event_refs` is the fixed
+eight-event list, `outer_terminal_event_id` is preallocated before exposure, and
+`completed_at` is exactly the projection's `outer_terminal_event_at`. A material-
+exposed use summary retains only its pre-exposure identity/method/generation
+bindings and suppression-projection digest; provider audit, final delivery/
+cleanup status, node-control receipt list/certainty, attestation, detector, egress,
+sink-attempt, and incident fields are forbidden. Thus no common receipt field can
+restore a target-selected value omitted by the tagged summary.
 
 A denial after outer acceptance but before reservation has an empty summary
 array, both adapter/target booleans false, provider, node, and target certainty
@@ -1912,26 +2100,42 @@ operation sequence, or reordered receipt rejects.
 For `trusted_injection`, receipt validation proves the complete injector and
 actual-destination pre-send evidence and forbids any fact that target code
 received material. For `material_exposed`, it requires the accepted
-SBX-007/NODE/SBX enforcement profile plus every applicable pre/post egress
-evidence ref; a missing raw-socket/DNS/proxy/filesystem/IPC/child/alternate-mount
-barrier fact is receipt-invalid and cannot produce terminal success.
+SBX-007/NODE/SBX enforcement profile, the fixed pre-exposure barrier attestation,
+and the exact suppression projection digest. Target-attempt pre/post facts remain
+in the non-exportable bounded enforcement journal only until fencing and are
+wiped when enforcement closes, or remain inaccessible under the live fence; they
+never enter the receipt or an ordinary evidence
+ref. Missing host barrier capacity or the fixed terminal attestation is receipt-
+invalid and cannot produce terminal success.
 
-`ordered_c03_event_refs` contains `SecretCausalRef` values for every C03 event
-committed for this submission, with no duplicate, omission, or unrelated event.
-It is ordered by the Authority/event-owner durable append sequence, never caller
-timestamp or ID, and has at
-most 1,024 entries for the fixed v1 grammar and 16-requirement maximum. A path
+`ordered_c03_event_refs` contains `SecretCausalRef` values for every ordinary C03
+event committed before the receipt for this submission, with no duplicate,
+omission, or unrelated event. Private enforcement-journal slots, evidence IDs,
+retention events emitted after receipt commit, and retirement events are not
+event refs. It is ordered by the Authority/event-owner durable append sequence,
+never caller timestamp or ID, and has at most 3,840 entries for the fixed v1
+grammar and 16-requirement maximum. That exact maximum is
+`16 * (10 control rows * 21 pre-receipt event refs + 16 exposure refs + 12
+cleanup refs + 2 incident refs) = 3,840`. Each control row
+contributes one requested, one completed, up to 16 Authority lifecycle, and three
+reconciliation lifecycle refs; pre/post evidence and retained records are not
+event refs. The atomically committed outer action event is named separately by
+`outer_terminal_event_id`; `outcome.recorded` and later outer/tick events are not
+pre-receipt refs. A `material_exposed` receipt instead has exactly
+the eight fixed suppression C03 event refs and no target-selected control,
+cleanup, detector, incident, or sink-attempt ref. A path
 whose complete event set would exceed that bound denies before reservation;
 events cannot be dropped to fit a receipt. The V1/V4 maximum fixture uses 16
 requirements, one unique summary per requirement in requirement order, and the
-largest valid method/reconciliation event/control path under the 1,024 cap. It pins
-the full receipt bytes, which must not exceed 512 KiB, and proves that reordering
+largest valid method/reconciliation event/control path under the 3,840 cap. It pins
+the full receipt bytes, which must not exceed 2 MiB, and proves that reordering
 summaries/event refs, repeating a use/handle/event ID, or omitting a created
 handle fails validation. Static admission rejects a path whose declared maximum
 cannot fit that durable-receipt bound before reservation.
 
-Provider, node, and target certainty are independent stable `EffectCertainty`
-values. Receipt-level node certainty is the conservative maximum across every
+For `trusted_injection`, provider, node, and target certainty are independent
+stable `EffectCertainty` values. Receipt-level node certainty is the conservative
+maximum across every
 linked node-control receipt; it is `none` only when every node operation is
 proved no-send/no-effect.
 Receipt-level provider certainty is the conservative maximum across every
@@ -1946,10 +2150,15 @@ definitive target return is `known`, and an ambiguous return/cancellation is
 promoted to `uncertain` by delivery/cleanup uncertainty. A proved provider no-
 send after known node preparation can therefore have provider/target `none` but
 outer `known`. Terminal append/read uncertainty
-produces no receipt and the submission response reports outer `uncertain`; if
+produces no receipt and, for trusted injection, the submission response reports
+outer `uncertain`; after material exposure it withholds the fixed body and emits
+no alternate certainty projection. If
 reconciliation later proves/commits the exact retained receipt, that receipt's
 effect certainty remains derived from the actual provider/node/target/cleanup
-facts.
+facts. None of that derivation applies to a material-exposed readable record:
+every certainty dimension there is the fixed value from
+`MaterialExposureSuppressedProjectionV1`, while actual facts remain live only
+until fencing and wipe.
 
 Before secret-aware adapter entry, valid non-success statuses remain `Denied`,
 `NeedsApproval`, or `NeedsIntervention` according to stable rules. Once
@@ -1965,18 +2174,17 @@ the terminal intent for reconciliation.
 
 Once a `material_exposed` target receives material, its target return, exit code,
 signal, stdout/stderr/result bytes, result shape, error choice, and completion
-timing never choose a public field. The gateway holds external completion until
-the immutable driver-declared material-exposure publication deadline, terminates
-the target at that boundary if needed, and constructs the one fixed internal
-stable projection:
-`final_action_status=Failed`, `output` absent, exact bounded error code
-`material_exposed_publication_suppressed`, and publication disposition
-`target_publication_suppressed`; `postcondition_status=not_run`. Result APIs
-release only the fixed terminal/restricted envelope above, never that internal
-outcome or receipt. Broker-owned pre-exposure denials retain their ordinary stable
-status because target code had no material. Trusted terminal-store uncertainty
-may withhold any body under the existing non-retryable uncertainty rule, but
-target return, cleanup outcome, or captured bytes cannot select a different
+timing never choose any readable or ordinarily persisted field. The gateway
+fences at the immutable driver-declared material-exposure deadline, runs the fixed
+drain/cleanup windows, emits only the eight deadline-derived suppression events,
+and releases `MaterialExposureSuppressedProjectionV1` at deadline plus 42 seconds.
+Its stable status, retry, certainty, error, publication, postcondition, quarantine,
+state, event, and replay values are fixed by that object. Result APIs never expose
+the internal receipt or operational recovery state. Broker-owned pre-exposure
+denials retain their ordinary stable status because target code had no material.
+Trusted terminal-store uncertainty may withhold the fixed body under the existing
+non-retryable uncertainty rule, but target return, sink attempt, detector,
+cleanup, exit, timing, or captured bytes cannot select that failure or any other
 payload. Material-exposed postconditions never inspect a target result or
 captured byte.
 
@@ -2164,6 +2372,23 @@ node-control receipt, counter, method, or extension. Authorized restricted
 inspection returns the complete canonical event instead; no facade emits a
 partially stripped canonical event.
 
+That generic rule ends at the material-exposure boundary. Once a submission is
+`material_exposed`, no later complete canonical event or generic tenant/public
+projection is readable by a caller, workload, or tenant, including restricted
+tenant inspection. Every such read is replaced by the exact eight-event
+`MaterialExposureSuppressedProjectionV1` profile. Only controls completed before
+exposure retain ordinary pre-exposure records. Later actual provider/node/cleanup
+recovery rows may exist only in the private non-exportable owner ledger needed to
+finish the same predeclared controls; they are never evidence, forensic history,
+or an inspection source and are compacted to the fixed closure after enforcement.
+Target return/sink/detector/exit/captured-byte and cleanup-branch details remain
+solely in non-serializable node-local scratch and are wiped after fencing. Every
+durable readable closure is the fixed projection and cannot
+expose a richer fact through a trace, evidence, incident, telemetry, attestation,
+replay, or audit API. The fixed
+profile preserves mandatory causal evidence without publishing target-selected
+kind, outcome, safe error family, certainty, count, reference, or time.
+
 The causal-ref tag selects the owner stream without changing stable
 `TraceEvent`: `run_trace` appends the safe projection to the matching run stream;
 `management_event` appends the restricted C03 fact through the accepted
@@ -2337,9 +2562,15 @@ the write-ahead send time and forbids the result/audit/post/terminal fields.
 bundle: result digest, audit ID, and a 1-16 element ordered post-evidence list. A
 partial bundle rejects. `reconciling` preserves all fields from its prior state
 and requires the closed
-`reconciliation_claim {secret_reconciliation_claim_id, actor_principal_id,
-authority_revision, claimed_at, expires_at}`; it cannot replace result/evidence
-bytes. If exact safe result bytes
+`reconciliation_claim {secret_reconciliation_claim_id, holder_principal_id,
+authority_revision, holder_epoch, holder_owner_sequence, claimed_at,
+expires_at,prior_state_digest}`; it cannot replace result/evidence bytes. Every
+provider row is assigned exactly one non-reusable reconciliation claim ID in its
+pre-exposure containment unit. Claim-holder expiry or crash transfers ownership
+by CAS over `(claim_id,holder_epoch,holder_owner_sequence,prior_state_digest)` to
+the authorized supervisor, increments epoch and owner sequence, and preserves the
+same claim ID. No replacement ID is minted, and at most one unexpired holder can
+exist. If exact safe result bytes
 were retained under the invocation's unique result key before a row-state CAS was
 lost, reconciliation may validate them and atomically add the complete immutable
 bundle while moving to `sent_known`; otherwise that bundle remains absent. A
@@ -2667,12 +2898,17 @@ absence, never null, for forbidden fields:
 | `reconciling` | every immutable field from its prior state plus one claim | any replacement result/evidence/send fact or terminal field not already retained |
 | `terminal` | requested/pre evidence, result/post evidence, terminal-intent digest, receipt ID, completed event, lifecycle refs; send time exactly when result disposition was sent | reconciliation claim |
 
-`reconciliation_claim` contains exactly `secret_reconciliation_claim_id`, actor
-principal, authority revision, claimed time, expiry, and prior state/digest. Its
-expiry is later than claim and
-no later than the bounded reconciliation deadline. A unique CAS permits one
-reconciler. Duplicate evidence IDs, reordered lists, replacement pointers,
-state-field mismatch, unknown fields, or clock/storage uncertainty fail closed.
+`reconciliation_claim` contains exactly `secret_reconciliation_claim_id`, holder
+principal, authority revision, positive holder epoch, positive holder owner
+sequence, claimed time, expiry, and prior state/digest. Every node row is assigned
+exactly one non-reusable claim ID in its pre-exposure containment unit. Its expiry
+is later than claim and no later than the bounded reconciliation deadline. A
+unique CAS over claim ID, epoch, owner sequence, and prior-state digest permits
+one reconciler. After holder crash/expiry, only the authorized supervisor may
+transfer the same ID by incrementing epoch and owner sequence; no replacement ID
+is minted and no concurrent unexpired holder is legal. Duplicate evidence IDs,
+reordered lists, replacement pointers, state-field mismatch, unknown fields, or
+clock/storage uncertainty fail closed.
 
 The closed state graph is:
 
@@ -3088,12 +3324,14 @@ versioned direct request or exact Event/Evidence-observed tagged tick candidate
   -> adapter passes immutable terminal SecretDeliveryControlAttestation and a
      borrowed opaque response view to the gateway continuation
   -> trusted injection only: gateway postconditions and response-projection scan;
-     material exposure: fixed suppression projection and private incident scan
+     material exposure: fixed suppression projection and private live detector scan
   -> adapter wipes raw response/error buffers and returns a byte-free terminal
   -> secret.use.completed
   -> target termination, output drain, decoder finalization, and final seal
   -> immediate delivery/material/detector wipe/cleanup, close or quarantine
-  -> non-serializable SecretSubmitCompletion after cleanup certainty is known
+  -> trusted injection: non-serializable SecretSubmitCompletion after cleanup
+     certainty is known; material exposure: fixed completion at the predeclared
+     cleanup/projection deadline while richer live enforcement state remains separate
   -> GatewaySecretTerminalNormalizer constructs/seals private pending ActionOutcome
   -> Authority records immutable pending outcome + outer terminal intent
   -> common terminal path atomically records one terminal receipt and one final
@@ -3154,8 +3392,8 @@ Required rules:
    gateway continuation a bounded postcondition view and proposed public
    projections; the gateway scans them before the driver wipes/drops raw buffers.
    For `material_exposed`, the continuation accepts no proposed projection or
-   target-result postcondition: captured bytes flow only to private detector/
-   incident processing and the fixed suppression projection is selected before
+   target-result postcondition: captured bytes flow only to private live detector/
+   enforcement processing and the fixed suppression projection is selected before
    exposure. After the adapter returns byte-free, the session drains every
    delayed target source and finalizes decoders. No generic JSON, error string,
    result choice, exit code, target timing, artifact, state patch, or trace payload
@@ -3179,12 +3417,15 @@ Required rules:
     timeout, cleanup, evidence, or revocation failure/uncertainty is `Failed`,
     even when the target operation never started. Once material is exposed, the
     internal stable result is always the fixed `Failed` suppression projection
-    regardless of target return, while public result APIs return only the fixed
-    terminal/restricted suppression envelope; restricted lifecycle evidence still
-    records actual effect certainty. Provider/target/outer effect certainty
-    remains explicit in restricted owner records. Post-effect
-    intervention/quarantine is a separate C03/run fact, not a false
-    `NeedsIntervention` action status.
+    regardless of target return, while every result, event, state, evidence,
+    incident, telemetry, attestation, audit, and replay view returns only the
+    fixed suppression projection. Actual target/cleanup certainty exists only in
+    live non-exportable enforcement state until fencing and is then wiped; all
+    retained material-exposed certainty fields are fixed `uncertain`. Post-effect
+    intervention/quarantine for trusted injection is a separate C03/run fact, not
+    a false `NeedsIntervention` action status. For material exposure, that actual
+    branch is live owner state only; the sole retained fact is the fixed
+    `cleanup_projection=quarantined` value.
 12. `SecretSubmitCompletion` is consumed by the Gateway-owned
     `GatewaySecretTerminalNormalizer` shared by tick and direct submissions. It
     authenticates the sealed bytes, constructs and seals the one private pending
@@ -3429,19 +3670,31 @@ tick observation, writes one immutable compact
 schema, nominal `secret_consumed_effect_tombstone_id`, one complete closed
 `domain_binding` below, one domain-valid `disposition`, one named
 `disposition_digest`, one complete `authority_domain`, one
-`marker_slot_binding`, `consumed_at`, `compacted_at`, and one
-`previous_marker_binding`. `compacted_at >= consumed_at`.
-`marker_slot_binding` is exactly `normal {slot_id}` or
-`containment_emergency {secret_containment_reserve_id,slot_ordinal,slot_class}`
+`marker_slot_binding`, positive `marker_sequence`, `consumed_at`, `compacted_at`,
+and one `previous_marker_binding`. `compacted_at >= consumed_at`.
+`marker_slot_binding` is exactly
+`normal {kind="normal",slot_id}` or
+`containment_emergency {kind="containment_emergency",secret_containment_reserve_id,slot_ordinal,slot_class}`
 for the primary consumed identity. The emergency form must match a durable pre-
 exposure reservation and cannot be invented at compaction.
-`previous_marker_binding` is exactly `genesis` or
-`present {previous_marker_id,previous_marker_integrity_digest}` in the same
-trusted partition/authority domain. Null, omission of a required tag, unknown or
-cross-tag fields, and an out-of-sequence previous marker reject.
+`previous_marker_binding` is exactly `genesis {kind="genesis"}` or
+`present {kind="present",previous_marker_id,previous_marker_integrity_digest}` in the same
+trusted partition/authority domain and the same derived pool/slot class. Null,
+omission of a required tag, unknown or cross-tag fields, and an out-of-sequence
+previous marker reject. For a normal marker, `pool_class="normal"` and slot class
+is derived exactly from the domain-binding tag: `direct_outer`, `tick_outer`,
+`approval_continuation`, `provider_control`, `node_control`, or
+`tick_observation`. For an emergency marker,
+`pool_class="containment_emergency"` and slot class is the exact closed
+`marker_slot_binding.slot_class`. No chain may interleave classes.
+`marker_sequence` is exactly 1 with `genesis`; a present predecessor must be
+sequence `marker_sequence-1` in the same chain. Duplicate, zero, skipped, or
+decreasing sequence values reject before marker commit.
 `previous_marker_id` is itself a closed tag containing exactly one nominal
-consumed-effect tombstone, permanent auxiliary marker, or retired-domain marker
-ID; untagged UUIDs are invalid.
+consumed-effect tombstone or permanent auxiliary marker ID; untagged UUIDs and
+retired-domain deny-head IDs are invalid. A deny head belongs to its separate
+domain-head chain and never pretends to be a member of every replaced partition,
+pool, or slot-class chain.
 
 The tagged `domain_binding` union is complete:
 
@@ -3449,17 +3702,19 @@ The tagged `domain_binding` union is complete:
 | --- | --- | --- | --- | --- |
 | `direct_outer` | `trusted_partition_digest` from `splendor.secret.action_submission_partition_digest.v1`; direct idempotency key and submission ID | exact direct ingress digest, direct semantic request digest, outer-idempotency digest, wrapper digest, and submission digest | original closed action-or-invocation effect coordinate | `terminal|effect_uncertain`; `splendor.secret.outer_tombstone_disposition_digest.v1` |
 | `tick_outer` | the same submission partition profile; observation ID, submission ID, run/tick/ordinal | policy-output digest, retained-candidate digest, candidate-semantic digest, tick-key digest, observation-link-receipt digest, outer-idempotency digest, wrapper digest, and submission digest | original closed action-or-invocation effect coordinate | `terminal|effect_uncertain`; `splendor.secret.outer_tombstone_disposition_digest.v1` |
-| `approval_challenge_continuation` | original submission partition digest; continuation, submission, approval, obligation, and authority-decision IDs plus explicit `receipt_id_binding=absent|present` | approval-challenge digest, approval-continuation semantic digest, original wrapper digest, original submission digest, and `continuation_receipt_digest_binding=absent|present` matching the receipt-ID tag | complete original action/invocation coordinate plus exact challenge/obligation coordinate | `terminal|effect_uncertain|cancelled|denied|expired|revoked`; `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` |
+| `approval_challenge_continuation` | original submission partition digest; continuation, submission, approval, obligation, and authority-decision IDs plus `receipt_id_binding`, exactly `absent {kind="absent"}` or `present {kind="present",receipt_id}` | approval-challenge digest, approval-continuation semantic digest, original wrapper digest, original submission digest, and `continuation_receipt_digest_binding`, exactly `absent {kind="absent"}` or `present {kind="present",continuation_receipt_digest}` matching the receipt-ID tag | complete original action/invocation coordinate plus exact challenge/obligation coordinate | `terminal|effect_uncertain|cancelled|denied|expired|revoked`; `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` |
 | `provider_control` | `splendor.secret.provider_control_partition_digest.v1`; provider-control invocation ID | provider-control plan digest and trusted partition digest | provider trust scope, provider ID, route ID/revision, operation, and complete target-scope digest | `terminal|effect_uncertain`; `splendor.secret.provider_control_tombstone_disposition_digest.v1` |
 | `node_control_target_generation` | `splendor.secret.node_control_partition_digest.v1`; node-control invocation ID, exposure-lineage ID, and target generation | node-control plan digest, target-binding digest, and trusted partition digest | tenant/node/instance, exposure-lineage ID, target generation, operation, and target-binding digest | `terminal|effect_uncertain`; `splendor.secret.node_control_tombstone_disposition_digest.v1` |
 | `tick_observation` | `splendor.secret.tick_candidate_observation_partition_digest.v1`; observation ID and run/tick/ordinal | policy-output, retained-candidate, and candidate-semantic digests | `observation {run_id,tick_id,candidate_ordinal}`; never an action/invocation | `expired_unclaimed|linked_submission_terminal|linked_submission_uncertain`; `splendor.secret.tick_observation_tombstone_disposition_digest.v1` |
+| `containment_reserve` | `splendor.secret.containment_reserve_partition_digest.v1`; containment-reserve ID, submission ID, use-attempt ID, and exposure-lineage ID | exact reserve-closure digest | `containment {node_id,secret_action_submission_id,secret_use_attempt_id,secret_exposure_lineage_id}`; never an adapter effect | `closure_verified`; `splendor.secret.containment_reserve_tombstone_disposition_digest.v1` |
 
 Emergency non-primary identities use the separate closed
 `splendor.secret.permanent_auxiliary_identity_marker.v1`. It contains exactly its
 schema, nominal `secret_permanent_auxiliary_identity_marker_id`, complete parent
 authority domain, parent primary tombstone ID/integrity
 digest, containment reserve ID, slot ordinal/class, one closed
-`auxiliary_identity`, `claimed_at`, `marked_at`, and previous-marker binding. The
+`auxiliary_identity`, positive `marker_sequence`, `claimed_at`, `marked_at`, and
+previous-marker binding. The
 identity is exactly one of `provider_reconciliation_claim`,
 `node_reconciliation_claim`, `delivery_control_attestation`,
 `terminal_delivery_receipt`, `cleanup_command`, `consumed_tombstone`, or
@@ -3471,6 +3726,9 @@ changed parent, reserve, slot, class, identity, time, or chain pointer conflicts
 and quarantines the parent domain. This closed marker, not an open tombstone tag,
 keeps every claimed auxiliary ID non-reusable after its full owner record is
 deleted. Its maximum canonical size is 2 KiB and the maximum fixture is pinned.
+Its previous-marker binding obeys the same exact partition/domain/pool/slot-class
+chain key, sequence-1/genesis rules, and head CAS above and cannot point to a
+marker from another emergency slot class.
 
 `splendor.secret.tick_candidate_observation_partition_digest.v1` contains
 exactly its schema, tenant ID, agent ID, and run ID. The approval-continuation
@@ -3484,42 +3742,158 @@ schema and the complete closed tagged provider-control `target_scope` from the
 accepted plan, including every tag-specific ID/revision/generation; it excludes
 the digest output. The provider tombstone effect coordinate uses only this named
 digest, never an implementation-local target summary.
+`splendor.secret.containment_reserve_partition_digest.v1` contains exactly its
+schema, tenant ID, node ID, and run ID. The immutable pre-tombstone closure uses
+schema `splendor.secret.containment_reserve_closure.v1` and contains exactly its
+schema plus `secret_containment_reserve_id`, `secret_action_submission_id`,
+`secret_use_attempt_id`, `secret_exposure_lineage_id`,
+`target_generation_binding`, preallocated `secret_consumed_effect_tombstone_id`,
+`projection_binding`, `closure_ordinal`, `closure_projected_at`, preallocated
+`closure_ref`,
+`hot_entry_id_root`, `record_credit_id_root`, `incident_credit_id`,
+`durable_byte_limit`, and `marker_slot_binding_root`. Its digest uses exact
+projection `splendor.secret.containment_reserve_closure_digest.v1`, containing
+its digest schema, the closure record schema as `closure_schema_version`, and
+every other closure field; the output is external. The three roots commit
+exactly 38, 719, and 35 preallocated entries in slot-ordinal order. Each hot leaf
+is exactly `{schema_version,slot_ordinal,hot_entry_id}`, each record leaf is
+exactly `{schema_version,slot_ordinal,record_credit_id}`, and each marker leaf is
+exactly `{schema_version,slot_ordinal,marker_slot_binding}` under respectively
+named `splendor.secret.containment_hot_slot_leaf.v1`,
+`splendor.secret.containment_record_slot_leaf.v1`, and
+`splendor.secret.containment_marker_slot_leaf.v1`; each leaf uses the common
+digest rule and roots use the retirement
+Merkle odd-leaf rule with distinct node prefix
+`splendor.secret.containment_slot_merkle_node.v1`. Empty roots, duplicate/gapped
+ordinals, or wrong counts reject. The digest contains no actual target branch,
+used/unused bit, deletion state, release time, or tombstone integrity output. The
+owner may create this immutable closure only after every operational row is
+terminal and all profile-required fixed closure projections are committed.
+`projection_binding` is exactly
+`trusted_injection {kind="trusted_injection",operation_deadline}` or
+`material_exposed {kind="material_exposed",
+material_exposure_suppressed_projection_digest,response_release_at}`.
+`closure_ordinal` is literal 1 and `closure_projected_at` is exactly the fixed
+suppression `response_release_at` for material exposure or the predeclared
+trusted-injection operation deadline plus 42 seconds; both values are sealed at
+reservation. Neither records actual closure/commit time or owner event count.
 
-The named disposition projections are closed rather than a generic terminal
-status hash:
+The named disposition projections are exact wire objects rather than generic
+terminal-status hashes. Every top-level field below is required. Every
+conditional nested object is either exactly `absent {kind="absent"}` or the
+field-specific `present` object defined below; omission, null, a generic `id` or
+`digest` field name, and cross-tag fields reject.
 
-- `splendor.secret.outer_tombstone_disposition_digest.v1` contains its schema,
-  submission ID, exact disposition, final stable status binding, outer effect
-  certainty, terminal-intent digest binding, delivery-receipt ID/digest binding,
-  outer-terminal-event binding, and complete publication binding. A terminal
-  disposition requires every present terminal field; `effect_uncertain` requires
-  explicit absent/present tags for each retained pointer and outer certainty
-  `uncertain`.
-- `splendor.secret.approval_continuation_tombstone_disposition_digest.v1`
-  contains its schema, continuation/submission/approval/obligation IDs, exact
-  disposition, challenge outcome/event bindings, receipt claim/digest binding,
-  final delivery-receipt/outer-event bindings, and completion-time binding.
-  `cancelled` requires only its run-cancellation event; `denied|expired|revoked`
-  require the exact no-effect final pair; `terminal|effect_uncertain` preserve
-  their exact claimed-receipt and final/uncertain pointers.
-- `splendor.secret.provider_control_tombstone_disposition_digest.v1` contains
-  its schema, invocation ID, exact disposition, result outcome, retry count,
-  effect certainty, provider-audit ID, result digest, terminal-intent digest,
-  completed-event ref, and ordered Authority lifecycle-event refs. Terminal
-  requires the complete retained bundle; uncertainty uses explicit pointer tags
-  and certainty `uncertain`.
-- `splendor.secret.node_control_tombstone_disposition_digest.v1` contains its
-  schema, invocation ID, exposure-lineage ID, target generation, exact retry
-  profile, disposition, owner outcome, retry count, send disposition, effect
-  certainty, result/terminal-intent/receipt/completed-event bindings, and ordered
-  Authority lifecycle-event refs. Terminal requires the complete retained
-  bundle; uncertainty preserves every known pointer and uses explicit absence.
-- `splendor.secret.tick_observation_tombstone_disposition_digest.v1` contains its
-  schema, observation ID, claim-state terminal revision/sequence, exact
-  disposition, expiry, expiry-tombstone binding, and a link-receipt/submission
-  binding. `expired_unclaimed` requires the expiry tombstone and forbids link/
-  submission fields. A linked disposition requires the exact link receipt and
-  submission ID/digest tuple and forbids an expiry winner.
+| Projection schema | Exact top-level fields in addition to `schema_version` |
+| --- | --- |
+| `splendor.secret.outer_tombstone_disposition_digest.v1` | `secret_action_submission_id`, `disposition`, `final_status_binding`, `outer_effect_certainty`, `terminal_intent_binding`, `delivery_receipt_binding`, `outer_terminal_event_binding`, `publication_binding` |
+| `splendor.secret.approval_continuation_tombstone_disposition_digest.v1` | `secret_approval_continuation_id`, `secret_action_submission_id`, `approval_id`, `obligation_id`, `authority_decision_id`, `disposition`, `challenge_binding`, `receipt_claim_binding`, `final_delivery_receipt_binding`, `final_outer_event_binding`, `completion_time_binding`, `cancellation_event_binding` |
+| `splendor.secret.provider_control_tombstone_disposition_digest.v1` | `provider_control_invocation_id`, `disposition`, `result_binding`, `terminal_intent_binding`, `completed_event_binding`, `authority_lifecycle_event_refs` |
+| `splendor.secret.node_control_tombstone_disposition_digest.v1` | `node_control_invocation_id`, `secret_exposure_lineage_id`, `target_generation`, `retry_profile`, `disposition`, `result_binding`, `terminal_intent_binding`, `node_control_receipt_binding`, `completed_event_binding`, `authority_lifecycle_event_refs` |
+| `splendor.secret.tick_observation_tombstone_disposition_digest.v1` | `secret_tick_candidate_observation_id`, `owner_partition_digest`, `policy_output_digest`, `retained_candidate_digest`, `candidate_semantic_digest`, `disposition`, `terminal_binding` |
+| `splendor.secret.containment_reserve_tombstone_disposition_digest.v1` | `secret_containment_reserve_id`, `secret_action_submission_id`, `secret_use_attempt_id`, `secret_exposure_lineage_id`, `disposition`, `closure_binding` |
+
+The exact tagged nested objects and state rules are:
+
+- `final_status_binding` is `absent` or
+  `present {kind="present",final_action_status}`;
+  `terminal_intent_binding` is `absent` or
+  `present {kind="present",terminal_intent_digest}`;
+  `delivery_receipt_binding` is `absent` or
+  `present {kind="present",delivery_receipt_id,receipt_digest}`; and
+  `outer_terminal_event_binding` is `absent` or
+  `present {kind="present",causal_ref}`. `publication_binding` is exactly
+  `trusted_injection {kind="trusted_injection", disposition="publishable", sealed_output_digest_binding}`,
+  where the nested binding is `absent` or
+  `present {kind="present",sealed_output_digest}`, or exactly
+  `material_exposed {kind="material_exposed", disposition="target_publication_suppressed", material_exposure_suppressed_projection_digest}`.
+  Outer `terminal` requires
+  present final status, terminal-intent digest, delivery-receipt ID/digest,
+  outer-terminal causal ref, and the profile-matching publication tag. Outer
+  `effect_uncertain` requires
+  `outer_effect_certainty="uncertain"`; every pointer still uses its exact
+  absent/present tag and no known pointer may be discarded.
+- `challenge_binding` is always
+  `present {kind="present",challenge_outcome_digest,action_needs_approval_event_ref,
+  approval_requested_event_ref}`. `receipt_claim_binding` is `absent` or
+  `present {kind="present",receipt_id,continuation_receipt_digest,receipt_claim_ref}`.
+  `final_delivery_receipt_binding` is `absent` or
+  `present {kind="present",delivery_receipt_id,receipt_digest}`;
+  `final_outer_event_binding` and `cancellation_event_binding` are each `absent`
+  or `present {kind="present",causal_ref}`; and `completion_time_binding` is
+  `absent` or `present {kind="present",completed_at}`. `cancelled` requires cancellation event
+  and completion time and forbids receipt/final-pair bindings. `denied|expired|
+  revoked` require the exact no-effect final receipt/event and completion time.
+  `terminal|effect_uncertain` preserve the exact claim and every known final or
+  uncertain pointer; terminal requires all final bindings.
+- Provider `result_binding` is `absent` or
+  `present {kind="present",outcome,retry_count,effect_certainty,
+  provider_audit_id,provider_control_result_digest}`. Terminal intent uses
+  `absent` or `present {kind="present",provider_control_terminal_intent_digest}`;
+  completed event uses `absent` or `present {kind="present",causal_ref}`;
+  `authority_lifecycle_event_refs` is a required ordered 0-16 array of unique
+  `SecretCausalRef` values in Authority owner sequence, present even when empty.
+  `terminal` requires all present and a complete
+  retained result. `effect_uncertain` requires result certainty `uncertain` when
+  result is present and explicit pointer tags otherwise.
+- Node `result_binding` is `absent` or
+  `present {kind="present",owner_outcome,retry_count,send_disposition,
+  effect_certainty,node_control_result_digest}`. Receipt uses
+  `present {kind="present",node_control_receipt_id}` or `absent`; terminal intent
+  uses `absent` or
+  `present {kind="present",node_control_terminal_intent_digest}`; completed event
+  uses `absent` or `present {kind="present",causal_ref}`;
+  `authority_lifecycle_event_refs` is a required ordered 0-16 array of unique
+  `SecretCausalRef` values in Authority owner sequence. `terminal` requires result,
+  intent, receipt, and event. Uncertainty
+  preserves every known pointer, uses explicit absence for unknown pointers, and
+  requires `effect_certainty="uncertain"` for a present uncertain result.
+- Tick `terminal_binding` is exactly one of:
+
+```text
+expired {
+  kind="expired", state="expired", unclaimed_expires_at,
+  winning_owner_revision, winning_transition_sequence,
+  secret_consumed_effect_tombstone_id
+}
+linked {
+  kind="linked", secret_tick_candidate_observation_link_receipt_id,
+  observation_link_receipt_digest, secret_action_submission_id,
+  outer_idempotency_digest, wrapper_digest, submission_digest
+}
+```
+
+  `expired_unclaimed` requires `expired`; linked terminal/uncertain requires
+  `linked`. The expired object binds the preallocated tombstone ID but contains
+  no tombstone integrity digest, pointer revision, placeholder, zero value, or
+  field whose value transitively includes this disposition digest. Thus the
+  disposition is computable before the tombstone exists. The later verified
+  integrity digest is external in the claim-row pointer only.
+- Containment `closure_binding` is exactly
+  `verified {kind="verified",closure_ordinal=1,closure_projected_at,
+  closure_ref,containment_reserve_closure_digest}`. All fields are required; the
+  projected time is fixed-six-digit UTC and obeys the profile-specific
+  predeclared rule above, the causal ref was preallocated before exposure, and the
+  digest authenticates the exact immutable pre-tombstone closure above.
+  `disposition` is exactly
+  `closure_verified`. Preparation,
+  partial accounting, quarantine, a nonterminal row, a second tombstone ID, or a
+  missing/corrupt closure is ineligible and keeps the reserve row pinned. The
+  later tombstone integrity, record deletion, zero-live-debit release audit, and
+  reserve-release CAS are external and cannot enter their own ancestry.
+
+For tick expiry, the exact disposition input is therefore observation ID, owner
+partition digest, policy-output digest, both candidate digests,
+`disposition="expired_unclaimed"`,
+`state="expired"`, fixed expiry, winning terminal revision/sequence, and the one
+preallocated tombstone ID. The implementation fixtures at
+`conformance/fixtures/secrets/tombstone-dispositions-v1/` must contain non-nil
+IDs, non-zero revisions/sequences, fixed-six-digit real timestamps, and actual
+computed digests for every Rust/OpenAPI/Python/TypeScript object. The four
+surfaces must produce byte-for-byte identical JCS and digest outputs. Fixtures
+that use a placeholder/zero digest, mutate a hashed object, omit an explicit tag,
+or hash the tombstone integrity into its own ancestry are invalid rather than
+golden evidence.
 
 Every disposition projection is validated, JCS-encoded, and hashed under its own
 exact schema prefix by the common C03 rule. Its output is stored as
@@ -3536,11 +3910,17 @@ maximum tag.
 `splendor.secret.consumed_effect_tombstone_integrity_digest.v1`, containing
 exactly its digest schema, the record schema as `tombstone_schema_version`,
 tombstone ID, complete domain binding, disposition, disposition digest, complete
-authority domain, marker-slot binding, both times, and previous-marker binding.
+authority domain, marker-slot binding, marker sequence, both times, and previous-
+marker binding.
 The digest output is external and excluded. The authoritative marker index stores
-the tombstone ID/digest and enforces one hash chain per trusted partition plus
-authority domain. Missing, forked, reordered, or mismatched chain state is
+the tombstone ID/digest and enforces one hash chain per
+`(trusted_partition_digest,authority_domain,pool_class,slot_class)`. Missing,
+forked, reordered, class-mismatched, or otherwise inconsistent chain state is
 corruption and fails closed.
+Each marker commit CASes the exact prior `(marker_sequence,marker_id,
+marker_integrity_digest)` head to its one successor in the same transaction;
+genesis CASes an absent head to sequence 1. Concurrent successors cannot both
+commit.
 
 `authority_domain` is exactly one of:
 
@@ -3556,9 +3936,9 @@ node_generation {
 }
 ```
 
-Direct/tick outer, approval, and observation tags require their matching run
-domain; provider control requires its exact route domain; node control requires
-the exact lineage-scoped node-generation domain. Independent lineages on the same
+Direct/tick outer, approval, observation, and containment-reserve tags require
+their matching run domain; provider control requires its exact route domain; node
+control requires the exact lineage-scoped node-generation domain. Independent lineages on the same
 node may each use generation `1` and have different domains, partition digests,
 marker chains, lookup keys, and retirement decisions. A handle, use attempt,
 node plan/result/receipt, cleanup command, restart/migration record, or compaction
@@ -3572,12 +3952,14 @@ configures an equal-or-lower `max_unretired_consumed_identities_tenant`; normal-
 pool minima are 4,096 and 1,024. At 2 KiB per marker, normal non-borrowable floors
 are at least 8 MiB node and 2 MiB per tenant/node. Before accepting a normal
 outer, continuation, provider-control, node-control, or observation identity, the
-owner reserves one normal slot from both scopes. A containment identity instead
+owner reserves one physical node slot and attributes it to one tenant
+suballocation, satisfying both scope ledgers without double allocation. A containment identity instead
 must claim its exact already-reserved emergency slot and cannot consume normal
-capacity. A retired-domain marker remains in the same pool/slot class as the
-individual markers it replaces. Full or uncertain capacity rejects the new
-identity before acceptance/effect; it never deletes an existing marker or
-borrows the other pool.
+capacity. Authority-domain retirement summarizes each replaced pool/slot-class
+chain in committed leaves, but its permanent deny head is charged only to the
+separate retirement pool; it never masquerades as a normal or emergency marker.
+Full or uncertain capacity rejects the new identity before acceptance/effect; it
+never deletes an existing marker or borrows another pool.
 
 The lookup rule is fail closed and precedes coordinate allocation, current
 attempt derivation, policy/provider/node work, or effect:
@@ -3608,18 +3990,23 @@ Outer direct/tick submissions retain both key and action/invocation coordinates;
 approval tombstones retain challenge and semantic receipt coordinates; provider
 controls retain invocation/route/target plan coordinates; node controls retain
 invocation/target generation; expired unclaimed observations retain their
-observation/candidate digest. `SecretActionIdempotencyKey`, observation,
+observation/candidate digest; containment tombstones retain reserve/submission/
+use-attempt/exposure-lineage/release-audit coordinates.
+`SecretActionIdempotencyKey`, observation,
 submission, continuation, approval/challenge, provider-control, node-control,
 action/invocation, and target-generation identities are never reused, including
 after process restart or authority-domain retirement.
 
 Compaction order is deterministic and transactional:
 
-1. Active, nonterminal, reconciling, awaiting-approval, continuing, or uncertain
-   rows and their reserve/evidence are ineligible for destructive compaction.
-2. For an eligible full terminal or expired-unclaimed record, validate its
-   partition, semantic digest, effect coordinate, disposition, and terminal
-   intent/receipt/event integrity.
+1. Active, nonterminal, reconciling, awaiting-approval, continuing, or unresolved-
+   uncertainty rows and their reserve/evidence are ineligible for destructive
+   compaction. A closed terminal `effect_uncertain` disposition is eligible only
+   under its exact retained terminal/tombstone rules.
+2. For an eligible full terminal, expired-unclaimed observation, or closure-
+   verified containment-reserve record, validate its partition, semantic/closure
+   digest, effect coordinate, disposition, and applicable terminal intent/receipt/
+   event integrity.
 3. Insert-or-verify the exact tombstone under unique domain/identity/effect keys
    and durably append `secret.retention.tombstone_committed` with owner, policy
    revision, source record digest, and no protected payload.
@@ -3638,44 +4025,250 @@ capacity and are excluded from user retention quotas.
 Individual tombstones survive hot/full retention until the owning authority
 domain is permanently retired. Retirement requires current Authority plus the
 run/provider-route/node owner, a closed signed/typed retirement decision, proof
-that no active/uncertain/continuable row or exposure exists, and a durable
-`splendor.secret.retired_authority_domain_marker.v1` deny marker plus audit event.
-The trusted retirement-partition digest is the common C03 digest of exact
-projection `splendor.secret.retired_authority_domain_partition_digest.v1`, which
-contains only its schema and the complete closed authority domain above.
-That marker contains exactly its schema, nominal
-`secret_retired_authority_domain_marker_id`, complete authority domain, trusted
-retirement-partition digest, positive final owner generation/revision, retirement
-`retirement_authority_decision_id: AuthorityDecisionId`, ordered 1-16 unique
-`EvidenceId` values, `retired_at`, positive
-`replaced_marker_count`, first and last replaced primary-or-auxiliary marker
-IDs/integrity digests, marker-slot binding, and previous-marker binding. It has no optional or
-free-form field and no protected output, secret-use metadata, evidence body,
-target result, credential, or error.
+that no active/uncertain/continuable row or exposure exists, and a complete
+commitment to every independently chained normal/emergency marker set. One
+marker cannot replace multiple partition chains or belong to multiple pools.
 
-`retired_domain_marker_integrity_digest` uses exact projection
-`splendor.secret.retired_authority_domain_marker_integrity_digest.v1`, containing
-its digest schema, marker record schema, and every other marker field; the digest
-output is external and excluded. Uniqueness is the complete authority domain.
-Exact duplicate retirement bytes return the same marker/digest; a changed final
-revision, decision, evidence order, marker range/count, slot, chain pointer, or
-time conflicts and quarantines the domain. Marker range/count includes every
-primary tombstone and permanent auxiliary identity marker in canonical chain
-order. Marker commit and its integrity digest
-are atomic. After verification, every request in the retired domain rejects
-before per-ID lookup or effect; individual tombstones may then be deleted in
-canonical chain order, but IDs and the domain can never be reopened or reassigned.
-Retirement marker corruption, fork, or unavailability denies the complete domain.
-The retired marker's maximum canonical size is 2 KiB; V1 pins the 16-evidence
-maximum, every authority-domain tag, and both previous-marker variants.
+The owner builds one closed `RetiredPartitionChainCommitment` wire object with
+schema `splendor.secret.retired_partition_chain_commitment.v1` for every distinct
+`(trusted_partition_digest,authority_domain,pool_class,slot_class)` present in the
+domain. Every field is required:
 
-Replay reads full records, tombstones, and retired-domain markers as historical
+| Field | Contract |
+| --- | --- |
+| `schema_version` | Exact leaf schema. |
+| `trusted_partition_digest` | Exact source partition. |
+| `authority_domain` | Complete domain being retired. |
+| `pool_class` | Exactly `normal` or `containment_emergency`. |
+| `slot_class` | One legal class for that pool from the closed list below. |
+| `first_sequence`, `last_sequence` | Complete positive source-chain range; `first_sequence` is exactly 1 and `last_sequence >= 1`. A suffix cannot retire a domain. |
+| `prior_head_digest` | Exact fixed domain-separated genesis digest for this complete chain. |
+| `final_head_digest` | Integrity digest of the marker at last sequence. |
+| `marker_count` | Exactly `last-first+1`, equal to visited markers, and no greater than `4294967295`. |
+| `slot_count` | Exact occupied source slots represented by the leaf; equal to `marker_count` because every source marker occupies one slot and encoded as a `u32`. |
+| `chain_validation` | Exactly `complete_no_fork {kind="complete_no_fork",visited_marker_count,visited_slot_count,sequence_set_digest,slot_set_digest}` with counts equal to the two fields. |
+
+`sequence_set_digest` uses schema
+`splendor.secret.retired_partition_sequence_set_digest.v1` and an ordered array
+of exact `{sequence,marker_id,marker_integrity_digest,previous_marker_binding}`
+objects for every marker from first through last. `slot_set_digest` uses schema
+`splendor.secret.retired_partition_slot_set_digest.v1` and the matching ordered
+array of exact `{sequence,marker_slot_binding}` objects. Both use the common
+prefix/JCS/BLAKE3 rule, exclude their digest output, and reject duplicate, missing,
+or non-contiguous sequences. Marker IDs retain their closed primary/auxiliary tag.
+The genesis value is the common C03 digest of exact projection
+`splendor.secret.marker_chain_genesis_digest.v1` containing its schema,
+`trusted_partition_digest`, complete `authority_domain`, `pool_class`, and
+`slot_class`; it is not a shared zero or empty hash.
+
+Normal slot classes are exactly `direct_outer`, `tick_outer`,
+`approval_continuation`, `provider_control`, `node_control`, and
+`tick_observation`. Emergency slot classes are exactly
+`provider_control_invocation`, `node_control_invocation`,
+`reconciliation_claim`, `control_row_tombstone`,
+`delivery_control_attestation`, `terminal_delivery_receipt`, `cleanup_command`,
+`containment_reserve_tombstone`, and `incident`. A cross-pool class, unknown class,
+gap,
+duplicate sequence, fork, marker/slot count mismatch, wrong prior/final digest,
+or marker charged to an unlisted slot makes the complete retirement invalid.
+
+`retired_partition_chain_commitment_digest` uses exact schema
+`splendor.secret.retired_partition_chain_commitment_digest.v1`, the leaf schema
+as `leaf_schema_version`, and every other leaf field; its output is external.
+Leaves sort by raw 32-byte partition digest, then canonical authority-domain
+bytes, ASCII pool-class spelling, and ASCII slot-class spelling. Duplicate sort
+keys, leaf digests, or final-head digests reject. The canonical Merkle root is
+computed over raw 32-byte leaf-digest
+outputs. A one-leaf tree has that leaf digest as its root. While a level has more
+than one digest, an odd final digest is paired with itself once at that level and
+each pair becomes
+`BLAKE3("splendor.secret.retired_partition_merkle_node.v1" || 0x00 || left ||
+right)`. Processing stops when one digest remains; there is no repeated hashing
+of a one-entry level. An empty tree is invalid. The resulting
+`blake3:<lowercase hex>` value is
+`retired_partition_leaf_root`.
+
+The authoritative marker index must stream chain keys in that canonical order;
+an out-of-order, duplicate, or non-monotonic stream aborts. Retirement does not
+perform an unbudgeted in-memory key sort. It retains only the 4,096 raw leaf
+digests needed for in-place Merkle reduction while the two bounded serialization
+buffers build and verify one 64-leaf chunk at a time.
+
+The permanent domain object is one
+`RetiredAuthorityDomainDenyHead` with schema
+`splendor.secret.retired_authority_domain_deny_head.v1`. It is charged only to a
+dedicated non-borrowable retirement-head pool. Every field is required:
+
+```text
+schema_version
+secret_retired_authority_domain_deny_head_id
+authority_domain
+trusted_retirement_partition_digest
+secret_retirement_manifest_id
+retirement_manifest_integrity_digest
+retired_partition_leaf_root
+leaf_count
+pool_slot_counts
+total_replaced_marker_count
+total_source_slot_count
+final_owner_generation
+retirement_authority_decision_id
+retirement_decision_owner_sequence
+retirement_evidence_ids
+retired_at
+previous_domain_head_binding
+```
+
+The trusted retirement-partition digest uses exact projection
+`splendor.secret.retired_authority_domain_partition_digest.v1` containing its
+schema and exactly one owner-scope tag derived from the authority domain:
+`run_owner {kind="run_owner",tenant_id}`,
+`provider_route_owner {kind="provider_route_owner",provider_trust_scope,
+secret_provider_id,secret_provider_route_id}`, or
+`node_owner {kind="node_owner",tenant_id,node_id,instance_id}`. It deliberately
+excludes run ID, route revision, exposure lineage, and target generation so successive retired
+domains under one owner scope form one deny-head chain. `leaf_count` is 1 through
+4,096.
+`pool_slot_counts` is a fixed 15-entry array containing every normal and emergency
+pool/slot-class pair above, sorted first by ASCII pool spelling
+(`containment_emergency`, then `normal`) and then by ASCII slot-class spelling,
+including zero-count pairs. Each entry contains exactly `pool_class`, `slot_class`,
+`marker_count`, and `slot_count`; each entry equals the checked grouped sum of its
+leaves. `total_replaced_marker_count` and `total_source_slot_count` equal the sums
+of all 15 entries. Evidence IDs are 1-16 unique IDs in owner sequence.
+`previous_domain_head_binding` is exactly `genesis {kind="genesis"}` or
+`present {kind="present",secret_retired_authority_domain_deny_head_id,
+deny_head_integrity_digest}` in the separate authority-domain deny-head chain; it
+is never a source-marker pointer. Genesis is legal only for the first owner-
+sequence head in `trusted_retirement_partition_digest`; present must resolve to
+the immediate prior verified head in that same partition. A skipped, forked,
+cross-partition, or non-monotonic previous head rejects every later release.
+
+`retired_authority_domain_deny_head_integrity_digest` uses exact projection
+`splendor.secret.retired_authority_domain_deny_head_integrity_digest.v1`, which
+contains its digest schema, head schema as `deny_head_schema_version`, and every
+other head field; the output is external. Exact duplicate head bytes return the
+same head/digest. Any changed domain, root, count, decision, owner sequence,
+evidence order, time, or previous head conflicts and quarantines the domain.
+The head's maximum canonical size is 8 KiB.
+
+Before manifest commit, the authority-domain retirement gate denies every new
+identity in that domain and each authoritative source chain-head row CASes from
+`active` to exact
+`retirement_prepared {secret_retirement_manifest_id,
+retired_partition_chain_commitment_digest,first_sequence,last_sequence,
+final_head_digest,marker_count,slot_count}`. The row's chain key is unchanged.
+This freezes append and sequence-index membership without copying per-marker
+records. Every prepared field must equal its leaf/chunk/journal entry. A missing,
+changed, or differently prepared head is corruption. Before a deny head exists,
+an owner may abandon the attempt only by revalidating every unchanged source
+chain and CASing all rows back to `active`; partial rollback leaves the domain
+gated and releases nothing. After a deny head exists, rollback is forbidden.
+
+Retirement ordering and recovery are exact:
+
+1. reserve one in-flight retirement capacity unit and one unused permanent deny-
+   head slot, then install the domain retirement gate before scanning source
+   markers;
+2. verify every source chain without mutation, build sorted leaves/chunks, root,
+   and exact pool/slot counts, CAS every source chain head to its exact
+   `retirement_prepared` leaf binding, and persist/re-read the integrity-verified
+   bounded manifest, chunk set, and initial release journal;
+3. on any fork, corruption, missing marker, duplicate leaf, root mismatch, or
+   count mismatch, abort, append the fixed failure audit, and release no source
+   slot;
+4. revalidate the manifest/chunk digests and every prepared chain head, commit
+   and re-read the deny head plus integrity digest, then install the authority-
+   domain deny index before any per-identity lookup can run;
+5. release/delete exact normal and emergency source slots in canonical leaf/
+   sequence order according to the committed counts. Each slot-state CAS and the
+   matching per-leaf release-journal advance are one owner transaction; the final
+   marker, whose integrity digest equals the committed final-head digest, and its
+   prepared chain-head row are always released last. A mismatch releases nothing
+   further and quarantines;
+6. verify the final released counts, append the retirement audit, and delete the
+   temporary manifest/chunks/release journal. The permanent deny head and domain
+   index remain.
+
+A crash before head commit recomputes leaves from unchanged source markers and
+the same manifest ID/prepared chain heads. A crash after head commit first rejects
+the domain, then resumes only missing releases from the integrity-verified
+manifest, committed root/counts,
+digest chunks, and release journal. The authoritative marker index maintains,
+while a source slot is occupied, exact transactional lookups by both
+`(trusted_partition_digest,authority_domain,pool_class,slot_class,marker_sequence)`
+and unique `marker_integrity_digest`; releasing the final marker removes those
+lookups in the same CAS. Thus each incomplete leaf is recovered from its chunk's
+final-head digest and prepared chain-head row and continues through the frozen
+sequence index at the journal's exact `next_sequence` without an unbounded scan.
+The final marker and prepared row are released last, so this lookup cannot
+disappear before the leaf is complete; a completed leaf needs no source marker.
+After release completes, restart needs only the deny head/root and fixed count
+array to reject old IDs;
+deleted leaves and source markers are never required for lookup. The domain-
+deny lookup always precedes identity/tombstone lookup, allocation, policy,
+provider/node work, or effect. Once the verified head exists, old IDs always
+return `consumed_effect_retired`; the domain can never reopen or be reassigned.
+
+Capacity is closed. One domain has at most 4,096 leaves; admission denies creation
+of a 4,097th distinct chain key or a 4,294,967,296th marker in one chain before
+accepting the identity. Leaves are at most
+2 KiB and are streamed, not retained as a second full manifest. The closed
+`splendor.secret.retirement_manifest.v1` header contains exactly
+`schema_version`, `secret_retirement_manifest_id`, `authority_domain`,
+`trusted_retirement_partition_digest`, preallocated
+`secret_retired_authority_domain_deny_head_id`,
+`retirement_authority_decision_id`, `retirement_decision_owner_sequence`,
+`leaf_count`, `chunk_count`, `retired_partition_leaf_root`, `pool_slot_counts`,
+ordered `chunk_digests`, and owner `created_at`; its maximum canonical size is 16
+KiB. `chunk_digests` has exactly `chunk_count` entries in chunk-index order. The
+external `retirement_manifest_integrity_digest` uses projection
+`splendor.secret.retirement_manifest_integrity_digest.v1`, containing its digest
+schema, the manifest schema as `manifest_schema_version`, and every other header
+field; its output is excluded and stored beside the immutable manifest and in the
+deny head.
+
+A manifest has at most 64 chunks. Each chunk is one fixed 4-KiB binary block of
+64 consecutive 64-byte
+`{retired_partition_chain_commitment_digest,final_head_digest}` entries; unused
+final-chunk entries are all zero and excluded by `leaf_count`. Its matching
+`chunk_digests[chunk_index]` is
+`BLAKE3("splendor.secret.retirement_chunk_digest.v1" || 0x00 ||
+u32be(chunk_index) || u32be(nonzero_entry_count) || complete_4096_byte_block)`,
+encoded as the common lowercase `blake3:` value. Wrong length, index, entry count,
+padding, digest, order, or a nonzero unused entry is corruption and releases
+nothing. The release journal is exactly 4,096 fixed 64-byte entries
+containing raw `retired_partition_chain_commitment_digest`, `first_sequence`,
+`last_sequence`, and `next_sequence` as three big-endian `u64` values, and
+`committed_slot_count`/`released_slot_count` as two big-endian `u32` values. Unused
+entries are all zero and excluded by `leaf_count`; completed entries have
+`next_sequence=last_sequence+1` and equal slot counts. Each active journal entry
+is initialized with `next_sequence=first_sequence`,
+`committed_slot_count` equal to the leaf slot count, and
+`released_slot_count=0`. Each release transaction increments `next_sequence` and
+`released_slot_count` by exactly one after matching the source sequence/slot;
+skips, decreases, changed commitment digests, over-counts, or nonzero unused
+entries are corruption and stop all further release. Thus one in-flight
+retirement reservation is exactly 528 KiB durable scratch: 64 * 4 KiB chunks +
+16 KiB manifest header + 4,096 * 64 bytes = 256 KiB release journal. Its hot
+scratch is exactly 448 KiB: 4,096 * 32-byte leaf digests + two 128-KiB leaf-
+serialization buffers + one 64-KiB count/release map of 4,096 fixed 16-byte
+`{leaf_index,pool_ordinal,slot_class_ordinal,marker_count,slot_count}` entries.
+Nodes reserve four such in-flight units and each active
+tenant/node reserves one as a node suballocation. Permanent head minima are 4,096
+node and 1,024 per active tenant/node at 8 KiB each: 32 MiB and 8 MiB. Neither
+scratch nor head capacity can be borrowed by normal/emergency markers or user
+work. A tenant scratch/head charge is attribution of one node-owned unit/slot,
+not a second physical allocation.
+
+Replay reads full records, tombstones, and retired-domain deny heads as historical
 facts only. It reports whether duplicate safety comes from a full row, compact
-tombstone, or retired-domain deny marker and never calls policy, claims an ID,
+tombstone, or retired-domain deny head and never calls policy, claims an ID,
 restores protected output, or performs provider/node/adapter/target work.
 Retention fixtures expire full records for every direct/tick outer, approval
 continuation/challenge, provider control, node control/target generation, and
-unclaimed observation; exact and changed duplicates across restart still return
+unclaimed observation plus every released containment reserve; exact and changed
+duplicates across restart still return
 original safe disposition/conflict with zero effects. Corruption/unavailability,
 concurrent compaction/duplicate, quota exhaustion, deletion-audit failure, and
 domain retirement/reopen attempts all fail closed. Canonical fixtures pin every
@@ -3877,13 +4470,16 @@ artifact, sibling, child, helper, or external process; its configured maximum is
 the already admitted per-invocation 1-MiB captured-output queue plus the bounded
 64-KiB delivery object, and overflow quarantines rather than spills. Captured
 stdout, stderr, result, crash, exit, signal, and timing bytes remain inside this
-private scratch solely for detector and restricted incident-evidence processing.
+private scratch solely for live detector and enforcement processing.
 They are never returned or persisted in an ordinary outcome, error, state,
 trace, event projection, artifact, dataset, checkpoint, observability export, or
 replay export, even when every bounded detector reports no match. After detector
-finalization, the owner wipes them; uncertainty quarantines the scratch under the
-existing incident-retention rule and still releases no byte. Scratch is never an
-outbound credential slot or publication path.
+finalization, the owner wipes them. If direct wipe cannot be proved, the private
+allocation and exact process boundary remain live, inaccessible, and quarantined
+until the owner retries zeroization or destroys the boundary; the allocation
+cannot be reclassified as retained incident/forensic storage or reused. No API,
+incident, forensic, or tenant owner can read it. Scratch is never an outbound
+credential slot, publication path, or ordinary forensic record.
 
 C03 v1 has no target-controlled declassifier. A material-exposed registration
 therefore fixes before exposure one broker-owned publication deadline and the
@@ -3935,6 +4531,43 @@ host/transport state before returning a private wrapper. A URI, raw evidence ID,
 copied record, user assertion, stale observation, missing phase, or digest-only
 claim cannot satisfy a barrier.
 
+For `material_exposed`, the stronger host bound is exact:
+
+```text
+max_material_exposed_sink_attempts_per_use = 16
+```
+
+Before exposure, the host reserves 16 ordered pre-send record slots, 16 matching
+post-send slots, and one overflow/termination slot. Immediately before every
+attempted network, filesystem, IPC, child, proxy, device, helper, or alternate-
+mount sink, an unskippable host CAS increments the private saturating attempted-
+operation counter from its initial value zero. Values 1 through 16 consume
+exactly the corresponding pre-send slot;
+the host denies with zero emitted bytes and consumes the matching post-send slot
+before target code can continue. Counter value 17 consumes the one overflow/
+termination slot, performs no target sink attempt, and immediately fences and
+terminates the process. No value above 17, further target instruction, new
+evidence allocation, or replacement slot is reachable.
+Counter/journal integrity loss or CAS uncertainty follows the same value-17
+termination path before any sink instruction can continue; if recording itself is
+unavailable, the independent host supervisor still terminates and retains the
+fixed suppression projection rather than allowing an attempt.
+
+These 33 records are fixed-size, pre-reserved node-local enforcement-journal
+records, not ordinary trace/evidence/incident/telemetry. Their canonical retained
+private-owner projection contains only the preallocated use/handle/generation
+binding, fixed slot ordinal, fixed profile digest, and `denied_zero_bytes`; it
+contains no sink kind, target-selected time, bytes, detector result, actual count,
+or used/unused flag. The live used-slot bitmap is non-exportable and is wiped with
+the journal when enforcement closes; unresolved state remains inaccessible under
+the live fence without changing the fixed release. Crash or panic fences the
+process, so no later attempt can rely on a lost counter. Bounded private owner
+persistence always receives the same 33 fixed capacity projections regardless of
+how many slots live enforcement consumed, while ordinary persistence receives
+only the same eight suppression events. No API, receipt, attestation, replay, or
+tenant/restricted view can distinguish zero attempts, attempts 1 through 16, or
+overflow at 17.
+
 Evidence phases are not implementation-selected. Every applicable control has a
 `pre_exposure` fact before material delivery and a `terminal_absence` fact after
 its enforcement object is closed; terminal absence proves control/handle closure,
@@ -3942,14 +4575,17 @@ not erasure from target memory. `trusted_injection_boundary`,
 `destination_network_egress`, `ipc_egress`, and `proxy_egress` additionally have
 one fresh `pre_send` and one matching `post_send` fact for each attempted
 credential-bearing write; only its exact injector may use
-`allowed_nominal_slot`. Under `material_exposed`, every attempted network,
-filesystem, IPC, child-process, proxy, device, helper, or alternate-mount sink has
-one fresh `pre_send` decision and one matching `post_send` fact, both bound to
-`denied_zero_bytes`, before a later attempt. An `allowed_nominal_slot` disposition
-under material exposure is invalid. The typed owner evidence behind each ref must
-prove the operation was intercepted before any payload byte; an after-send scan
-cannot create that fact. Phase
-order is fixed by owner sequence, and evidence is unique by
+`allowed_nominal_slot`. Under `material_exposed`, every permitted attempted sink
+consumes one fresh private pre-send decision and matching private post-send fact
+from the 16-pair journal above, both bound to `denied_zero_bytes`, before a later
+attempt. Attempt 17 consumes only the overflow/termination record and reaches no
+sink. An `allowed_nominal_slot` disposition under material exposure is invalid.
+The live typed owner wrapper must prove interception before any payload byte; an
+after-send scan cannot create that fact. The actual phase records are never
+ordinary evidence refs and are wiped when enforcement closes or remain
+inaccessible under its live fence; the fixed capacity projection is identical on
+every path. Private phase order is fixed by owner
+sequence, and live journal entries are unique by
 `(secret_use_attempt_id, delivery_handle_id, target_generation, control_kind,
 phase, attempted_operation_sequence)`. Missing, duplicate, reordered, or
 cross-attempt phase evidence fails closed.
@@ -3978,6 +4614,10 @@ containment evidence, and prevents success/publication. Cleanup cannot relabel a
 possible exfiltration as absent. Replay inspects these records only and cannot
 open a socket, resolve DNS, inspect a live mount/process, recreate a proxy, or
 re-run a barrier.
+
+For material exposure, "records typed containment evidence" means only the fixed
+suppression records; attempted sink, match, and cleanup details remain live-only
+until wipe and replay cannot distinguish their branches.
 
 ### Mechanisms
 
@@ -4036,7 +4676,7 @@ required control; "where supported" is not an allow path:
 - debugger/ptrace access denied outside the exact trusted operator policy;
 - for `trusted_injection`, stdout/stderr, process args, environment snapshots,
   manifests, metrics, and debug bundles scanned before ordinary persistence; for
-  `material_exposed`, captured target bytes remain private detector/incident input
+  `material_exposed`, captured target bytes remain private live detector/enforcement input
   and are never ordinarily persisted regardless of scan result;
 - child inheritance denied unless the child is the exact bound process;
 - workspace, image-layer, artifact, swap, page-dump, and generic cache writes
@@ -4058,27 +4698,31 @@ plus their BLAKE3 integrity digests in a private non-cloneable
 `SealedSecretActionProjection`. Later outer recording consumes only those exact
 bytes after verifying every digest. For `material_exposed`, that sealed type has
 no byte-bearing variant: it contains only the fixed broker-owned suppression
-disposition, fixed stable failure/error projection, and bounded control counters
-whose values are fixed by the admitted profile rather than target output. Raw
+projection and its precomputed digest. Raw
 target/driver response, error, postcondition, exit, and timing bytes never enter
 `ActionOutcome`, ordinary traces/events, state, artifacts, or errors. No scan
-result can promote them to publishable. Restricted detector/incident owners may
-retain only the keyed leak token, closed representation/control enums, nominal
-evidence/incident IDs, and fixed bounded counters; raw captured bytes remain
-private until wiped or quarantined and are unavailable through result inspection.
-No later adapter/provider/target callback can alter or append public bytes. The
-stable non-secret path remains unchanged. `secret.delivery.closed` is the last
-C03 delivery event. Opaque, transformed, too-large, truncated, decoder-incomplete,
-or undrained material-exposed output changes only restricted containment handling,
-never the fixed public projection. Cleanup uncertainty keeps the fence and
-detector available for reconciliation or records why secure retention is
-impossible; it never emits `closed` or a target-derived result.
+result can promote them to publishable. V1 has no accepted forensic-
+confidentiality owner, so detector match state, leak token, representation/control
+choice, target-derived or additional evidence/incident ID, counters, and cleanup
+branch are not retained for a material-exposed target. The one preallocated fixed
+incident projection contains only `MaterialExposureSuppressedProjectionV1` and
+its digest. Richer facts exist only in live node-local enforcement scratch and
+are wiped when enforcement closes. Any unresolved value remains inaccessible
+under the live fence, is never retained as evidence, and cannot delay or alter the
+fixed release. No later adapter/provider/target callback can
+alter or append readable bytes. The stable non-secret path remains unchanged.
+Opaque, transformed, too-large, truncated, decoder-incomplete, undrained, and
+cleanup-uncertain material-exposed paths all produce the same fixed eight-event
+sequence and `cleanup_projection=quarantined`; live fencing remains until safe
+owner recovery, but no target-derived result or richer ordinary record exists.
 
 Splendor cannot prove erasure from an untrusted process after it has read the
 credential, from copied process/container memory, from a provider SDK, from a
-hypervisor, or from hardware. The receipt reports the controls applied and
-cleanup certainty. Uncertain cleanup is not success: it quarantines the target,
-denies new leases there, and emits incident-worthy restricted evidence.
+hypervisor, or from hardware. A trusted-injection receipt reports the controls
+applied and cleanup certainty. A material-exposed receipt reports only the fixed
+suppression projection and fixed `uncertain` certainty. Actual cleanup uncertainty
+is not success: live owner state quarantines the target and denies new leases,
+while every readable record remains byte/time-identical to the fixed projection.
 
 `SecretMaterial`, provider projection sessions, delivery contexts, opaque driver
 views, decoder overlaps, detector keys, and unsealed/sealed buffers have explicit
@@ -4244,15 +4888,16 @@ or minimum v1 conformance bounds; deployments may be stricter but not looser:
 | Concurrent invocation/overlap | At most 16 secret-aware invocations per node and 4 per tenant/node; at most 8 simultaneously open scanned sources per invocation; each source retains at most 256 KiB shared overlap across all detectors; 32 MiB node / 8 MiB tenant ceiling. |
 | Detector throughput | At least 100 MiB/s aggregate on the activation hardware for declared representations, measured with 4 KiB through 1 MiB chunks and the maximum active detector set. |
 | Streaming/backpressure | At most 1 MiB unscanned queued bytes per invocation; 16 MiB node / 4 MiB tenant ceiling; producers block or the output quarantines, never bypasses scanning. |
-| Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node hot schemas are at most 1,024 bytes. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retired-domain markers are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 512 KiB; outcomes obey the endpoint bound. Retention never deletes a tombstone or active uncertainty to admit work. |
-| Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per tombstone or retired-domain marker, non-borrowable normal floors are at least 8 MiB node / 2 MiB tenant. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency slots. |
-| Emergency permanent-marker store | Every containment unit atomically reserves exactly 17 typed emergency marker slots before exposure: 2 provider-control invocations, 8 node-control invocations, 2 reconciler claims, 1 delivery-control attestation, 1 terminal delivery receipt, 1 cleanup command, 1 consumed tombstone, and 1 incident identity. For 64 node/16 tenant units this is 1,088/272 slots and exact separate hard 2,176/544-KiB floors at 2 KiB each. Used slots remain charged after tombstone commit; unused slots return only on verified reserve release. Domain retirement may replace same-domain used markers but never reopen an ID. |
+| Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node hot schemas are at most 1,024 bytes. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 2 MiB and has at most 3,840 event refs; outcomes obey the endpoint bound. Retention never deletes a tombstone or active uncertainty to admit work. |
+| Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per tombstone, non-borrowable normal floors are exactly 8 MiB node / 2 MiB tenant. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency or retirement slots. |
+| Emergency permanent-marker store | Every containment unit atomically reserves exactly 35 typed emergency marker slots before exposure: 2 provider-control invocations, 8 node-control invocations, 10 row-bound reconciliation claims, 10 control-row tombstone IDs, 1 delivery-control attestation, 1 terminal delivery receipt, 1 cleanup command, 1 containment-reserve tombstone, and 1 incident identity. For 64 node/16 tenant units this is 2,240/560 slots and exact separate 4,480/1,120-KiB floors at 2 KiB each. Used slots remain charged after tombstone commit; unused slots return only on verified reserve release. Domain retirement releases exact committed chain counts but never reopens an ID. |
 | Tick observation durability | At most 16 C03 observations per policy output and 1 MiB canonical candidate bytes per observation, hence at most 16 MiB candidate bytes in one atomic batch. The Event/Evidence writer streams the quota-controlled durable batch without retaining a second hot copy. Unclaimed expiry is exactly 5 minutes minimum, `tick_deadline + 60 seconds`, and 24 hours maximum under the recorded policy revision. Link and expiry CAS the same owner row; at/after expiry only the winning digest tombstone remains effect-ineligible, while a winning exact link receipt pins candidate bytes through outer terminal/retention. This durable budget is excluded from the in-memory equation below and storage uncertainty rejects the whole batch before outer claim. |
 | Fixed restricted metadata | At most 8 MiB node / 2 MiB tenant for lineage indexes, control plans, and admission bookkeeping. |
-| Non-borrowable containment hot reserve | Preprovision 64 `SecretContainmentReserve` units per node and 16 per active tenant/node. Each unit has 14 entries at at most 2 KiB; 1,792 KiB node and 448 KiB tenant are rounded up to hard 2 MiB node / 512 KiB tenant pools. Normal work cannot consume them. |
-| Non-borrowable containment durable reserve | Each reserve unit owns exactly 4,768 KiB durable bytes, 552 event/evidence credits, and one incident credit under the exact derivation below. Floors are 298 MiB/35,328 event-evidence/64 incident credits per node and 74.5 MiB/8,832 event-evidence/16 incident credits per active tenant/node. Tombstone/retirement transactions debit this reserve, while retained markers remain charged to the separate typed emergency marker store. |
-| Total restricted node/tenant memory | 98 MiB node and 24.5 MiB per tenant/node: 96/24 MiB normal plus 2/0.5 MiB containment hot reserve. No category or tenant may borrow containment capacity. There are at most 16 requirements per action. Durable reserve bytes are storage admission, not resident-memory claims. |
-| Output drain | 30 s maximum after target exit/cancel. Trusted-injection timeout quarantines and prevents terminal success/publication. Material-exposed bytes are never publishable; timeout changes restricted containment evidence only and retains the fixed suppression projection. |
+| Non-borrowable containment hot reserve | Preprovision 64 `SecretContainmentReserve` units per node and 16 per active tenant/node. Each unit has exactly 38 entries at at most 2 KiB; exact pools are 4,864 KiB node and 1,216 KiB tenant. Normal work cannot consume them. |
+| Non-borrowable containment durable reserve | Each reserve unit owns exactly 7,164 KiB durable bytes, 719 event/evidence/enforcement-record credits, and one incident credit under the exact derivation below. Floors are 447.75 MiB/46,016 records/64 incident credits per node and 111.9375 MiB/11,504 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to their exact emergency slots. |
+| Retirement capacity | Dedicated permanent deny-head minima are 4,096 node and 1,024 per active tenant/node at 8 KiB: 32/8 MiB. Four node and one per-tenant in-flight reservations each own 528 KiB durable manifest/release scratch and 448 KiB hot scratch, giving 2,112/528 KiB durable and 1,792/448 KiB hot floors. Retirement capacity is non-borrowable and separate from normal/emergency markers. |
+| Total restricted node/tenant memory | 102.5 MiB node and 25.625 MiB per active tenant/node: 96/24 MiB normal, 4.75/1.1875 MiB containment hot reserve, and 1.75/0.4375 MiB retirement hot scratch. No category or tenant may borrow containment or retirement capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
+| Output drain | 30 s maximum ending at the predeclared exposure deadline plus 30 seconds. Trusted-injection timeout quarantines and prevents terminal success/publication. Material-exposed bytes are never publishable; actual exit, timeout, and drain state alter only live non-exportable enforcement and retain byte/time-identical fixed suppression records. |
 | Local cleanup | 10 s maximum for FD/socket close, unlink/unmount, projection deletion acknowledgement, and detector finalization; timeout is cleanup uncertainty. |
 | Provider revoke acknowledgement | 5 s maximum; timeout remains effect-uncertain and cannot report revoked success. |
 | Soak | 24 hours, at least 100,000 lease/use/cleanup cycles, maximum cardinality for at least one hour, zero leaked canaries, zero target-controlled material-exposed publication, zero duplicate effects, zero unbounded queue growth, and memory after cleanup within 5% of the post-warmup baseline. |
@@ -4267,8 +4912,9 @@ observed averages:
 + (4096 hot entries * 2 KiB)
 + 8 MiB fixed metadata
 = 96 MiB normal node maximum
-+ 2 MiB non-borrowable containment hot reserve
-= 98 MiB total node maximum
++ (64 containment units * 38 entries * 2 KiB = 4,864 KiB = 4.75 MiB)
++ (4 retirement scratch units * 448 KiB = 1,792 KiB = 1.75 MiB)
+= 102.5 MiB total node maximum
 
 (16 detectors * 512 KiB)
 + (4 invocations * 8 sources * 256 KiB overlap)
@@ -4276,22 +4922,68 @@ observed averages:
 + (1024 hot entries * 2 KiB)
 + 2 MiB fixed metadata
 = 24 MiB normal tenant/node maximum
-+ 512 KiB non-borrowable containment hot reserve
-= 24.5 MiB total tenant/node maximum
++ (16 containment units * 38 entries * 2 KiB = 1,216 KiB = 1.1875 MiB)
++ (1 retirement scratch unit * 448 KiB = 0.4375 MiB)
+= 25.625 MiB total tenant/node maximum
 
-64 node reserve units * 14 entries * 2 KiB = 1,792 KiB <= 2 MiB
-16 tenant reserve units * 14 entries * 2 KiB = 448 KiB <= 512 KiB
+64 node reserve units * 38 entries * 2 KiB = 4,864 KiB
+16 tenant reserve units * 38 entries * 2 KiB = 1,216 KiB
 
-64 node reserve units * 17 emergency marker slots * 2 KiB
-  = 2,176 KiB emergency marker floor
-16 tenant reserve units * 17 emergency marker slots * 2 KiB
-  = 544 KiB emergency marker floor
+64 node reserve units * 35 emergency marker slots * 2 KiB
+  = 4,480 KiB emergency marker floor
+16 tenant reserve units * 35 emergency marker slots * 2 KiB
+  = 1,120 KiB emergency marker floor
 
-64 node reserve units * 4,768 KiB durable = 298 MiB durable floor
-16 tenant reserve units * 4,768 KiB durable = 74.5 MiB durable floor
-64 node reserve units * 552 event/evidence = 35,328 credits
-16 tenant reserve units * 552 event/evidence = 8,832 credits
+64 node reserve units * 7,164 KiB durable = 447.75 MiB durable floor
+16 tenant reserve units * 7,164 KiB durable = 111.9375 MiB durable floor
+64 node reserve units * 719 event/evidence/enforcement records = 46,016 credits
+16 tenant reserve units * 719 event/evidence/enforcement records = 11,504 credits
+
+4 node retirement units * 528 KiB durable = 2,112 KiB durable scratch
+1 tenant retirement unit * 528 KiB durable = 528 KiB durable scratch
+4 node retirement units * 448 KiB hot = 1,792 KiB hot scratch
+1 tenant retirement unit * 448 KiB hot = 448 KiB hot scratch
+4,096 node deny heads * 8 KiB = 32 MiB permanent retirement pool
+1,024 tenant deny heads * 8 KiB = 8 MiB permanent retirement pool
 ```
+
+Tenant capacity is a suballocation of configured node capacity, never an
+independent promise. For every dimension `D` in `{containment_units, normal_hot_
+bytes, containment_hot_bytes, durable_bytes, event_evidence_enforcement_credits,
+incident_credits, normal_marker_slots, emergency_marker_slots_by_class,
+control_row_tombstone_slots, retirement_head_slots, retirement_inflight_units,
+retirement_durable_scratch_bytes, retirement_hot_scratch_bytes}`, admission and
+restart enforce:
+
+```text
+configured_node_capacity[D]
+  >= sum(active_tenant_reserved_capacity[tenant_id][D])
+```
+
+Retained charged markers and deny heads for a non-executing tenant continue to
+count as a retained tenant reservation until their authoritative retention rule
+permits release; deactivation cannot hide them from the sum. No dimension may be
+overcommitted, borrowed from another dimension, or satisfied by observed average
+use. At the stated floors, one tenant reservation is exactly 16 containment
+units and the corresponding 25.625-MiB hot, 111.9375-MiB containment durable,
+11,504-record, 16-incident, 1,024-normal-marker, 560-emergency-marker,
+176-tombstone, 1,024-retirement-head, and one-retirement-scratch suballocation.
+Therefore the 64-unit node floor admits at most four simultaneous active tenant
+reservations.
+
+A fifth tenant is denied before observation, outer acceptance, reserve, provider/
+node work, or exposure unless one owner transaction first increases and persists
+every insufficient node dimension, verifies the new checksums, and then commits
+the tenant reservation. Partial enlargement is non-authorizing. Pending tenant
+requests are admitted fairly by `(authority_request_sequence,tenant_id canonical
+UUID bytes)`; a later request cannot bypass an earlier request that fits the same
+complete vector. Release is an owner CAS after all active rows are terminal and
+all non-returnable marker/head charges have been retained in the tenant's
+explicit durable suballocation. It returns each releasable dimension atomically;
+no other tenant observes partial capacity. Restart reconstructs node totals from
+all active and retained tenant reservation rows before enabling C03. Missing,
+duplicate, negative, or sum-over-node accounting disables new exposure and
+quarantines existing affected reservations.
 
 The representation implementation must prove a maximum-size secret with every
 enabled plain/base64/base64url/percent/split/log-injection matcher fits the
@@ -4306,14 +4998,30 @@ generation binding is exactly `absent` at reservation and is CASed once to
 replaced or cleared. One unit has exactly two provider-control credits (`revoke`
 plus read-only `audit`), eight node-control credits (fence, terminate, close
 handle, close socket, unmount, delete projection, attest absence, acknowledge
-revocation), two reconciler-claim credits, two terminal/tombstone hot credits,
-552 durable event/evidence entries, one incident entry, 4,768 KiB durable bytes,
-and 17 typed emergency marker slots. An inapplicable operation leaves its credits
-and marker slots unused; they cannot be reassigned to normal work or another
-exposure. A backend whose declared worst case exceeds any unit dimension is
-inadmissible until a stricter profile or larger accepted budget exists.
+revocation), exactly one pre-reserved row-bound reconciliation claim ID for each
+of those ten controls, one control-row tombstone ID for each control, and the
+other fixed identities below. It owns 38 hot entries, 719 durable event/evidence/
+enforcement-record entries, one incident entry, 7,164 KiB durable bytes, and 35
+typed emergency marker slots. An inapplicable operation leaves its row and fixed
+credits unused; a claim-holder crash/expiry transfers the same durable claim ID
+and consumes no replacement identity. Credits cannot be reassigned to normal
+work or another exposure. A backend whose declared worst case exceeds any unit
+dimension is inadmissible until a stricter profile or larger accepted budget
+exists.
+Every one of the 38 hot slots, 719 record slots, and 35 marker slots receives its
+unique owner-local typed slot ID/binding at atomic reservation. Their three exact
+ordinal roots are persisted in the reserve row before exposure and later reused
+unchanged by the containment closure digest; no recovery allocates replacement
+slot IDs.
 
-The 552 event/evidence credits are exact maximum cardinality, not margin:
+The 38 hot entries are exact: one reserve row, one use-attempt row, two provider-
+control indexes, eight node-control indexes, ten reconciliation-holder rows, ten
+control-row tombstone construction rows, one containment-reserve-tombstone
+construction row, one delivery-attestation pointer, one terminal-receipt pointer,
+one cleanup state,
+one incident pointer, and one suppression-projection state.
+
+The 719 record credits are exact maximum cardinality, not margin:
 
 ```text
 per provider or node control:
@@ -4322,59 +5030,89 @@ per provider or node control:
   + 16 post-evidence records
   + 1 completed event
   + 16 Authority lifecycle-event records
-  = 50
+  + 3 reconciliation records (claim, start, completion)
+  + 4 retained recovery records
+      (result, terminal intent, receipt-or-audit, terminal recovery commit)
+  + 5 tombstone-before-delete records
+      (prepared, committed, verified, full-record-deleted, deletion audit)
+  + 2 marker records (charged, row-capacity-released)
+  = 64
 
-2 provider controls * 50 = 100
-8 node controls * 50 = 400
+2 provider controls * 64 = 128
+8 node controls * 64 = 512
 
 non-control reserve slots:
   16 exposure lifecycle/control-attestation records
   + 12 cleanup/revocation/containment records
   + 6 outer terminal/publication-suppression records
-  + 8 tombstone/compaction/retirement/deletion records
-  + 6 provider/node reconciliation claim/start/completion records
+  + 8 containment-reserve-tombstone/compaction/verification/deletion records
+  + 33 material-exposure barrier-closure records
+      (16 fixed pre-send ordinals, 16 fixed post-send denials,
+       1 fixed overflow/termination closure)
   + 4 incident/reserve-release records
-  = 52
+  = 79
 
-100 + 400 + 52 = 552 event/evidence records per containment unit
+128 + 512 + 79 = 719 records per containment unit
 ```
 
-The 52 non-control slots are closed by those category/count pairs and cannot be
-borrowed across categories. The 16 exposure slots are exactly reserve claim, use
-reservation, target allocation, pre-exposure control attestation, provider
-acquisition, delivery prepared, delivery activated, target started, target
-stopped, output drained, detector finalized, provider released, node released,
-delivery closed, exposure released, and final control attestation. The 12 cleanup
-slots are exactly leak signal, quarantine, revoke request/result, fence request/
-result, terminate, handle close, socket close, unmount, projection delete, and
-absence acknowledgement. The six outer terminal slots are terminal intent,
+The 79 non-control slots are closed by those category/count pairs and cannot be
+borrowed across categories. For material exposure, all 79 fixed private-owner
+closure records commit in the same order and at the same deadline-derived times
+regardless of target behavior. They are not individually caller/workload/tenant
+readable; every readable projection routes to
+`MaterialExposureSuppressedProjectionV1`. Private owner recovery may advance an
+underlying operational row later, but that row has no projector and no name below
+denotes a readable actual completion or detector result. The 16 exposure slots
+are reserve claim,
+use reservation, target allocation, pre-exposure control attestation, provider
+acquisition, delivery prepared, delivery activated, target-start projection,
+target-stop projection, output-drain projection, detector-finalized projection,
+provider-release projection, node-release projection, delivery-close projection,
+exposure-release projection, and final control attestation. The 12 cleanup slots
+are suppression signal, quarantine projection, revoke request/result projections,
+fence request/result projections, terminate projection, handle-close projection,
+socket-close projection, unmount projection, projection-delete projection, and
+absence-acknowledgement projection. The six outer terminal slots are terminal
+intent,
 pending outcome, receipt, action event, outcome record, and publication
-suppression. The eight retention slots are tombstone request, commit, verification,
-full-record deletion, retirement decision, retired marker, marker verification,
-and individual-marker deletion. The six reconciliation slots are claim, start,
-and completion for each of provider and node. The final four are incident request,
-incident record, reserve-release request, and reserve-release completion. A path
-needing a second record for any fixed slot is over profile and denies new exposure
-before reservation rather than dropping evidence. Emergency records that cannot
+suppression. The eight containment-reserve retention slots are fixed projections
+for tombstone preparation, commit, verification, full-record deletion, deletion
+audit, marker charge, release check, and release audit. They do not assert that
+the corresponding physical mutation occurred at projection time. Actual closure/
+tombstone/release state lives only in the already-budgeted containment reserve/
+release row and permanent marker slot, has no readable projector, and consumes no
+additional record credit. The 33 barrier-closure records have exact fixed
+ordinals and
+fixed values; actual attempt consumption exists only in the bounded live journal
+and is wiped. The final four are the fixed incident request, fixed suppression-
+only incident projection, reserve-release request projection, and reserve-release
+completion projection. A path needing a second record for any fixed slot is over
+profile and denies new exposure before reservation rather than dropping evidence.
+Emergency records that cannot
 fit the ordinary outer receipt's declared event-ref maximum remain in the
-restricted management/incident stream; the outer remains uncertain/quarantined
-and no record is omitted or target-controlled outcome released.
+non-exportable owner recovery stream; those records still carry only the fixed
+suppression projection and never target-selected facts. A material-exposed caller
+receives only the fixed eight-event projection and no target-selected outcome.
+Every post-exposure timestamp or certainty field in one of these records is copied
+from its associated fixed suppression phase; a schema that cannot represent that
+projection cannot persist the record. Pre-exposure reservation facts remain
+ordinary owner facts because they precede material visibility.
 
-The 4,768-KiB durable reservation follows maximum canonical sizes:
+The 7,164-KiB durable reservation follows maximum canonical sizes:
 
 ```text
-552 event/evidence records * 4 KiB                  = 2,208 KiB
+719 event/evidence/enforcement records * 4 KiB      = 2,876 KiB
 10 provider/node plan+row+result+intent+receipt
   bundles * 64 KiB                                  =   640 KiB
 pending stable ActionOutcome bytes                  = 1,024 KiB
-outer delivery receipt                              =   512 KiB
+outer delivery receipt                              = 2,048 KiB
 outer terminal intent                               =    64 KiB
 delivery-control attestation record                 =    64 KiB
 incident record                                     =    64 KiB
-2 reconciliation bundles * 32 KiB                   =    64 KiB
-reserve/cleanup/tombstone/retirement state aggregate=   128 KiB
+10 row-bound reconciliation bundles * 32 KiB        =   320 KiB
+containment reserve/release row                      =    64 KiB
                                                        ---------
-                                                       4,768 KiB
+                                                       7,164 KiB
 ```
 
 Each listed maximum is a schema admission bound. A future larger record or
@@ -4382,11 +5120,14 @@ additional record kind requires a new accepted profile and revised FND-012
 equations; compression, average size, and an unexplained safety margin cannot
 substitute for the declared maximum.
 
-The 17 emergency marker slots are likewise exact: 2 provider-control invocation
-IDs + 8 node-control invocation IDs + 2 `SecretReconciliationClaimId` values + 1
+The 35 emergency marker slots are likewise exact: 2 provider-control invocation
+IDs + 8 node-control invocation IDs + 10 row-bound
+`SecretReconciliationClaimId` values + 10 control-row consumed-tombstone IDs + 1
 delivery-control attestation ID + 1 terminal delivery-receipt ID + 1 cleanup-
-command ID + 1 consumed-tombstone ID + 1 incident ID. Each slot has a fixed class
-and ordinal in the reserve. Before accepting one of those identities,
+command ID + 1 containment-reserve consumed-tombstone ID + 1 incident ID. Each
+control row's invocation, claim, and tombstone ordinals bind one another and
+cannot be exchanged with another row. Each slot has a fixed class and ordinal in
+the reserve. Before accepting one of those identities,
 Authority atomically CASes the matching unused slot to
 `claimed {nominal_identity,authority_domain}`; a normal identity or different
 class cannot claim it. The identity's tombstone transaction atomically changes
@@ -4394,20 +5135,23 @@ that slot to `charged {permanent_marker_id,marker_integrity_digest}`, where the
 marker is the primary consumed-effect tombstone or exact auxiliary marker above.
 A charged slot
 remains in the emergency marker store after reserve release. Verified domain
-retirement may replace same-domain charged markers with one same-pool retired-
-domain marker and return only excess slots; it never moves a charge to the normal
-pool or permits reuse.
+retirement commits one chain leaf per partition/pool/slot class and the separate
+retirement-pool deny head before returning exactly the source slots in the head's
+count array. It never moves a charge between pools or permits reuse.
 
 Admission first proves the configured node and active-tenant reserve floors, then
-atomically reserves one complete unit, all 17 emergency marker slots, durable
-bytes, event/evidence credits, and incident credit per proposed use attempt before
+atomically reserves one complete unit, all 35 emergency marker slots, durable
+bytes, record credits, and incident credit per proposed use attempt before
 use claim, node preparation, provider acquisition, material exposure, adapter
-entry, or target work. For `N` requirements it requires `N` available tenant
-units and `N` available node units; partial reservation rolls back with no effect.
-Tenant normal slots/bytes, node normal slots/bytes, tenant emergency marker/unit,
-and node emergency marker/unit are acquired in that order, then ordered by
+entry, or target work. For `N` requirements it requires `N` available units in
+the tenant suballocation and in the node aggregate. Each physical node unit is
+charged once and attributed to exactly one tenant reservation; the tenant check
+is not a second independent allocation. Partial reservation rolls back with no effect.
+Accounting locks for tenant normal, node normal, tenant emergency, and node
+emergency dimensions are acquired in that order; the resulting physical node
+charges are each attributed once to the tenant suballocation, then ordered by
 Authority event sequence and canonical use-attempt ID. Historical charged
-emergency markers count against their separate pool; if fewer than all 17 slots
+emergency markers count against their separate pool; if fewer than all 35 slots
 remain, new exposure stops before reserve/use/provider/node/adapter work. A loser
 denies/quarantines new exposure before any such work.
 
@@ -4427,18 +5171,37 @@ marker slot.
 The reservation survives process/node restart and remains bound through provider
 revoke/audit, node fence/terminate/close/unmount/delete/attest, detector drain,
 scan/seal, cleanup, terminal intent/receipt/event, incident append, reconciliation,
-and consumed-effect tombstone commit. It releases only when provider and node
-effect state, revocation, cleanup, terminal evidence, and tombstone are all known
-terminal and no reconciler/incident write remains. Any uncertainty retains the
-unit; retirement requires the same fail-closed domain process. Release is an
-Authority CAS plus durable `secret.containment_reserve.released` audit, never a
-timeout or garbage-collector inference. Release returns only still-unused marker
-slots and unused durable/event/incident credits. Every claimed identity remains
-reserved, and every charged permanent tombstone remains charged to its exact
-emergency slot; releasing other capacity never makes it evictable. Restart and
-reconciliation rebuild available/unused/claimed/charged arithmetic from durable
-reserve/slot rows. A mismatch, lost row, double claim, or negative balance fails
-closed without dropping the reserve. Permanent lineage-scoped domain retirement
+all ten control-row tombstone transactions, and the containment-reserve tombstone
+commit. It releases only when every provider and node row is terminal or
+permanently uncertain as a closed terminal `effect_uncertain` disposition, never merely
+in-progress/sent-uncertain/reconciling; its one row-bound reconciliation lifecycle
+is closed; its retained result/terminal recovery is committed; its own tombstone
+is committed/verified; its full-record-deleted audit is durable; and revocation,
+cleanup, outer terminal evidence, containment-reserve tombstone, and incident work
+are terminal. Any unresolved or nonterminal uncertainty retains the unit;
+retirement requires the same fail-closed domain process.
+
+Release is an Authority allocator CAS guarded by the verified permanent
+containment-reserve tombstone, never a timeout or garbage-collector inference. Its
+exact order is closure record/digest, containment-reserve tombstone construction/
+commit/re-read, fixed-record deletion plus deletion audit, zero-live-debit check,
+then allocator CAS. The permanent tombstone is the durable audit for the old
+reserve identity. The fixed `secret.containment_reserve.released` projection is
+committed and compacted before the allocator CAS and does not assert that the
+physical unit was already reusable. Before that CAS, every live debit against the
+hot/durable/record/incident unit must be zero because its record was safely
+summarized and deleted after the corresponding tombstone/audit; the CAS then
+returns that complete physical unit for another exposure under a fresh reserve
+ID. Only still-unused emergency marker slots return with it. Every identity
+claimed by an executed row must already have its
+charged permanent marker; a claimed-but-uncharged slot blocks release. Every
+charged marker remains charged to its exact emergency slot until domain
+retirement; releasing the reusable unit never makes a marker evictable. Restart
+and reconciliation rebuild available/unused/claimed/charged arithmetic from
+durable reserve/slot rows, including all ten fixed claim IDs and eleven tombstone
+IDs. A mismatch, lost row, replacement claim ID, concurrent holder, double claim,
+or negative balance fails closed without dropping the reserve. Permanent lineage-
+scoped domain retirement
 follows the closed marker protocol above before any charged slot can return.
 
 Active detector, overlap, queue, use-attempt, approval continuation, provider/node
@@ -4451,9 +5214,12 @@ drops old semantics, active detection, or emergency capacity.
 
 The activation report records hardware, provider profile, concurrency, latency
 histograms, cardinalities, memory high-water mark, detector throughput,
-backpressure, drain/cleanup outcomes, and failures. Missing, skipped, simulated
-outside the declared profile, or over-budget evidence keeps the feature gate off
-and is not FND-012 or gold completion.
+backpressure, drain/cleanup outcomes, and failures for trusted injection. Its
+material-exposure section records only the admitted profile, fixed projected
+cardinalities/budgets, and pass/fail of synthetic-canary equality assertions; it
+contains no production target-specific outcome, branch, counter, or time. Missing,
+skipped, simulated outside the declared profile, or over-budget evidence keeps
+the feature gate off and is not FND-012 or gold completion.
 
 ## Pre-Persistence Leak Barrier
 
@@ -4485,12 +5251,14 @@ on every path that can carry target-controlled or provider-controlled bytes.
   tenants, leases, generations, nodes, and restarts while preserving equality
   within the one detector/representation scope. The token is not a provider
   value commitment, bearer, or offline verifier.
-- The central restricted event receives only the leak token, exact
+- For `trusted_injection`, the central restricted event receives only the leak token, exact
   `SecretUseAttemptId`, its one action/invocation effect coordinate, delivery
   handle/generation and source process/output coordinates, representation class,
   quarantine state, and restricted incident ref. Cleanup evidence uses the same
   use-attempt/effect/handle tuple. It cannot resolve the token to bytes, and a
   mismatched/missing tuple rejects rather than becoming uncorrelated evidence.
+  Material-exposed detection emits no such token-bearing event; it emits only the
+  fixed suppression event profile and wipes the live match state.
 
 Streaming detection retains an overlap of `max_encoded_pattern_bytes - 1`, with
 `max_encoded_pattern_bytes` capped at 256 KiB and each source record/chunk capped
@@ -4526,20 +5294,22 @@ and deny it with zero emitted bytes; only private broker scratch exists. Post-
 persistence scanning is additional defense and cannot substitute for that pre-
 operation deny-all enforcement.
 
-For `material_exposed`, scanning captured target bytes is incident detection only.
+For `material_exposed`, scanning captured target bytes is live enforcement input only.
 The scanner receives those bytes through a private non-serializable source and
-returns no target-derived public projection. Match, no-match, unknown coverage,
+returns no target-derived readable projection. Match, no-match, unknown coverage,
 decoder success/failure, output length, and chunk boundaries cannot alter the
-fixed public outcome, error, artifact, state, trace, or timing-release choice.
+fixed outcome, error, artifact, state, trace, evidence, incident, attestation,
+telemetry, replay, or timing-release choice.
 Ordinary persistence receives no captured byte or target-selected digest.
 
 A scan match, scanner unavailability, detector-registration failure, ambiguous
 partial scan, or output too large for the declared bounded scanner policy cannot
 be silently redacted and marked successful. C03 v1 has one disposition: quarantine
 the output and process boundary, fail the action, deny new lineage claims, revoke
-the affected lease, append containment evidence, and request incident handling
-when that owner exists. Cleanup or incident unavailability leaves
-`needs_intervention`; it never weakens containment or becomes success.
+the affected lease, and follow the same fixed suppression/quarantine/terminal
+path used for every material-exposed execution. Live cleanup or incident
+unavailability retains the fence but cannot change a readable field, event,
+count, time, or state and never weakens containment or becomes success.
 
 ### Limits and false positives
 
@@ -4548,9 +5318,10 @@ hashed, steganographic, custom-XOR/table/alphabet, schema-bit, error-choice,
 timing-choice, hardware-private, or otherwise opaque derivations. A separate
 data-use policy may authorize additional inspection but cannot prove malicious-
 code noninterference or authorize material-exposed publication. Unknown coverage
-is recorded only in restricted incident evidence and quarantined for a secret-
-exposed process; no captured byte, match choice, or coverage result is persisted
-or published through ordinary surfaces or produces action success.
+quarantines a secret-exposed process in live owner state but is not recorded in
+ordinary or tenant-readable incident evidence; no captured byte, match choice,
+coverage result, or target-specific token is persisted or published and none
+produces action success.
 
 Structured false-positive exceptions are versioned, exact schema/path rules with
 owner, reason, expiry, and test evidence. An allowlist cannot contain raw values,
@@ -4559,12 +5330,14 @@ fields, or convert scanner uncertainty into success. User-provided data that
 resembles a credential is quarantined or handled by an approved exact exception;
 it is never copied into a global detector allowlist.
 
-The event hash chain or access-controlled event MAC covers the exact leak token
+For `trusted_injection`, the event hash chain or access-controlled event MAC covers the exact leak token
 when the token is stored in the event. A projection that cannot expose the token
 stores an access-controlled commitment to the complete token and covers that
 commitment instead. Token/commitment substitution, removal, or representation
 change must break event integrity. Exclusion from content IDs and idempotency
-digests never excludes it from event integrity.
+digests never excludes it from event integrity. Material-exposed detection never
+persists a token or commitment in v1; its fixed event chain covers only the
+precomputed suppression projection digest.
 
 ## Trace, State, Artifact, and Replay Contract
 
@@ -4591,19 +5364,23 @@ secret.provider.fetch.completed
 secret-aware adapter method entered; Authority sets secret_aware_adapter_entered
 secret.delivery.ready
 secret.delivery.activated
-exposure-profile pre-send barriers/evidence become durable before each send
+trusted injection: exposure-profile barriers/evidence become durable before each send
+material exposure: fixed 33 barrier closures are durable; actual use is live-only
 immediately before target call, Authority sets target_operation_started
 target operation returns while adapter retains opaque driver-owned response
 terminal SecretDeliveryControlAttestation accepted inside adapter invocation
-gateway postcondition verification + response scan through borrowed continuation
+trusted injection: gateway postcondition verification + response scan
+material exposure: no target-result postcondition; fixed suppression projection
 adapter wipes raw response/error buffers and returns byte-free terminal
-secret.use.completed
+trusted injection: secret.use.completed
+material exposure: no event at actual return; live completion capability only
 target termination + bounded output drain
 decoder finalization + all pre-persistence/publication decisions + final seal
-secret.cleanup.started
-OS/projection cleanup + final detector scan
-detector key destruction/deregistration
-secret.delivery.closed | secret.cleanup.uncertain | secret.quarantined
+trusted injection: secret.cleanup.started -> OS/projection cleanup + final scan
+  -> detector key destruction/deregistration
+  -> secret.delivery.closed | secret.cleanup.uncertain | secret.quarantined
+material exposure: live cleanup/detector branches stay private; emit only the
+  eight fixed deadline-derived suppression events
 gateway returns private SecretSubmitCompletion
 atomic SecretDeliveryReceipt + exactly one action.executed | action.failed
 trusted injection: sealed public ActionOutcome released
@@ -4744,7 +5521,8 @@ log message is not equivalent evidence.
   generations, outer submission/terminal-intent, approval-continuation, use-
   attempt, provider-control, and node-control invocation/terminal-intent ledgers;
   compact hot indexes; containment reserves; backing-source claims; permanent
-  consumed-effect tombstones and retired-domain markers; routing refs; handles;
+  consumed-effect tombstones, in-flight retired partition-chain commitments, and
+  permanent retired authority-domain deny heads; routing refs; handles;
   safe attestation/egress-evidence records; full terminal receipts; safe control
   results/audits; pending validated outcome records; safe events; and CAS heads
   only. Event/Evidence separately owns the immutable safe preclaim tick-candidate
@@ -4758,7 +5536,9 @@ log message is not equivalent evidence.
 - Generic traces carry only closed
   `splendor.secret.access_event_projection.v1` values. Canonical
   `SecretAccessEvent`, provider, detector, and incident facts use
-  access-controlled evidence records.
+  access-controlled evidence records before material exposure and for trusted
+  injection. After material exposure, every one of those surfaces carries only
+  the fixed suppression projection and no detector or incident fact.
 - Secret material, direct/unkeyed value digests, provider request bytes, and
   provider material never participate in shared canonical serialization, state
   hashes, artifact IDs, idempotency digests, or public evidence digests. The
@@ -4771,14 +5551,15 @@ log message is not equivalent evidence.
 
 ### Replay
 
-Replay remains inspect-only by default. It reconstructs recorded ref revisions,
+Replay remains inspect-only by default. For trusted injection, it reconstructs recorded ref revisions,
 lease decisions, target bindings, provider outcomes, use claims, revocations,
 cleanup, leak/quarantine, approval continuation, provider/node control ledger
 states, containment reserves, backing-source ownership, full/tombstoned preclaim
 observations plus claim-state/link receipts, consumed-effect tombstones/retired
 domains, exposure profiles/egress evidence, publication-suppression dispositions,
-and effect certainty from safe records. It never exposes material-exposed captured
-bytes or reconstructs a target-selected result.
+and effect certainty from safe records. For material exposure, it reconstructs
+only the fixed suppression projection and eight-event profile; it never exposes
+captured bytes, target/cleanup facts, or a target-selected result.
 
 Replay never:
 
@@ -4817,6 +5598,11 @@ Allowed SDK ergonomics return only:
   inspection-scope checks; material-exposed submissions always use the fixed
   terminal/restricted suppression view after exposure;
 - structured denial and cleanup/quarantine status.
+
+That last status is available only before material exposure or for trusted
+injection. After material exposure, SDKs decode only the fixed
+`cleanup_projection=quarantined` field and cannot inspect actual cleanup,
+detector, incident, or intervention state.
 
 There is no SDK method named or behaving as `get_secret`, `resolve_secret`,
 `read_secret_value`, `secret_bytes`, or equivalent. There is no standalone
@@ -5101,7 +5887,7 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Approval receipt duplicate or changed continuation | Original category or `conflict` | Exact duplicate returns continuing/final state with zero second claim/effect; competing receipt or any changed bound field is `not_retryable` and effect `none`. Raw grant never executes. |
 | Missing/corrupt terminal receipt or intent | `uncertain` | `not_retryable`; outer certainty `uncertain`, same-submission lookup/reconciliation only. |
 | Full record compacted with exact tombstone | `expired` or original `uncertain` | Return restricted `consumed_effect_retired`/original uncertainty; never treat as miss, recreate protected output, or authorize an effect. Changed digest remains conflict. |
-| Tombstone or retired-domain marker unavailable/corrupt | `unavailable` or `integrity_failure` | Fail closed before allocation/effect; `not_retryable` until authoritative storage is repaired. Quota cannot delete the marker. |
+| Tombstone or retired authority-domain deny head unavailable/corrupt, or an in-flight retired partition-chain commitment unavailable/corrupt before release completes | `unavailable` or `integrity_failure` | Fail closed before allocation/effect; `not_retryable` until authoritative storage is repaired. Quota cannot delete a live tombstone/commitment or permanent deny head. After verified release completion, intentional manifest/leaf deletion is valid and the deny head alone rejects the domain. |
 | Expired or revoked authority/work-order/data-use/lease | `expired` or `revoked` | `retry_with_new_authorization` only for a new request/attempt, `none` |
 | Stale ref/placement/fencing/refresh/concurrent CAS | `stale_head` or `conflict` | exact same-ID retry returns the first denial; changed expected values require a fresh command ID, and any reserved/crossed use requires a fresh use-attempt ID; only the proved prepared/unreserved exception may retain the use-attempt ID, `none` |
 | Aggregate exhausted or attempted widening | `quota_exceeded` or `conflict` | `not_retryable`; preserves parent counters/start/deadline, provider/node/target `none`. |
@@ -5115,14 +5901,14 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Node-control invocation reused with changed plan bytes | `conflict` | `not_retryable`; changed delivery has effect `none`; original remains unchanged/hidden. |
 | Node-control uncertainty | `uncertain` | One reconciler may finish retained bytes; original mutation never re-enters. Only a fresh separately authorized read-only same-target attestation may inspect current state; parent remains quarantined. |
 | Containment reserve, emergency marker allowance, or floor unavailable | `quota_exceeded` or `unavailable` | Stop new exposure before use/provider/node/adapter work. Already-reserved revoke/fence/cleanup/terminal/tombstone writes retain their exact durable slots; corruption quarantines but cannot discard/reassign a reserve. |
-| Material exposure owner/profile or egress evidence unavailable | `unavailable`, `unsafe`, or `uncertain` | Deny before provider acquisition/exposure when possible; after exposure, block send, fail/quarantine, revoke/cleanup, and never retry or report success. |
-| Material-exposed network/proxy/DNS/filesystem/IPC/child/helper/alternate-mount attempt, including correct destination but wrong slot | `unauthorized`, `unsafe`, or `protected_data_denial` | Deny all with typed zero-byte evidence, fail/quarantine target and parent, and preserve actual certainty; no destination allowlist or after-send DLP can allow it. |
-| Material-exposed target output/result/error/exit/timing choice, including custom XOR/table/alphabet, schema-valid JSON bits, error choice, and chunked covert output | `protected_data_denial`; fixed `SecretErrorCode=material_exposed_publication_suppressed` | Internal stable status/error/publication disposition is fixed before exposure; public APIs return only the fixed terminal/restricted envelope with output/outcome/receipt/artifact/state/trace fields absent and no early release. Captured bytes remain private detector/incident input and are wiped/quarantined. Pattern no-match never authorizes publication. |
+| Material exposure owner/profile or egress evidence unavailable | `unavailable`, `unsafe`, or `uncertain` before exposure; fixed suppression projection after exposure | Deny before provider acquisition/exposure when possible. After exposure, block send, fail/quarantine, revoke/cleanup, and emit only the fixed projection; owner/evidence failure cannot select an error or event branch. Never retry or report success. |
+| Material-exposed network/proxy/DNS/filesystem/IPC/child/helper/alternate-mount attempt, including correct destination but wrong slot | Fixed `protected_data_denial` projection | Deny all with the predeclared zero-byte barrier, fail/quarantine target and parent, and emit only the fixed suppression records with fixed `uncertain` certainty; no destination allowlist, attempt kind, or after-send DLP result can alter a readable record. |
+| Material-exposed target output/result/error/exit/timing choice, including custom XOR/table/alphabet, schema-valid JSON bits, error choice, and chunked covert output | `protected_data_denial`; fixed `SecretErrorCode=material_exposed_publication_suppressed` | Stable status/error/publication disposition is fixed before exposure; APIs and retained evidence return only `MaterialExposureSuppressedProjectionV1` at its fixed release time. Captured bytes remain live private detector input and are wiped; wipe uncertainty keeps the inaccessible allocation quarantined without changing the projection. Pattern no-match never authorizes publication. |
 | Adapter delivery failure before target start | `unavailable` or `internal_invariant_violation` | Final action `Failed`; target `none`; outer is the conservative provider/node/target/cleanup maximum. |
 | Trusted-injection target definitive failure | Exact mapped `driver_failure`, `timeout`, `cancellation`, `postcondition_failure`, `unsafe`, or `integrity_failure` | Final action `Failed`; target `known`, outer at least `known`; no blind outer resubmit. |
 | Trusted-injection target send/result uncertainty | `uncertain` | Final action `Failed`, `not_retryable`; target and outer `uncertain`. |
-| Leak or post-target scanner denial | `protected_data_denial` or `unavailable` | `not_retryable` until containment/new evidence; preserve provider/node/target dimensions and derive outer conservatively, never reset to `none`. Material exposure retains its fixed public suppression envelope. |
-| Cleanup uncertainty | `uncertain` | Explicit same-target containment/reconciliation only. Material exposure retains its fixed public suppression envelope while actual uncertainty remains restricted owner evidence. |
+| Leak or post-target scanner denial | `protected_data_denial` or `unavailable` for trusted injection; fixed suppression projection after material exposure | `not_retryable` until containment/new evidence. Trusted injection preserves dimensions and derives outer conservatively; material exposure persists fixed certainty and no scanner-selected fact anywhere. |
+| Cleanup uncertainty | `uncertain` | Explicit same-target containment/reconciliation only. Material exposure retains its fixed suppression projection everywhere; actual uncertainty remains only in live non-exportable enforcement state until fencing and wipe. |
 | Evidence/clock/internal invariant unavailable | `unavailable`, `uncertain`, or `internal_invariant_violation` | fail closed; never implicit allow |
 
 | Threat or failure | Required behavior |
@@ -5143,7 +5929,7 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Same outer key or action/invocation with changed bytes/key | Conflict without mutating or repeating the original effect. |
 | Exact approval challenge receipt after `NeedsApproval` | Continue the same parent once through stable `/actions`, preserve original direct key or tick observation/digests, revalidate current authority, and create at most one adapter/target effect. |
 | Approval duplicate/competing receipt, crash, cancel, expiry, or revocation | Exact duplicate resolves the one continuation; competing/changed receipt denies; cancel/revoke/expiry wins prevent claim; post-claim crash uses only the same durable claim and terminal intent. |
-| Retry after full dedupe record expiry or authority-domain retirement | Tombstone or retired-domain marker rejects before allocation/effect. Exact/changed bytes never become a fresh miss and IDs are never reused. |
+| Retry after full dedupe record expiry or authority-domain retirement | Tombstone or the permanent retired authority-domain deny head rejects before allocation/effect. In-flight partition commitments govern release only and are not required after verified completion. Exact/changed bytes never become a fresh miss and IDs are never reused. |
 | Same-tenant/run principal presents another principal's submission ID | `splendor.actions.submit` alone receives uniform not-available; only original-principal current authority or dedicated current audited inspection can receive full/restricted status. |
 | Original principal's work-order/data-use/result visibility expires or is revoked before response | Return restricted non-retryable state only; withhold stable output and restricted receipt metadata on immediate, duplicate, and lookup paths. |
 | Provider outage/circuit open | Deny or bounded same-trust failover only under the rules above. |
@@ -5155,16 +5941,16 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Duplicate or response-lost provider renew/revoke/audit/active probe | Resolve the Authority ledger; exact bytes return original state/result, changed bytes conflict, sent uncertainty never re-enters the method, and post-effect loss uses retained bytes or a new authorized read-only audit. |
 | Node fence/terminate/close/unmount/delete/attest/revocation acknowledgement outside node-control gateway profile | Reject; direct node/OS/orchestrator mutation count remains zero. |
 | Node-control retry after proved no-send versus after write-ahead send | Only `one_no_send_retry_100ms` permits one same-plan retry after exactly 100 ms with owner proof of zero bridge bytes/local mutation. `no_retry`, missing proof, changed bytes, or any `sent_uncertain|sent_known` state permits no resend or failover. |
-| Normal/uncertain quotas or normal marker slots filled after exposure | The unit's non-borrowable durable credits and 17 typed emergency marker slots admit the exact control/evidence/terminal/tombstone sequence. New exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. |
+| Normal/uncertain quotas or normal marker slots filled after exposure | The unit's non-borrowable 719 record credits, 7,164 KiB durable bytes, and 35 typed emergency marker slots admit the exact control/evidence/terminal/tombstone sequence. New exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. |
 | Independent lineages share node/instance/generation number | Node domain, handle, plan, result, receipt, marker, cleanup, restart/migration, and retirement also bind the nominal exposure-lineage ID. Retirement of lineage A generation 1 cannot conflict with, compact, or deny lineage B generation 1. |
 | Lease not active/expired/revoked/max-use | Atomic deny before exposure/effect. |
 | Unknown/closed handle | Uniform deny; never attempt provider lookup from handle metadata. |
-| Cleanup uncertain | Quarantine target, deny new leases, record restricted incident-worthy evidence. |
-| Leak match or scanner unavailable | Fail/quarantine/revoke by closed policy; never silently redact to success. |
-| Material-exposed code attempts raw socket, DNS rebinding, proxy, filesystem, IPC, child-process, alternate-mount, or alternate-origin/account/resource exfiltration | SBX-007/Node pre-send and host controls block bytes before they leave, then fence/quarantine/revoke and record typed evidence; absent enforcement denies material before provider acquisition. |
+| Cleanup uncertain | Quarantine target and deny new leases; for material exposure, persist only the fixed suppression projection and retain actual uncertainty only in live enforcement state until wipe. |
+| Leak match or scanner unavailable | Fail/quarantine/revoke by closed policy; material exposure emits the same fixed projection for either case and never silently redacts to success. |
+| Material-exposed code attempts raw socket, DNS rebinding, proxy, filesystem, IPC, child-process, alternate-mount, or alternate-origin/account/resource exfiltration | SBX-007/Node barriers block bytes before they leave, then fence/quarantine/revoke and emit the fixed suppression records; attempt kind/count remains live-only and is wiped. Absent enforcement denies material before provider acquisition. |
 | Replay requests live resolution | Reject as `replay_forbidden`; adapter/provider invocation count remains zero. |
 | Clock rollback/skew/unavailable | Deny issuance, renewal, and use; do not extend expiry. |
-| Trace/event/evidence unavailable | Fail closed before provider/effect; after possible effect, report uncertainty and quarantine cleanup. |
+| Trace/event/evidence unavailable | Fail closed before provider/effect; after a possible trusted-injection effect, report uncertainty and quarantine cleanup. After material exposure, retain the fence and fixed pre-reserved suppression path; no unavailable/uncertain branch chosen by target behavior is readable. |
 | Terminal receipt/action append unavailable | Release no `ActionOutcome`; block direct response/tick/state advancement and reconcile without provider/driver replay. |
 | Delivery method switch on the same parent key | Preserve aggregate use/deadline/taint and one-target exclusion; a method child may narrow but cannot reset or overlap. |
 
@@ -5192,17 +5978,17 @@ failure handler from inventing a different status or bypass path:
 | Required material-exposure/SBX-007 or egress profile unavailable before provider acquisition | `none / none|known` | 0 / 0 | `NeedsIntervention`; target `none`, outer conservative | Deny material acquisition/delivery, consume any committed reservation, clean preparation, and do not degrade to uncontrolled user-code exposure. |
 | Delivery resolution failure or panic after adapter entry but before target start | `known / known` | 1 / 0 | `Failed`; target `none`, outer conservative | Adapter entry is execution under stable semantics; cleanup runs and one failed terminal pair commits. |
 | Trusted-injection actual-destination/DNS/proxy pre-send barrier denial after entry | `known / known` | 1 / 0 | `Failed`; target `none`, outer conservative | No credential-bearing bytes leave; fence/cleanup and record typed denial evidence. |
-| Material-exposed network/filesystem/IPC/child/proxy/helper/alternate-mount attempt, including approved destination with wrong header/query/path/body/frame | Each from durable receipts | 1 / 1 | `Failed`; target/outer `known|uncertain` | Deny-all host barrier proves zero emitted bytes, target/parent quarantine, lease revokes, drain/scan/cleanup run, and no success/output publication occurs. After-send DLP cannot pass the case. |
-| Material-exposed target returns any result/error/output/exit choice | Each from durable receipts | 1 / 1 | Fixed `Failed` suppression projection; target certainty remains restricted evidence | No target byte/digest/artifact/state/trace/error leaves, no early result release occurs, and scan result cannot alter the projection. Cleanup/incident handling may vary only in restricted owner evidence. |
+| Material-exposed network/filesystem/IPC/child/proxy/helper/alternate-mount attempt, including approved destination with wrong header/query/path/body/frame | Fixed `uncertain / uncertain` projection | 1 / 1 | Fixed `Failed` suppression projection | Deny-all host barrier emits zero bytes, target/parent quarantine, lease revokes, drain/scan/cleanup run, and only the fixed eight-event profile is retained. Attempt kind/count and cleanup branch remain live-only until wipe. |
+| Material-exposed target returns any result/error/output/exit choice | Fixed `uncertain / uncertain` projection | 1 / 1 | Fixed `Failed` suppression projection | No target byte/digest/artifact/state/trace/error leaves, no early result release occurs, and scan, cleanup, and incident paths cannot alter any readable record. There is no richer retained evidence owner in v1. |
 | Trusted-injection target returns definitive failure | `known / known` | 1 / 1 | `Failed`; target/outer `known` | Accept terminal control attestation, scan/seal safe error/evidence, cleanup, and one failed terminal pair. |
 | Trusted-injection target result is ambiguous | `known|uncertain / known|uncertain` | 1 / 1 | `Failed`; target/outer `uncertain` | No automatic retry; drain, quarantine/reconcile, clean, and commit one failed pair when evidence permits. |
 | Trusted-injection postcondition denied/uncertain | Each from durable receipts | 1 / 1 | `Failed`; target `known|uncertain`, outer conservative | No `action.executed`; seal failure evidence, cleanup, and one failed terminal pair. Material-exposed postconditions never consume target results. |
-| Scan/seal/output-coverage failure after target return | Each from durable receipts | 1 / 1 | `Failed`; target `known|uncertain`, outer conservative | Trusted-injection bytes quarantine with no partial release. Material-exposed bytes were never publishable and retain the same fixed suppression projection while restricted containment records the failure. |
+| Scan/seal/output-coverage failure after target return | Each from durable receipts for trusted injection; fixed certainty for material exposure | 1 / 1 | `Failed`; trusted-injection certainty is conservative, material exposure uses the fixed projection | Trusted-injection bytes quarantine with no partial release. Material-exposed bytes were never publishable; the live failure branch is wiped on enforcement close or remains inaccessible under the fence without a richer retained record. |
 | Cancellation/timeout before adapter entry | Each from durable send facts | 0 / 0 | `NeedsIntervention`; target `none`, outer conservative | Stop acquisition/delivery, consume reservations, cleanup/quarantine, and commit one terminal pair. |
 | Cancellation/timeout after entry but before target start | Each from durable send facts | 1 / 0 | `Failed`; target `none`, outer conservative | Entry fact forbids `NeedsIntervention`; cleanup/quarantine and one failed terminal pair. |
-| Cancellation/timeout after target start | Each from durable send facts | 1 / 1 | `Failed`; target/outer `known|uncertain` | Drain within bounds, scan/seal, cleanup/quarantine, one failed terminal pair, and no blind retry. |
+| Cancellation/timeout after target start | Each from durable send facts for trusted injection; fixed certainty for material exposure | 1 / 1 | `Failed`; material exposure uses the fixed suppression projection | Drain within bounds, scan/seal, cleanup/quarantine, one failed terminal pair, and no blind retry. Material-exposed timeout/return timing cannot alter a readable record or release time. |
 | Provider/node/adapter unwind or panic | Each from durable send facts | Exactly from durable entry/start facts | `NeedsIntervention` only at 0 adapter entries; otherwise `Failed` | Gateway guard owns cleanup. Missing facts are treated as crossed/uncertain; panic-abort/process death uses supervisor reconciliation and cannot emit success. |
-| Cleanup/drop/wipe failure | Each from durable send facts | Exactly from durable entry/start facts | `NeedsIntervention` at 0 entries; otherwise `Failed`; outer `uncertain` | Retain detector/fence where possible, emit cleanup uncertainty/quarantine, and commit one non-success pair. |
+| Cleanup/drop/wipe failure | Each from durable send facts for trusted injection; fixed certainty after material exposure | Exactly from durable entry/start facts before exposure; fixed projection after material exposure | `NeedsIntervention` at 0 entries; otherwise `Failed`; material exposure uses the fixed suppression projection | Retain detector/fence where possible. Trusted injection emits cleanup uncertainty; material exposure keeps that branch live-only and commits the same fixed suppression pair. |
 | Pending-outcome/terminal receipt/action append failure | Preserve all dimensions | Preserve both facts | No public `ActionOutcome`; outer `uncertain` | Keep the Gateway-sealed immutable pending bytes and Authority terminal intent with `terminal_evidence_blocked`; no outcome/state/direct success/next tick until one-pair reconciliation, with no repeated effect or outcome reconstruction. |
 | Revocation acknowledgement uncertainty | Independent provider/control facts | In-flight action preserves its entry/start facts | Control `effect_uncertain`; action status follows adapter-entry fact | Keep `revocation_pending`, emit `revocation_uncertain`, quarantine, and use a fresh authorized same-target control invocation for reconciliation. |
 
@@ -5262,7 +6048,7 @@ policy-manifest/tick-key bytes, exact observation link-versus-expiry CAS/receipt
 at before/at/after boundaries, duplicate-observation conflict, UUIDv5 audience
 bytes, semantic idempotency bytes, wrapper/outer direct/tick/approval/provider/
 node plan and terminal-intent digest bytes, every full/restricted response state
-matrix, every closed tombstone/disposition/retired-marker tag and integrity chain,
+matrix, every closed tombstone/disposition/retired-chain/deny-head tag and integrity chain,
 leak-token generation/key separation, and token-integrity tampering. Provider
 terminal goldens contain the nominal invocation ID plus explicit plan/partition
 digests and no inferred invocation digest. Node goldens include the exact retry
@@ -5283,7 +6069,8 @@ remains `not_exercised`.
   closed command grammar, semantic idempotency, authorized lookup ordering,
   outer submission/terminal-intent and challenge-bound approval-continuation
   ledgers/reconciler, provider-control invocation/terminal-intent/hot-index
-  ledger, permanent consumed-effect tombstones/retired-domain markers,
+  ledger, permanent consumed-effect tombstones, in-flight retired partition-chain
+  commitments, and permanent retired authority-domain deny heads,
   containment-reserve accounting, parent exposure
   aggregates with method children, atomic lease/aggregate use claims, expiry,
   same-attempt renewal, rotation/revocation, use-attempt ledger, refresh CAS,
@@ -5331,12 +6118,22 @@ remains `not_exercised`.
   index pointer variants, and the generated 902-byte maximum record.
 - Retention tests compact full direct/tick outer, approval challenge/
   continuation, provider-control, node-control/target-generation, and expired
-  observation records. Exact/changed duplicates across restart hit the tombstone
-  or retired-domain marker and cause zero new effects; every named disposition
+  observation records plus released containment reserves. Exact/changed
+  duplicates across restart hit the tombstone
+  or permanent authority-domain deny head and cause zero new effects; in-flight
+  partition-chain commitments validate exact release until completion. Every named disposition
   digest and integrity-chain byte is pinned. Corruption, deletion pressure,
   concurrent compaction, and domain reopen fail closed. Two lineages on one
   node/instance each use target generation 1; compacting/retiring one leaves the
   other's handles, controls, lookup, cleanup, and retirement authority unchanged.
+  A provider-route domain fixture contains many trusted partitions and both
+  normal provider-control and emergency revoke/audit chains. It pins sorted
+  leaves, all 15 pool/slot count entries including zeros, Merkle root, deny-head
+  bytes, manifest integrity/chunk digests, final-head reverse lookup, crash-
+  before/after-head recovery, release journal, and exact source-slot
+  release. A fork, corrupt marker, count mismatch, 4,097th leaf,
+  4,294,967,296th marker in one chain, or interrupted release frees no
+  uncommitted slot and never reopens an old ID.
 - Result-authorization tests use principals A and B in the same tenant/run. A
   receives full immediate/duplicate POST only while current result/output/data-
   use/work-order/revocation policy allows; submit-only GET is always restricted,
@@ -5371,7 +6168,7 @@ remains `not_exercised`.
   -> borrowed permit -> provider -> driver-local `resolve_and_deliver` -> exactly
   one target driver invoke -> terminal control attestation -> trusted-injection
   gateway postcondition/public-projection scan or material-exposed fixed
-  suppression/private incident scan -> raw-buffer wipe -> delayed-source drain/
+  suppression/private live detector scan -> raw-buffer wipe -> delayed-source drain/
   decoder finalization/final seal -> cleanup -> common terminal normalizer ->
   final outcome. Multi-requirement tests prove all reservations precede the first
   provider call and a provider failure skips later fetches/driver execution. With
@@ -5475,8 +6272,10 @@ remains `not_exercised`.
   wrong header, query, path, body, or protocol frame. Accepted SBX-007 deny-all
   controls prove zero bytes left for every attempt with typed pre/post evidence,
   quarantine/cleanup, and no publication. Captured target bytes remain only in
-  bounded private broker scratch for detector/incident handling and are wiped or
-  quarantined; no scanned/sealed target-output publication exists. Additional
+  bounded private broker scratch for live detector/enforcement handling and are
+  wiped; wipe uncertainty keeps inaccessible live quarantine but creates no
+  richer target-specific retained incident path or scanned/sealed target-output
+  publication. Additional
   targets emit custom XOR/table transforms, custom alphabets, secret bits in valid
   JSON values, selectable error/result branches, chosen exit codes/delays, and
   chunked low-bandwidth covert output. Every case records the same fixed internal
@@ -5485,15 +6284,30 @@ remains `not_exercised`.
   fields. Missing enforcement denies before provider acquisition/
   delivery; destination allowlists, pattern no-match, after-send DLP, and cleanup
   alone never pass the case.
+- For one predeclared exposure deadline and preallocated identity set, equality
+  fixtures record exposure and then vary immediate/delayed return, exit/error choice, each denied sink
+  kind, zero through 16 attempts plus overflow, detector match/no-match/outage,
+  drain/cleanup success/failure, crash/timeout, resource use, and covert output.
+  They assert byte-for-byte equal response, pending stable outcome, terminal
+  intent, receipt, fixed barrier closures, event, trace, state, evidence,
+  incident, telemetry, attestation, audit, and replay projections; identical IDs,
+  field presence, event order/cardinality, digests, timestamps, and release time;
+  and absence of any richer persisted target fact.
 - Pressure fixtures fill every normal hot/durable quota and active-uncertainty
   allowance plus every normal marker slot after an exposure has atomically
   reserved its unit, then exercise provider revoke/audit, node fence/terminate/close/
   unmount/delete/attest, cleanup, terminal evidence, incident, reconciliation,
-  and tombstone/retirement commit from the non-borrowable reserve. All 17 typed
-  marker slots, 552 event/evidence slots, and 4,768 KiB byte categories are driven
+  and tombstone/retirement commit from the non-borrowable reserve. All 35 typed
+  marker slots, 719 event/evidence/enforcement-record credits, and 7,164 KiB durable bytes are driven
   to their exact maxima. New exposure stops first, every already-reserved write
   retains its slot through restart, used/unused release and domain retirement are
   verified, and no active/tombstone/reserve row is evicted or reassigned.
+  Each of the two provider and eight node rows independently loses a result/event/
+  CAS acknowledgement, transfers its one same-ID reconciliation claim after
+  holder crash/expiry, terminalizes retained bytes without repeating the effect,
+  and completes its own tombstone-before-delete/verification/deletion audit. A
+  replacement claim ID, concurrent holder, second tombstone for one row, or record beyond
+  the exact per-row allowance fails the fixture.
 - Use synthetic canaries to test plain, common encoded, split/chunked, and
   log-injection forms at every declared chunk boundary across params, prompts,
   delayed stdout/stderr after exit, state, trace, artifacts, errors, debug
@@ -5579,14 +6393,23 @@ remains `not_exercised`.
   latency, cardinality, timeout/retry, detector throughput/memory/backpressure,
   output-drain, cleanup, and 24-hour soak budget passes on the activation
   composition. Worst-case 64-KiB material with every enabled representation at
-  64 detectors and 16 concurrent invocations satisfies the 98-MiB node and
-  24.5-MiB tenant equations including the 2-MiB/512-KiB hot containment pools,
-  plus the 298-MiB/74.5-MiB durable reserve floors, normal minimum 8-MiB/2-MiB
-  marker stores, and emergency 2,176/544-KiB marker floors. The report proves
-  35,328/8,832 event-evidence credits and all 17 marker classes per unit. Overflow admission
+  the 64-detector/16-invocation node maxima and 16-detector/4-invocation tenant
+  maxima satisfies the 102.5-MiB node and 25.625-MiB tenant equations, including the 4.75/1.1875-MiB containment hot
+  pools and 1.75/0.4375-MiB retirement hot scratch. The report also proves the
+  447.75/111.9375-MiB containment durable floors, 2.0625/0.515625-MiB retirement
+  durable scratch floors, normal 8/2-MiB marker stores, 4,480/1,120-KiB emergency
+  marker floors, 32/8-MiB retirement deny-head floors, 46,016/11,504 record
+  credits, and all 35 typed emergency marker slots per unit. Overflow admission
   deterministically denies before provider/node/adapter work and never evicts
   active detector/control/tombstone state. Missing evidence keeps
   `secret_broker_v1` off.
+- Hierarchical capacity fixtures atomically reserve the complete dimension vector
+  for four active tenants at the 64-unit node floor and 16-unit tenant floor. A
+  fair-sequence fifth tenant denies before observation/effect; partial growth of
+  any node dimension still denies. It is admitted only after every deficient node
+  dimension is increased, checksummed, persisted, and reflected in restart
+  reconstruction. Retained marker/head charges survive tenant deactivation, and
+  release exposes no partial capacity to a competing tenant.
 - Sustained trusted-injection/material-exposed canary runs continuously attempt
   raw socket/DNS/proxy/filesystem/IPC/child/helper/alternate-mount and correct-
   destination wrong-slot egress. No forbidden byte leaves; material exposure has
@@ -5791,10 +6614,10 @@ Independent reviewers should recommend acceptance only if all are true:
   injection may run gateway postconditions and scan a proposed projection before
   raw-buffer wipe, then seal the complete drained publication set before public
   release. Material exposure accepts no target-result postcondition/projection;
-  captured bytes remain private detector/incident input, never ordinary
-  state/trace/artifact/error/output, and are wiped/quarantined. Cancellation,
-  timeout, panic, process death, and cleanup failure enter the same fail-closed
-  session path.
+  captured bytes remain private live detector/enforcement input, never ordinary
+  state/trace/artifact/error/output, and are wiped or kept inaccessible under live
+  quarantine until zeroization succeeds. Cancellation, timeout, panic, process
+  death, and cleanup failure enter the same fail-closed session path.
 - Stable outcome meanings are preserved. Tick and direct actions use one
   Gateway-owned terminal normalizer that constructs/seals the private pending
   stable outcome; Authority owns its durable record and terminal intent. Every
@@ -5810,7 +6633,8 @@ Independent reviewers should recommend acceptance only if all are true:
   sent/started with a definitive result is at least `known`, and ambiguity is
   `uncertain`. Receipt outer certainty is their conservative maximum including
   delivery/cleanup uncertainty. Missing terminal evidence releases no receipt
-  and reports submission uncertainty instead.
+  and reports submission uncertainty instead. This derivation is for trusted
+  injection; every material-exposed certainty field is fixed `uncertain`.
 - The delivery-control handoff is a typed immutable attestation with exact typed
   evidence refs and no promised final status; the separate terminal receipt is
   bound to the final outer action status and exact action/invocation/use attempts.
@@ -5832,16 +6656,22 @@ Independent reviewers should recommend acceptance only if all are true:
 - `trusted_injection` keeps bytes out of target code and revalidates the actual
   exact destination, redirect/DNS/proxy/transport immediately before send.
   `material_exposed` requires accepted SBX-007/NODE/SBX deny-all network,
-  filesystem, IPC, child, proxy, and alternate-mount enforcement with typed pre/
-  post evidence; otherwise general-purpose target delivery denies before
+  filesystem, IPC, child, proxy, and alternate-mount enforcement with the fixed
+  33-record barrier capacity and live private pre/post journal; otherwise general-
+  purpose target delivery denies before
   provider acquisition. After exposure, one fixed broker-owned `Failed`/absent-
   output/suppression projection is recorded internally and one fixed terminal/
   restricted envelope is released at the fixed boundary; custom XOR,
   table, alphabet, valid-JSON-bit, error/result/exit/timing, and chunked output
-  cannot choose any public/persistent value. Exfiltration attempts quarantine and
-  never become success through cleanup. Workloads needing returned data or
+  cannot choose any readable or ordinary-persistent value. Exfiltration attempts
+  quarantine and never become success through cleanup. Workloads needing returned data or
   credentialed network/IPC use trusted injection or a future separately accepted
   declassifier contract.
+- Material-exposed pending outcome, terminal intent/receipt, attestation, eight
+  C03 events, outer event/outcome, tick state/complete path, incident, telemetry,
+  audit, SDK, and replay projection use only preallocated IDs and deadline-derived
+  fixed bytes/times. Target return, sink, detector, cleanup, resource, and covert
+  choices are absent; no richer retained forensic owner exists in v1.
 - Provider renew/revoke/audit/active probes are typed gateway-mediated control
   effects with an Authority ledger claimed before evidence/bootstrap/provider I/O,
   canonical plan equality, authorization, deadlines, no-send-only bounded retry,
@@ -5876,13 +6706,20 @@ Independent reviewers should recommend acceptance only if all are true:
   cleanup, restart/migration, tombstones, and retirement preserve that lineage;
   independent lineages with generation 1 never collide. Recovery mismatch
   quarantines rather than allocating a sibling.
-- Direct/tick, approval, provider, node, and observation IDs/effect coordinates
-  have a closed tagged tombstone union with exact per-domain accepted bindings,
-  effect coordinates, named disposition digests, authority domains, slot sources,
-  and integrity chain. Retired-domain marker fields/digest are exact. Full-record
+- Direct/tick, approval, provider, node, observation, and containment-reserve IDs/
+  effect coordinates have a closed tagged tombstone union with exact per-domain
+  accepted bindings, effect coordinates, named disposition digests, authority
+  domains, slot sources, and per-partition/pool/slot-class integrity chains.
+  Retired partition-chain commitment, Merkle root, manifest/chunk digests, final-
+  head lookup, release journal, and permanent authority-domain deny-head fields/
+  digests are exact. Full-record
   expiry never becomes a miss; exact/changed equality remains deterministic after
   deletion, corrupt/unavailable dedupe denies, retired domains reject before
   lookup, quota cannot delete/rearm markers, and replay remains no-effect.
+- Tick-observation expiry preallocates one tombstone ID, records a digest-free
+  pending pointer, hashes only pre-integrity terminal facts, commits/re-reads the
+  tombstone, then installs its external integrity digest. Every crash boundary is
+  same-ID resumable; placeholders, recursion, or mutable-after-hash bytes reject.
 - Delivery, cleanup, renewal, rotation, revocation, offline, HA, retention, leak,
   replay, compatibility, and threat behavior is fail closed and testable.
 - Process taint, delivery-control evidence, detector/output-drain lifetime,
@@ -5894,25 +6731,39 @@ Independent reviewers should recommend acceptance only if all are true:
   ledger are explicit.
 - Material-exposed processing has network, IPC, proxy, child/helper, and external-
   filesystem egress deny-all and no credential-backed outbound use. Only private
-  broker scratch exists for bounded leak/incident scanning; target-controlled
-  bytes are never sealed for publication. Outbound credential use
+  broker scratch exists for bounded live leak enforcement; target-controlled
+  bytes and detector results are wiped on enforcement close or remain inaccessible
+  under the live fence, and are never sealed or retained for publication.
+  Outbound credential use
   requires trusted injection's exact actual destination and nominal slot; wrong
   header/query/path/body/frame attempts emit zero bytes.
 - Before every exposure, a non-borrowable reserve covers worst-case provider
   revoke/audit, node fence/terminate/close/unmount/delete/attest, cleanup,
   terminal/evidence/incident/reconciliation/tombstone work. Normal quota cannot
   consume it; unavailable reserve stops new work first; release waits for known
-  terminal cleanup/revocation. It atomically includes 17 typed emergency marker
-  slots, exactly 552 event/evidence credits, and 4,768 KiB durable bytes per unit;
-  normal identities cannot borrow those slots and release returns only unused
-  capacity. FND-012 proves 98/24.5-MiB hot totals, 298/74.5-MiB durable
-  containment floors, normal minimum 8/2-MiB marker stores, and emergency
-  2,176/544-KiB marker floors.
+  terminal cleanup/revocation. It atomically includes 35 typed emergency marker
+  slots, exactly 719 event/evidence/enforcement-record credits, and 7,164 KiB
+  durable bytes per unit;
+  normal identities cannot borrow those slots. Verified release returns the
+  reusable hot/durable/record unit after zero live debit and only unused marker
+  slots; charged markers remain until domain retirement. FND-012 proves
+  102.5/25.625-MiB restricted-memory totals,
+  447.75/111.9375-MiB containment durable floors, 46,016/11,504 record-credit
+  floors, normal minimum 8/2-MiB marker stores, emergency 4,480/1,120-KiB marker
+  floors, and separate 32/8-MiB retirement deny-head floors.
+- Each of two provider and eight node rows owns one non-reusable reconciliation
+  claim ID and one row tombstone ID; holder recovery transfers the same claim by
+  CAS. Material exposure admits at most 16 sink attempts, then consumes the one
+  pre-reserved overflow/termination record before any 17th sink operation.
 - The <=2-KiB hot submission/provider/node-control indexes contain only lookup/
   state/digest/terminal pointers; active uncertainty cannot be evicted and full
   immutable terminal intents/receipts/results use quota-controlled durable
   storage. Summary and event order/uniqueness/cardinality are fixed and covered
-  by the 16-requirement maximum fixture.
+  by the 16-requirement, 3,840-event-ref maximum fixture.
+- Tenant floors are node suballocations in every hot/durable/record/incident/
+  marker/tombstone/retirement dimension. The 64-unit node floor admits four
+  16-unit tenant reservations; a fifth denies before effect unless every deficient
+  node dimension is atomically enlarged, persisted, and restart-verified.
 - Current read-time redaction is explicitly insufficient for live C03.
 - External SDK/scanner rules distinguish caller/bootstrap credentials from
   workload secrets and never expose material. Every adopted credential-capable
