@@ -66,7 +66,12 @@ directly. For material exposure, NODE/SBX alone owns isolation preparation and
 finalization state, Authority alone owns the absorbing one-shot authority commit,
 and Event/Evidence alone owns the stable run cursor plus terminalization lease;
 owners exchange authenticated immutable receipts and never mutate another
-owner's table. An authority-owned `SecretActionReconciler` is the only crash-
+owner's table. State Service remains the sole state-node/head visibility owner,
+Agent Instance Controller remains the sole run/tick lifecycle and next-tick
+owner, and Authority remains the sole secret publication-authorization owner.
+Their publication handoff uses immutable authenticated owner-local commands,
+completion receipts, arm acknowledgements, and a final Authority read fence; it
+does not introduce a combined owner or cross-service transaction. An authority-owned `SecretActionReconciler` is the only crash-
 recovery
 writer for outer submissions/use attempts: it may complete already-recorded
 cleanup or terminal evidence, but it cannot call a provider, node target
@@ -401,6 +406,7 @@ The following C03-owned IDs are UUID-backed nominal newtypes in
 | `secret_use_claim_id` | `SecretUseClaimId` | One atomic exposure/use claim. |
 | `secret_containment_reserve_id` | `SecretContainmentReserveId` | One pre-exposure non-borrowable containment reservation; not a quota credit or authority. |
 | `secret_publication_authorization_id` | `SecretPublicationAuthorizationId` | One durable origin-specific final result/state publication authorization; never action, receipt, or trace identity. |
+| `secret_publication_prepare_receipt_id` | `SecretPublicationPrepareReceiptId` | One Authority-owned immutable receipt for a prepared but not yet externally released publication. |
 | `secret_reconciliation_claim_id` | `SecretReconciliationClaimId` | One nominal provider/node reconciliation-claim identity; it is not permission to repeat an effect. |
 | `secret_consumed_effect_tombstone_id` | `SecretConsumedEffectTombstoneId` | One immutable permanent consumed-identity/effect marker. |
 | `secret_permanent_auxiliary_identity_marker_id` | `SecretPermanentAuxiliaryIdentityMarkerId` | One immutable permanent non-reuse marker for one containment auxiliary identity. |
@@ -420,6 +426,17 @@ owners must supply distinct nominal `WorkloadAttemptId`, `PlacementDecisionId`,
 `IncidentId` before
 the corresponding production integration can land. C03 must not emulate any of
 those with `RunId`, `WorkloadId`, a string, or metadata.
+
+The State Service and Agent Instance Controller must additionally supply distinct
+nominal `StatePublicationCommandId`, `StatePublicationCompletionReceiptId`,
+`StatePublicationArmCommandId`, `StatePublicationArmAcknowledgementId`,
+`AgentLifecyclePublicationCommandId`,
+`AgentLifecyclePublicationCompletionReceiptId`,
+`AgentLifecyclePublicationArmCommandId`,
+`AgentLifecyclePublicationArmAcknowledgementId`, and
+`CompletedChallengeTickReceiptId` types before the corresponding publication arm
+can be implemented. They are owner-local command/receipt identities, never C03
+aliases or permission tokens.
 
 `SecretProviderVersionRef` and `SecretProviderCorrelationId` are validated
 opaque newtypes, not IDs or locators. `SecretLeakToken` has the fixed keyed
@@ -650,16 +667,23 @@ deduplication cannot satisfy it:
 | --- | --- |
 | `max_c03_action_canonical_bytes` | 32 KiB for the complete unchanged stable `Action`. |
 | `max_c03_action_outcome_canonical_bytes` | 64 KiB for the complete unchanged stable `ActionOutcome`. A larger successful value must be a governed artifact/data reference inside that bound, never inline bytes. |
-| `max_c03_action_failed_kind_canonical_bytes` / complete stable envelope | 104 KiB for complete unchanged `ActionFailed {action,error,result}` kind bytes and 112 KiB for its complete unchanged stable `TraceEvent` envelope. |
+| Any legal stable action-terminal kind / complete stable envelope | 104 KiB / 112 KiB independently for each of `ActionExecuted`, `ActionDenied`, `ActionFailed`, `ActionNeedsApproval`, and `ActionNeedsIntervention`. Each maximum fixture uses that variant's unchanged exact stable fields; a slot for one variant never authorizes another. |
 | `max_c03_outcome_recorded_kind_canonical_bytes` / complete stable envelope | 72 KiB for complete unchanged `OutcomeRecorded {outcome,feedback=null,reward=null}` kind bytes and 80 KiB for its complete unchanged stable `TraceEvent` envelope. |
+| Approval lifecycle kind / complete stable envelope | 32 KiB / 40 KiB independently for `ApprovalRequested`, `ApprovalGranted`, `ApprovalDenied`, `ApprovalExpired`, and `ApprovalRevoked`. |
+| Existing run-cancellation source envelope | 16 KiB for the exact already-owned cancellation event bound by a cancelled continuation; C03 does not fabricate it. |
 | Additive C03 event kind / complete stable envelope | 4 KiB / 8 KiB independently for each of the eight exact variants. |
 | `StateCommitted` or `LoopTickCompleted` kind / complete stable envelope | 4 KiB / 8 KiB independently for each tick-only stable suffix event. |
-| Complete stable terminal event set | 256 KiB direct for eight 8-KiB C03 envelopes plus the 112-KiB `ActionFailed` and 80-KiB `OutcomeRecorded`; 272 KiB tick after the two 8-KiB state/tick envelopes. |
-| All retained Event/Evidence terminal append command bytes | 288 KiB direct / 304 KiB tick, including one exact embedded canonical copy of every applicable event and all command/range metadata. No individual command or complete command set may exceed the origin bound. |
-| Timing-safe projection envelope / private correspondence sidecar | 12 KiB / 4 KiB per stable source; 160 KiB direct for ten sources and 192 KiB tick for twelve. |
-| Complete delivery receipt / complete full response / restricted response | 1,920 KiB / 2,044 KiB / 4 KiB. The full-response bound includes the complete receipt, complete outcome, and response envelope simultaneously; full plus restricted authorized alternatives fit one 2,048-KiB materialization. |
-| Result-authorization audit / publication authorization | 128 KiB / 8 KiB. |
-| Tick prepared state-node/head transaction | 2,048 KiB including patch bytes, metadata, pending/final head objects, run/tick update, and recovery bindings; it excludes publication authorization, which has its own common allocation. |
+| Complete stable terminal event set | Generated from the closed grammar below. Maxima are 192/208 KiB for ordinary direct/tick, 232/248 KiB for approval challenge direct/tick, 256/272 KiB for ordinary material direct/tick, 232 KiB for a non-material approval continuation, and 296 KiB for a material approval continuation. |
+| Authority or Event/Evidence terminal append-command set | `T + 32 KiB` for each retained owner copy, where `T` is the generated complete event-set bound. Authority outbox and Event/Evidence inbox are distinct copies. |
+| Terminal append acknowledgement | 8 KiB per actual append command. The grammar emits two commands for a direct terminal episode, four for an ordinary tick episode, two for a continuation final episode, and one for cancellation. |
+| Timing-safe projection envelope / private correspondence sidecar | 12 KiB / 4 KiB per actual projection source. Trace, state-head, run-inspect, and audit source cardinalities are generated separately below. |
+| Projection view checkpoint / checkpoint acknowledgement | 8 KiB / 4 KiB for each non-empty view-kind chain. One 16-KiB export manifest/root and one 4-KiB export acknowledgement are also retained per publication episode. |
+| Complete delivery receipt / complete full response / restricted response | 1,920 KiB / 2,044 KiB / 4 KiB. The full-response bound includes the complete receipt, complete outcome, and response envelope simultaneously. A pre-effect empty-use receipt has an independent 128-KiB maximum. |
+| Exact dynamic authorized response member set | 4,096 KiB: `full,false` 2,044 + `full,true` 2,044 + `restricted,false` 4 + `restricted,true` 4. These are four separately persisted canonical BLOBs, not one mutable body. |
+| Exact material-exposed response member set | 4 KiB: only `restricted,false`; every true/full member is inapplicable and forbidden. |
+| Result-authorization audit / publication authorization / Authority prepare receipt | 128 KiB / 16 KiB / 8 KiB. The tagged authorization includes only arm-applicable membership and owner-receipt digests. |
+| Owner-local publication command, completion receipt, arm command, or arm acknowledgement | 8 KiB independently for every State Service or Agent Instance Controller object. No command embeds another owner's object bytes; it binds their digest. |
+| Tick prepared state-node/head objects | 2,048 KiB including patch bytes, metadata, pending/final head objects, and State Service recovery bindings. Agent Instance Controller run/tick objects and all cross-owner commands/receipts are separately budgeted; this is not a combined transaction. |
 
 Canonical Rust maximum fixtures use bounded legal filler/reference values to hit
 each named length exactly and cap-plus-one fixtures to prove rejection. Rust,
@@ -667,6 +691,83 @@ OpenAPI, Python, and TypeScript must emit byte-identical RFC 8785 objects and th
 same measured lengths. The generated size manifest, not a hand estimate, is the
 oracle; CI rejects any schema whose maximum fixture differs from this table or
 whose legal fixture can exceed it.
+
+The source of every terminal, publication, and resource variant is one closed
+generated grammar. Its axes are exactly:
+
+```text
+origin = direct | tick
+exposure = pre_effect | trusted_injection | material_exposed
+terminal_action = ActionExecuted | ActionDenied | ActionFailed |
+  ActionNeedsApproval | ActionNeedsIntervention | none
+approval_disposition = not_applicable | challenge | continued_granted |
+  continued_denied | continued_expired | continued_revoked | continued_cancelled
+projection_source = trace | state_head | run_inspect | audit
+```
+
+The legality table is total; a tuple absent from it is invalid:
+
+| Approval disposition | Exposure | Legal terminal action | Stable source suffix |
+| --- | --- | --- | --- |
+| `not_applicable` | `pre_effect` | `ActionDenied` or `ActionNeedsIntervention` | terminal action, `OutcomeRecorded`, then the ordinary tick suffix only for tick origin |
+| `not_applicable` | `trusted_injection` | `ActionExecuted`, `ActionFailed`, or pre-adapter `ActionNeedsIntervention` | terminal action, `OutcomeRecorded`, then the ordinary tick suffix only for tick origin |
+| `not_applicable` | `material_exposed` | fixed `ActionFailed` only | eight additive suppression events, `ActionFailed`, `OutcomeRecorded`, then the ordinary tick suffix only for tick origin |
+| `challenge` | `pre_effect` | `ActionNeedsApproval` only | `ActionNeedsApproval`, `ApprovalRequested`, `OutcomeRecorded`, then the completed challenge-tick suffix only for tick origin |
+| `continued_granted` | `pre_effect` | `ActionDenied` or `ActionNeedsIntervention` | `ApprovalGranted`, terminal action, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_granted` | `trusted_injection` | `ActionExecuted`, `ActionFailed`, or pre-adapter `ActionNeedsIntervention` | `ApprovalGranted`, terminal action, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_granted` | `material_exposed` | fixed `ActionFailed` only | `ApprovalGranted`, eight additive suppression events, `ActionFailed`, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_denied` | `pre_effect` | `ActionDenied` only | `ApprovalDenied`, `ActionDenied`, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_expired` | `pre_effect` | `ActionDenied` only | `ApprovalExpired`, `ActionDenied`, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_revoked` | `pre_effect` | `ActionDenied` only | `ApprovalRevoked`, `ActionDenied`, `OutcomeRecorded`; no continuation-created state/tick suffix |
+| `continued_cancelled` | `pre_effect` | `none` | the exact existing run-cancellation event only; no action terminal, outcome, state, or tick event is fabricated |
+
+`ActionNeedsApproval` is legal only in the challenge row. `ActionDenied` and
+`ActionNeedsIntervention` require zero adapter entries. `ActionExecuted` and
+`ActionFailed` obey the adapter-entry rules elsewhere. `material_exposed` is
+always the fixed suppression failure. An approval continuation retains its
+original direct/tick origin in every digest and record even though its final
+episode uses the explicit `no_new_tick_suffix` disposition.
+
+For each legal tuple the generator derives actual stable-event count `E`, complete
+stable-event bytes `T`, append-command/acknowledgement count `C`, trace-source
+count, state-head-source count, and response-set applicability. Run-inspect and
+audit each have cardinality one. The complete derived inventory is:
+
+| Terminal episode | `E` | `T` KiB | `C` | trace/state-head/run/audit sources | Non-empty view kinds | Response members |
+| --- | ---: | ---: | ---: | --- | ---: | --- |
+| Ordinary pre-effect or trusted direct | 2 | 192 | 2 | 2/0/1/1 | 3 | four dynamic members |
+| Ordinary pre-effect or trusted tick | 4 | 208 | 4 | 4/1/1/1 | 4 | four dynamic members |
+| Ordinary material direct | 10 | 256 | 2 | 10/0/1/1 | 3 | `restricted,false` only |
+| Ordinary material tick | 12 | 272 | 4 | 12/1/1/1 | 4 | `restricted,false` only |
+| Approval challenge direct | 3 | 232 | 2 | 3/0/1/1 | 3 | four dynamic members |
+| Approval challenge tick | 5 | 248 | 4 | 5/1/1/1 | 4 | four dynamic members |
+| Non-material continuation final episode | 3 | 232 | 2 | 3/0/1/1 | 3 | four dynamic members |
+| Material continuation final episode | 11 | 296 | 2 | 11/0/1/1 | 3 | `restricted,false` only |
+| Cancelled continuation final episode | 1 | 16 | 1 | 1/0/1/1 | 3 | four dynamic members |
+
+For every actual stable event, Event/Evidence allocates one distinct 4-KiB
+metadata record and one exact payload BLOB contribution. Common terminal action
+and `OutcomeRecorded` records are never charged to additive-C03 slots. For every
+projection source it allocates one envelope record and one sidecar record. For
+every non-empty view kind it allocates one chain-head hot slot, one checkpoint
+record, and one checkpoint-acknowledgement record. One export-manifest record and
+one export-acknowledgement record complete the projection episode. The projection
+record and bundle equations are therefore exactly:
+
+```text
+projection_records = 2 * projection_sources + 2 * nonempty_view_kinds + 2
+projection_bundle_kib = 16 * projection_sources
+  + 12 * nonempty_view_kinds + 20
+```
+
+The generator emits a schema-path/source/copy/owner/slot ledger. Each row contains
+the exact schema path, grammar tuple, source ID kind, canonical-byte maximum,
+physical owner, retained-copy ordinal, record slot, bundle slot, hot slot when
+applicable, marker class or explicit `not_applicable`, and release rule. Generation
+fails on an unassigned legal schema path, unreachable variant, missing owner copy,
+missing stable-event metadata record, missing response member, missing command/
+receipt/acknowledgement, duplicate slot reuse, multiply charged copy, unbudgeted
+chain/checkpoint/export object, or a slot reachable from two union arms.
 
 The 2-MiB direct request and 1-MiB tick-candidate limits remain outer envelope
 limits; neither weakens the 32-KiB nested action limit. Direct parsing enforces
@@ -685,26 +786,48 @@ before effect.
 
 Every persisted canonical copy is explicit:
 
-| Persistent owner/copy | Maximum bundle bytes direct/tick | Copy rule |
+| Persistent owner/copy | Generated maximum | Copy rule |
 | --- | ---: | --- |
-| Authority pending outcome, receipt, result-authorization audit, terminal intent, and delivery-control attestation | 64 + 1,920 + 128 + 64 + 64 KiB | Five distinct immutable objects; no field or BLOB sharing is assumed. |
-| Authority pending terminal event set | 256/272 KiB | One exact private event-set copy retained for recovery. |
-| Event/Evidence append command set | 288/304 KiB | A second copy containing exact canonical event bytes plus command metadata. |
-| Event/Evidence stable payload BLOBs | 256/272 KiB | A third copy in append-only storage; each event's separate 4-KiB record metadata credit is counted below. |
-| Event/Evidence timing-safe envelopes and protected correspondence sidecars | 160/192 KiB | One 12-KiB envelope and one 4-KiB sidecar per direct/tick source. |
-| Publication authorization and exact authorized response materialization | 8 + 2,048 KiB | One immutable authorization/membership table plus separately persisted exact canonical full/restricted member BLOBs; duplicates release the selected byte-identical member after current authorization. |
-| Tick state node, state data/metadata, pending/final head, and run/tick update | 0/2,048 KiB | Distinct tick-only state objects; no trace-payload sharing. |
+| Authority pending outcome, receipt, result-authorization audit, terminal intent, and applicable delivery-control attestation | 64 + 1,920 + 128 + 64 + 64 KiB post-reservation; the pre-effect receipt is independently 128 KiB and attestation is absent | Distinct immutable objects; cross-arm absent objects consume no copy slot. |
+| Authority pending terminal event set | `T` KiB | First exact event-byte copy retained for recovery. |
+| Authority append-command outbox | `T + 32` KiB | Second copy, with exact command/range metadata. |
+| Event/Evidence append-command inbox | `T + 32` KiB | Third owner-local copy; acknowledgement loss never causes Authority to mutate Event/Evidence rows. |
+| Event/Evidence stable payload BLOBs | `T` KiB | Fourth event-byte copy in append-only storage, plus one metadata record per actual event. |
+| Event/Evidence append acknowledgements | `8 * C` KiB | One immutable acknowledgement per actual append command. Authority retains only authenticated IDs/digests in its own records. |
+| Event/Evidence projection envelopes, sidecars, chains, checkpoints, acknowledgements, and export root | `16P + 12V + 20` KiB | `P` and `V` come only from the grammar. No trace source stands in for state-head, run-inspect, or audit. |
+| Authority publication authorization, prepare receipt, and exact response members | 4,120 KiB dynamic; 28 KiB material | The 16-KiB tagged authorization and 8-KiB prepare receipt are distinct. Dynamic stages all four exact members; material stages only fixed `restricted,false`; Authority prepare promotes those same BLOB slots without another copy. |
+| State Service and Agent Instance Controller owner-local command/receipt copies | 32 KiB direct/continuation maximum; 64 KiB ordinary tick maximum | Four 8-KiB Agent objects, plus four distinct State objects for a new tick suffix. No owner embeds or writes another owner's row. |
+| Tick State Service state node/data/metadata/pending/final head objects | 2,048 KiB only when the grammar emits a new tick suffix | An approval continuation references its already-completed challenge-tick receipt and allocates none of these objects. |
+| Completed challenge-tick receipt | Two 8-KiB retained copies for a tick challenge | Agent Instance Controller owns the authenticated receipt; Authority retains one validated consumed copy. The continuation references those immutable bytes and does not regenerate them. |
 
-The signed checkpoint/export manifest and its references fit the separate 64-KiB
-management/projection bundle below. Export and inspect-only replay read the
-immutable stored timing-safe envelopes by ID/digest and do not persist another
-copy inside this containment unit. A caller that requests a separately persisted
-export/replay artifact must first reserve that artifact owner's independent
-canonical-byte budget; C03 does not infer sharing or charge it to this unit. State
-objects and append-only trace payloads remain separate even when their source JSON
-subvalues are equal. The generated FND-012 report assigns every maximum BLOB or
-reference to exactly one row above or one named record/bundle below and fails on
-an unassigned or multiply assigned persisted copy.
+The normative folded schema-path/source/copy/owner/slot ledger is:
+
+| Schema-path family | Generated source/cardinality | Physical copies and owner | Exact slot charge |
+| --- | --- | --- | --- |
+| `terminal_profile.stable_events[*]`, including terminal action, approval, cancellation, all additive C03, `OutcomeRecorded`, and tick suffix paths | The exact `E` event IDs and `T` bytes for the legal grammar row | Authority pending set and outbox; Event/Evidence inbox and append-only payload | `E` metadata records plus the `4*T` bundle term; no common event borrows an additive-event slot. |
+| `terminal_append_commands[*]` and `terminal_append_acknowledgements[*]` | Exact `C` command IDs and `C` acknowledgement IDs | Authority outbox; Event/Evidence inbox and acknowledgement | `3*C` records, two 32-KiB command-wrapper terms, and `8*C` acknowledgement KiB. |
+| `projection_sources[trace|state_head|run_inspect|audit][*]` | Exact `P` sources, separately cardinalized by view kind | Event/Evidence envelope and protected correspondence sidecar | `2*P` records and `16*P` KiB. Material uses `TimingSafeProjectionEnvelopeV1`; non-material uses its exact authorized source/view envelope and integrity sidecar, never an alias to raw bytes. |
+| `projection_chains[view_kind]` and checkpoints | Exact `V` non-empty chains | Event/Evidence chain head, checkpoint, and acknowledgement | `V` hot heads, `2*V` records, and `12*V` KiB. |
+| `projection_export_manifest` and acknowledgement | One publication episode | Event/Evidence manifest/root and acknowledgement | Two records and 20 KiB. |
+| `authority_terminal_objects[*]` | Exact pre-effect/challenge/post-reservation/cancelled arm | Authority owns each immutable object | `A` records and exact `A_kib`; forbidden cross-arm objects allocate nothing. |
+| `publication_authorization` and `publication_prepare_receipt` | One of each per episode | Authority owns both | Two records, 24 KiB, one authorization hot pointer, and two typed markers as folded by the profile. |
+| `authorized_response_members` | Four dynamic members or one material member | Authority stores every member BLOB exactly once | `D=3` dynamic extent records or zero material extent records, plus 4,096 or 4 KiB. |
+| `state_publication.*` / `agent_publication.*` | Four Agent objects for every v1 episode plus four State objects only for a new tick suffix | Each named owner stores only its command/receipt/arm/ack object | Four owner index records, 32/64 KiB, and the exact profile hot/marker slots; no cross-owner embedded copy. |
+| `tick_state_objects.*` | One ordinary/challenge tick suffix | State Service node/data/metadata/pending/final-head objects | 2,048 KiB and the tick-only profile hot/marker terms; no Event/Evidence record alias. |
+| `completed_challenge_tick_receipt` | One receipt with two retained copies | Agent Instance Controller owner copy and Authority consumed copy | `H=2` records, 16 KiB, and one typed marker. |
+| `trusted_output_seal_records[*]` | Sixteen ordered pre-publication coverage records, sixteen matching postcondition/final-seal records, and one overflow/fence | Gateway/Event/Evidence enforcement ledger under the trusted arm | `S=33` records; absent from pre-effect/material arms. |
+| `operational_profile.*` | Exact provider/node/reserve/cleanup/containment/send/barrier/incident/lease rows | Owners named in the operational ledger below | The folded operational vector below; action-level paths above are assigned only to the terminal-host unit. |
+
+Each unfolded generated row replaces the symbols with one legal union arm and one
+ordinal. It cannot collapse two table rows because their bytes happen to match.
+
+Export and inspect-only replay read the immutable stored envelope and manifest
+IDs/digests and do not persist another implicit copy inside this unit. A caller
+that requests a separately persisted export/replay artifact must reserve that
+artifact owner's independent canonical-byte budget. State objects and append-only
+trace payloads remain separate even when source JSON subvalues are equal. No
+database page, content deduplication, compression ratio, or reference alias
+reduces these logical maxima.
 
 The canonical Rust source for the proposed public body is the future
 `splendor_types::secrets::SubmitSecretActionRequest`, not a private daemon
@@ -1626,9 +1749,10 @@ the acknowledgement and expected revisions, then CASes its owner row's
 its own intent and receipt pointers, moving the submission only to
 `terminalizing`. The acknowledgement is co-stored
 and indexed with the existing Event/Evidence append slot and consumes no separate
-record credit. Authority's pending event-set copy, the canonical append-command
-copy, and Event/Evidence's append-only payload copy are three separately charged
-BLOBs under the 256/272, 288/304, and 256/272-KiB direct/tick bounds above. The
+record credit. Authority's pending event-set and append-command-outbox copies plus
+Event/Evidence's append-command-inbox and append-only payload copies are four
+separately charged BLOBs under the grammar-derived `T`, `T+32`, `T+32`, and `T`
+bounds. The
 append-command closed schema contains the command ID, destination owner/run/cursor,
 expected previous event hash, ordered event kinds/IDs, exact canonical payload
 bytes, payload digest, source commitment, and expected bundle cardinality. A
@@ -1672,99 +1796,295 @@ is disabled for this fixed patch, so the stable event carries `snapshot_id=null`
 Direct origin
 commits no state.
 
-State-node preparation and `StateCommitted` append use one fenced owner
-transaction over the then-current next sequence. The event ID in state metadata
-is therefore allocated for that append, not reserved earlier; append failure
-consumes no sequence and exposes neither the prepared node nor a head transition.
+State-node preparation and `StateCommitted` append use a fenced State Service
+owner transaction over the then-current next sequence. The event ID in state
+metadata is therefore allocated for that append, not reserved earlier; append
+failure consumes no sequence and exposes neither the prepared node nor a head
+transition. Agent Instance Controller never writes that transaction or its rows.
 
-The state owner durably prepares the node and a fenced pending head transition
-before `StateCommitted`; it does not expose the new head or advance the next tick
-until `StateCommitted` and `LoopTickCompleted` append, the final head CAS/run
-update completes, and publication authorization commits. A crash after node preparation resumes the same node and
-actual refs. A crash after either stable suffix event resumes from the exact last
-durable append. A stored append with lost acknowledgement is re-read by exact
-sequence, deterministic ID, payload bytes, prior hash, and event hash; equality
-advances progress, while any mismatch quarantines the run and releases no false
-transition. A failed append does not consume its sequence. Lease expiry leaves a
-durable terminalization fence; a successor one-second owner epoch may append only
-the uncommitted suffix from the retained terminal intent. No unrelated run event
-may cross an incomplete suffix, no state/tick advance occurs, and no provider,
-node, adapter, or target effect is replayed.
+#### Owner-local tick publication handoff
 
-The final head CAS and run-row update use their actual commit/update times. A
-recovered prepared node retains its original truthful `created_at`; it is never
+State Service alone mutates state nodes, state-head revisions, and state read
+fences. Agent Instance Controller alone mutates run/tick lifecycle and next-tick
+admission. Authority alone mutates the secret submission, response members, and
+`SecretPublicationAuthorizationV1`. Event/Evidence alone appends stable events and
+projection checkpoints. The following owner-local protocol is mandatory. State
+and Agent ownership never combine; there is no foreign-row write, shared database
+transaction, two-phase-commit claim, or inferred success from readable rows.
+
+Before sending a completion command, Authority materializes every arm-applicable
+canonical response member once into its reserved eventual-publication BLOB slots
+and persists the ordered aggregate/member digests. The staged set is private,
+immutable, and non-releasable; it is the same 4,096-KiB dynamic or 4-KiB material
+copy later referenced by authorization, not an extra copy. Recovery reads those
+exact bytes. It may never reconstruct them from outcome/receipt fields after an
+owner command has bound their digest.
+
+For an ordinary tick suffix, Authority first retains and sends the immutable State
+command below. Only after validating the returned State receipt does it construct,
+retain, and send the immutable Agent command. Direct and continuation episodes
+start with the Agent command and its explicit State `not_applicable` binding:
+
+- `splendor.state.secret_tick_publication_complete_command.v1`, identified by
+  `StatePublicationCommandId`, contains exactly its schema, submission/origin/
+  run/tick/action IDs, expected State Service partition/head/node revisions,
+  prepared state-node ID/hash/data/metadata digests, exact `StateCommitted` and
+  `LoopTickCompleted` IDs/event hashes/payload digests, terminal append
+  acknowledgement IDs/digests, state-head target, projection state-head
+  checkpoint ID/digest, response-set aggregate digest, Authority expected
+  submission revision, command owner/audience/expiry, and command digest;
+- `splendor.agent.secret_publication_complete_command.v1`, identified by
+  `AgentLifecyclePublicationCommandId`, contains exactly its schema, the same
+  submission/origin/run/action and terminal-event bindings, exact tick binding or
+  literal `not_applicable`, expected Agent Instance Controller run revision and
+  origin-applicable tick revision/status binding, completed State-
+  receipt binding as exact ID/digest for tick or literal `not_applicable` for
+  direct/continuation, run-inspect checkpoint ID/digest, response-set aggregate
+  digest, Authority expected submission revision, command owner/audience/expiry,
+  and command digest.
+
+State Service validates its current exact revisions and stable suffix, commits
+only its pending/final head plus local fence state `publication_pending`, and
+returns immutable authenticated
+`splendor.state.secret_tick_publication_completion_receipt.v1`. The receipt is
+identified by `StatePublicationCompletionReceiptId` and contains every command
+binding/digest, revisions before/after, final head ID/revision/CAS receipt, state
+node/hash/data/metadata digests, suffix/checkpoint bindings, local fence revision,
+truthful `completed_at`, owner identity/audience/expiry, and receipt digest plus
+authentication evidence. The physically final head remains externally unreadable.
+
+Agent Instance Controller then validates that exact State receipt without writing
+State Service rows. It commits only run/tick status `publication_pending`, keeps
+run-complete and next-tick read/admission fences closed, and returns immutable
+authenticated
+`splendor.agent.secret_publication_completion_receipt.v1`, identified by
+`AgentLifecyclePublicationCompletionReceiptId`. It contains its command digest,
+the complete State receipt ID/digest binding for tick or exact `not_applicable`
+binding for direct/continuation, run revisions before/after, pending run status,
+tick lifecycle binding containing revisions/status and `LoopTickCompleted` ID/
+hash/digest for tick or exact `not_applicable` for direct/continuation, run-inspect
+checkpoint,
+local fence revision, truthful `completed_at`, owner identity/audience/expiry,
+and receipt digest plus authentication evidence.
+
+Authority validates every arm-applicable complete receipt, every expected
+revision, all terminal and projection facts, and the exact response-set digest.
+In one Authority-only CAS it persists the tagged authorization in state
+`prepared`, binds and promotes the unchanged staged response members, and persists
+immutable
+`splendor.secret.publication_prepare_receipt.v1`; the submission remains
+`terminalizing`. That prepare receipt contains its nominal ID, authorization ID/
+digest, submission revision before/after, complete Agent completion-receipt ID/
+digest, complete State completion-receipt ID/digest for tick or exact State
+`not_applicable` for direct/continuation, response-set digest,
+truthful `prepared_at`, Authority owner/audience/expiry, and receipt digest plus
+authentication evidence. It is evidence of prepared publication, not permission
+for any owner to mutate another owner's state or expose a result.
+
+Ordinary and challenge tick origins require both State and Agent branches. Every
+action/cancellation episode in the v1 grammar changes its parent lifecycle, so
+direct origin and a continuation final episode require the Agent branch while
+their State binding is literal `not_applicable`; they
+cannot serialize a State command, receipt, arm, acknowledgement, node, head, or
+revision. A continuation from a completed challenge tick additionally references
+the immutable completed-challenge receipt below but never reuses its old State or
+Agent commands. Cancellation uses the same Agent-only rule. No legal v1 grammar
+arm omits its Agent command/receipt/arm/acknowledgement.
+
+Authority next sends the arm-applicable owner-local commands. For a tick, the
+State command uses schema
+`splendor.state.secret_tick_publication_arm_command.v1` and is identified
+by `StatePublicationArmCommandId`, binds the State completion receipt, Authority
+prepare receipt, authorization/response digests, expected State fence revision,
+and exact audience/expiry. The Agent command uses schema
+`splendor.agent.secret_publication_arm_command.v1` and is identified by
+`AgentLifecyclePublicationArmCommandId`, binds the Agent completion receipt plus
+the same Authority facts and expected Agent fence revision. Each owner validates
+the Authority-authenticated prepare receipt and CASes only its local fence from
+`publication_pending` to `publication_armed`; each returns an immutable
+authenticated acknowledgement. State uses
+`splendor.state.secret_tick_publication_arm_acknowledgement.v1` and
+`StatePublicationArmAcknowledgementId`; Agent uses
+`splendor.agent.secret_publication_arm_acknowledgement.v1` and
+`AgentLifecyclePublicationArmAcknowledgementId`. Each contains its
+command/receipt/authorization digests, revision before/after, truthful
+`acknowledged_at`, and owner/audience/expiry. `publication_armed` still exposes
+nothing by itself: State/head/run/next-tick readers require every applicable local
+arm acknowledgement and the Authority authorization state `released`.
+
+After validating every arm-applicable acknowledgement, Authority performs its
+final expected-revision CAS from authorization `prepared` to `released` and submission
+`terminalizing` to the arm-applicable released state. Authority writes no State,
+run, or tick row. This final Authority fact is the shared read-fence token checked
+by response, State Service, Agent Instance Controller, trace/state/run inspection,
+export, telemetry, and replay readers. Therefore no result, final state head, run
+completion, or next tick is externally visible from any strict prefix of the
+handoff, while no cross-service atomic transaction is assumed.
+
+Every command, receipt, acknowledgement, and prepare receipt digest is the common
+C03 schema-prefix/JCS/BLAKE3 digest over its complete closed record except the
+external digest and authentication outputs. Owner authentication is the accepted
+owner attestation/signature binding to exact owner, audience, expiry, and key
+status. Unknown, omitted, null, cross-owner, stale, expired, substituted, or
+changed fields reject. Exact duplicate command bytes return the same owner record;
+same nominal ID with changed bytes conflicts and leaves all rows/fences unchanged.
+Lost acknowledgements are recovered by authenticated lookup using the same command
+ID and digest. Receipt bytes are never regenerated from current mutable rows.
+
+Crash order is closed: before an owner command, only the prior owner facts exist;
+after applicable State completion, its head stays pending; after Agent completion,
+all applicable local fences stay pending; after Authority prepare, every public
+read still sees `terminalizing`; after either arm, the shared Authority-release
+condition is still
+false; after all applicable arms but before Authority release, all public views
+remain closed; after Authority release, every owner already has its exact armed
+record.
+Restart reloads the same IDs/bytes and resumes only the next owner-local CAS. A
+digest/revision conflict, missing owner record, corrupt receipt, exhausted
+terminalization epoch, clock/store uncertainty, or owner unavailability moves to
+permanent withholding under the existing overflow rule and never replays an
+effect, appends a substitute suffix, opens a fence, or fabricates owner success.
+
+A tick-origin approval challenge uses this protocol for its completed challenge
+tick. Its State arm is ordered before its Agent arm. In the Agent arm owner
+transaction, Agent Instance Controller atomically persists its arm
+acknowledgement and immutable
+`splendor.agent.completed_challenge_tick_receipt.v1`, identified by
+`CompletedChallengeTickReceiptId`, over the original tick origin, challenge
+prepared-publication authorization digest, exact State and Agent completion/arm
+receipts/acknowledgements, final head/run/tick revisions, `ActionNeedsApproval`,
+`ApprovalRequested`,
+`OutcomeRecorded`, `StateCommitted`, and `LoopTickCompleted` facts, and projection
+checkpoints. Authority must validate and retain its second exact copy before it
+may release the challenge authorization. A later continuation
+must bind those exact receipt bytes and uses
+`final_continuation_suffix={"kind":"no_new_tick_suffix"}`. It issues no State
+command, reopens no tick, creates no state node/head, and emits no new
+`StateCommitted` or `LoopTickCompleted`; changing the original origin to direct is
+an integrity conflict.
+
+The State Service final-head CAS and Agent Instance Controller run-row update use
+their respective actual owner commit/update times.
+A recovered prepared node retains its original truthful `created_at`; it is never
 rewritten to the schedule or recovery time. A failed pending transition is not a
 visible state head and cannot advance run `updated_at` as if completion occurred.
 
-#### Origin-specific publication authorization
+#### Generated terminal-profile publication authorization
 
 Outer receipt/action finalization is not publication. It leaves the submission
 in `terminalizing` and every outcome, receipt, state head, run-complete view, and
-fixed suppression response private. Exactly one durable closed
+fixed suppression response private. Exactly one Authority-owned durable closed
 `SecretPublicationAuthorizationV1`, schema
-`splendor.secret.publication_authorization.v1`, is the final release barrier. Its
-owner is Authority for direct origin and the exact application run/state owner
-for tick origin; daemon, SDK, Event/Evidence, exporter, replay, and duplicate-
-lookup code cannot create or mutate it. It contains exactly:
+`splendor.secret.publication_authorization.v1`, is the final release barrier for
+one generated publication episode. State Service, Agent Instance Controller,
+daemon, SDK, Event/Evidence, exporter, replay, and duplicate lookup cannot create
+or mutate it.
 
-- `schema_version`, one non-nil `SecretPublicationAuthorizationId`, one closed
-  direct/tick origin binding, submission/action/run IDs and tick ID only for tick;
-- exact ordered eight C03 event IDs/digests, `ActionFailed` and
-  `OutcomeRecorded` IDs/event hashes/payload digests, terminal append
-  acknowledgement IDs/digests, terminal intent and delivery-receipt IDs/digests,
-  sealed outcome digest, authorized-response-set aggregate digest, required
-  restricted-member canonical-byte digest, and full-member canonical-byte digest
-  exactly for a non-material origin that can publish the full view;
-- for direct origin, the required run-update ID/revision or an explicit
-  `not_applicable` binding when the accepted application contract requires no run
-  mutation;
-- for tick origin, prepared state-node ID/state hash/data digest, state metadata
-  digest, `StateCommitted` and `LoopTickCompleted` IDs/event hashes/payload
-  digests, final state-head ID/revision/CAS receipt, and run/tick status-update
-  ID/revision;
-- the applicable timing-safe projection terminal checkpoint ID/digest, projection
-  chain terminal digest, projection policy ID/revision, signing-key ID/status
-  statement, current result-visibility policy ID/revision, owner revision before/
-  after, truthful `authorized_at`, and `publication_authorization_digest`.
+The authorization has a common closed header followed by exactly one tagged
+`terminal_profile`. The header contains exactly `schema_version`, non-nil
+authorization and submission IDs, state `prepared|released`, the complete
+generated grammar discriminants, immutable direct/tick origin binding, action and
+run IDs plus tick ID only when original origin is tick, terminal-intent binding,
+ordered terminal append acknowledgement IDs/digests, complete projection-source
+inventory digest, ordered applicable view-kind checkpoint/chain digests,
+projection policy/key-status/export-manifest bindings, one tagged
+`authorized_response_members`, current result-visibility policy ID/revision,
+Authority revision before/after, truthful prepared/released times, prepare-receipt
+ID/digest, and `publication_authorization_digest`. Conditional times use explicit
+closed absent/present tags; no field is null.
+
+`terminal_profile` is the following total tagged union. Each arm contains only the
+fields listed for that arm; every cross-arm field is forbidden:
+
+| Arm | Exact arm-only bindings |
+| --- | --- |
+| `pre_effect_terminal` | Legal `ActionDenied|ActionNeedsIntervention` event ID/hash/payload digest, `OutcomeRecorded`, empty-use delivery receipt, sealed outcome, applicable C03 pre-effect event refs, and origin suffix binding. |
+| `trusted_injection_terminal` | Legal `ActionExecuted|ActionFailed|ActionNeedsIntervention` terminal event, `OutcomeRecorded`, complete delivery receipt, sealed outcome/output binding, terminal control attestation, ordered actually applicable C03 event refs, and origin suffix binding. `ActionNeedsIntervention` requires zero adapter entries. |
+| `material_exposed_terminal` | Exact eight ordered suppression-event IDs/hashes/payload digests, fixed `ActionFailed`, `OutcomeRecorded`, fixed material receipt/outcome/attestation/projection digests, and origin suffix binding. No trusted output, full-response, target-selected, or dynamic-duplicate field is legal. |
+| `approval_challenge` | Continuation ID/semantic digest/state revision, exact `ActionNeedsApproval`, `ApprovalRequested`, `OutcomeRecorded`, challenge outcome/digest and approval/obligation IDs, zero-effect facts, and challenge origin suffix binding. Delivery receipt, attestation, and effect fields are forbidden. |
+| `approval_continuation_pre_effect` | Continuation/challenge/receipt-claim bindings, exact `ApprovalGranted|ApprovalDenied|ApprovalExpired|ApprovalRevoked` event as applicable, legal final `ActionDenied|ActionNeedsIntervention`, `OutcomeRecorded`, empty-use final receipt/outcome, original-origin binding, and continuation suffix binding. |
+| `approval_continuation_trusted_injection` | Continuation/challenge/receipt-claim bindings, exact `ApprovalGranted`, legal final `ActionExecuted|ActionFailed|ActionNeedsIntervention`, `OutcomeRecorded`, complete final receipt/outcome/attestation, ordered applicable C03 refs, immutable original origin, and continuation suffix binding. |
+| `approval_continuation_material_exposed` | Continuation/challenge/receipt-claim bindings, `ApprovalGranted`, eight ordered suppression events, fixed `ActionFailed`, `OutcomeRecorded`, fixed final material receipt/outcome/attestation/projection digests, immutable original origin, and continuation suffix binding. Dynamic/full response fields are forbidden. |
+| `approval_continuation_cancelled` | Continuation/challenge binding, exact already-owned run-cancellation event ID/hash/payload digest, cancellation state revision, immutable original origin, and continuation suffix binding. Approval grant, terminal action, `OutcomeRecorded`, delivery receipt, state commit, and tick completion are forbidden. |
+
+The closed `origin_suffix_binding` is `direct`, `ordinary_tick`, or
+`completed_challenge_tick`. `direct` contains the exact Agent Instance Controller
+completion/arm command/receipt/acknowledgement bindings and an explicit State
+`not_applicable` tag. `ordinary_tick` contains exact State Service and
+Agent Instance Controller completion and arm command/receipt/acknowledgement
+IDs/digests plus state node/head/run/tick revisions and `StateCommitted`/
+`LoopTickCompleted` facts. `completed_challenge_tick` contains the original tick
+ID, exact `CompletedChallengeTickReceiptId` and both retained-copy digests, final
+challenge state/head/run/tick and projection checkpoint bindings, the continuation
+episode's exact Agent completion/arm command/receipt/acknowledgement bindings, and
+literal
+`final_continuation_suffix={"kind":"no_new_tick_suffix"}`. That arm forbids every
+new State command/receipt, state node/head revision, `StateCommitted`,
+`LoopTickCompleted`, and tick-reopen field. It cannot be serialized as `direct`.
+
+`authorized_response_members` is exactly one of:
+
+```text
+dynamic {
+  aggregate_digest,
+  members: [
+    {view="full",       duplicate=false, canonical_length, canonical_digest},
+    {view="full",       duplicate=true,  canonical_length, canonical_digest},
+    {view="restricted", duplicate=false, canonical_length, canonical_digest},
+    {view="restricted", duplicate=true,  canonical_length, canonical_digest}
+  ]
+}
+material_fixed_false {
+  aggregate_digest,
+  members: [
+    {view="restricted", duplicate=false, canonical_length, canonical_digest}
+  ]
+}
+```
+
+Member order is exactly the displayed order. Every digest covers the complete
+canonical final response body, including `view` and `duplicate`; the aggregate
+digest covers the complete ordered member table under named schema
+`splendor.secret.authorized_response_members_digest.v1`. Dynamic member lengths
+are independently bounded at 2,044/2,044/4/4 KiB and total 4,096 KiB. Material
+fixed-false has one 4-KiB member and cannot contain a true/full member. The
+authorization itself is at most 16 KiB and is the sole membership table; member
+BLOBs are separately persisted under their exact digest.
+
+For a dynamic set, creating POST and every GET select only the matching authorized
+`duplicate=false` member, while an exact duplicate POST selects only the matching
+authorized `duplicate=true` member. Current result authorization independently
+selects `full` or `restricted`; it cannot alter duplicate disposition. For a
+`material_fixed_false` set, creating POST, exact duplicate POST, and GET all select
+the sole `restricted,false` member; returning `true` would itself create a forbidden
+target-timing distinction. Response
+loss, duplicate lookup, export, replay, SDK decoding, and a current full-to-
+restricted downgrade select an already stored exact member. No daemon, SDK,
+projector, exporter, replay worker, or serializer may rewrite `duplicate`, view,
+certainty, reason, outcome, receipt, JSON spelling, or any other byte after the
+member digest, or reconstruct a body from component fields.
 
 The authorization digest is the common prefix/JCS/BLAKE3 digest over the complete
-closed record except that external digest output. Unknown, missing, duplicate,
-null, cross-origin, placeholder, stale-revision, mismatched event/state/receipt/
-response digest, incomplete projection checkpoint, or unsigned/unverifiable
-projection input rejects. The separately persisted authorized response set is at
-most 2,048 KiB and has exactly the aggregate and applicable component digests in
-this record. It is a logical closed member set, not another serialized wrapper:
-storage retains the members as exact canonical response BLOBs, while the 8-KiB
-authorization is the sole membership table. The set contains the <=2,044-KiB
-complete full response when that origin can ever publish full plus the <=4-KiB
-exact restricted response; material exposure stores only its restricted member
-and omits the full-member digest. Current authorization selects a stored member;
-no partial, broader, or reconstructed substitute is legal.
-
-The direct owner may commit authorization only after `ActionFailed` and
-`OutcomeRecorded` are both durably appended/acknowledged, terminal receipt and
-submission pointers are finalized, timing-safe projection integrity/checkpoint is
-verified, and any required run update is durable. The tick owner may commit only
-after every direct fact plus the fixed state node, `StateCommitted`,
-`LoopTickCompleted`, final head CAS, run/tick status update, and projection
-integrity/checkpoint are durable. One expected-revision transaction persists the
-authorization and exact response-set member bytes, advances
-`terminalizing -> terminal`, and opens the read fence. A tick head CAS may be
-physically durable before this
-transaction, but every state/run/next-tick reader is fenced by the absent
-authorization and cannot expose it. No origin borrows the other's shorter rule.
+closed record except the external digest and owner-authentication outputs.
+Unknown, missing, duplicate, null, cross-origin, cross-arm, placeholder, stale-
+revision, changed-member, mismatched event/state/receipt/response, incomplete
+projection checkpoint, or unsigned/unverifiable owner input rejects. Authority
+may prepare it only after every arm-applicable event, acknowledgement, terminal
+object, projection checkpoint, exact response member, and owner-local completion
+receipt is durable. It may release it only through the owner-local arm protocol
+above. No origin, exposure, approval, or terminal-action arm borrows another
+arm's shorter fact set.
 
 Creating POST, duplicate POST, GET, daemon/SDK response serialization, trace/
 state/run inspection, export, telemetry, and replay release final bytes only after
-validating the exact authorization, authorized-response-set/member digests,
-current owner revision, projection checkpoint/key status, and current caller/
-result visibility.
+validating authorization state `released`, exact response member/aggregate
+digests, all arm-applicable owner acknowledgements, projection checkpoint/key
+status, current Authority revision, and current caller/result visibility.
 Cancellation, revocation, work-order/data-use expiry, or result-read policy change
-is revalidated at each release and may withhold all bytes or reduce a currently
-permitted full view to the authorized restricted member; it never rewrites
-committed audit facts or creates a broader view. Response loss after authorization
-returns the same stored authorized member bytes with zero new event, state,
-authorization, effect, or owner transition.
+is revalidated at each release and may withhold all bytes or select the already-
+authorized matching restricted member; it never rewrites committed facts or
+creates a broader/new member. Response loss returns the same stored member bytes
+with zero new event, state, authorization, effect, or owner transition.
 
 Failure before authorization is fail-closed. Missing/exhausted suffix append,
 state-node/head CAS, run/tick update, projection verification/checkpoint, response
@@ -1942,10 +2262,10 @@ Deletion, omission, truncation, or a missing checkpoint makes verification fail.
 These integrity objects do not create an unbudgeted side ledger. Each envelope,
 private correspondence sidecar, and chain update is co-indexed under the existing
 source event/state/audit record but its canonical bytes consume the explicit
-160/192-KiB direct/tick projection-sidecar bundle, not the source record's 4-KiB
+grammar-derived `16P+12V+20`-KiB projection bundle, not the source record's 4-KiB
 metadata credit. The suppression-projection hot slot carries only the chain-head
-pointer. The signed checkpoint/export-root data uses the existing fixed 64-KiB
-management/projection bundle. Canonical maximum fixtures include those exact
+pointer. Chain/checkpoint acknowledgements and the export root are terms in that
+same generated bundle rather than a fixed shared allowance. Canonical maximum fixtures include those exact
 bytes. A source whose envelope/sidecar/checkpoint cannot fit its named bundle is
 over profile and denies before exposure; it cannot allocate an ordinary or
 emergency extra record or infer storage sharing.
@@ -2472,7 +2792,7 @@ dimensions and conservative outer certainty, ordered use summaries, outer
 cleanup/postcondition status, optional bounded error code, the complete closed
 `publication_binding` plus its permitted trusted-injection sealed-output digest,
 and complete sealed-`ActionOutcome` digest, ordered
-C03 event refs, terminal receipt/event IDs, expected Authority/run/state
+C03 event refs, terminal receipt/event IDs, expected Authority/State-Service/Agent-Controller
 revisions, one `terminal_event_append_command_id`, its exact event or event-bundle
 payload digest, `terminal_correspondence_initial_state=prepared`, and Authority
 preparation time. For
@@ -2870,13 +3190,23 @@ exactly:
   `not_run|allowed|denied|uncertain`;
 - exact stable outer `final_action_status`, conservative
   `outer_effect_certainty`, optional bounded error code, and one closed
-  `publication_binding`: `trusted_injection` carries `publishable` plus an exact
+  `publication_binding`: `pre_effect` carries `no_effect` plus the exact named
+  empty-use projection digest; `trusted_injection` carries `publishable` plus an
+  exact
   `sealed_output_digest` present only when publishable; `material_exposed`
   carries only `disposition=target_publication_suppressed` plus the fixed
   suppression-projection digest, while the separate bounded error field is the
   fixed suppression code; target-derived output, error, artifact, state, trace,
   and result digests are forbidden;
 - `ordered_c03_event_refs`, `outer_terminal_event_id`, and `completed_at`.
+
+The named `splendor.secret.empty_use_projection_digest.v1` projection contains
+exactly its schema, submission ID, `use_attempt_summaries=[]`, adapter-entered and
+target-started false, provider/node/target certainty `none`, cleanup
+`not_required`, postcondition `not_run`, and the legal pre-effect final status/
+outer certainty. Its output is external and uses the common digest rule. It
+contains no receipt digest, time, publication ID, or effect field and therefore is
+not recursive.
 
 For a material-exposed receipt, both entry/start booleans are fixed `true`, outer
 cleanup is fixed `quarantined`, postcondition is fixed `not_run`, final status is
@@ -3030,9 +3360,12 @@ trusted-partition digest, `secret_action_submission_id`,
 `state: SecretActionSubmissionState`,
 submission semantic digest, optional terminal-intent digest, and, only after
 outer-receipt commit, receipt ID, receipt digest, final status, and outer
-certainty. State `terminalizing` additionally requires an absent publication-
-authorization pointer; state `terminal` requires the exact publication-
-authorization ID/digest and authorized-response-set/member digests.
+certainty. State `terminalizing` requires a closed publication binding that is
+either `absent` before Authority prepare or `prepared` with the exact authorization
+ID/digest, prepare-receipt ID/digest, response-set/member digests, and applicable
+owner-completion/arm state. State `terminal` requires that same authorization in
+state `released`, every applicable arm acknowledgement, and unchanged authorized-
+response-set/member digests. A prepared pointer never satisfies a terminal read.
 It contains no use summary, event list, evidence, output, provider/node detail,
 or error text and is never itself terminal evidence. The complete immutable
 receipt, terminal intent, and pending/outcome record live in quota-controlled
@@ -4444,12 +4777,17 @@ versioned direct request or exact Event/Evidence-observed tagged tick candidate
   -> Authority validates that acknowledgement and CAS-finalizes only its own
      receipt pointers; outer submission becomes terminalizing
   -> Event/Evidence appends and acknowledges exact OutcomeRecorded
-  -> tick only: prepare fixed state node -> append/acknowledge StateCommitted ->
-     append/acknowledge LoopTickCompleted -> final head CAS + run/tick update
-  -> direct/tick: verify timing-safe projection chain/checkpoint and every
-     origin-specific event/state/receipt/response digest
-  -> exact publication owner persists SecretPublicationAuthorizationV1 plus the
-     authorized response-set member bytes and CASes terminalizing -> terminal
+  -> tick only: State Service prepares fixed state node/head; Event/Evidence
+     appends/acknowledges StateCommitted and LoopTickCompleted
+  -> Event/Evidence completes projection chains/checkpoints; Authority verifies
+     every origin-specific event/state/receipt/projection digest
+  -> Authority stages every exact response-member BLOB/digest in private slots
+  -> applicable State Service and Agent Instance Controller owners independently
+     commit only local publication-pending facts and return authenticated receipts
+  -> Authority persists prepared SecretPublicationAuthorizationV1 plus exact
+     response members; applicable State/Agent owners arm only local read fences
+  -> Authority validates arm acknowledgements and alone CASes authorization to
+     released plus terminalizing -> terminal
   -> after current result-read authorization, trusted injection releases the
      authorized ActionOutcome/receipt response; material exposure releases only
      the authorized fixed terminal/restricted suppression envelope
@@ -4569,19 +4907,24 @@ Required rules:
     experimental wrapper correction; stable non-secret submissions remain
     byte-for-byte unchanged pending any broader trace migration.
 13. A tick-owned action that did not pause for approval then emits
-    `outcome.recorded`, performs its explicit state commit, emits
-    `tick.completed`, finalizes the state head and run/tick status, verifies the
-    projection checkpoint, and only then commits publication authorization. A
-    direct action or approval continuation emits `outcome.recorded`, verifies its
-    direct projection/run suffix, and only then commits publication authorization.
+    `outcome.recorded`, performs its explicit State Service commit, and emits
+    `tick.completed` through Event/Evidence. State Service and Agent Instance
+    Controller independently move only their local head and run/tick rows behind
+    `publication_pending` fences and return exact completion receipts. Authority
+    verifies projection checkpoints, persists prepared authorization plus response
+    members, obtains both local arm acknowledgements, and only then CASes its own
+    authorization to `released`. A direct action or approval continuation emits
+    `outcome.recorded` and uses the arm-applicable Agent-only/no-new-State form of
+    the same protocol.
     The original approval-required tick completes its unchanged
     stable challenge suffix. Its later receipt continuation invents no new tick
     or state event. All paths
     use the same final normalizer and receipt. Gateway session/orchestrator,
     provider, node, and driver emit no outer `action.*` event.
 14. If owner-local terminal preparation, any Event/Evidence append/
-    acknowledgement, Authority finalization, state/head/run update, projection
-    verification, response materialization, or publication authorization is blocked after a possible
+    acknowledgement, Authority finalization, State or Agent owner update/receipt/
+    arm, projection verification, response materialization, or publication
+    authorization is blocked after a possible
     effect, the private result is `terminal_evidence_blocked`: no serializable
     `ActionOutcome`, visible state commit, direct success response, run completion, or
     next tick is allowed. The outer submission is `uncertain` before outer
@@ -4889,12 +5232,17 @@ schema plus `secret_containment_reserve_id`, `secret_action_submission_id`,
 `target_generation_binding`, preallocated `secret_consumed_effect_tombstone_id`,
 `projection_binding`, `closure_ordinal`, `closure_projected_at`, preallocated
 `closure_ref`,
-`hot_entry_id_root`, `record_credit_id_root`, `incident_credit_id`,
-`durable_byte_limit`, and `marker_slot_binding_root`. Its digest uses exact
+`generated_resource_profile`, `generated_resource_profile_digest`,
+`hot_entry_count`, `record_credit_count`, `bundle_byte_limit`,
+`durable_byte_limit`, `marker_slot_count`, `hot_entry_id_root`,
+`record_credit_id_root`, `incident_credit_id`, and
+`marker_slot_binding_root`. Its digest uses exact
 projection `splendor.secret.containment_reserve_closure_digest.v1`, containing
 its digest schema, the closure record schema as `closure_schema_version`, and
-every other closure field; the output is external. The three roots commit
-exactly 51, 1,179, and 47 preallocated entries in slot-ordinal order. Each hot leaf
+every other closure field; the output is external. `generated_resource_profile`
+is the complete grammar tuple and approval-parent disposition from the generated
+inventory below. The three roots commit exactly the profile's printed counts in
+slot-ordinal order, at most 65 hot, 1,276 record, and 64 marker entries. Each hot leaf
 is exactly `{schema_version,slot_ordinal,hot_entry_id}`, each record leaf is
 exactly `{schema_version,slot_ordinal,record_credit_id}`, and each marker leaf is
 exactly `{schema_version,slot_ordinal,marker_slot_binding}` under respectively
@@ -4904,7 +5252,9 @@ named `splendor.secret.containment_hot_slot_leaf.v1`,
 digest rule and roots use the retirement
 Merkle odd-leaf rule with distinct node prefix
 `splendor.secret.containment_slot_merkle_node.v1`. Empty roots, duplicate/gapped
-ordinals, or wrong counts reject. The digest contains no actual target branch,
+ordinals, a count/root/profile mismatch, or a limit below the generated profile
+rejects. A narrower profile can never be widened after acceptance. The digest
+contains no actual target branch,
 used/unused bit, deletion state, release time, or tombstone integrity output. The
 owner may create this immutable closure for trusted injection only after every
 operational row is terminal and all profile-required closure projections are
@@ -4947,10 +5297,14 @@ The exact tagged nested objects and state rules are:
   `present {kind="present",delivery_receipt_id,receipt_digest}`; and
   `outer_terminal_event_binding` is `absent` or
   `present {kind="present",causal_ref}`. `publication_binding` is exactly
+  `pre_effect {kind="pre_effect",disposition="no_effect",empty_use_projection_digest}`,
+  exactly
   `trusted_injection {kind="trusted_injection", disposition="publishable", sealed_output_digest_binding}`,
   where the nested binding is `absent` or
   `present {kind="present",sealed_output_digest}`, or exactly
   `material_exposed {kind="material_exposed", disposition="target_publication_suppressed", material_exposure_suppressed_projection_digest}`.
+  Cross-tag fields are forbidden and this tag must equal the generated terminal
+  profile's exposure arm.
   Outer `terminal` requires
   present final status, terminal-intent digest, delivery-receipt ID/digest,
   outer-terminal causal ref, and the profile-matching publication tag. Outer
@@ -5395,7 +5749,7 @@ Retirement ordering and recovery are exact:
    domain deny index before any per-identity lookup can run;
 5. release/delete exact normal and emergency source slots in canonical leaf/
    sequence order according to the committed counts. Each slot-state CAS and the
-   matching per-leaf release-journal advance are one owner transaction; the final
+   matching per-leaf release-journal advance are one retirement-owner transaction; the final
    marker, whose integrity digest equals the committed final-head digest, and its
    prepared chain-head row are always released last. A mismatch releases nothing
    further and quarantines;
@@ -6191,15 +6545,15 @@ or minimum v1 conformance bounds; deployments may be stricter but not looser:
 | Concurrent invocation/overlap | At most 16 secret-aware invocations per node and 4 per tenant/node; at most 8 simultaneously open scanned sources per invocation; each source retains at most 256 KiB shared overlap across all detectors; 32 MiB node / 8 MiB tenant ceiling. |
 | Detector throughput | At least 100 MiB/s aggregate on the activation hardware for declared representations, measured with 4 KiB through 1 MiB chunks and the maximum active detector set. |
 | Streaming/backpressure | At most 1 MiB unscanned queued bytes per invocation; 16 MiB node / 4 MiB tenant ceiling; producers block or the output quarantines, never bypasses scanning. |
-| Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node completed and reconciliation-exhausted hot schemas are at most 2 KiB. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 1,920 KiB, has at most 6,096 event refs and 2,320 trusted-send evidence refs, and obeys the 2,048-KiB complete-response bound. Retention never deletes a tombstone or active uncertainty to admit work. |
+| Idempotency/replay state | At most 4,096 hot command/use-attempt/submission-index/provider-control/node-control entries per node and 1,024 per tenant/node, at most 2 KiB each; 8 MiB node / 2 MiB tenant ceiling. Active outer/approval/provider/node uncertainty cannot be evicted. Exact provider/node completed and reconciliation-exhausted hot schemas are at most 2 KiB. Full terminal intents, receipts, plans/results/audits/evidence, pending sealed outcomes, permanent tombstones, and retirement deny heads are excluded from the hot-entry size claim and use separately controlled durable storage. Each delivery receipt is at most 1,920 KiB, has at most 6,096 event refs and 2,320 trusted-send evidence refs. A dynamic publication simultaneously stores the exact 4,096-KiB four-member response set; material stores only its exact 4-KiB fixed-false member. Retention never deletes a tombstone or active uncertainty to admit work. |
 | Normal permanent non-reuse marker store | Configure positive node and active-tenant maxima with minima 4,096/1,024 unretired normal identities. At 2 KiB per tombstone, non-borrowable normal floors are exactly 8 MiB node / 2 MiB tenant. One normal slot is reserved before each accepted non-containment identity; exhaustion denies before effect. Normal identities cannot consume emergency or retirement slots. |
-| Emergency permanent-marker store | Every containment unit atomically reserves exactly 47 typed emergency marker slots before exposure: 2 provider-control invocation IDs, 11 node-control invocation IDs, 13 row-bound reconciliation claim IDs, 13 control-row tombstone IDs, and the 8 fixed auxiliary IDs below. For 64 node/16 tenant units this is 3,008/752 slots and exact separate 6,016/1,504-KiB floors at 2 KiB each. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
+| Emergency permanent-marker store | The generated maximum is exactly 64 typed slots: 12 for the completed tick challenge and 52 for its continuation. Challenge slots are authorization, prepare receipt, four State command/receipt/arm/ack identities, four Agent command/receipt/arm/ack identities, completed-challenge receipt, and continuation identity. Continuation slots are 44 exact operational identities plus delivery attestation, terminal receipt, authorization, prepare receipt, and four Agent command/receipt/arm/ack identities; it emits no new State identity. A narrower profile reserves its exact printed classes and cannot widen. For 64 node/16 tenant maximum units the floors are 4,096/1,024 slots and 8,192/2,048 KiB at 2 KiB each. Used slots remain charged after tombstone commit. Trusted-injection unused slots return only on verified reserve release. Every material-exposure slot/debit is permanently `non_retirable_v1`; ordinary retirement cannot release it. |
 | Tick observation durability | At most 16 C03 observations per policy output and 1 MiB canonical candidate bytes per observation, hence at most 16 MiB candidate bytes in one atomic batch. The Event/Evidence writer streams the quota-controlled durable batch without retaining a second hot copy. Unclaimed expiry is exactly 5 minutes minimum, `tick_deadline + 60 seconds`, and 24 hours maximum under the recorded policy revision. Link and expiry CAS the same owner row; at/after expiry only the winning digest tombstone remains effect-ineligible, while a winning exact link receipt pins candidate bytes through outer terminal/retention. This durable budget is excluded from the in-memory equation below and storage uncertainty rejects the whole batch before outer claim. |
 | Fixed restricted metadata | At most 8 MiB node / 2 MiB tenant for lineage indexes, control plans, and admission bookkeeping. |
-| Non-borrowable containment hot reserve | Preprovision 64 `SecretContainmentReserve` units per node and 16 per active tenant/node. Each unit has exactly 51 entries at at most 2 KiB; exact pools are 6,528 KiB node and 1,632 KiB tenant. Normal work cannot consume them. |
-| Non-borrowable containment durable reserve | Each reserve unit owns exactly 14,020 KiB durable bytes, 1,179 maximum-tick-path event/evidence/enforcement-record credits (1,171 direct-path credits), and one incident credit under the generated inventory below. Floors are 876.25 MiB/75,456 records/64 incident credits per node and 219.0625 MiB/18,864 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to exact emergency slots. Material-exposed units and all owner-control/Authority-commit/terminalization/state/publication resources are permanently pinned regardless of physical cleanup. |
+| Non-borrowable containment hot reserve | Preprovision 64 maximum `SecretContainmentReserve` units per node and 16 per active tenant/node. Each approval-capable unit owns 65 entries at at most 2 KiB; exact pools are 8,320 KiB node and 2,080 KiB tenant. A narrower non-approval profile may commit only its generated exact smaller vector and cannot later widen. Normal work cannot consume either pool. |
+| Non-borrowable containment durable reserve | The maximum vector is 22,584 KiB durable bytes, 1,276 event/evidence/enforcement-record credits, 17,564 KiB non-record bundles, 64 emergency markers, and one incident credit. The byte/bundle maximum is tick-origin trusted approval continuation; the independent record maximum is tick-origin material approval continuation. Floors are 1,411.5 MiB/81,664 records/64 incident credits per node and 352.875 MiB/20,416 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to exact emergency slots. Material-exposed units and all owner-control/Authority-commit/terminalization/state/publication resources are permanently pinned regardless of physical cleanup. |
 | Retirement capacity | Dedicated permanent deny-head minima are 4,096 node and 1,024 per active tenant/node at 8 KiB: 32/8 MiB. Four node and one per-tenant in-flight reservations each own 528 KiB durable manifest/release scratch and 448 KiB hot scratch, giving 2,112/528 KiB durable and 1,792/448 KiB hot floors. Retirement capacity is non-borrowable and separate from normal/emergency markers. |
-| Total restricted node/tenant memory | 104.125 MiB node and 26.03125 MiB per active tenant/node: 96/24 MiB normal, 6.375/1.59375 MiB containment hot reserve, and 1.75/0.4375 MiB retirement hot scratch. No category or tenant may borrow containment or retirement capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
+| Total restricted node/tenant memory | 105.875 MiB node and 26.46875 MiB per active tenant/node: 96/24 MiB normal, 8.125/2.03125 MiB containment hot reserve, and 1.75/0.4375 MiB retirement hot scratch. No category or tenant may borrow containment or retirement capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
 | Output drain | 30 s maximum ending at the predeclared exposure deadline plus 30 seconds. Trusted-injection timeout quarantines and prevents terminal success/publication. Material-exposed bytes are never publishable; actual exit, timeout, and drain state alter only live non-exportable enforcement and retain byte/time-identical fixed suppression records. |
 | Local cleanup | 10 s maximum for FD/socket close, unlink/unmount, projection deletion acknowledgement, and detector finalization; timeout is cleanup uncertainty. |
 | Provider revoke acknowledgement | 5 s maximum; timeout remains effect-uncertain and cannot report revoked success. |
@@ -6215,9 +6569,9 @@ observed averages:
 + (4096 hot entries * 2 KiB)
 + 8 MiB fixed metadata
 = 96 MiB normal node maximum
-+ (64 containment units * 51 entries * 2 KiB = 6,528 KiB = 6.375 MiB)
++ (64 containment units * 65 entries * 2 KiB = 8,320 KiB = 8.125 MiB)
 + (4 retirement scratch units * 448 KiB = 1,792 KiB = 1.75 MiB)
-= 104.125 MiB total node maximum
+= 105.875 MiB total node maximum
 
 (16 detectors * 512 KiB)
 + (4 invocations * 8 sources * 256 KiB overlap)
@@ -6225,22 +6579,24 @@ observed averages:
 + (1024 hot entries * 2 KiB)
 + 2 MiB fixed metadata
 = 24 MiB normal tenant/node maximum
-+ (16 containment units * 51 entries * 2 KiB = 1,632 KiB = 1.59375 MiB)
++ (16 containment units * 65 entries * 2 KiB = 2,080 KiB = 2.03125 MiB)
 + (1 retirement scratch unit * 448 KiB = 0.4375 MiB)
-= 26.03125 MiB total tenant/node maximum
+= 26.46875 MiB total tenant/node maximum
 
-64 node reserve units * 51 entries * 2 KiB = 6,528 KiB
-16 tenant reserve units * 51 entries * 2 KiB = 1,632 KiB
+64 node reserve units * 65 entries * 2 KiB = 8,320 KiB
+16 tenant reserve units * 65 entries * 2 KiB = 2,080 KiB
 
-64 node reserve units * 47 emergency marker slots * 2 KiB
-  = 6,016 KiB emergency marker floor
-16 tenant reserve units * 47 emergency marker slots * 2 KiB
-  = 1,504 KiB emergency marker floor
+64 node reserve units * 64 emergency marker slots * 2 KiB
+  = 8,192 KiB emergency marker floor
+16 tenant reserve units * 64 emergency marker slots * 2 KiB
+  = 2,048 KiB emergency marker floor
 
-64 node reserve units * 14,020 KiB durable = 876.25 MiB durable floor
-16 tenant reserve units * 14,020 KiB durable = 219.0625 MiB durable floor
-64 node reserve units * 1,179 event/evidence/enforcement records = 75,456 credits
-16 tenant reserve units * 1,179 event/evidence/enforcement records = 18,864 credits
+64 node reserve units * 22,584 KiB durable = 1,411.5 MiB durable floor
+16 tenant reserve units * 22,584 KiB durable = 352.875 MiB durable floor
+64 node reserve units * 17,564 KiB bundles = 1,097.75 MiB bundle floor
+16 tenant reserve units * 17,564 KiB bundles = 274.4375 MiB bundle floor
+64 node reserve units * 1,276 event/evidence/enforcement records = 81,664 credits
+16 tenant reserve units * 1,276 event/evidence/enforcement records = 20,416 credits
 64 node reserve units * 14 control/containment tombstones = 896 tombstones
 16 tenant reserve units * 14 control/containment tombstones = 224 tombstones
 
@@ -6252,6 +6608,11 @@ observed averages:
 1,024 tenant deny heads * 8 KiB = 8 MiB permanent retirement pool
 ```
 
+The bundle floor is an independently checked sublimit within, not additional to,
+the durable-byte floor. Likewise record credits constrain cardinality while their
+4-KiB bytes are already included in each profile's durable total. Admission must
+satisfy all three correlated profile dimensions without summing either one twice.
+
 The 14 tombstones per unit are exactly one for each of the two provider and eleven
 node-control rows plus one containment-reserve tombstone. They are identities and
 record obligations already represented in the generated slots above, not an
@@ -6260,7 +6621,8 @@ additional byte or record-credit pool.
 Tenant capacity is a suballocation of configured node capacity, never an
 independent promise. For every dimension `D` in `{containment_units, normal_hot_
 bytes, containment_hot_bytes, durable_bytes, event_evidence_enforcement_credits,
-incident_credits, normal_marker_slots, emergency_marker_slots_by_class,
+bundle_bytes_within_durable, authorized_response_member_bytes, incident_credits,
+normal_marker_slots, emergency_marker_slots_by_class,
 control_row_tombstone_slots, retirement_head_slots, retirement_inflight_units,
 retirement_durable_scratch_bytes, retirement_hot_scratch_bytes}`, admission and
 restart enforce:
@@ -6275,14 +6637,15 @@ count as a retained tenant reservation until their authoritative retention rule
 permits release; deactivation cannot hide them from the sum. No dimension may be
 overcommitted, borrowed from another dimension, or satisfied by observed average
 use. At the stated floors, one tenant reservation is exactly 16 containment
-units and the corresponding 26.03125-MiB hot, 219.0625-MiB containment durable,
-18,864-record, 16-incident, 1,024-normal-marker, 752-emergency-marker,
+units and the corresponding 26.46875-MiB hot, 352.875-MiB containment durable,
+274.4375-MiB bundle-within-durable, 20,416-record, 16-incident, 1,024-normal-marker, 1,024-emergency-marker,
 224-tombstone, 1,024-retirement-head, and one-retirement-scratch suballocation.
 Therefore the 64-unit node floor admits at most four simultaneous active tenant
 reservations.
 
 A fifth tenant is denied before observation, outer acceptance, reserve, provider/
-node work, or exposure unless one owner transaction first increases and persists
+node work, or exposure unless one Authority allocator transaction first increases
+and persists
 every insufficient node dimension, verifies the new checksums, and then commits
 the tenant reservation. Partial enlargement is non-authorizing. Pending tenant
 requests are admitted fairly by `(authority_request_sequence,tenant_id canonical
@@ -6306,171 +6669,231 @@ copying 256 KiB per detector. If that proof fails, configured cardinality is
 reduced until both equations hold; coverage is never reduced silently.
 
 `SecretContainmentReserve` is an Authority-owned durable reservation keyed by
-tenant/node, outer submission, use attempt, and exposure lineage. Its target-
-generation binding is exactly `absent` at reservation and is CASed once to
-`present` when typed node allocation creates that generation; it can never be
-replaced or cleared. One unit has exactly two provider-control credits (`revoke`
-plus read-only `audit`) and eleven node-control credits, exactly one for every
-`SecretNodeControlOperation` variant including `prepare_delivery` and
-`activate_delivery`, with `abort_delivery` as the eleventh. It has one pre-reserved
-row-bound reconciliation claim ID and one control-row tombstone ID for each of
-those thirteen controls, and the other fixed identities below. It owns 51 hot
-entries, 1,179 maximum tick-path durable event/evidence/enforcement-record
-entries, one incident entry, 14,020 KiB maximum durable bytes, and 47 typed
-emergency marker slots. An inapplicable
-operation leaves its row and fixed credits unused; a claim-holder crash/expiry
-transfers the same durable claim ID
-only through legal epochs 1 and 2 and consumes no replacement identity. The unit
-also owns the fixed 145-record trusted-send evidence subreserve described above.
-Credits cannot be reassigned to normal
-work or another exposure. A backend whose declared worst case exceeds any unit
-dimension is inadmissible until a stricter profile or larger accepted budget
-exists.
-Every one of the 51 hot slots, 1,179 record slots, and 47 marker slots receives its
-unique owner-local typed slot ID/binding at atomic reservation. Their three exact
-ordinal roots are persisted in the reserve row before exposure and later reused
-unchanged by the containment closure digest; no recovery allocates replacement
-slot IDs.
+tenant/node, outer submission, use attempt, exposure lineage, and the complete
+generated resource profile. Its target-generation binding is exactly `absent` at
+reservation and is CASed once to `present` when typed node allocation creates that
+generation; it can never be replaced or cleared. One post-reservation profile has
+exactly two provider-control credits (`revoke` plus read-only `audit`) and eleven
+node-control credits, one for every `SecretNodeControlOperation` including
+`prepare_delivery`, `activate_delivery`, and `abort_delivery`. It has one row-bound
+reconciliation claim ID and one control-row tombstone ID for each of those
+thirteen controls. An inapplicable operation leaves its fixed row/credits unused;
+a claim-holder crash/expiry transfers the same claim ID only through epochs 1 and
+2. Trusted profiles also own the 145-record send-evidence subreserve. No credit is
+reassigned to normal work or another exposure.
 
-The following generated durable-object-to-slot inventory is normative. `Records`
-counts unique 4-KiB event/evidence/enforcement slots. `Bundle KiB` is additional
-canonical owner-object capacity and is not double-counted as a record slot. A
-slash is direct/tick maximum. Zero is an explicit bound, not an omitted category:
+An approval-capable parent is admitted against its complete challenge-plus-final
+profile before the challenge is released. The challenge phase allocates no use
+attempt, provider/node control row, exposure lineage, material, adapter entry, or
+target work; only its generated pre-effect objects and parent capacity binding
+exist. A winning continuation activates only the already-bound final profile.
+Denial, expiry, revocation, or cancellation consumes only the generated smaller
+final arm. This is capacity reservation, not authorization or a side effect, and
+it prevents a released challenge from promising an unbudgeted continuation.
 
-| Slot class and exact maximum objects | Hot | Records direct/tick | Bundle KiB direct/tick | Emergency markers | Required bindings |
+That binding is the closed nested outer-row object
+`splendor.secret.approval_parent_capacity_binding.v1`: schema, submission ID,
+immutable original origin, exact challenge profile, declared maximum final
+profile, complete combined vector, hot/record/bundle/marker slot roots, incident
+credit, state `reserved|activated|released|permanently_pinned`, revision, and
+binding digest. At challenge it contains no use-attempt, exposure-lineage, target-
+generation, control-invocation, or effect ID. Exact continuation activation CASes
+the same binding once, assigns the final profile's new use/exposure/control IDs,
+and cannot widen any dimension. A no-effect final arm consumes its exact challenge/
+final slots and releases only unused future operational slots after all published
+facts and permanent markers are accounted. Material activation makes the complete
+binding `permanently_pinned`. Crash recovery reuses the same roots/revision; a
+missing binding, changed profile, stale CAS, or partial slot root withholds the
+challenge/final response and performs no effect.
+The object is at most 2 KiB and is stored inside the already-counted challenge
+parent hot row; its roots refer to reserved slots and do not duplicate their
+leaves or consume an implicit bundle copy.
+
+`Records` below are unique 4-KiB event/evidence/enforcement slots. `Bundle KiB`
+is additional canonical owner-object capacity and is never double-counted as a
+record. Durable KiB is always `4 * Records + Bundle KiB`. The folded operational
+ledger is exact; the schema-path ledger expands each row to one source/copy/owner/
+slot entry:
+
+| Operational row class | Hot | Records | Bundle KiB | Markers | Exact contents |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 2 provider controls, each with requested, 16 pre, 16 post, ordinary-completed-or-distinct-exhausted event, 16 Authority lifecycle, 10 reconciliation, 4 result-or-exhaustion recovery, 5 tombstone/delete, and 2 marker records | 6 | 142/142 | 256/256 | 6 | Two control indexes, two holder rows, two tombstone rows; plan/row/result-or-explicit-absence/intent/receipt-or-audit plus reconciliation bundles. |
-| 11 canonical node controls with the same 71-slot closed profile and NODE/SBX result or explicit exhausted absence | 33 | 781/781 | 1,408/1,408 | 33 | Eleven control indexes, holder rows, tombstone rows, including typed prepare, activate, and Authority-linearized abort; no exhausted path fabricates owner result/receipt/completed event. |
-| Reserve/use plus 16 exposure lifecycle/control-attestation records | 2 | 16/16 | 0/0 | 0 | Reserve and use-attempt hot rows; actual owner timestamps remain internal. |
-| 12 cleanup/revocation/containment records | 1 | 12/12 | 0/0 | 1 | Cleanup hot row and command marker; physical result never enters material projection. |
-| Authority pending outcome/receipt/result authorization/terminal intent/attestation plus pending stable event set and complete append-command set | 2 | 7/7 | 2,784/2,816 | 2 | Distinct 64-KiB outcome, 1,920-KiB receipt, 128-KiB result-authorization audit, 64-KiB intent, 64-KiB attestation, 256/272-KiB pending event set, and 288/304-KiB append-command set. Acknowledgements are co-stored with their append records. |
-| 8 containment-reserve tombstone/compaction/verification/deletion records | 1 | 8/8 | 64/64 | 1 | Tombstone-construction row, closure/release row, reserve tombstone marker. |
-| 33 material barrier-closure records | 0 | 33/33 | 0/0 | 0 | 16 pre-send, 16 post-send-denial, one overflow/termination closure. |
-| Maximum trusted-send evidence profile | 1 | 145/145 | 0/0 | 0 | Counter/reserve hot row; 8 controls times pre-exposure plus 8 pre/post pairs plus terminal absence, then overflow/fence. |
-| Incident, signed timing-safe projection checkpoint/export root, fixed management/forensic projection-denial evidence, permanent-pin request, and completion | 1 | 4/4 | 64/64 | 1 | Incident pointer/record; includes signed projection manifest root and denial of unaccepted raw forensic timing access. |
-| Suppression-projection state | 1 | 0/0 | 0/0 | 0 | Fixed schedule/projection digest plus projection-chain-head pointer only. |
-| Authority one-shot commit record/receipt and preparation-ID marker; NODE preparation/finalization/abort and Authority no-commit-decision objects are already inside the three typed node-control profiles | 1 | 2/2 | 64/64 | 1 | Authority commit pointer/receipt only; preparation nominal ID marker remains separate and no NODE saga slot is duplicated. |
-| `SecretTerminalizationLeaseId` owner row plus epochs 0..2 acquire/progress/failure-or-release records, overflow, and retention: 12 fixed slots | 1 | 12/12 | 64/64 | 1 | One hot lease/fence/progress row and one same-ID marker; epoch 3 consumes overflow. |
-| All eight additive C03 stable trace records, stable suffix payload BLOBs, timing-safe envelopes, and correspondence sidecars | 0 | 8/8 | 416/464 | 0 | Event/Evidence stores 256/272 KiB of complete raw payload copies plus 160/192 KiB of signed envelopes/protected sidecars; no stable ID is preallocated. |
-| Origin-specific `SecretPublicationAuthorizationV1`, authorized-response-set bytes, and marker | 1 | 1/1 | 2,056/2,056 | 1 | One <=8-KiB immutable authorization/membership table and one <=2,048-KiB exact full/restricted member-BLOB set; direct/tick suffix rules differ but capacity does not. |
-| Tick-only prepared state node, truthful state metadata, pending head transition, stable `StateCommitted`, stable `LoopTickCompleted`, final head commit, run/tick update, and recovery marker | 0 | 0/8 | 0/2,048 | 0 | One fenced state-head transaction; direct origin consumes none of these slots and publication is separately allocated above. |
-| **Generated total** | **51** | **1,171/1,179** | **7,176/9,304** | **47** | `1,171*4+7,176=11,860 KiB` direct; `1,179*4+9,304=14,020 KiB` tick. |
+| Two provider controls | 6 | 142 | 256 | 6 | Two independent 71-record plan/row/result-or-explicit-absence/intent/receipt-or-audit/reconciliation/tombstone profiles. |
+| Eleven canonical node controls | 33 | 781 | 1,408 | 33 | Eleven independent 71-record owner-defined profiles, including prepare, activate, and abort; exhausted paths never fabricate a result or ordinary-completed event. |
+| Reserve/use and exposure lifecycle | 2 | 16 | 0 | 0 | Reserve/use hot rows and sixteen fixed lifecycle/control-attestation record slots. |
+| Cleanup/revocation/containment | 1 | 12 | 0 | 1 | Twelve fixed records and one cleanup-command identity. |
+| Containment closure/tombstone | 1 | 8 | 64 | 1 | Closure, verification, deletion audit, and reserve-tombstone identity. |
+| Trusted-send maximum | 1 | 145 | 0 | 0 | Eight controls, eight pre/post send pairs, terminal absence, and overflow/fence. |
+| Material barrier closure | 0 | 33 | 0 | 0 | Sixteen pre-send, sixteen post-denial, and one overflow/termination record. |
+| Incident/projection denial/pin | 1 | 4 | 64 | 1 | Incident pointer/record, fixed denial, permanent pin, and completion. |
+| Material suppression state | 1 | 0 | 0 | 0 | Schedule/projection digest and chain-head pointer. |
+| Authority one-shot commit | 1 | 2 | 64 | 1 | Authority commit/receipt; NODE prepare/finalize/abort remain in their node-control rows. |
+| Terminalization lease | 1 | 12 | 64 | 1 | Same-ID epochs 0..2, progress, failure/release, overflow, and retention. |
+| **Trusted operational base** | **47** | **1,122** | **1,920** | **44** | All rows except material barrier/suppression. |
+| **Material operational base** | **48** | **1,155** | **1,920** | **44** | Trusted base plus barrier/suppression; unused trusted-send alternatives remain permanently pinned. |
 
-The per-control 71 slots admit either ordinary completion or the distinct
-`reconciliation_exhausted` terminal objects in the same typed alternatives; they
-do not require both or permit borrowing. The canonical enum drives eleven such
-node profiles; its `prepare_delivery`, `activate_delivery`, and `abort_delivery`
-profiles include every NODE/SBX prepare/finalize/abort success, crash recovery,
-expiry, and absorbing-abandonment object. Only the two Authority commit record/
-receipt slots remain outside those profiles. The 12 terminalization slots admit
-epoch 0 plus exactly two
-same-ID recovery epochs and cap+1 overflow. Unused alternative slots remain bound
-to the unit. Every C03 trace record, stable suffix record, state object, owner
-receipt, and projection-denial record is therefore named. A path requiring an
-unlisted object or second use of a slot is over profile and new exposure denies
-before reservation.
-
-For material exposure, raw records retain truthful owner/stable timestamps and
-are restricted; readable surfaces use only the versioned timing-safe projections.
-Private owner recovery may advance an operational row later, but no slot name
-asserts a physical result at its schedule. Trusted-injection claims only its
-formula-derived prefix, while material exposure permanently pins the complete
-inventory including unused trusted-send and alternative-recovery slots.
-
-The 14,020-KiB maximum tick-path durable reservation follows maximum canonical
-sizes; the direct path omits the final 2,048-KiB state transaction bundle and its
-eight 4-KiB record slots:
+For one terminal episode, let `P` be its generated projection-source count and
+`V` its non-empty view-kind count. Its projection record count is
+`Q=2P+2V+2`; its projection bundle is `16P+12V+20`. Its exact record equation is:
 
 ```text
-1,179 event/evidence/enforcement records * 4 KiB    = 4,716 KiB
-13 provider/node plan+row+result+intent+receipt
-  bundles * 64 KiB                                  =   832 KiB
-pending stable ActionOutcome bytes                  =    64 KiB
-outer delivery receipt                              = 1,920 KiB
-result-authorization audit                          =   128 KiB
-outer terminal intent                               =    64 KiB
-delivery-control attestation record                 =    64 KiB
-Authority pending stable event-set copy             =   272 KiB
-Event/Evidence append-command-set copy              =   304 KiB
-Event/Evidence stable payload BLOB copy             =   272 KiB
-timing-safe envelopes/correspondence sidecars       =   192 KiB
-incident record                                     =    64 KiB
-13 row-bound reconciliation bundles * 64 KiB        =   832 KiB
-containment reserve/release row                      =    64 KiB
-Authority one-shot commit/receipt bundle             =    64 KiB
-terminalization lease/fence/progress/overflow bundle =    64 KiB
-publication authorization + authorized response      = 2,056 KiB
-tick state-node/head/run transaction bundle          = 2,048 KiB
-                                                       ---------
-                                                       14,020 KiB
-
-direct: 1,171 records * 4 KiB + 7,176 KiB bundles    = 11,860 KiB
+episode_records = E + Q + 3*C + A + 2 + 4 + D + S + H
 ```
 
-Each listed maximum is a schema admission bound. A future larger record or
-additional record kind requires a new accepted profile and revised FND-012
-equations; compression, average size, and an unexplained safety margin cannot
-substitute for the declared maximum.
+`E`, `C`, `P`, and `V` come from the grammar table above. `A` is Authority
+terminal-object metadata: 4 pre-effect, 5 challenge/post-reservation, or 2
+cancelled. The literal 2 is authorization plus prepare-receipt metadata; 4 is the
+fixed owner-local receipt/index allocation; `D=3` for a dynamic four-member
+response and `0` for material fixed-false; `S=33` only for trusted output seal/
+postcondition records; `H=2` only for the two retained completed-challenge-tick
+receipt copies. The three records per append command are Authority outbox,
+Event/Evidence inbox, and durable acknowledgement metadata. Each actual stable
+event independently consumes the `E` metadata record even when it is a common
+action terminal or `OutcomeRecorded`.
 
-The implementation must generate its FND-012 resource report from canonical Rust
-maximum fixtures and registered driver-manifest maxima, not a hand-maintained
-copy of these equations. The generator reads the two-operation provider manifest
-and canonical eleven-variant `SecretNodeControlOperation` enum first, asserts one and
-only one 71-record profile per control, then serializes every maximum record under
-its real schema, reads each trusted-send declaration, asserts the `1..8` send and
-one-through-eight control bounds, counts all control and terminalization holder
-epochs/transfers/overflow, traverses every prepare/commit/abort/finalize,
-stable trace/state, projection, and publication object/copy row in the table, and derives receipt refs, hot slots, direct/
-tick record credits, canonical bytes, marker slots, tenant/node floors, and
-16-requirement totals. CI fails if generated values differ from
-51/1,171-direct/1,179-tick/11,860-direct-KiB/14,020-tick-KiB/47,
-6,096/2,320, or the
-equations above. OpenAPI, Python,
-TypeScript, and operator reports consume that generated evidence; none may carry
-an independent larger or smaller oracle.
+The exact non-record episode bundle is:
 
-The 47 emergency marker slots are likewise exact: 2 provider-control invocation
-IDs + 11 node-control invocation IDs + 13 row-bound
-`SecretReconciliationClaimId` values + 13 control-row consumed-tombstone IDs + 1
-delivery-control attestation ID + 1 terminal delivery-receipt ID + 1 cleanup-
-command ID + 1 containment-reserve consumed-tombstone ID + 1 incident ID + 1
-NODE/SBX `MaterialExposureIsolationPreparationId` + 1 Event/Evidence
-`SecretTerminalizationLeaseId` + 1 `SecretPublicationAuthorizationId`. The last
-three slots reserve generic typed capacity
-only; their nominal IDs are allocated by their owners at preparation and epoch 0,
-not preallocated by Authority or admission. Each
-control row's invocation, claim, and tombstone ordinals bind one another and
-cannot be exchanged with another row. Each slot has a fixed class and ordinal in
-the reserve. Before accepting one of those identities,
-Authority atomically CASes the matching unused slot to
-`claimed {nominal_identity,authority_domain,owner_receipt_digest}` after validating
-the owning service receipt; it never mints the foreign identity. A normal identity
-or different class cannot claim it. The identity's tombstone transaction atomically changes
-that slot to `charged {permanent_marker_id,marker_integrity_digest}`, where the
-marker is the primary consumed-effect tombstone or exact auxiliary marker above.
-A charged slot
-remains in the emergency marker store after trusted-injection reserve release.
-Verified ordinary trusted-injection domain
-retirement commits one chain leaf per partition/pool/slot class and the separate
-retirement-pool deny head before returning exactly the source slots in the head's
-count array. It never moves a charge between pools or permits reuse. A material-
-exposure slot is permanently charged/non-retirable and never enters that release.
+```text
+A_kib + (4*T + 64 + 8*C) + (16*P + 12*V + 20)
+  + publication_kib + owner_kib + state_kib + challenge_receipt_kib
 
-Admission first proves the configured node and active-tenant reserve floors, then
-atomically reserves one complete unit, all 47 emergency marker slots, durable
-bytes, record credits, and incident credit per proposed use attempt before
-use claim, node preparation, provider acquisition, material exposure, adapter
-entry, or target work. For `N` requirements it requires `N` available units in
-the tenant suballocation and in the node aggregate. Each physical node unit is
-charged once and attributed to exactly one tenant reservation; the tenant check
-is not a second independent allocation. Partial reservation rolls back with no effect.
-Accounting locks for tenant normal, node normal, tenant emergency, and node
-emergency dimensions are acquired in that order; the resulting physical node
-charges are each attributed once to the tenant suballocation, then ordered by
-Authority event sequence and canonical use-attempt ID. Historical charged
-emergency markers count against their separate pool; if fewer than all 47 slots
-remain, new exposure stops before reserve/use/provider/node/adapter work. A loser
-denies/quarantines new exposure before any such work.
+A_kib = 384 pre-effect | 576 challenge | 2,240 post-reservation | 192 cancelled
+publication_kib = 4,120 dynamic | 28 material-fixed-false
+owner_kib = 32 direct/continuation | 64 ordinary/challenge tick
+state_kib = 2,048 ordinary/challenge tick | 0 direct/continuation
+challenge_receipt_kib = 16 challenge tick | 0 otherwise
+```
+
+Those Authority terms are closed copies, not padding. Pre-effect is 64-KiB
+outcome + 128-KiB empty-use receipt + 128-KiB result-authorization audit + 64-KiB
+intent. Challenge is 64-KiB outcome + 256-KiB immutable challenge/continuation +
+64-KiB approval-request binding + 128-KiB result-authorization audit + 64-KiB
+intent. Post-reservation is 64-KiB outcome + 1,920-KiB receipt + 128-KiB audit +
+64-KiB intent + 64-KiB attestation. Cancelled is 128-KiB audit + 64-KiB
+cancellation intent. `D=3` is exactly the dynamic aggregate index plus one
+full-member-pair extent index and one restricted-member-pair extent index; the
+four canonical member BLOBs remain separately charged in `publication_kib`.
+
+`4*T+64+8*C` is four separately charged event-byte copies, the two 32-KiB
+command wrappers, and one acknowledgement BLOB per append command. The 2,048-KiB
+State Service bundle is therefore present in every tick profile and absent from a
+continuation final episode; it cannot be hidden inside a trace or owner-command
+copy. Folding those equations gives the exact terminal-episode vectors:
+
+| Terminal episode only | Hot | Records | Bundle KiB | Markers |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary pre-effect direct / tick | 7 / 9 | 37 / 53 | 5,504 / 7,724 | 7 / 11 |
+| Approval challenge direct / tick | 8 / 10 | 41 / 59 | 5,872 / 8,108 | 7 / 12 |
+| Ordinary trusted terminal, excluding operational base, direct / tick | 8 / 10 | 71 / 87 | 7,360 / 9,580 | 8 / 12 |
+| Ordinary material terminal, excluding operational base, direct / tick | 7 / 9 | 59 / 75 | 3,652 / 5,872 | 8 / 12 |
+| Continuation pre-effect final episode | 7 | 40 | 5,680 | 7 |
+| Continuation trusted final episode, excluding operational base | 8 | 74 | 7,536 | 8 |
+| Continuation material final episode, excluding operational base | 7 | 62 | 3,828 | 8 |
+| Cancelled continuation final episode | 7 | 29 | 4,584 | 7 |
+
+The complete generated profiles, including a retained challenge when applicable,
+are normative. `Receipt` is `canonical KiB / maximum pre-receipt C03 refs /
+maximum trusted-send evidence refs`; `none` means no delivery receipt is legal:
+
+| Complete profile | Hot | Records | Bundle KiB | Durable KiB | Markers | Receipt |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Pre-effect direct | 7 | 37 | 5,504 | 5,652 | 7 | `128/0/0` |
+| Pre-effect tick | 9 | 53 | 7,724 | 7,936 | 11 | `128/0/0` |
+| Trusted ordinary direct | 55 | 1,193 | 9,280 | 14,052 | 52 | `1,920/6,096/2,320` |
+| Trusted ordinary tick | 57 | 1,209 | 11,500 | 16,336 | 56 | `1,920/6,096/2,320` |
+| Material ordinary direct | 55 | 1,214 | 5,572 | 10,428 | 52 | `1,920/8/0` |
+| Material ordinary tick | 57 | 1,230 | 7,792 | 12,712 | 56 | `1,920/8/0` |
+| Approval challenge direct | 8 | 41 | 5,872 | 6,036 | 7 | `none` |
+| Approval challenge tick | 10 | 59 | 8,108 | 8,344 | 12 | `none` |
+| Direct parent, challenge plus pre-effect continuation | 15 | 81 | 11,552 | 11,876 | 14 | `128/0/0` |
+| Tick-origin parent, challenge plus pre-effect continuation | 17 | 99 | 13,788 | 14,184 | 19 | `128/0/0` |
+| Direct parent, challenge plus trusted continuation | 63 | 1,237 | 15,328 | 20,276 | 59 | `1,920/6,096/2,320` |
+| Tick-origin parent, challenge plus trusted continuation | **65** | 1,255 | **17,564** | **22,584** | **64** | `1,920/6,096/2,320` |
+| Direct parent, challenge plus material continuation | 63 | 1,258 | 11,620 | 16,652 | 59 | `1,920/8/0` |
+| Tick-origin parent, challenge plus material continuation | **65** | **1,276** | 13,856 | 18,960 | **64** | `1,920/8/0` |
+| Direct parent, challenge plus cancellation | 15 | 70 | 10,456 | 10,736 | 14 | `none` |
+| Tick-origin parent, challenge plus cancellation | 17 | 88 | 12,692 | 13,044 | 19 | `none` |
+
+The maximum admission vector takes each dimension independently:
+`hot=65`, `records=1,276`, `bundle=17,564 KiB`, `durable=22,584 KiB`,
+`markers=64`, and one incident credit. It is not a fictitious single path: the
+bundle/durable maximum is the tick-origin trusted-continuation parent, while the
+record maximum is the tick-origin material-continuation parent. Sixteen-request
+receipt maxima remain exactly `16*(13*27+16+12+2)=6,096` C03 refs and
+`16*145=2,320` trusted-send refs; terminal/post-receipt events and owner-local
+publication objects are bound by authorization and are not falsely inserted into
+the pre-receipt arrays.
+
+For a multi-requirement action, the lowest canonical requirement ordinal is the
+sole terminal-host unit for action-level outcome/event/projection/publication/
+State/Agent objects; every other unit uses only its requirement-local operational
+rows. All units retain their non-borrowable alternative capacity so loss of normal
+quota cannot strand the action, but the unfolded ledger assigns each actual object
+to the terminal host exactly once. A future larger schema, new legal event, extra
+owner copy, or additional response member requires an accepted profile and
+regenerated equations; compression, sharing, or observed averages cannot satisfy
+the declared maximum.
+
+The per-control 71 slots admit ordinary completion or the distinct
+`reconciliation_exhausted` alternative, never both. The canonical enum drives
+eleven node profiles and two provider profiles. The 12 lease slots admit epoch 0,
+two same-ID recoveries, and overflow. A generated schema-path/source/copy/owner/
+slot ledger expands every folded row above. Each entry names the closed schema
+path and union arm, source ID kind, canonical maximum, physical owner, retained-
+copy ordinal, record/bundle/hot slot, marker class or `not_applicable`, and release
+rule. Generation fails on an unassigned or unreachable arm, duplicate slot,
+missing copy, missing common-event metadata, missing owner command/receipt/
+acknowledgement, unbudgeted State object or projection source/checkpoint/export,
+wrong response-member cardinality, or a slot reachable from two arms.
+
+The exact maximum 64-marker parent consists of 12 challenge-tick identities plus
+52 trusted/material continuation identities. The challenge identities are its
+authorization, prepare receipt, four State command/receipt/arm/ack identities,
+four Agent command/receipt/arm/ack identities, completed-challenge-tick receipt,
+and approval-continuation identity. The continuation identities are 44 operational
+identities plus eight final-publication identities. The 44 are two provider
+invocations, eleven node invocations, thirteen reconciliation claims, thirteen
+control-row tombstones, cleanup command, containment-reserve tombstone, incident,
+material-isolation preparation, and terminalization lease. The final eight are
+delivery-control attestation, terminal delivery receipt, publication
+authorization, publication prepare receipt, and four Agent command/receipt/arm/
+ack identities. A continuation emits no new State identities. These exact typed
+classes, ordinals, and roots are fixed; no generic remainder exists.
+
+Authority reserves slot bindings. It allocates only the command IDs for commands
+it issues; those are caller idempotency identities in owner-supplied nominal types.
+State Service or Agent Instance Controller alone allocates its completion receipt,
+arm acknowledgement, and completed-challenge receipt IDs. After validating an
+owner object, Authority CASes the matching slot from `unused` to
+`claimed {nominal_identity,authority_domain,owner_receipt_digest}`; a command slot
+instead binds the issued command digest. Same-class replacement, a normal
+identity, or another class rejects. Tombstone commit moves
+the slot to `charged {permanent_marker_id,marker_integrity_digest}`. Verified
+trusted retirement preserves charged markers under the separate retirement head;
+material slots are permanently charged/non-retirable.
+
+The implementation must generate the FND-012 report from canonical Rust maximum
+fixtures and registered driver manifests. It first enumerates all legal grammar
+tuples, two provider controls, eleven node-control variants, trusted sends, stable
+events, owner-local commands/receipts/acknowledgements, State objects, projection
+sources/copies/checkpoints/exports, publication arms, and exact response members.
+It then emits the unfolded ledger and recomputes every profile, parent sum,
+receipt bound, marker class, and node/tenant floor. CI fails unless it derives the
+complete profile table, maximum vector `65/1,276/17,564/22,584/64`, response sets
+`4,096/4 KiB`, receipt refs `6,096/2,320`, and equations above. OpenAPI, Python,
+TypeScript, and operator reports consume that one generated evidence artifact;
+none carries an independent oracle.
+
+Admission proves configured node and active-tenant floors, then atomically
+reserves the exact generated vector and incident credit before its first legal
+phase. For approval parents this occurs before challenge release; it grants no
+effect authority. For `N` requirements it requires `N` vectors in both tenant
+suballocation and node aggregate. A physical node charge is attributed exactly
+once to one tenant; the tenant check is not a second allocation. Partial
+reservation rolls back with no effect. Accounting locks are tenant normal, node
+normal, tenant emergency, then node emergency, ordered within each by Authority
+sequence and canonical parent/use-attempt ID. If any dimension or exact marker
+class is short, new challenge/exposure stops before owner command, reserve/use,
+provider/node/adapter, or target work. Existing reservations are never evicted.
 
 Emergency controls still traverse current authority, gateway, permit, evidence,
 and exact provider/node ledgers, but debit the bound reserve rather than normal
@@ -6506,8 +6929,10 @@ quarantine retains the unit. No release path interprets exhaustion as external
 success.
 
 A material-exposed unit is never release-eligible or C03-retirable in v1. From
-the absorbing Authority one-shot commit onward, its complete 51 hot slots, 1,179
-record credits, 14,020 KiB durable bytes, incident credit, all 47 marker debits,
+the absorbing Authority one-shot commit onward, its complete accepted material
+profile and parent prefix remain charged; the allocator-wide ceilings are 65 hot
+slots, 1,276 record credits, 22,584 KiB durable bytes, one incident credit, and 64
+marker debits,
 private scratch, execution resources, and tenant/node
 admission charge remain pinned identically. Actual return, revocation, fencing,
 drain, wipe, cleanup, reconciliation, tombstone completion, or zero live debit
@@ -6740,9 +7165,12 @@ Authority prepares pending receipt/outcome/intent + exact append command
 Event/Evidence appends exactly one action.executed | action.failed and durable ack
 Authority validates ack and CAS-finalizes SecretDeliveryReceipt; submission terminalizing
 outcome.recorded
-tick only: prepared state node + state.committed + tick.completed + final head CAS
-origin-specific run/tick update + timing-safe projection checkpoint verification
-publication owner commits SecretPublicationAuthorizationV1 and authorized response-set member bytes
+tick only: State Service prepares node/head; Event/Evidence appends state.committed/tick.completed
+Agent Instance Controller validates the completed suffix and keeps run/tick pending
+State and Agent return exact owner-local completion receipts with read fences closed
+Authority persists prepared SecretPublicationAuthorizationV1 + exact response members
+State and Agent arm only their local fences and return exact acknowledgements
+Authority validates every applicable acknowledgement and alone CASes authorization to released
 submission terminal; current result-read authorization revalidated
 trusted injection: authorized sealed ActionOutcome/receipt response released
 material exposure: authorized fixed terminal/restricted suppression envelope released
@@ -6752,8 +7180,9 @@ An approval-required first attempt has this exact compatible fork after
 `verification.completed`: atomically persist the immutable continuation and
 stable challenge outcome, emit `action.needs_approval` and
 `approval.requested`, move the parent to `awaiting_approval`, release the stable
-outcome, and complete the ordinary path suffix. It has no reserve, use claim,
-provider/node/adapter/target work, or delivery receipt. A later exact stable
+outcome, and complete the ordinary path suffix. Before release, Authority reserves
+the exact generated challenge-plus-final capacity vector, but creates no exposure
+containment/use row, provider/node/adapter/target work, or delivery receipt. A later exact stable
 `/actions` continuation emits daemon audit, `verification.started`, current
 authority/approval revalidation, durable one-use receipt claim,
 `approval.granted`, and parent `continuing` before the reserve/use sequence above.
@@ -7336,7 +7765,7 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | Duplicate or response-lost provider renew/revoke/audit/active probe | Resolve the Authority ledger; exact bytes return original state/result, changed bytes conflict, sent uncertainty never re-enters the method, and post-effect loss uses retained bytes or a new authorized read-only audit. |
 | Node fence/terminate/close/unmount/delete/attest/revocation acknowledgement outside node-control gateway profile | Reject; direct node/OS/orchestrator mutation count remains zero. |
 | Node-control retry after proved no-send versus after write-ahead send | Only `one_no_send_retry_100ms` permits one same-plan retry after exactly 100 ms with owner proof of zero bridge bytes/local mutation. `no_retry`, missing proof, changed bytes, or any `sent_uncertain|sent_known` state permits no resend or failover. |
-| Normal/uncertain quotas or normal marker slots filled after exposure | The unit's non-borrowable 1,179 tick/1,171 direct record credits, 14,020/11,860 KiB durable bytes, 51 hot slots, and 47 typed emergency marker slots admit the generated owner-control/Authority-commit/terminal/trace/state/publication/tombstone sequence. New exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. A material-exposed unit remains permanently pinned/non-retirable. |
+| Normal/uncertain quotas or normal marker slots filled after exposure | The accepted generated vector, bounded by independent maxima of 1,276 records, 17,564 bundle KiB, 22,584 durable KiB, 65 hot slots, and 64 typed emergency marker slots, admits its exact owner-control/Authority-commit/terminal/trace/state/publication/tombstone sequence. New challenge/exposure stops first; no existing reserve, active state, or marker is evicted/reassigned. A material-exposed unit remains permanently pinned/non-retirable. |
 | Independent lineages share node/instance/generation number | Node domain, handle, plan, result, receipt, marker, cleanup, restart/migration, and retirement also bind the nominal exposure-lineage ID. Retirement of lineage A generation 1 cannot conflict with, compact, or deny lineage B generation 1. |
 | Lease not active/expired/revoked/max-use | Atomic deny before exposure/effect. |
 | Unknown/closed handle | Uniform deny; never attempt provider lookup from handle metadata. |
@@ -7361,7 +7790,7 @@ failure handler from inventing a different status or bypass path:
 | Authentication/closed-schema/raw-ingress/owner-compatibility failure before outer acceptance | `none / none` | 0 / 0 | No C03 `ActionOutcome`; visibility-safe transport error | No submission, receipt, action event, provider/node/adapter/target call, or persistence of rejected raw bytes. |
 | Tick policy trace/observation/scan/digest/batch failure before outer claim | `none / none` | 0 / 0 | No C03 `ActionOutcome`; tick fails closed | No outer row/effect/state advancement; exact retained bytes are reused only by explicit same-tick recovery, never policy reinvocation or orphan reconciliation. |
 | Accepted authority/verifier denial before reservation | `none / none` | 0 / 0 | `Denied`; target/outer `none` | Empty use-attempt batch and one matching final pair; no provider/delivery event. |
-| Initial approval challenge | `none / none` | 0 / 0 | Stable attempt-terminal `NeedsApproval`; C03 parent `awaiting_approval` | Prepare the immutable continuation/challenge outcome, append one exact `action.needs_approval`/`approval.requested` bundle through Event/Evidence, then Authority-finalize from its durable acknowledgement; no reserve, batch, delivery receipt, provider/node/adapter/target work, or effect-terminal parent. |
+| Initial approval challenge | `none / none` | 0 / 0 | Stable attempt-terminal `NeedsApproval`; C03 parent `awaiting_approval` | Reserve the generated challenge-plus-final capacity vector, prepare the immutable continuation/challenge outcome, append one exact `action.needs_approval`/`approval.requested` bundle through Event/Evidence, and complete the owner-local publication handoff. No exposure containment/use row, delivery receipt, provider/node/adapter/target work, or effect-terminal parent exists. |
 | Exact approval receipt continuation | From the later actual path | At most 1 / 1 across the parent | Stable final result from the one continued gateway attempt | Same parent/key/action/tick observation and requirements; current checks plus one durable receipt claim, no policy/new tick/state advance, and exactly one final pair. |
 | Approval denial/expiry/revocation/cancel or competing receipt | `none / none` before claim | 0 / 0 | Stable no-effect denial pair, or C03 `cancelled` with no fabricated action outcome | Exact raw fail-closed evidence may close awaiting parent; changed/competing receipt conflicts; cancel/revoke/expiry winner prevents claim. |
 | Accepted verifier/runtime unavailability before reservation | `none / none` | 0 / 0 | `NeedsIntervention`; target/outer `none` | Empty use-attempt batch and one matching terminal pair; fail closed with no provider/node/adapter/target work. |
@@ -7389,7 +7818,7 @@ failure handler from inventing a different status or bypass path:
 | Cancellation/timeout after target start | Each from durable send facts for trusted injection; fixed certainty for material exposure | 1 / 1 | `Failed`; material exposure uses the fixed suppression projection | Drain within bounds, scan/seal, cleanup/quarantine, one failed terminal pair, and no blind retry. Material-exposed timeout/return timing cannot alter a readable record or release time. |
 | Provider/node/adapter unwind or panic | Each from durable send facts | Exactly from durable entry/start facts | `NeedsIntervention` only at 0 adapter entries; otherwise `Failed` | Gateway guard owns cleanup. Missing facts are treated as crossed/uncertain; panic-abort/process death uses supervisor reconciliation and cannot emit success. |
 | Cleanup/drop/wipe failure | Each from durable send facts for trusted injection; fixed certainty after material exposure | Exactly from durable entry/start facts before exposure; fixed projection after material exposure | `NeedsIntervention` at 0 entries; otherwise `Failed`; material exposure uses the fixed suppression projection | Retain detector/fence where possible. Trusted injection emits cleanup uncertainty; material exposure keeps that branch live-only and commits the same fixed suppression pair. |
-| Pending-outcome/terminal prepare, any suffix append/acknowledgement/finalization, state/head/run update, projection verification, or publication authorization failure | Preserve all dimensions | Preserve both facts | No public `ActionOutcome`; outer `uncertain` or submission `terminalizing` | Keep every exact Gateway/Authority/Event/State owner copy and acknowledgement with `terminal_evidence_blocked` or `publication_authorization_blocked`; no final outcome/receipt/state/run/next-tick/export/replay release until exact owner-local reconciliation and publication authorization, with no repeated effect, changed append bytes, or reconstruction. Exhaustion withholds permanently. |
+| Pending-outcome/terminal prepare, any suffix append/acknowledgement/finalization, State/Agent owner update/receipt/arm, projection verification, or publication authorization failure | Preserve all dimensions | Preserve both facts | No public `ActionOutcome`; outer `uncertain` or submission `terminalizing` | Keep every exact Gateway/Authority/Event/State/Agent owner copy and acknowledgement with `terminal_evidence_blocked` or `publication_authorization_blocked`; no final outcome/receipt/state/run/next-tick/export/replay release until exact owner-local reconciliation and publication authorization, with no repeated effect, changed append bytes, or reconstruction. Exhaustion withholds permanently. |
 | Revocation acknowledgement uncertainty | Independent provider/control facts | In-flight action preserves its entry/start facts | Control `effect_uncertain`; action status follows adapter-entry fact | Keep `revocation_pending`, emit `revocation_uncertain`, quarantine, and use a fresh authorized same-target control invocation for reconciliation. |
 
 ## Validation and Acceptance Plan
@@ -7409,7 +7838,8 @@ Contract acceptance and implementation evidence are separate gates.
 V1a is C03-owned pre-placement grammar only:
 
 - Add C03-owned ref, requirement, provider, detector, event, command, outer
-  submission/idempotency/receipt/publication-authorization, approval-continuation, exposure-lineage,
+  submission/idempotency/receipt/publication-authorization/publication-prepare,
+  approval-continuation, exposure-lineage,
   bootstrap-binding, and node-control IDs plus closed enums, `SecretRef`,
   `SecretLeasePolicy`, and
   `SecretUseRequirement` with `deny_unknown_fields`.
@@ -7431,7 +7861,9 @@ terminal-intent/hot-index/receipt records importing the sole owner-defined exact
 node `reconciliation_exhausted` intent/receipt/explicit-absence/hot-index/
 tombstone variants, material-isolation preparation plus Authority commit and
 NODE finalization, no-commit authorization, and typed abort receipts, bounded terminalization-lease progress/overflow,
-owner-local terminal append command/draft/acknowledgement records,
+  owner-local terminal append command/draft/acknowledgement records and the
+  imported State/Agent publication command/completion/arm/acknowledgement plus
+  completed-challenge-tick receipt contracts,
 timing-safe trace/state-head/run-inspect/audit projections plus the signed
 `TimingSafeProjectionEnvelopeV1`, detached
 `TimingSafeProjectionSignatureInputV1`, source-correspondence/checkpoint/export-manifest
@@ -7470,8 +7902,18 @@ pin a complete 32-KiB stable `Action`, 32-KiB-plus-one rejection, complete 64-Ki
 stable `ActionOutcome`, 64-KiB-plus-one fixed-failure normalization, and successful
 large-output artifact/data reference. They serialize every complete `ActionFailed`,
 `OutcomeRecorded`, additive C03 event, state/tick suffix, Authority pending copy,
-append command, Event/Evidence payload copy, projection sidecar, publication
-authorization/response, and state/head object under the exact per-object bounds.
+  Authority append-command outbox, Event/Evidence append-command inbox and payload
+  copy, projection source/sidecar/chain/checkpoint/export object, publication
+  authorization/prepare receipt, every exact response member, State/Agent owner-
+  local command/receipt/arm/acknowledgement, completed-challenge-tick receipt, and
+  state/head object under the exact per-object bounds.
+  The generated terminal/resource fixture enumerates every legal origin/exposure/
+  terminal/approval/projection tuple, independently serializes each stable
+  terminal kind and `OutcomeRecorded`, expands the schema-path/source/copy/owner/
+  slot ledger, and recomputes every complete profile and parent sum. Missing or
+  duplicate slots/copies, unreachable arms, a tick profile without the 2,048-KiB
+  State bundle, and any value other than maximum vector
+  `65/1,276/17,564/22,584/64` fail V1.
 Driver-manifest fixtures
 pin every trusted-send limit/control-set cardinality from one through eight and
 reject missing, zero, nine, duplicate, or out-of-set declarations.
@@ -7626,7 +8068,7 @@ remains `not_exercised`.
   outer submission claim. Direct begins at its versioned ingress. Both
   then prove
   final verification -> non-borrowable containment reservation -> use reservation
-  -> target/control allocation -> material-only typed prepare receipt -> absorbing
+  -> target/control allocation -> profile-tagged typed node preparation receipt -> absorbing
   Authority commit receipt -> typed activate/finalization receipt -> exact receipt/
   current-authority provider gate -> durable pre-provider evidence
   -> borrowed permit -> provider -> driver-local `resolve_and_deliver` -> exactly
@@ -7732,6 +8174,25 @@ remains `not_exercised`.
   changed event, exposes an outcome before publication authorization, advances a
   visible state/head/tick early, or
   repeats provider/node/adapter/target work.
+- Owner-local publication crash fixtures stop before/after State completion,
+  Agent completion, Authority prepare, each State/Agent arm, both arms, and the
+  Authority release CAS. At every strict prefix, response/state/run/next-tick/
+  export/replay reads remain fenced. Lost replies recover the immutable record by
+  command ID/digest; exact duplicates return it; changed bytes, stale revisions,
+  wrong owner/audience/expiry, substituted receipt, or cross-owner write leave all
+  fences closed. State Service mutates only state/head rows, Agent Instance
+  Controller only run/tick rows, and Authority only submission/authorization rows.
+  Tick-challenge continuation fixtures validate the retained completed-challenge
+  receipt, issue no new State command, do not reopen the tick, and append no new
+  `StateCommitted` or `LoopTickCompleted`.
+- Publication-union fixtures contain a positive canonical record for every legal
+  grammar row: pre-effect denial/intervention, trusted execution/failure/pre-entry
+  intervention, fixed material failure, direct/tick challenge, every continued
+  grant/deny/expiry/revocation final, and cancellation for both immutable original
+  origins. Negatives swap terminal events, outcomes, C03 refs, owner receipts,
+  response-set tags, direct/tick origin, challenge receipt, projection checkpoint,
+  or any cross-arm field. An absent legal tuple, material dynamic response, trusted
+  fixed-false response, or continuation-created tick suffix fails before release.
 - Projection-integrity fixtures omit, reorder, duplicate, substitute, and truncate
   envelopes; alter projected payload/source identity/sequence/causal parent/state
   head/policy/key/checkpoint; splice across run/view/policy chains; swap a safe
@@ -7824,15 +8285,17 @@ remains `not_exercised`.
   allowance plus every normal marker slot after an exposure has atomically
   reserved its unit, then exercise provider revoke/audit, node fence/terminate/close/
   unmount/delete/attest, cleanup, terminal evidence, incident, reconciliation,
-  and tombstone work from the non-borrowable reserve. Direct and tick fixtures
-  drive all 51 hot slots, 47 marker slots, 1,171/1,179 event/evidence/enforcement-
-  record credits, and 11,860/14,020 KiB durable bytes to their generated exact
-  maxima. They include the complete 71-record typed `prepare_delivery` profile,
+  and tombstone work from the non-borrowable reserve. Fixtures drive every
+  complete generated single-episode and approval-parent profile, including the
+  independent 65-hot, 1,276-record, 17,564-bundle-KiB, 22,584-durable-KiB, and
+  64-marker maxima. They include the complete 71-record typed `prepare_delivery` profile,
   Authority commit/receipt, the complete 71-record typed `activate_delivery`
-  profile, the complete 71-record typed `abort_delivery` profile, all three
-  canonical event copies, timing projection sidecars, all eight C03 trace records,
-  terminalization lease epochs, stable suffix, publication authorization/response,
-  and tick state-node/metadata/head transaction. New exposure stops
+  profile, the complete 71-record typed `abort_delivery` profile, all four
+  canonical event copies, every separately counted trace/state-head/run/audit
+  projection source, chain/checkpoint/export object, all eight C03 trace records,
+  owner-local commands/receipts/acknowledgements, terminalization lease epochs,
+  stable suffix, publication authorization/four-member or fixed-false response
+  set, and the separately charged 2,048-KiB tick State Service transaction. New exposure stops
   first, every already-reserved write retains its slot through restart, trusted-
   injection release and permanent material non-retirement are verified, and no
   active/tombstone/reserve row is evicted or reassigned.
@@ -7851,10 +8314,13 @@ remains `not_exercised`.
 - A canonical-manifest lint enumerates exactly two provider controls and all eleven
   `SecretNodeControlOperation` variants, proves each maps to one 71-record/3-hot/
   128-KiB/3-marker profile, and fails on any missing, duplicate, extra, or hand-
-  written operation. It recomputes all 13 reconciliation claims/tombstones, the
-  two Authority commit slots, 51/1,171/1,179/7,176/9,304/47 unit totals, tenant/
-  node floors, and the 6,096-event-ref receipt maximum from schemas rather than
-  prose constants.
+  written operation. It expands every legal grammar arm into the schema-path/
+  source/copy/owner/slot ledger and rejects an unassigned path, unreachable arm,
+  duplicate slot, missing stable-event metadata, owner copy, response member, or
+  projection object. It recomputes all 13 reconciliation claims/tombstones, every
+  single and approval-parent profile, maximum vector
+  `65/1,276/17,564/22,584/64`, tenant/node floors, and the 6,096/2,320 receipt
+  maxima from schemas rather than prose constants.
 - Terminalization pressure separately crashes after every one of ten direct and
   twelve tick stable appends, prepared state node, metadata write, pending-head
   write, final-head CAS, run/tick update, projection verification/checkpoint,
@@ -7890,9 +8356,17 @@ remains `not_exercised`.
   optional tag, order, timestamp, candidate/policy/tick digest, retained
   observation byte, expiry/tombstone, and stable plain-candidate mapping. Response
   fixtures pin all nine states in full/restricted views, every required/forbidden
-  field, awaiting challenge/cancelled behavior, complete/
-  withheld receipt, split/outer certainty, duplicate/poll/retry behavior,
-  content type, HTTP status, size cap, and unknown-field/enum negatives. For
+  field, awaiting challenge/cancelled behavior, complete/withheld receipt, split/
+  outer certainty, content type, HTTP status, size cap, and unknown-field/enum
+  negatives. For every dynamic terminal they persist and digest byte-distinct
+  `full,false`, `full,true`, `restricted,false`, and `restricted,true` members,
+  prove the 2,044+2,044+4+4=4,096-KiB simultaneous bound, and prove that creating
+  POST/GET choose false while exact duplicate POST chooses true independently of
+  current full/restricted authorization. Response loss, downgrade, export, replay,
+  and SDK lookup return one stored member byte-for-byte; post-digest duplicate/view
+  rewriting or reconstruction fails. Material fixtures persist only the 4-KiB
+  `restricted,false` member and prove creating, duplicate, and GET all select it;
+  any true/full member fails schema and authorization. For
   canonical-byte limits, all four languages produce identical 32-KiB action,
   64-KiB outcome, complete event/command/copy maxima, and cap-plus-one rejection
   vectors; a large governed artifact/data-ref output succeeds without inline
@@ -7971,15 +8445,16 @@ remains `not_exercised`.
   output-drain, cleanup, and 24-hour soak budget passes on the activation
   composition. Worst-case 64-KiB material with every enabled representation at
   the 64-detector/16-invocation node maxima and 16-detector/4-invocation tenant
-  maxima satisfies the 104.125-MiB node and 26.03125-MiB tenant equations,
-  including the 6.375/1.59375-MiB containment hot
+  maxima satisfies the 105.875-MiB node and 26.46875-MiB tenant equations,
+  including the 8.125/2.03125-MiB containment hot
   pools and 1.75/0.4375-MiB retirement hot scratch. The report also proves the
-  876.25/219.0625-MiB containment durable floors, 2.0625/0.515625-MiB retirement
-  durable scratch floors, normal 8/2-MiB marker stores, 6,016/1,504-KiB emergency
-  marker floors, 32/8-MiB retirement deny-head floors, 75,456/18,864 record
-  credits, 896/224 control-plus-containment tombstones, all 51 hot and 47 typed
-  emergency marker slots per unit, direct/tick
-  1,171/1,179 records and 11,860/14,020 KiB, the 6,096/2,320 receipt ref maxima, and 71
+  1,411.5/352.875-MiB containment durable and 1,097.75/274.4375-MiB bundle floors,
+  2.0625/0.515625-MiB retirement durable scratch floors, normal 8/2-MiB marker
+  stores, 8,192/2,048-KiB emergency marker floors, 32/8-MiB retirement deny-head
+  floors, 81,664/20,416 record credits, 896/224 control-plus-containment
+  tombstones, the complete generated profile table, independent
+  65/1,276/17,564/22,584/64 maxima, 4,096/4-KiB response sets, the 6,096/2,320
+  receipt ref maxima, and 71
   records per control row. The report is generated from the
   canonical Rust schemas and driver-manifest maxima and fails on any mismatch
   with the normative equations; hand-maintained operator values are insufficient.
@@ -8117,8 +8592,11 @@ Known prerequisite boundaries remain explicit:
   `SecretTerminalizationLeaseId` with epoch 0 plus at most two same-ID one-second
   recoveries, durable fence/progress, cap+1 overflow, truthful stable timestamps,
   detached-signature timing-safe projection protocol, and direct/tick publication-
-  authorization inputs; the application run/state owner must supply the tick
-  final-head/run-status/publication CAS fence; NODE/SBX must
+  authorization inputs; State Service must supply the typed state publication
+  command/completion/arm/ack contracts and mutate only state/head fences, while
+  Agent Instance Controller must supply the corresponding lifecycle contracts,
+  completed-challenge-tick receipt, and mutate only run/tick fences. Authority
+  alone owns the final publication CAS; NODE/SBX must
   supply `SandboxId` and `ProcessBoundaryId`; DUC must supply `DataUseGrantId`;
   change/incident owners supply their revocation-target IDs. C03 cannot expose
   dependent variants first.
@@ -8198,6 +8676,25 @@ Independent reviewers should recommend acceptance only if all are true:
   Submit-only unrelated principals receive uniform not-available, while an
   existence-authorized caller without result visibility receives only restricted
   non-retryable status.
+- Every dynamic terminal authorization stores all four exact canonical response
+  members (`full,false`, `full,true`, `restricted,false`, `restricted,true`) and
+  selection never rewrites a byte after digest. Creating POST/GET choose false;
+  exact duplicate POST chooses true independently of view. Material exposure has
+  the closed fixed-false arm and stores only `restricted,false`; all routes select
+  it and no true/full member is legal.
+- One closed generated grammar covers every legal direct/tick, pre-effect/trusted/
+  material, terminal-action, approval-continuation, and projection-source tuple.
+  Its total tagged `SecretPublicationAuthorizationV1` binds only arm-applicable
+  events, owner receipts, response members, and original-origin suffix. A
+  continuation from a completed tick challenge references that immutable receipt,
+  emits no new State/tick suffix, and cannot be rewritten as direct.
+- State Service alone mutates state/head visibility, Agent Instance Controller
+  alone mutates run/tick lifecycle, Event/Evidence alone appends events/
+  projections, and Authority alone mutates submission/publication authorization.
+  Exact completion receipts, Authority prepare, local arm acknowledgements, and
+  final Authority release form the read fence; no strict prefix exposes response,
+  head, run completion, next tick, export, or replay final and no distributed or
+  shared-owner transaction is assumed.
 - Authority claims one durable outer submission before C03 terminal evidence,
   reservation, provider/node work, or adapter entry; a tick outer may be inserted
   only after its exact durable Event/Evidence link receipt validates. Exact
@@ -8206,7 +8703,7 @@ Independent reviewers should recommend acceptance only if all are true:
   an effect.
 - Complete unchanged stable `Action` and `ActionOutcome` bytes are independently
   capped at 32/64 KiB for C03 without changing their schemas. Every complete
-  stable/additive event, append command, Authority/Event/State copy, projection,
+  stable/additive event, append command, Authority/Event/State/Agent copy, projection,
   response, and publication object has the named generated maximum; cap-plus-one
   rejects or uses the fixed pre-reserved post-effect failure, and large successful
   data is a governed artifact/data reference.
@@ -8414,18 +8911,19 @@ Independent reviewers should recommend acceptance only if all are true:
   waits for ordinary terminal cleanup/revocation or the exact non-material
   exhausted-row quarantine/retirement policy; material-exposed units are never
   release-eligible and remain permanently pinned/non-retirable. The Authority-
-  local allocator transaction includes 51 hot slots, 47 typed emergency marker
-  slots, exactly 1,171 direct or
-  1,179 tick event/evidence/enforcement-record credits, and 11,860 direct or 14,020
-  KiB tick durable bytes per unit;
+  local allocator transaction reserves the exact generated profile and enforces
+  independent maxima of 65 hot slots, 64 typed emergency marker slots, 1,276
+  event/evidence/enforcement-record credits, 17,564 bundle KiB, and 22,584 durable
+  KiB per approval-capable parent;
   normal identities cannot borrow those slots. Verified trusted-injection release
   returns the reusable unit after zero live debit and only unused marker slots;
   material ordinary retirement is forbidden. Charged material markers remain
   permanently. FND-012 proves
-  104.125/26.03125-MiB restricted-memory totals,
-  876.25/219.0625-MiB containment durable floors, 75,456/18,864 record-credit
+  105.875/26.46875-MiB restricted-memory totals,
+  1,411.5/352.875-MiB containment durable floors, 1,097.75/274.4375-MiB bundle
+  floors, 81,664/20,416 record-credit
   floors, 896/224 control-plus-containment tombstone floors, normal minimum
-  8/2-MiB marker stores, emergency 6,016/1,504-KiB marker
+  8/2-MiB marker stores, emergency 8,192/2,048-KiB marker
   floors, and separate 32/8-MiB retirement deny-head floors. The report is
   generated from canonical Rust schemas and manifest maxima rather than copied
   prose arithmetic.
