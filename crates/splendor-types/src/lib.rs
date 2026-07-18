@@ -52,6 +52,7 @@ mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod secrets;
 mod security_invariants;
 mod state_handoff;
 mod trace;
@@ -216,6 +217,11 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use secrets::{
+    SecretClassification, SecretDeliveryExposureProfile, SecretDeliveryMethod, SecretLeasePolicy,
+    SecretLeasePolicyError, SecretOfflineBehavior, SecretProviderVersionRef,
+    SecretProviderVersionRefError, SecretPurpose, SecretUseIntent,
 };
 pub use security_invariants::{
     validate_security_invariant_catalog, ContainmentAction, CryptoAgility, ExecutableGoldEvidence,

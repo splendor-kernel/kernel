@@ -5,13 +5,19 @@
 ### Added
 
 - **status/incomplete:** added exactly 40 behavior-free C03 V1a nominal secret
-  UUID identity types with checked non-nil construction, strict lowercase
-  hyphenated parsing/deserialization, canonical serialization, bounded
-  non-echoing errors, and byte-order-compatible ordering. This IDs-only slice
-  adds no `SecretRef`, `SecretUseRequirement`, provider port, broker lifecycle,
-  lease/delivery record, secret side effect, generated public surface, scanner,
-  feature activation, issue closure, or gold pass; stable 0.1 ID behavior and
-  bytes remain unchanged.
+  UUID identity types plus six owner-independent closed enums, a strict opaque
+  non-locator `SecretProviderVersionRef`, and a closed valid-by-construction
+  `SecretLeasePolicy`. IDs retain checked non-nil construction, strict lowercase
+  hyphenated wire forms, canonical serialization, bounded non-echoing errors,
+  and byte-order-compatible ordering. Pre-placement primitives reject unknown,
+  malformed, duplicate, null, wrong-type, out-of-range, locator-like, and unsafe
+  integer forms without adding authority or runtime behavior. This partial slice
+  adds no complete `SecretRef`, `SecretUseRequirement`, lease record/lifecycle,
+  provider port, broker, Gateway/daemon/API/SDK/generated surface, scanner,
+  feature activation, issue closure, or gold pass. The owner-defined
+  `SecretCredentialSlotId` and exact credential-sink/trusted-send/destination
+  contracts remain external blockers; stable 0.1 behavior and bytes remain
+  unchanged.
 - Hardened physical/edge resident boundaries without changing intervention or
   trace-record schemas. Operator intervention evidence is now checked against
   the authoritative tenant, agent, run, node, action, granted status, and expiry,
