@@ -408,6 +408,7 @@ The following C03-owned IDs are UUID-backed nominal newtypes in
 | `secret_containment_command_id` | `SecretContainmentCommandId` | Idempotency identity for leak containment. |
 | `secret_use_claim_id` | `SecretUseClaimId` | One atomic exposure/use claim. |
 | `secret_outer_admission_capacity_binding_id` | `SecretOuterAdmissionCapacityBindingId` | One Authority-owned pre-outer capacity ownership identity; not a use, exposure, target, quota credit, or authority. |
+| `physical_metadata_budget_signing_key_id` | `PhysicalMetadataBudgetSigningKeyId` | One purpose-separated trusted-registry Ed25519 signing-key identity for physical-metadata budget sets; never a projection, work-order, caller, node, provider, or generic string identity. |
 | `secret_containment_reserve_id` | `SecretContainmentReserveId` | One pre-exposure non-borrowable containment reservation; not a quota credit or authority. |
 | `secret_publication_preparation_id` | `SecretPublicationPreparationId` | One Authority-owned immutable pre-arm publication proof; never a final release or permission token. |
 | `secret_publication_authorization_id` | `SecretPublicationAuthorizationId` | One durable immutable origin-specific final result/state publication authorization; never action, receipt, or trace identity. |
@@ -478,6 +479,7 @@ schema profile or RFC amendment; privileged consumers do not guess.
 | `SecretDeliveryExposureProfile` | `trusted_injection`, `material_exposed` |
 | `SecretOuterAdmissionCapacityBindingState` | `outer_reserved`, `approval_parent`, `use_containment`, `released`, `permanently_pinned` |
 | `SecretPhysicalMetadataOwnerKind` | `agent_instance_controller`, `authority`, `event_evidence`, `gateway`, `incident`, `node_sbx`, `state_service` |
+| `PhysicalMetadataBudgetSignatureAlgorithm` | `ed25519` |
 | `SecretTickCandidateClaimState` | `unclaimed`, `linked_to_exact_submission`, `expired` |
 | `SecretNodeControlRetryProfile` | `no_retry`, `one_no_send_retry_100ms` |
 | `SecretMaterialExposedPublicationDisposition` | `target_publication_suppressed` |
@@ -804,20 +806,120 @@ one-budget root is that budget digest and an empty set is invalid. The final
 the basis digest, complete canonical vector/roots, complete physical aggregate
 vector, budget-set root and the composite backend-profile binding; its output is
 external. No physical budget contains that final digest, so the digest graph is
-acyclic. The live registry input is one closed
-`PhysicalMetadataBudgetSetBindingV1`, schema
-`splendor.secret.physical_metadata_budget_set_binding.v1`, containing exactly
-its schema, node ID, instance ID, configuration-owner principal ID, positive
-configuration revision, `valid_from`, `not_after`, final generated-resource-
-profile digest, complete 1..7 physical budgets, aggregate vector, budget-set root,
-composite backend-profile binding, signing-key ID, signature-algorithm tag and
-signature. The detached signature input is every preceding field under distinct
-schema `splendor.secret.physical_metadata_budget_set_signature_input.v1`; it
-excludes only the signature bytes. Authority validates current node/instance,
-owner status, key trust/revocation, exact audience, time interval, all budget
-digests/roots/sums and monotonic configuration revision before each admission.
-Caller, policy, provider and target bytes cannot select this object, and an
-expired or unverifiable binding authorizes no new outer.
+acyclic.
+
+The live registry input is one closed `PhysicalMetadataBudgetSetBindingV1`.
+Its exact final field table is:
+
+| Final binding field | Exact v1 contract |
+| --- | --- |
+| `schema_version` | Literal `splendor.secret.physical_metadata_budget_set_binding.v1`. |
+| `node_id` | One non-nil nominal `NodeId` for the configured node. |
+| `instance_id` | One non-nil nominal `InstanceId` on that node. |
+| `configuration_owner_principal_id` | One non-nil nominal `PrincipalId` naming the configuration owner. |
+| `configuration_revision` | Positive JSON safe integer; strictly monotonic for the exact node/instance/configuration-owner coordinate. |
+| `valid_from` | Canonical fixed-six-digit RFC 3339 UTC timestamp at which the binding first becomes valid. |
+| `not_after` | Canonical fixed-six-digit RFC 3339 UTC timestamp strictly later than `valid_from`; the binding is invalid at and after this instant. |
+| `generated_resource_profile_digest` | Exact final generated-resource-profile digest defined above. |
+| `physical_metadata_budgets` | Complete ordered array of 1..7 closed `PhysicalMetadataBudgetV1` objects, in ASCII `SecretPhysicalMetadataOwnerKind` order, with no duplicate owner. |
+| `physical_metadata_aggregate_vector` | Closed object containing exactly the ten physical byte/slot dimensions above, each equal to the checked sum of the ordered budgets. |
+| `physical_metadata_budget_set_root` | Exact non-empty root over those ordered budget-digest outputs. |
+| `composite_backend_profile_binding` | Closed object containing exactly `backend_profile_tag`, `backend_profile_revision`, and `backend_profile_digest`, byte-identical to every budget's profile coordinate. |
+| `physical_metadata_budget_signing_key_id` | One non-nil nominal `PhysicalMetadataBudgetSigningKeyId`. |
+| `signature_algorithm` | Literal closed `PhysicalMetadataBudgetSignatureAlgorithm::ed25519`, serialized exactly as lowercase `ed25519`. |
+| `physical_metadata_budget_signature` | Exactly 64 Ed25519 signature bytes encoded as unpadded base64url. |
+
+`PhysicalMetadataBudgetSignatureAlgorithm` has exactly one v1 value,
+`ed25519`. `none`, empty, unknown, legacy, case-normalized, implementation-
+selected, negotiated, key-type-substituted, or fallback algorithms are invalid.
+The signature decoder rejects null/empty values, padding, malformed base64url,
+noncanonical encodings, and decoded lengths other than exactly 64 bytes. Unknown
+or duplicate fields and duplicate JSON keys reject before any cryptographic or
+budget processing.
+
+`PhysicalMetadataBudgetSigningKeyId` is not an alias for
+`ProjectionSigningKeyId`, a work-order key, caller-token key, node/instance ID,
+provider key, `PrincipalId`, or a generic string. Its trusted-registry record
+contains exactly one 32-byte Ed25519 public verification key and binds
+`key_purpose=physical_metadata_budget_signing`,
+`audience=splendor.secret.physical_metadata_budget_set_binding.v1`, the exact
+`node_id`, `instance_id`, and `configuration_owner_principal_id`, key status and
+validity, and revocation state. The verification key bytes are obtained only
+from that trusted registry, never from the binding, caller, policy, provider,
+target, or a fallback key search. Projection, work-order, caller-token,
+provider, and all other signing or verification keys are purpose-separated and
+cannot satisfy this lookup even if their key bytes are identical.
+
+The detached non-recursive input is the distinct closed type
+`PhysicalMetadataBudgetSetSignatureInputV1`, schema
+`splendor.secret.physical_metadata_budget_set_signature_input.v1`. It contains
+the input schema field followed by every final binding field above except only
+the external `physical_metadata_budget_signature` output:
+
+| Signature-input field | Exact value source |
+| --- | --- |
+| `signature_input_schema_version` | Literal `splendor.secret.physical_metadata_budget_set_signature_input.v1`. |
+| `schema_version` | Byte-identical final-binding literal `splendor.secret.physical_metadata_budget_set_binding.v1`. |
+| `node_id` | Byte-identical final-binding field. |
+| `instance_id` | Byte-identical final-binding field. |
+| `configuration_owner_principal_id` | Byte-identical final-binding field. |
+| `configuration_revision` | Byte-identical final-binding field. |
+| `valid_from` | Byte-identical final-binding field. |
+| `not_after` | Byte-identical final-binding field. |
+| `generated_resource_profile_digest` | Byte-identical final-binding field. |
+| `physical_metadata_budgets` | Byte-identical complete ordered final-binding array. |
+| `physical_metadata_aggregate_vector` | Byte-identical complete final-binding object. |
+| `physical_metadata_budget_set_root` | Byte-identical final-binding field. |
+| `composite_backend_profile_binding` | Byte-identical complete final-binding object. |
+| `physical_metadata_budget_signing_key_id` | Byte-identical final-binding field. |
+| `signature_algorithm` | Byte-identical literal `ed25519`. |
+
+This is the complete input table. No final signed field is omitted, renamed,
+derived, normalized, or represented twice. There is no
+`physical_metadata_budget_signature` key and no absent, null, empty-string,
+zeroed, or other signature placeholder. The final binding object and any object
+containing a signature placeholder are never signature inputs.
+
+The canonical signature-input bytes are exact RFC 8785 JSON bytes of that
+closed input object. The Ed25519 message is exactly the ASCII bytes
+`b"splendor.secret.physical_metadata_budget_set_signature_input.v1"`, followed
+by one `0x00` byte, followed by those canonical bytes. The configuration owner
+signs that message and only then adds the external 64-byte unpadded-base64url
+`physical_metadata_budget_signature` to the final binding.
+
+Authority's validation order is exact and fail closed before any budget value
+may influence profile selection, capacity calculation, allocator state, or
+outer mutation:
+
+1. Validate the closed final binding and every nested schema, field, type,
+   bound, ordering, duplicate/unknown/null rule, timestamp spelling, and RFC 8785
+   canonical form.
+2. Require the exact lowercase `ed25519` algorithm and decode one canonical
+   unpadded-base64url signature to exactly 64 bytes.
+3. Look up the exact nominal `PhysicalMetadataBudgetSigningKeyId` in the trusted
+   registry and require the exact 32-byte Ed25519 key type, physical-budget-
+   signing purpose, audience, node, instance, and configuration-owner bindings.
+4. Require the key status/validity/revocation record to authorize verification
+   with no fallback, alternate key, algorithm negotiation, or downgrade.
+5. Reconstruct the complete detached input and exact domain-separated message,
+   then successfully verify the Ed25519 signature.
+6. Only after signature success, validate current binding time, monotonic
+   configuration revision, node/instance/owner status, backend profile, final
+   generated profile digest, ordered budget digests, row/set roots, aggregate
+   vector, and every dimensionwise row/set/tenant/node sum using checked non-
+   wrapping arithmetic. Overflow, saturation, truncation, or a value outside the
+   target allocator type rejects.
+7. Only after every preceding check succeeds may the binding participate in
+   profile matching or admission.
+
+Any failure keeps `secret_broker_v1` off for new work and creates no capacity
+debit, outer-admission binding, child reserve, allocator CAS, or outer row.
+Changing one bit of the node, instance, configuration owner/revision, validity,
+generated profile, any budget/vector/root/backend coordinate, key ID, or
+algorithm invalidates the signature. Consequently cross-node, cross-instance,
+cross-profile, and cross-revision replay fail before budget use. Caller, policy,
+provider and target bytes cannot select this object, and an expired, revoked,
+stale, overflowing, or unverifiable binding authorizes no new outer.
 
 Every outer admission binding, child reserve,
 closure, tenant/node reservation and allocator CAS carries that aggregate vector,
@@ -7747,7 +7849,7 @@ or minimum v1 conformance bounds; deployments may be stricter but not looser:
 | Fixed restricted canonical metadata payload | At most 8 MiB node / 2 MiB tenant for lineage indexes, control plans, and admission bookkeeping, excluding separately generated physical backend metadata. |
 | Non-borrowable containment hot reserve | Preprovision 64 maximum outer-admission units per node and 16 per active tenant/node; each later specializes into zero or more `SecretContainmentReserve` children without a new allocation. Each approval-capable terminal-host unit owns one 16-KiB action-submission index, one compact 2-KiB outer-binding pointer, and at most 66 other compact entries at 2 KiB each: 68 entries and 150 KiB per unit. Exact canonical pools are 9,600 KiB (9.375 MiB) node and 2,400 KiB (2.34375 MiB) tenant. Entry count and canonical payload bytes are independent admission dimensions. A narrower final profile can only release an unused suffix after its final tombstone/retention gate; it can never widen. Normal work cannot consume either pool. |
 | Non-borrowable containment durable reserve | The maximum canonical vector is 22,644 KiB durable bytes, 1,283 event/evidence/enforcement-record credits, 17,596 KiB non-record bundles, 67 emergency markers, and one incident credit. The byte/bundle maximum is tick-origin trusted approval continuation; the independent record maximum is tick-origin material approval continuation. Every complete profile charges one outer binding as two records/8 durable KiB and one direct/tick outer tombstone as four records, each exactly once per outer submission. Floors are 1,415.25 MiB/82,112 records/64 incident credits per node and 353.8125 MiB/20,528 records/16 incident credits per active tenant/node. Control-row tombstones debit this reserve; retained markers remain charged to exact emergency slots. Material-exposed units and all owner-control/Authority-commit/terminalization/state/publication resources are permanently pinned regardless of physical cleanup. |
-| Authenticated physical metadata reserve | Every canonical row above has a current configured `PhysicalMetadataBudgetV1`, and every complete set has a current signed `PhysicalMetadataBudgetSetBindingV1`. Admission atomically reserves its complete physical hot/durable metadata bytes plus key/index/checksum/allocator/extent/transaction-journal byte/slot subdimensions under the exact owner/backend profile tag, revision, digest and row/set roots. Unknown, missing, stale, cap-plus-one or sum-over-node physical state denies before outer insertion. No physical dimension borrows from canonical bytes, another physical dimension, another backend or another tenant. |
+| Authenticated physical metadata reserve | Every canonical row above has a current configured `PhysicalMetadataBudgetV1`, and every complete set has a current Ed25519-signed `PhysicalMetadataBudgetSetBindingV1`. Authority must complete the exact closed-schema/algorithm/signature/key-purpose/audience/node/instance/owner verification order before any budget participates in profile or capacity calculation. Admission then atomically reserves its complete physical hot/durable metadata bytes plus key/index/checksum/allocator/extent/transaction-journal byte/slot subdimensions under the exact owner/backend profile tag, revision, digest and row/set roots. Unknown, missing, unsigned, stale, revoked, wrong-key, malformed-signature, cap-plus-one, overflow or sum-over-node physical state denies before outer insertion. No physical dimension borrows from canonical bytes, another physical dimension, another backend or another tenant. |
 | Retirement capacity | Dedicated permanent deny-head minima are 4,096 node and 1,024 per active tenant/node at 8 KiB: 32/8 MiB. Four node and one per-tenant in-flight reservations each own 528 KiB durable manifest/release scratch and 448 KiB hot scratch, giving 2,112/528 KiB durable and 1,792/448 KiB hot floors. Retirement capacity is non-borrowable and separate from normal/emergency markers. |
 | Canonical restricted payload resident memory | 107.125 MiB node and 26.78125 MiB per active tenant/node: 96/24 MiB normal canonical payload, 9.375/2.34375 MiB containment hot canonical payload, and 1.75/0.4375 MiB retirement hot canonical scratch. These are not total physical-memory values. No category or tenant may borrow capacity. There are at most 16 requirements per action. Durable reserve bytes and permanent markers/heads are storage admission, not resident-memory claims. |
 | Physical resident/storage floors | The node/tenant physical resident floors are the canonical 107.125/26.78125-MiB values plus the generated configured `physical_hot_metadata_bytes` sums for every normal, containment and retirement row. The containment physical storage floors are canonical 1,415.25/353.8125 MiB plus generated configured `physical_durable_metadata_bytes`; all other physical byte/slot sublimits are separately provisioned. FND-012 prints exact values for each authenticated backend profile. This RFC defines no universal backend overhead value. |
@@ -7887,13 +7989,16 @@ releasable in v1.
 No ordinary retirement, cleanup, reconciliation, or operator action removes their
 accounting/marker/isolation dimensions or tenant attribution. No other tenant
 observes partial capacity.
-Restart first authenticates every pinned backend profile and reconstructs node
-totals from all active/retained tenant reservation and outer-admission binding
-rows before enabling C03. It recomputes canonical vectors, physical vectors,
-budget-set/row roots, backend tag/revision/digest and hot-entry cardinality;
+Restart first repeats the complete detached Ed25519 verification and trusted-key
+status/purpose/audience/node/instance/owner checks for every pinned backend
+profile, then reconstructs node totals from all active/retained tenant reservation
+and outer-admission binding rows before enabling C03. It recomputes canonical
+vectors, physical vectors, budget-set/row roots, backend tag/revision/digest and
+hot-entry cardinality with checked non-wrapping sums;
 outer ownership is never inferred from use rows. Missing, duplicate, negative,
-unknown-profile, root mismatch, or sum-over-node accounting disables every new
-outer and quarantines existing affected reservations.
+unknown-profile, signature/key failure, root mismatch, overflow, or sum-over-node
+accounting disables every new outer and quarantines existing affected
+reservations.
 
 The representation implementation must prove a maximum-size secret with every
 enabled plain/base64/base64url/percent/split/log-injection matcher fits the
@@ -9112,7 +9217,7 @@ exact internal code. Errors use the existing `ErrorCategory`, `RetryClass`, and
 | `abort_delivery` proof/permit/send/result/acknowledgement failure or abort/commit race | `unavailable`, `conflict`, or `uncertain` | Authority commit and no-commit authorization CAS one decision row; exactly one wins. Abort requires the fresh typed no-retry invocation and exact proof/coordinates, performs only `prepared -> aborted`, and never calls provider/adapter/target. Uncertain send has no blind retry; retained ledger recovery returns/terminalizes only the original result. Direct/background/reused-prepare/untyped abort traps at zero. |
 | Terminalization lease epoch cap or state/cursor mismatch | `uncertain` / `reconciliation_exhausted` | Epoch 0 plus at most two same-ID one-second recoveries; cap+1 consumes terminalization overflow, appends no fabricated stable suffix/state head, retry never, run fenced, response withheld, material reserve permanently pinned. |
 | Raw material-window trace/state/run/audit timing requested | `unauthorized` / `material_exposure_raw_timing_restricted` | Require explicit v1 projection negotiation and projection scope or deny uniformly. Stable internal timestamps remain truthful; no current endpoint/scope exposes raw timing. |
-| Outer admission binding, containment reserve, hot-entry cardinality, emergency marker allowance, authenticated physical budget/profile/root, or any canonical/physical floor unavailable | `quota_exceeded` or `unavailable` | Stop the new outer before insertion, or stop child specialization before use/provider/node/adapter work. Already-reserved revoke/fence/cleanup/terminal/tombstone writes retain their exact canonical and physical slots; corruption quarantines but cannot discard/reassign a reserve. |
+| Outer admission binding, containment reserve, hot-entry cardinality, emergency marker allowance, authenticated physical budget/profile/root/signature/key, or any canonical/physical floor unavailable | `quota_exceeded` or `unavailable` | Stop the new outer before insertion, or stop child specialization before use/provider/node/adapter work. An invalid signature, algorithm, key binding/status, aggregate or revision is never degraded to an unsigned/default budget. Already-reserved revoke/fence/cleanup/terminal/tombstone writes retain their exact canonical and physical slots; corruption quarantines but cannot discard/reassign a reserve. |
 | Material exposure owner/profile or egress evidence unavailable | `unavailable`, `unsafe`, or `uncertain` before exposure; fixed suppression projection after exposure | Deny before provider acquisition/exposure when possible. After exposure, block send, fail/quarantine, revoke/cleanup, and emit only the fixed projection; owner/evidence failure cannot select an error or event branch. Never retry or report success. |
 | Material-exposed network/proxy/DNS/filesystem/IPC/child/device/helper/alternate-mount attempt, including correct destination but wrong slot | Fixed `protected_data_denial` projection | Deny all with the predeclared zero-byte barrier and continue the same precommitted target/parent quarantine and fixed suppression records used on every path; no destination allowlist, attempt kind, or after-send DLP result can alter a readable record. |
 | Material-exposed target output/result/error/exit/timing choice, including custom XOR/table/alphabet, schema-valid JSON bits, error choice, and chunked covert output | `protected_data_denial`; fixed `SecretErrorCode=material_exposed_publication_suppressed` | Stable status/error/publication disposition is fixed before exposure; result APIs return only `MaterialExposureSuppressedProjectionV1`, while retained evidence/export uses the signed timing-safe envelope carrying the exact audit projection at the fixed release. Captured bytes remain live private detector input and are wiped; wipe uncertainty keeps the inaccessible allocation quarantined without changing the projection. Pattern no-match never authorizes publication. |
@@ -9241,8 +9346,9 @@ Contract acceptance and implementation evidence are separate gates.
 - Independent architecture, security, contract, and compatibility review accepts
   this RFC without changing task or gold status.
 - Review independently proves atomic outer-capacity ownership, monotonic
-  specialization and authenticated physical-metadata admission/restart with no
-  inference, borrowing or universal-backend claim.
+  specialization and authenticated physical-metadata admission/restart with a
+  closed purpose-separated Ed25519 signature suite and no inference, borrowing,
+  downgrade, replay or universal-backend claim.
 - Documentation links, catalog parsing, architecture policy, whitespace, and
   status scans pass.
 - V0 authorizes implementation planning only. It closes no SECR task.
@@ -9284,9 +9390,11 @@ timing-safe trace/state-head/run-inspect/audit projections plus the signed
 `TimingSafeProjectionEnvelopeV1`, detached
 `TimingSafeProjectionSignatureInputV1`, source-correspondence/checkpoint/export-manifest
 owner schemas, containment reserve with typed emergency marker slots,
-  `PhysicalMetadataBudgetV1`, signed `PhysicalMetadataBudgetSetBindingV1`,
-  physical metadata row/budget-set roots and the authenticated backend-profile
-  binding contract,
+  `PhysicalMetadataBudgetV1`, nominal `PhysicalMetadataBudgetSigningKeyId`,
+  closed `PhysicalMetadataBudgetSignatureAlgorithm`, signed
+  `PhysicalMetadataBudgetSetBindingV1`, detached
+  `PhysicalMetadataBudgetSetSignatureInputV1`, physical metadata row/budget-set
+  roots and the authenticated backend-profile binding contract,
   `SecretPublicationPreparationV1`, prepare receipt, immutable final
   `SecretPublicationAuthorizationV1` with authorized response-set bytes and
   `SecretTerminalRetryDecisionV1`,
@@ -9342,6 +9450,19 @@ large-output artifact/data reference. They serialize every complete `ActionFaile
   67 markers` fail V1. Generation also fails unless every profile has a complete
   physical budget row/set root and all ten exact physical dimensions under each
   authenticated backend tag/revision/digest.
+  Physical-budget signature goldens shared by Rust/OpenAPI/Python/TypeScript pin
+  the complete detached input object, exact RFC 8785 canonical bytes, exact
+  schema-literal/zero-byte domain-separated message, nominal key ID/type/purpose/
+  audience binding, and exact 64-byte unpadded-base64url Ed25519 signature.
+  Negative vectors cover unknown, empty, `none`, case-changed and legacy
+  algorithms; wrong key ID/type/purpose/audience; malformed, wrong-length,
+  padded, noncanonical and one-bit-corrupted signatures; one-bit changes to every
+  signed coordinate; expired/revoked keys and bindings; stale revision;
+  cross-node/instance/profile/revision replay; absent/null/empty/placeholder
+  signatures; and checked aggregate overflow. Every negative denies before
+  profile or budget use, capacity debit, allocator/binding mutation, or outer
+  insertion. No language may fall back to a generic key, alternate algorithm or
+  implementation-local message.
   Separate publication-progress goldens cover direct, ordinary tick, challenge
   tick, and continuation profiles at `not_started`, every legal completion/arm
   prefix, `released`, and `permanently_withheld`, plus all three exact
@@ -9832,7 +9953,12 @@ remains `not_exercised`.
   free while exhausting one physical dimension and proves the next tenant still
   denies before outer/effect. Missing report, unknown backend, stale revision,
   changed digest/root, partial metadata growth and restart sum mismatch keep C03
-  off and preserve existing debits.
+  off and preserve existing debits. Configuration/restart fault fixtures also
+  cover unknown/`none`/case-changed algorithms, wrong key type/purpose/audience,
+  revoked or expired key, malformed/tampered/noncanonical signature, every signed-
+  coordinate bit change, cross-node/instance/profile/revision replay and aggregate
+  overflow. Each fails before budget use, debit, binding or outer insertion, and
+  no fallback profile or key is attempted.
   Each of the two provider and eleven node rows independently loses a result/event/
   CAS acknowledgement, runs epoch 0 plus both legal same-ID transfers at epochs 1
   and 2 under exact five-second holder leases, terminalizes retained bytes without
@@ -9902,8 +10028,11 @@ remains `not_exercised`.
   hot `PublicationEpisodeBindingV1` and `PublicationHistoryV1` tags, owner prefix,
   direct/tick outer tombstone disposition, approval publication-causality binding,
   `SecretOuterAdmissionCapacityBindingV1` states/specializations,
-  `PhysicalMetadataBudgetV1`, `PhysicalMetadataBudgetSetBindingV1` and their row/
-  budget-set roots, permanent auxiliary
+  `PhysicalMetadataBudgetV1`, `PhysicalMetadataBudgetSigningKeyId`,
+  `PhysicalMetadataBudgetSignatureAlgorithm`,
+  `PhysicalMetadataBudgetSetBindingV1`,
+  `PhysicalMetadataBudgetSetSignatureInputV1`, exact detached canonical/message/
+  signature bytes and their row/budget-set roots, permanent auxiliary
   marker tags, all exact marker-role columns in the 67-row maximum bijection, the
   fixed 16-byte retirement count/release entry, and the fixed 31-entry pool/class
   count array across Rust/OpenAPI/Python/TypeScript
@@ -10020,10 +10149,14 @@ remains `not_exercised`.
   receipt ref maxima, and 71
   records per control row. The report is generated from the
   canonical Rust schemas and driver-manifest maxima and fails on any mismatch
-  with the normative equations. It also authenticates every backend profile,
-  prints each physical metadata dimension/root and proves the physical resident/
-  storage floors as canonical plus configured metadata; hand-maintained operator
-  values or one universal backend overhead are insufficient.
+  with the normative equations. It also authenticates every backend profile only
+  after the exact Ed25519 detached-input and key-purpose/audience/node/instance/
+  owner/status verification order, prints each physical metadata dimension/root
+  and proves the physical resident/storage floors as canonical plus configured
+  metadata; hand-maintained operator values, unsigned/default profiles, fallback
+  keys or one universal backend overhead are insufficient. Rotation, revocation,
+  expiry, stale-revision, replay, signature-tamper and checked-overflow cases keep
+  C03 off before new admission while preserving existing debits for quarantine.
   Overflow admission
   deterministically denies before provider/node/adapter work and never evicts
   active detector/control/tombstone state. Missing evidence keeps
@@ -10313,6 +10446,13 @@ Independent reviewers should recommend acceptance only if all are true:
   fresh authorization, every known/uncertain effect and all other finals are
   `not_retryable`, and same-key terminal requests are lookup only. Preparation,
   final authorization, and every dynamic response member bind its digest.
+- `PhysicalMetadataBudgetSetBindingV1` has the complete closed field table,
+  nominal purpose-separated signing-key identity, literal-only Ed25519 algorithm,
+  exact 64-byte unpadded-base64url signature, detached RFC 8785 input, distinct
+  schema/zero-byte domain-separated message and ordered fail-closed verification
+  contract above. Unknown/downgraded algorithms, wrong or revoked keys, malformed
+  signatures, changed signed coordinates, replay and aggregate overflow deny
+  before profile selection, debit, allocator/binding mutation or outer insertion.
 - Authority atomically reserves one complete authenticated canonical/physical
   vector and inserts one durable outer-admission binding plus outer submission
   before C03 terminal evidence, use specialization, provider/node work, or adapter
