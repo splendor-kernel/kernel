@@ -16,6 +16,10 @@ use thiserror::Error;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_VERSION_REF_BYTES: usize = 128;
 const CLOSED_SECRET_ENUM_ERROR: &str = "secret enum must be an exact lowercase snake-case string";
+const PROVIDER_VERSION_REF_SERDE_ERROR: &str = "secret provider version reference is invalid";
+const LEASE_POLICY_INTEGER_TYPE_ERROR: &str = "secret lease policy integer field has invalid type";
+const LEASE_POLICY_RENEWABLE_TYPE_ERROR: &str =
+    "secret lease policy renewable field has invalid type";
 
 trait ClosedSecretEnum: Copy {
     fn wire_spelling(self) -> &'static str;
@@ -264,7 +268,9 @@ impl<'de> Deserialize<'de> for SecretProviderVersionRef {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(SecretProviderVersionRefVisitor)
+        deserializer
+            .deserialize_str(SecretProviderVersionRefVisitor)
+            .map_err(|_| D::Error::custom(PROVIDER_VERSION_REF_SERDE_ERROR))
     }
 }
 
@@ -324,131 +330,8 @@ impl<'de> Visitor<'de> for SecretProviderVersionRefVisitor {
     where
         E: DeError,
     {
-        SecretProviderVersionRef::try_new(value).map_err(E::custom)
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        SecretProviderVersionRef::try_from(value).map_err(E::custom)
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret provider version reference must be a string",
-        ))
-    }
-
-    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret provider version reference must be a string",
-        ))
+        SecretProviderVersionRef::try_new(value)
+            .map_err(|_| E::custom(PROVIDER_VERSION_REF_SERDE_ERROR))
     }
 }
 
@@ -865,7 +748,9 @@ impl<'de> Deserialize<'de> for NoEchoU64 {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(NoEchoU64Visitor)
+        deserializer
+            .deserialize_u64(NoEchoU64Visitor)
+            .map_err(|_| D::Error::custom(LEASE_POLICY_INTEGER_TYPE_ERROR))
     }
 }
 
@@ -884,132 +769,6 @@ impl<'de> Visitor<'de> for NoEchoU64Visitor {
     {
         Ok(NoEchoU64(value))
     }
-
-    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        u64::try_from(value)
-            .map(NoEchoU64)
-            .map_err(|_| E::custom("secret lease policy integer field is out of range"))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        u64::try_from(value)
-            .map(NoEchoU64)
-            .map_err(|_| E::custom("secret lease policy integer field is out of range"))
-    }
-
-    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        u64::try_from(value)
-            .map(NoEchoU64)
-            .map_err(|_| E::custom("secret lease policy integer field is out of range"))
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
-
-    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret lease policy integer field has invalid type",
-        ))
-    }
 }
 
 struct NoEchoBool(bool);
@@ -1019,7 +778,9 @@ impl<'de> Deserialize<'de> for NoEchoBool {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(NoEchoBoolVisitor)
+        deserializer
+            .deserialize_bool(NoEchoBoolVisitor)
+            .map_err(|_| D::Error::custom(LEASE_POLICY_RENEWABLE_TYPE_ERROR))
     }
 }
 
@@ -1037,132 +798,6 @@ impl<'de> Visitor<'de> for NoEchoBoolVisitor {
         E: DeError,
     {
         Ok(NoEchoBool(value))
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Err(E::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
-    }
-
-    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        Err(A::Error::custom(
-            "secret lease policy renewable field has invalid type",
-        ))
     }
 }
 

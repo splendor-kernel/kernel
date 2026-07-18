@@ -359,22 +359,33 @@ fn provider_version_ref_serde_and_errors_are_strict_bounded_and_non_echoing() {
     let serde_error = serde_json::from_str::<SecretProviderVersionRef>(&encoded)
         .expect_err("oversized reference JSON must reject")
         .to_string();
+    assert!(serde_error.starts_with(PROVIDER_VERSION_REF_SERDE_ERROR));
     assert!(serde_error.len() <= 120);
     assert!(!serde_error.contains(&oversized));
 
     for (raw, candidate) in [
+        ("\"\"", ""),
+        (
+            "\"release/PRIVATE_PROVIDER_SENTINEL\"",
+            "PRIVATE_PROVIDER_SENTINEL",
+        ),
+        ("\"révision\"", "révision"),
         ("null", "null"),
         ("true", "true"),
         ("4242424242", "4242424242"),
         ("17.5", "17.5"),
         ("{}", "{}"),
         ("[]", "[]"),
+        ("\"PRIVATE_PROVIDER_SENTINEL", "PRIVATE_PROVIDER_SENTINEL"),
     ] {
         let error = serde_json::from_str::<SecretProviderVersionRef>(raw)
-            .expect_err("non-string reference JSON must reject")
+            .expect_err("invalid reference JSON must reject")
             .to_string();
+        assert!(error.starts_with(PROVIDER_VERSION_REF_SERDE_ERROR));
         assert!(error.len() <= 120);
-        assert!(!error.contains(candidate));
+        if !candidate.is_empty() {
+            assert!(!error.contains(candidate));
+        }
     }
 }
 
@@ -644,6 +655,104 @@ fn lease_policy_serde_rejects_null_wrong_type_coercion_and_invalid_values() {
     for raw in invalid_value_cases {
         assert_policy_rejects(raw);
     }
+}
+
+#[test]
+fn lease_policy_scalar_fields_reject_coercion_with_fixed_non_reflecting_errors() {
+    const SENSITIVE_SENTINEL: &str = "PRIVATE_POLICY_SCALAR_SENTINEL";
+
+    for value in [
+        "-1",
+        "1.0",
+        "1e0",
+        "\"PRIVATE_POLICY_SCALAR_SENTINEL\"",
+        "true",
+        "null",
+        "[]",
+        r#"{"PRIVATE_POLICY_SCALAR_SENTINEL":1}"#,
+        "18446744073709551616",
+    ] {
+        let raw = format!(
+            r#"{{"max_lease_duration_seconds":{value},"max_continuous_lifetime_seconds":3600,"max_uses":10,"renewable":true,"clock_skew_tolerance_seconds":5}}"#
+        );
+        let error = assert_policy_rejects(&raw);
+        assert!(error.starts_with(LEASE_POLICY_INTEGER_TYPE_ERROR));
+        assert!(!error.contains(SENSITIVE_SENTINEL));
+    }
+
+    for value in [
+        "-1",
+        "1.0",
+        "1e0",
+        "\"PRIVATE_POLICY_SCALAR_SENTINEL\"",
+        "1",
+        "null",
+        "[]",
+        r#"{"PRIVATE_POLICY_SCALAR_SENTINEL":true}"#,
+    ] {
+        let raw = format!(
+            r#"{{"max_lease_duration_seconds":300,"max_continuous_lifetime_seconds":3600,"max_uses":10,"renewable":{value},"clock_skew_tolerance_seconds":5}}"#
+        );
+        let error = assert_policy_rejects(&raw);
+        assert!(error.starts_with(LEASE_POLICY_RENEWABLE_TYPE_ERROR));
+        assert!(!error.contains(SENSITIVE_SENTINEL));
+    }
+
+    for (raw, expected_error) in [
+        (
+            r#"{"max_lease_duration_seconds":9007199254740992,"max_continuous_lifetime_seconds":9007199254740992,"max_uses":10,"renewable":true,"clock_skew_tolerance_seconds":5}"#,
+            SecretLeasePolicyError::MaxLeaseDurationOutOfRange,
+        ),
+        (
+            r#"{"max_lease_duration_seconds":300,"max_continuous_lifetime_seconds":9007199254740992,"max_uses":10,"renewable":true,"clock_skew_tolerance_seconds":5}"#,
+            SecretLeasePolicyError::MaxContinuousLifetimeOutOfRange,
+        ),
+        (
+            r#"{"max_lease_duration_seconds":300,"max_continuous_lifetime_seconds":3600,"max_uses":9007199254740992,"renewable":true,"clock_skew_tolerance_seconds":5}"#,
+            SecretLeasePolicyError::MaxUsesOutOfRange,
+        ),
+        (
+            r#"{"max_lease_duration_seconds":300,"max_continuous_lifetime_seconds":3600,"max_uses":10,"renewable":true,"clock_skew_tolerance_seconds":31}"#,
+            SecretLeasePolicyError::ClockSkewToleranceOutOfRange,
+        ),
+        (
+            r#"{"max_lease_duration_seconds":300,"max_continuous_lifetime_seconds":299,"max_uses":10,"renewable":true,"clock_skew_tolerance_seconds":5}"#,
+            SecretLeasePolicyError::ContinuousLifetimeLessThanLeaseDuration,
+        ),
+    ] {
+        let error = assert_policy_rejects(raw);
+        assert!(error.starts_with(&expected_error.to_string()));
+    }
+}
+
+#[test]
+fn lease_policy_rejects_non_json_serde_scalar_and_byte_forms_without_reflection() {
+    use serde::de::value::{
+        BytesDeserializer, CharDeserializer, Error as ValueError, I128Deserializer,
+        I64Deserializer, StringDeserializer, U128Deserializer,
+    };
+
+    const SENSITIVE_SENTINEL: &str = "PRIVATE_POLICY_SERDE_SENTINEL";
+    let assert_rejected = |result: Result<SecretLeasePolicy, ValueError>| {
+        let error = result
+            .expect_err("non-object serde form must reject")
+            .to_string();
+        assert_eq!(error, "secret lease policy must be an object");
+        assert!(!error.contains(SENSITIVE_SENTINEL));
+    };
+
+    assert_rejected(SecretLeasePolicy::deserialize(I64Deserializer::new(-1)));
+    assert_rejected(SecretLeasePolicy::deserialize(I128Deserializer::new(-1)));
+    assert_rejected(SecretLeasePolicy::deserialize(U128Deserializer::new(
+        u128::MAX,
+    )));
+    assert_rejected(SecretLeasePolicy::deserialize(CharDeserializer::new('x')));
+    assert_rejected(SecretLeasePolicy::deserialize(StringDeserializer::new(
+        SENSITIVE_SENTINEL.to_owned(),
+    )));
+    assert_rejected(SecretLeasePolicy::deserialize(BytesDeserializer::new(
+        SENSITIVE_SENTINEL.as_bytes(),
+    )));
 }
 
 fn restricted_policy_canonical_bytes(value: &Value) -> Vec<u8> {
