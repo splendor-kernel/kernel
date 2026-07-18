@@ -4,6 +4,14 @@
 
 ### Added
 
+- **status/incomplete:** added exactly 40 behavior-free C03 V1a nominal secret
+  UUID identity types with checked non-nil construction, strict lowercase
+  hyphenated parsing/deserialization, canonical serialization, bounded
+  non-echoing errors, and byte-order-compatible ordering. This IDs-only slice
+  adds no `SecretRef`, `SecretUseRequirement`, provider port, broker lifecycle,
+  lease/delivery record, secret side effect, generated public surface, scanner,
+  feature activation, issue closure, or gold pass; stable 0.1 ID behavior and
+  bytes remain unchanged.
 - Hardened physical/edge resident boundaries without changing intervention or
   trace-record schemas. Operator intervention evidence is now checked against
   the authoritative tenant, agent, run, node, action, granted status, and expiry,
