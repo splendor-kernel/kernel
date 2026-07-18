@@ -2,7 +2,9 @@
 
 ## Status and Binding
 
-**Status:** Proposed for acceptance
+**Status:** Accepted planning contract
+
+**Accepted:** 2026-07-18
 
 **Compatibility line:** Additive experimental 0.2/v2 contract over the stable
 0.1 gateway, trace, state, replay, work-order, and identity invariants
@@ -13,14 +15,14 @@
 
 **Functional requirements:** `FR-0.2-02`, `FR-0.2-08`
 
-This RFC is the proposed C03 child contract for aggregate issue
+This RFC is the accepted C03 planning contract for aggregate issue
 [#183](https://github.com/splendor-kernel/kernel/issues/183) and task issues
 [#245](https://github.com/splendor-kernel/kernel/issues/245) through
 [#250](https://github.com/splendor-kernel/kernel/issues/250). Historical issue
 #154 was a planning tracker; its closure did not accept a Secret Broker
 contract or prove implementation.
 
-This is a docs-only proposal. It does not implement a secret broker, add a
+This acceptance is docs-only. It does not implement a secret broker, add a
 public schema, create a provider adapter, change the Action Gateway, change a
 daemon endpoint, migrate a trace or state store, exercise a gold example, or
 close any C03 issue. Acceptance authorizes implementation against this contract
