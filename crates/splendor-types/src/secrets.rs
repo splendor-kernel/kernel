@@ -333,6 +333,13 @@ impl<'de> Visitor<'de> for SecretProviderVersionRefVisitor {
         SecretProviderVersionRef::try_new(value)
             .map_err(|_| E::custom(PROVIDER_VERSION_REF_SERDE_ERROR))
     }
+
+    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(PROVIDER_VERSION_REF_SERDE_ERROR))
+    }
 }
 
 /// Finite lease bounds carried by a future secret reference.

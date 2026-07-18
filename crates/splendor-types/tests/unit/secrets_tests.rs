@@ -390,6 +390,17 @@ fn provider_version_ref_serde_and_errors_are_strict_bounded_and_non_echoing() {
 }
 
 #[test]
+fn provider_version_ref_generic_serde_rejects_char_without_coercion() {
+    use serde::de::value::{CharDeserializer, Error as ValueError};
+
+    let error = SecretProviderVersionRef::deserialize(CharDeserializer::<ValueError>::new('x'))
+        .expect_err("a char must not be coerced to a valid one-character provider reference")
+        .to_string();
+    assert_eq!(error, PROVIDER_VERSION_REF_SERDE_ERROR);
+    assert!(error.len() <= 120);
+}
+
+#[test]
 fn provider_version_ref_validates_borrowed_input_before_allocating_and_retains_owned_input() {
     let oversized = "z".repeat(1_000_000);
     assert_eq!(
