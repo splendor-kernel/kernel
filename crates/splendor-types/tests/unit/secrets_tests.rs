@@ -1,8 +1,9 @@
 use super::*;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
+use std::io::{self, Read};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -15,7 +16,7 @@ fn fixture() -> Value {
 
 fn assert_closed_enum<T>(expected: &[(T, &str)])
 where
-    T: Copy + DeserializeOwned + PartialEq + Serialize + std::fmt::Debug,
+    T: Copy + DeserializeOwned + Ord + PartialEq + Serialize + std::fmt::Debug,
 {
     for (variant, spelling) in expected {
         let encoded = serde_json::to_string(variant).expect("enum must serialize");
@@ -26,19 +27,65 @@ where
         );
 
         let case_changed = format!("\"{}\"", spelling.to_ascii_uppercase());
+        let case_error = serde_json::from_str::<T>(&case_changed)
+            .expect_err("case-changed enum value must reject")
+            .to_string();
+        assert!(case_error.starts_with(CLOSED_SECRET_ENUM_ERROR));
+        assert!(!case_error.contains(&spelling.to_ascii_uppercase()));
+
+        let tagged_object = format!(r#"{{"{spelling}":null}}"#);
+        let tagged_error = serde_json::from_str::<T>(&tagged_object)
+            .expect_err("externally tagged enum object must reject")
+            .to_string();
         assert!(
-            serde_json::from_str::<T>(&case_changed).is_err(),
-            "case-changed value must reject: {spelling}"
+            tagged_error.starts_with(CLOSED_SECRET_ENUM_ERROR),
+            "unexpected tagged-object error: {tagged_error}"
+        );
+        assert!(
+            !tagged_error.contains(spelling),
+            "tagged-object error must not reflect: {spelling}"
         );
     }
 
-    assert!(serde_json::from_str::<T>("\"future_value\"").is_err());
-    for invalid in ["null", "true", "17", "17.5", "{}", "[]"] {
-        assert!(
-            serde_json::from_str::<T>(invalid).is_err(),
-            "non-string enum form must reject: {invalid}"
-        );
+    const SENSITIVE_SENTINEL: &str = "PRIVATE_ENUM_SENTINEL_DO_NOT_REFLECT";
+    for invalid in [
+        format!("\"{SENSITIVE_SENTINEL}\""),
+        "null".to_owned(),
+        "true".to_owned(),
+        "987654321".to_owned(),
+        "17.5".to_owned(),
+        format!(r#"{{"{SENSITIVE_SENTINEL}":null}}"#),
+        format!(r#"["{SENSITIVE_SENTINEL}"]"#),
+    ] {
+        let error = serde_json::from_str::<T>(&invalid)
+            .expect_err("unknown or non-string enum form must reject")
+            .to_string();
+        assert!(error.starts_with(CLOSED_SECRET_ENUM_ERROR));
+        assert!(error.len() <= 120, "enum errors must remain bounded");
+        assert!(!error.contains(SENSITIVE_SENTINEL));
     }
+
+    let mut ordered_variants = expected
+        .iter()
+        .map(|(variant, _)| *variant)
+        .collect::<Vec<_>>();
+    ordered_variants.sort();
+    let ordered_spellings = ordered_variants
+        .iter()
+        .map(|variant| {
+            serde_json::to_value(variant)
+                .expect("ordered enum must serialize")
+                .as_str()
+                .expect("ordered enum must serialize as a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_ascii_order = expected
+        .iter()
+        .map(|(_, spelling)| (*spelling).to_owned())
+        .collect::<Vec<_>>();
+    expected_ascii_order.sort();
+    assert_eq!(ordered_spellings, expected_ascii_order);
 }
 
 #[test]
@@ -331,6 +378,24 @@ fn provider_version_ref_serde_and_errors_are_strict_bounded_and_non_echoing() {
     }
 }
 
+#[test]
+fn provider_version_ref_validates_borrowed_input_before_allocating_and_retains_owned_input() {
+    let oversized = "z".repeat(1_000_000);
+    assert_eq!(
+        oversized.parse::<SecretProviderVersionRef>(),
+        Err(SecretProviderVersionRefError::TooLong { max_bytes: 128 })
+    );
+    assert_eq!(
+        SecretProviderVersionRef::try_new(oversized.as_str()),
+        Err(SecretProviderVersionRefError::TooLong { max_bytes: 128 })
+    );
+
+    let owned = String::from("release-003");
+    let allocation = owned.as_ptr();
+    let version = SecretProviderVersionRef::try_from(owned).expect("owned input must validate");
+    assert_eq!(version.as_str().as_ptr(), allocation);
+}
+
 fn valid_policy() -> SecretLeasePolicy {
     SecretLeasePolicy::try_new(300, 3600, 10, true, 5).expect("valid policy")
 }
@@ -442,6 +507,22 @@ fn assert_policy_rejects(raw: &str) -> String {
     error
 }
 
+struct OneByteReader<'a> {
+    input: &'a [u8],
+    consumed: usize,
+}
+
+impl Read for OneByteReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.consumed == self.input.len() {
+            return Ok(0);
+        }
+        buffer[0] = self.input[self.consumed];
+        self.consumed += 1;
+        Ok(1)
+    }
+}
+
 #[test]
 fn lease_policy_serde_rejects_missing_duplicate_unknown_and_malformed_objects() {
     let field_names = [
@@ -476,6 +557,31 @@ fn lease_policy_serde_rejects_missing_duplicate_unknown_and_malformed_objects() 
     let unknown_error = assert_policy_rejects(unknown);
     assert!(!unknown_error.contains("VERY_SENSITIVE_UNKNOWN_FIELD"));
     assert!(!unknown_error.contains("PRIVATE_POLICY_CANDIDATE"));
+
+    let malformed_unknown = r#"{"VERY_SENSITIVE_UNKNOWN_FIELD":"#;
+    let malformed_unknown_error = assert_policy_rejects(malformed_unknown);
+    assert!(malformed_unknown_error.contains("contains an unknown field"));
+    assert!(!malformed_unknown_error.contains("EOF"));
+
+    let oversized_unknown = format!(
+        r#"{{"VERY_SENSITIVE_UNKNOWN_FIELD":"{}"}}"#,
+        "PRIVATE_POLICY_VALUE_SENTINEL".repeat(40_000)
+    );
+    let mut reader = OneByteReader {
+        input: oversized_unknown.as_bytes(),
+        consumed: 0,
+    };
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    let oversized_unknown_error = SecretLeasePolicy::deserialize(&mut deserializer)
+        .expect_err("unknown field must reject before its oversized value")
+        .to_string();
+    assert!(oversized_unknown_error.contains("contains an unknown field"));
+    assert!(!oversized_unknown_error.contains("PRIVATE_POLICY_VALUE_SENTINEL"));
+    assert!(
+        reader.consumed < 128,
+        "unknown policy value was consumed before denial: {} bytes",
+        reader.consumed
+    );
 
     assert_policy_rejects(r#"{"max_lease_duration_seconds":300"#);
     for raw in [

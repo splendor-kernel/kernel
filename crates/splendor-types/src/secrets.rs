@@ -4,104 +4,206 @@
 //! authorize secret access, resolve provider locations, create leases, or
 //! perform delivery.
 
-use serde::de::{Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
 use std::fmt;
+use std::marker::PhantomData;
 use std::str::FromStr;
 use thiserror::Error;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROVIDER_VERSION_REF_BYTES: usize = 128;
+const CLOSED_SECRET_ENUM_ERROR: &str = "secret enum must be an exact lowercase snake-case string";
 
+trait ClosedSecretEnum: Copy {
+    fn wire_spelling(self) -> &'static str;
+    fn from_wire_spelling(value: &str) -> Option<Self>;
+}
+
+struct ClosedSecretEnumVisitor<T>(PhantomData<T>);
+
+impl<T> ClosedSecretEnumVisitor<T> {
+    const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<'de, T> Visitor<'de> for ClosedSecretEnumVisitor<T>
+where
+    T: ClosedSecretEnum,
+{
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(CLOSED_SECRET_ENUM_ERROR)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        T::from_wire_spelling(value).ok_or_else(|| E::custom(CLOSED_SECRET_ENUM_ERROR))
+    }
+}
+
+macro_rules! define_closed_secret_enum {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $wire_spelling:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl ClosedSecretEnum for $name {
+            fn wire_spelling(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire_spelling,)+
+                }
+            }
+
+            fn from_wire_spelling(value: &str) -> Option<Self> {
+                match value {
+                    $($wire_spelling => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.wire_spelling())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer
+                    .deserialize_str(ClosedSecretEnumVisitor::<Self>::new())
+                    .map_err(|_| D::Error::custom(CLOSED_SECRET_ENUM_ERROR))
+            }
+        }
+
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.wire_spelling().cmp(other.wire_spelling())
+            }
+        }
+
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+    };
+}
+
+define_closed_secret_enum! {
 /// Classification of secret material referenced by a future secret record.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretClassification {
     /// Material used to authenticate to a protected service.
-    AuthenticationCredential,
+    AuthenticationCredential => "authentication_credential",
     /// Material used to create cryptographic signatures.
-    SigningMaterial,
+    SigningMaterial => "signing_material",
     /// Material used for encryption or decryption.
-    EncryptionMaterial,
+    EncryptionMaterial => "encryption_material",
     /// Configuration that must remain private.
-    PrivateConfiguration,
+    PrivateConfiguration => "private_configuration",
     /// Secret material without a more specific v1 classification.
-    OpaqueSecret,
+    OpaqueSecret => "opaque_secret",
+}
 }
 
+define_closed_secret_enum! {
 /// Closed delivery vocabulary for a future secret-use requirement.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretDeliveryMethod {
     /// Delivery through a pre-opened inherited file descriptor.
-    InheritedFd,
+    InheritedFd => "inherited_fd",
     /// Delivery through a bounded file on a memory-backed filesystem.
-    TmpfsFile,
+    TmpfsFile => "tmpfs_file",
     /// Delivery through a one-shot local socket.
-    OneShotLocalSocket,
+    OneShotLocalSocket => "one_shot_local_socket",
     /// Delivery through an orchestrator-managed projected secret.
-    OrchestratorProjectedSecret,
+    OrchestratorProjectedSecret => "orchestrator_projected_secret",
     /// Compatibility vocabulary only; this variant grants no permission.
-    EnvironmentVariable,
+    EnvironmentVariable => "environment_variable",
+}
 }
 
+define_closed_secret_enum! {
 /// Intended operation for a future secret use.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretUseIntent {
     /// Authenticate to a service or resource.
-    Authenticate,
+    Authenticate => "authenticate",
     /// Sign data.
-    Sign,
+    Sign => "sign",
     /// Encrypt data.
-    Encrypt,
+    Encrypt => "encrypt",
     /// Decrypt data.
-    Decrypt,
+    Decrypt => "decrypt",
     /// Derive bounded session material.
-    DeriveSession,
+    DeriveSession => "derive_session",
     /// Bootstrap a protected transport.
-    BootstrapTransport,
+    BootstrapTransport => "bootstrap_transport",
+}
 }
 
+define_closed_secret_enum! {
 /// Closed purpose vocabulary for a future secret use.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretPurpose {
     /// Access an external service.
-    ExternalServiceAccess,
+    ExternalServiceAccess => "external_service_access",
     /// Access a governed data source.
-    DataSourceAccess,
+    DataSourceAccess => "data_source_access",
     /// Access an artifact store.
-    ArtifactStoreAccess,
+    ArtifactStoreAccess => "artifact_store_access",
     /// Access a model provider.
-    ModelProviderAccess,
+    ModelProviderAccess => "model_provider_access",
     /// Access an orchestrator service.
-    OrchestratorAccess,
+    OrchestratorAccess => "orchestrator_access",
     /// Access a device-local service.
-    DeviceServiceAccess,
+    DeviceServiceAccess => "device_service_access",
     /// Perform a cryptographic operation.
-    CryptographicOperation,
+    CryptographicOperation => "cryptographic_operation",
+}
 }
 
+define_closed_secret_enum! {
 /// Offline behavior allowed by a future secret reference.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretOfflineBehavior {
     /// Deny secret use while the required authority path is unavailable.
-    Deny,
+    Deny => "deny",
     /// Existing uses may continue only until their already-established expiry.
-    ContinueExistingUntilExpiry,
+    ContinueExistingUntilExpiry => "continue_existing_until_expiry",
+}
 }
 
+define_closed_secret_enum! {
 /// Exposure profile declared by a future driver-owned credential sink.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SecretDeliveryExposureProfile {
     /// The driver provides a trusted injection boundary.
-    TrustedInjection,
+    TrustedInjection => "trusted_injection",
     /// Secret material becomes exposed to the target process boundary.
-    MaterialExposed,
+    MaterialExposed => "material_exposed",
+}
 }
 
 /// Opaque immutable provider version reference.
@@ -113,10 +215,10 @@ pub struct SecretProviderVersionRef(String);
 
 impl SecretProviderVersionRef {
     /// Creates a provider version reference after strict non-locator validation.
-    pub fn try_new(value: impl Into<String>) -> Result<Self, SecretProviderVersionRefError> {
-        let value = value.into();
-        validate_provider_version_ref(&value)?;
-        Ok(Self(value))
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, SecretProviderVersionRefError> {
+        let value = value.as_ref();
+        validate_provider_version_ref(value)?;
+        Ok(Self(value.to_owned()))
     }
 
     /// Returns the validated opaque reference text.
@@ -129,7 +231,8 @@ impl TryFrom<String> for SecretProviderVersionRef {
     type Error = SecretProviderVersionRefError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::try_new(value)
+        validate_provider_version_ref(&value)?;
+        Ok(Self(value))
     }
 }
 
@@ -228,7 +331,7 @@ impl<'de> Visitor<'de> for SecretProviderVersionRefVisitor {
     where
         E: DeError,
     {
-        SecretProviderVersionRef::try_new(value).map_err(E::custom)
+        SecretProviderVersionRef::try_from(value).map_err(E::custom)
     }
 
     fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
@@ -628,7 +731,6 @@ impl<'de> Visitor<'de> for SecretLeasePolicyVisitor {
                     renewable = Some(map.next_value::<NoEchoBool>()?.0);
                 }
                 SecretLeasePolicyField::Unknown => {
-                    let _: IgnoredAny = map.next_value()?;
                     return Err(A::Error::custom(
                         "secret lease policy contains an unknown field",
                     ));

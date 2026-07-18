@@ -22,9 +22,9 @@ does not authorize access, delivery, publication, reconciliation, retry,
 renewal, or any other operation. The implemented values contain no secret
 material, provider locator, credential, authority, lifecycle, or runtime state.
 
-## Canonical contract
+## Canonical identity contract
 
-Each implemented type:
+Each implemented identity type:
 
 - is a distinct Rust newtype backed by a non-nil UUID;
 - parses and deserializes only lowercase hyphenated canonical UUID text;
@@ -50,6 +50,11 @@ The following enums are closed to their exact lowercase snake-case v1 values:
 | `SecretOfflineBehavior` | `deny`, `continue_existing_until_expiry` |
 | `SecretDeliveryExposureProfile` | `trusted_injection`, `material_exposed` |
 
+These enums serialize and deserialize only as the exact string values above.
+Case changes, unknown strings, externally tagged objects, and every non-string
+form reject with fixed non-reflecting errors. Their Rust ordering compares exact
+ASCII wire spellings rather than declaration order.
+
 `environment_variable` is compatibility vocabulary only. Its presence grants no
 permission and does not add delivery behavior.
 
@@ -57,8 +62,9 @@ permission and does not add delivery behavior.
 printable non-space ASCII. It rejects `/`, `\\`, `?`, `#`, and `:`, so a URI
 scheme, path, query, or fragment cannot enter the type. It is never normalized,
 resolved, or exposed through locator/provider helpers. Construction,
-`TryFrom<String>`, `FromStr`, and deserialization all use the same validation;
-errors are bounded and do not retain candidate text.
+`TryFrom<String>`, `FromStr`, and deserialization all use the same validation.
+Borrowed input is validated before allocation, while `TryFrom<String>` retains
+the validated allocation; errors are bounded and do not retain candidate text.
 
 `SecretLeasePolicy` is a closed object with five required fields and no schema
 field or defaults:
