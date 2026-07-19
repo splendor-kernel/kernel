@@ -1043,7 +1043,7 @@ fn valid_use_requirement_value() -> Value {
 }
 
 fn assert_requirement_rejects(raw: &str) -> String {
-    let error = serde_json::from_str::<SecretUseRequirement>(raw)
+    let error = SecretUseRequirement::from_json_slice(raw.as_bytes())
         .expect_err("invalid secret-use requirement must reject")
         .to_string();
     assert!(
@@ -1055,8 +1055,9 @@ fn assert_requirement_rejects(raw: &str) -> String {
 
 #[test]
 fn use_requirement_fixture_pins_canonical_bytes_getters_and_preference_order() {
-    let requirement: SecretUseRequirement = serde_json::from_str(use_requirement_fixture_text())
-        .expect("canonical fixture must deserialize");
+    let requirement =
+        SecretUseRequirement::from_json_slice(use_requirement_fixture_text().as_bytes())
+            .expect("canonical fixture must parse through bounded ingress");
 
     assert_eq!(
         requirement.schema_version(),
@@ -1216,7 +1217,7 @@ fn use_requirement_constructor_accepts_exact_boundaries_and_rejects_invalid_valu
 }
 
 #[test]
-fn use_requirement_serde_rejects_missing_duplicate_unknown_and_top_level_forms() {
+fn use_requirement_ingress_rejects_missing_duplicate_unknown_and_top_level_forms() {
     let fields = [
         "credential_slot_id",
         "delivery_methods",
@@ -1263,17 +1264,11 @@ fn use_requirement_serde_rejects_missing_duplicate_unknown_and_top_level_forms()
     assert!(!error.contains(UNKNOWN_VALUE));
 
     let malformed_unknown = format!(r#"{{"{UNKNOWN_KEY}":"#);
-    let mut reader = OneByteReader {
-        input: malformed_unknown.as_bytes(),
-        consumed: 0,
-    };
-    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
-    let error = SecretUseRequirement::deserialize(&mut deserializer)
-        .expect_err("unknown field must reject before reading its value")
+    let error = SecretUseRequirement::from_json_slice(malformed_unknown.as_bytes())
+        .expect_err("unknown field must reject without reflecting its malformed value")
         .to_string();
-    assert!(error.starts_with(SecretUseRequirementError::UnknownField.code()));
+    assert_eq!(error, SecretUseRequirementError::UnknownField.code());
     assert!(!error.contains(UNKNOWN_KEY));
-    assert!(reader.consumed < 80);
 
     for raw in [
         "null",
@@ -1290,7 +1285,7 @@ fn use_requirement_serde_rejects_missing_duplicate_unknown_and_top_level_forms()
 }
 
 #[test]
-fn use_requirement_serde_rejects_null_wrong_types_false_empty_duplicate_and_overflow() {
+fn use_requirement_ingress_rejects_null_wrong_types_false_empty_duplicate_and_overflow() {
     let fields = [
         "credential_slot_id",
         "delivery_methods",
@@ -1483,9 +1478,8 @@ fn use_requirement_rejects_malformed_ids_non_string_enums_and_candidate_echo_pat
     let error = assert_requirement_rejects(malformed);
     assert!(!error.contains("PRIVATE_MALFORMED_CANDIDATE"));
 
-    use serde::de::value::{CharDeserializer, Error as ValueError};
-    let error = SecretUseRequirement::deserialize(CharDeserializer::<ValueError>::new('x'))
-        .expect_err("generic char form must reject")
+    let error = SecretUseRequirement::from_json_slice(br#"{9876543210:true}"#)
+        .expect_err("non-string JSON key must reject")
         .to_string();
     assert_eq!(
         error,

@@ -6,11 +6,15 @@
 
 - **status/incomplete:** added the additive experimental, behavior-free
   `SecretUseRequirement` v1 Rust contract in `splendor-types`. Private fields,
-  checked construction, strict non-reflecting deserialization, fixed error codes,
-  and a canonical fixture enforce the exact schema, opaque `SecretRefId`, imported
+  checked construction, a sole duplicate-aware bounded `from_json_slice` byte
+  ingress, fixed non-reflecting source-free error codes, and a canonical fixture
+  enforce the exact schema, opaque `SecretRefId`, imported
   Driver Registry-owned `SecretCredentialSlotId`, closed intent/purpose, one-to-
   five unique ordered delivery preferences, positive safe-JSON-integer duration
-  and use limits, and `required: true`. The contract contains no material,
+  and use limits, and `required: true`. The validated type implements `Serialize`
+  but not public generic `Deserialize`; its exact ingress caps raw bytes, depth,
+  tokens, members, elements, and decoded name/string bytes before private wire
+  decoding. The contract contains no material,
   provider locator, destination, target, authority, lease, handle, fallback, or
   environment name. It grants no authority and adds no `SecretRef`, credential
   authorization, provider, broker, Gateway, runtime, daemon/API/SDK/generated

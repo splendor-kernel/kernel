@@ -96,8 +96,10 @@ candidate-policy reflection.
 ## Secret-use requirement contract
 
 `SecretUseRequirement` is the additive experimental Rust representation of
-`splendor.secret.use_requirement.v1`. Its fields are private, and both
-`try_new` and strict custom deserialization produce only valid v1 values.
+`splendor.secret.use_requirement.v1`. Its fields are private. `try_new` accepts
+already typed values, while `from_json_slice` is the sole imported, persisted,
+rehydrated, or otherwise untrusted byte ingress. The validated type implements
+`Serialize` but intentionally does not implement public generic `Deserialize`.
 
 | Field | Rule |
 | --- | --- |
@@ -117,6 +119,26 @@ uses the exact closed nine-field shape in RFC 8785 member order. Missing,
 duplicate, unknown, null, wrong-type, false, malformed-ID, unknown-enum, empty,
 over-bound, zero, and safe-integer-overflow inputs reject. Error variants expose
 only bounded fixed codes and retain no rejected candidate text.
+
+Before constructing its private wire input, `from_json_slice` performs one
+duplicate-aware JSON preflight with these exact v1 limits:
+
+| Resource | Maximum |
+| --- | ---: |
+| Raw encoded JSON | 1,024 bytes |
+| Object/array depth, root at depth 1 | 2 |
+| Decoder tokens (container delimiters, names, scalar values) | 26 |
+| Object members across the document | 9 |
+| Array elements across the document | 5 |
+| Decoded bytes per member name or string | 36 |
+
+These limits are specific to the closed nine-field, maximum-five-method schema.
+The generated legal maximum is 465 compact bytes and reaches every structural
+limit except raw encoded bytes, where bounded room remains for harmless
+whitespace and equivalent JSON escapes. Cap-plus-one, malformed UTF-8/JSON,
+duplicate names at any object depth, unknown root fields, overlong decoded
+names/strings, and whitespace or escape bombs fail closed. Parser details,
+locations, rejected keys/values, and source chains are not exposed.
 
 The requirement contains no secret material, provider locator, destination,
 target, authority, declaration revision, lease, delivery handle, fallback, or
@@ -185,6 +207,10 @@ let requirement = SecretUseRequirement::try_new(
     true,
 )?;
 assert!(requirement.required());
+
+let encoded = serde_json::to_vec(&requirement)?;
+let parsed = SecretUseRequirement::from_json_slice(&encoded)?;
+assert_eq!(parsed, requirement);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -209,9 +235,10 @@ Provider version reference failures distinguish empty, over-bound,
 non-printable/non-ASCII, and forbidden-locator-delimiter categories without
 retaining rejected text. Lease policy failures identify only the violated fixed
 range or relationship; strict serde failures do not echo unknown keys or field
-values. Secret-use requirement failures are fixed code-only categories; strict
-field wrappers prevent malformed IDs, enum candidates, schema candidates, and
-wrong scalar types from being reflected. No implemented primitive contains a
+values. Secret-use requirement failures are fixed code-only categories; its
+bounded byte parser and private wire input prevent malformed IDs, enum
+candidates, schema candidates, keys, parser details, and wrong scalar types from
+being reflected. No implemented primitive contains a
 secret value/material/byte field, provider request, raw provider error,
 credential value, token, password, or API key.
 
@@ -220,10 +247,13 @@ credential value, token, password, or API key.
 The symbols are additive experimental 0.2/v2 Rust exports. The closed enum
 spellings, opaque version-reference wire string, five-field policy object, and
 nine-field `SecretUseRequirement` object are the bounded C03 contract for this
-slice. Existing 0.1 ID constructors,
-permissive parsing/deserialization behavior, serialized bytes, and aliases remain
-unchanged. Existing C03 pre-placement and Driver Registry credential-sink fixture
-bytes are also unchanged. Future records that use these values still require
+slice. Removing public generic `Deserialize` in favor of the sole bounded
+`from_json_slice` ingress is the pre-release security correction for this new
+experimental type; its canonical serialized bytes are unchanged. Existing 0.1
+ID constructors, permissive parsing/deserialization behavior, serialized bytes,
+and aliases remain unchanged. Existing C03 pre-placement and Driver Registry
+credential-sink fixture bytes are also unchanged. Future records that use these
+values still require
 their owning contracts and compatible versioning. In particular, complete
 revision-bearing credential authorization, approved destination binding,
 `SecretRef`, Authority/Gateway/runtime consumption, and historical migration

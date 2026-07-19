@@ -2,14 +2,17 @@
 //!
 //! A requirement names an opaque secret reference and one driver-owned
 //! credential slot. It is a proposal only: it grants no authority, resolves no
-//! provider, creates no lease, and performs no delivery or I/O.
+//! provider, creates no lease, and performs no delivery or I/O. Untrusted,
+//! imported, persisted, and rehydrated bytes must enter through
+//! [`SecretUseRequirement::from_json_slice`].
 
 use crate::{
     SecretCredentialSlotId, SecretDeliveryMethod, SecretPurpose, SecretRefId, SecretUseIntent,
 };
-use serde::de::{Error as DeError, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -18,6 +21,17 @@ pub const SECRET_USE_REQUIREMENT_SCHEMA_V1: &str = "splendor.secret.use_requirem
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_DELIVERY_METHODS: usize = 5;
+
+// These ingress limits are intentionally specific to the closed nine-field v1
+// requirement. The maximum legal value has one root object, one five-element
+// array, nine members, 26 decoder tokens, and 36-byte UUID strings. The raw cap
+// leaves bounded room for harmless JSON whitespace and equivalent escapes.
+const MAX_INGRESS_BYTES: usize = 1_024;
+const MAX_INGRESS_DEPTH: usize = 2;
+const MAX_INGRESS_TOKENS: usize = 26;
+const MAX_INGRESS_MEMBERS: usize = 9;
+const MAX_INGRESS_ELEMENTS: usize = 5;
+const MAX_INGRESS_STRING_BYTES: usize = 36;
 
 /// Closed, valid-by-construction request to use one opaque secret reference.
 ///
@@ -32,6 +46,15 @@ const MAX_DELIVERY_METHODS: usize = 5;
 ///
 /// let _ = SecretUseRequirement::default();
 /// ```
+///
+/// The validated type intentionally implements `Serialize` but not
+/// `Deserialize`; bytes must use the bounded owner parser:
+///
+/// ```compile_fail
+/// use splendor_types::SecretUseRequirement;
+///
+/// let _: SecretUseRequirement = serde_json::from_slice(b"{}").unwrap();
+/// ```
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SecretUseRequirement {
     secret_ref_id: SecretRefId,
@@ -45,6 +68,61 @@ pub struct SecretUseRequirement {
 }
 
 impl SecretUseRequirement {
+    /// Parses one untrusted requirement through the exact bounded v1 ingress.
+    pub fn from_json_slice(input: &[u8]) -> Result<Self, SecretUseRequirementError> {
+        #[derive(Default)]
+        struct WireValue(Option<serde_json::Value>);
+
+        impl<'de> Deserialize<'de> for WireValue {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                serde_json::Value::deserialize(deserializer).map(|value| Self(Some(value)))
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct SecretUseRequirementWire {
+            #[serde(default)]
+            credential_slot_id: WireValue,
+            #[serde(default)]
+            delivery_methods: WireValue,
+            #[serde(default)]
+            intent: WireValue,
+            #[serde(default)]
+            purpose: WireValue,
+            #[serde(default)]
+            requested_duration_seconds: WireValue,
+            #[serde(default)]
+            requested_max_uses: WireValue,
+            #[serde(default)]
+            required: WireValue,
+            #[serde(default)]
+            schema_version: WireValue,
+            #[serde(default)]
+            secret_ref_id: WireValue,
+            #[serde(flatten)]
+            unknown_fields: BTreeMap<String, serde_json::Value>,
+        }
+
+        preflight_requirement(input)?;
+        let wire: SecretUseRequirementWire = serde_json::from_slice(input)
+            .map_err(|_| SecretUseRequirementError::InvalidContractShape)?;
+        parse_wire(
+            wire.credential_slot_id.0,
+            wire.delivery_methods.0,
+            wire.intent.0,
+            wire.purpose.0,
+            wire.requested_duration_seconds.0,
+            wire.requested_max_uses.0,
+            wire.required.0,
+            wire.schema_version.0,
+            wire.secret_ref_id.0,
+            !wire.unknown_fields.is_empty(),
+        )
+    }
+
     /// Constructs one validated, non-authorizing secret-use requirement.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
@@ -160,25 +238,16 @@ impl Serialize for SecretUseRequirement {
     }
 }
 
-impl<'de> Deserialize<'de> for SecretUseRequirement {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(SecretUseRequirementVisitor)
-    }
-}
-
 /// Fixed, non-reflecting validation failures for a secret-use requirement.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum SecretUseRequirementError {
-    /// The top-level value was not the exact closed object form.
+    /// The input exceeded an ingress budget or was not exact valid JSON/object form.
     InvalidContractShape,
     /// At least one required member was absent.
     MissingRequiredField,
-    /// A member appeared more than once.
+    /// A member appeared more than once at an object depth.
     DuplicateField,
-    /// A member outside the closed v1 schema appeared.
+    /// A member outside the closed v1 root schema appeared.
     UnknownField,
     /// The schema version was absent from the exact v1 value space.
     InvalidSchemaVersion,
@@ -250,44 +319,327 @@ impl fmt::Debug for SecretUseRequirementError {
 
 impl Error for SecretUseRequirementError {}
 
-enum SecretUseRequirementField {
-    CredentialSlotId,
-    DeliveryMethods,
-    Intent,
-    Purpose,
-    RequestedDurationSeconds,
-    RequestedMaxUses,
-    Required,
-    SchemaVersion,
-    SecretRefId,
-    Unknown,
+#[allow(clippy::too_many_arguments)]
+fn parse_wire(
+    credential_slot_id: Option<serde_json::Value>,
+    delivery_methods: Option<serde_json::Value>,
+    intent: Option<serde_json::Value>,
+    purpose: Option<serde_json::Value>,
+    requested_duration_seconds: Option<serde_json::Value>,
+    requested_max_uses: Option<serde_json::Value>,
+    required: Option<serde_json::Value>,
+    schema_version: Option<serde_json::Value>,
+    secret_ref_id: Option<serde_json::Value>,
+    has_unknown_fields: bool,
+) -> Result<SecretUseRequirement, SecretUseRequirementError> {
+    if has_unknown_fields {
+        return Err(SecretUseRequirementError::UnknownField);
+    }
+    let (
+        Some(credential_slot_id),
+        Some(delivery_methods),
+        Some(intent),
+        Some(purpose),
+        Some(requested_duration_seconds),
+        Some(requested_max_uses),
+        Some(required),
+        Some(schema_version),
+        Some(secret_ref_id),
+    ) = (
+        credential_slot_id,
+        delivery_methods,
+        intent,
+        purpose,
+        requested_duration_seconds,
+        requested_max_uses,
+        required,
+        schema_version,
+        secret_ref_id,
+    )
+    else {
+        return Err(SecretUseRequirementError::MissingRequiredField);
+    };
+
+    if schema_version.as_str() != Some(SECRET_USE_REQUIREMENT_SCHEMA_V1) {
+        return Err(SecretUseRequirementError::InvalidSchemaVersion);
+    }
+    let secret_ref_id = secret_ref_id
+        .as_str()
+        .ok_or(SecretUseRequirementError::InvalidSecretRefId)?
+        .parse()
+        .map_err(|_| SecretUseRequirementError::InvalidSecretRefId)?;
+    let credential_slot_id = credential_slot_id
+        .as_str()
+        .ok_or(SecretUseRequirementError::InvalidCredentialSlotId)?
+        .parse()
+        .map_err(|_| SecretUseRequirementError::InvalidCredentialSlotId)?;
+    let intent = parse_intent(&intent)?;
+    let purpose = parse_purpose(&purpose)?;
+    let delivery_methods = parse_delivery_methods(delivery_methods)?;
+    let requested_duration_seconds = requested_duration_seconds
+        .as_u64()
+        .ok_or(SecretUseRequirementError::InvalidRequestedDuration)?;
+    let requested_max_uses = requested_max_uses
+        .as_u64()
+        .ok_or(SecretUseRequirementError::InvalidRequestedMaxUses)?;
+    let required = required
+        .as_bool()
+        .ok_or(SecretUseRequirementError::InvalidRequired)?;
+
+    SecretUseRequirement::try_new(
+        secret_ref_id,
+        credential_slot_id,
+        intent,
+        purpose,
+        delivery_methods,
+        requested_duration_seconds,
+        requested_max_uses,
+        required,
+    )
 }
 
-struct SecretUseRequirementFieldVisitor;
+fn parse_intent(value: &serde_json::Value) -> Result<SecretUseIntent, SecretUseRequirementError> {
+    match value.as_str() {
+        Some("authenticate") => Ok(SecretUseIntent::Authenticate),
+        Some("sign") => Ok(SecretUseIntent::Sign),
+        Some("encrypt") => Ok(SecretUseIntent::Encrypt),
+        Some("decrypt") => Ok(SecretUseIntent::Decrypt),
+        Some("derive_session") => Ok(SecretUseIntent::DeriveSession),
+        Some("bootstrap_transport") => Ok(SecretUseIntent::BootstrapTransport),
+        _ => Err(SecretUseRequirementError::InvalidIntent),
+    }
+}
 
-impl<'de> Visitor<'de> for SecretUseRequirementFieldVisitor {
-    type Value = SecretUseRequirementField;
+fn parse_purpose(value: &serde_json::Value) -> Result<SecretPurpose, SecretUseRequirementError> {
+    match value.as_str() {
+        Some("external_service_access") => Ok(SecretPurpose::ExternalServiceAccess),
+        Some("data_source_access") => Ok(SecretPurpose::DataSourceAccess),
+        Some("artifact_store_access") => Ok(SecretPurpose::ArtifactStoreAccess),
+        Some("model_provider_access") => Ok(SecretPurpose::ModelProviderAccess),
+        Some("orchestrator_access") => Ok(SecretPurpose::OrchestratorAccess),
+        Some("device_service_access") => Ok(SecretPurpose::DeviceServiceAccess),
+        Some("cryptographic_operation") => Ok(SecretPurpose::CryptographicOperation),
+        _ => Err(SecretUseRequirementError::InvalidPurpose),
+    }
+}
+
+fn parse_delivery_methods(
+    value: serde_json::Value,
+) -> Result<Vec<SecretDeliveryMethod>, SecretUseRequirementError> {
+    let serde_json::Value::Array(values) = value else {
+        return Err(SecretUseRequirementError::InvalidDeliveryMethods);
+    };
+    let mut methods = Vec::with_capacity(values.len());
+    for value in values {
+        let method = match value.as_str() {
+            Some("inherited_fd") => SecretDeliveryMethod::InheritedFd,
+            Some("tmpfs_file") => SecretDeliveryMethod::TmpfsFile,
+            Some("one_shot_local_socket") => SecretDeliveryMethod::OneShotLocalSocket,
+            Some("orchestrator_projected_secret") => {
+                SecretDeliveryMethod::OrchestratorProjectedSecret
+            }
+            Some("environment_variable") => SecretDeliveryMethod::EnvironmentVariable,
+            _ => return Err(SecretUseRequirementError::InvalidDeliveryMethod),
+        };
+        methods.push(method);
+    }
+    Ok(methods)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct IngressStats {
+    depth: usize,
+    tokens: usize,
+    members: usize,
+    elements: usize,
+}
+
+#[derive(Default)]
+struct PreflightScanner {
+    stats: IngressStats,
+    failure: Option<SecretUseRequirementError>,
+    pending_parser_error: Option<SecretUseRequirementError>,
+}
+
+fn preflight_requirement(input: &[u8]) -> Result<IngressStats, SecretUseRequirementError> {
+    if input.len() > MAX_INGRESS_BYTES {
+        return Err(SecretUseRequirementError::InvalidContractShape);
+    }
+    let mut scanner = PreflightScanner::default();
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let result = PreflightSeed {
+        scanner: &mut scanner,
+        depth: 1,
+    }
+    .deserialize(&mut deserializer);
+    if result.is_err() {
+        return Err(scanner
+            .failure
+            .or(scanner.pending_parser_error)
+            .unwrap_or(SecretUseRequirementError::InvalidContractShape));
+    }
+    deserializer
+        .end()
+        .map_err(|_| SecretUseRequirementError::InvalidContractShape)?;
+    Ok(scanner.stats)
+}
+
+impl PreflightScanner {
+    fn reject(&mut self, error: SecretUseRequirementError) -> PreflightError {
+        self.failure.get_or_insert(error);
+        PreflightError
+    }
+
+    fn add_tokens(&mut self, count: usize) -> Result<(), PreflightError> {
+        self.stats.tokens = self
+            .stats
+            .tokens
+            .checked_add(count)
+            .ok_or_else(|| self.reject(SecretUseRequirementError::InvalidContractShape))?;
+        if self.stats.tokens > MAX_INGRESS_TOKENS {
+            return Err(self.reject(SecretUseRequirementError::InvalidContractShape));
+        }
+        Ok(())
+    }
+
+    fn enter_container(&mut self, depth: usize) -> Result<(), PreflightError> {
+        if depth > MAX_INGRESS_DEPTH {
+            return Err(self.reject(SecretUseRequirementError::InvalidContractShape));
+        }
+        self.stats.depth = self.stats.depth.max(depth);
+        self.add_tokens(2)
+    }
+
+    fn check_string(&mut self, value: &str) -> Result<(), PreflightError> {
+        if value.len() > MAX_INGRESS_STRING_BYTES {
+            return Err(self.reject(SecretUseRequirementError::InvalidContractShape));
+        }
+        Ok(())
+    }
+
+    fn add_member(&mut self) -> Result<(), PreflightError> {
+        self.stats.members = self
+            .stats
+            .members
+            .checked_add(1)
+            .ok_or_else(|| self.reject(SecretUseRequirementError::InvalidContractShape))?;
+        if self.stats.members > MAX_INGRESS_MEMBERS {
+            return Err(self.reject(SecretUseRequirementError::InvalidContractShape));
+        }
+        self.add_tokens(1)
+    }
+
+    fn add_element(&mut self) -> Result<(), PreflightError> {
+        self.stats.elements = self
+            .stats
+            .elements
+            .checked_add(1)
+            .ok_or_else(|| self.reject(SecretUseRequirementError::InvalidContractShape))?;
+        if self.stats.elements > MAX_INGRESS_ELEMENTS {
+            return Err(self.reject(SecretUseRequirementError::TooManyDeliveryMethods));
+        }
+        Ok(())
+    }
+
+    fn add_scalar(&mut self) -> Result<(), PreflightError> {
+        self.add_tokens(1)
+    }
+
+    fn add_string(&mut self, value: &str) -> Result<(), PreflightError> {
+        self.check_string(value)?;
+        self.add_scalar()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreflightError;
+
+impl fmt::Display for PreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(SecretUseRequirementError::InvalidContractShape.code())
+    }
+}
+
+impl Error for PreflightError {}
+
+struct PreflightSeed<'a> {
+    scanner: &'a mut PreflightScanner,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for PreflightSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PreflightVisitor {
+            scanner: self.scanner,
+            depth: self.depth,
+        })
+    }
+}
+
+struct PreflightVisitor<'a> {
+    scanner: &'a mut PreflightScanner,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for PreflightVisitor<'_> {
+    type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a secret-use requirement field")
+        formatter.write_str("bounded secret-use requirement JSON")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
+    }
+
+    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
+    }
+
+    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        self.scanner.add_scalar().map_err(E::custom)
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
     where
         E: DeError,
     {
-        Ok(match value {
-            "credential_slot_id" => SecretUseRequirementField::CredentialSlotId,
-            "delivery_methods" => SecretUseRequirementField::DeliveryMethods,
-            "intent" => SecretUseRequirementField::Intent,
-            "purpose" => SecretUseRequirementField::Purpose,
-            "requested_duration_seconds" => SecretUseRequirementField::RequestedDurationSeconds,
-            "requested_max_uses" => SecretUseRequirementField::RequestedMaxUses,
-            "required" => SecretUseRequirementField::Required,
-            "schema_version" => SecretUseRequirementField::SchemaVersion,
-            "secret_ref_id" => SecretUseRequirementField::SecretRefId,
-            _ => SecretUseRequirementField::Unknown,
-        })
+        self.scanner.add_string(value).map_err(E::custom)
     }
 
     fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
@@ -304,639 +656,291 @@ impl<'de> Visitor<'de> for SecretUseRequirementFieldVisitor {
         self.visit_str(&value)
     }
 
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Ok(SecretUseRequirementField::Unknown)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretUseRequirementField {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_identifier(SecretUseRequirementFieldVisitor)
-    }
-}
-
-struct SecretUseRequirementVisitor;
-
-impl<'de> Visitor<'de> for SecretUseRequirementVisitor {
-    type Value = SecretUseRequirement;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(SecretUseRequirementError::InvalidContractShape.code())
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut credential_slot_id = None;
-        let mut delivery_methods = None;
-        let mut intent = None;
-        let mut purpose = None;
-        let mut requested_duration_seconds = None;
-        let mut requested_max_uses = None;
-        let mut required = None;
-        let mut schema_version = None;
-        let mut secret_ref_id = None;
-
-        while let Some(field) = map.next_key::<SecretUseRequirementField>()? {
-            match field {
-                SecretUseRequirementField::CredentialSlotId => {
-                    reject_duplicate::<A::Error>(credential_slot_id.is_some())?;
-                    credential_slot_id = Some(map.next_value::<CredentialSlotIdInput>()?.0);
-                }
-                SecretUseRequirementField::DeliveryMethods => {
-                    reject_duplicate::<A::Error>(delivery_methods.is_some())?;
-                    delivery_methods = Some(map.next_value::<DeliveryMethodsInput>()?.0);
-                }
-                SecretUseRequirementField::Intent => {
-                    reject_duplicate::<A::Error>(intent.is_some())?;
-                    intent = Some(map.next_value::<IntentInput>()?.0);
-                }
-                SecretUseRequirementField::Purpose => {
-                    reject_duplicate::<A::Error>(purpose.is_some())?;
-                    purpose = Some(map.next_value::<PurposeInput>()?.0);
-                }
-                SecretUseRequirementField::RequestedDurationSeconds => {
-                    reject_duplicate::<A::Error>(requested_duration_seconds.is_some())?;
-                    requested_duration_seconds =
-                        Some(map.next_value::<RequestedDurationInput>()?.0);
-                }
-                SecretUseRequirementField::RequestedMaxUses => {
-                    reject_duplicate::<A::Error>(requested_max_uses.is_some())?;
-                    requested_max_uses = Some(map.next_value::<RequestedMaxUsesInput>()?.0);
-                }
-                SecretUseRequirementField::Required => {
-                    reject_duplicate::<A::Error>(required.is_some())?;
-                    required = Some(map.next_value::<RequiredInput>()?.0);
-                }
-                SecretUseRequirementField::SchemaVersion => {
-                    reject_duplicate::<A::Error>(schema_version.is_some())?;
-                    map.next_value::<SchemaVersionInput>()?;
-                    schema_version = Some(());
-                }
-                SecretUseRequirementField::SecretRefId => {
-                    reject_duplicate::<A::Error>(secret_ref_id.is_some())?;
-                    secret_ref_id = Some(map.next_value::<SecretRefIdInput>()?.0);
-                }
-                SecretUseRequirementField::Unknown => {
-                    return Err(A::Error::custom(SecretUseRequirementError::UnknownField));
-                }
-            }
-        }
-
-        let missing = || A::Error::custom(SecretUseRequirementError::MissingRequiredField);
-        schema_version.ok_or_else(missing)?;
-        SecretUseRequirement::try_new(
-            secret_ref_id.ok_or_else(missing)?,
-            credential_slot_id.ok_or_else(missing)?,
-            intent.ok_or_else(missing)?,
-            purpose.ok_or_else(missing)?,
-            delivery_methods.ok_or_else(missing)?,
-            requested_duration_seconds.ok_or_else(missing)?,
-            requested_max_uses.ok_or_else(missing)?,
-            required.ok_or_else(missing)?,
-        )
-        .map_err(A::Error::custom)
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
-    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_contract_shape()
-    }
-
     fn visit_none<E>(self) -> Result<Self::Value, E>
     where
         E: DeError,
     {
-        invalid_contract_shape()
+        self.scanner.add_scalar().map_err(E::custom)
     }
 
     fn visit_unit<E>(self) -> Result<Self::Value, E>
     where
         E: DeError,
     {
-        invalid_contract_shape()
-    }
-
-    fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        invalid_contract_shape()
-    }
-}
-
-fn reject_duplicate<E>(duplicate: bool) -> Result<(), E>
-where
-    E: DeError,
-{
-    if duplicate {
-        Err(E::custom(SecretUseRequirementError::DuplicateField))
-    } else {
-        Ok(())
-    }
-}
-
-fn invalid_contract_shape<T, E>() -> Result<T, E>
-where
-    E: DeError,
-{
-    Err(E::custom(SecretUseRequirementError::InvalidContractShape))
-}
-
-struct SchemaVersionInput;
-
-impl<'de> Deserialize<'de> for SchemaVersionInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_str(SchemaVersionVisitor)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidSchemaVersion))
-    }
-}
-
-struct SchemaVersionVisitor;
-
-impl<'de> Visitor<'de> for SchemaVersionVisitor {
-    type Value = SchemaVersionInput;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(SecretUseRequirementError::InvalidSchemaVersion.code())
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        if value == SECRET_USE_REQUIREMENT_SCHEMA_V1 {
-            Ok(SchemaVersionInput)
-        } else {
-            Err(E::custom(SecretUseRequirementError::InvalidSchemaVersion))
-        }
-    }
-}
-
-struct SecretRefIdInput(SecretRefId);
-
-impl<'de> Deserialize<'de> for SecretRefIdInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SecretRefId::deserialize(deserializer)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidSecretRefId))
-    }
-}
-
-struct CredentialSlotIdInput(SecretCredentialSlotId);
-
-impl<'de> Deserialize<'de> for CredentialSlotIdInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SecretCredentialSlotId::deserialize(deserializer)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidCredentialSlotId))
-    }
-}
-
-struct IntentInput(SecretUseIntent);
-
-impl<'de> Deserialize<'de> for IntentInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SecretUseIntent::deserialize(deserializer)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidIntent))
-    }
-}
-
-struct PurposeInput(SecretPurpose);
-
-impl<'de> Deserialize<'de> for PurposeInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SecretPurpose::deserialize(deserializer)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidPurpose))
-    }
-}
-
-struct DeliveryMethodInput(SecretDeliveryMethod);
-
-impl<'de> Deserialize<'de> for DeliveryMethodInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SecretDeliveryMethod::deserialize(deserializer)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidDeliveryMethod))
-    }
-}
-
-struct DeliveryMethodsInput(Vec<SecretDeliveryMethod>);
-
-impl<'de> Deserialize<'de> for DeliveryMethodsInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DeliveryMethodsVisitor)
-    }
-}
-
-struct DeliveryMethodsVisitor;
-
-impl<'de> Visitor<'de> for DeliveryMethodsVisitor {
-    type Value = DeliveryMethodsInput;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(SecretUseRequirementError::InvalidDeliveryMethods.code())
+        self.scanner.add_scalar().map_err(E::custom)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        let mut methods = Vec::with_capacity(MAX_DELIVERY_METHODS);
-        while let Some(method) = sequence.next_element::<DeliveryMethodInput>()? {
-            if methods.len() == MAX_DELIVERY_METHODS {
-                return Err(A::Error::custom(
-                    SecretUseRequirementError::TooManyDeliveryMethods,
-                ));
-            }
-            methods.push(method.0);
+        self.scanner
+            .enter_container(self.depth)
+            .map_err(A::Error::custom)?;
+        while sequence
+            .next_element_seed(PreflightSeed {
+                scanner: self.scanner,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {
+            self.scanner.add_element().map_err(A::Error::custom)?;
         }
-        Ok(DeliveryMethodsInput(methods))
+        Ok(())
     }
 
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        invalid_delivery_methods()
-    }
-
-    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
         A: MapAccess<'de>,
     {
-        invalid_delivery_methods()
+        self.scanner
+            .enter_container(self.depth)
+            .map_err(A::Error::custom)?;
+        let mut names = HashSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            let parser_error = if self.depth == 1 {
+                root_field_error(&name).ok_or_else(|| {
+                    A::Error::custom(self.scanner.reject(SecretUseRequirementError::UnknownField))
+                })?
+            } else {
+                SecretUseRequirementError::InvalidContractShape
+            };
+            self.scanner.check_string(&name).map_err(A::Error::custom)?;
+            if !names.insert(name.clone()) {
+                let error = self
+                    .scanner
+                    .reject(SecretUseRequirementError::DuplicateField);
+                return Err(A::Error::custom(error));
+            }
+            self.scanner.add_member().map_err(A::Error::custom)?;
+            if self.depth == 1 {
+                self.scanner.pending_parser_error = Some(parser_error);
+            }
+            map.next_value_seed(PreflightSeed {
+                scanner: self.scanner,
+                depth: self.depth + 1,
+            })?;
+            if self.depth == 1 {
+                self.scanner.pending_parser_error = None;
+            }
+        }
+        Ok(())
     }
 }
 
-fn invalid_delivery_methods<T, E>() -> Result<T, E>
-where
-    E: DeError,
-{
-    Err(E::custom(SecretUseRequirementError::InvalidDeliveryMethods))
-}
-
-struct RequestedDurationInput(u64);
-
-impl<'de> Deserialize<'de> for RequestedDurationInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_u64(U64Visitor)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidRequestedDuration))
-    }
-}
-
-struct RequestedMaxUsesInput(u64);
-
-impl<'de> Deserialize<'de> for RequestedMaxUsesInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_u64(U64Visitor)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidRequestedMaxUses))
-    }
-}
-
-struct U64Visitor;
-
-impl<'de> Visitor<'de> for U64Visitor {
-    type Value = u64;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an unsigned integer")
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Ok(value)
-    }
-}
-
-struct RequiredInput(bool);
-
-impl<'de> Deserialize<'de> for RequiredInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_bool(BoolVisitor)
-            .map(Self)
-            .map_err(|_| D::Error::custom(SecretUseRequirementError::InvalidRequired))
-    }
-}
-
-struct BoolVisitor;
-
-impl<'de> Visitor<'de> for BoolVisitor {
-    type Value = bool;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a boolean")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-    where
-        E: DeError,
-    {
-        Ok(value)
+fn root_field_error(name: &str) -> Option<SecretUseRequirementError> {
+    match name {
+        "credential_slot_id" => Some(SecretUseRequirementError::InvalidCredentialSlotId),
+        "delivery_methods" => Some(SecretUseRequirementError::InvalidDeliveryMethods),
+        "intent" => Some(SecretUseRequirementError::InvalidIntent),
+        "purpose" => Some(SecretUseRequirementError::InvalidPurpose),
+        "requested_duration_seconds" => Some(SecretUseRequirementError::InvalidRequestedDuration),
+        "requested_max_uses" => Some(SecretUseRequirementError::InvalidRequestedMaxUses),
+        "required" => Some(SecretUseRequirementError::InvalidRequired),
+        "schema_version" => Some(SecretUseRequirementError::InvalidSchemaVersion),
+        "secret_ref_id" => Some(SecretUseRequirementError::InvalidSecretRefId),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::de::value::{
-        CharDeserializer, Error as ValueError, MapDeserializer, SeqDeserializer, StringDeserializer,
-    };
 
-    fn assert_fixed_error<T>(result: Result<T, ValueError>, expected: SecretUseRequirementError) {
-        let error = match result {
-            Ok(_) => panic!("generic serde form must reject"),
-            Err(error) => error.to_string(),
-        };
-        assert_eq!(error, expected.code());
-    }
+    const SECRET_REF_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001";
+    const CREDENTIAL_SLOT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4101";
 
-    #[test]
-    fn generic_top_level_forms_fail_closed_with_fixed_errors() {
-        let expected = SecretUseRequirementError::InvalidContractShape;
-        assert_fixed_error(SecretUseRequirementVisitor.visit_bool(true), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_i64(-1), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_i128(i128::MIN), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_u64(1), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_u128(u128::MAX), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_f64(1.5), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_char('x'), expected);
-        assert_fixed_error(
-            SecretUseRequirementVisitor.visit_str("PRIVATE_TOP_LEVEL_CANDIDATE"),
-            expected,
-        );
-        assert_fixed_error(
-            SecretUseRequirementVisitor.visit_string("PRIVATE_TOP_LEVEL_CANDIDATE".to_owned()),
-            expected,
-        );
-        assert_fixed_error(
-            SecretUseRequirementVisitor.visit_bytes(b"PRIVATE_TOP_LEVEL_CANDIDATE"),
-            expected,
-        );
-        assert_fixed_error(
-            SecretUseRequirementVisitor.visit_byte_buf(b"PRIVATE_TOP_LEVEL_CANDIDATE".to_vec()),
-            expected,
-        );
-        assert_fixed_error(SecretUseRequirementVisitor.visit_none(), expected);
-        assert_fixed_error(SecretUseRequirementVisitor.visit_unit(), expected);
-        assert_fixed_error(
-            SecretUseRequirementVisitor.visit_seq(SeqDeserializer::<_, ValueError>::new(
-                std::iter::empty::<u8>(),
-            )),
-            expected,
-        );
-    }
-
-    #[test]
-    fn generic_delivery_collection_forms_fail_closed_with_fixed_errors() {
-        let expected = SecretUseRequirementError::InvalidDeliveryMethods;
-        assert_fixed_error(DeliveryMethodsVisitor.visit_bool(true), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_i64(-1), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_i128(i128::MIN), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_u64(1), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_u128(u128::MAX), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_f64(1.5), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_char('x'), expected);
-        assert_fixed_error(
-            DeliveryMethodsVisitor.visit_str("PRIVATE_DELIVERY_LIST_CANDIDATE"),
-            expected,
-        );
-        assert_fixed_error(
-            DeliveryMethodsVisitor.visit_string("PRIVATE_DELIVERY_LIST_CANDIDATE".to_owned()),
-            expected,
-        );
-        assert_fixed_error(
-            DeliveryMethodsVisitor.visit_bytes(b"PRIVATE_DELIVERY_LIST_CANDIDATE"),
-            expected,
-        );
-        assert_fixed_error(
-            DeliveryMethodsVisitor.visit_byte_buf(b"PRIVATE_DELIVERY_LIST_CANDIDATE".to_vec()),
-            expected,
-        );
-        assert_fixed_error(DeliveryMethodsVisitor.visit_none(), expected);
-        assert_fixed_error(DeliveryMethodsVisitor.visit_unit(), expected);
-        assert_fixed_error(
-            DeliveryMethodsVisitor.visit_map(MapDeserializer::<_, ValueError>::new(
-                std::iter::empty::<(u8, u8)>(),
-            )),
-            expected,
-        );
-    }
-
-    #[test]
-    fn generic_field_identifiers_do_not_reflect_unknown_candidates() {
-        let required = SecretUseRequirementField::deserialize(
-            StringDeserializer::<ValueError>::new("required".to_owned()),
+    fn legal_maximum() -> SecretUseRequirement {
+        SecretUseRequirement::try_new(
+            SECRET_REF_ID.parse().expect("secret ref"),
+            CREDENTIAL_SLOT_ID.parse().expect("credential slot"),
+            SecretUseIntent::BootstrapTransport,
+            SecretPurpose::CryptographicOperation,
+            vec![
+                SecretDeliveryMethod::InheritedFd,
+                SecretDeliveryMethod::TmpfsFile,
+                SecretDeliveryMethod::OneShotLocalSocket,
+                SecretDeliveryMethod::OrchestratorProjectedSecret,
+                SecretDeliveryMethod::EnvironmentVariable,
+            ],
+            MAX_SAFE_INTEGER,
+            MAX_SAFE_INTEGER,
+            true,
         )
-        .expect("owned exact field must parse");
-        assert!(matches!(required, SecretUseRequirementField::Required));
+        .expect("legal maximum")
+    }
 
-        let unknown =
-            SecretUseRequirementField::deserialize(CharDeserializer::<ValueError>::new('x'))
-                .expect("char field form must become the non-reflecting unknown marker");
-        assert!(matches!(unknown, SecretUseRequirementField::Unknown));
+    #[test]
+    fn bounded_ingress_accepts_the_generated_legal_maximum_and_exact_raw_cap() {
+        let maximum = legal_maximum();
+        let canonical = serde_json::to_vec(&maximum).expect("maximum serialization");
+        assert_eq!(canonical.len(), 465, "generated legal maximum changed");
+        assert!(canonical.len() < MAX_INGRESS_BYTES);
+        assert_eq!(
+            preflight_requirement(&canonical),
+            Ok(IngressStats {
+                depth: MAX_INGRESS_DEPTH,
+                tokens: MAX_INGRESS_TOKENS,
+                members: MAX_INGRESS_MEMBERS,
+                elements: MAX_INGRESS_ELEMENTS,
+            })
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(&canonical),
+            Ok(maximum.clone())
+        );
+
+        let mut exact_raw_cap = canonical;
+        exact_raw_cap.resize(MAX_INGRESS_BYTES, b' ');
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(&exact_raw_cap),
+            Ok(maximum)
+        );
+    }
+
+    #[test]
+    fn bounded_ingress_rejects_each_cap_plus_one() {
+        let canonical = serde_json::to_vec(&legal_maximum()).unwrap();
+        let mut raw_cap_plus_one = canonical;
+        raw_cap_plus_one.resize(MAX_INGRESS_BYTES + 1, b' ');
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(&raw_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+
+        let depth_cap_plus_one = br#"{"required":[[]]}"#;
+        assert_eq!(
+            preflight_requirement(depth_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(depth_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+
+        let token_cap_plus_one = br#"{"credential_slot_id":[],"delivery_methods":[],"intent":[],"purpose":[],"requested_duration_seconds":[],"requested_max_uses":[],"required":[],"schema_version":[],"secret_ref_id":[]}"#;
+        assert_eq!(
+            preflight_requirement(token_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(token_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+
+        let member_cap_plus_one = br#"{"required":{"a":null,"b":null,"c":null,"d":null,"e":null,"f":null,"g":null,"h":null,"i":null}}"#;
+        assert_eq!(
+            preflight_requirement(member_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(member_cap_plus_one),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+
+        let element_cap_plus_one = br#"{"delivery_methods":[null,null,null,null,null,null]}"#;
+        assert_eq!(
+            preflight_requirement(element_cap_plus_one),
+            Err(SecretUseRequirementError::TooManyDeliveryMethods)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(element_cap_plus_one),
+            Err(SecretUseRequirementError::TooManyDeliveryMethods)
+        );
+
+        let overlong = "x".repeat(MAX_INGRESS_STRING_BYTES + 1);
+        let string_cap_plus_one = format!(r#"{{"required":"{overlong}"}}"#);
+        assert_eq!(
+            preflight_requirement(string_cap_plus_one.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(string_cap_plus_one.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        let name_cap_plus_one = format!(r#"{{"required":{{"{overlong}":true}}}}"#);
+        assert_eq!(
+            preflight_requirement(name_cap_plus_one.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(name_cap_plus_one.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+    }
+
+    #[test]
+    fn bounded_ingress_handles_whitespace_escapes_duplicates_and_malformed_json() {
+        let canonical = serde_json::to_string(&legal_maximum()).unwrap();
+        let escaped = canonical.replacen("splendor", r"\u0073plendor", 1);
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(escaped.as_bytes()),
+            Ok(legal_maximum())
+        );
+
+        let whitespace_bomb = format!("{}{}", canonical, " ".repeat(MAX_INGRESS_BYTES));
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(whitespace_bomb.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+        let escape_bomb = format!(
+            r#"{{"required":"{}"}}"#,
+            r"\u0061".repeat(MAX_INGRESS_BYTES / 6)
+        );
+        assert!(escape_bomb.len() > MAX_INGRESS_BYTES);
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(escape_bomb.as_bytes()),
+            Err(SecretUseRequirementError::InvalidContractShape)
+        );
+
+        assert_eq!(
+            SecretUseRequirement::from_json_slice(
+                br#"{"required":{"nested":true,"nested":false}}"#
+            ),
+            Err(SecretUseRequirementError::DuplicateField)
+        );
+        for (malformed, expected) in [
+            (
+                b"{".as_slice(),
+                SecretUseRequirementError::InvalidContractShape,
+            ),
+            (
+                br#"{123:true}"#,
+                SecretUseRequirementError::InvalidContractShape,
+            ),
+            (
+                br#"{"required":"unterminated}"#,
+                SecretUseRequirementError::InvalidRequired,
+            ),
+            (
+                &[0xff, 0xfe],
+                SecretUseRequirementError::InvalidContractShape,
+            ),
+        ] {
+            let error = SecretUseRequirement::from_json_slice(malformed)
+                .expect_err("malformed JSON must reject");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn ingress_errors_have_fixed_source_free_canary_safe_bytes() {
+        const KEY_CANARY: &str = "PRIVATE_KEY_CANARY";
+        const VALUE_CANARY: &str = "PRIVATE_VALUE_CANARY";
+        let raw = format!(r#"{{"{KEY_CANARY}":"{VALUE_CANARY}"}}"#);
+        let error = SecretUseRequirement::from_json_slice(raw.as_bytes())
+            .expect_err("unknown canary field must reject");
+        assert_eq!(error, SecretUseRequirementError::UnknownField);
+        assert_eq!(error.to_string(), error.code());
+        assert_eq!(format!("{error:?}"), error.code());
+        assert!(!error.to_string().contains(KEY_CANARY));
+        assert!(!error.to_string().contains(VALUE_CANARY));
+        assert!(std::error::Error::source(&error).is_none());
+
+        let numeric_key = SecretUseRequirement::from_json_slice(br#"{9876543210:true}"#)
+            .expect_err("a non-string JSON key must reject");
+        assert_eq!(numeric_key, SecretUseRequirementError::InvalidContractShape);
+        assert_eq!(numeric_key.to_string(), "invalid_contract_shape");
+        assert!(!numeric_key.to_string().contains("9876543210"));
     }
 }
