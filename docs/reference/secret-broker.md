@@ -2,25 +2,30 @@
 
 ## Status
 
-**status/incomplete — C03 V1a identities, owner-independent pre-placement
-grammar, behavior-free trusted-send control vocabulary, and non-authorizing
-secret-use requirement grammar only.**
+**status/incomplete — behavior-free C03 identities, pre-placement grammar,
+non-authorizing secret-use requirements, revision-bound secret references, and
+historical-v1 read/deny views only.**
 
 The current implementation adds 40 behavior-free nominal UUID identity types,
 seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, a
-valid-by-construction `SecretLeasePolicy`, and the strict
-`SecretUseRequirement` v1 Rust contract in `splendor-types`. The requirement
-imports the Driver Registry-owned `SecretCredentialSlotId`. It does not
-implement `SecretRef`, credential authorization, a provider port, a broker or
-lease lifecycle, lease or delivery records, secret material handling,
-Gateway/daemon/API/SDK integration, a scanner, side effects, feature activation,
-issue closure, or gold evidence. No generated public surface is claimed.
+valid-by-construction `SecretLeasePolicy`, the strict `SecretUseRequirement` v1
+Rust contract, and RFC 0014's additive `SecretCredentialAuthorizationV2` and
+`SecretRefV2` contracts in `splendor-types`. It also decodes frozen v1 ref bytes
+into closed historical views that always deny live use. These contracts import
+the Driver Registry-owned operation, slot, destination-digest, declaration, and
+trusted-send types rather than copying them. They do not implement a provider
+port, broker or lease lifecycle, ref persistence/head mutation, migration
+execution, lease or delivery records, secret material handling, Authority or
+Gateway decisions, daemon/API/SDK integration, a scanner, side effects, feature
+activation, issue closure, or gold evidence. No generated public surface is
+claimed.
 
 ## Purpose and boundary
 
 These values reserve distinct identities and closed policy vocabulary and let
-typed callers describe a non-authorizing secret-use requirement without creating
-an authority, lease, provider, or allocation owner.
+typed callers describe non-authorizing secret-use requirements and
+revision-bound ref declarations without creating an authority, lease, provider,
+or allocation owner.
 Possessing an identity, enum value, provider version reference, or lease policy
 does not authorize access, delivery, publication, reconciliation, retry,
 renewal, or any other operation. The implemented values contain no secret
@@ -146,6 +151,82 @@ environment name. It does not construct or consume
 `SecretRef.allowed_credential_bindings`; possession or successful parsing grants
 no authority.
 
+## Revision-bound secret-reference contract
+
+RFC 0014 adds two behavior-free Rust schemas without changing the accepted v1
+bytes in place:
+
+| Type | Exact schema | Purpose |
+| --- | --- | --- |
+| `SecretCredentialAuthorizationV2` | `splendor.secret.credential_authorization.v2` | Binds one exact Driver operation, positive declaration revision, credential slot, destination schema, exposure/trusted-send profile, and one-to-sixteen approved destination digests. |
+| `SecretRefV2` | `splendor.secret.ref.v2` | Binds one positive ref revision and provider/version/classification/policy metadata to one-to-sixteen unique v2 authorization coordinates. |
+
+Both types have private fields, checked constructors, deterministic `Serialize`,
+fixed code-only errors, and no generic `Deserialize`. Imported, persisted, or
+otherwise untrusted bytes must use `from_json_slice`. One duplicate-aware
+preflight validates JSON and enforces every resource bound before strict private
+wire construction:
+
+| Resource | Authorization v2 | Secret ref v2 / historical v1 |
+| --- | ---: | ---: |
+| Raw JSON bytes | 8,192 | 65,536 |
+| Container depth, root at 1 | 8 | 12 |
+| Decoder tokens | 128 | 2,048 |
+| Object members | 32 | 384 |
+| Array elements | 32 | 512 |
+| Decoded UTF-8 bytes per name/string | 256 | 256 |
+
+Unknown, missing, duplicate, null, wrong-kind, malformed, over-bound, and
+noncanonical values fail in RFC 0014's fixed precedence. Errors retain no input,
+candidate, parser location, or source chain. Decimal revisions must be positive
+safe JSON integer tokens; signs, leading zeroes, fractions, exponents, strings,
+and values above `9007199254740991` reject. The ref rejects duplicate
+authorization binding keys even when their approved digest sets differ or only
+overlap. Delivery methods form a unique semantic set and
+`environment_variable` alone is invalid.
+
+Validation rejects before normalization. Destination digests, trusted-send
+controls, authorization entries, and delivery methods then use RFC 0014's exact
+canonical set ordering. Compact serialization is the RFC 8785 JCS byte sequence.
+The checked-in fixtures are:
+
+- `crates/splendor-types/tests/fixtures/secrets/v2/authorization-v2-same-revision.json`
+- `crates/splendor-types/tests/fixtures/secrets/v2/secret-ref-v2-same-revision.json`
+- `crates/splendor-types/tests/fixtures/secrets/v2/authorization-v2-legal-maximum.json`
+- `crates/splendor-types/tests/fixtures/secrets/v2/secret-ref-v2-legal-maximum.json`
+
+The legal-maximum fixtures independently pin every semantic maximum. Their
+canonical byte lengths and BLAKE3 hashes are 2,237 bytes /
+`6576988eddba3e8368783447a58ae48739a5c67779019aac247a2cd03ef5f49d`
+and 37,041 bytes /
+`af2f77f6e7b0f87c2ba845a095b3ef391934409d21da485e041c18bfc8625f19`,
+respectively.
+
+`compare_secret_credential_authorization_v2` is a pure comparison against one
+already-supplied validated `DriverOperationCredentialSinksV1`. It checks, in
+order, operation, declaration revision, slot, destination schema, exposure,
+trusted-send profile, containing-ref classification, and requirement intent. It
+performs no lookup, lifecycle/current-head selection, purpose or Authority
+evaluation, persistence, provider access, or I/O. `Matched` is not authority,
+proof, evidence, a decision, permit, lease, or cache value; comparison results
+and mismatch codes are intentionally non-serializable.
+
+## Historical v1 read/deny views
+
+`HistoricalSecretRefV1::from_json_slice` accepts only the frozen RFC 0014 v1
+shape through the ref ingress budget and strict private-wire parser. It never
+routes history into a live type. Historical entries are sorted by canonical JCS
+bytes, assigned stable zero-based source ordinals, and expose the exact
+domain-separated BLAKE3 entry and ref digests required for later proof-bound
+migration. The fixture is
+`crates/splendor-types/tests/fixtures/secrets/v2/historical-secret-ref-v1.json`.
+
+Historical view types serialize deterministically but do not implement generic
+`Deserialize`, live-type conversion, migration, lookup, Authority evaluation, or
+current-head selection. `live_denial()` always returns the fieldless
+`historical_revisionless_authorization_live_denied` result. No implementation
+infers a current Driver declaration revision from v1 history.
+
 ## Implemented identity inventory
 
 | Area | Types |
@@ -214,14 +295,35 @@ assert_eq!(parsed, requirement);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+```rust
+use splendor_types::{HistoricalSecretRefV1, SecretRefV2};
+
+let live_bytes = include_bytes!(
+    "../../crates/splendor-types/tests/fixtures/secrets/v2/secret-ref-v2-same-revision.json"
+);
+let secret_ref = SecretRefV2::from_json_slice(live_bytes)?;
+assert_eq!(secret_ref.secret_ref_revision(), 2);
+
+let historical_bytes = include_bytes!(
+    "../../crates/splendor-types/tests/fixtures/secrets/v2/historical-secret-ref-v1.json"
+);
+let historical = HistoricalSecretRefV1::from_json_slice(historical_bytes)?;
+assert_eq!(
+    historical.live_denial().to_string(),
+    "historical_revisionless_authorization_live_denied"
+);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Lifecycle, trace, and replay
 
-No lifecycle is implemented. Creating or parsing an ID, provider version
-reference, enum, lease policy, or use requirement does not create a secret
-reference, authority, lease, or delivery. This slice emits no trace/evidence
-event, changes no state, and performs no side effect. Consequently there is no
-C03 runtime replay path; the values may only round-trip as behavior-free
-contracts in code that explicitly uses them.
+No lifecycle is implemented. Creating or parsing any value in this reference,
+including a v2 ref, does not make it current, create Authority, select a Driver
+declaration, migrate history, issue a lease, resolve a provider, or perform
+delivery. This slice emits no trace/evidence event, changes no state, and
+performs no side effect. There is no C03 runtime replay path; code may only
+round-trip and inspect these behavior-free contracts. Inspecting historical v1
+never converts it into live authority.
 
 ## Failure and security behavior
 
@@ -238,9 +340,13 @@ range or relationship; strict serde failures do not echo unknown keys or field
 values. Secret-use requirement failures are fixed code-only categories; its
 bounded byte parser and private wire input prevent malformed IDs, enum
 candidates, schema candidates, keys, parser details, and wrong scalar types from
-being reflected. No implemented primitive contains a
-secret value/material/byte field, provider request, raw provider error,
-credential value, token, password, or API key.
+being reflected. Revision-bound ref and authorization parser failures expose
+only RFC 0014's closed fixed codes. `Debug` for validated v2 and historical
+records emits only a fixed type label; comparison `Display`/`Debug` emits only
+`matched` or one fixed mismatch code. Rejected candidates and approved
+destination coordinates are not retained in errors or source chains. No
+implemented primitive contains a secret value/material/byte field, provider
+request, raw provider error, credential value, token, password, or API key.
 
 ## Compatibility and versioning
 
@@ -252,9 +358,9 @@ slice. Removing public generic `Deserialize` in favor of the sole bounded
 experimental type; its canonical serialized bytes are unchanged. Existing 0.1
 ID constructors, permissive parsing/deserialization behavior, serialized bytes,
 and aliases remain unchanged. Existing C03 pre-placement and Driver Registry
-credential-sink fixture bytes are also unchanged. Future records that use these
-values still require
-their owning contracts and compatible versioning. In particular, complete
-revision-bearing credential authorization, approved destination binding,
-`SecretRef`, Authority/Gateway/runtime consumption, and historical migration
-remain blocked on their separately accepted C03 contract and owner prerequisites.
+credential-sink fixture bytes are also unchanged. RFC 0014's authorization/ref
+v2 schemas are additive experimental successors; revision-less v1 remains
+historical read/deny only and there is no dual live-reader fallback. Persisted
+records, Authority/Gateway consumption, historical migration execution,
+provider resolution, daemon/API/SDK surfaces, and generated schemas remain
+blocked on separately accepted owner contracts and production-path evidence.
