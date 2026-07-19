@@ -143,6 +143,7 @@ Acceptance may authorize a later behavior-free C03 slice to expose only:
 | `HistoricalSecretRefV1` | Closed, non-live historical ref view and bounded parser. |
 | `HistoricalSecretRefV1Error` | One fixed non-reflecting historical-parser error. |
 | `HistoricalSecretRefV1LiveDenial` | One fieldless non-live denial result. |
+| `compare_secret_credential_authorization_v2` | Exact pure function `pub fn compare_secret_credential_authorization_v2(authorization: &SecretCredentialAuthorizationV2, ref_classification: &SecretClassification, requirement_intent: &SecretUseIntent, declaration: &DriverOperationCredentialSinksV1) -> SecretCredentialDeclarationComparisonV2`; it performs no lookup, authority decision, persistence, or I/O. |
 | `SecretCredentialDeclarationComparisonV2` | Behavior-free comparison result; never authority or proof. |
 | `SecretCredentialDeclarationMismatchCodeV2` | Closed, code-only declaration/context mismatch taxonomy. |
 
@@ -889,35 +890,42 @@ Those are the exact eighteen non-null members of one future command proof-bundle
 object. `source_entry` and `target_entry` are the complete closed historical-v1
 and v2 authorization objects, not strings or projections. Evidence IDs are
 owner-nominal IDs and evidence digests bind the complete separately contracted
-owner records described below. The explicit Registry fields must equal those
-records and make installation/admission/declaration/lifecycle substitution fail
-before target construction. Unknown, missing, null, duplicate, alias, side, or
-extension members reject before evidence lookup.
+owner records described below. The explicit Registry fields must equal the
+Registry-owned facts in the Registry record and the same Registry coordinates
+bound by the Authority historical record. This exact three-way equality makes
+installation/admission/declaration/lifecycle substitution fail before target
+construction without making Registry own a C03 source entry. Unknown, missing,
+null, duplicate, alias, side, or extension members reject before evidence
+lookup.
 
 | Binding | Exact required facts |
 | --- | --- |
 | Source ref | Exact `SecretRefId`, positive source `secret_ref_revision`, complete canonical source-ref JCS bytes, and `source_ref_digest`. |
 | Source entry | Exact `source_entry_identity`, zero-based canonical ordinal, complete canonical entry JCS bytes, `source_entry_digest`, canonical operation, slot, destination schema, exposure profile, trusted-send profile, and complete sorted approved-digest set. |
-| Authority historical evidence | Immutable Authority evidence identity, schema/version, canonical digest, integrity/signature-chain identity, exact tenant, source-ref identity/revision/digest, source-entry identity/ordinal/digest/coordinate, issuance-or-import decision identity, and the one exact positive declaration revision proven for that entry. |
-| Driver Registry admission evidence | Immutable Registry evidence identity, schema/version, canonical digest, integrity/signature-chain identity, exact tenant scope, installation identity and scope, immutable admission identity and admission digest, canonical operation, positive declaration revision, complete canonical declaration digest, exact slot-entry bytes/fingerprint, lifecycle state `active`, and the exact monotonic lifecycle generation observed for migration. |
-| Target entry | Exact positive target ref revision, target canonical ordinal, complete canonical v2 entry JCS bytes and digest, and the exact proven declaration revision inserted into that target entry. |
+| Authority historical evidence | Immutable Authority evidence identity, schema/version, canonical digest, integrity/signature-chain identity, exact tenant, source-ref identity/revision/digest, source-entry identity/ordinal/digest/coordinate and complete sorted approved-digest set, issuance-or-import decision identity, the one exact positive declaration revision proven for that entry, and the exact Registry evidence identity/digest plus tenant scope, installation/scope, admission/digest, operation, declaration revision/digest, slot, and lifecycle generation to which that Authority decision was bound. |
+| Driver Registry admission evidence | Immutable Registry evidence identity, schema/version, canonical digest, integrity/signature-chain identity, exact tenant scope, installation identity and scope, immutable admission identity and admission digest, canonical operation, positive declaration revision, complete canonical declaration digest, exact slot-entry bytes/fingerprint, lifecycle state `active`, and the exact monotonic lifecycle generation observed for migration. It contains no C03 ref, source-entry identity/digest, approved destination set, or C03 decision. |
+| Target entry | Target canonical ordinal, complete canonical v2 entry JCS bytes and digest, and the exact proven declaration revision inserted into that target entry. Target ref revision, creation time, complete bytes, and ref digest are later Authority allocation results and are not proof-bundle facts. |
 
-The Authority and Registry evidence identities are distinct. Both owner records
-must directly bind the same source-entry identity and digest, operation, slot,
-tenant scope, and proven declaration revision. Registry evidence additionally
-binds its own installation/admission scope and lifecycle generation. Evidence
-for one entry, ref, tenant, installation, admission, operation, slot, declaration
-digest/revision, or lifecycle generation cannot prove another even when numbers
-or bytes happen to match. Registry's source-entry identity/digest field is only
-an immutable correlation to the historical admission fact; Registry neither
-interprets nor approves C03's approved-digest set, ref classification, provider
-coordinates, lease policy, or target ref bytes.
+The Authority and Registry evidence identities are distinct. Authority
+historical evidence alone binds the C03 source-ref and source-entry identity,
+digest, coordinate, and complete approved-digest set to the exact Registry
+evidence identity, digest, and Registry-owned coordinates listed above. Registry
+evidence binds only its tenant/installation/admission/operation/declaration/slot/
+lifecycle facts. Migration proves the join by requiring the Registry evidence
+identity, digest, and every Registry coordinate in the proof bundle and Authority
+record to equal the Registry record byte-for-byte. Evidence for one entry, ref,
+tenant, installation, admission, operation, slot, declaration digest/revision,
+or lifecycle generation cannot prove another even when numbers or bytes happen
+to match. Registry never attests a C03 ref, source-entry identity or digest,
+approved destination set, ref classification, provider coordinate, lease policy,
+or target ref byte.
 
 A caller assertion, unsigned manifest, matching number, current registry head,
 operation lookup, declaration byte similarity, timestamp, filename, database
 row/order/join, import order, provider metadata, or hidden relation proves none
-of these facts. If either owner evidence record did not historically bind the
-exact entry and all facts assigned to its owner, that entry's revision is
+of these facts. If Authority evidence did not historically bind the exact C03
+entry to the exact Registry evidence record and coordinates, or Registry
+evidence did not bind every Registry-owned fact, that entry's revision is
 unproven and migration to live authority is impossible.
 
 #### Bijective shape-preserving transform
@@ -938,28 +946,39 @@ For each mapped entry, the target is the deterministic source entry with only:
    `splendor.secret.credential_authorization.v2`; and
 2. the exact separately proven positive `driver_declaration_revision` inserted.
 
-For the containing ref, the target is the deterministic source ref with only:
+The normalized migration target specification follows RFC 0012's command-only
+`SecretRefSpec` ownership rule. It contains exactly these eleven semantic
+members: `secret_ref_id`, `tenant_id`, `secret_provider_id`,
+`provider_namespace`, `logical_name`, `provider_version_ref`, `classification`,
+`allowed_credential_bindings`, `allowed_delivery_methods`, `lease_policy`, and
+`offline_behavior`. The binding array contains the mapped v2 entries above in
+canonical order. The specification contains no target schema field,
+`secret_ref_revision`, `created_at`, `disabled_at`, target ref digest, generated
+identity, or owner time.
 
-1. `schema_version` changed from `splendor.secret.ref.v1` to
-   `splendor.secret.ref.v2`;
-2. a fresh positive Authority-issued `secret_ref_revision` fixed by the command;
-3. one Authority-issued target-revision `created_at` fixed by the command and not
-   earlier than the source revision's `created_at`; and
-4. each source authorization replaced by its mapped entry above and then
-   canonically sorted.
+After the first durable command claim and an allow decision, Authority constructs
+the one target from that retained specification and source record by only:
 
-Every other semantic value is byte-for-byte preserved after canonical parsing:
-ref ID, tenant, provider ID/namespace/version, logical name, classification,
-allowed delivery methods, lease policy, offline behavior, optional `disabled_at`,
-every operation/slot/destination-schema/exposure/profile value, and every
-approved digest.
-`created_at` is governed only by item 3 above.
-Command/result/event identities and first-observation times are new owner facts
-outside `SecretRefV2`; they do not permit another target-field change. A target
-that changes any other value is not migration. It must deny here and, if desired,
-be submitted later as a separately authorized ordinary v2 update with a fresh
-nominal command ID, expected head, current authority, and ref revision after
-migration completes.
+1. setting `schema_version` to `splendor.secret.ref.v2`;
+2. allocating one fresh positive Authority-owned `secret_ref_revision`;
+3. allocating one Authority-owned target-revision `created_at` not earlier than
+   the source revision's `created_at`;
+4. copying the source's optional Authority-owned `disabled_at` unchanged when it
+   is present; and
+5. inserting the specification's mapped v2 entries.
+
+Every semantic proposal value is byte-for-byte preserved after canonical
+parsing: ref ID, tenant, provider ID/namespace/version, logical name,
+classification, allowed delivery methods, lease policy, offline behavior, every
+operation/slot/destination-schema/exposure/profile value, and every approved
+digest. The target revision, creation time, complete target bytes, and target ref
+digest are owner results retained after allocation, not caller-selected or
+pre-claim command facts. Command/result/event identities and first-observation
+times are other owner facts outside `SecretRefV2`; they do not permit another
+target-field change. A target specification that changes any other semantic
+value is not migration. It must deny here and, if desired, be submitted later as
+a separately authorized ordinary v2 update with a fresh nominal command ID,
+expected head, current authority, and ref revision after migration completes.
 
 The exact Authority issuance/import-evidence and Driver Registry admission-
 evidence schemas are prerequisites owned by their respective components. No
@@ -973,14 +992,14 @@ evidence in their place.
 
 The future closed command schema is exactly
 `splendor.secret.ref_revision_migration_command.v1`. It is a closed object with
-these exact eighteen required, non-null members:
+these exact fifteen required, non-null members:
 
 | Field | Exact command content |
 | --- | --- |
 | `schema_version` | Exact command schema above. |
 | `secret_ref_mutation_command_id` | Exact imported RFC 0012 nominal command ID. |
-| `tenant_id` | Exact authenticated tenant. |
-| `actor_principal_id` | Exact authenticated principal. |
+| `actor_binding` | Exact RFC 0012 `SecretCommandActorBinding`, containing only authenticated `tenant_id`, authenticated `actor_principal_id`, the complete current `SecretAuthorityBinding`, and `causal_ref`; its tenant and principal equal the authority binding. |
+| `observed_at` | Exact RFC 0012 Authority-owned first-observation timestamp. It is allocated and retained by Authority during the first atomic claim and is never accepted from caller bytes. |
 | `required_scope` | Literal `splendor.secrets.refs.migrate_revision_binding`. |
 | `service_audience` | Exact authenticated Authority-service audience. |
 | `work_order_id` | Exact current work order authorizing this migration. |
@@ -990,11 +1009,17 @@ these exact eighteen required, non-null members:
 | `source_ref_digest` | Exact source digest defined above. |
 | `proof_bundles` | Non-empty ordered array with exactly one closed eighteen-member proof bundle per canonical source entry. |
 | `expected_head` | Closed object defined below. |
-| `target_ref` | Complete validated `SecretRefV2`, including fixed target ID/revision/creation time and exact canonical entries. |
-| `target_ref_digest` | Exact target digest defined above. |
-| `current_authority_binding` | Complete current RFC 0012 `SecretAuthorityBinding`, including principal, capability, work order, data-use, Authority/policy/revocation revisions, and causal authority ref. |
+| `migration_target_spec` | Complete closed eleven-member command-only specification defined above. It excludes target schema, revision, creation/disable time, complete target bytes, and target ref digest. |
 | `expected_current_generations` | Closed object defined below. |
-| `causal_ref` | Exact RFC 0012 `SecretCausalRef`; it is causality, not authority. |
+
+The explicit `work_order_id` and `work_order_digest` are semantic fields and
+remain in equality even though work order is not part of the stable nominal-
+command lookup scope below. `work_order_id` must equal the binding's required
+work-order ID. `work_order_digest` is independently validated against that same
+current immutable signed work order because RFC 0012's
+`SecretAuthorityBinding` does not carry a work-order digest. The command-level
+`causal_ref` is inside `actor_binding`; no duplicate top-level causal or
+authority field is permitted.
 
 `expected_head` contains exactly `secret_ref_id`, positive
 `secret_ref_revision`, `secret_ref_digest`, and positive
@@ -1029,13 +1054,17 @@ ID/revision/digest must equal the exact source ref identity/revision/digest. A
 historical ref that is no longer the current head cannot overwrite or branch from
 a newer head through this migration path.
 
-The closed semantic projection has exactly two members: `schema_version`, equal
-to `splendor.secret.ref_revision_migration_semantic_projection.v1`, and
-`command`, containing the complete validated eighteen-field command unchanged,
-including every nested object and ordered proof bundle. RFC 8785 JCS determines
-exact member order. Authority-owned first-observation/completion times, audit
-record, generated result/event IDs, and physical outbox/store metadata are
-excluded because none is command content. Its digest is:
+The closed normalized semantic projection has exactly two members:
+`schema_version`, equal to
+`splendor.secret.ref_revision_migration_semantic_projection.v1`, and
+`command_semantics`, containing all fourteen semantic command members other than
+Authority-owned `observed_at`, including the complete actor binding, work-order
+ID/digest, source, proof bundles, expected values, and migration target
+specification. It contains no target ref revision, target creation time, complete
+target bytes, target ref digest, completion time, audit record, generated
+result/event ID, or physical outbox/store metadata. RFC 8785 JCS determines exact
+member order. This follows RFC 0012's semantic-idempotency exclusion of
+Authority-owned observation/result facts. Its digest is:
 
 ```text
 migration_semantic_digest_input =
@@ -1045,39 +1074,58 @@ migration_semantic_digest =
   "blake3:" || lowercase_hex(BLAKE3-256(migration_semantic_digest_input))
 ```
 
-Authority's trusted ledger partition is the exact authenticated tenant,
-principal, work-order identity, command kind, service audience, and nominal
-command ID. Caller body bytes cannot select another partition. Before ledger
-lookup or result release, Authority reruns current authentication, dedicated
-scope, tenant/ref visibility, work-order/capability/data-use, revocation, and
-audit checks. The first accepted observation retains forever within the owner
-contract's non-reuse horizon: first observation time, complete canonical command
-bytes, semantic digest, exact source/target bytes and digests, ordered proof
-bundles, expected heads/generations, decision, state, and terminal or in-progress
-result. Nominal command IDs are never reusable. When full records reach their
-accepted retention limit, Authority keeps a permanent non-reuse tombstone over
-the trusted partition, semantic digest, target ref revision/digest, and terminal
-result digest, so an exact or changed command can never become a fresh miss.
+Authority maintains one stable nominal-command non-reuse index keyed exactly by
+authenticated `tenant_id`, authenticated `actor_principal_id`, command kind
+`ref_revision_migration`, and `SecretRefMutationCommandId`. Work-order identity,
+work-order digest, service audience, ref identity, expected values, and every
+other request/body field are deliberately absent from this lookup key. The key
+is derived from authenticated context plus the nominal ID, never from an
+untrusted actor binding. Therefore a retry under another otherwise-valid work
+order reaches the retained nominal command and cannot become a fresh miss.
 
-An exact duplicate in the same trusted partition and with the same complete
-semantic digest never reruns migration. After current visibility authorization,
-it returns only the retained historical result or resumes the one retained
-in-progress command. The same nominal command ID with any changed semantic byte,
-proof order/identity/digest, source/target byte, expected head/generation, or
-authority fact is a conflict and creates no record, ref revision, head move, or
-effect beyond restricted denial evidence. Hidden, absent, unauthorized, exact-
-duplicate-with-now-hidden-result, and conflict cases share the outward profile
-above. A new target or refreshed expected value requires a fresh nominal command
-ID; evidence links never authorize reuse under changed command bytes.
+Authority completes authentication, dedicated-scope, tenant/ref-visibility,
+current work-order/capability/data-use, revocation, service-audience, and audit
+checks before any stable-index lookup or claim, then derives the stable key. In
+one atomic compare-insert, the first accepted observation claims the non-reuse
+index and retains the complete normalized semantic projection/digest, the
+Authority-owned `observed_at`, and the resulting fifteen-field command in
+`accepted` state. No target revision, target creation time, target bytes, target
+digest, target row, or ref orphan exists at this point. Authority reruns those
+current checks before releasing prior state or a retained result.
+
+The retained row later adds, but never replaces, the canonical decision/state,
+the one owner-allocated target revision, creation time, exact bytes, and digest,
+and the terminal or in-progress result. The ordered proof bundles and expected
+heads/generations remain the exact command facts retained at claim. Nominal
+command IDs are never reusable within the stable key's owner retention horizon.
+When full records reach their accepted retention limit, Authority keeps a
+permanent non-reuse tombstone over that same stable key, semantic digest, whether
+target allocation occurred, any allocated target revision/digest, and terminal
+result digest. Deletion can never turn an exact or changed command into a fresh
+miss.
+
+An exact duplicate under the same stable key and with the same complete semantic
+digest never reruns migration. After current visibility authorization, it returns
+only the retained historical result or resumes the one retained in-progress
+command. The same stable key with any changed semantic byte, including a changed
+work-order ID/digest or authority binding, proof order/identity/digest, source or
+target-spec byte, or expected head/generation, is
+`migration_command_conflict`. The conflict is decided from the retained index
+before any new command row, target allocation, target append/orphan, head move,
+or other effect. Hidden, absent, unauthorized,
+exact-duplicate-with-now-hidden-result, and conflict cases share the outward
+profile above. A new target or refreshed expected value requires a fresh nominal
+command ID; evidence links never authorize reuse under changed semantic bytes.
 
 #### Command state, durable ordering, and recovery
 
 The Authority-owned command state machine is closed to:
 
 ```text
-accepted -> decided -> append_prepared -> target_appended -> head_committed -> completed
+accepted -> authorized -> target_allocated -> append_prepared -> target_appended -> head_committed -> completed
 accepted -> denied
-decided -> denied
+authorized -> denied
+target_allocated -> denied
 append_prepared -> denied
 target_appended -> denied_stale_state
 ```
@@ -1085,24 +1133,38 @@ target_appended -> denied_stale_state
 `denied`, `denied_stale_state`, and `completed` are terminal. State and result
 transitions use owner-controlled CAS. The required ordering is:
 
-1. claim the trusted idempotency partition and retain the first complete command;
-2. validate both owner evidence chains, bijection, shape preservation, exact
-   target bytes, expected head, and current generations without provider, node,
-   Gateway, or driver effects;
-3. retain the canonical decision and a unique prepared event or transactional
-   outbox record before any target append;
-4. append exactly the command's immutable target bytes once under unique
+1. derive and atomically claim the stable nominal-command index, retaining the
+   normalized proposal/digest, Authority-owned `observed_at`, and complete
+   command in `accepted` state;
+2. validate both owner evidence chains and their exact cross-record equality,
+   the bijection, shape-preserving migration target specification, expected
+   head, and current generations without provider, node, Gateway, or driver
+   effects;
+3. retain the canonical allow decision and advance to `authorized`, or retain a
+   terminal denial without allocating any target fact;
+4. after authorization, atomically reserve exactly one fresh positive target
+   ref revision, allocate exactly one owner creation time, construct the complete
+   target from the retained specification/source, compute its canonical bytes
+   and digest, and retain all four facts while advancing to `target_allocated`;
+5. retain a unique prepared event or transactional outbox record before any
+   target append;
+6. append exactly the retained immutable target bytes once under unique
    `(SecretRefId, target secret_ref_revision)` and target digest; the same key
    with changed bytes is an invariant conflict, never an overwrite;
-5. after a durable prepared/append acknowledgement, CAS the head only from the
+7. after a durable prepared/append acknowledgement, CAS the head only from the
    exact expected head/digest/generation to that already-appended target while
    atomically rechecking the retained current Authority/ref generations and the
    separately contracted current Registry lifecycle evidence;
-6. retain one terminal decision/event/result binding the command, semantic
+8. retain one terminal decision/event/result binding the command, semantic
    digest, source, proof set, target, append result, head-CAS result, and final
    state; and
-7. release a response only after the canonical event is durably appended or a
+9. release a response only after the canonical event is durably appended or a
    unique outbox append has durable acknowledgement.
+
+Target allocation in step 4 is one owner transaction/CAS. A crash cannot expose
+an allocated revision without the same row also retaining its creation time,
+complete bytes, and digest. Every duplicate and recovery path reuses those exact
+facts; none invokes the allocator or owner clock again.
 
 If Event/Evidence storage is separate, Authority writes the unique outbox in the
 same transaction as each decision/state change. No response, live head, or
@@ -1116,19 +1178,23 @@ CAS. Recovery behavior is closed:
 
 | Crash or loss point | Sole permitted recovery |
 | --- | --- |
-| Before first ledger claim | No command state or ref effect exists; an authenticated retry may make the first claim. |
-| After claim or decision, before prepared append | Resume only the retained command/decision and write the one prepared event/outbox. |
+| Before first stable-index claim | No command state, target fact, or ref effect exists; an authenticated retry may make the first atomic claim. |
+| After claim, before authorization decision | Resume validation only from the retained command/proposal and owner `observed_at`; denial allocates no target. |
+| After authorization, before or during target allocation | Complete only the row's one CAS allocation transition. Read uncertain transaction state first; if `target_allocated`, reuse all retained facts, and if still `authorized`, atomically allocate and retain one revision/time/byte/digest tuple. Never invoke the allocator or clock after `target_allocated`. |
+| After target allocation, before prepared append | Reuse only the retained target revision/time/bytes/digest and write the one prepared event/outbox. |
 | After preparation, before target append | Append only the retained target bytes under the already-fixed target revision/digest. |
 | After target append, before head CAS | Verify that exact append, then attempt only the original expected-head/current-generation CAS; stale state terminates as `denied_stale_state`. |
 | After head CAS, before terminal event/result | Append/finalize only the retained terminal bytes proving the already-committed head; do not repeat the CAS or append. |
 | After terminal commit, before response | An authorized exact duplicate returns the retained historical result; no mutation runs. |
 
 The reconciler cannot mint or select another command/ref/evidence/event/result
-identity, allocate another ref revision, alter source/target/proof bytes, change
-the decision, consult `latest`, invoke policy anew, or call Registry, provider,
-node, Gateway, driver, adapter, lease, or delivery effects. Required current
-Registry evidence must already be a retained owner-authenticated current-
-lifecycle input whose later contract permits the stage-5 atomic recheck;
+identity, allocate a second ref revision/time/target, alter source/target/proof
+bytes, change the decision, consult `latest`, invoke policy anew, or call
+Registry, provider, node, Gateway, driver, adapter, lease, or delivery effects.
+It may finish the sole `authorized -> target_allocated` owner CAS only as the
+table specifies. Required current Registry evidence must already be a retained
+owner-authenticated current-lifecycle input whose later contract permits the
+step-7 atomic recheck;
 otherwise migration remains blocked. Reconciliation exhaustion or unavailable
 trusted state fails closed and requires intervention; it never retries under new
 bytes.
@@ -1172,13 +1238,14 @@ future generated or persisted surface before that surface is exposed.
 | `authorization-v2-stale-revision-denied` | In the later lifecycle suite, exact revision 7 exists but is stale or revoked. Deny internally as `driver_declaration_revision_not_active`; revision 8 is not selected. |
 | `secret-ref-v2-refresh-required` | In the later Authority mutation suite, attempt to replace binding revision 7 with 8 under ref revision 2. Deny internally as `secret_ref_revision_refresh_required`; a fresh ref revision and authority are required. |
 | `secret-ref-v1-historical-read-deny` | Exact v1 bytes parse only into the historical view. Audit/replay read succeeds and live comparison returns `historical_revisionless_authorization_live_denied`. |
-| `secret-ref-v1-migration-proven` | Exact source bytes/digest, per-entry identities/ordinals/bytes/digests, Authority issuance proofs, Registry tenant/installation/admission/declaration/lifecycle proofs, bijection, expected head/current generations, semantic command digest, and fresh authority produce exactly the canonical ref v2 target above at revision 2. Source v1 bytes remain unchanged. |
-| `secret-ref-v1-migration-unproven` | Remove or alter any source-ref, source-entry, Authority-evidence, Registry-evidence, target-entry, scope, admission, declaration, or lifecycle binding. Deny internally as unproven/mismatch with zero live head mutation. |
+| `secret-ref-v1-migration-proven` | Exact source bytes/digest, per-entry identities/ordinals/bytes/digests, Authority evidence that binds each C03 entry to the exact Registry evidence ID/digest/coordinates, Registry-only tenant/installation/admission/operation/declaration/slot/lifecycle evidence, bijection, expected head/current generations, normalized semantic digest, and fresh authority cause Authority to allocate and retain exactly the canonical ref v2 target above at revision 2. Source v1 bytes remain unchanged. |
+| `secret-ref-v1-migration-unproven` | Remove or alter any source-ref, source-entry, Authority-to-Registry evidence binding, Registry-owned fact, target-entry, scope, admission, declaration, or lifecycle coordinate. Registry evidence that purports to attest a C03 source entry is invalid rather than sufficient. Deny internally as unproven/mismatch with zero live head mutation. |
 | `secret-ref-v1-migration-cross-revision` | Source proof binds revision 7 while declaration evidence or proposed target names 8. Deny `driver_declaration_revision_mismatch`; numeric ordering and active revision do not repair it. |
 | `secret-ref-v1-migration-bijection-denied` | Multi-entry vectors swap or reuse proofs, duplicate/omit source or target entries, reuse an evidence identity, or create one-to-many/many-to-one mappings. Deny `migration_mapping_not_bijective`; no target becomes live. |
-| `secret-ref-v1-migration-shape-change-denied` | Independently mutate every ref and entry field other than the two schema versions, new owner-issued ref revision/creation time, and each separately proven declaration revision. Deny `migration_shape_change_forbidden`; an ordinary v2 update is not treated as migration. |
-| `secret-ref-v1-migration-command-duplicate` | Drop responses at every state. An exact command/semantic digest returns or completes only the retained original result and revision. The same command ID with any changed byte returns internal `migration_command_conflict`; no second revision/event/effect is created. |
-| `secret-ref-v1-migration-crash-recovery` | Crash before/after claim, decision, preparation/outbox, target append, head CAS, terminal append, and response. Only the recovery table transition occurs; stale head leaves one non-live immutable target, and replay/reconciler performs no external call. |
+| `secret-ref-v1-migration-shape-change-denied` | Independently mutate every source/spec/entry semantic field other than the schema-version transform and each separately proven declaration revision. Target revision, creation time, complete bytes, and ref digest cannot be supplied in the proposal. Deny `migration_shape_change_forbidden`; an ordinary v2 update is not treated as migration. |
+| `secret-ref-v1-migration-command-duplicate` | Drop responses at every state. An exact normalized semantic digest returns or completes only the retained original result and owner-allocated revision/time/bytes/digest. The same stable-key command ID with any changed semantic byte returns internal `migration_command_conflict`; no second row, allocation, revision, event, or effect is created. |
+| `secret-ref-v1-migration-command-work-order-conflict` | First claim one command ID under valid work order A. Retry the same ID and authenticated tenant/principal under distinct valid work order B, changing `work_order_id`, `work_order_digest`, and the matching actor authority binding. The stable nominal-command index finds A and returns internal `migration_command_conflict` before any B row, target allocation, append/orphan, event, or head effect. |
+| `secret-ref-v1-migration-crash-recovery` | Crash before/after stable claim, decision, atomic target allocation, preparation/outbox, target append, head CAS, terminal append, and response. Only the recovery-table transition occurs; every post-allocation path reuses one revision/time/bytes/digest tuple, stale head leaves one non-live immutable target, and replay/reconciler performs no external call. |
 | `secret-ref-visibility-oracle-denied` | Hidden, absent, wrong tenant/principal/scope, unproven, mismatch, stale, revoked, wrong head, and conflict inputs produce byte-identical padded outward responses and satisfy the fixed timing profile. Exact facts appear only in authorized/audited restricted evidence. |
 | `secret-ref-live-coordinate-mutation-denied` | In the later runtime suite, mutate each complete-live-coordinate dimension independently. Every mutation misses/denies, and prefix/digest/ref/revision-only cache keys are rejected. |
 | `secret-ref-final-use-race-denied` | In the later runtime suite, commit ref/authority/policy/data-use/work-order/Registry/audience/lease stale or revoked state between normalization, lease, permit, provider access, and each send/use. The transition wins and fences outstanding use. |
@@ -1218,9 +1285,9 @@ gold evidence.
 - Per-entry source identities/digests and a bijective shape-preserving transform
   prevent proof swapping, proof reuse, and ordinary semantic edits disguised as
   migration.
-- One semantic migration command, retained result, fixed revision, CAS ordering,
-  and no-second-revision recovery prevent response loss or replay from creating
-  another live ref.
+- One stable nominal-command index, semantic proposal, retained owner allocation,
+  CAS ordering, and no-second-revision recovery prevent work-order changes,
+  response loss, or replay from creating another row, orphan, or live ref.
 - Complete live coordinates and final-use generation checks prevent cache reuse
   across tenant/ref/purpose/audience/lease boundaries and make stale/revoked
   transitions win races.
@@ -1248,7 +1315,7 @@ This proposed contract has no runtime impact.
 | Surface | Impact authorized by acceptance |
 | --- | --- |
 | Trace/evidence | None for behavior-free construction. A later migration implementation must retain the command, semantic digest, per-entry owner proofs, decision, prepared/append/head/terminal links, and restricted audit attribution under the exact state/recovery contract above. Generic projections omit sensitive coordinates and digests. |
-| State/store | None in this RFC. Future behavior-free persisted fixtures retain exact schema/revision bytes. A later Authority owner may append the one command-fixed target and CAS the head once; Store enforces uniqueness/CAS but never decides migration or recovery. |
+| State/store | None in this RFC. Future behavior-free persisted fixtures retain exact schema/revision bytes. A later Authority owner may append the one post-claim owner-allocated and retained target and CAS the head once; Store enforces uniqueness/CAS but never decides migration or recovery. |
 | Replay | Historical v1 and v2 values and retained migration states may be inspected. Replay cannot claim/reconcile a command, create authority, migrate, append, move a head, select a declaration, issue a lease, or execute a side effect. |
 | Gateway/driver/provider/node | None. No lookup, projection, verification, lease, material, delivery, or invocation path is added. |
 | Daemon/API/SDK/generated | None. Any future surface must reproduce the canonical fixture family before exposure. |
@@ -1315,10 +1382,11 @@ If accepted, implementation may proceed only in this order:
 6. Only after separately accepted Authority issuance/import-evidence, Driver
    Registry admission/lifecycle-evidence, and cross-owner current-generation
    recheck contracts exist may a separately reviewed Authority persistence/
-   migration slice implement the exact command, semantic idempotency ledger,
-   per-entry bijection, event/outbox/CAS state machine, visibility profile, and
-   one reconciler above. No mock, test helper, broad evidence row, database join,
-   or hidden side table satisfies that gate.
+   migration slice implement the exact command, stable nominal-ID non-reuse
+   index, semantic idempotency ledger, post-claim owner target allocation,
+   per-entry bijection and cross-owner evidence equality, event/outbox/CAS state
+   machine, visibility profile, and one reconciler above. No mock, test helper,
+   broad evidence row, database join, or hidden side table satisfies that gate.
 7. Complete credential authorization, ref-head mutation, full-coordinate caches,
    idempotency, leases, final-use generation fencing,
    projection use, Gateway integration, providers, nodes, SDKs, and gold remain
@@ -1359,9 +1427,11 @@ This RFC must remain Proposed until independent reviewers confirm all of:
 - security review confirms the complete revision-bearing coordinate, fresh-ref
   and fresh-authority rule, declaration/classification/intent stage separation,
   strict live v2-only behavior, historical read/deny, per-entry bijective
-  shape-preserving migration, one-command/no-second-revision recovery, complete
-  live coordinates/final-use fencing, pre-lookup visibility, fail-closed
-  unavailable state, bounded ingress, and non-reflecting errors;
+  shape-preserving migration, Authority-only C03-to-Registry evidence binding,
+  stable command-ID non-reuse across work-order changes, post-claim owner target
+  allocation and no-second-revision recovery, complete live coordinates/final-
+  use fencing, pre-lookup visibility, fail-closed unavailable state, bounded
+  ingress, and non-reflecting errors;
 - contract review confirms every field, type, bound, order, canonical byte,
   validation stage, error, fixture, migration, rollback, compatibility rule,
   implementation gate, and non-goal is internally consistent; and
