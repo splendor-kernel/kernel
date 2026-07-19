@@ -4,17 +4,34 @@
 
 ### Added
 
+- **status/incomplete:** added the first behavior-free `DRREG-001` credential-
+  sink contract in `splendor-types`: strict canonical driver-operation
+  validation over the unchanged `DriverOperationRef`, nominal
+  `SecretCredentialSlotId`, checked operation sink/trusted-send declarations,
+  exact destination-digest and code-only error types, deterministic canonical
+  serialization, and a bounded duplicate-aware `from_json_slice` ingress. The
+  public declaration implements `Serialize` but not `Deserialize`; malformed,
+  unknown, duplicate, null, over-bound, noncanonical and profile-mismatched
+  inputs fail closed without candidate reflection. This additive experimental
+  slice grants no authority and adds no manifest registry, admission, projection
+  execution, Gateway/provider/node behavior, C03 credential authorization,
+  daemon/API/SDK/generated surface, feature activation, issue closure, or
+  `G07`/`G08` pass.
 - **status/incomplete:** added exactly 40 behavior-free C03 V1a nominal secret
-  UUID identity types plus six owner-independent closed enums, a strict opaque
-  non-locator `SecretProviderVersionRef`, and a closed valid-by-construction
-  `SecretLeasePolicy`. IDs retain checked non-nil construction, strict lowercase
-  hyphenated wire forms, canonical serialization, bounded non-echoing errors,
-  and byte-order-compatible ordering. Pre-placement primitives reject unknown,
+  UUID identity types plus seven closed enums (six owner-independent
+  pre-placement enums and the C03-owned `SecretDeliveryControlKind` trusted-send
+  control vocabulary), a strict opaque non-locator `SecretProviderVersionRef`,
+  and a closed valid-by-construction `SecretLeasePolicy`. IDs retain checked
+  non-nil construction, strict lowercase hyphenated wire forms, canonical
+  serialization, bounded non-echoing errors, and byte-order-compatible ordering.
+  Pre-placement primitives reject unknown,
   malformed, duplicate, null, wrong-type, out-of-range, locator-like, and unsafe
   integer forms without adding authority or runtime behavior. This partial slice
   adds no complete `SecretRef`, `SecretUseRequirement`, lease record/lifecycle,
   provider port, broker, Gateway/daemon/API/SDK/generated surface, scanner,
-  feature activation, issue closure, or gold pass. The owner-defined
+  feature activation, issue closure, or gold pass. The new control vocabulary
+  grants no authority and adds no broker, delivery, driver, registry, or runtime
+  behavior. The owner-defined
   `SecretCredentialSlotId` and exact credential-sink/trusted-send/destination
   contracts remain external blockers; stable 0.1 behavior and bytes remain
   unchanged.

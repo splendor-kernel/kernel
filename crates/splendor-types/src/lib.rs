@@ -37,6 +37,7 @@ mod cloud_helper;
 mod daemon_security;
 mod determinism;
 mod device_profile;
+mod driver;
 mod escalation;
 mod external_governance;
 mod failure_taxonomy;
@@ -109,6 +110,14 @@ pub use device_profile::{
     DeviceProfile, DeviceProfileValidationError, DeviceSafetyConstraint, ALLOWED_PHYSICAL_ACTIONS,
     DEVICE_KIND_CAPABILITY_PREFIX, DEVICE_PROFILE_SCHEMA, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
     PHYSICAL_ACTION_CAPABILITY_PREFIX,
+};
+pub use driver::{
+    validate_driver_operation_ref_v1, DriverCredentialDestinationDigest,
+    DriverCredentialDestinationDigestError, DriverCredentialSinkContractError,
+    DriverCredentialSinkContractErrorCode, DriverOperationCredentialSinkV1,
+    DriverOperationCredentialSinksV1, DriverOperationRefV1ValidationError,
+    DriverTrustedSendProfileV1, SecretCredentialSlotId, SecretCredentialSlotIdError,
+    DRIVER_OPERATION_CREDENTIAL_SINKS_SCHEMA_V1, DRIVER_OPERATION_SCHEMA_V1,
 };
 pub use escalation::{
     EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
@@ -219,9 +228,9 @@ pub use schema_extensions::{
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
 };
 pub use secrets::{
-    SecretClassification, SecretDeliveryExposureProfile, SecretDeliveryMethod, SecretLeasePolicy,
-    SecretLeasePolicyError, SecretOfflineBehavior, SecretProviderVersionRef,
-    SecretProviderVersionRefError, SecretPurpose, SecretUseIntent,
+    SecretClassification, SecretDeliveryControlKind, SecretDeliveryExposureProfile,
+    SecretDeliveryMethod, SecretLeasePolicy, SecretLeasePolicyError, SecretOfflineBehavior,
+    SecretProviderVersionRef, SecretProviderVersionRefError, SecretPurpose, SecretUseIntent,
 };
 pub use security_invariants::{
     validate_security_invariant_catalog, ContainmentAction, CryptoAgility, ExecutableGoldEvidence,

@@ -2,12 +2,12 @@
 
 ## Status
 
-**status/incomplete — C03 V1a identities plus owner-independent pre-placement
-grammar only.**
+**status/incomplete — C03 V1a identities, owner-independent pre-placement
+grammar, and behavior-free trusted-send control vocabulary only.**
 
 The current implementation adds 40 behavior-free nominal UUID identity types,
-six closed enums, a strictly validated opaque `SecretProviderVersionRef`, and a
-valid-by-construction `SecretLeasePolicy` in `splendor-types`. It does not
+seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, and
+a valid-by-construction `SecretLeasePolicy` in `splendor-types`. It does not
 implement `SecretRef`, `SecretUseRequirement`, a provider port, a broker or lease
 lifecycle, lease or delivery records, secret material handling,
 Gateway/daemon/API/SDK integration, a scanner, side effects, feature activation,
@@ -49,6 +49,7 @@ The following enums are closed to their exact lowercase snake-case v1 values:
 | `SecretPurpose` | `external_service_access`, `data_source_access`, `artifact_store_access`, `model_provider_access`, `orchestrator_access`, `device_service_access`, `cryptographic_operation` |
 | `SecretOfflineBehavior` | `deny`, `continue_existing_until_expiry` |
 | `SecretDeliveryExposureProfile` | `trusted_injection`, `material_exposed` |
+| `SecretDeliveryControlKind` | `core_dump`, `ptrace_debug`, `child_inheritance`, `output_capture`, `swap_page_dump`, `generic_cache`, `orchestrator_projection`, `trusted_injection_boundary`, `destination_network_egress`, `filesystem_sink_egress`, `ipc_egress`, `child_process_egress`, `proxy_egress`, `alternate_mount_egress` |
 
 These enums serialize and deserialize only as the exact string values above.
 Case changes, unknown strings, externally tagged objects, and every non-string
@@ -57,6 +58,11 @@ ASCII wire spellings rather than declaration order.
 
 `environment_variable` is compatibility vocabulary only. Its presence grants no
 permission and does not add delivery behavior.
+
+`SecretDeliveryControlKind` is the C03-owned trusted-send control vocabulary for
+future driver credential-sink declarations. A value describes a control kind
+only; it does not prove that a control is present, grant delivery authority, or
+add broker, driver, registry, Gateway, or runtime behavior.
 
 `SecretProviderVersionRef` is an opaque 1-to-128-byte string containing only
 printable non-space ASCII. It rejects `/`, `\\`, `?`, `#`, and `:`, so a URI

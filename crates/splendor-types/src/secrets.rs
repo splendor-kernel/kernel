@@ -210,6 +210,40 @@ pub enum SecretDeliveryExposureProfile {
 }
 }
 
+define_closed_secret_enum! {
+/// Trusted-send control vocabulary for a future driver-owned credential sink.
+pub enum SecretDeliveryControlKind {
+    /// Core-dump control kind.
+    CoreDump => "core_dump",
+    /// Ptrace/debug control kind.
+    PtraceDebug => "ptrace_debug",
+    /// Child-inheritance control kind.
+    ChildInheritance => "child_inheritance",
+    /// Output-capture control kind.
+    OutputCapture => "output_capture",
+    /// Swap/page-dump control kind.
+    SwapPageDump => "swap_page_dump",
+    /// Generic-cache control kind.
+    GenericCache => "generic_cache",
+    /// Orchestrator-projection control kind.
+    OrchestratorProjection => "orchestrator_projection",
+    /// Trusted-injection-boundary control kind.
+    TrustedInjectionBoundary => "trusted_injection_boundary",
+    /// Destination-network-egress control kind.
+    DestinationNetworkEgress => "destination_network_egress",
+    /// Filesystem-sink-egress control kind.
+    FilesystemSinkEgress => "filesystem_sink_egress",
+    /// IPC-egress control kind.
+    IpcEgress => "ipc_egress",
+    /// Child-process-egress control kind.
+    ChildProcessEgress => "child_process_egress",
+    /// Proxy-egress control kind.
+    ProxyEgress => "proxy_egress",
+    /// Alternate-mount-egress control kind.
+    AlternateMountEgress => "alternate_mount_egress",
+}
+}
+
 /// Opaque immutable provider version reference.
 ///
 /// The value is deliberately not a provider locator. It cannot contain URI,

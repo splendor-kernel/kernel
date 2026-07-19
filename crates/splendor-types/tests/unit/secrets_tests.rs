@@ -65,6 +65,12 @@ where
         assert!(!error.contains(SENSITIVE_SENTINEL));
     }
 
+    let char_error =
+        T::deserialize(serde::de::value::CharDeserializer::<serde::de::value::Error>::new('x'))
+            .expect_err("char enum form must reject")
+            .to_string();
+    assert_eq!(char_error, CLOSED_SECRET_ENUM_ERROR);
+
     let mut ordered_variants = expected
         .iter()
         .map(|(variant, _)| *variant)
@@ -162,6 +168,43 @@ fn closed_secret_enums_have_exact_v1_wire_values() {
             "material_exposed",
         ),
     ]);
+    assert_closed_enum(&[
+        (SecretDeliveryControlKind::CoreDump, "core_dump"),
+        (SecretDeliveryControlKind::PtraceDebug, "ptrace_debug"),
+        (
+            SecretDeliveryControlKind::ChildInheritance,
+            "child_inheritance",
+        ),
+        (SecretDeliveryControlKind::OutputCapture, "output_capture"),
+        (SecretDeliveryControlKind::SwapPageDump, "swap_page_dump"),
+        (SecretDeliveryControlKind::GenericCache, "generic_cache"),
+        (
+            SecretDeliveryControlKind::OrchestratorProjection,
+            "orchestrator_projection",
+        ),
+        (
+            SecretDeliveryControlKind::TrustedInjectionBoundary,
+            "trusted_injection_boundary",
+        ),
+        (
+            SecretDeliveryControlKind::DestinationNetworkEgress,
+            "destination_network_egress",
+        ),
+        (
+            SecretDeliveryControlKind::FilesystemSinkEgress,
+            "filesystem_sink_egress",
+        ),
+        (SecretDeliveryControlKind::IpcEgress, "ipc_egress"),
+        (
+            SecretDeliveryControlKind::ChildProcessEgress,
+            "child_process_egress",
+        ),
+        (SecretDeliveryControlKind::ProxyEgress, "proxy_egress"),
+        (
+            SecretDeliveryControlKind::AlternateMountEgress,
+            "alternate_mount_egress",
+        ),
+    ]);
 
     assert_eq!(
         serde_json::to_string(&SecretDeliveryMethod::EnvironmentVariable)
@@ -178,6 +221,7 @@ fn enum_fixture_pins_the_exact_closed_inventories() {
         .expect("fixture enums must be an object");
     let expected_names = [
         "SecretClassification",
+        "SecretDeliveryControlKind",
         "SecretDeliveryExposureProfile",
         "SecretDeliveryMethod",
         "SecretOfflineBehavior",
@@ -198,6 +242,7 @@ fn enum_fixture_pins_the_exact_closed_inventories() {
         ("SecretPurpose", 7),
         ("SecretOfflineBehavior", 2),
         ("SecretDeliveryExposureProfile", 2),
+        ("SecretDeliveryControlKind", 14),
     ];
     for (name, length) in expected_lengths {
         assert_eq!(
@@ -258,6 +303,25 @@ fn enum_fixture_pins_the_exact_closed_inventories() {
     assert_eq!(
         enums["SecretDeliveryExposureProfile"],
         json!(["trusted_injection", "material_exposed"])
+    );
+    assert_eq!(
+        enums["SecretDeliveryControlKind"],
+        json!([
+            "core_dump",
+            "ptrace_debug",
+            "child_inheritance",
+            "output_capture",
+            "swap_page_dump",
+            "generic_cache",
+            "orchestrator_projection",
+            "trusted_injection_boundary",
+            "destination_network_egress",
+            "filesystem_sink_egress",
+            "ipc_egress",
+            "child_process_egress",
+            "proxy_egress",
+            "alternate_mount_egress"
+        ])
     );
 }
 
@@ -909,6 +973,23 @@ fn implemented_values_and_fixture_objects_have_no_secret_payload_keys() {
             SecretDeliveryExposureProfile::MaterialExposed,
         ])
         .expect("exposure profile serialization"),
+        serde_json::to_value([
+            SecretDeliveryControlKind::CoreDump,
+            SecretDeliveryControlKind::PtraceDebug,
+            SecretDeliveryControlKind::ChildInheritance,
+            SecretDeliveryControlKind::OutputCapture,
+            SecretDeliveryControlKind::SwapPageDump,
+            SecretDeliveryControlKind::GenericCache,
+            SecretDeliveryControlKind::OrchestratorProjection,
+            SecretDeliveryControlKind::TrustedInjectionBoundary,
+            SecretDeliveryControlKind::DestinationNetworkEgress,
+            SecretDeliveryControlKind::FilesystemSinkEgress,
+            SecretDeliveryControlKind::IpcEgress,
+            SecretDeliveryControlKind::ChildProcessEgress,
+            SecretDeliveryControlKind::ProxyEgress,
+            SecretDeliveryControlKind::AlternateMountEgress,
+        ])
+        .expect("delivery control serialization"),
         serde_json::to_value(SecretProviderVersionRef::try_new("release-001").expect("valid ref"))
             .expect("version ref serialization"),
         serde_json::to_value(valid_policy()).expect("policy serialization"),
