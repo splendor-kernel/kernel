@@ -1109,6 +1109,60 @@ fn use_requirement_fixture_pins_canonical_bytes_getters_and_preference_order() {
 }
 
 #[test]
+fn use_requirement_ingress_accepts_every_intent_and_purpose_wire_spelling() {
+    let canonical = use_requirement_fixture_text()
+        .strip_suffix('\n')
+        .expect("canonical fixture must have one trailing newline");
+
+    for (expected, spelling) in [
+        (SecretUseIntent::Authenticate, "authenticate"),
+        (SecretUseIntent::Sign, "sign"),
+        (SecretUseIntent::Encrypt, "encrypt"),
+        (SecretUseIntent::Decrypt, "decrypt"),
+        (SecretUseIntent::DeriveSession, "derive_session"),
+        (SecretUseIntent::BootstrapTransport, "bootstrap_transport"),
+    ] {
+        let input = canonical.replace(
+            r#""intent":"authenticate""#,
+            &format!(r#""intent":"{spelling}""#),
+        );
+        let requirement = SecretUseRequirement::from_json_slice(input.as_bytes())
+            .expect("every exact intent spelling must parse through bounded ingress");
+
+        assert_eq!(requirement.intent(), expected);
+        assert_eq!(requirement.purpose(), SecretPurpose::ExternalServiceAccess);
+        assert_eq!(serde_json::to_string(&requirement).unwrap(), input);
+    }
+
+    for (expected, spelling) in [
+        (
+            SecretPurpose::ExternalServiceAccess,
+            "external_service_access",
+        ),
+        (SecretPurpose::DataSourceAccess, "data_source_access"),
+        (SecretPurpose::ArtifactStoreAccess, "artifact_store_access"),
+        (SecretPurpose::ModelProviderAccess, "model_provider_access"),
+        (SecretPurpose::OrchestratorAccess, "orchestrator_access"),
+        (SecretPurpose::DeviceServiceAccess, "device_service_access"),
+        (
+            SecretPurpose::CryptographicOperation,
+            "cryptographic_operation",
+        ),
+    ] {
+        let input = canonical.replace(
+            r#""purpose":"external_service_access""#,
+            &format!(r#""purpose":"{spelling}""#),
+        );
+        let requirement = SecretUseRequirement::from_json_slice(input.as_bytes())
+            .expect("every exact purpose spelling must parse through bounded ingress");
+
+        assert_eq!(requirement.intent(), SecretUseIntent::Authenticate);
+        assert_eq!(requirement.purpose(), expected);
+        assert_eq!(serde_json::to_string(&requirement).unwrap(), input);
+    }
+}
+
+#[test]
 fn use_requirement_constructor_accepts_exact_boundaries_and_rejects_invalid_values() {
     let all_methods = vec![
         SecretDeliveryMethod::InheritedFd,
