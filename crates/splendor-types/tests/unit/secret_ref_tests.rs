@@ -12,6 +12,49 @@ const MAXIMUM_AUTHORIZATION_FIXTURE: &[u8] =
 const MAXIMUM_REF_FIXTURE: &[u8] =
     include_bytes!("../fixtures/secrets/v2/secret-ref-v2-legal-maximum.json");
 
+#[test]
+fn canonical_fixture_family_hashes_are_pinned() {
+    for (name, fixture, expected_len, expected_blake3) in [
+        (
+            "authorization-v2-same-revision",
+            AUTHORIZATION_FIXTURE,
+            673,
+            "0ad457b86c8039cfbacfd4e2d785c985656c45fef86ccddbfe5de8c969618060",
+        ),
+        (
+            "secret-ref-v2-same-revision",
+            REF_FIXTURE,
+            1_347,
+            "8bf4eb0d822ca320ae1731b76d13caeb024291b1fadd1f5ec49aa5fefdd90139",
+        ),
+        (
+            "historical-secret-ref-v1",
+            HISTORICAL_FIXTURE,
+            1_315,
+            "da5bf26d3fd9d9424387a1c1d301c3bf42c1aea5bdffd7fc6c852c3f28f302af",
+        ),
+        (
+            "authorization-v2-legal-maximum",
+            MAXIMUM_AUTHORIZATION_FIXTURE,
+            2_237,
+            "6576988eddba3e8368783447a58ae48739a5c67779019aac247a2cd03ef5f49d",
+        ),
+        (
+            "secret-ref-v2-legal-maximum",
+            MAXIMUM_REF_FIXTURE,
+            37_041,
+            "af2f77f6e7b0f87c2ba845a095b3ef391934409d21da485e041c18bfc8625f19",
+        ),
+    ] {
+        assert_eq!(fixture.len(), expected_len, "{name} byte length changed");
+        assert_eq!(
+            blake3::hash(fixture).to_hex().as_str(),
+            expected_blake3,
+            "{name} BLAKE3 changed"
+        );
+    }
+}
+
 fn fixture_bytes(input: &'static [u8]) -> &'static [u8] {
     input.strip_suffix(b"\n").unwrap_or(input)
 }
@@ -2209,4 +2252,59 @@ fn historical_v1_rejects_every_non_frozen_or_duplicate_shape_without_reflection(
             .unwrap_err(),
         HistoricalSecretRefV1Error::InvalidHistoricalSecretRef
     );
+}
+
+#[test]
+fn secret_ref_wire_grammar_remains_delegated_to_owner_codecs() {
+    // Rust visibility enforces that these seams stay crate-private. This narrow
+    // source guard additionally prevents the containing C03 parser from quietly
+    // reintroducing Driver/C03 wire vocabularies beside those owner seams.
+    let source = include_str!("../../src/secret_ref.rs");
+    for required_owner_seam in [
+        "DriverOperationRefWireV1",
+        "DriverTrustedSendProfileWireV1",
+        "is_driver_destination_schema_v1",
+        ".matches_exposure(",
+        "SecretClassification::from_wire_spelling",
+        "SecretDeliveryExposureProfile::from_wire_spelling",
+        "SecretOfflineBehavior::from_wire_spelling",
+        "SecretDeliveryMethod::from_wire_spelling",
+    ] {
+        assert!(
+            source.contains(required_owner_seam),
+            "secret_ref.rs must consume the owner codec/spelling seam `{required_owner_seam}`"
+        );
+    }
+
+    for copied_owner_grammar in [
+        "struct DriverOperationWire",
+        "struct TrustedSendProfileWire",
+        "fn is_destination_schema",
+        "fn profile_matches_exposure",
+        "fn parse_delivery_control",
+        "\"driver\" =>",
+        "\"operation\" =>",
+        "\"applicable_delivery_controls\" =>",
+        "\"max_credential_bearing_sends\" =>",
+        "\"trusted_injection\"",
+        "\"not_applicable\"",
+        "\"authentication_credential\"",
+        "\"signing_material\"",
+        "\"encryption_material\"",
+        "\"private_configuration\"",
+        "\"opaque_secret\"",
+        "\"continue_existing_until_expiry\"",
+        "\"inherited_fd\"",
+        "\"tmpfs_file\"",
+        "\"one_shot_local_socket\"",
+        "\"orchestrator_projected_secret\"",
+        "\"environment_variable\"",
+        "\"trusted_injection_boundary\"",
+        "\"destination_network_egress\"",
+    ] {
+        assert!(
+            !source.contains(copied_owner_grammar),
+            "secret_ref.rs copied owner wire grammar `{copied_owner_grammar}`; reuse driver.rs/secrets.rs instead"
+        );
+    }
 }

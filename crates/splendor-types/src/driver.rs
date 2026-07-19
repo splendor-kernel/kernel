@@ -10,7 +10,7 @@ use crate::{
     DriverOperationRef, SecretClassification, SecretDeliveryControlKind,
     SecretDeliveryExposureProfile, SecretUseIntent,
 };
-use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
@@ -44,6 +44,8 @@ const INVALID_OPERATION: &str = "invalid_driver_operation";
 const INVALID_SLOT: &str = "invalid_secret_credential_slot_id";
 const NIL_SLOT: &str = "nil_secret_credential_slot_id";
 const INVALID_DIGEST: &str = "invalid_driver_credential_destination_digest";
+const TRUSTED_INJECTION_PROFILE_KIND: &str = "trusted_injection";
+const NOT_APPLICABLE_PROFILE_KIND: &str = "not_applicable";
 
 /// Validates the existing standalone operation reference for use at the strict
 /// Driver Registry v1 declaration boundary.
@@ -690,7 +692,7 @@ impl DriverTrustedSendProfileV1 {
                 DriverCredentialSinkContractErrorCode::TrustedInjectionBoundaryRequired,
             ));
         }
-        applicable_delivery_controls.sort_by_key(|value| delivery_control_wire(*value));
+        applicable_delivery_controls.sort_by_key(|value| value.wire_spelling());
         Ok(Self {
             profile: DriverTrustedSendProfileKind::TrustedInjection {
                 max_credential_bearing_sends,
@@ -709,8 +711,8 @@ impl DriverTrustedSendProfileV1 {
     /// Returns the exact profile tag.
     pub const fn kind(&self) -> &'static str {
         match self.profile {
-            DriverTrustedSendProfileKind::TrustedInjection { .. } => "trusted_injection",
-            DriverTrustedSendProfileKind::NotApplicable => "not_applicable",
+            DriverTrustedSendProfileKind::TrustedInjection { .. } => TRUSTED_INJECTION_PROFILE_KIND,
+            DriverTrustedSendProfileKind::NotApplicable => NOT_APPLICABLE_PROFILE_KIND,
         }
     }
 
@@ -736,7 +738,7 @@ impl DriverTrustedSendProfileV1 {
         }
     }
 
-    fn matches_exposure(&self, exposure: SecretDeliveryExposureProfile) -> bool {
+    pub(crate) fn matches_exposure(&self, exposure: SecretDeliveryExposureProfile) -> bool {
         matches!(
             (&self.profile, exposure),
             (
@@ -765,7 +767,7 @@ impl Serialize for DriverTrustedSendProfileV1 {
                     "applicable_delivery_controls",
                     applicable_delivery_controls,
                 )?;
-                state.serialize_field("kind", "trusted_injection")?;
+                state.serialize_field("kind", TRUSTED_INJECTION_PROFILE_KIND)?;
                 state.serialize_field(
                     "max_credential_bearing_sends",
                     max_credential_bearing_sends,
@@ -774,11 +776,500 @@ impl Serialize for DriverTrustedSendProfileV1 {
             }
             DriverTrustedSendProfileKind::NotApplicable => {
                 let mut state = serializer.serialize_struct("DriverTrustedSendProfileV1", 1)?;
-                state.serialize_field("kind", "not_applicable")?;
+                state.serialize_field("kind", NOT_APPLICABLE_PROFILE_KIND)?;
                 state.end()
             }
         }
     }
+}
+
+enum DriverWireScalar {
+    String(String),
+    Unsigned(u64),
+    Other,
+}
+
+impl DriverWireScalar {
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::String(value) => Some(value),
+            Self::Unsigned(_) | Self::Other => None,
+        }
+    }
+
+    fn into_u64(self) -> Option<u64> {
+        match self {
+            Self::Unsigned(value) => Some(value),
+            Self::String(_) | Self::Other => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverWireScalar {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DriverWireScalarVisitor)
+    }
+}
+
+struct DriverWireScalarVisitor;
+
+impl<'de> Visitor<'de> for DriverWireScalarVisitor {
+    type Value = DriverWireScalar;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one private Driver Registry wire scalar")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(u64::try_from(value)
+            .map(DriverWireScalar::Unsigned)
+            .unwrap_or(DriverWireScalar::Other))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::Unsigned(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::String(value))
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::Other)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::Other)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::Other)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DriverWireScalar::Other)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(DriverWireScalar::Other)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<String, IgnoredAny>()?.is_some() {}
+        Ok(DriverWireScalar::Other)
+    }
+}
+
+macro_rules! invalid_driver_wire_scalar_visits {
+    ($invalid:expr) => {
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok($invalid)
+        }
+    };
+}
+
+macro_rules! invalid_driver_wire_sequence_visit {
+    ($invalid:expr) => {
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($invalid)
+        }
+    };
+}
+
+enum DriverWireArray<T> {
+    Values(Vec<T>),
+    Invalid,
+}
+
+impl<'de, T> Deserialize<'de> for DriverWireArray<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DriverWireArrayVisitor(std::marker::PhantomData))
+    }
+}
+
+struct DriverWireArrayVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T> Visitor<'de> for DriverWireArrayVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = DriverWireArray<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("one private Driver Registry wire array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<T>()? {
+            values.push(value);
+        }
+        Ok(DriverWireArray::Values(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<String, IgnoredAny>()?.is_some() {}
+        Ok(DriverWireArray::Invalid)
+    }
+
+    invalid_driver_wire_scalar_visits!(DriverWireArray::Invalid);
+}
+
+/// Crate-private strict wire codec for the Driver Registry-owned operation
+/// coordinate. Privileged containing schemas reuse this codec and then apply
+/// their own error translation and precedence.
+#[derive(Default)]
+pub(crate) struct DriverOperationRefWireV1 {
+    driver: Option<DriverWireScalar>,
+    operation: Option<DriverWireScalar>,
+    schema_version: Option<DriverWireScalar>,
+    invalid_shape: bool,
+}
+
+impl DriverOperationRefWireV1 {
+    fn invalid() -> Self {
+        Self {
+            invalid_shape: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn into_validated(self) -> Result<DriverOperationRef, ()> {
+        if self.invalid_shape {
+            return Err(());
+        }
+        let operation = DriverOperationRef {
+            driver: self
+                .driver
+                .and_then(DriverWireScalar::into_string)
+                .ok_or(())?,
+            operation: self
+                .operation
+                .and_then(DriverWireScalar::into_string)
+                .ok_or(())?,
+            schema_version: self
+                .schema_version
+                .and_then(DriverWireScalar::into_string)
+                .ok_or(())?,
+        };
+        validate_driver_operation_ref_v1(&operation).map_err(|_| ())?;
+        Ok(operation)
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverOperationRefWireV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DriverOperationRefWireV1Visitor)
+    }
+}
+
+struct DriverOperationRefWireV1Visitor;
+
+impl<'de> Visitor<'de> for DriverOperationRefWireV1Visitor {
+    type Value = DriverOperationRefWireV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the private Driver Registry operation wire object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut wire = DriverOperationRefWireV1::default();
+        while let Some(name) = map.next_key::<String>()? {
+            let target = match name.as_str() {
+                "driver" => &mut wire.driver,
+                "operation" => &mut wire.operation,
+                "schema_version" => &mut wire.schema_version,
+                _ => {
+                    wire.invalid_shape = true;
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+            };
+            if target.is_some() {
+                wire.invalid_shape = true;
+                map.next_value::<IgnoredAny>()?;
+            } else {
+                *target = Some(map.next_value::<DriverWireScalar>()?);
+            }
+        }
+        Ok(wire)
+    }
+
+    invalid_driver_wire_sequence_visit!(DriverOperationRefWireV1::invalid());
+    invalid_driver_wire_scalar_visits!(DriverOperationRefWireV1::invalid());
+}
+
+#[derive(Clone, Copy)]
+enum TrustedSendProfileWireError {
+    InvalidShape,
+    InvalidKind,
+    InvalidSendLimit,
+    InvalidControlSet,
+    TrustedInjectionBoundaryRequired,
+    NotApplicablePayloadForbidden,
+}
+
+/// Crate-private strict wire codec for the Driver Registry-owned trusted-send
+/// profile. C03 containing schemas map its closed structural result into their
+/// own fixed error stage without copying this vocabulary.
+#[derive(Default)]
+pub(crate) struct DriverTrustedSendProfileWireV1 {
+    applicable_delivery_controls: Option<DriverWireArray<DriverWireScalar>>,
+    kind: Option<DriverWireScalar>,
+    max_credential_bearing_sends: Option<DriverWireScalar>,
+    invalid_shape: bool,
+    is_object: bool,
+}
+
+impl DriverTrustedSendProfileWireV1 {
+    fn invalid() -> Self {
+        Self::default()
+    }
+
+    fn kind_spelling(&self) -> Option<&str> {
+        match self.kind.as_ref() {
+            Some(DriverWireScalar::String(value)) => Some(value),
+            Some(DriverWireScalar::Unsigned(_) | DriverWireScalar::Other) | None => None,
+        }
+    }
+
+    fn decode(self) -> Result<DriverTrustedSendProfileV1, TrustedSendProfileWireError> {
+        if !self.is_object {
+            return Err(TrustedSendProfileWireError::InvalidShape);
+        }
+        match self.kind.and_then(DriverWireScalar::into_string).as_deref() {
+            Some(TRUSTED_INJECTION_PROFILE_KIND) => {
+                if self.invalid_shape {
+                    return Err(TrustedSendProfileWireError::InvalidShape);
+                }
+                let limit = self
+                    .max_credential_bearing_sends
+                    .and_then(DriverWireScalar::into_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or(TrustedSendProfileWireError::InvalidSendLimit)?;
+                if !(1..=8).contains(&limit) {
+                    return Err(TrustedSendProfileWireError::InvalidSendLimit);
+                }
+                let controls = match self.applicable_delivery_controls {
+                    Some(DriverWireArray::Values(values)) => values,
+                    Some(DriverWireArray::Invalid) | None => {
+                        return Err(TrustedSendProfileWireError::InvalidControlSet);
+                    }
+                };
+                let mut parsed = Vec::with_capacity(controls.len());
+                for control in controls {
+                    parsed.push(
+                        control
+                            .into_string()
+                            .as_deref()
+                            .and_then(SecretDeliveryControlKind::from_wire_spelling)
+                            .ok_or(TrustedSendProfileWireError::InvalidControlSet)?,
+                    );
+                }
+                DriverTrustedSendProfileV1::try_trusted_injection(limit, parsed).map_err(|error| {
+                    match error.code() {
+                        DriverCredentialSinkContractErrorCode::InvalidSendLimit => {
+                            TrustedSendProfileWireError::InvalidSendLimit
+                        }
+                        DriverCredentialSinkContractErrorCode::InvalidControlSet => {
+                            TrustedSendProfileWireError::InvalidControlSet
+                        }
+                        DriverCredentialSinkContractErrorCode::TrustedInjectionBoundaryRequired => {
+                            TrustedSendProfileWireError::TrustedInjectionBoundaryRequired
+                        }
+                        _ => TrustedSendProfileWireError::InvalidShape,
+                    }
+                })
+            }
+            Some(NOT_APPLICABLE_PROFILE_KIND) => {
+                if self.invalid_shape
+                    || self.applicable_delivery_controls.is_some()
+                    || self.max_credential_bearing_sends.is_some()
+                {
+                    return Err(TrustedSendProfileWireError::NotApplicablePayloadForbidden);
+                }
+                Ok(DriverTrustedSendProfileV1::not_applicable())
+            }
+            Some(_) | None => Err(TrustedSendProfileWireError::InvalidKind),
+        }
+    }
+
+    pub(crate) fn into_profile(self) -> Result<DriverTrustedSendProfileV1, ()> {
+        self.decode().map_err(|_| ())
+    }
+
+    fn into_declaration_profile(
+        self,
+        exposure: SecretDeliveryExposureProfile,
+    ) -> Result<DriverTrustedSendProfileV1, DriverCredentialSinkContractError> {
+        let expected_kind = match exposure {
+            SecretDeliveryExposureProfile::TrustedInjection => TRUSTED_INJECTION_PROFILE_KIND,
+            SecretDeliveryExposureProfile::MaterialExposed => NOT_APPLICABLE_PROFILE_KIND,
+        };
+        if self.kind_spelling() != Some(expected_kind) {
+            return Err(contract_error(
+                DriverCredentialSinkContractErrorCode::ExposureProfileMismatch,
+            ));
+        }
+        self.decode().map_err(|error| {
+            contract_error(match error {
+                TrustedSendProfileWireError::InvalidShape => {
+                    DriverCredentialSinkContractErrorCode::InvalidContractShape
+                }
+                TrustedSendProfileWireError::InvalidKind => {
+                    DriverCredentialSinkContractErrorCode::ExposureProfileMismatch
+                }
+                TrustedSendProfileWireError::InvalidSendLimit => {
+                    DriverCredentialSinkContractErrorCode::InvalidSendLimit
+                }
+                TrustedSendProfileWireError::InvalidControlSet => {
+                    DriverCredentialSinkContractErrorCode::InvalidControlSet
+                }
+                TrustedSendProfileWireError::TrustedInjectionBoundaryRequired => {
+                    DriverCredentialSinkContractErrorCode::TrustedInjectionBoundaryRequired
+                }
+                TrustedSendProfileWireError::NotApplicablePayloadForbidden => {
+                    DriverCredentialSinkContractErrorCode::NotApplicablePayloadForbidden
+                }
+            })
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DriverTrustedSendProfileWireV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DriverTrustedSendProfileWireV1Visitor)
+    }
+}
+
+struct DriverTrustedSendProfileWireV1Visitor;
+
+impl<'de> Visitor<'de> for DriverTrustedSendProfileWireV1Visitor {
+    type Value = DriverTrustedSendProfileWireV1;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the private Driver Registry trusted-send-profile wire object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut wire = DriverTrustedSendProfileWireV1 {
+            is_object: true,
+            ..DriverTrustedSendProfileWireV1::default()
+        };
+        while let Some(name) = map.next_key::<String>()? {
+            match name.as_str() {
+                "applicable_delivery_controls" => {
+                    if wire.applicable_delivery_controls.is_some() {
+                        wire.invalid_shape = true;
+                        map.next_value::<IgnoredAny>()?;
+                    } else {
+                        wire.applicable_delivery_controls =
+                            Some(map.next_value::<DriverWireArray<DriverWireScalar>>()?);
+                    }
+                }
+                "kind" => {
+                    if wire.kind.is_some() {
+                        wire.invalid_shape = true;
+                        map.next_value::<IgnoredAny>()?;
+                    } else {
+                        wire.kind = Some(map.next_value::<DriverWireScalar>()?);
+                    }
+                }
+                "max_credential_bearing_sends" => {
+                    if wire.max_credential_bearing_sends.is_some() {
+                        wire.invalid_shape = true;
+                        map.next_value::<IgnoredAny>()?;
+                    } else {
+                        wire.max_credential_bearing_sends =
+                            Some(map.next_value::<DriverWireScalar>()?);
+                    }
+                }
+                _ => {
+                    wire.invalid_shape = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(wire)
+    }
+
+    invalid_driver_wire_sequence_visit!(DriverTrustedSendProfileWireV1::invalid());
+    invalid_driver_wire_scalar_visits!(DriverTrustedSendProfileWireV1::invalid());
+}
+
+#[derive(Deserialize)]
+struct DriverOperationCredentialSinkWireV1 {
+    credential_slot_id: Option<serde_json::Value>,
+    allowed_classifications: Option<serde_json::Value>,
+    allowed_intents: Option<serde_json::Value>,
+    destination_schema: Option<serde_json::Value>,
+    delivery_exposure_profile: Option<serde_json::Value>,
+    trusted_send_profile: Option<DriverTrustedSendProfileWireV1>,
+    #[serde(flatten)]
+    unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// One validated credential sink in an operation declaration.
@@ -819,7 +1310,7 @@ impl DriverOperationCredentialSinkV1 {
             ));
         }
         let destination_schema = destination_schema.into();
-        if !is_destination_schema(&destination_schema) {
+        if !is_driver_destination_schema_v1(&destination_schema) {
             return Err(contract_error(
                 DriverCredentialSinkContractErrorCode::InvalidDestinationSchema,
             ));
@@ -829,8 +1320,8 @@ impl DriverOperationCredentialSinkV1 {
                 DriverCredentialSinkContractErrorCode::ExposureProfileMismatch,
             ));
         }
-        allowed_classifications.sort_by_key(|value| classification_wire(*value));
-        allowed_intents.sort_by_key(|value| intent_wire(*value));
+        allowed_classifications.sort_by_key(|value| value.wire_spelling());
+        allowed_intents.sort_by_key(|value| value.wire_spelling());
         Ok(Self {
             credential_slot_id,
             allowed_classifications,
@@ -900,116 +1391,12 @@ pub struct DriverOperationCredentialSinksV1 {
 impl DriverOperationCredentialSinksV1 {
     /// Parses one untrusted declaration through the exact bounded v1 ingress.
     pub fn from_json_slice(input: &[u8]) -> Result<Self, DriverCredentialSinkContractError> {
-        struct DriverOperationRefWireV1(Option<DriverOperationRef>);
-
-        struct DriverOperationRefWireV1Visitor;
-
-        impl<'de> Visitor<'de> for DriverOperationRefWireV1Visitor {
-            type Value = DriverOperationRefWireV1;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(INVALID_OPERATION)
-            }
-
-            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(DriverOperationRefWireV1(None))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut driver = None;
-                let mut operation = None;
-                let mut schema_version = None;
-                let mut invalid = false;
-                while let Some(name) = map.next_key::<String>()? {
-                    let value = map.next_value::<serde_json::Value>()?;
-                    let target = match name.as_str() {
-                        "driver" => &mut driver,
-                        "operation" => &mut operation,
-                        "schema_version" => &mut schema_version,
-                        _ => {
-                            invalid = true;
-                            continue;
-                        }
-                    };
-                    if target.is_some() {
-                        invalid = true;
-                    }
-                    *target = value.as_str().map(str::to_owned);
-                    if target.is_none() {
-                        invalid = true;
-                    }
-                }
-                let operation = match (invalid, driver, operation, schema_version) {
-                    (false, Some(driver), Some(operation), Some(schema_version)) => {
-                        Some(DriverOperationRef {
-                            driver,
-                            operation,
-                            schema_version,
-                        })
-                    }
-                    _ => None,
-                };
-                Ok(DriverOperationRefWireV1(operation))
-            }
-        }
-
-        impl<'de> Deserialize<'de> for DriverOperationRefWireV1 {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                deserializer.deserialize_any(DriverOperationRefWireV1Visitor)
-            }
-        }
-
         #[derive(Deserialize)]
         struct DriverOperationCredentialSinksWireV1 {
             schema_version: Option<serde_json::Value>,
             driver_operation: Option<DriverOperationRefWireV1>,
             driver_declaration_revision: Option<serde_json::Value>,
-            credential_sinks: Option<serde_json::Value>,
+            credential_sinks: Option<Vec<DriverOperationCredentialSinkWireV1>>,
             #[serde(flatten)]
             unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
         }
@@ -1024,7 +1411,8 @@ impl DriverOperationCredentialSinksV1 {
         parse_declaration_wire(
             !wire.unknown_fields.is_empty(),
             wire.schema_version,
-            wire.driver_operation.and_then(|operation| operation.0),
+            wire.driver_operation
+                .and_then(|operation| operation.into_validated().ok()),
             wire.driver_declaration_revision,
             wire.credential_sinks,
         )
@@ -1379,7 +1767,7 @@ fn parse_declaration_wire(
     schema_version: Option<serde_json::Value>,
     driver_operation: Option<DriverOperationRef>,
     driver_declaration_revision: Option<serde_json::Value>,
-    credential_sinks: Option<serde_json::Value>,
+    credential_sinks: Option<Vec<DriverOperationCredentialSinkWireV1>>,
 ) -> Result<DriverOperationCredentialSinksV1, DriverCredentialSinkContractError> {
     if has_unknown_fields {
         return Err(contract_error(
@@ -1411,12 +1799,9 @@ fn parse_declaration_wire(
             contract_error(DriverCredentialSinkContractErrorCode::InvalidDeclarationRevision)
         })?;
 
-    let sink_values = credential_sinks
-        .as_ref()
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            contract_error(DriverCredentialSinkContractErrorCode::InvalidContractShape)
-        })?;
+    let sink_values = credential_sinks.ok_or_else(|| {
+        contract_error(DriverCredentialSinkContractErrorCode::InvalidContractShape)
+    })?;
     if sink_values.is_empty() {
         return Err(contract_error(
             DriverCredentialSinkContractErrorCode::EmptyCredentialSinks,
@@ -1429,35 +1814,23 @@ fn parse_declaration_wire(
     }
     let mut sinks = Vec::with_capacity(sink_values.len());
     for value in sink_values {
-        sinks.push(parse_sink_value(value)?);
+        sinks.push(parse_sink_wire(value)?);
     }
     DriverOperationCredentialSinksV1::try_new(operation, revision, sinks)
 }
 
-fn parse_sink_value(
-    value: &serde_json::Value,
+fn parse_sink_wire(
+    wire: DriverOperationCredentialSinkWireV1,
 ) -> Result<DriverOperationCredentialSinkV1, DriverCredentialSinkContractError> {
-    let object = value.as_object().ok_or_else(|| {
-        contract_error(DriverCredentialSinkContractErrorCode::InvalidContractShape)
-    })?;
-    if !has_only_fields(
-        object,
-        &[
-            "credential_slot_id",
-            "allowed_classifications",
-            "allowed_intents",
-            "destination_schema",
-            "delivery_exposure_profile",
-            "trusted_send_profile",
-        ],
-    ) {
+    if !wire.unknown_fields.is_empty() {
         return Err(contract_error(
             DriverCredentialSinkContractErrorCode::InvalidContractShape,
         ));
     }
 
-    let slot = object
-        .get("credential_slot_id")
+    let slot = wire
+        .credential_slot_id
+        .as_ref()
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             contract_error(DriverCredentialSinkContractErrorCode::InvalidCredentialSlot)
@@ -1466,52 +1839,22 @@ fn parse_sink_value(
         .map_err(|_| {
             contract_error(DriverCredentialSinkContractErrorCode::InvalidCredentialSlot)
         })?;
-    let classifications = parse_classifications(object.get("allowed_classifications"))?;
-    let intents = parse_intents(object.get("allowed_intents"))?;
-    let destination_schema = object
-        .get("destination_schema")
+    let classifications = parse_classifications(wire.allowed_classifications.as_ref())?;
+    let intents = parse_intents(wire.allowed_intents.as_ref())?;
+    let destination_schema = wire
+        .destination_schema
+        .as_ref()
         .and_then(serde_json::Value::as_str)
-        .filter(|value| is_destination_schema(value))
+        .filter(|value| is_driver_destination_schema_v1(value))
         .ok_or_else(|| {
             contract_error(DriverCredentialSinkContractErrorCode::InvalidDestinationSchema)
         })?;
 
-    let profile_value = object.get("trusted_send_profile").ok_or_else(|| {
+    let profile_wire = wire.trusted_send_profile.ok_or_else(|| {
         contract_error(DriverCredentialSinkContractErrorCode::MissingTrustedSendProfile)
     })?;
-    if profile_value.is_null() {
-        return Err(contract_error(
-            DriverCredentialSinkContractErrorCode::MissingTrustedSendProfile,
-        ));
-    }
-    let exposure = parse_exposure(object.get("delivery_exposure_profile"))?;
-    let profile_object = profile_value.as_object().ok_or_else(|| {
-        contract_error(DriverCredentialSinkContractErrorCode::ExposureProfileMismatch)
-    })?;
-    let profile_kind = profile_object
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            contract_error(DriverCredentialSinkContractErrorCode::ExposureProfileMismatch)
-        })?;
-    let profile = match (exposure, profile_kind) {
-        (SecretDeliveryExposureProfile::TrustedInjection, "trusted_injection") => {
-            parse_trusted_injection_profile(profile_object)?
-        }
-        (SecretDeliveryExposureProfile::MaterialExposed, "not_applicable") => {
-            if profile_object.len() != 1 {
-                return Err(contract_error(
-                    DriverCredentialSinkContractErrorCode::NotApplicablePayloadForbidden,
-                ));
-            }
-            DriverTrustedSendProfileV1::not_applicable()
-        }
-        _ => {
-            return Err(contract_error(
-                DriverCredentialSinkContractErrorCode::ExposureProfileMismatch,
-            ));
-        }
-    };
+    let exposure = parse_exposure(wire.delivery_exposure_profile.as_ref())?;
+    let profile = profile_wire.into_declaration_profile(exposure)?;
 
     DriverOperationCredentialSinkV1::try_new(
         slot,
@@ -1536,18 +1879,12 @@ fn parse_classifications(
     }
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        let parsed_value = match value.as_str() {
-            Some("authentication_credential") => SecretClassification::AuthenticationCredential,
-            Some("signing_material") => SecretClassification::SigningMaterial,
-            Some("encryption_material") => SecretClassification::EncryptionMaterial,
-            Some("private_configuration") => SecretClassification::PrivateConfiguration,
-            Some("opaque_secret") => SecretClassification::OpaqueSecret,
-            _ => {
-                return Err(contract_error(
-                    DriverCredentialSinkContractErrorCode::InvalidClassificationSet,
-                ));
-            }
-        };
+        let parsed_value = value
+            .as_str()
+            .and_then(SecretClassification::from_wire_spelling)
+            .ok_or_else(|| {
+                contract_error(DriverCredentialSinkContractErrorCode::InvalidClassificationSet)
+            })?;
         parsed.push(parsed_value);
     }
     if has_duplicates(&parsed) {
@@ -1571,19 +1908,12 @@ fn parse_intents(
     }
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        let parsed_value = match value.as_str() {
-            Some("authenticate") => SecretUseIntent::Authenticate,
-            Some("sign") => SecretUseIntent::Sign,
-            Some("encrypt") => SecretUseIntent::Encrypt,
-            Some("decrypt") => SecretUseIntent::Decrypt,
-            Some("derive_session") => SecretUseIntent::DeriveSession,
-            Some("bootstrap_transport") => SecretUseIntent::BootstrapTransport,
-            _ => {
-                return Err(contract_error(
-                    DriverCredentialSinkContractErrorCode::InvalidIntentSet,
-                ));
-            }
-        };
+        let parsed_value = value
+            .as_str()
+            .and_then(SecretUseIntent::from_wire_spelling)
+            .ok_or_else(|| {
+                contract_error(DriverCredentialSinkContractErrorCode::InvalidIntentSet)
+            })?;
         parsed.push(parsed_value);
     }
     if has_duplicates(&parsed) {
@@ -1597,90 +1927,12 @@ fn parse_intents(
 fn parse_exposure(
     value: Option<&serde_json::Value>,
 ) -> Result<SecretDeliveryExposureProfile, DriverCredentialSinkContractError> {
-    match value.and_then(serde_json::Value::as_str) {
-        Some("trusted_injection") => Ok(SecretDeliveryExposureProfile::TrustedInjection),
-        Some("material_exposed") => Ok(SecretDeliveryExposureProfile::MaterialExposed),
-        _ => Err(contract_error(
-            DriverCredentialSinkContractErrorCode::ExposureProfileMismatch,
-        )),
-    }
-}
-
-fn parse_trusted_injection_profile(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Result<DriverTrustedSendProfileV1, DriverCredentialSinkContractError> {
-    if !has_only_fields(
-        object,
-        &[
-            "kind",
-            "max_credential_bearing_sends",
-            "applicable_delivery_controls",
-        ],
-    ) {
-        return Err(contract_error(
-            DriverCredentialSinkContractErrorCode::InvalidContractShape,
-        ));
-    }
-    let send_limit = object
-        .get("max_credential_bearing_sends")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|value| (1..=8).contains(value))
-        .ok_or_else(|| contract_error(DriverCredentialSinkContractErrorCode::InvalidSendLimit))?
-        as u8;
-    let controls = parse_controls(object.get("applicable_delivery_controls"))?;
-    DriverTrustedSendProfileV1::try_trusted_injection(send_limit, controls)
-}
-
-fn parse_controls(
-    value: Option<&serde_json::Value>,
-) -> Result<Vec<SecretDeliveryControlKind>, DriverCredentialSinkContractError> {
-    let values = value
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| contract_error(DriverCredentialSinkContractErrorCode::InvalidControlSet))?;
-    if values.is_empty() || values.len() > MAX_DELIVERY_CONTROLS {
-        return Err(contract_error(
-            DriverCredentialSinkContractErrorCode::InvalidControlSet,
-        ));
-    }
-    let mut parsed = Vec::with_capacity(values.len());
-    for value in values {
-        let parsed_value = match value.as_str() {
-            Some("core_dump") => SecretDeliveryControlKind::CoreDump,
-            Some("ptrace_debug") => SecretDeliveryControlKind::PtraceDebug,
-            Some("child_inheritance") => SecretDeliveryControlKind::ChildInheritance,
-            Some("output_capture") => SecretDeliveryControlKind::OutputCapture,
-            Some("swap_page_dump") => SecretDeliveryControlKind::SwapPageDump,
-            Some("generic_cache") => SecretDeliveryControlKind::GenericCache,
-            Some("orchestrator_projection") => SecretDeliveryControlKind::OrchestratorProjection,
-            Some("trusted_injection_boundary") => {
-                SecretDeliveryControlKind::TrustedInjectionBoundary
-            }
-            Some("destination_network_egress") => {
-                SecretDeliveryControlKind::DestinationNetworkEgress
-            }
-            Some("filesystem_sink_egress") => SecretDeliveryControlKind::FilesystemSinkEgress,
-            Some("ipc_egress") => SecretDeliveryControlKind::IpcEgress,
-            Some("child_process_egress") => SecretDeliveryControlKind::ChildProcessEgress,
-            Some("proxy_egress") => SecretDeliveryControlKind::ProxyEgress,
-            Some("alternate_mount_egress") => SecretDeliveryControlKind::AlternateMountEgress,
-            _ => {
-                return Err(contract_error(
-                    DriverCredentialSinkContractErrorCode::InvalidControlSet,
-                ));
-            }
-        };
-        parsed.push(parsed_value);
-    }
-    if has_duplicates(&parsed) {
-        return Err(contract_error(
-            DriverCredentialSinkContractErrorCode::InvalidControlSet,
-        ));
-    }
-    Ok(parsed)
-}
-
-fn has_only_fields(object: &serde_json::Map<String, serde_json::Value>, allowed: &[&str]) -> bool {
-    object.keys().all(|key| allowed.contains(&key.as_str()))
+    value
+        .and_then(serde_json::Value::as_str)
+        .and_then(SecretDeliveryExposureProfile::from_wire_spelling)
+        .ok_or_else(|| {
+            contract_error(DriverCredentialSinkContractErrorCode::ExposureProfileMismatch)
+        })
 }
 
 impl Serialize for DriverOperationCredentialSinksV1 {
@@ -1717,7 +1969,7 @@ where
     values.iter().any(|value| !seen.insert(*value))
 }
 
-fn is_destination_schema(value: &str) -> bool {
+pub(crate) fn is_driver_destination_schema_v1(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.is_empty()
         || bytes.len() > MAX_DESTINATION_SCHEMA_BYTES
@@ -1746,46 +1998,6 @@ fn is_destination_schema(value: &str) -> bool {
         && version.as_bytes()[0].is_ascii_digit()
         && version.as_bytes()[0] != b'0'
         && version.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn classification_wire(value: SecretClassification) -> &'static str {
-    match value {
-        SecretClassification::AuthenticationCredential => "authentication_credential",
-        SecretClassification::SigningMaterial => "signing_material",
-        SecretClassification::EncryptionMaterial => "encryption_material",
-        SecretClassification::PrivateConfiguration => "private_configuration",
-        SecretClassification::OpaqueSecret => "opaque_secret",
-    }
-}
-
-fn intent_wire(value: SecretUseIntent) -> &'static str {
-    match value {
-        SecretUseIntent::Authenticate => "authenticate",
-        SecretUseIntent::Sign => "sign",
-        SecretUseIntent::Encrypt => "encrypt",
-        SecretUseIntent::Decrypt => "decrypt",
-        SecretUseIntent::DeriveSession => "derive_session",
-        SecretUseIntent::BootstrapTransport => "bootstrap_transport",
-    }
-}
-
-fn delivery_control_wire(value: SecretDeliveryControlKind) -> &'static str {
-    match value {
-        SecretDeliveryControlKind::CoreDump => "core_dump",
-        SecretDeliveryControlKind::PtraceDebug => "ptrace_debug",
-        SecretDeliveryControlKind::ChildInheritance => "child_inheritance",
-        SecretDeliveryControlKind::OutputCapture => "output_capture",
-        SecretDeliveryControlKind::SwapPageDump => "swap_page_dump",
-        SecretDeliveryControlKind::GenericCache => "generic_cache",
-        SecretDeliveryControlKind::OrchestratorProjection => "orchestrator_projection",
-        SecretDeliveryControlKind::TrustedInjectionBoundary => "trusted_injection_boundary",
-        SecretDeliveryControlKind::DestinationNetworkEgress => "destination_network_egress",
-        SecretDeliveryControlKind::FilesystemSinkEgress => "filesystem_sink_egress",
-        SecretDeliveryControlKind::IpcEgress => "ipc_egress",
-        SecretDeliveryControlKind::ChildProcessEgress => "child_process_egress",
-        SecretDeliveryControlKind::ProxyEgress => "proxy_egress",
-        SecretDeliveryControlKind::AlternateMountEgress => "alternate_mount_egress",
-    }
 }
 
 #[cfg(test)]

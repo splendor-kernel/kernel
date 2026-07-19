@@ -4,10 +4,14 @@
 //! serializing, or comparing them never grants authority, resolves a provider,
 //! issues a lease, invokes a driver, or performs I/O.
 
+use crate::driver::{
+    is_driver_destination_schema_v1, DriverOperationRefWireV1, DriverTrustedSendProfileWireV1,
+};
+#[cfg(test)]
+use crate::SecretDeliveryControlKind;
 use crate::{
-    validate_driver_operation_ref_v1, DriverCredentialDestinationDigest,
-    DriverOperationCredentialSinksV1, DriverOperationRef, DriverTrustedSendProfileV1,
-    SecretClassification, SecretCredentialSlotId, SecretDeliveryControlKind,
+    DriverCredentialDestinationDigest, DriverOperationCredentialSinksV1, DriverOperationRef,
+    DriverTrustedSendProfileV1, SecretClassification, SecretCredentialSlotId,
     SecretDeliveryExposureProfile, SecretDeliveryMethod, SecretLeasePolicy, SecretOfflineBehavior,
     SecretProviderId, SecretProviderVersionRef, SecretRefId, SecretUseIntent, TenantId,
 };
@@ -95,7 +99,7 @@ impl SecretCredentialAuthorizationV2 {
         trusted_send_profile: DriverTrustedSendProfileV1,
         mut approved_destination_digests: Vec<DriverCredentialDestinationDigest>,
     ) -> Result<Self, SecretCredentialAuthorizationV2Error> {
-        validate_driver_operation_ref_v1(&driver_operation).map_err(|_| {
+        crate::validate_driver_operation_ref_v1(&driver_operation).map_err(|_| {
             authorization_error(SecretCredentialAuthorizationV2ErrorCode::InvalidDriverOperation)
         })?;
         if !(1..=MAX_SAFE_INTEGER).contains(&driver_declaration_revision) {
@@ -104,12 +108,12 @@ impl SecretCredentialAuthorizationV2 {
             ));
         }
         let destination_schema = destination_schema.into();
-        if !is_destination_schema(&destination_schema) {
+        if !is_driver_destination_schema_v1(&destination_schema) {
             return Err(authorization_error(
                 SecretCredentialAuthorizationV2ErrorCode::InvalidDestinationSchema,
             ));
         }
-        if !profile_matches_exposure(&trusted_send_profile, delivery_exposure_profile) {
+        if !trusted_send_profile.matches_exposure(delivery_exposure_profile) {
             return Err(authorization_error(
                 SecretCredentialAuthorizationV2ErrorCode::InvalidExposureProfileBinding,
             ));
@@ -418,7 +422,7 @@ impl SecretRefV2 {
         }
         sort_by_canonical_bytes(&mut allowed_credential_bindings)
             .map_err(|_| ref_error(SecretRefV2ErrorCode::InvalidContractShape))?;
-        allowed_delivery_methods.sort_by_key(|method| delivery_method_wire(*method));
+        allowed_delivery_methods.sort_by_key(|method| method.wire_spelling());
         Ok(Self {
             secret_ref_id,
             secret_ref_revision,
@@ -1338,150 +1342,6 @@ macro_rules! invalid_wire_scalar_visits {
 }
 
 #[derive(Default)]
-struct DriverOperationWire {
-    driver: Option<WireScalar>,
-    operation: Option<WireScalar>,
-    schema_version: Option<WireScalar>,
-    invalid_shape: bool,
-}
-
-impl DriverOperationWire {
-    fn invalid() -> Self {
-        Self {
-            invalid_shape: true,
-            ..Self::default()
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for DriverOperationWire {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DriverOperationWireVisitor)
-    }
-}
-
-struct DriverOperationWireVisitor;
-
-impl<'de> Visitor<'de> for DriverOperationWireVisitor {
-    type Value = DriverOperationWire;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("the private driver-operation wire object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut wire = DriverOperationWire::default();
-        while let Some(name) = map.next_key::<String>()? {
-            match name.as_str() {
-                "driver" => read_wire_field!(map, wire.driver, WireScalar, wire.invalid_shape),
-                "operation" => {
-                    read_wire_field!(map, wire.operation, WireScalar, wire.invalid_shape)
-                }
-                "schema_version" => {
-                    read_wire_field!(map, wire.schema_version, WireScalar, wire.invalid_shape)
-                }
-                _ => {
-                    wire.invalid_shape = true;
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-        }
-        Ok(wire)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(DriverOperationWire::invalid())
-    }
-
-    invalid_wire_scalar_visits!(DriverOperationWire::invalid());
-}
-
-#[derive(Default)]
-struct TrustedSendProfileWire {
-    applicable_delivery_controls: Option<WireArray<WireScalar>>,
-    kind: Option<WireScalar>,
-    max_credential_bearing_sends: Option<WireScalar>,
-    invalid_shape: bool,
-}
-
-impl TrustedSendProfileWire {
-    fn invalid() -> Self {
-        Self {
-            invalid_shape: true,
-            ..Self::default()
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for TrustedSendProfileWire {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(TrustedSendProfileWireVisitor)
-    }
-}
-
-struct TrustedSendProfileWireVisitor;
-
-impl<'de> Visitor<'de> for TrustedSendProfileWireVisitor {
-    type Value = TrustedSendProfileWire;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("the private trusted-send-profile wire object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut wire = TrustedSendProfileWire::default();
-        while let Some(name) = map.next_key::<String>()? {
-            match name.as_str() {
-                "applicable_delivery_controls" => read_wire_field!(
-                    map,
-                    wire.applicable_delivery_controls,
-                    WireArray<WireScalar>,
-                    wire.invalid_shape
-                ),
-                "kind" => read_wire_field!(map, wire.kind, WireScalar, wire.invalid_shape),
-                "max_credential_bearing_sends" => read_wire_field!(
-                    map,
-                    wire.max_credential_bearing_sends,
-                    WireScalar,
-                    wire.invalid_shape
-                ),
-                _ => {
-                    wire.invalid_shape = true;
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-        }
-        Ok(wire)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(TrustedSendProfileWire::invalid())
-    }
-
-    invalid_wire_scalar_visits!(TrustedSendProfileWire::invalid());
-}
-
-#[derive(Default)]
 struct LeasePolicyWire {
     clock_skew_tolerance_seconds: Option<WireScalar>,
     max_continuous_lifetime_seconds: Option<WireScalar>,
@@ -1576,9 +1436,9 @@ struct AuthorizationWire {
     delivery_exposure_profile: Option<WireScalar>,
     destination_schema: Option<WireScalar>,
     driver_declaration_revision: Option<WireScalar>,
-    driver_operation: Option<DriverOperationWire>,
+    driver_operation: Option<DriverOperationRefWireV1>,
     schema_version: Option<WireScalar>,
-    trusted_send_profile: Option<TrustedSendProfileWire>,
+    trusted_send_profile: Option<DriverTrustedSendProfileWireV1>,
     invalid_shape: bool,
 }
 
@@ -1643,7 +1503,7 @@ impl<'de> Visitor<'de> for AuthorizationWireVisitor {
                 "driver_operation" => read_wire_field!(
                     map,
                     wire.driver_operation,
-                    DriverOperationWire,
+                    DriverOperationRefWireV1,
                     wire.invalid_shape
                 ),
                 "schema_version" => {
@@ -1652,7 +1512,7 @@ impl<'de> Visitor<'de> for AuthorizationWireVisitor {
                 "trusted_send_profile" => read_wire_field!(
                     map,
                     wire.trusted_send_profile,
-                    TrustedSendProfileWire,
+                    DriverTrustedSendProfileWireV1,
                     wire.invalid_shape
                 ),
                 _ => {
@@ -1846,7 +1706,7 @@ fn parse_authorization_wire(
     let destination_schema = wire
         .destination_schema
         .and_then(WireScalar::into_string)
-        .filter(|value| is_destination_schema(value))
+        .filter(|value| is_driver_destination_schema_v1(value))
         .ok_or_else(|| {
             authorization_error(SecretCredentialAuthorizationV2ErrorCode::InvalidDestinationSchema)
         })?;
@@ -1856,7 +1716,7 @@ fn parse_authorization_wire(
     let profile = parse_trusted_send_profile(wire.trusted_send_profile).map_err(|_| {
         authorization_error(SecretCredentialAuthorizationV2ErrorCode::InvalidTrustedSendProfile)
     })?;
-    if !profile_matches_exposure(&profile, exposure) {
+    if !profile.matches_exposure(exposure) {
         return Err(authorization_error(
             SecretCredentialAuthorizationV2ErrorCode::InvalidExposureProfileBinding,
         ));
@@ -2093,7 +1953,7 @@ fn parse_historical_ref_wire(wire: SecretRefWire) -> Result<HistoricalSecretRefV
     for (ordinal, authorization) in credential_authorizations.iter_mut().enumerate() {
         authorization.source_entry_ordinal = ordinal;
     }
-    allowed_delivery_methods.sort_by_key(|method| delivery_method_wire(*method));
+    allowed_delivery_methods.sort_by_key(|method| method.wire_spelling());
     let mut historical = HistoricalSecretRefV1 {
         secret_ref_id,
         secret_ref_revision,
@@ -2141,11 +2001,11 @@ fn parse_historical_authorization_wire(
     let destination_schema = wire
         .destination_schema
         .and_then(WireScalar::into_string)
-        .filter(|value| is_destination_schema(value))
+        .filter(|value| is_driver_destination_schema_v1(value))
         .ok_or(())?;
     let delivery_exposure_profile = parse_exposure(wire.delivery_exposure_profile).ok_or(())?;
     let trusted_send_profile = parse_trusted_send_profile(wire.trusted_send_profile)?;
-    if !profile_matches_exposure(&trusted_send_profile, delivery_exposure_profile) {
+    if !trusted_send_profile.matches_exposure(delivery_exposure_profile) {
         return Err(());
     }
     let approved_destination_digests =
@@ -2169,60 +2029,16 @@ fn parse_historical_authorization_wire(
     Ok(historical)
 }
 
-fn parse_driver_operation(value: Option<DriverOperationWire>) -> Result<DriverOperationRef, ()> {
-    let value = value.ok_or(())?;
-    if value.invalid_shape {
-        return Err(());
-    }
-    let operation = DriverOperationRef {
-        driver: value.driver.and_then(WireScalar::into_string).ok_or(())?,
-        operation: value
-            .operation
-            .and_then(WireScalar::into_string)
-            .ok_or(())?,
-        schema_version: value
-            .schema_version
-            .and_then(WireScalar::into_string)
-            .ok_or(())?,
-    };
-    validate_driver_operation_ref_v1(&operation).map_err(|_| ())?;
-    Ok(operation)
+fn parse_driver_operation(
+    value: Option<DriverOperationRefWireV1>,
+) -> Result<DriverOperationRef, ()> {
+    value.ok_or(())?.into_validated()
 }
 
 fn parse_trusted_send_profile(
-    value: Option<TrustedSendProfileWire>,
+    value: Option<DriverTrustedSendProfileWireV1>,
 ) -> Result<DriverTrustedSendProfileV1, ()> {
-    let value = value.ok_or(())?;
-    if value.invalid_shape {
-        return Err(());
-    }
-    match value.kind.and_then(WireScalar::into_string).as_deref() {
-        Some("trusted_injection") => {
-            let limit = value
-                .max_credential_bearing_sends
-                .and_then(WireScalar::into_u64)
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or(())?;
-            let controls = match value.applicable_delivery_controls {
-                Some(WireArray::Values(values)) => values,
-                Some(WireArray::Invalid) | None => return Err(()),
-            };
-            let mut parsed = Vec::with_capacity(controls.len());
-            for control in controls {
-                parsed.push(parse_delivery_control(control).ok_or(())?);
-            }
-            DriverTrustedSendProfileV1::try_trusted_injection(limit, parsed).map_err(|_| ())
-        }
-        Some("not_applicable") => {
-            if value.applicable_delivery_controls.is_some()
-                || value.max_credential_bearing_sends.is_some()
-            {
-                return Err(());
-            }
-            Ok(DriverTrustedSendProfileV1::not_applicable())
-        }
-        _ => Err(()),
-    }
+    value.ok_or(())?.into_profile()
 }
 
 fn parse_destination_digests(
@@ -2351,63 +2167,19 @@ fn parse_positive_safe_integer(value: Option<WireScalar>) -> Option<u64> {
 }
 
 fn parse_classification(value: Option<WireScalar>) -> Option<SecretClassification> {
-    match value.and_then(WireScalar::into_string)?.as_str() {
-        "authentication_credential" => Some(SecretClassification::AuthenticationCredential),
-        "signing_material" => Some(SecretClassification::SigningMaterial),
-        "encryption_material" => Some(SecretClassification::EncryptionMaterial),
-        "private_configuration" => Some(SecretClassification::PrivateConfiguration),
-        "opaque_secret" => Some(SecretClassification::OpaqueSecret),
-        _ => None,
-    }
+    SecretClassification::from_wire_spelling(&value?.into_string()?)
 }
 
 fn parse_exposure(value: Option<WireScalar>) -> Option<SecretDeliveryExposureProfile> {
-    match value.and_then(WireScalar::into_string)?.as_str() {
-        "trusted_injection" => Some(SecretDeliveryExposureProfile::TrustedInjection),
-        "material_exposed" => Some(SecretDeliveryExposureProfile::MaterialExposed),
-        _ => None,
-    }
+    SecretDeliveryExposureProfile::from_wire_spelling(&value?.into_string()?)
 }
 
 fn parse_offline_behavior(value: Option<WireScalar>) -> Option<SecretOfflineBehavior> {
-    match value.and_then(WireScalar::into_string)?.as_str() {
-        "deny" => Some(SecretOfflineBehavior::Deny),
-        "continue_existing_until_expiry" => {
-            Some(SecretOfflineBehavior::ContinueExistingUntilExpiry)
-        }
-        _ => None,
-    }
+    SecretOfflineBehavior::from_wire_spelling(&value?.into_string()?)
 }
 
 fn parse_delivery_method(value: WireScalar) -> Option<SecretDeliveryMethod> {
-    match value.into_string()?.as_str() {
-        "inherited_fd" => Some(SecretDeliveryMethod::InheritedFd),
-        "tmpfs_file" => Some(SecretDeliveryMethod::TmpfsFile),
-        "one_shot_local_socket" => Some(SecretDeliveryMethod::OneShotLocalSocket),
-        "orchestrator_projected_secret" => Some(SecretDeliveryMethod::OrchestratorProjectedSecret),
-        "environment_variable" => Some(SecretDeliveryMethod::EnvironmentVariable),
-        _ => None,
-    }
-}
-
-fn parse_delivery_control(value: WireScalar) -> Option<SecretDeliveryControlKind> {
-    match value.into_string()?.as_str() {
-        "core_dump" => Some(SecretDeliveryControlKind::CoreDump),
-        "ptrace_debug" => Some(SecretDeliveryControlKind::PtraceDebug),
-        "child_inheritance" => Some(SecretDeliveryControlKind::ChildInheritance),
-        "output_capture" => Some(SecretDeliveryControlKind::OutputCapture),
-        "swap_page_dump" => Some(SecretDeliveryControlKind::SwapPageDump),
-        "generic_cache" => Some(SecretDeliveryControlKind::GenericCache),
-        "orchestrator_projection" => Some(SecretDeliveryControlKind::OrchestratorProjection),
-        "trusted_injection_boundary" => Some(SecretDeliveryControlKind::TrustedInjectionBoundary),
-        "destination_network_egress" => Some(SecretDeliveryControlKind::DestinationNetworkEgress),
-        "filesystem_sink_egress" => Some(SecretDeliveryControlKind::FilesystemSinkEgress),
-        "ipc_egress" => Some(SecretDeliveryControlKind::IpcEgress),
-        "child_process_egress" => Some(SecretDeliveryControlKind::ChildProcessEgress),
-        "proxy_egress" => Some(SecretDeliveryControlKind::ProxyEgress),
-        "alternate_mount_egress" => Some(SecretDeliveryControlKind::AlternateMountEgress),
-        _ => None,
-    }
+    SecretDeliveryMethod::from_wire_spelling(&value.into_string()?)
 }
 
 fn parse_lease_policy(value: Option<LeasePolicyWire>) -> Option<SecretLeasePolicy> {
@@ -2423,32 +2195,6 @@ fn parse_lease_policy(value: Option<LeasePolicyWire>) -> Option<SecretLeasePolic
         value.clock_skew_tolerance_seconds?.into_u64()?,
     )
     .ok()
-}
-
-fn profile_matches_exposure(
-    profile: &DriverTrustedSendProfileV1,
-    exposure: SecretDeliveryExposureProfile,
-) -> bool {
-    matches!(
-        (profile.kind(), exposure),
-        (
-            "trusted_injection",
-            SecretDeliveryExposureProfile::TrustedInjection
-        ) | (
-            "not_applicable",
-            SecretDeliveryExposureProfile::MaterialExposed
-        )
-    )
-}
-
-fn delivery_method_wire(method: SecretDeliveryMethod) -> &'static str {
-    match method {
-        SecretDeliveryMethod::InheritedFd => "inherited_fd",
-        SecretDeliveryMethod::TmpfsFile => "tmpfs_file",
-        SecretDeliveryMethod::OneShotLocalSocket => "one_shot_local_socket",
-        SecretDeliveryMethod::OrchestratorProjectedSecret => "orchestrator_projected_secret",
-        SecretDeliveryMethod::EnvironmentVariable => "environment_variable",
-    }
 }
 
 fn has_duplicates<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
@@ -2474,20 +2220,6 @@ fn is_canonical_label(value: &str) -> bool {
         && bytes[1..].iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
-}
-
-fn is_destination_schema(value: &str) -> bool {
-    if value.is_empty() || value.len() > MAX_LABEL_BYTES || !value.is_ascii() {
-        return false;
-    }
-    let Some((prefix, version)) = value.rsplit_once(".v") else {
-        return false;
-    };
-    is_canonical_label(prefix)
-        && !version.is_empty()
-        && version.as_bytes()[0].is_ascii_digit()
-        && version.as_bytes()[0] != b'0'
-        && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_exact_timestamp(value: &str) -> bool {
