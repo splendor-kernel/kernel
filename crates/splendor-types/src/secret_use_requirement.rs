@@ -241,7 +241,8 @@ impl Serialize for SecretUseRequirement {
 /// Fixed, non-reflecting validation failures for a secret-use requirement.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum SecretUseRequirementError {
-    /// The input exceeded an ingress budget or was not exact valid JSON/object form.
+    /// The input exceeded a general ingress budget or parsing failed before a
+    /// recognized root-field error stage could be attributed.
     InvalidContractShape,
     /// At least one required member was absent.
     MissingRequiredField,
