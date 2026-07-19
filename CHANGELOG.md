@@ -4,6 +4,39 @@
 
 ### Added
 
+- **status/incomplete:** added RFC 0014's additive behavior-free
+  `SecretCredentialAuthorizationV2` and `SecretRefV2` Rust contracts in
+  `splendor-types`, with checked construction, deterministic canonical
+  serialization, fixed non-reflecting errors, strict duplicate-aware bounded
+  byte parsers, an exact pure Driver declaration/classification/intent
+  comparison, and closed historical-v1 read/deny views with stable source-entry
+  ordinals and domain-separated digests. Canonical minimal, accepted historical,
+  and independently generated legal-maximum fixtures pin set ordering, exact
+  bytes, and ingress bounds. Validated v2 and historical records implement
+  `Serialize` but not generic `Deserialize`; comparison and historical-denial
+  results are non-serializable. This slice grants no authority and adds no
+  lookup, current-head selection, migration execution, persistence, cache,
+  provider, lease, material delivery, Gateway/runtime behavior,
+  daemon/API/SDK/generated surface, issue closure, feature activation, or gold
+  evidence. RFC 0012 v1 bytes remain historical-only, and RFC 0013 Driver-owned
+  operation, slot, declaration, trusted-send, and digest contracts remain
+  unchanged.
+- **status/incomplete:** added the additive experimental, behavior-free
+  `SecretUseRequirement` v1 Rust contract in `splendor-types`. Private fields,
+  checked construction, a sole duplicate-aware bounded `from_json_slice` byte
+  ingress, fixed non-reflecting source-free error codes, and a canonical fixture
+  enforce the exact schema, opaque `SecretRefId`, imported
+  Driver Registry-owned `SecretCredentialSlotId`, closed intent/purpose, one-to-
+  five unique ordered delivery preferences, positive safe-JSON-integer duration
+  and use limits, and `required: true`. The validated type implements `Serialize`
+  but not public generic `Deserialize`; its exact ingress caps raw bytes, depth,
+  tokens, members, elements, and decoded name/string bytes before private wire
+  decoding. The contract contains no material,
+  provider locator, destination, target, authority, lease, handle, fallback, or
+  environment name. It grants no authority and adds no `SecretRef`, credential
+  authorization, provider, broker, Gateway, runtime, daemon/API/SDK/generated
+  surface, scanner, side effect, issue closure, or `G08` evidence. Stable 0.1,
+  existing C03 pre-placement, and Driver Registry contract bytes are unchanged.
 - **status/incomplete:** added the first behavior-free `DRREG-001` credential-
   sink contract in `splendor-types`: strict canonical driver-operation
   validation over the unchanged `DriverOperationRef`, nominal
@@ -27,14 +60,14 @@
   Pre-placement primitives reject unknown,
   malformed, duplicate, null, wrong-type, out-of-range, locator-like, and unsafe
   integer forms without adding authority or runtime behavior. This partial slice
-  adds no complete `SecretRef`, `SecretUseRequirement`, lease record/lifecycle,
+  adds no complete `SecretRef`, lease record/lifecycle,
   provider port, broker, Gateway/daemon/API/SDK/generated surface, scanner,
   feature activation, issue closure, or gold pass. The new control vocabulary
   grants no authority and adds no broker, delivery, driver, registry, or runtime
-  behavior. The owner-defined
-  `SecretCredentialSlotId` and exact credential-sink/trusted-send/destination
-  contracts remain external blockers; stable 0.1 behavior and bytes remain
-  unchanged.
+  behavior. The owner-defined `SecretCredentialSlotId` and behavior-free exact
+  credential-sink/trusted-send/destination contracts are now imported
+  prerequisites; complete revision-bearing C03 authorization remains separately
+  blocked. Stable 0.1 behavior and bytes remain unchanged.
 - Hardened physical/edge resident boundaries without changing intervention or
   trace-record schemas. Operator intervention evidence is now checked against
   the authoritative tenant, agent, run, node, action, granted status, and expiry,

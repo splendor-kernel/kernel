@@ -746,6 +746,23 @@ fn ingress_top_level_precedence_and_operation_shape_are_exact() {
             DriverCredentialSinkContractErrorCode::InvalidDriverOperation,
         );
     }
+
+    for invalid_driver_field in [
+        serde_json::json!(true),
+        serde_json::json!(-1),
+        serde_json::json!(1),
+        serde_json::json!(1.5),
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let mut value = fixture_value();
+        value["driver_operation"]["driver"] = invalid_driver_field;
+        assert_value_error(
+            &value,
+            DriverCredentialSinkContractErrorCode::InvalidDriverOperation,
+        );
+    }
 }
 
 #[test]
@@ -1008,6 +1025,7 @@ fn ingress_profile_precedence_and_denials_are_exact() {
     }
     for controls in [
         serde_json::Value::Null,
+        serde_json::json!({}),
         serde_json::json!([]),
         serde_json::json!(["unknown"]),
         serde_json::json!(["trusted_injection_boundary", "trusted_injection_boundary"]),
