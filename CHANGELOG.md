@@ -4,6 +4,23 @@
 
 ### Added
 
+- **status/incomplete:** added RFC 0014's additive behavior-free
+  `SecretCredentialAuthorizationV2` and `SecretRefV2` Rust contracts in
+  `splendor-types`, with checked construction, deterministic canonical
+  serialization, fixed non-reflecting errors, strict duplicate-aware bounded
+  byte parsers, an exact pure Driver declaration/classification/intent
+  comparison, and closed historical-v1 read/deny views with stable source-entry
+  ordinals and domain-separated digests. Canonical minimal, accepted historical,
+  and independently generated legal-maximum fixtures pin set ordering, exact
+  bytes, and ingress bounds. Validated v2 and historical records implement
+  `Serialize` but not generic `Deserialize`; comparison and historical-denial
+  results are non-serializable. This slice grants no authority and adds no
+  lookup, current-head selection, migration execution, persistence, cache,
+  provider, lease, material delivery, Gateway/runtime behavior,
+  daemon/API/SDK/generated surface, issue closure, feature activation, or gold
+  evidence. RFC 0012 v1 bytes remain historical-only, and RFC 0013 Driver-owned
+  operation, slot, declaration, trusted-send, and digest contracts remain
+  unchanged.
 - **status/incomplete:** added the additive experimental, behavior-free
   `SecretUseRequirement` v1 Rust contract in `splendor-types`. Private fields,
   checked construction, a sole duplicate-aware bounded `from_json_slice` byte

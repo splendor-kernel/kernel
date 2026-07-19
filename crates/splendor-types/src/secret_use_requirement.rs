@@ -399,28 +399,17 @@ fn parse_wire(
 }
 
 fn parse_intent(value: &serde_json::Value) -> Result<SecretUseIntent, SecretUseRequirementError> {
-    match value.as_str() {
-        Some("authenticate") => Ok(SecretUseIntent::Authenticate),
-        Some("sign") => Ok(SecretUseIntent::Sign),
-        Some("encrypt") => Ok(SecretUseIntent::Encrypt),
-        Some("decrypt") => Ok(SecretUseIntent::Decrypt),
-        Some("derive_session") => Ok(SecretUseIntent::DeriveSession),
-        Some("bootstrap_transport") => Ok(SecretUseIntent::BootstrapTransport),
-        _ => Err(SecretUseRequirementError::InvalidIntent),
-    }
+    value
+        .as_str()
+        .and_then(SecretUseIntent::from_wire_spelling)
+        .ok_or(SecretUseRequirementError::InvalidIntent)
 }
 
 fn parse_purpose(value: &serde_json::Value) -> Result<SecretPurpose, SecretUseRequirementError> {
-    match value.as_str() {
-        Some("external_service_access") => Ok(SecretPurpose::ExternalServiceAccess),
-        Some("data_source_access") => Ok(SecretPurpose::DataSourceAccess),
-        Some("artifact_store_access") => Ok(SecretPurpose::ArtifactStoreAccess),
-        Some("model_provider_access") => Ok(SecretPurpose::ModelProviderAccess),
-        Some("orchestrator_access") => Ok(SecretPurpose::OrchestratorAccess),
-        Some("device_service_access") => Ok(SecretPurpose::DeviceServiceAccess),
-        Some("cryptographic_operation") => Ok(SecretPurpose::CryptographicOperation),
-        _ => Err(SecretUseRequirementError::InvalidPurpose),
-    }
+    value
+        .as_str()
+        .and_then(SecretPurpose::from_wire_spelling)
+        .ok_or(SecretUseRequirementError::InvalidPurpose)
 }
 
 fn parse_delivery_methods(
@@ -431,16 +420,10 @@ fn parse_delivery_methods(
     };
     let mut methods = Vec::with_capacity(values.len());
     for value in values {
-        let method = match value.as_str() {
-            Some("inherited_fd") => SecretDeliveryMethod::InheritedFd,
-            Some("tmpfs_file") => SecretDeliveryMethod::TmpfsFile,
-            Some("one_shot_local_socket") => SecretDeliveryMethod::OneShotLocalSocket,
-            Some("orchestrator_projected_secret") => {
-                SecretDeliveryMethod::OrchestratorProjectedSecret
-            }
-            Some("environment_variable") => SecretDeliveryMethod::EnvironmentVariable,
-            _ => return Err(SecretUseRequirementError::InvalidDeliveryMethod),
-        };
+        let method = value
+            .as_str()
+            .and_then(SecretDeliveryMethod::from_wire_spelling)
+            .ok_or(SecretUseRequirementError::InvalidDeliveryMethod)?;
         methods.push(method);
     }
     Ok(methods)

@@ -53,6 +53,7 @@ mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod secret_ref;
 mod secret_use_requirement;
 mod secrets;
 mod security_invariants;
@@ -227,6 +228,14 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use secret_ref::{
+    compare_secret_credential_authorization_v2, HistoricalSecretCredentialAuthorizationV1,
+    HistoricalSecretRefV1, HistoricalSecretRefV1Error, HistoricalSecretRefV1LiveDenial,
+    SecretCredentialAuthorizationV2, SecretCredentialAuthorizationV2Error,
+    SecretCredentialAuthorizationV2ErrorCode, SecretCredentialDeclarationComparisonV2,
+    SecretCredentialDeclarationMismatchCodeV2, SecretRefV2, SecretRefV2Error, SecretRefV2ErrorCode,
+    SECRET_CREDENTIAL_AUTHORIZATION_SCHEMA_V2, SECRET_REF_SCHEMA_V2,
 };
 pub use secret_use_requirement::{
     SecretUseRequirement, SecretUseRequirementError, SECRET_USE_REQUIREMENT_SCHEMA_V1,

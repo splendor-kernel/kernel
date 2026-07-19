@@ -22,7 +22,6 @@ const LEASE_POLICY_RENEWABLE_TYPE_ERROR: &str =
     "secret lease policy renewable field has invalid type";
 
 trait ClosedSecretEnum: Copy {
-    fn wire_spelling(self) -> &'static str;
     fn from_wire_spelling(value: &str) -> Option<Self>;
 }
 
@@ -71,18 +70,24 @@ macro_rules! define_closed_secret_enum {
             )+
         }
 
-        impl ClosedSecretEnum for $name {
-            fn wire_spelling(self) -> &'static str {
+        impl $name {
+            pub(crate) const fn wire_spelling(self) -> &'static str {
                 match self {
                     $(Self::$variant => $wire_spelling,)+
                 }
             }
 
-            fn from_wire_spelling(value: &str) -> Option<Self> {
+            pub(crate) fn from_wire_spelling(value: &str) -> Option<Self> {
                 match value {
                     $($wire_spelling => Some(Self::$variant),)+
                     _ => None,
                 }
+            }
+        }
+
+        impl ClosedSecretEnum for $name {
+            fn from_wire_spelling(value: &str) -> Option<Self> {
+                Self::from_wire_spelling(value)
             }
         }
 
