@@ -37,6 +37,7 @@ mod cloud_helper;
 mod daemon_security;
 mod determinism;
 mod device_profile;
+mod driver;
 mod escalation;
 mod external_governance;
 mod failure_taxonomy;
@@ -52,6 +53,7 @@ mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod secrets;
 mod security_invariants;
 mod state_handoff;
 mod trace;
@@ -109,6 +111,14 @@ pub use device_profile::{
     DEVICE_KIND_CAPABILITY_PREFIX, DEVICE_PROFILE_SCHEMA, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
     PHYSICAL_ACTION_CAPABILITY_PREFIX,
 };
+pub use driver::{
+    validate_driver_operation_ref_v1, DriverCredentialDestinationDigest,
+    DriverCredentialDestinationDigestError, DriverCredentialSinkContractError,
+    DriverCredentialSinkContractErrorCode, DriverOperationCredentialSinkV1,
+    DriverOperationCredentialSinksV1, DriverOperationRefV1ValidationError,
+    DriverTrustedSendProfileV1, SecretCredentialSlotId, SecretCredentialSlotIdError,
+    DRIVER_OPERATION_CREDENTIAL_SINKS_SCHEMA_V1, DRIVER_OPERATION_SCHEMA_V1,
+};
 pub use escalation::{
     EscalationContext, EscalationDecision, EscalationObservation, EscalationPolicy,
     EscalationPolicyError, EscalationRule, EscalationScope, EscalationTrigger,
@@ -153,8 +163,22 @@ pub use ids::{
     AuthorityObligationReceiptId, AuthorityRevocationId, CapabilityGrantId, CircuitBreakerId,
     DeviceId, EscalationId, FleetId, IdentityEventId, IdentityValidationError, InstanceId,
     InterventionId, KillSwitchId, MessageId, NodeId, PrincipalId, PrincipalProofRefId, RunId,
-    RuntimeIdentityContext, SnapshotId, StateNodeId, StatePartitionId, TenantId, TickId,
-    TraceEventId, TraceId, TraceIdentityContext, WorkOrderId, WorkOrderIdError, WorkloadId,
+    RuntimeIdentityContext, SecretAccessEventId, SecretActionIdempotencyKey,
+    SecretActionSubmissionId, SecretApprovalContinuationId, SecretAudienceId,
+    SecretBootstrapSourceBindingId, SecretCleanupCommandId, SecretConsumedEffectTombstoneId,
+    SecretContainmentCommandId, SecretContainmentReserveId, SecretDeliveryControlAttestationId,
+    SecretDeliveryHandleId, SecretDeliveryReceiptId, SecretDetectorRegistrationId,
+    SecretExposureLineageId, SecretIdParseError, SecretLeaseId, SecretLeaseRequestId,
+    SecretNodeControlInvocationId, SecretNodeControlReceiptId,
+    SecretOuterAdmissionCapacityBindingId, SecretPermanentAuxiliaryIdentityMarkerId,
+    SecretProviderAuditId, SecretProviderControlInvocationId, SecretProviderId,
+    SecretProviderRouteId, SecretPublicationAuthorizationId, SecretPublicationPreparationId,
+    SecretPublicationPrepareReceiptId, SecretReconciliationClaimId, SecretRefId,
+    SecretRefMutationCommandId, SecretRenewalCommandId, SecretRetiredAuthorityDomainDenyHeadId,
+    SecretRetirementManifestId, SecretRevocationCommandId, SecretRotationCommandId,
+    SecretTickCandidateObservationId, SecretTickCandidateObservationLinkReceiptId,
+    SecretUseAttemptId, SecretUseClaimId, SnapshotId, StateNodeId, StatePartitionId, TenantId,
+    TickId, TraceEventId, TraceId, TraceIdentityContext, WorkOrderId, WorkOrderIdError, WorkloadId,
 };
 pub use message::{
     DelegatedAuthority, LocalDelegationAuthorityEvidence, Message, MessageDeliveryStatus,
@@ -202,6 +226,11 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use secrets::{
+    SecretClassification, SecretDeliveryControlKind, SecretDeliveryExposureProfile,
+    SecretDeliveryMethod, SecretLeasePolicy, SecretLeasePolicyError, SecretOfflineBehavior,
+    SecretProviderVersionRef, SecretProviderVersionRefError, SecretPurpose, SecretUseIntent,
 };
 pub use security_invariants::{
     validate_security_invariant_catalog, ContainmentAction, CryptoAgility, ExecutableGoldEvidence,

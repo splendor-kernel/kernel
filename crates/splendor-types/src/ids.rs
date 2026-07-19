@@ -18,7 +18,7 @@
 //! ```
 
 use crate::ContentHash;
-use serde::de::Error as DeError;
+use serde::de::{Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
@@ -208,6 +208,421 @@ uuid_id! {
 uuid_id! {
     /// Unique identifier for a scoped kill-switch governance object.
     KillSwitchId
+}
+
+/// Validation failure for a C03 secret identity.
+///
+/// Errors intentionally omit the rejected input so candidate values cannot be
+/// copied into logs or API responses through formatting.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SecretIdParseError {
+    /// The input was not canonical lowercase hyphenated UUID text.
+    #[error("secret ID must use canonical lowercase hyphenated UUID text")]
+    InvalidFormat,
+    /// Nil is not a valid C03 secret identity.
+    #[error("secret ID must not be nil")]
+    Nil,
+}
+
+fn parse_strict_secret_uuid(value: &str) -> Result<Uuid, SecretIdParseError> {
+    if value.len() != 36 || !value.is_ascii() {
+        return Err(SecretIdParseError::InvalidFormat);
+    }
+    let uuid = Uuid::parse_str(value).map_err(|_| SecretIdParseError::InvalidFormat)?;
+    let mut canonical = Uuid::encode_buffer();
+    if uuid.hyphenated().encode_lower(&mut canonical) != value {
+        return Err(SecretIdParseError::InvalidFormat);
+    }
+    if uuid.is_nil() {
+        return Err(SecretIdParseError::Nil);
+    }
+    Ok(uuid)
+}
+
+struct StrictSecretUuidVisitor;
+
+impl<'de> Visitor<'de> for StrictSecretUuidVisitor {
+    type Value = Uuid;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("canonical lowercase hyphenated non-nil UUID text")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        parse_strict_secret_uuid(value).map_err(E::custom)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_char<E>(self, _value: char) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        Err(E::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        Err(A::Error::custom(SecretIdParseError::InvalidFormat))
+    }
+
+    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        Err(A::Error::custom(SecretIdParseError::InvalidFormat))
+    }
+}
+
+macro_rules! strict_secret_uuid_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            /// Parses a non-nil canonical lowercase hyphenated UUID.
+            pub fn parse(value: &str) -> Result<Self, SecretIdParseError> {
+                parse_strict_secret_uuid(value).map(Self)
+            }
+
+            /// Returns the underlying non-nil UUID.
+            pub fn as_uuid(&self) -> &Uuid {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = SecretIdParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value)
+            }
+        }
+
+        impl TryFrom<Uuid> for $name {
+            type Error = SecretIdParseError;
+
+            fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+                if value.is_nil() {
+                    Err(SecretIdParseError::Nil)
+                } else {
+                    Ok(Self(value))
+                }
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.0.to_string())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer
+                    .deserialize_any(StrictSecretUuidVisitor)
+                    .map(Self)
+            }
+        }
+    };
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one logical secret reference history.
+    ///
+    /// Secret identity types are nominal and cannot be interchanged:
+    ///
+    /// ```compile_fail
+    /// use splendor_types::{SecretLeaseId, SecretRefId};
+    ///
+    /// fn accept_secret_ref(_id: SecretRefId) {}
+    ///
+    /// let lease_id: SecretLeaseId =
+    ///     "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001".parse().unwrap();
+    /// accept_secret_ref(lease_id);
+    /// ```
+    SecretRefId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one idempotent secret lease request.
+    SecretLeaseRequestId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one secret lease lifecycle.
+    SecretLeaseId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one node-local secret delivery-handle lifecycle.
+    SecretDeliveryHandleId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one immutable secret-effect delivery receipt.
+    SecretDeliveryReceiptId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one terminal delivery-control attestation.
+    SecretDeliveryControlAttestationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one durable outer secret-action submission.
+    SecretActionSubmissionId
+}
+
+strict_secret_uuid_id! {
+    /// Canonical UUID idempotency key for one direct secret-action submission.
+    SecretActionIdempotencyKey
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one exact secret approval continuation.
+    SecretApprovalContinuationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one outer-admission capacity binding.
+    SecretOuterAdmissionCapacityBindingId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one configured secret provider.
+    SecretProviderId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one immutable configured secret provider route.
+    SecretProviderRouteId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one sanitized secret provider audit receipt.
+    SecretProviderAuditId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one provider control invocation.
+    SecretProviderControlInvocationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one private bootstrap source binding.
+    SecretBootstrapSourceBindingId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one immutable secret access event.
+    SecretAccessEventId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one preclaim tick-candidate observation.
+    SecretTickCandidateObservationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one tick-candidate observation link receipt.
+    SecretTickCandidateObservationLinkReceiptId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one resident-node secret control invocation.
+    SecretNodeControlInvocationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one immutable node-control terminal receipt.
+    SecretNodeControlReceiptId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one trusted secret target audience.
+    SecretAudienceId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one restricted detector registration.
+    SecretDetectorRegistrationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one secret exposure aggregate or lineage.
+    SecretExposureLineageId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one reserved secret use attempt.
+    SecretUseAttemptId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one secret-reference mutation command.
+    SecretRefMutationCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one secret renewal command.
+    SecretRenewalCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one secret rotation command.
+    SecretRotationCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one scoped secret revocation command.
+    SecretRevocationCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one secret cleanup command.
+    SecretCleanupCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Idempotency identifier for one secret containment command.
+    SecretContainmentCommandId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one atomic secret exposure or use claim.
+    SecretUseClaimId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one pre-exposure containment reservation.
+    SecretContainmentReserveId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one immutable publication preparation.
+    SecretPublicationPreparationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one final result or state publication authorization.
+    SecretPublicationAuthorizationId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one publication prepare receipt.
+    SecretPublicationPrepareReceiptId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one provider or node reconciliation claim.
+    SecretReconciliationClaimId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one permanent consumed-effect tombstone.
+    SecretConsumedEffectTombstoneId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one permanent containment auxiliary marker.
+    SecretPermanentAuxiliaryIdentityMarkerId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one retired authority-domain deny head.
+    SecretRetiredAuthorityDomainDenyHeadId
+}
+
+strict_secret_uuid_id! {
+    /// Unique identifier for one authority-domain retirement manifest.
+    SecretRetirementManifestId
 }
 
 /// Stable identifier for a signed work order.
