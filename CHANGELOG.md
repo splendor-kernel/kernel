@@ -4,6 +4,22 @@
 
 ### Added
 
+- **status/incomplete:** added the additive experimental, behavior-free
+  `SecretUseRequirement` v1 Rust contract in `splendor-types`. Private fields,
+  checked construction, a sole duplicate-aware bounded `from_json_slice` byte
+  ingress, fixed non-reflecting source-free error codes, and a canonical fixture
+  enforce the exact schema, opaque `SecretRefId`, imported
+  Driver Registry-owned `SecretCredentialSlotId`, closed intent/purpose, one-to-
+  five unique ordered delivery preferences, positive safe-JSON-integer duration
+  and use limits, and `required: true`. The validated type implements `Serialize`
+  but not public generic `Deserialize`; its exact ingress caps raw bytes, depth,
+  tokens, members, elements, and decoded name/string bytes before private wire
+  decoding. The contract contains no material,
+  provider locator, destination, target, authority, lease, handle, fallback, or
+  environment name. It grants no authority and adds no `SecretRef`, credential
+  authorization, provider, broker, Gateway, runtime, daemon/API/SDK/generated
+  surface, scanner, side effect, issue closure, or `G08` evidence. Stable 0.1,
+  existing C03 pre-placement, and Driver Registry contract bytes are unchanged.
 - **status/incomplete:** added the first behavior-free `DRREG-001` credential-
   sink contract in `splendor-types`: strict canonical driver-operation
   validation over the unchanged `DriverOperationRef`, nominal
@@ -27,14 +43,14 @@
   Pre-placement primitives reject unknown,
   malformed, duplicate, null, wrong-type, out-of-range, locator-like, and unsafe
   integer forms without adding authority or runtime behavior. This partial slice
-  adds no complete `SecretRef`, `SecretUseRequirement`, lease record/lifecycle,
+  adds no complete `SecretRef`, lease record/lifecycle,
   provider port, broker, Gateway/daemon/API/SDK/generated surface, scanner,
   feature activation, issue closure, or gold pass. The new control vocabulary
   grants no authority and adds no broker, delivery, driver, registry, or runtime
-  behavior. The owner-defined
-  `SecretCredentialSlotId` and exact credential-sink/trusted-send/destination
-  contracts remain external blockers; stable 0.1 behavior and bytes remain
-  unchanged.
+  behavior. The owner-defined `SecretCredentialSlotId` and behavior-free exact
+  credential-sink/trusted-send/destination contracts are now imported
+  prerequisites; complete revision-bearing C03 authorization remains separately
+  blocked. Stable 0.1 behavior and bytes remain unchanged.
 - Hardened physical/edge resident boundaries without changing intervention or
   trace-record schemas. Operator intervention evidence is now checked against
   the authoritative tenant, agent, run, node, action, granted status, and expiry,

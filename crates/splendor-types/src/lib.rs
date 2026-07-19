@@ -53,6 +53,7 @@ mod placement;
 mod policy_distribution;
 mod primitives;
 mod schema_extensions;
+mod secret_use_requirement;
 mod secrets;
 mod security_invariants;
 mod state_handoff;
@@ -226,6 +227,9 @@ pub use schema_extensions::{
     validate_extension_map_with_reserved_keys, validate_extension_value,
     validate_extension_value_with_reserved_keys, ExtensionValidationError,
     ExtensionValidationReason, RESERVED_EXTENSION_KEYS, RESERVED_EXTENSION_KEY_FRAGMENTS,
+};
+pub use secret_use_requirement::{
+    SecretUseRequirement, SecretUseRequirementError, SECRET_USE_REQUIREMENT_SCHEMA_V1,
 };
 pub use secrets::{
     SecretClassification, SecretDeliveryControlKind, SecretDeliveryExposureProfile,

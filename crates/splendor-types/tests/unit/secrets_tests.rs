@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    SecretCredentialSlotId, SecretRefId, SecretUseRequirement, SecretUseRequirementError,
+    SECRET_USE_REQUIREMENT_SCHEMA_V1,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -993,6 +997,7 @@ fn implemented_values_and_fixture_objects_have_no_secret_payload_keys() {
         serde_json::to_value(SecretProviderVersionRef::try_new("release-001").expect("valid ref"))
             .expect("version ref serialization"),
         serde_json::to_value(valid_policy()).expect("policy serialization"),
+        serde_json::to_value(valid_use_requirement()).expect("use requirement serialization"),
     ];
     for value in &implemented {
         assert_no_secret_payload_keys(value);
@@ -1007,4 +1012,578 @@ fn implemented_values_and_fixture_objects_have_no_secret_payload_keys() {
     )
     .expect("canonical policy must be JSON");
     assert_no_secret_payload_keys(&canonical_policy);
+}
+
+const SECRET_REF_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001";
+const CREDENTIAL_SLOT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4101";
+
+fn use_requirement_fixture_text() -> &'static str {
+    include_str!("../fixtures/secrets/v1a/secret-use-requirement.json")
+}
+
+fn valid_use_requirement() -> SecretUseRequirement {
+    SecretUseRequirement::try_new(
+        SECRET_REF_ID.parse().expect("secret ref ID"),
+        CREDENTIAL_SLOT_ID.parse().expect("credential slot ID"),
+        SecretUseIntent::Authenticate,
+        SecretPurpose::ExternalServiceAccess,
+        vec![
+            SecretDeliveryMethod::OrchestratorProjectedSecret,
+            SecretDeliveryMethod::InheritedFd,
+        ],
+        300,
+        2,
+        true,
+    )
+    .expect("valid use requirement")
+}
+
+fn valid_use_requirement_value() -> Value {
+    serde_json::from_str(use_requirement_fixture_text()).expect("canonical requirement fixture")
+}
+
+fn assert_requirement_rejects(raw: &str) -> String {
+    let error = SecretUseRequirement::from_json_slice(raw.as_bytes())
+        .expect_err("invalid secret-use requirement must reject")
+        .to_string();
+    assert!(
+        error.len() <= 180,
+        "requirement errors must remain bounded: {error}"
+    );
+    error
+}
+
+#[test]
+fn use_requirement_fixture_pins_canonical_bytes_getters_and_preference_order() {
+    let requirement =
+        SecretUseRequirement::from_json_slice(use_requirement_fixture_text().as_bytes())
+            .expect("canonical fixture must parse through bounded ingress");
+
+    assert_eq!(
+        requirement.schema_version(),
+        SECRET_USE_REQUIREMENT_SCHEMA_V1
+    );
+    assert_eq!(requirement.secret_ref_id().to_string(), SECRET_REF_ID);
+    assert_eq!(
+        requirement.credential_slot_id().to_string(),
+        CREDENTIAL_SLOT_ID
+    );
+    assert_eq!(requirement.intent(), SecretUseIntent::Authenticate);
+    assert_eq!(requirement.purpose(), SecretPurpose::ExternalServiceAccess);
+    assert_eq!(
+        requirement.delivery_methods(),
+        [
+            SecretDeliveryMethod::OrchestratorProjectedSecret,
+            SecretDeliveryMethod::InheritedFd,
+        ]
+    );
+    assert_eq!(requirement.requested_duration_seconds(), 300);
+    assert_eq!(requirement.requested_max_uses(), 2);
+    assert!(requirement.required());
+
+    let serialized = serde_json::to_vec(&requirement).expect("requirement serialization");
+    let fixture_bytes = include_bytes!("../fixtures/secrets/v1a/secret-use-requirement.json");
+    assert_eq!(fixture_bytes.last(), Some(&b'\n'));
+    assert_eq!(serialized, fixture_bytes[..fixture_bytes.len() - 1]);
+    assert_eq!(requirement, valid_use_requirement());
+
+    let reversed = SecretUseRequirement::try_new(
+        SECRET_REF_ID.parse().unwrap(),
+        CREDENTIAL_SLOT_ID.parse().unwrap(),
+        SecretUseIntent::Authenticate,
+        SecretPurpose::ExternalServiceAccess,
+        vec![
+            SecretDeliveryMethod::InheritedFd,
+            SecretDeliveryMethod::OrchestratorProjectedSecret,
+        ],
+        300,
+        2,
+        true,
+    )
+    .expect("reversed preference order remains valid");
+    assert_ne!(
+        serde_json::to_vec(&reversed).unwrap(),
+        serialized,
+        "preference order must change canonical bytes"
+    );
+}
+
+#[test]
+fn use_requirement_ingress_accepts_every_intent_and_purpose_wire_spelling() {
+    let canonical = use_requirement_fixture_text()
+        .strip_suffix('\n')
+        .expect("canonical fixture must have one trailing newline");
+
+    for (expected, spelling) in [
+        (SecretUseIntent::Authenticate, "authenticate"),
+        (SecretUseIntent::Sign, "sign"),
+        (SecretUseIntent::Encrypt, "encrypt"),
+        (SecretUseIntent::Decrypt, "decrypt"),
+        (SecretUseIntent::DeriveSession, "derive_session"),
+        (SecretUseIntent::BootstrapTransport, "bootstrap_transport"),
+    ] {
+        let input = canonical.replace(
+            r#""intent":"authenticate""#,
+            &format!(r#""intent":"{spelling}""#),
+        );
+        let requirement = SecretUseRequirement::from_json_slice(input.as_bytes())
+            .expect("every exact intent spelling must parse through bounded ingress");
+
+        assert_eq!(requirement.intent(), expected);
+        assert_eq!(requirement.purpose(), SecretPurpose::ExternalServiceAccess);
+        assert_eq!(serde_json::to_string(&requirement).unwrap(), input);
+    }
+
+    for (expected, spelling) in [
+        (
+            SecretPurpose::ExternalServiceAccess,
+            "external_service_access",
+        ),
+        (SecretPurpose::DataSourceAccess, "data_source_access"),
+        (SecretPurpose::ArtifactStoreAccess, "artifact_store_access"),
+        (SecretPurpose::ModelProviderAccess, "model_provider_access"),
+        (SecretPurpose::OrchestratorAccess, "orchestrator_access"),
+        (SecretPurpose::DeviceServiceAccess, "device_service_access"),
+        (
+            SecretPurpose::CryptographicOperation,
+            "cryptographic_operation",
+        ),
+    ] {
+        let input = canonical.replace(
+            r#""purpose":"external_service_access""#,
+            &format!(r#""purpose":"{spelling}""#),
+        );
+        let requirement = SecretUseRequirement::from_json_slice(input.as_bytes())
+            .expect("every exact purpose spelling must parse through bounded ingress");
+
+        assert_eq!(requirement.intent(), SecretUseIntent::Authenticate);
+        assert_eq!(requirement.purpose(), expected);
+        assert_eq!(serde_json::to_string(&requirement).unwrap(), input);
+    }
+}
+
+#[test]
+fn use_requirement_constructor_accepts_exact_boundaries_and_rejects_invalid_values() {
+    let all_methods = vec![
+        SecretDeliveryMethod::InheritedFd,
+        SecretDeliveryMethod::TmpfsFile,
+        SecretDeliveryMethod::OneShotLocalSocket,
+        SecretDeliveryMethod::OrchestratorProjectedSecret,
+        SecretDeliveryMethod::EnvironmentVariable,
+    ];
+    let maximum = SecretUseRequirement::try_new(
+        SECRET_REF_ID.parse().unwrap(),
+        CREDENTIAL_SLOT_ID.parse().unwrap(),
+        SecretUseIntent::BootstrapTransport,
+        SecretPurpose::CryptographicOperation,
+        all_methods.clone(),
+        MAX_SAFE_INTEGER,
+        MAX_SAFE_INTEGER,
+        true,
+    )
+    .expect("maximum requirement must validate");
+    assert_eq!(maximum.delivery_methods(), all_methods);
+    assert_eq!(maximum.requested_duration_seconds(), MAX_SAFE_INTEGER);
+    assert_eq!(maximum.requested_max_uses(), MAX_SAFE_INTEGER);
+
+    let make = |methods, duration, max_uses, required| {
+        SecretUseRequirement::try_new(
+            SECRET_REF_ID.parse().unwrap(),
+            CREDENTIAL_SLOT_ID.parse().unwrap(),
+            SecretUseIntent::Authenticate,
+            SecretPurpose::ExternalServiceAccess,
+            methods,
+            duration,
+            max_uses,
+            required,
+        )
+    };
+    let cases = [
+        (
+            make(vec![], 1, 1, true),
+            SecretUseRequirementError::EmptyDeliveryMethods,
+        ),
+        (
+            make(
+                vec![
+                    SecretDeliveryMethod::InheritedFd,
+                    SecretDeliveryMethod::TmpfsFile,
+                    SecretDeliveryMethod::OneShotLocalSocket,
+                    SecretDeliveryMethod::OrchestratorProjectedSecret,
+                    SecretDeliveryMethod::EnvironmentVariable,
+                    SecretDeliveryMethod::InheritedFd,
+                ],
+                1,
+                1,
+                true,
+            ),
+            SecretUseRequirementError::TooManyDeliveryMethods,
+        ),
+        (
+            make(
+                vec![
+                    SecretDeliveryMethod::InheritedFd,
+                    SecretDeliveryMethod::InheritedFd,
+                ],
+                1,
+                1,
+                true,
+            ),
+            SecretUseRequirementError::DuplicateDeliveryMethod,
+        ),
+        (
+            make(vec![SecretDeliveryMethod::InheritedFd], 0, 1, true),
+            SecretUseRequirementError::InvalidRequestedDuration,
+        ),
+        (
+            make(
+                vec![SecretDeliveryMethod::InheritedFd],
+                MAX_SAFE_INTEGER + 1,
+                1,
+                true,
+            ),
+            SecretUseRequirementError::InvalidRequestedDuration,
+        ),
+        (
+            make(vec![SecretDeliveryMethod::InheritedFd], 1, 0, true),
+            SecretUseRequirementError::InvalidRequestedMaxUses,
+        ),
+        (
+            make(
+                vec![SecretDeliveryMethod::InheritedFd],
+                1,
+                MAX_SAFE_INTEGER + 1,
+                true,
+            ),
+            SecretUseRequirementError::InvalidRequestedMaxUses,
+        ),
+        (
+            make(vec![SecretDeliveryMethod::InheritedFd], 1, 1, false),
+            SecretUseRequirementError::RequiredMustBeTrue,
+        ),
+    ];
+    for (actual, expected) in cases {
+        assert_eq!(actual, Err(expected));
+        assert_eq!(expected.to_string(), expected.code());
+        assert_eq!(format!("{expected:?}"), expected.code());
+        assert!(expected.code().len() <= 40);
+    }
+}
+
+#[test]
+fn use_requirement_ingress_rejects_missing_duplicate_unknown_and_top_level_forms() {
+    let fields = [
+        "credential_slot_id",
+        "delivery_methods",
+        "intent",
+        "purpose",
+        "requested_duration_seconds",
+        "requested_max_uses",
+        "required",
+        "schema_version",
+        "secret_ref_id",
+    ];
+    for field in fields {
+        let mut candidate = valid_use_requirement_value();
+        candidate.as_object_mut().unwrap().remove(field);
+        let error = assert_requirement_rejects(&candidate.to_string());
+        assert!(error.starts_with(SecretUseRequirementError::MissingRequiredField.code()));
+    }
+
+    let body = use_requirement_fixture_text()
+        .strip_prefix('{')
+        .expect("fixture object");
+    let duplicates = [
+        format!(r#"{{"credential_slot_id":"{CREDENTIAL_SLOT_ID}",{body}"#),
+        format!(r#"{{"delivery_methods":["inherited_fd"],{body}"#),
+        format!(r#"{{"intent":"sign",{body}"#),
+        format!(r#"{{"purpose":"data_source_access",{body}"#),
+        format!(r#"{{"requested_duration_seconds":1,{body}"#),
+        format!(r#"{{"requested_max_uses":1,{body}"#),
+        format!(r#"{{"required":true,{body}"#),
+        format!(r#"{{"schema_version":"{SECRET_USE_REQUIREMENT_SCHEMA_V1}",{body}"#),
+        format!(r#"{{"secret_ref_id":"{SECRET_REF_ID}",{body}"#),
+    ];
+    for raw in duplicates {
+        let error = assert_requirement_rejects(&raw);
+        assert!(error.starts_with(SecretUseRequirementError::DuplicateField.code()));
+    }
+
+    const UNKNOWN_KEY: &str = "PRIVATE_SECRET_CANDIDATE_UNKNOWN_FIELD";
+    const UNKNOWN_VALUE: &str = "PRIVATE_SECRET_CANDIDATE_UNKNOWN_VALUE";
+    let unknown = format!(r#"{{"{UNKNOWN_KEY}":"{UNKNOWN_VALUE}"}}"#);
+    let error = assert_requirement_rejects(&unknown);
+    assert!(error.starts_with(SecretUseRequirementError::UnknownField.code()));
+    assert!(!error.contains(UNKNOWN_KEY));
+    assert!(!error.contains(UNKNOWN_VALUE));
+
+    let malformed_unknown = format!(r#"{{"{UNKNOWN_KEY}":"#);
+    let error = SecretUseRequirement::from_json_slice(malformed_unknown.as_bytes())
+        .expect_err("unknown field must reject without reflecting its malformed value")
+        .to_string();
+    assert_eq!(error, SecretUseRequirementError::UnknownField.code());
+    assert!(!error.contains(UNKNOWN_KEY));
+
+    for raw in [
+        "null",
+        "true",
+        "17",
+        "17.5",
+        r#""PRIVATE_SECRET_CANDIDATE_TOP_LEVEL""#,
+        "[]",
+    ] {
+        let error = assert_requirement_rejects(raw);
+        assert!(error.starts_with(SecretUseRequirementError::InvalidContractShape.code()));
+        assert!(!error.contains("PRIVATE_SECRET_CANDIDATE_TOP_LEVEL"));
+    }
+}
+
+#[test]
+fn use_requirement_ingress_rejects_null_wrong_types_false_empty_duplicate_and_overflow() {
+    let fields = [
+        "credential_slot_id",
+        "delivery_methods",
+        "intent",
+        "purpose",
+        "requested_duration_seconds",
+        "requested_max_uses",
+        "required",
+        "schema_version",
+        "secret_ref_id",
+    ];
+    for field in fields {
+        let mut candidate = valid_use_requirement_value();
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), Value::Null);
+        assert_requirement_rejects(&candidate.to_string());
+    }
+
+    let wrong_types = [
+        ("credential_slot_id", json!(true)),
+        ("delivery_methods", json!("PRIVATE_METHOD_LIST_CANDIDATE")),
+        ("intent", json!(17)),
+        ("purpose", json!({"PRIVATE_PURPOSE_CANDIDATE": true})),
+        (
+            "requested_duration_seconds",
+            json!("PRIVATE_DURATION_CANDIDATE"),
+        ),
+        ("requested_max_uses", json!(false)),
+        ("required", json!(1)),
+        ("schema_version", json!(true)),
+        ("secret_ref_id", json!([])),
+    ];
+    for (field, value) in wrong_types {
+        let mut candidate = valid_use_requirement_value();
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        let error = assert_requirement_rejects(&candidate.to_string());
+        for sentinel in [
+            "PRIVATE_METHOD_LIST_CANDIDATE",
+            "PRIVATE_PURPOSE_CANDIDATE",
+            "PRIVATE_DURATION_CANDIDATE",
+        ] {
+            assert!(!error.contains(sentinel));
+        }
+    }
+
+    let semantic_invalid = [
+        ("delivery_methods", json!([])),
+        ("delivery_methods", json!(["inherited_fd", "inherited_fd"])),
+        (
+            "delivery_methods",
+            json!([
+                "inherited_fd",
+                "tmpfs_file",
+                "one_shot_local_socket",
+                "orchestrator_projected_secret",
+                "environment_variable",
+                "inherited_fd"
+            ]),
+        ),
+        ("requested_duration_seconds", json!(0)),
+        ("requested_duration_seconds", json!(MAX_SAFE_INTEGER + 1)),
+        ("requested_max_uses", json!(0)),
+        ("requested_max_uses", json!(MAX_SAFE_INTEGER + 1)),
+        ("required", json!(false)),
+    ];
+    let expected_codes = [
+        SecretUseRequirementError::EmptyDeliveryMethods,
+        SecretUseRequirementError::DuplicateDeliveryMethod,
+        SecretUseRequirementError::TooManyDeliveryMethods,
+        SecretUseRequirementError::InvalidRequestedDuration,
+        SecretUseRequirementError::InvalidRequestedDuration,
+        SecretUseRequirementError::InvalidRequestedMaxUses,
+        SecretUseRequirementError::InvalidRequestedMaxUses,
+        SecretUseRequirementError::RequiredMustBeTrue,
+    ];
+    for ((field, value), expected) in semantic_invalid.into_iter().zip(expected_codes) {
+        let mut candidate = valid_use_requirement_value();
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        let error = assert_requirement_rejects(&candidate.to_string());
+        assert!(
+            error.starts_with(expected.code()),
+            "unexpected error: {error}"
+        );
+    }
+
+    for (field, raw_value, expected) in [
+        (
+            "requested_duration_seconds",
+            "-1",
+            SecretUseRequirementError::InvalidRequestedDuration,
+        ),
+        (
+            "requested_duration_seconds",
+            "1.0",
+            SecretUseRequirementError::InvalidRequestedDuration,
+        ),
+        (
+            "requested_max_uses",
+            "18446744073709551616",
+            SecretUseRequirementError::InvalidRequestedMaxUses,
+        ),
+    ] {
+        let raw = use_requirement_fixture_text().replace(
+            &format!(r#""{field}":{}"#, valid_use_requirement_value()[field]),
+            &format!(r#""{field}":{raw_value}"#),
+        );
+        let error = assert_requirement_rejects(&raw);
+        assert!(error.starts_with(expected.code()));
+    }
+}
+
+#[test]
+fn use_requirement_rejects_malformed_ids_non_string_enums_and_candidate_echo_paths() {
+    let cases = [
+        (
+            "schema_version",
+            json!("PRIVATE_SCHEMA_VERSION_CANDIDATE"),
+            "PRIVATE_SCHEMA_VERSION_CANDIDATE",
+        ),
+        (
+            "secret_ref_id",
+            json!("PRIVATE_SECRET_REF_CANDIDATE"),
+            "PRIVATE_SECRET_REF_CANDIDATE",
+        ),
+        (
+            "secret_ref_id",
+            json!("00000000-0000-0000-0000-000000000000"),
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            "credential_slot_id",
+            json!("PRIVATE_CREDENTIAL_SLOT_CANDIDATE"),
+            "PRIVATE_CREDENTIAL_SLOT_CANDIDATE",
+        ),
+        (
+            "intent",
+            json!("PRIVATE_INTENT_CANDIDATE"),
+            "PRIVATE_INTENT_CANDIDATE",
+        ),
+        (
+            "purpose",
+            json!("PRIVATE_PURPOSE_CANDIDATE"),
+            "PRIVATE_PURPOSE_CANDIDATE",
+        ),
+        (
+            "delivery_methods",
+            json!(["PRIVATE_DELIVERY_METHOD_CANDIDATE"]),
+            "PRIVATE_DELIVERY_METHOD_CANDIDATE",
+        ),
+    ];
+    for (field, value, sentinel) in cases {
+        let mut candidate = valid_use_requirement_value();
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        let error = assert_requirement_rejects(&candidate.to_string());
+        assert!(!error.contains(sentinel), "candidate reflected: {error}");
+    }
+
+    for (field, value) in [
+        ("intent", json!(false)),
+        ("intent", json!({"authenticate": null})),
+        ("purpose", json!(17)),
+        ("purpose", json!(["external_service_access"])),
+        ("delivery_methods", json!([17])),
+        (
+            "delivery_methods",
+            json!([{"inherited_fd": "PRIVATE_NESTED_CANDIDATE"}]),
+        ),
+    ] {
+        let mut candidate = valid_use_requirement_value();
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        let error = assert_requirement_rejects(&candidate.to_string());
+        assert!(!error.contains("PRIVATE_NESTED_CANDIDATE"));
+    }
+
+    let malformed = r#"{"schema_version":"PRIVATE_MALFORMED_CANDIDATE"#;
+    let error = assert_requirement_rejects(malformed);
+    assert!(!error.contains("PRIVATE_MALFORMED_CANDIDATE"));
+
+    let error = SecretUseRequirement::from_json_slice(br#"{9876543210:true}"#)
+        .expect_err("non-string JSON key must reject")
+        .to_string();
+    assert_eq!(
+        error,
+        SecretUseRequirementError::InvalidContractShape.code()
+    );
+}
+
+#[test]
+fn use_requirement_wire_shape_contains_only_the_exact_non_authorizing_fields() {
+    let value = serde_json::to_value(valid_use_requirement()).expect("requirement value");
+    let keys = value
+        .as_object()
+        .expect("requirement object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "credential_slot_id",
+            "delivery_methods",
+            "intent",
+            "purpose",
+            "requested_duration_seconds",
+            "requested_max_uses",
+            "required",
+            "schema_version",
+            "secret_ref_id",
+        ]
+        .into_iter()
+        .collect()
+    );
+    for forbidden in [
+        "value",
+        "bytes",
+        "material",
+        "provider",
+        "provider_locator",
+        "destination",
+        "target",
+        "authority",
+        "delivery_handle",
+        "lease_id",
+        "fallback",
+        "environment_name",
+    ] {
+        assert!(!keys.contains(forbidden));
+    }
+
+    let ref_id: SecretRefId = SECRET_REF_ID.parse().unwrap();
+    let slot_id: SecretCredentialSlotId = CREDENTIAL_SLOT_ID.parse().unwrap();
+    assert_ne!(ref_id.to_string(), slot_id.to_string());
 }

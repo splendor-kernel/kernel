@@ -3,20 +3,24 @@
 ## Status
 
 **status/incomplete — C03 V1a identities, owner-independent pre-placement
-grammar, and behavior-free trusted-send control vocabulary only.**
+grammar, behavior-free trusted-send control vocabulary, and non-authorizing
+secret-use requirement grammar only.**
 
 The current implementation adds 40 behavior-free nominal UUID identity types,
-seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, and
-a valid-by-construction `SecretLeasePolicy` in `splendor-types`. It does not
-implement `SecretRef`, `SecretUseRequirement`, a provider port, a broker or lease
-lifecycle, lease or delivery records, secret material handling,
+seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, a
+valid-by-construction `SecretLeasePolicy`, and the strict
+`SecretUseRequirement` v1 Rust contract in `splendor-types`. The requirement
+imports the Driver Registry-owned `SecretCredentialSlotId`. It does not
+implement `SecretRef`, credential authorization, a provider port, a broker or
+lease lifecycle, lease or delivery records, secret material handling,
 Gateway/daemon/API/SDK integration, a scanner, side effects, feature activation,
 issue closure, or gold evidence. No generated public surface is claimed.
 
 ## Purpose and boundary
 
-These values reserve distinct identities and closed policy vocabulary for later
-C03 contracts without creating those contracts or their allocation owners.
+These values reserve distinct identities and closed policy vocabulary and let
+typed callers describe a non-authorizing secret-use requirement without creating
+an authority, lease, provider, or allocation owner.
 Possessing an identity, enum value, provider version reference, or lease policy
 does not authorize access, delivery, publication, reconciliation, retry,
 renewal, or any other operation. The implemented values contain no secret
@@ -89,6 +93,59 @@ getters expose the validated policy. Missing, duplicate, unknown, null,
 wrong-type, out-of-range, and invalid relationship forms reject without
 candidate-policy reflection.
 
+## Secret-use requirement contract
+
+`SecretUseRequirement` is the additive experimental Rust representation of
+`splendor.secret.use_requirement.v1`. Its fields are private. `try_new` accepts
+already typed values, while `from_json_slice` is the sole imported, persisted,
+rehydrated, or otherwise untrusted byte ingress. The validated type implements
+`Serialize` but intentionally does not implement public generic `Deserialize`.
+
+| Field | Rule |
+| --- | --- |
+| `schema_version` | Exactly `splendor.secret.use_requirement.v1`. |
+| `secret_ref_id` | Strict non-nil canonical `SecretRefId`. |
+| `credential_slot_id` | Strict non-nil canonical Driver Registry-owned `SecretCredentialSlotId`. |
+| `intent` | Exact closed `SecretUseIntent` string. |
+| `purpose` | Exact closed `SecretPurpose` string. |
+| `delivery_methods` | One through five unique `SecretDeliveryMethod` values in caller preference order. |
+| `requested_duration_seconds` | Integer `1..=9007199254740991`. |
+| `requested_max_uses` | Integer `1..=9007199254740991`. |
+| `required` | Exactly `true`; best-effort secret use is not defined in v1. |
+
+Delivery preferences are not sorted or silently deduplicated. Their order is
+preserved and changes canonical bytes; a duplicate fails closed. Serialization
+uses the exact closed nine-field shape in RFC 8785 member order. Missing,
+duplicate, unknown, null, wrong-type, false, malformed-ID, unknown-enum, empty,
+over-bound, zero, and safe-integer-overflow inputs reject. Error variants expose
+only bounded fixed codes and retain no rejected candidate text.
+
+Before constructing its private wire input, `from_json_slice` performs one
+duplicate-aware JSON preflight with these exact v1 limits:
+
+| Resource | Maximum |
+| --- | ---: |
+| Raw encoded JSON | 1,024 bytes |
+| Object/array depth, root at depth 1 | 2 |
+| Decoder tokens (container delimiters, names, scalar values) | 26 |
+| Object members across the document | 9 |
+| Array elements across the document | 5 |
+| Decoded bytes per member name or string | 36 |
+
+These limits are specific to the closed nine-field, maximum-five-method schema.
+The generated legal maximum is 465 compact bytes and reaches every structural
+limit except raw encoded bytes, where bounded room remains for harmless
+whitespace and equivalent JSON escapes. Cap-plus-one, malformed UTF-8/JSON,
+duplicate names at any object depth, unknown root fields, overlong decoded
+names/strings, and whitespace or escape bombs fail closed. Parser details,
+locations, rejected keys/values, and source chains are not exposed.
+
+The requirement contains no secret material, provider locator, destination,
+target, authority, declaration revision, lease, delivery handle, fallback, or
+environment name. It does not construct or consume
+`SecretRef.allowed_credential_bindings`; possession or successful parsing grants
+no authority.
+
 ## Implemented identity inventory
 
 | Area | Types |
@@ -100,9 +157,10 @@ candidate-policy reflection.
 | Exposure, use, commands | `SecretExposureLineageId`, `SecretUseAttemptId`, `SecretRefMutationCommandId`, `SecretRenewalCommandId`, `SecretRotationCommandId`, `SecretRevocationCommandId`, `SecretCleanupCommandId`, `SecretContainmentCommandId`, `SecretUseClaimId`, `SecretContainmentReserveId` |
 | Publication, reconciliation, retirement | `SecretPublicationPreparationId`, `SecretPublicationAuthorizationId`, `SecretPublicationPrepareReceiptId`, `SecretReconciliationClaimId`, `SecretConsumedEffectTombstoneId`, `SecretPermanentAuxiliaryIdentityMarkerId`, `SecretRetiredAuthorityDomainDenyHeadId`, `SecretRetirementManifestId` |
 
-`PhysicalMetadataBudgetSigningKeyId`, `SecretTerminalizationLeaseId`,
-`SecretCredentialSlotId`, and all other foreign-owner or V1b identities remain
-unimplemented.
+`SecretCredentialSlotId` is implemented by the behavior-free Driver Registry
+credential-sink contract and is imported rather than shadowed by C03.
+`PhysicalMetadataBudgetSigningKeyId`, `SecretTerminalizationLeaseId`, and all
+other foreign-owner or V1b identities remain unimplemented.
 
 ## Minimal examples
 
@@ -132,13 +190,38 @@ assert_eq!(policy.clock_skew_tolerance_seconds(), 5);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+```rust
+use splendor_types::{
+    SecretCredentialSlotId, SecretDeliveryMethod, SecretPurpose, SecretRefId,
+    SecretUseIntent, SecretUseRequirement,
+};
+
+let requirement = SecretUseRequirement::try_new(
+    "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001".parse::<SecretRefId>()?,
+    "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4101".parse::<SecretCredentialSlotId>()?,
+    SecretUseIntent::Authenticate,
+    SecretPurpose::ExternalServiceAccess,
+    vec![SecretDeliveryMethod::InheritedFd],
+    300,
+    1,
+    true,
+)?;
+assert!(requirement.required());
+
+let encoded = serde_json::to_vec(&requirement)?;
+let parsed = SecretUseRequirement::from_json_slice(&encoded)?;
+assert_eq!(parsed, requirement);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Lifecycle, trace, and replay
 
 No lifecycle is implemented. Creating or parsing an ID, provider version
-reference, enum, or lease policy does not create a corresponding record or
-lease. This slice emits no trace/evidence event, changes no state, and performs
-no side effect. Consequently there is no C03 runtime replay path; the values may
-only round-trip as behavior-free contracts in code that explicitly uses them.
+reference, enum, lease policy, or use requirement does not create a secret
+reference, authority, lease, or delivery. This slice emits no trace/evidence
+event, changes no state, and performs no side effect. Consequently there is no
+C03 runtime replay path; the values may only round-trip as behavior-free
+contracts in code that explicitly uses them.
 
 ## Failure and security behavior
 
@@ -152,17 +235,26 @@ Provider version reference failures distinguish empty, over-bound,
 non-printable/non-ASCII, and forbidden-locator-delimiter categories without
 retaining rejected text. Lease policy failures identify only the violated fixed
 range or relationship; strict serde failures do not echo unknown keys or field
-values. No implemented primitive contains a secret value/material/byte field,
-provider request, raw provider error, credential, token, password, or API key.
+values. Secret-use requirement failures are fixed code-only categories; its
+bounded byte parser and private wire input prevent malformed IDs, enum
+candidates, schema candidates, keys, parser details, and wrong scalar types from
+being reflected. No implemented primitive contains a
+secret value/material/byte field, provider request, raw provider error,
+credential value, token, password, or API key.
 
 ## Compatibility and versioning
 
 The symbols are additive experimental 0.2/v2 Rust exports. The closed enum
-spellings, opaque version-reference wire string, and five-field policy object are
-the bounded C03 contract for this slice. Existing 0.1 ID constructors,
-permissive parsing/deserialization behavior, serialized bytes, and aliases remain
-unchanged. Future records that use these values still require their owning
-contracts and compatible versioning. In particular, the owner-defined
-`SecretCredentialSlotId` and exact driver credential-sink authorization,
-trusted-send profile, and destination binding remain external blockers for a
-complete `SecretRef` and `SecretUseRequirement`.
+spellings, opaque version-reference wire string, five-field policy object, and
+nine-field `SecretUseRequirement` object are the bounded C03 contract for this
+slice. Removing public generic `Deserialize` in favor of the sole bounded
+`from_json_slice` ingress is the pre-release security correction for this new
+experimental type; its canonical serialized bytes are unchanged. Existing 0.1
+ID constructors, permissive parsing/deserialization behavior, serialized bytes,
+and aliases remain unchanged. Existing C03 pre-placement and Driver Registry
+credential-sink fixture bytes are also unchanged. Future records that use these
+values still require
+their owning contracts and compatible versioning. In particular, complete
+revision-bearing credential authorization, approved destination binding,
+`SecretRef`, Authority/Gateway/runtime consumption, and historical migration
+remain blocked on their separately accepted C03 contract and owner prerequisites.
