@@ -838,3 +838,105 @@ impl<'de> Visitor<'de> for BoolVisitor {
         Ok(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::value::{
+        CharDeserializer, Error as ValueError, MapDeserializer, SeqDeserializer, StringDeserializer,
+    };
+
+    fn assert_fixed_error<T>(result: Result<T, ValueError>, expected: SecretUseRequirementError) {
+        let error = match result {
+            Ok(_) => panic!("generic serde form must reject"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error, expected.code());
+    }
+
+    #[test]
+    fn generic_top_level_forms_fail_closed_with_fixed_errors() {
+        let expected = SecretUseRequirementError::InvalidContractShape;
+        assert_fixed_error(SecretUseRequirementVisitor.visit_bool(true), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_i64(-1), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_i128(i128::MIN), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_u64(1), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_u128(u128::MAX), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_f64(1.5), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_char('x'), expected);
+        assert_fixed_error(
+            SecretUseRequirementVisitor.visit_str("PRIVATE_TOP_LEVEL_CANDIDATE"),
+            expected,
+        );
+        assert_fixed_error(
+            SecretUseRequirementVisitor.visit_string("PRIVATE_TOP_LEVEL_CANDIDATE".to_owned()),
+            expected,
+        );
+        assert_fixed_error(
+            SecretUseRequirementVisitor.visit_bytes(b"PRIVATE_TOP_LEVEL_CANDIDATE"),
+            expected,
+        );
+        assert_fixed_error(
+            SecretUseRequirementVisitor.visit_byte_buf(b"PRIVATE_TOP_LEVEL_CANDIDATE".to_vec()),
+            expected,
+        );
+        assert_fixed_error(SecretUseRequirementVisitor.visit_none(), expected);
+        assert_fixed_error(SecretUseRequirementVisitor.visit_unit(), expected);
+        assert_fixed_error(
+            SecretUseRequirementVisitor.visit_seq(SeqDeserializer::<_, ValueError>::new(
+                std::iter::empty::<u8>(),
+            )),
+            expected,
+        );
+    }
+
+    #[test]
+    fn generic_delivery_collection_forms_fail_closed_with_fixed_errors() {
+        let expected = SecretUseRequirementError::InvalidDeliveryMethods;
+        assert_fixed_error(DeliveryMethodsVisitor.visit_bool(true), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_i64(-1), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_i128(i128::MIN), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_u64(1), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_u128(u128::MAX), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_f64(1.5), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_char('x'), expected);
+        assert_fixed_error(
+            DeliveryMethodsVisitor.visit_str("PRIVATE_DELIVERY_LIST_CANDIDATE"),
+            expected,
+        );
+        assert_fixed_error(
+            DeliveryMethodsVisitor.visit_string("PRIVATE_DELIVERY_LIST_CANDIDATE".to_owned()),
+            expected,
+        );
+        assert_fixed_error(
+            DeliveryMethodsVisitor.visit_bytes(b"PRIVATE_DELIVERY_LIST_CANDIDATE"),
+            expected,
+        );
+        assert_fixed_error(
+            DeliveryMethodsVisitor.visit_byte_buf(b"PRIVATE_DELIVERY_LIST_CANDIDATE".to_vec()),
+            expected,
+        );
+        assert_fixed_error(DeliveryMethodsVisitor.visit_none(), expected);
+        assert_fixed_error(DeliveryMethodsVisitor.visit_unit(), expected);
+        assert_fixed_error(
+            DeliveryMethodsVisitor.visit_map(MapDeserializer::<_, ValueError>::new(
+                std::iter::empty::<(u8, u8)>(),
+            )),
+            expected,
+        );
+    }
+
+    #[test]
+    fn generic_field_identifiers_do_not_reflect_unknown_candidates() {
+        let required = SecretUseRequirementField::deserialize(
+            StringDeserializer::<ValueError>::new("required".to_owned()),
+        )
+        .expect("owned exact field must parse");
+        assert!(matches!(required, SecretUseRequirementField::Required));
+
+        let unknown =
+            SecretUseRequirementField::deserialize(CharDeserializer::<ValueError>::new('x'))
+                .expect("char field form must become the non-reflecting unknown marker");
+        assert!(matches!(unknown, SecretUseRequirementField::Unknown));
+    }
+}
