@@ -2,9 +2,12 @@
 
 ## Status and Binding
 
-**Status:** Proposed
+**Status:** Accepted planning contract
 
-**Proposed:** 2026-07-19
+**Accepted:** 2026-07-19
+
+**Accepted proposal SHA-256:**
+`0d93b37f6417519db393b49c032e1e5ec8b8509e485e0af5446d010a349153a3`
 
 **Compatibility line:** Additive experimental 0.2/v2 C03 successor contract;
 historical RFC 0012 v1 bytes remain readable but non-live
