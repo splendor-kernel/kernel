@@ -2,7 +2,12 @@
 
 ## Status and Binding
 
-**Status:** Proposed
+**Status:** Accepted planning contract
+
+**Accepted:** 2026-07-20
+
+**Accepted proposal SHA-256:**
+`84d17b944a0be0e3edcf0a763db2c07a14d849eab8343fdc78193fe7249d9a09`
 
 **Compatibility line:** Additive experimental 0.2/v2 Authority owner contract
 preserving the stable 0.1 authority, work-order, Gateway, trace, state, replay,
