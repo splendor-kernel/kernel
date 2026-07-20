@@ -24,11 +24,19 @@ plus only the C03-required portions of `EVT-001` / [#271](https://github.com/spl
 safe replay/simulation planning
 
 **Normative compatibility inputs:** [RFC 0006](0006-agent-kernel-v2-lifecycle.md),
-[RFC 0010](0010-authority-service-contract.md),
 [RFC 0012](0012-secret-broker-contract.md),
 [RFC 0013](0013-driver-operation-credential-sink-contract.md),
 [RFC 0014](0014-revision-bound-secret-credential-authorization.md), and the
 [stable 0.1 primitive contract](../spec/0.1/primitives.md)
+
+**Informative implementation context:**
+[RFC 0010](0010-authority-service-contract.md) is `Status: Draft` and is used
+only to understand current Authority implementation and compatibility seams. It
+is not an accepted normative dependency of this RFC.
+
+**Separately authorized blocker:** transferable Event writer epochs, handoff,
+and live legacy cutover require `EVT-002` / [#272](https://github.com/splendor-kernel/kernel/issues/272).
+This RFC does not absorb or authorize that task.
 
 This RFC is a proposed, documentation-only prerequisite. It changes no runtime,
 package graph, persistence format, public schema, generated artifact, daemon API,
@@ -104,19 +112,21 @@ This RFC defines prerequisites, not full catalog-task completion.
 | --- | --- | --- |
 | `FND-002` / #221 | One package and mutation owner for Event, State, Evidence, and replay plans; dependency direction and compatibility facade rule | Crate creation, full plane split, all package README/CODEOWNERS work, generated surfaces, and complete architecture enforcement |
 | `EVT-001` / #271 | Versioned `EventEnvelope` family and exact stable `TraceEvent` compatibility profile | Migration of all producers, all service event kinds, fleet ordering, subscriptions, retention, and full event platform |
+| `EVT-002` / #272 | Separately authorized blocker only; the bounded profile in this RFC is non-transferable and local | Transferable Event writer lifecycle, epoch/fence allocation, handoff, live cutover/rollback, remote import, and task implementation |
 | `EVT-003` / #273 | Expected-sequence/fence append request, durable receipt, idempotency, bounded outbox/inbox, and effect-certainty outcomes | Full `EventStore`, every backend, all service outboxes, broad delivery ecosystem, and all fault-injection completion evidence |
 | `STA-001` / #279 | Named state partition, explicit owner/scope/schema/classification, and mandatory expected head | All standard domain profiles, world-state semantics, retention platform, arbitrary state service, and domain ontology |
 | `STA-002` / #280 | CAS head movement, writer epoch/fence validation, immutable commit, explicit conflict, and no-mutation results | Authority lease issuance, fleet handoff, automatic merge, every controller adoption, and complete migration evidence |
-| `EVID-001` / #287 | Typed bundle/item/claim/completeness/support grammar and immutable owner references | Materialization service, causal closure, signatures, every requirement profile, Artifact/Lineage implementation, and gate adoption |
+| `EVID-001` / #287 | Typed bundle/item/claim/completeness/support grammar, authenticated durable commit contract, and immutable owner references | Materialization service implementation, portable trust/signature infrastructure, causal closure, every requirement profile, Artifact/Lineage implementation, and gate adoption |
 
 The following required collaborators remain unmet or separately owned:
 
 | Dependency | Why it remains separate and blocking |
 | --- | --- |
 | `FND-001` | Owns canonical nominal ID and schema grammar. This RFC does not redefine existing IDs or independently finalize new ID wire forms. |
-| `FND-003` | Owns the generic command-decision-event transaction pattern and recoverable cross-owner mutation protocol. This RFC defines only the minimum owner-local append and state/event atomicity requirement. |
+| `FND-003` | Owns the generic command-decision-event transaction pattern and recoverable cross-owner mutation protocol, including independently owned authority-revocation-versus-State-CAS races. This RFC defines only the minimum owner-local append and state/event atomicity requirement and cannot make an independently committed owner snapshot current by copying it into State. |
 | `FND-006` | Owns broad schema migration, generated parity, and compatibility discipline. This RFC pins the 0.1 projection but does not complete cross-language migration. |
-| `AUTH-001` | Owns capability/authority semantics and the authority facts used to issue or revoke a writer lease. Evidence validates a supplied trusted lease/fence; it does not grant one. |
+| `EVT-002` / #272 | Owns transferable Event partition-writer records, epoch/fence lifecycle, handoff, and live cutover/rollback. Before it is separately accepted and implemented, this RFC permits only a fixed non-transferable local writer profile for fresh partitions. |
+| `AUTH-001` | Owns capability/authority semantics and eligibility/revocation facts. State validates those facts and exclusively allocates its writer epoch/fence; neither Evidence nor the external authority fact grants a State writer. |
 | `ART-001` | Owns immutable artifact identity, manifests, access, and lifecycle. Artifact references remain opaque and cannot be dereferenced or treated as proof until that owner exists. |
 | `LIN-001` | Owns lineage identities and derivation facts. Lineage references remain opaque and dependency-bound. |
 
@@ -183,9 +193,9 @@ The minimum public contract families authorized for later implementation are:
 
 | Family | Behavior-free values in `splendor-types` | Semantic owner in `splendor-evidence` |
 | --- | --- | --- |
-| Event | `EventEnvelope`, `EventPartition`, `EventCoordinate`, `EventAppendRequest`, `EventAppendOutcome`, `EventAppendReceipt`, `EventDurability`, `EventIntegrity`, bounded publication command/acknowledgement values | Profile admission, partition order, writer epoch/fence, idempotency, durability, integrity, append outcome, inbox reconciliation |
-| State | `StatePartition`, `StateHead`, `WriterLease`, `WriterFence`, `StateMutationRequest`, `StateMutationOutcome`, `StateCommitReceipt`, `StateCommitCoordinate` | Partition policy, trusted lease/fence acceptance, expected-head validation, immutable commit, head CAS, state/event composition |
-| Evidence | `EvidenceRequirement`, `EvidenceItem`, `EvidenceBundle`, `EvidenceCompleteness`, `EvidenceClaim`, `EvidenceSupportLevel`, `EvidenceBundleCoordinate`, `EvidenceView` | Requirement evaluation, completeness, claim-support ceiling, owner-reference validation, access-filtered/redacted view construction |
+| Event | `EventAppendIntent`, `EventEnvelope`, `EventPartition`, `EventCoordinate`, `EventAppendRequest`, `EventAppendOutcome`, `EventAppendReceipt`, `EventAppendBatchIntent`, `EventAppendBatchAcknowledgement`, `EventDurability`, `EventIntegrity`, bounded publication command/acknowledgement values | Intent admission, owner envelope materialization, partition order, fixed local writer check, idempotency, durability, integrity, append outcome, inbox reconciliation |
+| State | `StatePartition`, `StateHead`, `WriterEligibilityFacts`, `StateWriterActivationCommand`, `StateWriterActivationOutcome`, `StateWriterActivationReceipt`, `StateWriterBinding`, `StateMutationRequest`, `StateMutationOutcome`, `StateCommitReceipt`, `StateCommitCoordinate` | Partition policy, trusted eligibility acceptance, writer epoch/fence activation, expected-head validation, immutable commit, head CAS, state/event composition |
+| Evidence | `EvidenceRequirement`, `EvidenceItem`, `EvidenceBundle`, `EvidenceCompleteness`, `EvidenceClaim`, `EvidenceSupportLevel`, `EvidenceCommitRequest`, `EvidenceCommitOutcome`, `EvidenceCommitReceipt`, `EvidenceBundleCoordinate`, `EvidenceView` | Requirement evaluation, completeness, claim-support ceiling, authenticated durable commit, owner-reference validation, access-filtered/redacted view construction |
 | Replay/simulation | `ReplayPlan`, `SimulationPlan`, result/report references | Inspect/read-only planning, detached simulation constraints, live-effect and live-head prohibition |
 
 These are contract-family names, not accepted stable wire spellings. Existing
@@ -196,50 +206,109 @@ that gap with string aliases or private duplicate types.
 
 ## Event Contract
 
-### Event envelope family
+### Producer intent and owner envelope
 
-The public contract is a versioned `EventEnvelope` family. The first
-implementation must use an explicit versioned type rather than mutate
-stable `TraceEvent` in place. Its minimum semantic fields are:
+The producer submits a closed `EventAppendIntent`; it does not construct or
+persist a committed `EventEnvelope`. The intent contains only producer-owned
+facts:
+
+- intent schema/profile, authenticated producer, tenant/scope, and intended
+  partition;
+- occurred time, kind schema/kind, bounded typed payload or opaque safe payload
+  reference, causal parents, and correlation references;
+- a producer-fixed event identity and sequence only when the registered profile
+  requires them, including the stable 0.1 compatibility profile;
+- caller-requested durability, which is a floor that may only tighten owner and
+  deployment policy; and
+- command/audit correlation plus one idempotency key.
+
+The canonical intent digest covers every immutable intent field, including
+presence versus absence, producer-fixed identity/sequence when permitted,
+payload bytes/reference, causal fields, and requested durability. It excludes
+owner-assigned `recorded_at`, sequence or event identity when owner-assigned,
+integrity outputs, achieved durability, and receipts. The same idempotency key
+and intent digest identify one append forever. The same key with changed intent
+bytes is a permanent conflict.
+
+After authenticating and validating the intent, Event owner materializes the
+versioned committed `EventEnvelope` in the append transaction. The owner assigns
+`recorded_at`, the next sequence, Event identity where the profile does not
+require a producer-fixed identity, the previous/current integrity link, effective
+durability, owner revision, and committed visibility metadata. A producer-fixed
+identity or sequence is accepted only when the profile defines its derivation and
+the owner verifies exact equality before mutation. The owner never trusts a
+producer-supplied recorded time, integrity value, latest cursor, or achieved
+durability.
+
+The first implementation must use an explicit versioned envelope rather than
+mutate stable `TraceEvent` in place. Its minimum committed fields are:
 
 | Field family | Required rule |
 | --- | --- |
 | `schema_version` and `profile` | Closed envelope version and one registered owner profile. Unknown privileged profiles reject. |
-| `event_id` | One nominal event identity. For the 0.1 compatibility profile it is exactly the existing `TraceEventId`; no second identity is minted. New identity grammar waits for `FND-001`. |
+| `event_id` | One nominal event identity allocated by Event owner unless a registered compatibility profile requires an exactly validated producer-fixed identity. For the 0.1 profile it is exactly the existing `TraceEventId`; no second identity is minted. New identity grammar waits for `FND-001`. |
 | `partition` | Typed partition identity and exact tenant/run/owner scope. It never implies authority. |
-| `sequence` | Monotonic `u64` within the partition. It is not a fleet-global order. |
-| `writer_epoch` and `fence` | Positive owner epoch plus opaque fencing binding for a live ordered writer. Stable local compatibility may use a non-transferable local epoch profile; it cannot satisfy fleet or C03 authority. |
+| `sequence` | Owner-assigned monotonic `u64` within the partition, except an exactly validated compatibility sequence. It is not a fleet-global order. |
+| `writer_epoch` and `fence` | Exact current fixed local writer binding checked in the append transaction. Transfer, rotation, handoff, and cutover remain blocked on separately authorized `EVT-002`; this field does not authorize them. |
 | `producer` and `scope` | Exact authenticated producer reference and bounded identity scope. Producer identity does not grant event or action authority. |
-| `occurred_at` and `recorded_at` | Distinct timestamps. Occurrence time is producer-supplied evidence; recorded time is owner-assigned and cannot establish causality by itself. |
+| `occurred_at` and `recorded_at` | Distinct timestamps. Occurrence time is producer evidence; recorded time is assigned by Event owner in the append transaction and cannot establish causality by itself. |
 | `kind_schema` and `kind` | Registered owner kind and closed payload schema. Event kinds cannot carry hidden authority. |
 | `payload` | Exactly one bounded inline typed payload or immutable opaque payload reference. Protected payload copying is forbidden. |
 | `causal_parents` | Bounded immutable event coordinates with relation types. Missing or inaccessible parents remain explicit. |
 | `correlation_refs` | Bounded non-authorizing references for queries. They do not affect order or permission. |
 | `visibility` | Closed classification and audience policy reference enforced on reads and projections. |
-| `durability_class` | `required_before_effect`, `required_after_effect`, `best_effort_telemetry`, or `derived_export_only`. |
-| `integrity` | Canonical event digest, previous-partition digest when applicable, algorithm/version, and any owner integrity revision. |
+| `durability_class` | Owner-validated `required_before_effect`, `required_after_effect`, `best_effort_telemetry`, or `derived_export_only`; producer input cannot weaken it. |
+| `integrity` | Event-owner-derived canonical envelope digest, previous-partition digest when applicable, algorithm/version, and owner integrity revision. |
+| `intent_digest` | Exact canonical digest of the admitted producer intent from which this envelope was materialized. |
 
 The envelope must not contain raw secrets, private chain-of-thought, credentials,
 approval tokens, live capability material, unrestricted protected payloads, or
 provider-specific arbitrary data. A payload reference is not permission to
 dereference the target.
 
+### Fixed local partition-writer profile
+
+Before separately authorized `EVT-002`, Event owner supports only a fresh
+partition's durable `FixedLocalEventWriterRecord`. It binds owner principal,
+authenticated producer, tenant/scope/audience, partition, process instance,
+combined Store identity/profile, fixed positive epoch, opaque fence digest,
+created/expiry time, status `active | quarantined | closed`, prior/current
+cursor and integrity, record revision/digest, and deployment-policy revision.
+Creation is an expected-genesis all-or-none owner transaction. The profile has
+no command that chooses a higher epoch, rotates a fence, transfers a writer, or
+adopts a legacy partition.
+
+Every append and inbox transaction compares the exact current record revision,
+status, producer, Store identity, epoch/fence, cursor, and integrity in the same
+transaction that materializes the envelope. A same-epoch/different-fence writer,
+expired/closed/quarantined record, process/Store mismatch, or uncertain record
+lookup appends nothing and quarantines as applicable. `closed` and `quarantined`
+never return to `active` in this profile. Restart can resume only the same durable
+record, process trust binding, and Store after proving no alternate writer was
+admitted. Transferable lifecycle, higher-epoch acceptance, handoff, cutover, and
+rollback remain wholly owned by future `EVT-002` / #272.
+
 ### Stable `TraceEvent` compatibility profile
 
 `TraceEventCompatibilityProfileV0_1` is the required compatibility projection.
 For every stable 0.1 trace event:
 
-1. `event_id` is exactly `TraceEvent.trace_event_id`.
-2. The partition is the `agent_run` compatibility partition for the exact
+1. The producer intent carries the complete stable `TraceEvent` compatibility
+   value; Event owner derives or validates all envelope bindings rather than
+   trusting a caller-built envelope.
+2. `event_id` is exactly `TraceEvent.trace_event_id` and must equal the stable
+   derivation from run and sequence.
+3. The partition is the `agent_run` compatibility partition for the exact
    `run_id`.
-3. `sequence` is exactly `TraceEvent.sequence`; migration never renumbers it.
-4. `occurred_at` is exactly `TraceEvent.timestamp`.
-5. Scope and identity preserve the complete `TraceEvent.identity` values.
-6. Kind and payload preserve the exact `TraceEventKind` variant, field names,
+4. `sequence` is exactly `TraceEvent.sequence`; migration never renumbers it.
+5. `occurred_at` is exactly `TraceEvent.timestamp`; owner-assigned
+   `recorded_at` remains envelope metadata and is not inserted into stable bytes.
+6. Scope and identity preserve the complete `TraceEvent.identity` values.
+7. Kind and payload preserve the exact `TraceEventKind` variant, field names,
    values, and serialized spelling.
-7. The stable serializer and export projection emit the same 0.1 `TraceEvent`
+8. The stable serializer and export projection emit the same 0.1 `TraceEvent`
    bytes. Envelope-only fields are not injected into those bytes.
-8. Existing event hashes remain valid historical integrity facts. An envelope
+9. Existing event hashes remain valid historical integrity facts. An envelope
    integrity layer may bind them but cannot rewrite or reinterpret them.
 
 The required tick line remains exactly, in order:
@@ -254,7 +323,8 @@ actions.proposed
 constraints.evaluated
 verification.started
 verification.completed
-action.executed | action.denied | action.failed | action.needs_approval
+[escalation.triggered]
+action.executed | action.denied | action.failed | action.needs_approval | action.needs_intervention | (action.executed -> action.failed)
 outcome.recorded
 state.committed
 tick.completed
@@ -264,25 +334,35 @@ Existing Rust variant names and public event spellings remain the source for tha
 stable line. This RFC does not rename a `TraceEventKind`, change deterministic
 `TraceEventId::from_run_sequence`, alter run-local ordering, or add C03 metadata
 to `CandidatesProposed { actions }`. New C03 or v2 events are separate typed
-profiles linked causally to stable events.
+profiles linked causally to stable events. Brackets above mean the existing
+optional `EscalationTriggered` position, not a newly required event. The action
+segment is not always one exclusive terminal event: `ActionNeedsIntervention` is
+stable, and an adapter output followed by post-verification failure emits stable
+`ActionExecuted` followed by `ActionFailed` before `OutcomeRecorded`.
+Compatibility projection, replay, and tests must preserve that exact two-event
+order rather than collapse it to one status.
 
 ### Append request
 
 `EventAppendRequest` contains exactly the following semantic families:
 
-- one complete validated `EventEnvelope`;
+- one complete producer `EventAppendIntent` and its canonical intent digest;
 - the exact partition and `expected_next_sequence`, including zero for genesis;
 - the expected previous integrity digest or explicit genesis marker;
-- the writer epoch and fencing binding;
+- the fixed non-transferable local writer profile identity, epoch, and fencing
+  binding accepted when the fresh partition was created;
 - one caller-supplied idempotency key bound to the producer, partition, operation,
-  and canonical request digest;
-- the requested durability guarantee and event durability class; and
-- bounded command, causal, and audit attribution references.
+  canonical intent digest, and canonical request digest;
+- the caller-requested durability floor; and
+- bounded authenticated command, causal, and audit attribution references.
 
-The owner validates the complete envelope and request before calling Store. It
-does not read a latest sequence and silently retry with that value. A stale
-sequence, epoch, fence, previous digest, or changed idempotent request is a
-conflict with no append.
+Event owner validates the intent/request, computes effective durability,
+materializes the complete envelope, and commits it through Store. It does not
+accept a producer-built committed envelope, read a latest sequence and silently
+retry, or substitute current writer data for an expected binding. A stale
+sequence, local epoch/fence, previous digest, or changed idempotent request is a
+conflict with no append. Transferable writer activation, handoff, or cutover is
+not available through this request and remains blocked on `EVT-002`.
 
 ### Durability guarantees
 
@@ -294,22 +374,37 @@ The first contract slice supports these result levels:
 | `transaction_committed` | Owner store transaction committed under the configured crash-recovery contract | May satisfy a required event only when the deployment policy explicitly names this level |
 | `storage_barrier_confirmed` | Transaction committed and the configured backend synchronization barrier returned success | Required when the event profile or deployment policy demands storage synchronization |
 
-The request names the minimum level. The receipt names both configured and
-achieved levels plus the backend policy revision. The owner returns success only
-when achieved durability is at least the requested level. Queued, buffered,
-replicating, or exporter-accepted bytes are not durable unless the selected level
-explicitly and truthfully defines them as such. A remote replica or quorum is not
-implied by either local level.
+Effective minimum durability is:
+
+```text
+max(owner event-profile floor, deployment floor, caller-requested floor)
+```
+
+The ordering of levels is `memory_only < transaction_committed <
+storage_barrier_confirmed`. Owner profile and deployment floors are trusted
+configuration inputs fixed before the append request. A caller may request a
+stricter level but cannot select, override, omit, or downgrade either trusted
+floor. `required_before_effect`, privileged State/Event composition, durable
+Evidence used by C03, and any profile that says durable can never resolve to
+`memory_only`.
+
+The receipt names every input floor, the effective configured floor, achieved
+level, and backend policy revision. The owner returns success only when achieved
+durability is at least the effective floor. Queued, buffered, replicating, or
+exporter-accepted bytes are not durable unless the selected level explicitly and
+truthfully defines them as such. A remote replica or quorum is not implied by
+either local level.
 
 ### Append receipt and outcomes
 
 `EventAppendReceipt` is immutable and contains:
 
 - receipt schema/version and nominal receipt identity authorized by `FND-001`;
-- exact request digest and idempotency-key digest;
+- exact intent digest, request digest, and idempotency-key digest;
 - event ID, partition, sequence, writer epoch, and fencing digest;
 - previous and committed event integrity digests;
-- configured and achieved durability levels and backend policy revision;
+- owner-profile, deployment, caller, effective configured, and achieved
+  durability levels plus backend policy revision;
 - owner identity/revision and owner-assigned commit time; and
 - the exact visibility/classification reference of the stored event.
 
@@ -319,7 +414,7 @@ The closed append outcome family is:
 | --- | --- |
 | `appended(receipt)` | New event committed at the exact requested coordinate and durability. |
 | `duplicate(original_receipt)` | The same idempotency key, request digest, event ID, and canonical bytes were already committed. The original receipt is returned unchanged. |
-| `conflict(actual_cursor)` | Expected sequence, previous digest, epoch/fence, event identity, or idempotency binding differs. No append occurred. The returned cursor is non-authorizing and access-filtered. |
+| `conflict` | Expected sequence, previous digest, local epoch/fence, event identity, or idempotency binding differs. No append occurred. The mutation result is opaque unless a separate restricted conflict-detail query is authorized. |
 | `rejected(code)` | Closed schema, scope, visibility, bound, or policy validation failed before Store mutation. |
 | `failed_no_append(code)` | Store proved no append committed. |
 | `append_outcome_uncertain(recovery_ref)` | Store cannot prove commit or absence. No success receipt is fabricated; the partition is quarantined until same-request lookup/reconciliation resolves it. |
@@ -328,6 +423,15 @@ An uncertain append cannot be retried under a new event ID, sequence,
 idempotency key, or payload. Recovery queries the same owner using the retained
 request identity and digest. An `EventAppendReceipt`, cursor, or duplicate result
 never authorizes a caller, state transition, or external effect.
+
+Before selecting a detailed conflict result or looking up current coordinates,
+the owner authenticates dedicated Event read authority for the exact tenant,
+scope, partition, and audience and emits audit attribution. Without that read
+authority, absent, hidden, wrong-tenant, wrong-audience, stale, fenced, and
+same-ID/changed-request cases return one non-reflecting `conflict` profile with no
+cursor, sequence, epoch, hash, existence bit, distinguishable header, or
+finer-grained timing class. Authorized owner diagnostics use a separate audited
+`EventConflictDetail` view; mutation authority alone cannot obtain it.
 
 ## Transactional Outbox and Inbox Boundary
 
@@ -338,24 +442,77 @@ stores.
 The minimum behavior-free family is:
 
 - `OwnerOutboxEntry`: source owner, source transaction/revision, immutable
-  publication command, canonical command digest, idempotency key, destination
-  owner/audience, attempt metadata, and state `pending | acknowledged |
-  quarantined`;
-- `EventPublicationCommand`: one or a bounded batch of complete append requests
-  whose event IDs and bytes were fixed by the source owner before publication;
-- `EventInboxRecord`: destination owner, command identity/digest, source owner,
-  first-seen time, append result, and original receipt references; and
-- `EventPublicationAcknowledgement`: immutable binding from the command to every
-  original append receipt or one terminal rejection/conflict result.
+  publication command, canonical command digest, idempotency key, source tenant,
+  scope, authenticated source principal/producer, destination owner/audience,
+  transport/key-status binding, attempt metadata, and state `pending |
+  acknowledged | quarantined`;
+- `EventPublicationCommand`: one authenticated source-owner command containing
+  either one append intent or the constrained batch below, complete intent and
+  request digests, source transaction identity/revision/digest, destination
+  owner/audience, expiry, key/trust status reference, and no self-asserted
+  authority;
+- `EventInboxRecord`: destination owner, exact authenticated command
+  identity/digest, transport principal, source owner/producer/tenant/scope/source
+  transaction, first-seen time, append result, and original receipt references;
+  and
+- `EventPublicationAcknowledgement`: Event-owner-authenticated immutable binding
+  from the command and inbox transaction to every original append receipt or one
+  terminal rejection/conflict result, including owner identity, tenant, audience,
+  key/trust status, expiry, and acknowledgement digest.
+
+### Constrained first-slice batch
+
+`EventAppendBatchIntent` contains `1..=256` ordered append intents; an owner
+profile may lower but never raise that bound. Every item must target the same
+partition, authenticated producer, tenant/scope, durability profile, and one
+current fixed local writer-record revision and epoch/fence. Expected sequences
+are contiguous from the batch's one `expected_next_sequence`, and the first
+expected previous digest chains through each owner-materialized envelope in
+order.
+
+Event owner validates and materializes every item before mutation, then commits
+the batch idempotency record, all envelopes, all integrity links, and the one
+batch acknowledgement in one all-or-none owner transaction. When the batch
+arrives through cross-owner publication, that same Event transaction also
+commits the authenticated inbox dedupe record and publication acknowledgement;
+a direct owner-local pre-effect batch does not invent an inbox record. The batch
+acknowledgement binds the batch command/request digest, ordered intent digests,
+sequence range, previous/final integrity digests, and one exact
+`EventAppendReceipt` per item. No receipt is returned before the whole
+transaction reaches effective durability.
+
+Any item rejection, conflict, wrong partition/producer/epoch/fence, sequence gap,
+or changed duplicate causes zero batch appends and zero per-item receipts. Store
+uncertainty quarantines the complete batch and partition; no item is reported as
+committed or retried separately. Exact duplicate recovery returns the original
+complete acknowledgement and exact ordered receipt set. This batch contract does
+not support mixed partitions, epochs, writers, durability policies, partial
+success, transfer, handoff, or live legacy cutover.
 
 The source service writes its own state change and unique outbox row in one
 source-owner transaction when publication follows a source mutation. Delivery is
-at least once. Event owner commits inbox deduplication and event append in one
-Event-owner transaction. Exact duplicate delivery returns the original
-acknowledgement. Same command ID or idempotency key with changed bytes is an
-invariant conflict and quarantines the command. A lost acknowledgement causes
-lookup or redelivery of the same command; it never causes new event bytes or a
-second source mutation.
+at least once. Before dedupe lookup or persistence, Event owner validates a
+private trusted wrapper or signature/attestation and requires exact equality
+among authenticated transport/service principal, source owner, producer,
+tenant/scope, source transaction/revision/digest, destination owner/audience,
+command identity/digest, key/trust status, expiry/revocation state, and every
+append intent/request digest. Self-described fields never establish those facts.
+Wrong owner, tenant, audience, producer, destination, transport principal,
+expired/revoked/untrusted key, changed bytes, or unavailable authentication
+fails closed, appends nothing, persists no untrusted command/inbox bytes, and
+keeps source completion quarantined. A separately authorized transport-security
+audit may retain only non-reflecting safe attribution and reason codes.
+
+Event owner commits inbox deduplication and Event append in the one Event-owner
+transaction described above. Exact duplicate delivery returns the original
+authenticated acknowledgement. Same command ID or idempotency key with changed
+bytes is a permanent invariant conflict and quarantines the command. A lost
+acknowledgement causes authenticated lookup or redelivery of the same command; it
+never causes new event bytes or a second source mutation. The source validates
+Event owner identity, tenant, audience, command/inbox transaction digest, every
+receipt, key/trust status, expiry/revocation, and acknowledgement authentication
+before any completion visibility opens. A forged, stale, untrusted, mismatched,
+or unavailable acknowledgement leaves source completion closed and quarantined.
 
 If source state and outbox cannot share one local atomic boundary, the source
 mutation must remain uncommitted or unavailable until an explicit `FND-003`
@@ -368,6 +525,27 @@ uncertainty are visible owner states. They are never silently dropped or reporte
 as completed. Cross-boundary delivery is at-least-once; idempotent handling and
 unique event identity prevent duplicate semantic mutation.
 
+## Permanent Privileged Idempotency and Non-Reuse
+
+In this bounded slice, privileged Event/State/Evidence intent keys, command IDs,
+event IDs, source transaction coordinates, inbox/outbox IDs, original receipts,
+effect invocation coordinates, and their canonical request/semantic digests have
+no TTL and are not compacted, evicted, recycled, or reused. Restart, response
+loss, archive pressure, retention policy, and an unavailable lookup never turn a
+used or possibly used identity into a fresh miss. Unavailable history is
+uncertainty and fails closed.
+
+Any later retention protocol requires a separately accepted contract that first
+commits and verifies an immutable non-reuse tombstone or deny head before source
+history is removed. That record binds the trusted owner and partition, nominal
+identity, tenant/scope/audience, complete request/semantic digest, original
+coordinate/result or explicit uncertainty, retention generation, predecessor
+integrity, and tombstone integrity. It contains no prohibited source payload.
+Exact replay after tombstoning returns the retained terminal result or permanent
+duplicate disposition; changed replay remains permanent conflict. Missing,
+corrupt, inaccessible, or uncertain tombstone state denies and cannot allocate a
+replacement identity.
+
 ## Effect Certainty and Quarantine
 
 Every privileged operation that may cause an external effect records one closed
@@ -377,17 +555,33 @@ certainty state:
 | --- | --- |
 | `no_effect` | The owner proved the adapter/driver/provider boundary was not entered or proved no effect occurred. |
 | `effect_succeeded` | A trusted bounded result proves the one identified effect succeeded. |
-| `effect_failed` | A trusted bounded result proves the one identified effect did not succeed; partial effects are separately represented. |
+| `effect_failed` | A trusted bounded result proves the identified effect failed with no successful or uncertain sub-effect. |
+| `effect_partial` | The operation produced a typed bounded set containing at least one successful sub-effect and at least one failed or uncertain sub-effect. |
 | `effect_uncertain` | Timeout, process loss, provider ambiguity, or missing trustworthy result prevents proving success or failure. |
+
+`effect_partial` carries `1..=256` ordered `SubEffectResult` values; the driver
+profile may lower that bound. Each value binds a nominal sub-effect identity,
+parent invocation/action and idempotency identity, operation/schema, target
+coordinate digest, certainty `succeeded | failed | uncertain`, reversibility and
+compensation references where declared, trusted provider/adapter receipt, and
+causal event coordinate. A top-level `effect_failed` cannot hide a successful or
+uncertain sub-effect. A top-level `effect_uncertain` is used when even the
+complete sub-effect inventory cannot be trusted.
 
 Effect certainty is independent of event durability. An effect can be known to
 have succeeded while its required-after-effect publication remains pending; that
 operation is not publicly complete and remains quarantined. An irreversible
-`effect_uncertain` result is never rewritten as success or failure. It is never
-retried automatically under a fresh invocation, action, request, event, or
-idempotency identity. Recovery may only inspect the retained invocation and
-query a separately authorized idempotent status operation when such an operation
-is part of the driver contract. Otherwise intervention is required.
+`effect_uncertain` or uncertain sub-effect is never rewritten as success or
+failure. Retry eligibility is independent of the top-level success/failure label.
+No failed, partial, or uncertain operation or sub-effect repeats automatically
+unless the retained exact driver/invocation contract proves that retrying that
+exact unresolved set under the same invocation and idempotency identity is safe,
+does not repeat a successful sub-effect, and still satisfies current authority,
+permit, quota, expiry, and safety checks. A fresh invocation, action, request,
+event, sub-effect, or idempotency identity is never a retry. Recovery may inspect
+the retained invocation or call a separately authorized idempotent status
+operation when the driver contract defines one. Any irreversible, unenumerated,
+or uncertain sub-effect requires quarantine and intervention rather than retry.
 
 ## State Contract
 
@@ -415,53 +609,144 @@ last-writer-wins, caller-selected partition, hidden global memory, and automatic
 privileged conflict resolution are forbidden. Broader branch/merge policy is
 `STA-003`, not this RFC.
 
-### Writer lease, epoch, and fence
+### State-owned writer activation, epoch, and fence
 
-The behavior-free `WriterLease` and `WriterFence` family represents the
-validated writer binding consumed by State owner. It contains:
+Authority/Agent/Workload owners supply authenticated immutable
+`WriterEligibilityFacts`. Those facts bind their owner, authority/lease
+generation and status, principal plus agent/workload instance, tenant/scope,
+partition, expected head, allowed transition schemas, not-before/expiry,
+audience, revocation source, validation policy revision, and canonical digest.
+They establish eligibility only. They do not contain or select the State-current
+writer epoch/fence and cannot move a State head.
 
-- lease/reference identity and immutable digest;
-- issuing owner and authority evidence reference;
-- principal plus agent/workload instance binding;
-- exact partition and expected head revision/node;
-- positive writer epoch and opaque fencing token digest;
-- allowed transition schema set;
-- not-before, expiry, audience, and revocation/status evidence; and
-- validation time and validation policy revision.
+State owner exclusively creates a live writer through
+`StateWriterActivationCommand`. The command contains:
 
-Authority/Agent/Workload owners issue, renew, or revoke their grants under later
-contracts. State Service alone decides whether the supplied binding is current
-for its partition and whether its epoch/fence may move that head. Missing,
-expired, revoked, unavailable, wrong-audience, wrong-partition, wrong-schema,
-stale-epoch, or ambiguous lease evidence denies with no mutation. A
-process-local mutex is not a writer lease. Replay, simulation, imported
-snapshots, evidence bundles, and state references cannot acquire a live writer
+- command identity, canonical command digest, and permanent idempotency key;
+- exact partition descriptor revision, expected current head, and expected
+  current State-writer record revision/status;
+- requested writer principal plus agent/workload instance and transition-schema
+  ceiling;
+- complete owner-authenticated eligibility facts and current
+  authority/lease-status generation;
+- activation kind `initial_local | renew_same_writer | handoff`; for `handoff`,
+  an authenticated handoff-eligibility fact binding the previous and requested
+  writer, partition, expected writer/head revisions, source generation/status,
+  and handoff command digest;
+- requested expiry, owner audience, causal event, and audit attribution; and
+- requested durability floor.
+
+These activation kinds fix a closed owner interface; they do not imply that all
+paths are currently implementable. `initial_local` may execute only after an
+accepted eligibility-owner contract lets its authoritative current-status record
+participate in each local Store transaction for State activation and later head
+CAS. `renew_same_writer` and `handoff` have the same requirement or require
+an accepted `FND-003` cross-owner protocol. Copying, caching, or preflighting an
+independently committed status record inside State does not meet this rule. If the
+eligibility owner commits in another process, store, or transaction and no
+accepted `FND-003` protocol exists, every live activation or renewal that depends
+on that owner is unsupported and fails closed.
+
+`handoff` remains an interface stop until the separately owned Authority/Agent/
+Workload facts and an accepted same-transaction or `FND-003` handoff protocol
+exist. Its owner semantics are nevertheless fixed: external facts establish only
+the two writers' eligibility and ordered handoff intent; they never propose the
+next epoch or fence. Once a legal linearization path exists, State owner samples
+its clock, validates freshness and current status, checks the expected
+writer/head state, atomically and permanently fences the previous binding,
+allocates the next positive epoch and opaque fence, persists the one
+State-current writer record and its required transition event, and returns a
+`StateWriterActivationReceipt` only after effective durability. The receipt
+binds the command/idempotency digests, eligibility owner/record/generation,
+partition/head, previous and new writer revisions/status, newly allocated
+epoch/fence digest, principal/instance/schema ceiling, expiry, event receipt,
+owner-profile/deployment/caller/effective/achieved durability and backend policy,
+and owner revision/time. It is not Authority and cannot be used outside the
+bound partition. Until the prerequisite handoff facts and protocol are accepted,
+the owner rejects `handoff` before mutation; no implementation may approximate it
+with local mutexes, cached status, caller-selected epochs, or independent record
+updates.
+
+State activation and mutation use the same strictest-floor durability rule as
+Event: the effective floor is the maximum owner-profile, deployment, and caller
+floor. Caller input may tighten but never downgrade owner or deployment policy,
+and no live writer binding or committed State head is issued from `memory_only`.
+
+The closed activation outcome is `activated(receipt) |
+duplicate(original_receipt) | conflict | eligibility_denied(code) |
+failed_no_activation(code) | activation_outcome_uncertain(recovery_ref)`.
+An eligibility denial code is available only when the caller also has dedicated
+authority to read that exact eligibility/status fact; otherwise it maps to the
+same opaque `conflict`. Detailed current writer/head facts likewise require
+dedicated State read authority and an audited restricted query. Uncertainty
+quarantines the partition and same command; no replacement epoch, fence,
+command, or idempotency identity may be allocated.
+
+The resulting private `StateWriterBinding` is the only epoch/fence accepted by
+State mutation CAS. Once State commits a higher epoch, every lower epoch and any
+same-epoch/different-fence binding is permanently fenced even if its external
+lease has not expired. Replay, simulation, imported snapshots, evidence bundles,
+external eligibility records, and process-local mutexes cannot create a live
 binding.
 
-The owner allocates monotonically increasing epochs for ownership handoff. Once a
-higher epoch is accepted, every lower epoch remains fenced even if its original
-expiry has not elapsed. Fencing is checked in the same Store CAS that moves the
-head; a preflight check alone is insufficient.
+### Revocation and CAS linearization
+
+Authority/lease generation is distinct from State writer epoch. Preflight
+validation alone is insufficient. The State head CAS must atomically consume the
+current State-owned writer record and a current trusted authority/lease status
+generation. This is legal only when either:
+
+1. a local composition bridge lets the eligibility owner validate and commit its
+   authoritative status/revocation record while State validates and commits its
+   writer fence and head in the same Store transaction, without either owner
+   interpreting or rewriting the other's semantics; or
+2. an accepted `FND-003` cross-owner protocol defines authenticated commands,
+   ordering, recovery, and the exact linearization winner.
+
+An authoritative revocation, expiry transition, or ownership handoff and the
+resulting revocation/fence committed in the State-visible shared transaction
+before the head CAS wins and denies the mutation with no visible node, event,
+head, or receipt. A higher State epoch or fence committed before the CAS likewise
+wins. State owner evaluates an expiry boundary using the transaction's trusted
+clock. A stale status snapshot, generation mismatch, unavailable owner/status
+source, uncertain transaction, or lack of one of the two legal linearization
+paths makes live mutation unsupported and fails closed or quarantines the
+partition.
+
+The local bridge is composition, not a projection-owned substitute for
+Authority. It may pass closed authenticated facts and a shared transaction
+handle, but the eligibility owner must decide and persist its own authoritative
+generation/status in that transaction; State decides and persists only its
+writer/head records. A State-side cached or consumed-generation projection, even
+if authenticated and monotonic, cannot prove that an independently owned
+revocation did not win concurrently. Same generation with changed source bytes,
+generation regression, missing revocation history, uncertain owner
+participation, or transaction uncertainty quarantines and denies. This RFC does
+not claim generic cross-owner revocation linearization; every independent-owner
+race remains blocked on accepted `FND-003` and the relevant owner contracts.
 
 ### State mutation request
 
 `StateMutationRequest` contains:
 
-- command identity, canonical request digest, and idempotency key;
+- command identity, canonical request digest, and permanent idempotency key;
 - exact partition descriptor revision;
 - exact expected head revision and expected `StateNodeId` or explicit genesis;
-- validated writer lease/reference, epoch, and fence;
+- exact State-issued `StateWriterBinding`, writer record revision, epoch/fence,
+  and current trusted authority/lease-status generation;
 - one closed transition schema and typed state payload or opaque immutable
   payload reference;
 - parent node identities, next state hash, and immutable commit metadata;
-- causal event/evidence references and required `StateCommitted` compatibility
-  event; and
+- causal event/evidence inputs from which State owner derives the required
+  compatibility event and complete cross-binding; and
 - requested durability and audit attribution.
 
 The expected head is mandatory. Absence never means "use latest". The model or
-caller cannot choose a broader partition or writer. Protected payload bytes are
-admitted only after schema, classification, access, and pre-persistence secret
-checks.
+caller cannot choose a broader partition or writer. The supplied authority-status
+generation is an expected compare field, not proof of currentness; State verifies
+it through one legal transaction/protocol path at CAS. Protected payload bytes
+are admitted only after schema, classification, access, and pre-persistence
+secret checks.
 
 ### Immutable commit and CAS result
 
@@ -476,29 +761,61 @@ The closed result family is:
 
 | Result | Semantics |
 | --- | --- |
-| `committed(receipt)` | Immutable node, required event, and head CAS reached configured durability at the exact expected head/fence. |
+| `committed(receipt)` | Immutable node, required event, and head CAS reached effective durability at the exact expected head/fence. |
 | `duplicate(original_receipt)` | The exact command/request digest already committed; no new node, event, head revision, or time is allocated. |
-| `head_conflict(actual_head)` | Expected revision/node is stale; no mutation. Actual head is access-filtered and non-authorizing. |
-| `fenced(actual_epoch)` | Writer epoch/fence is stale or invalid; no mutation. |
-| `lease_denied(code)` | Writer binding is absent, expired, revoked, unavailable, wrong-scope, or wrong-schema; no mutation. |
+| `conflict` | Expected revision/node, writer record, authority generation, epoch/fence, command, or idempotency binding is stale or different; no mutation. The mutation response is opaque. |
+| `lease_denied(code)` | Writer binding is absent, expired, revoked, unavailable, wrong-scope, or wrong-schema; no mutation. A detailed code is returned only with dedicated authority to read that exact status; otherwise this maps to opaque `conflict`. |
 | `rejected(code)` | Closed schema, parent, hash, classification, or transition validation failed; no mutation. |
 | `failed_no_mutation(code)` | Store proved the immutable node/event/head transaction did not commit. |
 | `commit_outcome_uncertain(recovery_ref)` | Store cannot prove commit or absence; partition is quarantined and same-command recovery is required. |
 
 The `StateCommitReceipt` binds command/request digest, partition, descriptor
-revision, previous and new heads, immutable node and state hash, writer
-epoch/fence, required event append receipt, achieved durability, owner revision,
-and commit time. It is evidence of one state transition, not authority to make
-another.
+revision, previous and new heads, immutable node identity, state hash, exact
+snapshot reference identity/digest or absence, writer epoch/fence,
+authority-status generation, required event append receipt and digest,
+owner-profile/deployment/caller/effective/achieved durability and backend policy,
+owner revision, and commit time. It is evidence of one state transition, not
+authority to make another.
+
+Detailed actual head, writer revision, authority generation, or epoch is
+available only from a separate audited `StateConflictDetail` query after exact
+tenant/partition read authorization. Without that authority, absent, hidden,
+wrong-tenant, wrong-audience, stale-head, stale-fence, revoked, and
+same-ID/changed-request cases return the same non-reflecting `conflict` body,
+status, headers, and bounded timing class.
+
+### Owner-derived `StateCommitted` binding
+
+The mutation caller never supplies a committed `StateCommitted` event. In the
+atomic State/Event transaction, State owner derives the immutable state node,
+new head, stable compatibility event, envelope, and a complete owner-internal
+cross-binding from the one accepted request. The binding covers partition and
+descriptor revision; tenant, agent, run, and tick where applicable; previous and
+new head revisions/IDs; node ID, state hash, snapshot reference identity/digest
+or absence; current authority generation, State writer record revision, epoch,
+and fence digest; command, request, and idempotency digests; stable event ID,
+sequence, kind, payload, identity context, causal fields, previous/current
+integrity; and intent and envelope digests.
+
+For the stable profile, State owner derives exact
+`TraceEventKind::StateCommitted { state_hash, snapshot_id }`, exact
+`TraceIdentityContext.state_node_id`, and exact `TraceEventId` from run and the
+transaction's next sequence. Envelope-only metadata carries the additional
+partition/head/epoch/command binding without changing stable bytes. If a
+compatibility adapter supplies any proposed stable field, the owner treats it as
+an assertion and validates byte-for-byte and semantic equality across every
+field above before Store mutation. Any mismatch creates no node, event, head,
+receipt, visibility, or next tick.
 
 ### State/event atomicity
 
 For the first local implementation, immutable node persistence, required stable
 `StateCommitted` append, and head CAS must use one Store transaction supplied to
 and interpreted by State/Event owner code. The transaction checks expected head
-and current fence, writes the immutable node and event, advances the head, and
-returns both receipts only after configured durability. Any failure commits
-none of those visible facts.
+and current State writer record/fence plus the linearly current authority-status
+generation, derives and cross-binds the node/event, writes the immutable node and
+event, advances the head, and returns both receipts only after effective
+durability. Any failure commits none of those visible facts.
 
 If a deployment uses independent State and Event stores without a shared atomic
 engine boundary, this local operation is unsupported until `FND-003` or a later
@@ -507,7 +824,9 @@ fail closed before a live head move. It must not move the head and then append
 best-effort, append a false `StateCommitted` before CAS, or call two commits
 "atomic". A prepared immutable node may exist only as owner-internal non-live
 state and cannot be returned as current, admitted to the next tick, or projected
-as `StateCommitted`.
+as `StateCommitted`. Existing deployments with separate trace and state
+databases remain inspect-only migration sources; this RFC authorizes no live
+atomic cutover between them.
 
 ## Evidence Contract
 
@@ -551,6 +870,10 @@ true.
 - optional owner attestation/signature references when a later contract requires
   them.
 
+That optional bundle-level attestation is profile-specific. It does not replace
+the mandatory authenticated `EvidenceCommitReceipt` required for every durable
+bundle coordinate below.
+
 `EvidenceCompleteness` is one of:
 
 | Result | Meaning |
@@ -576,6 +899,81 @@ support than its item results permit. Missing mandatory evidence produces
 `incomplete` and cannot be normalized to pass. "Trace exists" is not correctness,
 and private chain-of-thought is never required evidence.
 
+### Authenticated durable Evidence commit
+
+A caller submits `EvidenceCommitRequest`, not a committed bundle coordinate or
+receipt. The request binds:
+
+- authenticated caller/source owner, tenant, scope, intended audience, command
+  identity, permanent idempotency key, and canonical request digest;
+- exact subject identity/digest and requirement profile identity/revision;
+- ordered item identities, owner/schema revisions, source coordinates/digests,
+  and source owner receipts/attestations required by the profile;
+- proposed bounded claims and evaluator/issuer references; and
+- caller-requested durability floor plus audit attribution.
+
+Evidence owner authenticates the source and audience, resolves only authorized
+source references, validates every owner/digest/schema/integrity binding,
+evaluates item results, computes completeness and support ceilings, orders the
+accepted items/claims canonically, materializes the bundle, computes its digest,
+and commits the bundle plus permanent idempotency record in one owner
+transaction. Callers cannot assert `complete`, `demonstrated`, owner revision,
+bundle identity/digest, achieved durability, or trusted attestation. Same
+idempotency identity plus changed subject, requirement, item order/content,
+claim, source receipt, audience, or request bytes is a permanent conflict.
+
+The closed `EvidenceCommitOutcome` is:
+
+| Outcome | Semantics |
+| --- | --- |
+| `committed(receipt, coordinate)` | The exact owner-materialized bundle and permanent idempotency record reached effective durability. |
+| `duplicate(original_receipt, original_coordinate)` | The exact request was already committed; original immutable values are returned. |
+| `conflict` | Identity/request/substitution conflict; no bundle committed. Mutation callers receive no source-existence detail. |
+| `rejected(code)` | Authentication, authorization, source, schema, completeness-policy, classification, or integrity validation failed before commit. |
+| `failed_no_commit(code)` | Store proved no bundle or idempotency mutation committed. |
+| `commit_outcome_uncertain(recovery_ref)` | Commit or absence cannot be proven; request and owner domain are quarantined for same-command recovery. |
+
+Evidence mutation performs tenant/scope/audience authorization before source or
+idempotency lookup. Without separate audited Evidence read authority, absent,
+hidden, wrong-tenant/audience, changed-source, and same-ID/changed-request cases
+return the same opaque `conflict` response with no source identity, bundle
+coordinate, digest, completeness, existence bit, distinct header, or finer timing
+class. Restricted `EvidenceConflictDetail` is an owner query, not a mutation
+outcome.
+
+`EvidenceCommitReceipt` is a durable owner-authenticated closed record binding:
+
+- receipt/bundle/command identities, permanent idempotency and request digests;
+- Evidence owner principal, service instance, trust root/key/attestation
+  identity, key status/revision, authentication algorithm/profile, and receipt
+  integrity/signature or private trusted-wrapper binding;
+- tenant, scope, audience, subject identity/digest, requirement profile/revision,
+  evaluator/issuer, and visibility/classification;
+- the complete ordered item identity, source-owner, source-receipt, and
+  source-attestation identities and digests; source trust/key status; item
+  digest/result set; complete ordered claims/support; and exact completeness
+  result;
+- canonical bundle digest, predecessor/current integrity, owner commit revision
+  and time; and
+- owner-profile, deployment, caller, effective configured, and achieved
+  durability plus backend policy revision.
+
+The same strictest-floor durability rule used by Event applies. General local
+profiles may use a private owner-validated authenticated wrapper rather than a
+portable signature, but such a receipt is usable only inside that exact trust
+boundary. Any external or C03 proof profile requires an independently verifiable
+owner signature/attestation and current accepted trust/key-status path. A
+memory-only, unsigned, untrusted, expired/revoked-key, wrong-owner,
+wrong-tenant/scope/audience, substituted-source, uncertain, or unverifiable
+receipt is not a durable Evidence coordinate and cannot satisfy privileged or
+C03 proof.
+
+Commit uncertainty is resolved only by authenticated same-request lookup using
+the retained command/idempotency/request digest. Recovery returns the original
+receipt/coordinate, proves no commit, or remains quarantined. It never creates a
+replacement bundle/receipt identity, changes item order or completeness, or
+treats unavailable history as fresh.
+
 ### Durable evidence coordinates
 
 The owner issues immutable coordinates sufficient for later C03 proof binding:
@@ -587,12 +985,16 @@ The owner issues immutable coordinates sufficient for later C03 proof binding:
   receipt reference; and
 - `EvidenceBundleCoordinate`: bundle identity, requirement profile/version,
   subject digest, completeness code, canonical bundle digest, owner revision,
-  and optional attestation reference.
+  mandatory `EvidenceCommitReceipt` identity/digest, achieved durability, and
+  required authentication/attestation reference for its trust profile.
 
 Exact names and nominal ID wire forms that do not already exist wait for
 `FND-001`. Coordinates never use a bare digest, cursor, timestamp, database row,
 or "latest" lookup as identity. They are immutable facts and cannot move a live
 head, authorize C03 migration, or grant payload visibility by themselves.
+`complete`, `demonstrated`, a bare bundle digest, an `EvidenceView`, or an
+in-memory/local-only coordinate cannot substitute for the authenticated durable
+commit receipt required by the consuming profile.
 
 ### Visibility and redacted views
 
@@ -620,40 +1022,53 @@ when it is derived from secret material or creates an uncontrolled disclosure.
 For a privileged external effect, the composition root follows this order:
 
 1. Authenticate the caller and validate command schema, identity, scope,
-   work-order/capability, data-use, policy, approval, quota, and current owner
-   state. Unavailable required checks deny, pause, quarantine, or request
-   intervention.
+   initial work-order/capability, data-use, policy, approval, quota, and owner
+   state needed to admit verification. Unavailable required checks deny, pause,
+   quarantine, or request intervention.
 2. Fix command, action/invocation, idempotency, event, and causal identities and
    canonical request digests. Retries reuse them.
-3. Append every `required_before_effect` event and obtain owner receipts at the
-   configured durability. Failure or uncertainty prevents Gateway/adapter entry.
-4. Run the complete Gateway/verifier chain against current inputs. A verifier
-   cannot treat an Event or Evidence receipt as authority.
-5. Execute at most the one bounded adapter/driver invocation under its retained
-   effect identity and idempotency contract.
-6. Record the trusted result and explicit effect-certainty state. An ambiguous
+3. Run the complete Gateway/verifier chain, including final-live Authority,
+   work-order, lease, approval, quota, policy, data-use, secret, safety,
+   capability, and adapter checks. On allow, Gateway retains the private final
+   effect permit/session across the next step; it does not expose a reusable
+   bearer receipt. A verifier cannot treat Event or Evidence as authority.
+4. For an allow, while the final permit remains held; for a deny, approval, or
+   intervention result, before returning: submit one constrained same-partition
+   all-or-none batch containing the stable `verification.started`,
+   `verification.completed`, and every owner-required decision/pre-effect event
+   in their semantic order. Obtain owner receipts at effective durability. Any
+   rejection, failure, uncertainty, or, on the allow path, permit
+   expiry/revocation or loss of the held session invalidates/withholds execution
+   and prevents adapter entry.
+5. Immediately after durable append, enter at most the one bounded adapter/driver
+   invocation while the same final permit/session is still live. No caller,
+   daemon, queue, or later request may reconstruct that permit from receipts.
+6. Record the trusted result, typed sub-effects, and explicit effect-certainty
+   state. An ambiguous
    result becomes `effect_uncertain` and is quarantined.
 7. Append required terminal events and, when state changes, perform the atomic
    State/Event transaction at the exact expected head/fence.
 8. Return or publish a terminal result only after every required event, state
-   head, and owner receipt reaches configured durability. Otherwise retain the
+   head, and owner receipt reaches effective durability. Otherwise retain the
    known effect result privately and quarantine publication/retry.
 
-For a privileged state-only mutation, steps 1-3 still apply where pre-decision
-evidence is required, then State owner validates the exact expected head/fence
-and performs the immutable node, required event, and head CAS in one supported
-atomic boundary. No external effect occurs.
+For a denied/intervention/approval result, step 4 durably records the complete
+verification decision and terminal pre-effect event before return; no effect
+permit reaches adapter entry. For a privileged state-only mutation, the same
+current verifier/authority principle applies, then State owner validates exact
+writer/status/head state and performs the immutable node, owner-derived event,
+and head CAS in one supported atomic boundary. No external effect occurs.
 
 ### Crash-point table
 
 | Crash or uncertainty point | Required recovery and visible result |
 | --- | --- |
 | Before command/idempotency claim | No command fact or effect exists. An authenticated retry may submit the same logical request and establish one identity. |
-| After command claim, before required-before-effect append | Resume only the retained command and identities. No adapter/driver entry is allowed. |
-| After pre-effect receipt, before Gateway entry | No effect. Same-command recovery may revalidate current authority and either continue or append a terminal denial/cancellation. |
-| During verifier evaluation | No effect. Uncertain or unavailable required verifier fails closed and records no allow. |
+| After command claim, before or during verifier evaluation | Resume only the retained command and identities. No adapter/driver entry is allowed. Uncertain or unavailable required verifier records no allow. |
+| After final permit creation, before/during pre-effect batch append | No effect. The private permit remains held only in the live Gateway session. Append rejection/failure/uncertainty invalidates it. Process loss destroys it; recovery reruns all current verification under the same command/invocation identities. |
+| After durable pre-effect receipts, before adapter entry | No effect. The same live session may enter the adapter only if the retained permit remains current. Process loss or permit expiry/revocation requires same-command re-verification; receipts never recreate authority. |
 | During external invocation | Use the retained invocation and driver idempotency contract. If absence/success/failure cannot be proven, record `effect_uncertain`, quarantine, and do not repeat an irreversible effect. |
-| After known effect, before terminal append | Retain `effect_succeeded` or `effect_failed` privately. Recover publication under the same identities only; never execute the effect again. Public completion remains closed. |
+| After known or partial effect, before terminal append | Retain exact top-level and sub-effect certainty privately. Recover publication under the same identities only. Repeat no successful/uncertain sub-effect; retry only when the retained exact contract proves the unresolved set safe. Public completion remains closed. |
 | During append transaction | Query the same request/receipt identity. If commit or absence cannot be proven, quarantine the partition; never allocate a replacement event. |
 | During atomic State/Event commit | Query the same state command. Either original receipt is returned, no mutation is proven, or the partition is quarantined. A partial visible head/event is an invariant violation. |
 | After immutable node preparation but before supported atomic commit | The node is detached owner-internal data, not current state and not a `StateCommitted` fact. Same-command recovery may reuse it; no next tick starts. |
@@ -702,7 +1117,8 @@ This RFC provides only the generic owner coordinates C03 needs later:
   record;
 - a State partition/head coordinate with expected-head CAS and fencing;
 - a typed Evidence item and bundle coordinate that preserves an Authority or
-  Registry owner-specific evidence identity and digest; and
+  Registry owner-specific evidence identity/digest plus an authenticated durable
+  Evidence commit receipt; and
 - explicit append, commit, publication, effect-certainty, and quarantine
   outcomes.
 
@@ -723,14 +1139,30 @@ sole migration decision owner. Registry remains the sole owner of Registry
 admission/lifecycle facts. Event/State/Evidence proves only what was durably
 recorded and what the named requirement supports.
 
+For RFC 0014 proof-bound migration, a generic bundle, `complete`,
+`demonstrated`, view, Event receipt, State receipt, or Evidence commit receipt is
+never sufficient by itself. C03 must validate the exact RFC 0014 Authority
+historical evidence record and owner authentication/attestation, the exact Driver
+Registry admission/lifecycle evidence record and owner
+authentication/attestation, the Evidence receipt's ordered source bindings, and
+every required three-way identity/digest/scope/revision/lifecycle equality. A
+memory-only, unsigned, untrusted, wrong-owner, wrong-tenant/scope/audience,
+expired/revoked-key, substituted-source, incomplete, inaccessible, corrupt,
+unavailable, or uncertain bundle/receipt denies migration with no live head move.
+
 The C03 tick and migration paths remain disabled until:
 
 1. this RFC is accepted;
 2. the required behavior-free grammar and owner package slices exist;
 3. durable append and State CAS/fencing pass their failure tests;
-4. Registry and Authority owner contracts and records exist;
-5. the C03-specific integration has a separately reviewed implementation; and
-6. stable 0.1 trace/state/replay compatibility tests pass.
+4. accepted `FND-003` ordering/recovery exists whenever State currentness or
+   migration crosses independently committed owner/store boundaries;
+5. separately authorized `EVT-002` writer/handoff work exists for any
+   transferable Event writer or live legacy cutover the path needs;
+6. Registry and Authority owner contracts, authenticated records, and trust paths
+   exist;
+7. the C03-specific integration has a separately reviewed implementation; and
+8. stable 0.1 trace/state/replay compatibility tests pass.
 
 A private C03/Authority table, kernel map, daemon projection, direct
 `splendor-store` call, stable `TraceEvent` payload extension, or best-effort log
@@ -750,9 +1182,10 @@ There is no flag-day replacement and no silent dual truth.
   sufficient for new privileged owner operations.
 - Existing `StateNodeId`, parent lineage, state hash, runtime identity metadata,
   trace link, snapshot references, and state handoff records remain readable.
-- Existing `StateGraph` behavior remains available through a kernel
-  compatibility facade for stable local 0.1 callers while its writes delegate to
-  the one State owner.
+- Existing `StateGraph` read behavior remains available through a kernel
+  compatibility projection. New owner writes are available only for fresh
+  partitions created in the supported combined Store topology; this RFC does not
+  live-migrate an existing separate state database.
 - Existing trace export and inspect-only replay fixtures continue to observe the
   0.1 projection, not envelope implementation metadata.
 
@@ -760,46 +1193,71 @@ There is no flag-day replacement and no silent dual truth.
 
 1. **Inventory and fixtures:** freeze representative stable 0.1 trace/state
    bytes, event hashes, ordering, state lineage, exports, replay reports, and
-   failure cases before changing production wiring.
+   failure cases before changing production wiring. Inventory does not make a
+   record safe to import.
 2. **Additive grammar:** add behavior-free versioned contract types and pure
    0.1 conversion/projection tests. No Store, kernel, daemon, or SDK writer
    changes occur in this step.
 3. **Owner service:** create `splendor-evidence` and its ports. In-memory
    deterministic implementations prove owner semantics but are not privileged
    durability.
-4. **Store adapter:** implement owner-required SQLite transaction, expected
-   sequence/fence, inbox/outbox, durability, integrity, and crash recovery while
-   keeping persistence decisions out of Store.
-5. **Kernel facade:** route one bounded local path through the owner. Stable
-   `TraceStore` and `StateGraph` facades project from that one canonical write;
-   they do not independently dual-write.
-6. **One-time import:** when existing databases need owner metadata, an explicit
-   versioned importer validates each legacy record, preserves original bytes,
-   IDs, sequence, hashes, parents, and timestamps, and emits a migration report.
-   Imported facts are historical and cannot acquire a live writer lease.
-7. **Cutover:** per partition, one durable cutover marker selects exactly one
-   canonical writer. Before the marker, the legacy compatibility adapter owns
-   writes through the owner facade; after it, the new owner store does. Both
-   writers are never active for the same partition.
-8. **Dependent adoption:** Registry, Authority, and then C03 consume owner-issued
+4. **Store adapter:** implement a new combined local SQLite engine capable of the
+   owner-required Event and State transaction, expected sequence/head/fence,
+   authenticated inbox/outbox, durability, integrity, permanent idempotency, and
+   crash recovery while keeping semantic decisions out of Store. Existing
+   separate databases are not silently attached to this transaction.
+5. **Fresh-partition kernel facade:** route one bounded local path for a newly
+   created partition through the owner and combined engine. Stable `TraceStore`
+   and `StateGraph` facades project from that one canonical write; they do not
+   independently dual-write or claim transfer from a legacy writer.
+6. **Safe inspect-only import:** before copying any legacy record, run the
+   versioned classification, schema, access, and pre-persistence leak scan over
+   every payload-bearing trace/state field. A safe classified record may be
+   copied with exact historical bytes, IDs, sequence, hashes, parents, and
+   timestamps and receives only a historical non-live import receipt. It cannot
+   acquire a writer binding or current authority.
+7. **Quarantine unsafe legacy records:** a prohibited, secret-bearing, protected
+   beyond the migration purpose, corrupt, or unclassifiable record is not copied
+   into the new Event/State/Evidence store, gets no privileged durability or
+   Evidence receipt, satisfies no C03 proof, and is excluded from generic
+   replay/export. The legacy source remains in place under a separately
+   authorized restricted forensic policy. The new store may retain only a
+   non-reflecting quarantine result in an owner-restricted migration ledger with
+   a safe source coordinate and reason code, never the prohibited bytes or an
+   unsafe secret-derived digest. Generic reads cannot observe that ledger or use
+   its presence as an existence oracle.
+8. **No live legacy cutover:** current 0.1 trace and state databases are separate.
+   Until separately authorized `EVT-002` supplies transferable Event writer
+   handoff and accepted `FND-003` supplies the required cross-store/owner
+   recovery and revocation ordering, they remain inspect-only migration sources.
+   No marker, compatibility facade, import, or local mutex may switch an existing
+   live partition, start a second writer, or claim atomic rollback.
+9. **Dependent adoption:** Registry, Authority, and then C03 consume owner-issued
    immutable references in separately reviewed slices. They never backfill or
    rewrite the owner history.
 
-If any projection differs in stable ID, sequence, kind, payload, order, state
-parent/hash/link, or inspect-only replay behavior, cutover stops. Rollback before
-persisted new bytes may remove an experimental slice. After new owner bytes
-exist, rollback retains read support and moves writers only through another
-explicit fenced migration; it never makes duplicate legacy and new writers
-current.
+If any safe projection differs in stable ID, sequence, kind, payload, order,
+state parent/hash/link, or inspect-only replay behavior, import stops and the
+source remains quarantined/read-only. Rollback before persisted new bytes may
+remove an experimental slice. After a fresh owner partition has persisted bytes,
+rollback may stop new mutation and retain read support, but it cannot activate a
+legacy writer, move the writer, renumber facts, delete idempotency history, or
+claim live rollback without the later `EVT-002`/`FND-003` protocols.
 
-### Local compatibility writer
+### Bounded non-transferable local Event writer
 
-The existing local-only runtime may use an owner-issued, non-transferable local
-writer epoch tied to one process instance and one explicit partition. This
-preserves local 0.1 operation while adding expected-sequence/head checks. It is
-not a fleet lease, cannot survive transfer as live authority, cannot satisfy C03
-proof-bound migration, and cannot be used when `AUTH-001` or distributed fencing
-is required.
+Before `EVT-002`, Event owner may create a fresh partition with one fixed
+non-transferable local writer profile bound to one authenticated producer, tenant,
+scope, process instance, combined Store identity, partition, epoch, opaque fence,
+and deployment lifetime. The profile has no activate, rotate, transfer, renew,
+handoff, import-as-live, cutover, rollback, or second-writer operation. Restart is
+allowed only when the same Store and exact writer binding are recovered and no
+other writer could have been admitted; uncertainty quarantines the partition.
+
+This profile can prove local append/CAS mechanics and stable projection for fresh
+partitions. It cannot preserve a live existing 0.1 writer through migration,
+satisfy C03 proof-bound migration where transferable ownership is required,
+serve fleet/resident transfer, or claim any part of `EVT-002` implementation.
 
 ## Security and Privacy
 
@@ -816,6 +1274,10 @@ is required.
   rejected payloads.
 - Tenant and visibility checks apply to payloads, references, cursors, conflict
   results, ranges, receipts, views, export, replay, and materialization.
+- Mutation conflicts disclose no cursor, head, epoch, hash, existence bit, or
+  tenant activity without separate dedicated read authority and audit. Hidden,
+  absent, wrong-tenant/audience, stale, fenced, and substitution responses use one
+  opaque profile and bounded timing class.
 - Protected sources are represented by immutable references and approved
   digests, not copied into generic events or bundles. Access to a ref does not
   imply access to its target.
@@ -824,6 +1286,17 @@ is required.
 - Private chain-of-thought is not a required or accepted generic Evidence item.
 - Append receipts, state receipts, cursors, evidence bundles, support levels,
   digests, and replay results are non-authorizing.
+- Outbox/inbox commands and acknowledgements require authenticated owner,
+  producer, tenant, source-transaction, destination, audience, key/status, and
+  complete intent binding before dedupe, append, or source visibility.
+- Privileged idempotency/non-reuse records are permanent in this slice. Missing,
+  compacted, corrupt, or unavailable history is never a fresh identity.
+- Legacy bytes are classified and scanned before copy. Prohibited, secret-bearing,
+  over-classified, corrupt, or unclassifiable records remain restricted in place
+  and never enter new generic replay/export or C03 proof.
+- C03 Evidence requires a durable authenticated commit receipt plus exact trusted
+  RFC 0014 Authority/Registry source records; completeness or a bare digest is
+  never enough.
 - Replay remains inspect-only by default and cannot use historical authority or
   execute live side effects.
 
@@ -836,9 +1309,10 @@ skipping the next slice's dependencies or tests.
 
 Scope:
 
-- additive closed Event append/receipt/coordinate, State
-  partition/head/request/receipt/coordinate, and Evidence
-  requirement/item/bundle/claim/coordinate values in `splendor-types`;
+- additive closed Event intent/envelope/append/batch/receipt/coordinate, State
+  partition/eligibility/activation/binding/request/receipt/coordinate, and
+  Evidence requirement/item/bundle/claim/commit/receipt/coordinate values in
+  `splendor-types`;
 - pure validation, canonical serialization, bounds, and 0.1
   TraceEvent/StateNode projection helpers; and
 - no I/O, package owner service, Store, daemon, SDK, or runtime wiring.
@@ -847,11 +1321,21 @@ Tests:
 
 - positive canonical round trips and deterministic bytes;
 - unknown/duplicate/null/oversize/wrong-ID/wrong-scope rejection;
-- event receipt and state receipt cannot be constructed for mismatched
-  request/commit digests;
+- intent/envelope ownership and canonical digest tests reject caller-supplied
+  recorded time, owner sequence/identity/integrity, and durability downgrade;
+- Event, State activation/commit, and Evidence receipts cannot be constructed for
+  mismatched request, owner, source, item, completeness, or commit digests;
 - stable 0.1 trace IDs, sequences, kinds, payloads, event hashes, state IDs,
-  parents, hashes, and trace links project unchanged;
-- missing mandatory Evidence items produce `incomplete`; and
+  parents, hashes, trace links, optional `escalation.triggered` position,
+  `action.needs_intervention`, and post-verification
+  `action.executed -> action.failed` project unchanged;
+- independent mutation of every State/`StateCommitted` cross-binding field
+  rejects with no valid value;
+- missing mandatory Evidence items produce `incomplete`, and memory-only,
+  unsigned/untrusted, wrong-owner/tenant/audience, missing or changed source
+  attestation, revoked-key, or uncertain receipts cannot form a privileged/C03
+  coordinate;
+- opaque conflict values contain no current cursor/head/epoch/existence data; and
 - receipts, refs, and bundles expose no authority conversion.
 
 Stop conditions:
@@ -879,17 +1363,43 @@ Tests:
 
 - ordered append, expected-sequence conflict, idempotent duplicate, changed-byte
   conflict, stale epoch/fence denial, and uncertain append quarantine;
+- fixed local Event writer restart recovers only the exact process/Store binding;
+  process or Store mismatch, same epoch/different fence, caller-selected higher
+  epoch, rotation, renewal, handoff, cutover, rollback, old/new dual-writer
+  attempt, lost writer-record acknowledgement, and clock/status uncertainty all
+  append nothing and fail closed before `EVT-002`;
+- constrained same-partition/same-writer contiguous batch all-or-none behavior,
+  complete duplicate acknowledgement, and whole-batch uncertainty;
+- outbox/inbox wrong-principal, cross-tenant, wrong-audience, stale/revoked key,
+  changed-command, forged-ack, and acknowledgement-loss denial/recovery;
 - named partition isolation, expected-head CAS, one-winner concurrency, stale
-  writer denial, detached replay/import denial, and no mutation on conflict;
+  writer denial, State-owned activation, same-transaction
+  revoke/expiry/higher-epoch versus CAS winners, detached replay/import denial,
+  and no mutation on conflict;
+- independently committed owner revocation, stale status snapshot, unavailable
+  eligibility owner, or uncertain owner participation cannot be linearized by a
+  State projection and leaves live activation/mutation unsupported pending
+  `FND-003`;
 - Evidence complete/incomplete/inaccessible/corrupt/unavailable and support-level
-  ceilings;
-- visibility filtering and redacted-view omission integrity; and
+  ceilings plus authenticated durable commit/duplicate/conflict/uncertainty;
+- permanent idempotency across restart, retention attempts, lost receipts,
+  exact/changed replay, and corrupt/missing history;
+- visibility filtering; byte/status/header and bounded timing-class equivalence
+  for absent, hidden, wrong-tenant/audience, stale, fenced, and substituted
+  opaque conflicts; audited restricted conflict views; and redacted-view omission
+  integrity; and
 - inspect-only ReplayPlan cannot select a live driver or writer.
 
 Stop conditions:
 
 - no production durability claim from in-memory tests;
 - no Authority lease issuance before `AUTH-001`;
+- no transferable Event writer, handoff, cutover, rollback, or `EVT-002`
+  implementation;
+- no live State mutation without the same-transaction status bridge or accepted
+  `FND-003` protocol;
+- no cached/projection-only status bridge is described or tested as equivalent to
+  current independently owned authority;
 - no Artifact/Lineage dereference before `ART-001`/`LIN-001`; and
 - no daemon, SDK, C03, or broad producer migration.
 
@@ -898,9 +1408,11 @@ Stop conditions:
 Scope:
 
 - add persistence traits/engines only for owner-approved records;
-- implement SQLite first with explicit transactions, WAL/sync policy, bounded
-  batches, expected sequence/epoch/fence, uniqueness, integrity, read range,
-  inbox/outbox persistence, and crash recovery; and
+- implement one combined local SQLite engine first with explicit transactions,
+  WAL/sync policy, constrained batches, expected sequence/head/epoch/fence,
+  authority-status generation, uniqueness, integrity, permanent idempotency,
+  authenticated inbox/outbox persistence, Evidence commits, and crash recovery;
+  and
 - retain deterministic in-memory Store behavior clearly labeled
   `memory_only`.
 
@@ -909,9 +1421,20 @@ Tests:
 - power loss/process kill/disk full/commit error/sync error at every append,
   inbox, outbox, state node, event, and head-CAS boundary;
 - no receipt before configured durability;
+- owner/deployment durability floors cannot be downgraded by caller input;
 - same-request recovery returns one original receipt;
-- append uncertainty and state uncertainty quarantine without replacement IDs;
-- duplicate delivery causes one semantic append/mutation;
+- append, batch, State activation/commit, and Evidence uncertainty quarantine
+  without replacement IDs;
+- duplicate authenticated delivery causes one semantic append/mutation and forged
+  delivery/acknowledgement causes none;
+- State/Event owner derivation and every cross-field substitution fail atomically;
+- revoke/expiry/status-generation/higher-epoch races inside the legal shared
+  authoritative transaction have one winner; equivalent races against an
+  independent owner are rejected as unsupported without `FND-003`;
+- fixed local Event writer restart/lost-ack recovery preserves one binding, while
+  same-epoch/different-fence, higher-epoch, handoff, cutover, rollback, and a
+  second writer remain impossible before `EVT-002`;
+- idempotency history survives restart and rejects deletion/compaction as fresh;
 - Store enforces owner-supplied CAS but never decides transition policy; and
 - corruption, integrity mismatch, stale sequence/head/fence, and cross-tenant
   reads fail closed.
@@ -920,38 +1443,59 @@ Stop conditions:
 
 - if node/event/head cannot share the required local atomic Store boundary, the
   state mutation path remains unsupported;
+- if current authority/revocation status cannot linearize in that transaction or
+  through accepted `FND-003`, live mutation remains unsupported;
 - no exactly-once, cross-store atomicity, remote quorum, fleet sync, retention,
   or subscription claim; and
-- no production cutover until compatibility fixtures pass.
+- no transferable writer or live legacy cutover before separately authorized
+  `EVT-002` and required `FND-003` protocols.
 
 ### Slice 4 - Kernel compatibility and atomic composition
 
 Scope:
 
-- route one local kernel trace/state path through the owner;
+- route one fresh-partition local kernel trace/state path through the owner and
+  combined Store;
 - preserve stable `TraceStore`, `StateGraph`, trace export, and replay facades as
   projections from one canonical owner write;
-- make required-before-effect append fail before adapter entry; and
+- run the full live verifier/final-authority chain, retain the final Gateway
+  permit, then append verification and required-before-effect events in one
+  all-or-none Event batch while that permit remains held, invalidating execution
+  on append failure; and
 - make state node, stable `StateCommitted`, and head CAS one supported local
   atomic operation.
 
 Tests:
 
-- complete stable tick line and exact 0.1 trace fixture equivalence;
+- complete stable tick line and exact 0.1 trace fixture equivalence, including
+  optional escalation position, intervention, and post-verification
+  executed-then-failed ordering;
 - denied/verifier-failed/pre-effect-store-failed actions make zero adapter calls;
+- verification-completed/pre-effect append occurs after the full final-live
+  verifier allow and before adapter entry while the same permit is retained;
+- permit-loss/expiry/revocation before adapter entry makes zero adapter calls and
+  receipts cannot recreate the permit;
 - state/event failure leaves old head current, starts no next tick, and reports
   no successful commit;
-- irreversible timeout becomes `effect_uncertain`, is quarantined, and is not
-  retried under a new identity;
+- failed/partial/uncertain sub-effects retain exact typed certainty, repeat no
+  successful sub-effect, and retry only the same invocation when its retained
+  contract proves the exact retry safe;
 - known effect plus terminal-store failure is truthfully retained and withheld,
   never rewritten as no effect;
 - restart and duplicate response return retained receipts without new IDs/times;
-- legacy database import and rollback preserve bytes/order/lineage; and
+- safe legacy records preserve bytes/order/lineage in inspect-only import;
+  synthetic secret, credential, protected-eval, PII, corrupt, and unclassifiable
+  values across every payload-bearing trace/state field produce zero new-store
+  payload bytes, no privileged receipt/C03 proof, and no generic replay/export;
+- existing separate trace/state databases cannot enter live cutover, dual-write,
+  or rollback topology; and
 - inspect-only replay makes zero live adapter/owner mutations.
 
 Stop conditions:
 
 - no silent dual write or per-partition writer overlap;
+- no live migration from separate legacy databases and no transferable writer
+  without `EVT-002` plus required `FND-003` protocol;
 - no daemon handler or Store becomes a second owner;
 - no broad EventEnvelope producer migration; and
 - no C03 path until Registry/Authority dependencies and independent security
@@ -973,6 +1517,9 @@ Tests:
 - exact owner-ID/digest/scope/revision equality and substitution denials;
 - missing/inaccessible/stale/corrupt owner evidence produces incomplete/denied,
   never pass;
+- memory-only, unsigned/untrusted, wrong owner/tenant/audience, changed
+  subject/requirement/item set, missing exact RFC 0014 source attestation, or
+  uncertain Evidence commit denies C03 use;
 - stale head/fence and append failure create no C03 live migration;
 - Event/Evidence unavailability creates no Authority or Registry shadow record;
 - proof-bound migration reuses exact retained command identities across crash
@@ -991,8 +1538,12 @@ Stop conditions:
 
 Every implementation slice requires independent architecture and security
 review. Relevant tests include positive, denial, failure, restart, duplicate,
-stale sequence, stale head, stale fence, disk/sync failure, effect uncertainty,
-visibility/redaction, inspect-only replay, compatibility projection, and
+stale sequence, stale head, stale fence, revoke/expiry/CAS races, disk/sync
+failure, non-downgradable durability, atomic batch failure, authenticated
+outbox/inbox, permanent idempotency, partial/uncertain effects, Evidence receipt
+and source-attestation substitution, opaque conflict equivalence, safe legacy
+quarantine, unsupported independent-owner revocation races, `EVT-002` lifecycle
+stops, visibility/redaction, inspect-only replay, compatibility projection, and
 dependency-direction evidence. A passing static architecture check or docs-only
 RFC is never runtime evidence.
 
@@ -1012,20 +1563,25 @@ This RFC does not implement or authorize:
   mutable memory, automatic merge, or distributed consensus;
 - a full outbox ecosystem, distributed exactly-once delivery, cross-store
   atomicity, or remote durability quorum;
+- a cross-owner revocation/CAS protocol, projection-based substitute, or any
+  implementation/completion of `FND-003`;
+- transferable Event writer activation, handoff, live cutover/rollback, or any
+  implementation/completion of `EVT-002` / #272;
 - Artifact Registry, Lineage Service, Authority, Registry, gate, approval,
   workload, run, or agent lifecycle schemas;
 - raw protected-payload storage, secret storage, private chain-of-thought, or
   post-read redaction as an ingress control;
 - driver/Gateway changes, provider execution, side-effect bypass, or automatic
-  retry of uncertain irreversible effects;
+  retry of failed, partial, or uncertain effects without retained exact
+  same-invocation retry-safety proof;
 - daemon endpoints, SDK/client surfaces, CLI commands, generated schemas,
   package dependencies, Store migrations, or runtime code;
 - RFC 0012 C03 tick observations, terminalization, projection, publication, or
   secret lifecycle records;
 - RFC 0014 proof-bound C03 runtime migration or its Authority/Registry record
   schemas;
-- full `FND-002`, `EVT-001`, `EVT-003`, `STA-001`, `STA-002`, or `EVID-001`
-  completion;
+- full `FND-002`, `EVT-001`, `EVT-002`, `EVT-003`, `STA-001`, `STA-002`, or
+  `EVID-001` completion;
 - any component completion, issue closure, gold pass, conformance pass, release
   readiness, or production certification; or
 - self-acceptance of this RFC.
