@@ -36,6 +36,12 @@ migration
 [RFC 0013](0013-driver-operation-credential-sink-contract.md) remain normative
 through RFC 0014
 
+**Required collaborating dependency:** before any restricted/redacted view or
+privileged export implementation, the applicable `FND-009` policy-independent
+classification, deterministic redaction, read-access, and privileged-export
+contract must be separately accepted and implemented. This RFC does not
+complete `FND-009`.
+
 **Informative implementation context:**
 [RFC 0010](0010-authority-service-contract.md) is `Status: Draft`. It describes
 the current bounded `AUTH-002a` issuance bridge and `AUTH-006a` local decision
@@ -104,7 +110,7 @@ current-generation checks, and head CAS.
 | Catalog task | Bounded target in this RFC | Explicitly not completed here |
 | --- | --- | --- |
 | `AUTH-002` / #239 | C03-required immutable evidence for an exact eligible Authority-native issuance/ref-mutation allow or a separately authorized attested historical import allow. | General issuer service completion, all signed work-order integration, renewable/non-renewable issuance, Workload Controller/Node Agent adoption, `G60`, or `G83`. |
-| `AUTH-006` / #243 | C03-required exact historical decision facts, restricted/redacted inspection, immutable original explanation, current-policy comparison boundary, and generic Evidence Service handoff. | Full decision-evidence platform, historical policy archive, every Authority decision family, public explain API, full `FND-009`, `G01`, or `G03`. |
+| `AUTH-006` / #243 | C03-required exact historical decision facts, Authority-record semantic projection and omission meaning, immutable original explanation, current-policy comparison boundary, release decision, and generic Evidence Service handoff. Any view/export implementation remains gated on the applicable accepted and implemented `FND-009` contract. | Full decision-evidence platform, historical policy archive, every Authority decision family, public explain API, any claim of completing `FND-009`, `G01`, or `G03`. |
 | RFC 0014 prerequisite | Authority-owned per-entry source record and publication finalization needed by the frozen C03 proof join. | Migration execution, target ref allocation/append, current ref-head mutation, or live credential use. |
 
 The bounded family covers only historical RFC 0014 source-entry evidence. It
@@ -152,11 +158,12 @@ One concept has one semantic owner.
 
 | Surface | Owns under this RFC | Must not own under this RFC |
 | --- | --- | --- |
-| `crates/splendor-authority` | Eligibility of native issuance/ref-mutation and attested import origins; exact historical allow semantics; one immutable source record per canonical entry; permanent proof-binding/idempotency indexes; Authority resource admission/accounting; Authority outbox intent; Authority publication finalization; restricted/redacted Authority views; Authority recovery decisions. | RFC 0014 migration command/target/head semantics, Registry facts, generic Event/Evidence durability, Store policy, Gateway execution, provider or node effects. |
+| `crates/splendor-authority` | Eligibility of native issuance/ref-mutation and attested import origins; exact historical allow semantics; one immutable source record per canonical entry; permanent proof-binding/idempotency indexes; Authority resource admission/accounting; Authority outbox intent; Authority publication finalization; Authority-record semantic projection, omission meaning, and release decisions; Authority recovery decisions. | Policy-independent field/payload classification, deterministic redaction, generic read/export access primitives, privileged-export records, RFC 0014 migration command/target/head semantics, Registry facts, generic Event/Evidence durability, Store policy, Gateway execution, provider or node effects. |
 | `crates/splendor-types` | Future behavior-free closed values, strict validation, deterministic serialization, and nominal identities only after accepted `FND-001`/`FND-006` grammar. | Authority eligibility, decision evaluation, currentness, I/O, durability, lifecycle, or migration execution. |
 | future `crates/splendor-evidence` | RFC 0015 Event append, Evidence commit, completeness, authenticated receipts, source-reference validation, durability, visibility primitives, and replay plans. | Authority decision meaning, historical-origin eligibility, Registry lifecycle truth, RFC 0014 migration authority, or Authority resource policy. |
 | `crates/splendor-store` | Generic persistence primitives and engines for owner-approved immutable rows, transactions, uniqueness, CAS, outbox state, indexes, and integrity storage. | Authority policy, import eligibility, evidence completeness, publication release, currentness, retention legality, or recovery decisions. |
 | future `crates/splendor-gateway::registry` | RFC 0016 declaration binding, admission, per-slot C03 Registry evidence, lifecycle/fence/currentness, Registry publication finalization, and Registry resource accounting. | Authority source-entry decision, approved destination set, C03 migration, generic Evidence completeness, or Authority counters. |
+| applicable `FND-009` owner contract | Policy-independent field/payload classification, deterministic redaction preserving identity/causal facts, read-access primitives, and privileged-export Event/Artifact requirements. | Authority decision meaning, mandatory Authority proof facts, omission meaning, proof release eligibility, or C03 migration authority. |
 | RFC 0014 C03/Authority migration owner | Exact frozen proof-bundle validation, bijective target transform, target allocation/append, final all-current checks, and source-head CAS. | Minting or repairing Authority/Registry/Event/Evidence records; inferring missing proof; rewriting history. |
 | daemon, SDK, CLI, bindings | Future authenticated transport translation and safe restricted display after separately accepted contracts. | Direct Store mutation, evidence construction, import eligibility, currentness inference, client-side authority, or alternate migration. |
 | callers, importers, policies, messages, work orders | May submit closed proposals and owner references where a later accepted command permits. | Self-attestation, owner selection, committed-record construction, proof completion, resource-policy choice, or authority creation. |
@@ -181,8 +188,8 @@ blocked on the named foundation owners.
 | Native historical origin | An exact Authority issuance/ref-mutation allow whose authoritative retained decision and source transaction created or approved the exact historical entry. |
 | Attested import origin | A separately authorized Authority import allow over exact validated historical bytes and independently verifiable provenance; it records import truth and never fabricates unavailable original issuance facts. |
 | Authority publication finalization | One immutable Authority record binding a fixed source identity/digest to exact RFC 0015 Event/Evidence acknowledgements, resource disposition, and restricted release state. |
-| Restricted Authority proof inspection view | One audited, access-filtered projection containing every fact mandatory for RFC 0014 validation or an explicit unavailable/inaccessible disposition. It grants access to the named source/finalization but is not a replacement owner record or standalone proof. |
-| Redacted Authority history view | One audited non-proof projection that omits protected coordinates and binds every omission; it cannot satisfy migration. |
+| Restricted Authority proof inspection view | One Authority-defined semantic projection containing every fact mandatory for RFC 0014 validation or an explicit unavailable/inaccessible disposition, rendered and access-filtered only through the applicable accepted `FND-009` primitives. It grants access to the named source/finalization but is not a replacement owner record or standalone proof. |
+| Redacted Authority history view | One Authority-defined non-proof projection whose omission meaning is fixed by Authority and whose classification, deterministic redaction, read checks, and privileged export use the applicable accepted `FND-009` primitives; it cannot satisfy migration. |
 | Current-policy comparison | A separate inspect-only result comparing the immutable original decision with an explicitly labeled current or counterfactual evaluation without rewriting or relabeling the original. |
 | Owner recovery state | Private Authority state for exact same-command/source/publication reconciliation. It is not a historical decision status, current authority, or migration result. |
 
@@ -294,7 +301,10 @@ and accounting records contain no secret material, secret-derived digest,
 provider credential, provider request/error, provider-resolvable locator,
 delivery endpoint, permit, lease material, approval token, private key, raw
 signature secret, protected evaluation case identifier, private chain-of-thought,
-or unrestricted protected payload.
+or unrestricted protected payload. Authority defines which Authority semantic
+facts are mandatory and what omission means; it does not redefine `FND-009`
+policy-independent classification, deterministic redaction, read access, or
+privileged-export behavior.
 
 Exact operation/scope/purpose facts are retained as closed owner facts or safe
 immutable references under restricted classification. Raw policy bodies,
@@ -350,7 +360,7 @@ migration-proven and cannot produce a partial target.
 
 The proof-set claim is Authority-internal completeness state. It does not add a
 nineteenth RFC 0014 proof-bundle member or replace RFC 0014's bundle count,
-ordering, and bijection checks.
+proof-bundle array ordering by `source_entry_ordinal`, and bijection checks.
 
 ## Permanent Proof Binding, Idempotency, and Non-Reuse
 
@@ -438,8 +448,9 @@ publication success.
 
 ## Frozen RFC 0014 Proof Bundle
 
-RFC 0014's ordered proof bundle has exactly these eighteen required non-null
-members, in this order:
+RFC 0014 orders the proof-bundle array by `source_entry_ordinal`. Each closed
+bundle object contains exactly these eighteen required non-null members, listed
+below in RFC 0014's presentation sequence for cross-RFC equality review:
 
 ```text
 source_entry_identity
@@ -465,7 +476,10 @@ target_entry_digest
 This RFC adds no nineteenth member, side field, extension, receipt field,
 finalization field, owner field, trust field, resource field, currentness field,
 or alternate bundle version. Unknown, missing, null, duplicate, alias, side, or
-extension members reject under RFC 0014 before owner lookup.
+extension members reject under RFC 0014 before owner lookup. JSON object member
+encounter order is not an additional parser rule. Deterministic object
+serialization follows RFC 0014's accepted RFC 8785 canonicalization contract;
+only the proof-bundle array order is caller-significant here.
 
 ### Direct field equality
 
@@ -487,9 +501,10 @@ joins.
 | `target_entry_ordinal`, `target_entry`, `target_entry_digest` | Satisfy RFC 0014's exact bijective shape-preserving transform and digest rules for the mapped source entry and proven revision. |
 
 Every source entry, Authority identity/digest, Registry identity/digest, and
-target entry appears exactly once under RFC 0014's ordering and bijection rules.
-Swapping, omitting, duplicating, reusing, splitting, merging, or mapping an entry
-many-to-one or one-to-many denies before target allocation.
+target entry appears exactly once under RFC 0014's proof-bundle array ordering
+and bijection rules. Swapping array elements, omitting, duplicating, reusing,
+splitting, merging, or mapping an entry many-to-one or one-to-many denies before
+target allocation.
 
 ### Transitive owner validation
 
@@ -628,6 +643,14 @@ data-use, policy, revocation, and dedicated historical-read or migration-proof
 authority must pass before any existence-sensitive source, proof-binding,
 idempotency, Registry, Event, Evidence, finalization, or resource lookup.
 
+Authority owns only the exact semantic projection for its records, the meaning
+of mandatory versus omitted Authority facts, and the final Authority release
+decision. The applicable accepted and implemented `FND-009` contract owns and
+must supply policy-independent field/payload classification, deterministic
+redaction, read-access enforcement primitives, and privileged-export Event and
+Artifact requirements. Authority consumes those primitives and policy inputs; it
+does not duplicate their policy engine or record ownership.
+
 This RFC does not invent a new external scope string or daemon response profile.
 RFC 0014's existing migration/history visibility rules remain controlling for
 that surface. Any future standalone Authority evidence query requires a
@@ -642,13 +665,15 @@ generation, signer, key, trust root, conflict reason, resource balance, lookup
 count, or retry advice through body, status, headers, timing class, logs, metrics,
 or error/source chains without the dedicated authorized view.
 
-Every restricted or redacted view requires a durable audit append before bytes
-are released. The audit binds inspector identity, tenant/ref, operation/scope,
-purpose, audience, current Authority/policy/work-order/capability/data-use/
-revocation generations, source/finalization coordinates, view kind and redaction
-policy, result, and owner time without copying protected source payloads. Audit
-reservation or commit failure withholds the view. Mutation authority alone does
-not grant proof-read authority.
+Every restricted or redacted view requires the accepted `FND-009` read check and
+a durable audit commit before bytes are released. When bytes are exported, its
+required privileged-export Event and Artifact must also commit. Those records
+bind inspector identity, tenant/ref, operation/scope, purpose, audience, current
+Authority/policy/work-order/capability/data-use/revocation generations,
+source/finalization coordinates, view kind and redaction policy, result, and
+owner time without copying protected source payloads. Required audit or export
+reservation/commit failure withholds the view. Mutation authority alone does not
+grant proof-read authority.
 
 A restricted C03 proof inspection view either exposes every mandatory Authority
 source, owner trust/key-status, publication, and Registry-binding fact or fails
@@ -670,7 +695,11 @@ Dedicated restricted evidence is not a generic observability escape hatch.
 Replay is inspect-only by default. With current read authority, it may
 reconstruct retained source decisions, canonical entry binding, proof-set
 completeness, publication/recovery state, later revocations, and RFC 0014 direct
-or transitive mismatch explanations.
+or transitive mismatch explanations. Replay-plan construction may use only
+authenticated, access-filtered read/query ports to obtain the exact immutable
+bytes permitted by current read authority. The resulting plan is detached and
+non-live; plan execution cannot use those ports to mutate, refresh, publish, or
+contact a live effect boundary.
 
 An inspect-only historical-policy re-evaluation may exist only after an accepted
 policy archive and evaluator contract can load the exact historical policy and
@@ -688,15 +717,17 @@ the output the original decision. Current `compare_authority_evidence` remains a
 local comparison of already-recorded `local.v1` artifacts and is not this
 historical re-evaluation or proof contract.
 
-Replay, generic evidence/history import or export inspection, simulation,
-re-evaluation, and comparison cannot:
+After authorized read/query and detached-plan construction, replay, generic
+evidence/history import or export inspection, simulation, re-evaluation, and
+comparison cannot:
 
 - claim or finalize a command, source, proof binding, outbox, Event, Evidence,
   audit, resource reservation, target, or head;
 - refresh Authority, principal, work-order, capability, policy, data-use,
   approval, Registry, trust, or key status;
 - contact a provider, node, Gateway, adapter, driver, network, filesystem,
-  database, or external effect service;
+  database, owner repository, publication port, or external effect service
+  during detached execution;
 - issue a grant, lease, permit, currentness receipt, or migration decision;
 - allocate or free owner capacity, reset counters/debt, or bypass semantic
   coalescing; or
@@ -705,23 +736,38 @@ re-evaluation, and comparison cannot:
 The separately authorized attested Authority import origin defined above is a
 distinct privileged mutation family, not replay or generic evidence import. It
 may claim an Authority historical source only through its authenticated command,
-complete pre-claim admission, and acyclic publication path. A generic safe
-non-live import may instead preserve exact bytes/provenance for restricted
-inspection without meeting the eligible attestation profile. Such an import
-must remain explicitly non-proof and cannot later be upgraded by attaching a
-current decision or reconstructed join.
+complete pre-claim admission, and acyclic publication path. It is the only
+Authority-owned import mutation in this RFC.
+
+Generic replay/history import is transient only. Under current read authority it
+may parse, validate, and use exact supplied or access-filtered bytes solely as
+detached non-live plan input. It creates no Authority source, non-proof record,
+import record, quarantine record, proof-set claim, binding/non-reuse index,
+outbox, Event/Evidence publication, finalization, import-specific audit result,
+currentness fact, target, or head mutation, and retains no bytes or provenance
+under this RFC. Independently required read/export audit belongs to the
+applicable `FND-009` owner and does not make the import persistent.
+
+Persistent non-proof inspection or quarantine requires a separately accepted
+owner and contract outside RFC 0017. Any such future record is not
+Authority-owned proof state under this contract, can never enter Authority proof
+or non-reuse indexes, cannot be selected by RFC 0014, and cannot be upgraded into
+RFC 0014 proof by attaching a current decision, provenance, attestation, or
+reconstructed join. If that separate owner contract is absent, persistence is
+unsupported rather than silently assigned to Authority.
 
 ## Finite Resource Admission, Isolation, and Retained Debt
 
 No privileged Authority operation in this family may durably claim a command,
 proof set, source entry, evidence identity, proof binding, outbox, finalization,
-audit view, import record, tombstone, or recovery mutation until finite
-owner-resource admission succeeds.
+audit view, attested-import source, tombstone, or recovery mutation until finite
+owner-resource admission succeeds. Generic replay/history import creates none of
+these retained objects.
 
 The effective Authority policy has finite hard bounds for all of these classes:
 
 - request rate and burst/concurrency;
-- in-flight proof-set, per-ref, per-entry, import, publication, audit, and
+- in-flight proof-set, per-ref, per-entry, attested-import, publication, audit, and
   recovery work;
 - retained command, proof-set, source, binding, finalization, view,
   non-reuse-marker, and tombstone cardinality;
@@ -756,11 +802,17 @@ claim and no accepted `FND-003` protocol proves compensatable accounting, the
 operation is unsupported and fails closed.
 
 After authentication/visibility and request-rate enforcement, semantic
-coalescing occurs before permanent allocation. A fresh command or import ID for
-an exact unchanged semantic request resumes the original retained path where
-family freshness/release rules permit; it does not force duplicate permanent
-history. Coalescing is tenant/principal/ref/entry/family/audience scoped and
-cannot reveal or reuse another scope's record.
+coalescing occurs before permanent allocation. A fresh command or attested-import
+command ID for an exact unchanged semantic request resumes the original retained
+path where family freshness/release rules permit; it does not force duplicate
+permanent history. Coalescing is tenant/principal/ref/entry/family/audience
+scoped and cannot reveal or reuse another scope's record.
+
+Transient generic import parsing remains subject to finite authenticated
+request, parser, byte, concurrency, and read/query limits, but it creates no
+permanent Authority reservation, retained debt, or compensating release. A
+separate persistent inspection/quarantine owner must define and account for its
+own resources under its separately accepted contract.
 
 Arithmetic is checked and non-wrapping. Missing, stale, unavailable, overflowed,
 corrupt, or uncertain policy, counter, capacity, reservation, debt, or downstream
@@ -788,7 +840,7 @@ These are semantic dispositions, not wire error codes.
 | Authentication, scope, tenant/ref visibility, audience, work order, capability, policy, data-use, expiry, or revocation fails | No existence-sensitive lookup or durable claim; one non-reflecting denial. |
 | Historical parser, canonical source identity/ordinal/digest, or complete ref-set validation fails | No proof-set/source/index/outbox mutation; rejected bytes are not retained in generic surfaces. |
 | Native origin is not exact or original Authority state is unavailable | Origin is ineligible; no reconstruction or `local.v1` upgrade. |
-| Import provenance/attestation, source-owner trust, or original facts are missing or untrusted | Import remains non-proof or denies; no original-issuance claim is fabricated. |
+| Attested-import provenance/attestation, source-owner trust, or original facts are missing or untrusted | Attested import denies; generic transient import cannot produce proof; no original-issuance claim is fabricated. |
 | Registry evidence or any exact three-way coordinate mismatches | The entry is unproven; no target allocation or partial ref proof. |
 | Same command changed, source-entry binding changed, or evidence identity reused | Permanent conflict; no replacement identity or fork. |
 | Resource reservation, checked arithmetic, or downstream accounting fails | No durable claim or owner/downstream write. |
@@ -800,7 +852,7 @@ These are semantic dispositions, not wire error codes.
 | Durable audit-before-view fails | View bytes are withheld. |
 | Owner/key/trust status is revoked, expired, inaccessible, or uncertain | History may remain inspectable under policy, but privileged proof release and migration deny. |
 | Final currentness or head CAS conflicts | RFC 0014 retains truthful stale/conflict result; no live target head is inferred. |
-| Replay/comparison/generic evidence or history import attempts mutation or external effect | Reject before effect; zero owner/head/provider/Gateway mutations. The separately authorized attested Authority import follows its privileged command path above. |
+| Replay/comparison/generic evidence or history import attempts mutation or external effect | Reject before effect; zero Authority proof/head/provider/Gateway mutations. A required FND-009 read/export audit remains separately owned and non-authorizing. The separately authorized attested Authority import follows its privileged command path above. |
 
 ### Race winners
 
@@ -821,7 +873,13 @@ These are semantic dispositions, not wire error codes.
 
 Exactly one Authority-owned reconciler may advance retained owner-local recovery
 state by CAS after all dependencies exist. It never acts as replay and never
-creates current authority.
+creates current authority. It may invoke only the retained authenticated
+same-command Authority repository port and the RFC 0015 Event/Evidence
+publication or query ports named by the table below. Concrete composition
+adapters may perform the storage and transport required to realize those ports
+under their accepted owner, authentication, idempotency, resource, durability,
+and `FND-003` contracts. These narrowly bounded same-command recovery operations
+are not permission for direct infrastructure access or unrelated effects.
 
 | Crash or loss point | Sole permitted recovery |
 | --- | --- |
@@ -839,9 +897,12 @@ creates current authority.
 The reconciler cannot select a different source ref/entry, Authority or Registry
 record, command, outbox, Event, Evidence, finalization, audit, or resource
 identity; change source/decision/Registry bytes; invoke policy as though it were
-the original decision; refresh currentness; allocate a target; move a ref head;
-or call a provider, node, Gateway, adapter, driver, network, filesystem, or other
-external effect.
+the original decision; refresh currentness; allocate a target; or move a ref
+head. It cannot access Store, network, filesystem, database, queue, or transport
+infrastructure directly; only the exact retained repository/publication/query
+ports above may cross those boundaries through composition adapters. It cannot
+call a provider, node, Gateway, business adapter, driver effect path, or any
+unrelated business, control-plane, or external effect.
 
 ## Compatibility, Migration, and Rollback
 
@@ -892,15 +953,18 @@ Scope:
   digest, timestamp, bound, signature/attestation, and error grammar;
 - accept `FND-006` cross-version, generated parity, persisted migration,
   downgrade, and rollback rules;
-- preserve RFC 0014's exact source and eighteen-member bundle bytes; and
+- preserve RFC 0014's exact source bytes, proof-bundle array semantics, closed
+  eighteen-name object membership, and RFC 8785 canonical bytes; and
 - consume, rather than invent, accepted identity/principal, policy, data-use,
-  work-order/capability, audit, trust/key-status, resource-accounting,
-  Event/Evidence, Registry, and `FND-003` owner contracts.
+  work-order/capability, audit, applicable `FND-009` classification/redaction/
+  read/export, trust/key-status, resource-accounting, Event/Evidence, Registry,
+  and `FND-003` owner contracts.
 
 Tests and evidence:
 
 - cross-language canonical fixtures for every newly frozen behavior-free value;
-- exact RFC 0014 bundle count/order and source-entry byte preservation;
+- exact RFC 0014 proof-bundle array order, closed object eighteen-name set,
+  RFC 8785 canonical bytes, and source-entry byte preservation;
 - dependency and ownership matrices proving no copied external-owner semantics;
 - N-1/N/N+1 read/deny and rollback fixtures; and
 - threat-model review of self-attestation, substitution, historical-authority,
@@ -920,8 +984,9 @@ Stop conditions:
 Scope:
 
 - add only accepted closed values, strict bounded parsers, checked constructors,
-  deterministic serialization, exact source projections, restricted/redacted
-  view values, and code-only non-reflecting errors to `splendor-types`;
+  deterministic serialization, exact Authority semantic projections and
+  omission values consumed by `FND-009`, and code-only non-reflecting errors to
+  `splendor-types`;
 - reuse RFC 0014 and RFC 0016 owner values exactly; and
 - expose no I/O, Authority service, repository, import execution,
   Event/Evidence call, migration, daemon, SDK, CLI, or generated surface not
@@ -937,7 +1002,8 @@ Tests and evidence:
 - canonical source excludes its own digest and all downstream receipts;
 - one-entry/one-evidence identity and complete multi-entry set fixtures; and
 - compile/API evidence of no unchecked constructor, generic authorizing map,
-  extension authority, `local.v1` conversion, or live-authority conversion.
+  extension authority, `local.v1` conversion, live-authority conversion, or
+  duplicate policy-independent classification/redaction/read/export primitive.
 
 Stop conditions:
 
@@ -950,7 +1016,7 @@ Stop conditions:
 
 Scope:
 
-- implement native/import eligibility, complete source fact validation,
+- implement native/attested-import eligibility, complete source fact validation,
   proof-set atomicity, permanent forward/reverse binding, semantic coalescing,
   finite Authority resource admission/accounting, source/finalization
   separation, restricted view decisions, and same-command recovery decisions
@@ -981,9 +1047,11 @@ Tests and evidence:
 Stop conditions:
 
 - in-memory tests prove only deterministic Authority semantics;
-- no permissive fake may stand in for live external-owner trust/currentness; and
-- no persistence/publication/import release or C03 use while owner dependencies
-  remain unmet.
+- no permissive fake may stand in for live external-owner trust/currentness;
+- no persistence/publication/attested-import release or C03 use while owner
+  dependencies remain unmet; and
+- no generic history-import persistence, non-proof record, or quarantine owner
+  in Authority.
 
 ### Slice 4 - Repository adapter and acyclic durability
 
@@ -1008,7 +1076,12 @@ Tests and evidence:
 - permanent proof binding, non-reuse, tombstone, retained debt, coalescing, and
   isolation survive restart and retention pressure;
 - same-command recovery preserves all original IDs, bytes, digests, times,
-  reservations, receipts, and finalization; and
+  reservations, receipts, and finalization;
+- recovery invokes only the exact retained authenticated Authority repository
+  and RFC 0015 Event/Evidence publication/query ports; composition adapters may
+  perform their required storage/transport, while direct infrastructure,
+  changed-command, alternate-owner, policy/currentness refresh, and unrelated
+  effect calls deny; and
 - Store and composition bridges map failures but decide no Authority, Registry,
   Evidence, release, or recovery semantics.
 
@@ -1020,13 +1093,17 @@ Stop conditions:
 - no distributed exactly-once, cross-store atomicity, production durability, or
   C03 migration claim beyond retained executable evidence.
 
-### Slice 5 - Native/import integration and restricted inspection
+### Slice 5 - Native/attested-import integration and restricted inspection
 
 Scope:
 
 - compose only accepted production owner ports for native issuance/ref mutation,
   attested historical import, identity/principal, work order/capability, policy,
   data use, audit, trust/key status, Registry, resource, Event, and Evidence;
+- consume the applicable accepted and implemented `FND-009` classification,
+  deterministic redaction, read-access, and privileged-export primitives while
+  keeping only Authority-record semantic projection, omission meaning, and
+  release decisions in Authority;
 - issue one distinct source/finalization per canonical entry only after complete
   ref-set admission; and
 - expose restricted/redacted owner queries only after pre-lookup authorization,
@@ -1034,26 +1111,38 @@ Scope:
 
 Tests and evidence:
 
-- native/import source-owner, attestation, key purpose/audience/status,
+- native/attested-import source-owner, attestation, key purpose/audience/status,
   revocation, policy/data-use/work-order/capability, and Registry substitution
   matrices;
 - imported provenance preserves its real import decision and cannot claim
   unauthenticated original issuance;
 - every restricted view contains all mandatory proof facts or denies; every
   redacted view binds omissions and remains non-proof;
+- FND-009 classification/redaction/read/export fixtures preserve Authority
+  identity and mandatory causal facts, enforce the same read policy, record each
+  privileged export, and prove Authority has no duplicate generic policy engine;
 - hidden/absent/wrong-tenant/principal/scope/audience/conflict/stale/revoked/
   corrupt/exhausted/unavailable cases have equivalent outward behavior under the
   later accepted daemon profile;
 - audit failure withholds every view; no protected/secret-derived payload appears
   in source, finalization, Event/Evidence, audit, logs, metrics, errors, or crash
   bundles; and
-- replay, import inspection, historical re-evaluation, and current-policy
-  comparison remain labeled, immutable, non-live, and zero-effect.
+- replay, transient generic import inspection, historical re-evaluation, and
+  current-policy comparison remain labeled, immutable, detached, and zero-effect;
+  generic import retains no Authority record, and any separately owned persistent
+  non-proof/quarantine record cannot enter proof indexes, be selected by RFC
+  0014, or be upgraded into proof.
 
 Stop conditions:
 
 - no external API until its authentication, scope, generated parity, and
   non-oracle profile are separately accepted and tested;
+- no restricted/redacted view or privileged-export implementation until the
+  applicable `FND-009` contract and executable owner boundary are accepted,
+  implemented, and integrated;
+- no persistent generic history-import inspection/quarantine until a separate
+  non-Authority owner contract is accepted; that owner remains outside RFC 0017
+  and cannot write Authority proof or non-reuse indexes;
 - no C03 proof release without independently verifiable owner attestation and
   current accepted trust/key-status validation; and
 - no RFC 0014 target allocation or head CAS in this slice.
@@ -1062,7 +1151,9 @@ Stop conditions:
 
 Scope:
 
-- preserve the exact ordered eighteen-member proof bundle;
+- preserve the proof-bundle array ordered by `source_entry_ordinal`, each closed
+  bundle object's exact eighteen-member name set, and RFC 0014/RFC 8785
+  deterministic object serialization without an encounter-order parser rule;
 - validate direct bundle equality, then transitive Authority/Registry source,
   trust, publication, Event/Evidence, resource, and currentness facts; and
 - integrate only through RFC 0014's retained migration command/state machine and
@@ -1070,8 +1161,9 @@ Scope:
 
 Tests and evidence:
 
-- exact eighteen-member object accepted; missing, null, duplicate, alias,
-  extension, reordered proof-bundle sequence, and nineteenth-member forms
+- exact eighteen-member object accepted regardless of JSON object encounter
+  order and canonicalized under RFC 8785; missing, null, duplicate, alias,
+  extension, reordered proof-bundle array sequence, and nineteenth-member forms
   rejected;
 - each direct member mutation and each transitive source/attestation/key/Event/
   Evidence/finalization/resource/currentness mutation denies independently;
@@ -1112,15 +1204,15 @@ test here is not execution evidence.
 | Authority dependencies | Mutate work-order ID/digest/revision/expiry/revocation, capability ID/revision/digest/chain/scope/revocation, policy ID/revision/status, data-use ID/revision/purpose/revocation, principal/credential status, freshness, and generations. |
 | Registry join | Mutate per-slot evidence ID/digest, tenant, installation/scope, admission/digest, permanent declaration binding, declaration digest/revision, operation, slot/sink entry, lifecycle state/generation, revision fence, publisher authority, and Registry finalization. |
 | Owner trust | Mutate Authority/Registry owner, service instance, signer, key ID/type/purpose/audience/status/revision/validity/revocation, attestation, source integrity, and trust root; recomputed but untrusted wrappers deny. |
-| Frozen bundle | Reproduce the exact ordered eighteen members and reject every missing/null/duplicate/alias/side/extension/nineteenth member; direct equality and transitive validation remain separate. |
+| Frozen bundle | Reproduce the proof-bundle array ordered by `source_entry_ordinal`; require each closed object to have the exact eighteen names; accept JSON object encounter-order variation through RFC 8785 canonicalization; reject every missing/null/duplicate/alias/side/extension/nineteenth member; keep direct equality separate from transitive validation. |
 | Bijection | Multi-entry permutation, omission, duplication, swap, evidence reuse, one-to-many, many-to-one, target ordinal, target bytes/digest, and cross-revision changes deny with no partial target. |
 | Publication | Source/outbox atomicity, exact Event/Evidence source binding, distinct family receipts, effective durability, completeness, finalization, no cycles, no finalization mutation, and no success from queue/bare digest/local memory. |
 | Idempotency | Exact duplicate at every state returns one original; changed command/source/decision/Registry semantics conflict; forward/reverse indexes and tombstones survive restart, retention, response loss, and concurrent callers. |
 | Resource admission | Exact ceiling/ceiling-plus-one after accepted numeric policy exists for rate, concurrency, cardinality, bytes/capacity, outbox/backlog, downstream reservations, retained debt, every isolation scope, overflow, restart, and compensation. |
-| Visibility/privacy | Pre-lookup auth, uniform non-reflecting denials, durable audit-before-view, mandatory restricted fields, redacted omission integrity, no secret/protected/low-entropy leakage, and no generic observability exposure. |
+| Visibility/privacy | Pre-lookup auth, uniform non-reflecting denials, accepted `FND-009` field classification/deterministic redaction/read-policy/privileged-export integration, Authority-owned semantic projection/omission/release decisions only, durable audit-before-view, mandatory restricted fields, redacted omission integrity, no secret/protected/low-entropy leakage, and no generic observability exposure. |
 | Currentness/races | Revoke or change every ref/Authority/policy/work-order/capability/data-use/principal/key/Registry/fence/publisher/lifecycle/resource generation between source, preflight, release, and final CAS; earlier committed invalidation wins. |
-| Recovery | Crash before/after reservation, claim, source/index/outbox, Event, Evidence, finalization, audit, and response; only same-command recovery occurs and uncertainty never allocates replacement identity. |
-| Replay/comparison/generic import | Inspect-only reconstruction; exact historical versus current/counterfactual labels; unavailable historical policy is not rewritten; generic import cannot self-attest or mutate proof state; zero owner/head/Gateway/provider/node/driver effects. The separately authorized attested Authority import is tested as its distinct privileged command family. |
+| Recovery | Crash before/after reservation, claim, source/index/outbox, Event, Evidence, finalization, audit, and response; only same-command recovery through the retained Authority repository and RFC 0015 publication/query ports occurs; concrete adapters perform only required storage/transport; direct infrastructure, changed bytes/owners, currentness refresh, and unrelated effects deny; uncertainty never allocates replacement identity. |
+| Replay/comparison/generic import | Authorized access-filtered read/query during detached-plan construction only; inspect-only reconstruction; exact historical versus current/counterfactual labels; unavailable historical policy is not rewritten; generic import is transient, cannot self-attest, persist under Authority, or mutate proof state; detached execution has zero owner/head/Gateway/provider/node/driver effects. A separately accepted persistent non-proof owner remains outside RFC 0017 and can never enter proof indexes or upgrade to proof. The separately authorized attested Authority import is tested as its distinct privileged command family. |
 | Compatibility | Current `local.v1`, issuance, RFC 0012-0016, stable Rust/Python/TypeScript/OpenAPI, dependency policy, formatting, and stable conformance remain unchanged. |
 
 Independent architecture/compatibility and security review are required before
@@ -1156,7 +1248,8 @@ This RFC does not implement, authorize, or claim:
   records, or stable 0.1 surfaces;
 - an Authority issuer service, general issuance/ref-mutation runtime, policy
   archive, historical re-evaluation engine, Evidence Service, Registry runtime,
-  audit service, trust/key registry, or resource-accounting runtime;
+  audit service, `FND-009` classification/redaction/read/export implementation,
+  trust/key registry, or resource-accounting runtime;
 - RFC 0014 migration command implementation, target allocation/append, ref-head
   CAS, target ref construction, secret lease/use, Gateway verifier, provider
   access, node delivery, adapter/driver invocation, or any external side effect;
@@ -1172,6 +1265,8 @@ This RFC does not implement, authorize, or claim:
 - public or generic exposure of source entries, approved destination digests,
   policy/data-use facts, Registry coordinates, trust/key facts, resource
   balances, or protected payloads;
+- persistence or owner selection for generic non-proof history import,
+  inspection, or quarantine records;
 - closure of #239, #243, any RFC 0014/C03 issue, any catalog task or component,
   conformance completion, release readiness, durability, production readiness,
   certification, or implementation completion;
@@ -1185,20 +1280,24 @@ security/privacy, and contract reviews confirm:
 
 - one Authority owner and no shadow Authority, Registry, Event/Evidence, Store,
   daemon, SDK, CLI, bridge, or C03 semantics;
-- exact eligible native/import origins, complete per-entry facts, distinct
+- exact eligible native/attested-import origins, complete per-entry facts, distinct
   identities, all-entry atomic source creation, and permanent proof binding;
-- unchanged RFC 0014 source grammar and exact ordered eighteen-member bundle,
-  with direct equality separated from transitive owner/receipt/currentness
-  validation and no nineteenth member;
+- unchanged RFC 0014 source grammar, proof-bundle array ordering by
+  `source_entry_ordinal`, each closed object's exact eighteen names, and RFC 8785
+  canonical serialization without an object encounter-order rule, with direct
+  equality separated from transitive owner/receipt/currentness validation and no
+  nineteenth member;
 - acyclic source/outbox -> Event/Evidence -> immutable finalization ordering,
   truthful durability, same-command recovery, and no cross-store overclaim;
 - historical-proof non-authority, immutable original explanation, labeled
-  current-policy comparison, inspect-only replay/generic history import, the
-  distinct authorized attested-import path, and final-CAS current rechecks under
-  RFC 0014/accepted `FND-003`;
+  current-policy comparison, detached inspect-only replay/transient generic
+  history import, no Authority-owned generic import persistence, the distinct
+  authorized attested-import path, and final-CAS current rechecks under RFC
+  0014/accepted `FND-003`;
 - restricted visibility, durable audit-before-view, non-reflecting conflicts,
-  independently verifiable owner trust/key status, and no secret/protected
-  payload leakage;
+  Authority-only projection/omission/release semantics, mandatory applicable
+  `FND-009` owner primitives, independently verifiable owner trust/key status,
+  and no secret/protected payload leakage;
 - finite multi-scope resource admission, isolation, semantic coalescing,
   retained debt, checked overflow, restart, and retention/non-reuse semantics
   without invented numeric or external-owner rules; and
