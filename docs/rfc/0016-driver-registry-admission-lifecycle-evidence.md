@@ -45,20 +45,27 @@ The Driver Registry will be the sole semantic owner of the minimum immutable
 admission, lifecycle, and exact-current evidence that RFC 0014 proof-bound C03
 migration requires.
 
-The bounded coordinate is one exact tenant-scoped installation, one immutable
-admission, one canonical RFC 0013 `DriverOperationRef`, one positive RFC 0013
-declaration revision, and one exact credential-sink entry in the complete RFC
-0013 declaration. The Registry will admit that coordinate only from
-authenticated registrar authority and independently verified immutable
-Artifact, Lineage, conformance, and runtime-compatibility facts. It will assign
-one immutable admission identity and one monotonic lifecycle generation.
+The bounded admission coordinate is one exact tenant-scoped installation, one
+canonical RFC 0013 `DriverOperationRef`, one positive RFC 0013 declaration
+revision, and the complete declaration with every credential-sink entry. The
+Registry admits that declaration-wide coordinate only from authenticated
+registrar authority and independently verified immutable Artifact, Lineage,
+conformance, and runtime-compatibility facts. Admission creates one immutable,
+non-live `admitted` record and generation; it selects no slot and grants no
+activation authority.
 
-The C03 live state vocabulary needed by this RFC is `active`, `stale`, and
-`revoked`. A fail-closed `quarantined` state is also reserved only for Registry
-integrity or outcome uncertainty. Only the exact current `active` generation may
-produce C03 current-lifecycle evidence. No name, alias, endpoint, tag, latest
-head, newest number, retained old record, or matching digest may substitute for
-the complete coordinate.
+Live `active` state requires a separate target-specific activation command,
+narrower activation authority, and exact deployment, gate, and rollout evidence
+from `DEP-005` or a later accepted activation-owner contract. An active
+declaration-wide admission can project one distinct immutable C03 Registry
+evidence record for each exact RFC 0013 sink entry. The remaining C03 lifecycle
+states are `stale`, `revoked`, and irreversible `quarantined`. Only an exact
+current `active` generation and its exact per-slot evidence may support C03.
+
+Command, publication, or acknowledgement uncertainty is not lifecycle
+`quarantined`; it is a private recoverable owner state that cannot open external
+visibility. No name, alias, endpoint, tag, latest head, newest number, retained
+old record, or matching digest may substitute for the complete coordinate.
 
 RFC 0014 remains the sole owner of the C03 source-entry, target-entry, approved
 destination, Authority migration, and final ref-head CAS semantics. RFC 0015
@@ -74,7 +81,7 @@ This RFC establishes only the following contract targets:
 | --- | --- | --- |
 | `DRREG-001` / #331 | Reuse the exact accepted RFC 0013 operation credential-sink declaration as the operation declaration admitted for C03. | Universal `DriverManifest`, all driver kinds, all operation semantics, alias migration, full conformance kit, and `G07`. |
 | `DRREG-002` / #332 | Authenticated immutable admission for one exact installation, operation, declaration revision, implementation/projector artifact set, and evidence set. | General registration platform, node endpoint inventory, installation health, self-test service, maturity promotion, discovery, or resolution. |
-| `DRREG-004` / #334 | C03-required `active`, `stale`, `revoked`, and uncertainty quarantine generation semantics, exact current query, and immutable history. | Deprecation, disabled/retired policy, side-by-side rollout, canary, health comparison, rollback, running-workload containment, or full lifecycle completion. |
+| `DRREG-004` / #334 | C03-required `admitted`, `active`, `stale`, `revoked`, and irreversible fail-closed quarantine generation semantics, exact current query, and immutable history. | Deprecation, disabled/retired policy, side-by-side rollout, canary, health comparison, rollback, running-workload containment, or full lifecycle completion. |
 
 This RFC does not define a universal `DriverManifest`. It does not define driver
 selection or resolution. It does not make a Registry admission selectable by the
@@ -103,11 +110,15 @@ workspace. RFC 0015 is an accepted planning contract, not implemented Event or
 Evidence owner behavior. Current state/trace stores and Authority code are
 compatibility inputs, not substitutes for the missing owners.
 
-Live Registry admission, initial activation, lifecycle mutation, current-proof
-issuance, and C03 consumption must stop until all applicable dependencies below
-are accepted and implemented. A foundation-readiness marker, test double,
-private table, unsigned row, filename, image tag, or current compatibility seam
-does not satisfy a stop.
+Public grammar stops until `FND-001` and `FND-006` freeze the required values.
+Deterministic, non-live owner state-machine tests may proceed after those
+behavior-free contracts and narrow test ports exist; they do not require fake
+live implementations of every collaborating owner. Composed admission
+publication, activation, lifecycle mutation, current-proof issuance, and C03
+consumption must stop until each dependency applicable to that live slice is
+accepted and implemented. A foundation-readiness marker, test double, private
+table, unsigned row, filename, image tag, or compatibility seam does not satisfy
+a live stop.
 
 | Dependency | Required before live behavior | Why this RFC cannot substitute |
 | --- | --- | --- |
@@ -116,14 +127,17 @@ does not satisfy a stop.
 | `FND-005` | Independently issued, immutable, signed or owner-authenticated conformance evidence tied to the exact implementation/projector artifacts, environment, suite, and result. | Current adapter tests and manifest validation are not an independent `ConformanceReport`, certification, or `G07` pass. |
 | `ART-001` and `ART-004` | Immutable artifact identity/version/digest plus trusted producer/build attestation, signature validation, key rotation, and revocation status for every implementation and projector artifact. | Registry cannot manufacture artifact identity, trust a filename/tag, or accept driver self-attestation. |
 | `LIN-001`, `LIN-002`, and `LIN-005` | Immutable producer relations, transactionally published producer receipts, controller-known input/output reconciliation, integrity/signing, anti-tamper status, and current trust facts. | Registry may retain owner refs but cannot infer lineage from names or correct an untrusted producer story. |
-| `AUTH-001` and `AUTH-003`, or a separately accepted registrar contract | One explicit typed registrar operation and exact tenant/installation/operation scope, current work-order binding, delegation narrowing, expiry, audience, and revocation behavior. | Caller authentication, ownership, driver identity, or generic operator text is not registrar authority. |
+| `AUTH-001` and `AUTH-003`, or separately accepted registrar/activation contracts | One explicit typed registrar operation plus a distinct narrower target-specific activation operation, exact tenant/installation/operation/deployment scopes, current work-order binding, delegation narrowing, expiry, audience, and revocation behavior. | Caller authentication, ownership, driver identity, registrar authority, or generic operator text is not activation authority. |
 | RFC 0015 runtime slices, including `EVT-003`, `EVID-001`, and the C03 trust profile | Behavior-free Event/Evidence values, owner package behavior, authenticated durable commit receipts, integrity/signature path, completeness, visibility, and Store durability. | Registry cannot mint Event/Evidence coordinates or call a current trace row durable proof. |
 | `FND-003` | Accepted recovery and linearization protocol for independent Registry/Event/Evidence stores and for current Artifact/Lineage/conformance/Authority revocation races that cannot share one authoritative transaction. | An outbox is not cross-store atomicity, and copying a current-status snapshot does not linearize a later revocation. |
 | `DEP-005` | Driver activation rollout, canary, health stop, promotion, and rollback ownership where any live installation can become active. | The narrow C03 state machine below is not a rollout controller and cannot activate production installations by itself. |
 
-Any implementation slice stops at its narrow port when one of these owners cannot
-supply the required fact. No Registry-local artifact, lineage, registrar,
-conformance, Event, Evidence, transaction, or rollout substitute is permitted.
+Any live implementation slice stops at its narrow port when one of these owners
+cannot supply the required fact. A deterministic in-memory port may test a
+closed Registry decision before live composition, but its result is explicitly
+non-live and cannot satisfy owner availability, durability, currentness, or C03
+proof. No Registry-local artifact, lineage, registrar, conformance, Event,
+Evidence, transaction, gate, deployment, or rollout substitute is permitted.
 
 ## Ownership and Dependency Direction
 
@@ -132,19 +146,28 @@ One mutation has one owner.
 | Surface | Owns under this RFC | Must not own under this RFC |
 | --- | --- | --- |
 | `crates/splendor-types` | Future behavior-free nominal values, closed records, strict parsing, deterministic serialization, and canonical projections only after `FND-001` and `FND-006` freeze the exact grammar. | Registry I/O, admission decisions, lifecycle transitions, currentness, evidence completeness, artifact/lineage/authority decisions, driver selection, or Gateway execution. |
-| `crates/splendor-gateway::registry` | Sole admission validation, immutable admission semantics, lifecycle state machine, generation allocation, expected-generation CAS interpretation, exact current query, Registry-owned evidence projection, command idempotency, and Registry recovery decisions. | Concrete provider behavior, C03 authority, Artifact/Lineage truth, Event/Evidence durability, Store policy, driver invocation, rollout, or endpoint health ownership. |
-| `crates/splendor-store` | Persistence traits/engines for owner-approved immutable records, unique indexes, permanent non-reuse markers, transactions, CAS, outbox rows, integrity storage, and exact reads. | Registrar policy, admission legality, lifecycle transition legality, current-proof eligibility, evidence completeness, retry policy, or latest selection. |
+| `crates/splendor-gateway::registry` | Sole admission validation, immutable admission semantics, activation/lifecycle state machine, generation allocation, expected-generation CAS interpretation, repository/application ports, exact current query, per-slot Registry evidence projection, publication finalization, command idempotency, and Registry recovery decisions. | Concrete provider behavior, C03 authority, Artifact/Lineage truth, Event/Evidence durability, Store policy, driver invocation, gate/rollout decisions, or endpoint health ownership. |
+| `crates/splendor-store` | Generic persistence primitives/engines that a composition-owned Registry repository adapter may use for immutable records, unique indexes, transactions, CAS, outbox rows, integrity storage, and exact reads. | A Registry repository trait, registrar policy, admission legality, activation/lifecycle legality, current-proof eligibility, publication completeness, retry policy, or latest selection. |
 | future `crates/splendor-evidence` | RFC 0015 Event append, Evidence commit, durability, integrity, completeness, authenticated receipts, restricted views, and replay plans. | Registry admission/lifecycle meaning, Artifact/Lineage truth, registrar authority, C03 migration authority, or driver invocation. |
 | Artifact and Lineage owners | Immutable artifact identity/attestation and producer/integrity/signing/current-trust facts supplied through narrow authenticated ports. | Registry admission, Registry lifecycle, C03 migration, or self-certification. |
-| Authority | Authenticated registrar operation/scope, work order, audience, delegation, expiry, revocation, and C03 migration decision supplied through narrow authenticated ports. | Registry state, Registry evidence, Event/Evidence durability, or driver self-admission. |
+| Authority | Authenticated registrar operation/scope, separately narrowed target-specific activation operation/scope, work order, audience, delegation, expiry, revocation, and C03 migration decision supplied through narrow authenticated ports. | Registry state, Registry evidence, Event/Evidence durability, gate/rollout decisions, or driver self-admission. |
 | daemon, SDK, CLI, bindings | Authentication and endpoint-scope enforcement, closed command/query translation, client ergonomics, safe restricted display. | Direct Store mutation, admission/lifecycle decisions, currentness inference, alternate lookup, client-side authority, or hidden Registry ownership. |
-| C03 / Authority migration owner | Exact consumption of Registry admission/current evidence during RFC 0014 proof validation and final migration CAS. | Mutating Registry state, minting Registry evidence, inferring a generation, or repairing missing proof. |
+| C03 / Authority migration owner | Exact consumption of per-slot Registry/current evidence during RFC 0014 proof validation and final migration CAS. | Mutating Registry state, minting Registry evidence, inferring a generation, or repairing missing proof. |
 | driver, adapter, endpoint, node | Supply untrusted proposals or separately owner-attested implementation facts where a later contract permits them. | Admitting, activating, attesting, certifying, selecting, or authorizing themselves. |
 
 Registry defines narrow outbound ports for authenticated current Authority,
 Artifact, Lineage, conformance, and Event/Evidence operations. Composition may
 bridge those ports. A bridge may authenticate, translate, and map failures; it
 cannot decide admission or mutate another owner's records.
+
+Registry also defines its repository port in `splendor-gateway::registry`.
+Because the target dependency policy forbids a direct dependency from
+`splendor-gateway` to `splendor-store`, a process-composition adapter that is
+allowed to depend on both implements that port with generic `splendor-store`
+primitives. Registry does not import Store, Store does not import Gateway, and
+the adapter owns no Registry semantics. Contract tests cover the Registry port,
+generic persistence behavior, CAS/outbox failure mapping, and the absence of a
+second mutation owner.
 
 ## Exact RFC 0013 Reuse
 
@@ -164,10 +187,12 @@ This RFC imports without copying, renaming, widening, wrapping, or translating:
   execution.
 
 Registry admission consumes one already validated RFC 0013 declaration and its
-exact canonical bytes. It selects a sink only by exact
-`SecretCredentialSlotId`, then binds the complete canonical sink-entry bytes. It
-does not create a second operation coordinate, slot grammar, profile grammar,
-declaration DTO, manifest field, or canonical serializer.
+exact canonical bytes. Admission is declaration-wide: it binds every entry,
+including each exact `SecretCredentialSlotId` and complete canonical sink-entry
+bytes, and selects none. A later C03 projection selects one entry only by its
+exact slot ID and binds that entry under a distinct per-slot Registry evidence
+identity. Registry does not create a second operation coordinate, slot grammar,
+profile grammar, declaration DTO, manifest field, or canonical serializer.
 
 RFC 0013 intentionally defines no declaration digest. This RFC requires a later
 FND-001-owned canonical digest profile over the exact RFC 0013 canonical
@@ -188,12 +213,16 @@ future grammar.
 | Semantic family | Minimum meaning |
 | --- | --- |
 | Registry installation scope | One immutable tenant-bound installation identity and exact deployment/locality/trust scope digest. It is distinct from a global driver definition/version and from every endpoint instance. |
-| Authenticated admission command | One permanently identified registrar command binding trusted actor context, exact installation, exact operation declaration, immutable artifacts, owner attestations, conformance, compatibility, and required durability. |
-| Immutable admission record | One owner-issued, content-bound acceptance of the exact installation/operation/revision/artifact/evidence coordinate, with immutable owner time/revision and no mutable endpoint or lifecycle field. |
-| Lifecycle transition command and record | One authenticated expected-generation CAS request and one immutable owner transition fact binding prior/new state and generation plus cause evidence. |
+| Authenticated admission command | One permanently identified registrar command binding trusted actor context, exact installation, the complete operation declaration and every sink, immutable artifacts, owner attestations, conformance, compatibility, and required durability. It grants no activation authority. |
+| Immutable admission source record | One owner-issued, content-bound, non-live acceptance of the exact installation/declaration/artifact/evidence coordinate, with immutable owner time/revision and an initial `admitted` generation. It contains no downstream Event/Evidence receipt. |
+| Activation command and source record | One separately authenticated target-state command with narrowed activation authority and exact deployment/gate/rollout evidence, plus one immutable expected-generation CAS fact moving `admitted` to `active`. |
+| Lifecycle transition command and source record | One authenticated expected-generation CAS request and one immutable owner transition fact binding prior/new state and generation plus cause evidence. It never performs activation. |
 | Lifecycle head | The sole mutable Registry pointer for one immutable admission coordinate, containing its exact current state, generation, record revision/digest, and integrity binding. |
+| Per-slot C03 Registry evidence | One immutable Registry-owned source record per exact admission, active generation, and RFC 0013 sink entry. RFC 0014's frozen `registry_admission_evidence_id` and digest name this per-slot record without changing its 18-member bundle. |
 | Exact currentness query | One authenticated, visibility-checked query over the complete admission coordinate and expected lifecycle generation. It has no name, latest, alias, endpoint, or fallback mode. |
-| Exact current lifecycle evidence | One owner-issued, access-filtered, durable observation that the exact immutable admission is still the exact current `active` generation at an owner verification time. It is non-authorizing and cannot replace the final owner recheck. |
+| Exact current-observation source record | One owner-issued, access-filtered immutable observation that the exact admission and per-slot evidence are still the exact current `active` generation at an owner verification time. It contains no downstream publication receipt and cannot replace the final owner recheck. |
+| Publication finalization record | One separate immutable Registry record binding an already-fixed source identity/digest to exact downstream Event/Evidence acknowledgements and opening the family-specific result for external visibility. It never mutates the source. |
+| Command/publication recovery state | Private owner state for claimed, source-committed, awaiting-publication, outcome-uncertain, or finalized work. It is not a Registry lifecycle state and grants no live visibility. |
 | Restricted Registry view | One audited access-filtered projection for authorized diagnostics or historical inspection. Redaction preserves explicit omission/inaccessibility and never converts incomplete proof into current proof. |
 
 ## Identity Separation and Exact Coordinates
@@ -211,12 +240,15 @@ The following concepts remain distinct even when values happen to be equal:
    transport realization. Endpoint health and locators are not part of the C03
    admission coordinate or evidence defined here.
 4. **Operation declaration identity** is the exact canonical RFC 0013
-   `DriverOperationRef`, positive declaration revision, complete declaration
-   bytes/digest, exact slot ID, and complete sink-entry bytes/fingerprint.
+   `DriverOperationRef`, positive declaration revision, and complete declaration
+   bytes/digest with every canonical sink entry. It is declaration-wide.
 5. **Admission identity** is the Registry owner's immutable acceptance of one
    exact installation and operation declaration coordinate under one exact set
    of verified source facts.
-6. **Lifecycle generation** is an owner-assigned monotonic counter for one
+6. **Per-slot C03 evidence identity** identifies one exact slot-entry projection
+   under one exact admission and active lifecycle generation. It is not the
+   declaration-wide admission identity and cannot be reused for another slot.
+7. **Lifecycle generation** is an owner-assigned monotonic counter for one
    admission. It is not a declaration revision, artifact version, owner
    revision, Event sequence, Evidence revision, endpoint generation, or C03 ref
    revision.
@@ -224,9 +256,10 @@ The following concepts remain distinct even when values happen to be equal:
 The C03 proof coordinate is exactly one tenant scope, installation identity and
 scope digest, admission identity and digest, canonical operation bytes, positive
 declaration revision, complete declaration digest, exact slot-entry bytes or
-fingerprint, lifecycle state `active`, and one lifecycle generation. Name-only,
-endpoint-only, alias, tag, mutable head, latest, newest numeric revision, bare
-digest, timestamp, or coincident counter equality proves nothing.
+fingerprint, distinct per-slot Registry evidence identity/digest, lifecycle
+state `active`, and one lifecycle generation. Name-only, endpoint-only, alias,
+tag, mutable head, latest, newest numeric revision, bare digest, timestamp, or
+coincident counter equality proves nothing.
 
 ## Authenticated Admission
 
@@ -266,7 +299,7 @@ normalized semantics bind at least:
 - the complete canonical RFC 0013 declaration bytes and required declaration
   digest;
 - every canonical sink-entry byte sequence and fingerprint in that declaration,
-  including the exact entry selected for later C03 proof;
+  with no selected admission slot;
 - every immutable implementation and destination-projector artifact identity,
   version, content digest, and manifest digest applicable to that declaration;
 - exact Artifact attestation identity/digest, signer/builder/producer trust and
@@ -288,53 +321,65 @@ corrupt, unsigned/untrusted, or uncertain fact rejects admission. A driver,
 adapter, endpoint, publisher, builder, test harness, or node cannot be both the
 subject and the required independent registrar/conformance attestor.
 
-### Immutable admission record
+### Immutable admission source record
 
-The Registry owner materializes the immutable admission record. The caller does
-not supply a committed record, admission digest, owner revision/time, lifecycle
-generation, Event receipt, Evidence receipt, or success result.
+The Registry owner materializes the immutable admission source record. The
+caller does not supply a committed record, admission digest, owner
+revision/time, lifecycle generation, Event receipt, Evidence receipt,
+publication finalization, or success result.
 
 The record binds all normalized semantics plus:
 
 - one owner-assigned immutable admission identity;
 - one owner-assigned admission revision and commit time;
-- the canonical admission record digest and predecessor/current integrity
-  binding required by the accepted FND/Event/Evidence profiles;
+- canonical admission source bytes and predecessor/current integrity binding
+  required by the accepted FND profiles, with the source digest computed over
+  those fixed bytes and retained alongside rather than inside them;
 - exact source-owner receipt and attestation identities/digests used in the
   decision;
 - the authenticated allow decision and registrar/work-order binding;
 - the exact owner transaction/command semantic digest;
-- the required Registry decision Event coordinate and append receipt; and
-- the required Registry admission Evidence bundle coordinate, commit receipt,
-  achieved durability, and trust/key-status binding.
+- the initial non-live lifecycle state `admitted` and owner-assigned first
+  positive generation; and
+- one owner-local outbox intent identity and required publication profiles,
+  fixed atomically with the source record but no downstream acknowledgement.
+
+The source record and its canonical digest contain no Registry publication
+finalization, Event coordinate/receipt, Evidence bundle coordinate/receipt, or
+digest that recursively depends on them. Its canonical bytes are fixed first;
+the atomically committed outbox intent references that already-fixed source
+identity/digest.
 
 The record is append-only. Endpoint instance, endpoint address, provider locator,
-installation health, current lifecycle state, current generation, approved C03
-destination set, secret ref, lease, or mutable alias is not an admission-record
-field. Those concepts either belong to another owner or to the separate
-lifecycle head.
+installation health, approved C03 destination set, secret ref, lease, or mutable
+alias is not an admission-record field. Current lifecycle state/generation live
+only in the separate lifecycle head; the source record retains only its initial
+`admitted` fact. The remaining concepts belong to another owner.
 
-Registry enforces one immutable admission per exact installation/global-version/
-operation/declaration-revision coordinate. A distinct command with byte-for-byte
-equal normalized semantics may resolve to the existing admission after full
-authorization and equality checks; it cannot create a second admission. The same
-coordinate with changed declaration, sink entry, artifact, attestation, lineage,
-conformance, compatibility, installation scope, or trusted binding is a permanent
-conflict. It cannot overwrite or repair the original record.
+Idempotency uniqueness is the stable command key, not the declaration
+coordinate. The same command with byte-for-byte equal normalized semantics
+resumes or returns its one original admission after publication and release
+checks; changed semantics under that command permanently conflict. A separately
+authorized new command may admit the same installation/global-version/operation/
+declaration revision under a new immutable admission identity only with complete
+fresh Artifact, Lineage, conformance, compatibility, Authority, and
+key/revocation proofs. Its own publication then follows the acyclic path below.
+It neither overwrites nor reactivates an older admission.
 
-### Initial active generation
+### Non-live admitted generation
 
-A successful admission creates the immutable admission and its initial
-`active` lifecycle head as one Registry-owner mutation. The owner assigns the
-first positive generation. Neither caller nor Store chooses it. The admission is
-not externally successful or current-queryable until all required Registry
-records and RFC 0015 Event/Evidence commits have reached the effective durability
-floor.
+A successful admission source transaction creates the immutable declaration-wide
+admission and its initial non-live `admitted` lifecycle head. The owner assigns
+the first positive generation; neither caller nor a persistence adapter chooses
+it. No per-slot C03 evidence is active or externally consumable from admission
+alone.
 
-If that all-or-none owner mutation cannot be combined with the required
-Event/Evidence boundary or recovered through accepted `FND-003`, live admission
-is unsupported. A pending row, queued event, memory-only result, or best-effort
-append is not active admission.
+Admission success becomes externally visible only after its distinct publication
+finalization record proves the required Registry source durability and RFC 0015
+Event/Evidence acknowledgements. Even then the result means only `admitted`, not
+selectable, deployed, active, current, or C03-eligible. A pending source row,
+queued event, memory-only result, unfinalized outbox, or admission-only authority
+cannot create `active` state.
 
 ## Lifecycle and Generation CAS
 
@@ -344,57 +389,107 @@ The C03-required state semantics are:
 
 | State | Meaning for this RFC |
 | --- | --- |
+| `admitted` | The declaration-wide admission is immutable, published, and non-live. It grants no selection, deployment, activation, or C03 authority. |
 | `active` | The exact admission passed every required source and compatibility check and has not been superseded by a later Registry lifecycle transition. Only this exact current generation may produce C03 current evidence. |
 | `stale` | The admission remains immutable and inspectable, but a source, compatibility, policy, or lifecycle fact no longer permits new C03 use. It is non-live. |
 | `revoked` | The admission is permanently forbidden for new live use. History remains immutable. It is terminal. |
-| `quarantined` | Registry integrity, source-currentness, Store outcome, Event/Evidence publication, or recovery uncertainty prevents a trustworthy live decision. It is non-live and fail-closed. |
+| `quarantined` | A committed Registry integrity, security, safety, or source-trust decision irreversibly prevents live use. It is non-live and distinct from recoverable command/publication uncertainty. |
 
-`active` is assigned only by the initial successful admission. The allowed
-forward transitions are:
+A lifecycle-head CAS may commit before its publication finalization. Until that
+family's finalization and release checks pass, the committed source/head is
+private and cannot be represented externally as admitted, active, current, or
+successful. This private publication state does not add another lifecycle value.
+
+`active` is assigned only by the separately authorized activation operation
+below. The allowed forward transitions are:
 
 ```text
+admitted -> active | stale | revoked | quarantined
 active -> stale | revoked | quarantined
 stale -> revoked | quarantined
 quarantined -> revoked
 revoked -> no state
 ```
 
-There is no `stale -> active`, `quarantined -> active`, or `revoked -> active`
-shortcut in this bounded contract. A later valid implementation must perform a
-new authenticated admission with a new immutable admission identity and complete
-fresh proof. It cannot reuse the revoked admission, declaration revision, command
-identity, evidence identity, or old active record as new authority.
+There is no `stale -> active`, `quarantined -> active`, `revoked -> active`, or
+`active -> active` shortcut in this bounded contract. An old admission in any of
+those non-live states is never reactivated. A separately authorized new
+admission may bind the same complete declaration only under a new immutable
+admission identity, new command identity, and complete fresh source proofs. It
+cannot reuse the old command, admission, per-slot evidence, lifecycle generation,
+or active record as new authority. C03 always binds exactly one admission,
+per-slot evidence identity, and active generation.
 
-### Transition command and immutable record
+### Activation command and source record
 
-Every lifecycle transition is a separately authenticated command with one
-permanent nominal command/idempotency identity. Its normalized semantics bind:
+Activation is a distinct typed expected-generation CAS operation whose sole
+target state is `active`. Its stable command namespace and normalized semantics
+bind all of these:
 
-- trusted actor, tenant, Registry audience, exact work order, and explicit
-  lifecycle/registrar authority outside untrusted body fields;
+- authenticated tenant, authenticated activation actor/service principal,
+  Registry service audience, command family, and permanent nominal command ID;
+- exact target installation, declaration-wide admission source/publication
+  identities/digests, expected `admitted` generation/head digest, and target
+  deployment scope;
+- a target-specific activation operation and narrower Authority decision that
+  cannot be satisfied by registrar/admission authority;
+- exact deployment plan, independent gate decisions, rollout/canary status,
+  health-stop state, policy revision, and owner receipts from `DEP-005` or a
+  separately accepted activation contract;
+- current Artifact, Lineage, conformance, compatibility, signer/key/revocation,
+  work-order, and Authority status required by the activation profile; and
+- required durability, publication, causal, and audit inputs.
+
+Missing, wrong-target, overbroad, stale, revoked, inaccessible, unsigned,
+unfinalized, or uncertain activation/deployment/gate/rollout evidence denies
+before lifecycle CAS. Admission-only or registrar-only authority cannot invoke,
+delegate, or satisfy activation.
+
+An accepted activation source transaction compares the exact `admitted` head,
+assigns the next monotonic generation without wraparound, appends one immutable
+activation source record, atomically CAS-moves the sole lifecycle head to
+`active`, and commits one owner-local outbox intent. The source record binds the
+prior/new state and generation, exact admission/target/deployment/gate/rollout
+evidence, narrowed authority, command semantic digest, owner revision/time, and
+integrity. It contains no downstream Event/Evidence receipt or publication
+finalization. `active` remains externally unusable until the separate activation
+publication finalization commits, and every release rechecks the exact head and
+all current owner facts.
+
+### Transition command and source record
+
+Every non-activation lifecycle transition is a separately authenticated command
+with one permanent nominal command/idempotency identity. Its normalized
+semantics bind:
+
+- authenticated actor/service principal, tenant, Registry audience, exact work
+  order, and explicit target-state lifecycle authority outside untrusted body
+  fields;
 - the complete immutable admission coordinate and admission digest;
 - exact expected current lifecycle state, generation, head revision/digest, and
   integrity binding;
 - one exact allowed target state;
 - bounded owner-authenticated cause evidence, including current source-owner
-  status/revocation facts where applicable;
+  status/revocation facts;
 - required Event/Evidence profile, durability, causal, and audit inputs; and
 - no caller-provided owner time, next generation, next head revision, or success
   receipt.
 
 An accepted transition atomically compares the expected lifecycle head, assigns
 exactly the next monotonic generation without wraparound, appends one immutable
-transition record, and CAS-moves the sole lifecycle head. The transition record
-binds prior and new state, prior and new generation, admission identity/digest,
-cause evidence, command/semantic digest, actor/authority/work-order references,
-owner revision/time, integrity, and required Event/Evidence coordinates and
-receipts.
+transition source record, CAS-moves the sole lifecycle head, and commits one
+owner-local outbox intent. The transition source record binds prior and new
+state, prior and new generation, admission identity/digest, cause evidence,
+command/semantic digest, actor/authority/work-order references, owner
+revision/time, and integrity. It contains no downstream Event/Evidence receipt
+or publication finalization.
 
 History is never edited. A no-op target is not an accepted transition and
-allocates no generation. An exact duplicate returns the original transition and
-generation. A stale expected state/generation or changed duplicate commits
-nothing. Store enforces the owner-supplied CAS but does not decide transition
-legality.
+allocates no generation. An exact duplicate resumes the original publication and
+may release the original transition only after its finalization and current
+visibility checks. A stale expected state/generation or changed duplicate
+commits nothing. The Registry repository adapter enforces the owner-supplied CAS
+through generic Store primitives but does not decide transition legality.
 
 ### Race winners
 
@@ -403,10 +498,10 @@ The Registry lifecycle-head transaction is the Registry linearization point.
 1. An `active -> stale|revoked|quarantined` transition durably committed before
    a currentness head read wins. The read cannot emit active evidence.
 2. A currentness read that observes an active generation must compare that exact
-   generation again before releasing its success result after Event/Evidence
-   acknowledgement. If a transition won meanwhile, the active result is
-   withheld. Any already committed observation remains restricted historical
-   evidence only.
+   generation and every current activation/deployment/source fact again before
+   releasing its success result after publication finalization. If a transition
+   or external revocation won meanwhile, the active result is withheld. Any
+   already committed observation remains restricted historical evidence only.
 3. A transition committed after current evidence release but before RFC 0014's
    final Authority migration CAS still wins. Authority must recheck the exact
    Registry generation through the owner-supported linearization path in that
@@ -415,11 +510,16 @@ The Registry lifecycle-head transaction is the Registry linearization point.
    numerically equal generation from another admission, or earlier successful
    query never wins over the current lifecycle head.
 5. If a current Artifact, Lineage, conformance, signer, registrar, work-order, or
-   other independent-owner revocation race cannot participate in one authoritative
-   transaction or an accepted `FND-003` protocol, live admission, transition,
-   current-proof issuance, and final C03 use are unsupported and fail closed.
-   Copying a source status into Registry does not prove that a newer source
-   transition did not win.
+   activation/deployment/gate/rollout or other independent-owner revocation race
+   cannot participate in one authoritative transaction or an accepted `FND-003`
+   protocol, activation, current-proof issuance, and final C03 use are unsupported
+   and fail closed. Copying a source status into Registry does not prove that a
+   newer source transition did not win.
+6. Command/publication outcome uncertainty never changes the lifecycle head by
+   itself. Recovery may finalize and release only the original operation if its
+   exact source transaction committed, no later lifecycle transition won, and
+   every family-specific current fact passes a fresh recheck. Otherwise it stays
+   private/uncertain or returns opaque denial. It never performs reactivation.
 
 This RFC does not define containment of already running workloads or driver
 rollout. Those semantics remain with their catalog owners and `DEP-005`.
@@ -438,10 +538,12 @@ The C03 currentness query names the complete expected Registry coordinate:
 - tenant scope;
 - installation identity and immutable scope digest;
 - admission identity and admission digest;
+- exact per-slot C03 Registry evidence identity/digest;
 - canonical RFC 0013 operation bytes;
 - positive declaration revision and complete declaration digest;
 - exact slot ID and sink-entry bytes/fingerprint; and
-- expected `active` lifecycle generation.
+- expected `active` lifecycle generation plus exact activation
+  source/finalization identities/digests.
 
 The owner performs exact-key lookup only. It does not expose a query by driver
 name, operation name alone, global version alone, endpoint, alias, tag, latest,
@@ -450,22 +552,24 @@ partial prefix. It does not fall back to another installation, admission,
 revision, slot, generation, artifact, or endpoint.
 
 Before issuing active evidence, Registry revalidates the immutable admission and
-its integrity, exact current lifecycle head, required current source-owner
-trust/revocation facts, Registry evidence-signing/trust state, and required
+its publication finalization/integrity, exact activation source/finalization,
+exact current lifecycle head, target deployment/gate/rollout status, required
+Artifact/Lineage/conformance/compatibility/Authority/work-order/key/revocation
+facts, per-slot evidence publication, Registry signing/trust state, and required
 Event/Evidence availability through the accepted owner boundaries. Any mismatch
 or uncertainty produces no active evidence.
 
 ### Current lifecycle evidence
 
-One successful query returns one owner-issued, access-filtered immutable current
-lifecycle evidence value. It binds at least:
+One successful query first commits one owner-issued, access-filtered immutable
+current-observation source record. It binds at least:
 
-- evidence identity, profile/version, canonical digest, and Registry owner
-  integrity or signature-chain identity;
+- current-observation identity, profile/version, canonical source digest, and
+  Registry owner integrity or signature-chain identity;
 - exact tenant and Registry audience/visibility binding;
 - exact installation identity and scope digest;
-- exact admission identity, admission digest, and immutable admission-evidence
-  identity/digest;
+- exact admission identity, admission digest, and immutable per-slot C03
+  Registry evidence identity/digest;
 - exact canonical operation bytes, positive declaration revision, complete
   declaration digest, exact slot ID, and sink-entry bytes/fingerprint;
 - current lifecycle state `active` and the exact observed generation;
@@ -475,11 +579,19 @@ lifecycle evidence value. It binds at least:
   references;
 - current source-owner status/revocation references required by the admission
   profile;
-- exact Registry query/issuance semantic digest and permanent nominal query
-  identity;
-- required Registry Event coordinate and append receipt; and
-- RFC 0015 Evidence bundle coordinate, authenticated commit receipt, achieved
-  durability, completeness, and attestation binding.
+- exact activation source/finalization, deployment, gate, rollout, and narrowed
+  activation-authority references required by the live profile; and
+- exact Registry query/issuance semantic digest, permanent nominal query
+  identity, owner revision/time, integrity, and owner-local outbox intent.
+
+The current-observation source record and its digest contain no Event receipt,
+Evidence bundle coordinate/receipt, or current-observation publication
+finalization. Event/Evidence owners bind the already-fixed observation digest.
+A distinct immutable current-observation publication finalization then binds
+those acknowledgements and is the only publication record that can open release.
+It is distinct from admission, activation, lifecycle-transition, and per-slot
+C03-evidence publication records; none of their acknowledgements are required to
+be equal.
 
 The effective durability floor is the strictest Registry-profile, deployment,
 and caller-requested floor under RFC 0015. `memory_only`, queue acceptance,
@@ -492,12 +604,34 @@ authority. Its verification time does not give it a grace period. It cannot be
 refreshed by replay or reused as proof that the generation stayed current after
 issuance.
 
-Current-proof issuance has one permanent nominal query identity. An exact
-duplicate resumes or returns only the original immutable result and its original
-verification time after current visibility checks. It never creates a later time
-or silently refreshes authority. Changed semantics under that identity conflict.
-A caller requiring a later observation uses a new nominal query identity and
-still receives no authority from it.
+Current-proof issuance has one permanent nominal query identity and this closed
+private state machine:
+
+```text
+claimed -> source_committed -> awaiting_publication -> finalized
+   |              |                    |
+   +--------------+--------------------+-> outcome_uncertain
+```
+
+`outcome_uncertain` is command/publication recovery state, not lifecycle
+`quarantined`. Recovery may return to `awaiting_publication` or `finalized` only
+for the same retained claim, source bytes, and downstream commands.
+
+Every initial or duplicate release through the current endpoint reauthenticates
+the caller and rechecks exact visibility, lifecycle head/generation, activation
+and deployment/gate/rollout evidence, Artifact/Lineage/conformance/compatibility,
+Authority/work-order status, every signer/key/revocation fact, per-slot evidence,
+and current-observation publication finalization. If any local transition or
+external revocation won, the endpoint returns only the uniform opaque current
+denial. It never returns an old immutable observation typed as current. That
+observation remains available only through separately authorized, durably
+audited historical inspection.
+
+An exact duplicate that still passes every release check returns only the
+original immutable result and original verification time. It never creates a
+later time or silently refreshes authority. Changed semantics under that identity
+conflict. A caller requiring a later observation uses a new nominal query
+identity and still receives no authority from it.
 
 ### Restricted and redacted views
 
@@ -511,71 +645,135 @@ Redaction cannot omit a mandatory C03 coordinate and still label the proof
 complete or current. An access-filtered C03 consumer either receives every
 mandatory Registry coordinate and trusted receipt or fails closed.
 
-## Immutable Registry Admission Evidence for RFC 0014
+## Per-Slot C03 Registry Evidence for RFC 0014
 
-Registry emits one owner-specific immutable admission-evidence record through the
-RFC 0015 Event/Evidence owner. The record asserts only Registry-owned facts. Its
-Artifact, Lineage, and conformance entries are exact source references and
+The declaration-wide admission source record selects no sink. After a separately
+authorized activation reaches one exact `active` generation and its distinct
+publication finalization commits, Registry materializes one distinct immutable
+C03 evidence source record for each exact RFC 0013 sink entry required for C03
+proof. The records share the same admission and declaration but each has a
+different owner-assigned evidence identity and digest bound to exactly one
+`SecretCredentialSlotId` and complete sink-entry bytes/fingerprint. Evidence
+identity/digest reuse across slots, admissions, or generations is forbidden.
+
+RFC 0014's frozen field names `registry_admission_evidence_id` and
+`registry_admission_evidence_digest` refer to this per-slot Registry evidence
+record. This RFC does not rename those members or add another proof-bundle field.
+The record asserts only Registry-owned facts. Artifact, Lineage, conformance,
+activation, deployment, and gate entries are exact source references and owner
 receipts that Registry verified; Registry does not reissue those owners' claims.
 
-The C03 proof projection binds exactly these semantic facts:
+Each per-slot C03 evidence source record binds exactly these semantic facts:
 
-- Registry evidence identity, profile/schema version, canonical evidence digest,
-  and Registry owner integrity or signature-chain identity;
+- distinct Registry evidence identity, profile/schema version, canonical
+  evidence digest, and Registry owner integrity or signature-chain identity;
 - exact tenant scope;
 - exact installation identity and immutable scope digest;
-- immutable admission identity and admission digest;
+- immutable declaration-wide admission identity and admission digest;
 - exact canonical RFC 0013 `DriverOperationRef` bytes;
 - exact positive RFC 0013 declaration revision;
 - complete canonical RFC 0013 declaration digest;
-- exact `SecretCredentialSlotId` plus complete canonical sink-entry bytes and
-  fingerprint;
+- one exact `SecretCredentialSlotId` plus its complete canonical sink-entry bytes
+  and fingerprint;
 - lifecycle state `active` and the exact monotonic lifecycle generation observed
   for the migration proof;
-- exact immutable implementation/projector Artifact source refs, versions,
-  digests, and Artifact attestation refs/digests;
-- exact Lineage producer, integrity, and signing source refs/digests;
-- exact independent conformance source identity/digest and compatibility-policy
-  reference; and
-- exact RFC 0015 Registry decision Event coordinate/receipt and admission
-  Evidence bundle coordinate/commit receipt, owner revision, durability,
-  completeness, trust/key-status, and commit time.
+- exact activation source/finalization and deployment/gate/rollout source
+  references for that target;
+- exact immutable implementation/projector Artifact identities, versions,
+  content and manifest digests, plus Artifact attestation identities/digests and
+  signer/key/revocation references;
+- exact Lineage producer receipts, required relation set, integrity/signing
+  identities/digests, and current anti-tamper references;
+- exact independent conformance identity/digest, suite/profile/version,
+  environment, result, issuer, current trust/revocation references, and
+  compatibility-policy reference; and
+- owner revision/time, trust/key status, source-record integrity, publication
+  profile, and owner-local outbox intent.
+
+The per-slot source record and canonical digest contain no generic Event
+coordinate/receipt, Evidence bundle coordinate/commit receipt, or publication
+finalization. Event/Evidence commits bind the already-fixed per-slot record
+digest. A separate immutable per-slot publication finalization binds those
+downstream acknowledgements and opens that evidence identity/digest for RFC 0014
+use. One slot's finalization cannot publish another slot's record.
 
 The evidence contains no C03 `SecretRef`, source-entry identity, source-entry
 digest, source approved-destination set, source classification, C03 provider
-coordinate, purpose, Authority decision, migration command, target entry, target
-ref, lease, permit, delivery handle, or C03 current-head decision. It contains no
-endpoint instance or provider locator. Registry never attests those facts.
+coordinate, purpose, Authority migration decision, migration command, target
+entry, target ref, lease, permit, delivery handle, or C03 current-head decision.
+It contains no endpoint instance or provider locator. Registry never attests
+those facts.
 
-The admission evidence is immutable historical evidence that the admission was
-active at the named generation and was durably recorded. It is not currentness
-by itself. A later stale, revoked, or quarantined transition does not rewrite or
-delete it; the exact current query and final Authority CAS prevent live reuse.
+The per-slot evidence is immutable historical evidence that one exact sink entry
+under the declaration-wide admission was active at the named generation and was
+published durably. It is not currentness by itself. A later stale, revoked, or
+quarantined transition does not rewrite or delete it; the exact current query and
+final Authority CAS prevent live reuse.
 
 ## RFC 0014 Three-Way Proof Binding
 
 RFC 0014 remains authoritative for source/target C03 grammar and migration. This
 RFC supplies the missing Registry owner side of its proof join.
 
-For every migrated C03 source entry, all Registry coordinates must match
-byte-for-byte across:
+RFC 0014's proof bundle remains exactly the following eighteen non-null members,
+with its existing closed parsing, ordering, bijection, and no-reuse rules:
 
-1. the exact RFC 0014 proof bundle and its complete source/target entry binding;
-2. the exact Authority historical evidence record that binds that C03 source
-   entry and approved-destination set to one Registry evidence identity/digest
-   and Registry coordinate;
-3. the exact immutable Registry admission record and Registry admission-evidence
-   record; and
-4. the exact Registry current lifecycle evidence and final owner currentness
-   recheck.
+```text
+source_entry_identity
+source_entry_ordinal
+source_entry
+source_entry_digest
+authority_historical_evidence_id
+authority_historical_evidence_digest
+registry_admission_evidence_id
+registry_admission_evidence_digest
+registry_installation_id
+registry_installation_scope_digest
+registry_admission_id
+registry_admission_digest
+registry_declaration_digest
+registry_lifecycle_generation
+proven_driver_declaration_revision
+target_entry_ordinal
+target_entry
+target_entry_digest
+```
 
-The required equality includes tenant, installation identity/scope digest,
-admission identity/digest, Registry evidence identity/digest, canonical operation
-bytes, positive declaration revision, complete declaration digest, exact slot ID
-and sink-entry bytes/fingerprint, lifecycle state `active`, lifecycle generation,
-and every required RFC 0015 Event/Evidence coordinate, receipt, integrity,
-durability, and trust binding. The Authority record additionally owns the C03
-source facts; Registry records must not copy or attest them.
+This RFC adds no nineteenth member, extension, side field, receipt field, or
+alternate bundle version. Any such change requires a separately accepted RFC
+0014 amendment.
+
+For every migrated C03 source entry, direct byte equality from that exact bundle
+to the dereferenced per-slot Registry evidence record is limited to the Registry
+members RFC 0014 actually carries: Registry evidence identity/digest,
+installation identity/scope digest, admission identity/digest, complete
+declaration digest, lifecycle generation, and the proven declaration revision.
+The closed `source_entry` supplies the canonical operation and exact slot for the
+existing RFC 0014 validation; those values must also equal the Authority
+historical record and dereferenced per-slot Registry evidence. The Authority
+record additionally owns the C03 source-entry identity/digest, complete approved
+destination set, and source decision; Registry records do not copy or attest
+those facts.
+
+That operation/slot comparison is RFC 0014's existing validation of the closed
+`source_entry` and dereferenced owner records. It does not create another
+top-level direct Registry member in the frozen proof bundle.
+
+Event/Evidence coordinates, append/commit receipts, publication-finalization
+identities, durability, completeness, integrity, signer, and key-status paths are
+validated transitively, not compared as nonexistent bundle members. The verifier
+must dereference the exact authenticated Authority record and exact per-slot
+Registry evidence source record, verify each source digest, then verify each
+record's own acyclic publication finalization and RFC 0015 receipts bind that
+already-fixed source digest. Admission, activation, per-slot evidence, lifecycle
+transition, and current-observation publication records are distinct. Their
+Event/Evidence coordinates and receipts are never required to equal one another.
+
+The complete proof therefore combines direct equality for the frozen eighteen
+members with transitive owner-record/receipt validation. A hidden database join,
+unverified receipt reference, current-query publication receipt substituted for
+per-slot evidence publication, or per-slot evidence reused for another canonical
+source entry is a denial.
 
 A bare digest, timestamp, signature without its key/status path, database row,
 foreign key, join result, query result, current head, endpoint, operation lookup,
@@ -585,10 +783,11 @@ digest, and neither can substitute for the complete record and owner receipt.
 
 Current lifecycle evidence is non-authorizing and is a preflight input only.
 Immediately before the RFC 0014 Authority migration head CAS, Authority must
-recheck the exact admission and generation as current `active` through the
-Registry owner and an accepted same-transaction or `FND-003` protocol. If a
-stale/revoked/quarantined transition or required external revocation committed
-first, it wins and migration commits no target head.
+recheck the exact admission, per-slot evidence, generation, activation,
+deployment/gate/rollout status, and external trust facts as current `active`
+through the Registry owner and an accepted same-transaction or `FND-003`
+protocol. If a stale/revoked/quarantined transition or required external
+revocation committed first, it wins and migration commits no target head.
 
 Missing, hidden, inaccessible, stale, revoked, quarantined, incomplete, corrupt,
 wrong-owner, wrong-tenant/scope/audience, untrusted, expired/revoked-key,
@@ -600,23 +799,52 @@ lease, delivery, or other side effect.
 
 ### Permanent command identity
 
-Admission, lifecycle transition, and current-proof issuance each use one
-family-specific nominal command/query identity as their sole idempotency
-identity. Stable lookup is derived from authenticated tenant, authenticated actor
-or service principal where applicable, command family, and that nominal
-identity. Work order, admission, expected generation, evidence digest, request
-ID, trace ID, and body fields are deliberately not substitutes for or alternate
-lookup identities.
+Admission, activation, non-activation lifecycle transition, per-slot C03 evidence
+issuance, current observation, publication finalization, outbox delivery, and
+every other privileged internal Registry operation each use one family-specific
+nominal command/query identity as their sole idempotency identity.
+
+Every stable key unconditionally binds this complete namespace:
+
+```text
+authenticated tenant
+authenticated actor or internal service principal
+command/query family
+Registry service audience
+family-specific nominal identity
+```
+
+There is no anonymous, tenant-only, family-only, or principal-optional form.
+Cross-principal, cross-tenant, cross-audience, or cross-family reuse of the same
+nominal bytes addresses a different stable key and never reaches another key's
+record. Credential identity/status, work order, authority decision, admission,
+expected generation, evidence digest, request ID, trace ID, and body fields are
+not alternate lookup identities; where part of normalized semantics, any change
+under one stable key is a permanent conflict.
 
 After authentication, visibility, and dedicated-scope checks, the first accepted
-observation atomically claims that stable identity and retains the complete
-normalized semantic projection/digest plus owner first-observation time. The
-same identity and same normalized semantics returns or resumes only the original
-result. Any changed semantic byte, including changed work order, authority,
-scope, declaration, artifact, evidence, expected generation, cause, audience, or
-durability request, is a permanent conflict before a second admission,
-transition, generation, current-proof record, Event, or Evidence result is
-created.
+operation atomically claims that stable identity and retains the complete
+normalized semantic projection/digest plus owner first-observation time. All
+owner-assigned admission, activation, transition, per-slot evidence, current
+observation, finalization, outbox identities; owner times/revisions; lifecycle
+generations; and canonical source bytes are either deterministically derived
+from the retained claim or allocated and retained in the same atomic claim/source
+transaction. No allocator result may escape before that retention boundary.
+
+A crash before durable retention cannot consume an identity and later allocate a
+replacement. A claim-keyed allocator or deterministic derivation must return the
+same candidate on recovery; an outcome-uncertain transaction is queried by its
+same claim/transaction identity before any retry. The caller, persistence
+adapter, outbox worker, Event owner, and Evidence owner cannot choose or replace
+Registry-owned values.
+
+The same stable key and same normalized semantics resumes only the original
+source/publication path. Release of its original result still requires the
+family-specific fresh checks in this RFC. Any changed semantic byte, including
+changed credential, work order, authority, scope, declaration, artifact,
+evidence, expected generation, cause, audience, or durability request, is a
+permanent conflict before a second source record, generation, publication,
+Event, or Evidence result is created.
 
 Full records and their non-reuse markers have no TTL in this contract. Retention
 may remove payloads only after an accepted protocol durably commits an immutable
@@ -624,70 +852,110 @@ non-reuse tombstone binding the stable key, semantic digest, original result or
 uncertainty, owner/integrity chain, and retention generation. Missing, corrupt,
 inaccessible, compacted, or uncertain history never becomes a fresh miss.
 
-### Unknown commit state
+### Command and publication outcome uncertainty
 
-If Registry Store cannot prove commit or absence, the exact command and every
-already allocated coordinate enter quarantine. Registry returns no success,
-allocates no replacement command/admission/evidence identity, chooses no new
-generation or timestamp, and does not retry under changed bytes. Recovery queries
-the same command and transaction identity and may only:
+If the Registry repository port or a downstream owner cannot prove commit or
+absence, the exact command enters private `outcome_uncertain` recovery state.
+This state is not lifecycle `quarantined`, does not move the lifecycle head, and
+is never externally visible as success/currentness. Registry allocates no
+replacement command/admission/evidence/finalization identity, generation, time,
+or source bytes and does not retry under changed semantics.
 
-- return the original retained result and coordinates;
-- prove no mutation and resume the one original command under its retained
-  semantics; or
-- remain quarantined and require intervention.
+Recovery queries the same stable key, claim, source transaction, outbox command,
+and downstream idempotency identities. It may only:
 
-Once an admission identity, owner time/revision, lifecycle generation, Event
-identity, Evidence identity, or canonical record bytes are allocated and
-retained, every recovery path reuses them exactly. An immutable admission or
-transition found without its required integrity/Event/Evidence binding is
-quarantined, never inferred complete or repaired by a new row.
+- recover the original retained source and continue its original publication;
+- prove no source mutation and resume the same retained/deterministic claim;
+- recover the original finalization and consider family-specific release; or
+- remain `outcome_uncertain` and require intervention.
 
-Inspect-only replay is not the reconciler. A sole Registry-owned reconciler may
-advance retained owner-local states by CAS after all dependencies exist, but it
-cannot allocate alternate identities, change semantics, reauthorize a registrar,
-select latest, call a driver, invoke the Gateway, perform C03 migration, or infer
-an external owner's current state.
+Before releasing a recovered admission, activation, transition, per-slot
+evidence, or current observation, Registry rechecks authentication/visibility,
+the exact lifecycle head, and every family-specific current source,
+activation/deployment, trust, key, and revocation fact. If a later lifecycle
+transition or external revocation won, the original immutable record remains
+historical and the live/current endpoint returns opaque denial. Recovery never
+performs activation or reactivation.
+
+An immutable source record found without its required integrity or publication
+finalization stays private and incomplete; it is never inferred complete or
+repaired with new identities. Inspect-only replay is not the reconciler. A sole
+Registry-owned reconciler may advance retained owner-local recovery/publication
+state by CAS after all dependencies exist, but it cannot allocate alternate
+identities, change semantics, reauthorize a caller, select latest, call a driver,
+invoke the Gateway, perform C03 migration, or infer an external owner's current
+state.
 
 ## Event, Evidence, and Outbox Ordering
 
-RFC 0015 owns Event/Evidence contracts and durability. Registry owns the source
-mutation and its truthful completion barrier.
+RFC 0015 owns Event/Evidence contracts and durability. Registry owns source
+mutations, owner-local outbox intent, and the separate Registry publication
+finalization that truthfully gates external visibility. Every admission,
+activation, lifecycle transition, per-slot C03 evidence, and current-observation
+operation follows this acyclic graph:
 
-No successful admission, lifecycle transition, or current-proof receipt may be
-returned, published, discovered, or consumed by C03 before:
+1. Registry authenticates/authorizes, claims the stable key, fixes canonical
+   source bytes, computes the source digest, and atomically commits the immutable
+   source record, required lifecycle head/CAS, command state, and one owner-local
+   outbox intent that references that already-fixed source identity/digest.
+2. Event owner accepts an authenticated idempotent append whose subject is that
+   exact source identity/digest and returns its append receipt only after the
+   required durability floor.
+3. Evidence owner accepts an authenticated idempotent commit that binds that
+   same source identity/digest, required Event receipt and source-owner facts,
+   then returns its bundle coordinate/receipt only after required completeness,
+   integrity, and durability.
+4. Registry validates those exact acknowledgements and commits a separate
+   immutable publication finalization record binding the fixed source
+   identity/digest, outbox identity, Event coordinate/receipt, Evidence bundle
+   coordinate/receipt, achieved durability/completeness, owner trust/key status,
+   finalization identity/revision/time, and family-specific release state.
+5. Registry performs the family-specific fresh head/source/revocation checks and
+   only then releases success or current visibility. Every duplicate release
+   repeats those checks.
 
-1. the Registry owner has committed the required immutable Registry records,
-   lifecycle head/CAS where applicable, command idempotency state, and canonical
-   owner result at the effective Registry durability floor;
-2. every required Registry decision/transition/current-observation Event has
-   reached the effective RFC 0015 Event durability floor; and
-3. every required owner-specific Registry Evidence bundle and authenticated
-   `EvidenceCommitReceipt` has reached the effective RFC 0015 Evidence durability
-   floor with complete exact source bindings.
+Every source uses a non-self-referential owner envelope. Canonical source payload
+bytes exclude their own digest and all downstream acknowledgements; Registry
+computes the digest only after those bytes are fixed and retains the identity,
+payload, and digest atomically. An outbox intent may carry its preassigned
+identity in the source payload, but the outbox row that references the resulting
+source digest is a distinct atomically committed record. No source digest,
+outbox digest, Event receipt, Evidence receipt, or finalization digest recursively
+contains itself.
 
-When Registry and Event/Evidence share one supported Store transaction, owner
-code may commit only the records each owner defines while the Store provides the
-atomic boundary. Neither owner interprets or rewrites the other's semantics.
+The source record, per-slot C03 evidence source, current-observation source, and
+their canonical digests contain none of their own downstream acknowledgements or
+publication-finalization values. Finalization never mutates a source record. Its
+own digest is not recursively made a prerequisite of the Event/Evidence commits
+that it records; any later audit event about finalization is a separate
+non-gating source operation.
 
-When they use independent stores, Registry writes its source mutation and one
-unique owner-local outbox command in the same Registry transaction. Event/Evidence
-uses authenticated inbox deduplication and at-least-once delivery, returns the
-original acknowledgement for an exact duplicate, and permanently conflicts on a
-same identity with changed bytes. Registry opens success/current visibility only
-after validating the exact owner acknowledgement and performing any required
-final lifecycle-head recheck.
+Admission, activation, lifecycle transition, per-slot evidence, and current
+observation each have distinct outbox commands, Event/Evidence commits, and
+publication finalizations. A receipt from one family/source cannot finalize
+another. Queue acceptance, unacknowledged outbox state, memory-only state, a bare
+digest, or a generic database row is never publication success.
 
-That independent-store path remains blocked until accepted `FND-003` recovery
+When Registry and Event/Evidence share one supported persistence transaction,
+the owners may commit their separately owned records through a composition
+boundary while retaining the source-before-acknowledgement digest graph. Neither
+owner interprets or rewrites the other's semantics. When they use independent
+stores, the Registry source record and outbox intent share one local atomic
+transaction; Event/Evidence use authenticated inbox deduplication and
+at-least-once delivery. Registry finalizes only after validating the original
+acknowledgements.
+
+The independent-store path remains blocked until accepted `FND-003` recovery
 defines the publication barrier and all crash winners. No implementation may
 call two commits atomic, claim distributed exactly-once, acknowledge queueing as
 durability, drop backlog, or infer success from an absent acknowledgement. If
-Registry state and its outbox cannot share one local atomic transaction, the
-source mutation is unsupported and fails closed.
+Registry source state and its outbox cannot share one local atomic transaction,
+the source mutation is unsupported and fails closed.
 
-An Event or Evidence receipt proves only its owner's durable record. It does not
-grant registrar authority, make an admission legal, keep a lifecycle generation
-current, authorize C03 migration, or permit a Gateway/provider effect.
+An Event, Evidence, or Registry publication-finalization receipt proves only its
+bounded durable record. It does not grant registrar/activation authority, make
+an admission legal, keep a lifecycle generation current, authorize C03
+migration, or permit a Gateway/provider effect.
 
 ## Security, Privacy, and Oracle Resistance
 
@@ -698,10 +966,10 @@ current, authorize C03 migration, or permit a Gateway/provider effect.
   secret, secret-derived hash, provider request/error, mutable endpoint, provider
   locator, protected payload, approval token, Gateway permit, lease material, or
   driver result payload.
-- Registrar authority, caller identity, tenant, audience, work order, expiry,
-  and revocation are trusted outer bindings. A driver, adapter, manifest,
-  endpoint, node report, Event, Evidence bundle, message, or body field cannot
-  grant or broaden them.
+- Registrar/activation authority, caller identity, tenant, audience, work order,
+  target scope, expiry, and revocation are trusted outer bindings. A driver,
+  adapter, manifest, endpoint, node report, Event, Evidence bundle, message, or
+  body field cannot grant or broaden them.
 - Artifact signatures, Lineage signatures, conformance attestations, Registry
   evidence signatures, and their trust/key-status/revocation chains are distinct.
   One valid signature cannot satisfy another owner or purpose. Unavailable or
@@ -728,11 +996,12 @@ current, authorize C03 migration, or permit a Gateway/provider effect.
   omissions and never hide contradictory or unavailable facts as absent.
 - Registry current evidence, RFC 0015 completeness, Event presence, a Store row,
   or an Artifact/Lineage reference is not authority.
-- No admission, transition, query, evidence build, replay, or recovery path may
-  call a provider, driver, adapter, node target, network, filesystem, device, or
-  Gateway side effect.
+- No admission, activation, transition, query, evidence build, replay, or
+  recovery path may call a provider, driver, adapter, node target, network,
+  filesystem, device, or Gateway side effect.
 - No shared agent, daemon, SDK, CLI, bridge, Store, or evidence service may
-  inherit or launder registrar, tenant, work-order, C03, or Gateway permission.
+  inherit or launder registrar, activation, tenant, work-order, C03, or Gateway
+  permission.
 
 ## Compatibility and Historical Import
 
@@ -757,10 +1026,12 @@ The following are not retroactive Registry admission proof:
 
 Historical inspection or import may preserve exact validated bytes and their
 original provenance under a non-live classification. It cannot mark an imported
-declaration or adapter `active`, allocate a live generation, mint Registry
-admission/current evidence, or make C03 migration possible unless the complete
-new authenticated admission path verifies every required immutable/current owner
-fact and commits the new owner records.
+declaration or adapter `admitted` or `active`, allocate a live generation, mint
+Registry admission/per-slot/current evidence, or make C03 migration possible.
+Only the complete new authenticated declaration-wide admission path may create a
+new non-live admission; only the separate narrowed activation path with current
+deployment/gate/rollout proof may create `active`; and only the per-slot and
+current publication paths may support RFC 0014.
 
 There is no dual Registry owner and no dual-write bridge. Existing stable
 adapter registration continues only as the existing compatibility path. It does
@@ -785,30 +1056,32 @@ Replay is inspect-only by default. With current read authority it may reconstruc
 - Event/Evidence publication and crash-recovery state; and
 - RFC 0014 proof equality or mismatch explanations over retained records.
 
-Replay, import, simulation, and policy comparison cannot admit a driver,
-transition or reactivate a lifecycle, allocate a generation, refresh Artifact,
-Lineage, conformance, Authority, key, or Registry current state, emit a live
-currentness receipt, move a Registry head, select or invoke a driver, call an
-endpoint, issue a Gateway permit, or perform C03 migration. A historical active
-record remains historical. A non-live simulation must use detached state and can
-produce only explicitly non-authorizing results.
+Replay, import, simulation, and policy comparison cannot admit or activate a
+driver, transition or reactivate a lifecycle, allocate a generation, refresh
+Artifact, Lineage, conformance, Authority, key, or Registry current state, emit a
+live currentness receipt, move a Registry head, select or invoke a driver, call
+an endpoint, issue a Gateway permit, or perform C03 migration. A historical
+active record remains historical. A non-live simulation must use detached state
+and can produce only explicitly non-authorizing results.
 
 ## Sequenced Implementation Plan, Tests, and Stops
 
 Every slice is separately reviewed. Passing one slice does not satisfy a later
 owner dependency or authorize a live route.
 
-### Slice 1 - Dependency and grammar freeze
+### Slice 1 - Grammar and port-contract freeze
 
 Scope:
 
 - accept and implement the required `FND-001` nominal/schema/digest grammar and
   `FND-006` compatibility/migration rules;
-- preserve RFC 0013 types, validation, and canonical bytes exactly;
-- accept/implement the required Artifact, Lineage, registrar Authority,
-  independent conformance, RFC 0015 `EVT-003`/`EVID-001` Event/Evidence,
-  `FND-003`, and `DEP-005` contracts; and
-- define no Registry code while a required owner coordinate remains unresolved.
+- preserve RFC 0013 types, validation, complete declaration bytes, and every
+  sink-entry byte exactly;
+- freeze only behavior-free Registry values and narrow owner ports needed for
+  deterministic tests; and
+- record Artifact, Lineage, registrar/activation Authority, conformance,
+  `EVT-003`/`EVID-001`, `FND-003`, and `DEP-005` as later live-composition stops,
+  not prerequisites to pure state-machine tests.
 
 Tests and evidence:
 
@@ -816,181 +1089,215 @@ Tests and evidence:
 - exact RFC 0013 declaration and sink-entry byte reuse, with no second serializer
   or operation/slot/profile type;
 - compatibility classification, N-1/N/N+1 read/deny, rollback, and persisted
-  migration fixtures;
-- Artifact/Lineage/conformance/registrar trust and revocation fixtures; and
-- retained evidence that every named dependency is implemented rather than
-  docs-claimed.
+  migration fixtures; and
+- dependency matrix proving which owner port blocks each live slice.
 
 Stop conditions:
 
 - stop on any unresolved ID, schema, digest, canonical-byte, timestamp, bound,
   error, generated parity, or migration question owned by `FND-001`/`FND-006`;
-- stop if conformance is self-attested or lacks exact artifact/environment/suite
-  binding;
-- stop if Artifact, Lineage, registrar Authority, RFC 0015 runtime, `FND-003`, or
-  `DEP-005` remains incomplete for the intended live path.
+- no live owner is represented by a permissive fake or docs claim; and
+- no external/generated surface before its parity and migration fixtures pass.
 
 ### Slice 2 - Behavior-free Registry values
 
 Scope:
 
-- add only the accepted closed values, strict parsing, deterministic
-  serialization, canonical projections, and code-only non-reflecting errors to
+- add only accepted closed values, strict parsing, deterministic serialization,
+  canonical projections, and code-only non-reflecting errors to
   `splendor-types`;
-- expose no service trait, Store, current lookup, lifecycle decision, daemon,
-  SDK, CLI, generated surface, or I/O; and
+- expose no service trait, repository, current lookup, lifecycle decision,
+  daemon, SDK, CLI, generated surface, or I/O; and
 - retain exact RFC 0013 values rather than wrappers or copies.
 
 Tests and evidence:
 
 - positive, unknown/duplicate/null/oversize/wrong-ID/wrong-owner/wrong-scope
   grammar fixtures;
-- nominal compile-time non-interchangeability among command, installation,
-  admission, lifecycle, Event, Evidence, endpoint, and C03 identities;
+- nominal non-interchangeability among admission, activation, lifecycle,
+  per-slot evidence, publication, Event, Evidence, endpoint, and C03 identities;
 - canonical bytes/digests and complete coordinate mutation tests; and
-- API tests proving no unchecked constructor, generic authorizing map,
-  `extensions` authority, alternate declaration parser, or authority conversion.
+- no unchecked constructor, generic authorizing map, `extensions` authority,
+  alternate declaration parser, or authority conversion.
 
 Stop conditions:
 
-- no behavior-free implementation before this RFC and the exact grammar owners
-  are accepted;
-- no generated/external surface before `FND-006` parity and migration fixtures;
-- no runtime or Store behavior in this slice.
+- no behavior-free implementation before this RFC and exact grammar owners are
+  accepted; and
+- no runtime, repository adapter, or live owner behavior in this slice.
 
-### Slice 3 - Registry owner state machine
+### Slice 3 - Deterministic Registry owner state machine
 
 Scope:
 
-- implement admission, immutable records, lifecycle transition legality,
-  permanent command identity, exact current-query interpretation, and recovery
-  decisions only in `splendor-gateway::registry`;
-- use deterministic in-memory ports to prove owner semantics; and
-- keep Artifact, Lineage, conformance, Authority, Store, and Event/Evidence behind
-  narrow authenticated ports.
+- implement declaration-wide non-live admission, activation/lifecycle legality,
+  per-slot evidence projection, source/finalization separation, permanent command
+  identity, current-release interpretation, and recovery decisions only in
+  `splendor-gateway::registry`;
+- define the Registry-owned repository/application port; and
+- use deterministic in-memory owner ports to prove semantics without claiming
+  external trust, durability, currentness, or live composition.
 
 Tests and evidence:
 
-- complete valid admission and exact duplicate return one admission/generation;
-- same command or admission coordinate with changed trusted or semantic bytes
-  conflicts before a second record;
-- wrong registrar/work order/tenant/audience/installation/operation/revision,
-  tampered artifact, revoked signer, incomplete lineage, self-attested
-  conformance, or incompatible runtime denies;
-- initial active generation, every allowed transition, every forbidden reverse
-  or no-op transition, exact generation increment, overflow denial, stale CAS,
+- a two-or-more-slot declaration creates one admission and distinct per-slot C03
+  evidence identities/digests without duplicate admission or slot conflict;
+- admission creates only `admitted`; admission/registrar authority cannot
+  activate; correct target-specific activation authority is narrower;
+- wrong/missing target, activation, deployment, gate, rollout, health-stop, or
+  current policy evidence denies before CAS;
+- same command/same semantics resumes one source; changed semantics conflict;
+  a separately authorized fresh command may create a new admission for the same
+  declaration without reactivating stale/revoked/quarantined history;
+- every allowed/forbidden transition, generation increment/overflow, stale CAS,
   and one-winner concurrent CAS;
-- transition-before-query and transition-before-final-recheck winners, with old
-  active evidence denied for live use;
-- unknown commit and missing idempotency history quarantine without replacement
-  identity; and
+- lifecycle `quarantined` is irreversible while command/publication
+  `outcome_uncertain` can only resume the same source/finalization and never
+  reactivate;
+- same nominal ID under another principal, tenant, audience, or family cannot
+  collide with or reveal the original stable key;
+- crash at every claim/allocation/retention point reuses the same deterministic
+  or atomically retained IDs, times, revisions, generations, and source bytes;
+- duplicate current release after every local lifecycle transition and simulated
+  Artifact/Lineage/conformance/Authority/key/work-order/activation/deployment
+  revocation returns opaque denial, while historical inspection remains scoped;
+  and
 - no adapter, provider, Gateway, network, filesystem, node, or C03 call.
 
 Stop conditions:
 
-- in-memory tests are semantic evidence only and cannot claim durability or live
-  admission;
-- no production activation, public composition, or current proof while any
-  external stop remains unmet;
-- no hidden local source-owner state or projection is accepted as current fact.
+- in-memory tests are semantic evidence only and cannot claim persistence,
+  admission publication, activation, current proof, or owner availability;
+- no hidden local source-owner state is accepted as a live current fact; and
+- no production composition while the applicable owner dependencies are unmet.
 
-### Slice 4 - Store and Event/Evidence durability
+### Slice 4 - Repository adapter and acyclic Event/Evidence durability
 
 Scope:
 
-- add Store traits/engines only for owner-approved immutable records, head CAS,
-  permanent non-reuse, outbox, and exact recovery reads;
-- implement Registry/Event/Evidence owner coordination under RFC 0015
-  `EVT-003`/`EVID-001` and accepted `FND-003`; and
-- keep semantic decisions in Registry and durability/completeness decisions in
-  Event/Evidence.
+- implement the Registry-owned repository port in a composition adapter using
+  generic `splendor-store` primitives, with no direct dependency from
+  `splendor-gateway` to `splendor-store` and no Store semantic ownership;
+- persist atomic claim/source/head/outbox transactions and separate immutable
+  publication finalizations; and
+- coordinate authenticated Event/Evidence commits under RFC 0015 and accepted
+  `FND-003`, retaining source -> acknowledgement -> finalization direction.
 
 Tests and evidence:
 
+- source canonical digest never contains its Event/Evidence receipt or
+  finalization, and every receipt binds the exact already-fixed source digest;
+- admission, activation, transition, each per-slot evidence record, and current
+  observation use distinct source/outbox/receipt/finalization identities;
 - process kill, power loss, disk full, commit/sync error, dropped acknowledgement,
   duplicate delivery, changed duplicate, backlog, and corruption at every claim,
-  admission, head, transition, outbox, Event, Evidence, and response boundary;
-- no success before effective durability and no caller downgrade;
-- exact duplicate recovery returns original IDs, bytes, generations, times, and
-  receipts;
-- Registry state/outbox and Event/Evidence inbox/commit atomicity are each
+  allocation, source, head, outbox, Event, Evidence, finalization, recheck, and
+  response boundary;
+- no success before effective durability/finalization and no caller downgrade;
+- exact duplicate recovery preserves original IDs, bytes, generations, times,
+  source digests, and acknowledgements;
+- Registry source/outbox and Event/Evidence inbox/commit atomicity are each
   truthful, with at-least-once delivery and no distributed exactly-once claim;
-- source-owner revocation races use the accepted linearization protocol or deny
-  as unsupported; and
-- Store never decides admission, transition, currentness, or retry.
+- contract tests prove the composition adapter maps generic Store failures but
+  never decides admission, activation, transition, currentness, or retry; and
+- source-owner races use accepted linearization or deny as unsupported.
 
 Stop conditions:
 
-- if Registry state and outbox cannot share one source transaction, stop;
-- if independent Event/Evidence publication lacks accepted `FND-003`, stop;
+- if Registry source state and outbox cannot share one local transaction, stop;
+- if independent Event/Evidence publication lacks accepted `FND-003`, stop; and
 - if any external current-status race cannot be linearized, keep live behavior
   unsupported and fail closed.
 
-### Slice 5 - Exact current query and Registry evidence
+### Slice 5 - Live activation, per-slot evidence, and exact current query
 
 Scope:
 
-- implement pre-lookup authentication/visibility, exact-key query, restricted
-  view, owner current-proof materialization, final release recheck, and Registry
-  admission/current Evidence profiles; and
+- compose Artifact, Lineage, registrar/activation Authority, independent
+  conformance, RFC 0015, and `DEP-005` owner ports only after their applicable
+  contracts/runtimes exist;
+- implement pre-lookup authorization, declaration-wide admission publication,
+  narrowed activation, distinct per-slot evidence publication, exact current
+  observation/finalization, every-release recheck, and restricted history; and
 - expose no resolution, selection, invocation, endpoint detail, or broad
   discovery API.
 
 Tests and evidence:
 
-- exact active coordinate succeeds only after required Event/Evidence durability;
-- mutate independently every tenant/installation/scope/admission/operation/
-  revision/declaration/slot/generation/source-receipt/key-status coordinate and
-  deny;
+- exact active coordinate succeeds only after admission, activation, per-slot,
+  and current-observation finalizations reach required durability;
+- multi-slot publication cannot swap/reuse slot evidence or finalization;
+- mutate independently tenant, installation/scope, admission, operation,
+  revision, declaration, slot, generation, activation/deployment/gate/rollout,
+  source/finalization receipt, signer/key/status, or audience and deny;
+- admission-only/registrar authority, broader sibling-target authority, wrong
+  target, and permission-laundered activation all deny;
+- duplicate current release after stale, revoked, lifecycle quarantine, Artifact
+  revocation, Lineage anti-tamper change, conformance revocation, Authority/work-
+  order revocation, activation/gate/rollout withdrawal, or Registry key
+  revocation returns one opaque current denial and never the old current object;
 - no latest, alias, endpoint, prefix, bare-digest, numeric, or fallback lookup;
-- hidden/absent/wrong-tenant/scope/audience/stale/revoked/quarantined/conflict/
-  corrupt/unavailable cases have equivalent outward body/status/header/timing
-  behavior under the later daemon profile;
-- restricted views require separate scope and durable audit and preserve
-  omission/inaccessibility;
-- Event/Evidence unsigned, memory-only, wrong-owner, changed-source,
-  incomplete, corrupt, unavailable, or uncertain results deny; and
-- replay cannot issue or refresh a current proof.
+- hidden/absent/wrong-tenant/scope/audience/conflict/corrupt/unavailable cases
+  have equivalent outward body/status/header/timing behavior under the later
+  daemon profile;
+- restricted views require separate scope and durable audit; and
+- replay cannot issue, refresh, activate, or release a current proof.
 
 Stop conditions:
 
-- no external API until the outward non-oracle profile and generated parity are
-  accepted and tested;
-- no current success while required owner key/revocation or source-currentness is
-  unavailable;
+- no live activation until narrowed activation authority plus exact
+  `DEP-005`/gate/rollout evidence and race protocol exist;
+- no external API until non-oracle behavior and generated parity are accepted and
+  tested;
+- no current success while any required owner fact is unavailable or uncertain;
+  and
 - no C03 adoption in this slice.
 
-### Slice 6 - Authority and C03 adoption
+### Slice 6 - Exact RFC 0014 Authority and C03 adoption
 
 Scope:
 
-- Authority historical evidence and migration owner adopt the exact RFC 0014
-  three-way binding in their separately accepted contract;
-- C03 consumes complete Registry admission and current evidence through owner
-  ports and performs the final Registry current-generation recheck in its
-  migration CAS; and
-- stable Gateway/provider/node paths remain uncalled by migration.
+- preserve RFC 0014's exact closed eighteen-member proof bundle;
+- Authority/C03 validate its explicit direct fields, then transitively
+  dereference exact authenticated Registry/Authority source records and each
+  record's own acyclic publication finalization/receipts; and
+- perform the final Registry generation and all-current-facts recheck in the
+  migration CAS without calling stable Gateway/provider/node paths.
 
 Tests and evidence:
 
-- exact positive proof binds one source entry to one Authority record, Registry
-  admission/evidence, current evidence, and target entry;
-- every Registry identity/digest/scope/operation/revision/declaration/slot/
-  generation/Event/Evidence substitution denies;
-- stale/revoked/quarantined transition at every preflight/final-CAS race wins;
-- unavailable/corrupt/inaccessible owner evidence, acknowledgement loss, Store
-  uncertainty, or final CAS conflict creates no live target head;
-- crash recovery reuses the exact RFC 0014 command and Registry evidence and
-  performs no provider, node, Gateway, adapter, or driver effect; and
-- stable 0.1 Action Gateway, trace, state, replay, and RFC 0013 fixtures remain
-  unchanged.
+- exact 18-member parse accepts the canonical object and rejects a missing,
+  null, duplicate, alias, reordered proof-bundle sequence, extension, or
+  nineteenth member;
+- direct equality is limited to frozen proof fields while Event/Evidence and
+  publication receipts validate transitively; admission/per-slot/current
+  receipts cannot substitute for one another;
+- one source entry binds one Authority record, one distinct per-slot Registry
+  evidence source/finalization, one current observation, and one target entry;
+- independently mutate implementation and projector Artifact identity, version,
+  content digest, manifest digest, attestation identity, signer, key, and
+  revocation status and deny;
+- independently mutate Lineage producer, relation set, receipt, integrity,
+  signing, and anti-tamper status and deny;
+- independently mutate conformance suite/profile/version, environment,
+  implementation/projector binding, result, issuer, trust, and revocation status
+  and deny, including a recomputed but untrusted outer wrapper;
+- every tenant/installation/admission/evidence/operation/revision/declaration/
+  slot/generation/direct-field/transitive-receipt substitution denies;
+- stale/revoked/quarantined or every named external revocation at preflight,
+  current duplicate release, publication-finalization release, and final CAS
+  wins with no target head;
+- acknowledgement loss, repository uncertainty, or final CAS conflict creates no
+  live target head and recovery reuses exact identities; and
+- stable 0.1 Gateway, trace, state, replay, and RFC 0013 fixtures remain
+  unchanged with no provider/node/adapter/driver effect.
 
 Stop conditions:
 
-- no Authority/C03 implementation before its own separately accepted evidence
-  contract and all owner runtimes exist;
+- no Authority/C03 implementation before its separately accepted evidence
+  contract and all required owner runtimes/linearization paths exist;
 - no mock, broad evidence row, database join, hidden side table, cached latest,
-  or direct Store call satisfies owner evidence;
+  or direct Store call satisfies owner evidence; and
 - no task/component/gold completion claim from this bounded adoption.
 
 ## Gold and Validation Status
@@ -1048,9 +1355,12 @@ contract for the bounded slices above. Acceptance alone changes no behavior and
 does not authorize implementation past an unmet stop.
 
 Review must confirm exact RFC 0013 reuse, one Registry owner, complete external
-blocker visibility, immutable admission, monotonic expected-generation CAS,
-race winners, permanent idempotency/non-reuse, truthful RFC 0015 durability,
-strict RFC 0014 proof equality, non-oracle visibility, inspect-only replay,
-compatibility with the stable adapter path, and all non-claims. Any accepted
-implementation still requires its own code, tests, retained validation, and
-dependency-safe review.
+blocker visibility, declaration-wide non-live admission, separately authorized
+activation, distinct per-slot C03 evidence, monotonic expected-generation CAS,
+irreversible lifecycle versus recoverable command quarantine, acyclic
+source/Event/Evidence/finalization ordering, every-release current rechecks,
+permanent idempotency/non-reuse, strict RFC 0014 direct/transitive proof
+validation, architecture-safe repository inversion, non-oracle visibility,
+inspect-only replay, compatibility with the stable adapter path, and all
+non-claims. Any accepted implementation still requires its own code, tests,
+retained validation, and dependency-safe review.
