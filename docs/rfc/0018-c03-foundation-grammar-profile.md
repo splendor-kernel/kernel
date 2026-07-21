@@ -2,9 +2,12 @@
 
 ## Status and Binding
 
-**Status:** Proposed planning contract
+**Status:** Accepted planning contract
 
-**Proposed:** 2026-07-21
+**Accepted:** 2026-07-21
+
+**Accepted proposal SHA-256:**
+`427028b9fff0fe7d2337095bdb9093fd0966ea0cb4e1e68c8b1ae89a3cf5ae69`
 
 **Compatibility line:** Additive experimental 0.2/v2 grammar profile preserving
 the stable 0.1 contracts and the accepted RFC 0012 through RFC 0017 contracts
