@@ -2,9 +2,14 @@
 
 ## Status and Binding
 
-**Status:** Proposed, documentation-only
+**Status:** Accepted lint-cardinality correction
 
 **Date:** 2026-07-21
+
+**Accepted:** 2026-07-21
+
+**Accepted proposal SHA-256:**
+`aae38a7b333daa66ed2ee027fdf738db67401db68d86a8fcfee321612e3e385e`
 
 **Active execution line:** `Splendor0.2-dev` / `0.2/v2`
 
