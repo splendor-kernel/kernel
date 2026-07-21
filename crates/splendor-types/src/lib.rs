@@ -42,6 +42,7 @@ mod escalation;
 mod external_governance;
 mod failure_taxonomy;
 mod fleet_telemetry;
+mod foundation_grammar;
 mod governance;
 mod hash;
 mod identity;
@@ -142,6 +143,11 @@ pub use fleet_telemetry::{
     NodeOnlineState, NodeTelemetry, QueueTelemetry, QuotaSignal, RunStatus, RunStatusCount,
     RunStatusCounts, RunTelemetry, RuntimeMode as TelemetryRuntimeMode, TelemetryAuthority,
     TraceSyncFailure, TraceSyncTelemetry, FLEET_TELEMETRY_SCHEMA_VERSION,
+};
+pub use foundation_grammar::{
+    CanonicalCountV1, CanonicalLabelV1, CanonicalOrdinalV1, CanonicalPositiveRevisionV1,
+    CanonicalSchemaIdV1, CanonicalSequenceV1, CanonicalTimestampV1, FoundationGrammarCodeV1,
+    FoundationGrammarError, RegistryDeclarationDigest,
 };
 pub use governance::{
     ApprovalDenial, ApprovalGrant, ApprovalRequest, ApprovalStatus, CircuitBreaker,
