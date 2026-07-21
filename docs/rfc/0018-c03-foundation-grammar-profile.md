@@ -232,8 +232,12 @@ currentness.
 
 ### Canonical integers
 
-Every newly introduced integer is a JSON integer token with no plus sign,
-fraction, exponent, or leading zero except `0`.
+Every newly introduced zero-inclusive integer is an original JSON token matching
+exactly `0|[1-9][0-9]*`. `CanonicalPositiveRevisionV1` instead matches exactly
+`[1-9][0-9]*`. Validation occurs on the original token before conversion to a
+language integer or floating-point value. Every minus-prefixed token, including
+`-0`, plus sign, fraction, exponent, and leading zero other than the single token
+`0` rejects.
 
 | Profile | Range |
 | --- | ---: |
@@ -583,9 +587,15 @@ version plus compatibility/security review.
 
 ## Untrusted-Ingress Budgets
 
-Counts include unknown and duplicate content before rejection. A token is an
-object/array open, object member, array element, or scalar. Nesting counts the
-root as depth one. Decoded string bytes count after escape processing.
+Counts include unknown and duplicate content before rejection. Decoder-token
+accounting matches the inherited RFC 0013 rule: one token for each object or
+array open, each object or array close, each object member name, and each scalar
+value. Commas and colons are not tokens. An array element has no additional
+element token beyond the token(s) for its value; object-member and array-element
+totals are independent counters. Thus `{}` and `[]` each use two tokens,
+`{"a":1}` uses four, `[1]` uses three, `{"a":[]}` uses five, and
+`[{"a":1}]` uses six. Nesting counts the root as depth one. Decoded string
+bytes count after escape processing.
 
 | Budget profile | Raw bytes | Depth | Tokens | Members | Elements | One decoded string | Canonical output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -978,10 +988,13 @@ Required tests:
   substitution tests;
 - timestamp boundaries, invalid dates, leap second, offsets, precision, and year
   boundaries;
-- JSON integer token and safe-range boundaries;
+- JSON integer token and safe-range boundaries, including rejection of `-0`,
+  every other minus-prefixed token, `+0`, leading zeroes, fractions, exponents,
+  and ceiling-plus-one;
 - digest prefix/width/case/algorithm tests plus independent inherited and
   `RegistryDeclarationDigest` BLAKE3 fixtures;
-- exact ceiling and ceiling-plus-one parser budgets;
+- exact ceiling and ceiling-plus-one parser budgets, with decoder-token fixtures
+  for `{}`, `[]`, `{"a":1}`, `[1]`, `{"a":[]}`, and `[{"a":1}]`;
 - no candidate reflection in errors; and
 - stable RFC 0013/0014 byte and digest fixtures unchanged;
 - stable `TraceEventId`/bytes and ordered-parent `StateNodeId` derivation fixtures
