@@ -1,0 +1,620 @@
+{
+  "format_id": "splendor.internal.conformance.rfc0021.offline-slice-1-cases.v1",
+  "profile": "rfc0021_c03_foundation_offline_slice_1",
+  "polarity": "negative",
+  "case_count": 68,
+  "cases": [
+    {
+      "case_id": "live_relation.stale_work_order",
+      "subject": "work_order",
+      "operation": "parse_live_relation",
+      "input": {"kind": "work_order_json", "body": {"json": "{\"schema_version\":\"splendor.work_order.v1\",\"work_order_id\":\"wo_stale_synthetic\",\"tenant_id\":\"00000000-0000-4000-8000-000000000001\",\"agent_id\":\"00000000-0000-4000-8000-000000000002\",\"run_id\":null,\"objective\":\"inspect synthetic state\",\"allowed_actions\":[\"read_state\"],\"allowed_adapters\":[\"local\"],\"allowed_permissions\":[],\"data_refs\":[],\"quotas\":{\"max_actions_per_tick\":null,\"max_action_duration_ms\":null,\"max_filesystem_read_bytes\":null,\"max_filesystem_write_bytes\":null,\"max_network_read_bytes\":null,\"max_network_write_bytes\":null,\"max_http_requests_per_minute\":null},\"placement\":{\"target\":\"local_resident\",\"data_locality\":null,\"requires_gpu\":null,\"dedicated_instance\":null,\"required_capabilities\":[],\"max_runtime_ms\":null},\"issued_at\":\"2029-01-01T00:00:00Z\",\"expires_at\":\"2029-12-31T00:00:00Z\",\"revocation\":\"active\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"schema_version\":\"splendor.work_order.v1\",\"work_order_id\":\"wo_stale_synthetic\",\"tenant_id\":\"00000000-0000-4000-8000-000000000001\",\"agent_id\":\"00000000-0000-4000-8000-000000000002\",\"run_id\":null,\"objective\":\"inspect synthetic state\",\"allowed_actions\":[\"read_state\"],\"allowed_adapters\":[\"local\"],\"allowed_permissions\":[],\"data_refs\":[],\"quotas\":{\"max_actions_per_tick\":null,\"max_action_duration_ms\":null,\"max_filesystem_read_bytes\":null,\"max_filesystem_write_bytes\":null,\"max_network_read_bytes\":null,\"max_network_write_bytes\":null,\"max_http_requests_per_minute\":null},\"placement\":{\"target\":\"local_resident\",\"data_locality\":null,\"requires_gpu\":null,\"dedicated_instance\":null,\"required_capabilities\":[],\"max_runtime_ms\":null},\"issued_at\":\"2029-01-01T00:00:00Z\",\"expires_at\":\"2029-12-31T00:00:00Z\",\"revocation\":\"active\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "live_relation.wrong_audience_caller_credential",
+      "subject": "caller_credential",
+      "operation": "parse_live_relation",
+      "input": {"kind": "caller_credential_json", "body": {"json": "{\"credential_id\":\"credential_wrong_audience\",\"principal\":{\"app\":{\"app_principal_id\":\"app_expected\",\"label\":null},\"client_principal_id\":\"client_synthetic\",\"label\":null},\"scopes\":[\"runs_read\"],\"binding\":{\"tenant\":{\"tenant_id\":\"00000000-0000-4000-8000-000000000001\"}},\"audience\":{\"daemon\":{\"daemon_id\":\"daemon_other\"}},\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"credential_id\":\"credential_wrong_audience\",\"principal\":{\"app\":{\"app_principal_id\":\"app_expected\",\"label\":null},\"client_principal_id\":\"client_synthetic\",\"label\":null},\"scopes\":[\"runs_read\"],\"binding\":{\"tenant\":{\"tenant_id\":\"00000000-0000-4000-8000-000000000001\"}},\"audience\":{\"daemon\":{\"daemon_id\":\"daemon_other\"}},\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "live_relation.wrong_owner_caller_credential",
+      "subject": "caller_credential",
+      "operation": "parse_live_relation",
+      "input": {"kind": "caller_credential_json", "body": {"json": "{\"credential_id\":\"credential_wrong_owner\",\"principal\":{\"app\":{\"app_principal_id\":\"app_other\",\"label\":null},\"client_principal_id\":\"client_synthetic\",\"label\":null},\"scopes\":[\"runs_read\"],\"binding\":{\"tenant\":{\"tenant_id\":\"00000000-0000-4000-8000-000000000001\"}},\"audience\":{\"daemon\":{\"daemon_id\":\"daemon_expected\"}},\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"credential_id\":\"credential_wrong_owner\",\"principal\":{\"app\":{\"app_principal_id\":\"app_other\",\"label\":null},\"client_principal_id\":\"client_synthetic\",\"label\":null},\"scopes\":[\"runs_read\"],\"binding\":{\"tenant\":{\"tenant_id\":\"00000000-0000-4000-8000-000000000001\"}},\"audience\":{\"daemon\":{\"daemon_id\":\"daemon_expected\"}},\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "live_relation.wrong_tenant_work_order",
+      "subject": "work_order",
+      "operation": "parse_live_relation",
+      "input": {"kind": "work_order_json", "body": {"json": "{\"schema_version\":\"splendor.work_order.v1\",\"work_order_id\":\"wo_wrong_tenant_synthetic\",\"tenant_id\":\"00000000-0000-4000-8000-000000000099\",\"agent_id\":\"00000000-0000-4000-8000-000000000002\",\"run_id\":null,\"objective\":\"inspect synthetic state\",\"allowed_actions\":[\"read_state\"],\"allowed_adapters\":[\"local\"],\"allowed_permissions\":[],\"data_refs\":[],\"quotas\":{\"max_actions_per_tick\":null,\"max_action_duration_ms\":null,\"max_filesystem_read_bytes\":null,\"max_filesystem_write_bytes\":null,\"max_network_read_bytes\":null,\"max_network_write_bytes\":null,\"max_http_requests_per_minute\":null},\"placement\":{\"target\":\"local_resident\",\"data_locality\":null,\"requires_gpu\":null,\"dedicated_instance\":null,\"required_capabilities\":[],\"max_runtime_ms\":null},\"issued_at\":\"2030-01-01T00:00:00Z\",\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "{\"schema_version\":\"splendor.work_order.v1\",\"work_order_id\":\"wo_wrong_tenant_synthetic\",\"tenant_id\":\"00000000-0000-4000-8000-000000000099\",\"agent_id\":\"00000000-0000-4000-8000-000000000002\",\"run_id\":null,\"objective\":\"inspect synthetic state\",\"allowed_actions\":[\"read_state\"],\"allowed_adapters\":[\"local\"],\"allowed_permissions\":[],\"data_refs\":[],\"quotas\":{\"max_actions_per_tick\":null,\"max_action_duration_ms\":null,\"max_filesystem_read_bytes\":null,\"max_filesystem_write_bytes\":null,\"max_network_read_bytes\":null,\"max_network_write_bytes\":null,\"max_http_requests_per_minute\":null},\"placement\":{\"target\":\"local_resident\",\"data_locality\":null,\"requires_gpu\":null,\"dedicated_instance\":null,\"required_capabilities\":[],\"max_runtime_ms\":null},\"issued_at\":\"2030-01-01T00:00:00Z\",\"expires_at\":\"2031-01-01T00:00:00Z\",\"revocation\":\"active\"}"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n001.schema.parse-reject.invalid-start",
+      "subject": "canonical_schema_id_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "1a.v1"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_version"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n002.schema.construct-reject.over-bound",
+      "subject": "canonical_schema_id_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "text", "body": {"value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.v1"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_bound"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n003.schema.from-str-reject.missing-version",
+      "subject": "canonical_schema_id_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "schema"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_version"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n004.schema.parse-reject.invalid-key",
+      "subject": "canonical_schema_id_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "schema/key.v1"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_version"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n005.schema.from-str-reject.invalid-version",
+      "subject": "canonical_schema_id_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "schema.v0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_version"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n006.label.parse-reject.unicode",
+      "subject": "canonical_label_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "é"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n007.label.construct-reject.over-bound",
+      "subject": "canonical_label_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "text", "body": {"value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_bound"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n008.label.from-str-reject.invalid-start",
+      "subject": "canonical_label_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "0label"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n009.label.parse-reject.invalid-ascii",
+      "subject": "canonical_label_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "label/value"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n010.code.parse-reject.unicode",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "codeé"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n011.code.construct-reject.over-bound",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "text", "body": {"value": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_bound"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n012.code.from-str-reject.invalid-start",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": ".code"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n013.code.parse-reject.invalid-ascii",
+      "subject": "foundation_grammar_code_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "code value"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_shape"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n014.timestamp.construct-reject.invalid-calendar",
+      "subject": "canonical_timestamp_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "text", "body": {"value": "2000-02-30T00:00:00.000000Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n015.timestamp.parse-reject.leap-second",
+      "subject": "canonical_timestamp_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:60.000000Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n016.timestamp.from-str-reject.utc-offset",
+      "subject": "canonical_timestamp_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00.000000+00:00"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n017.timestamp.parse-reject.lowercase-z",
+      "subject": "canonical_timestamp_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00.000000z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n018.timestamp.from-str-reject.missing-precision",
+      "subject": "canonical_timestamp_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n019.timestamp.parse-reject.short-precision",
+      "subject": "canonical_timestamp_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00.00000Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n020.timestamp.from-str-reject.long-precision",
+      "subject": "canonical_timestamp_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00.0000000Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n021.timestamp.parse-reject.leading-whitespace",
+      "subject": "canonical_timestamp_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": " 2000-01-01T00:00:00.000000Z"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n022.timestamp.from-str-reject.trailing-whitespace",
+      "subject": "canonical_timestamp_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "2000-01-01T00:00:00.000000Z "}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_timestamp"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n023.count.parse-reject.leading-zero",
+      "subject": "canonical_count_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "01"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n024.count.parse-reject.minus-zero",
+      "subject": "canonical_count_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "-0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n025.count.from-str-reject.exponent",
+      "subject": "canonical_count_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "1e0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n026.count.construct-reject.maximum-plus-one",
+      "subject": "canonical_count_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "u64", "body": {"value": 9007199254740992}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n027.ordinal.parse-reject.plus-sign",
+      "subject": "canonical_ordinal_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "+1"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n028.ordinal.parse-reject.fraction",
+      "subject": "canonical_ordinal_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "1.0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n029.ordinal.from-str-reject.maximum-plus-one",
+      "subject": "canonical_ordinal_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "9007199254740992"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n030.ordinal.construct-reject.maximum-plus-one",
+      "subject": "canonical_ordinal_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "u64", "body": {"value": 9007199254740992}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n031.sequence.parse-reject.leading-zero",
+      "subject": "canonical_sequence_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "00"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n032.sequence.parse-reject.negative",
+      "subject": "canonical_sequence_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "-1"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n033.sequence.from-str-reject.maximum-plus-one",
+      "subject": "canonical_sequence_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "9007199254740992"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n034.sequence.construct-reject.maximum-plus-one",
+      "subject": "canonical_sequence_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "u64", "body": {"value": 9007199254740992}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n035.revision.parse-reject.zero",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n036.revision.parse-reject.leading-zero",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "01"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n037.revision.from-str-reject.exponent",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "1e0"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n038.revision.from-str-reject.maximum-plus-one",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "9007199254740992"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n039.revision.construct-reject.zero",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "u64", "body": {"value": 0}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n040.revision.construct-reject.maximum-plus-one",
+      "subject": "canonical_positive_revision_v1",
+      "operation": "construct_reject",
+      "input": {"kind": "u64", "body": {"value": 9007199254740992}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_integer"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n041.digest.parse-reject.missing-prefix",
+      "subject": "registry_declaration_digest",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n042.digest.from-str-reject.algorithm",
+      "subject": "registry_declaration_digest",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "sha256:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n043.digest.parse-reject.width",
+      "subject": "registry_declaration_digest",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n044.digest.from-str-reject.uppercase",
+      "subject": "registry_declaration_digest",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "blake3:F18D117F253C367F79DE0CA2C546088580CC47E53F49CE177ED10022D39ECDB6"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n045.digest.parse-reject.leading-whitespace",
+      "subject": "registry_declaration_digest",
+      "operation": "parse_reject",
+      "input": {"kind": "text", "body": {"value": " blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6"}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n046.digest.from-str-reject.trailing-whitespace",
+      "subject": "registry_declaration_digest",
+      "operation": "from_str_reject",
+      "input": {"kind": "text", "body": {"value": "blake3:f18d117f253c367f79de0ca2c546088580cc47e53f49ce177ed10022d39ecdb6 "}},
+      "expected": {"execution_result": "rejected", "stable_error_code": "invalid_contract_digest"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n047.digest.wrong-domain",
+      "subject": "registry_declaration_digest",
+      "operation": "wrong_domain_compare",
+      "input": {"kind": "declaration", "body": {"resource_id": "rfc0013_driver_operation_credential_sinks_v1", "mutation": "none", "digest_domain": "wrong_domain_v2"}},
+      "expected": {"execution_result": "accepted", "serialized_utf8": "\"blake3:ce3e3334c4d36ffdf3dfff0dd71132a38116e8fa0c6c1843c10e395fa065c59a\"", "expected_digest_wire": "blake3:ce3e3334c4d36ffdf3dfff0dd71132a38116e8fa0c6c1843c10e395fa065c59a", "digest_equality": false},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n048.trace.canonical-alias-same.canonical-first",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"trace_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n049.trace.canonical-alias-same.alias-first",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_id\":\"11111111-1111-4111-8111-111111111111\",\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n050.trace.canonical-alias-different.canonical-first",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"trace_id\":\"33333333-3333-4333-8333-333333333333\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n051.trace.canonical-alias-different.alias-first",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_id\":\"33333333-3333-4333-8333-333333333333\",\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n052.trace.duplicate-canonical",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n053.trace.wrong-top-level-spelling",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"event_trace_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"identity\":{\"run_id\":\"22222222-2222-4222-8222-222222222222\"},\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n054.trace.missing-identity",
+      "subject": "trace_event",
+      "operation": "trace_reject",
+      "input": {"kind": "trace_json", "body": {"json": "{\"trace_event_id\":\"11111111-1111-4111-8111-111111111111\",\"run_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":7,\"timestamp\":[2030,1,0,0,0,0,0,0,0],\"kind\":\"RunStarted\"}"}},
+      "expected": {"execution_result": "rejected"},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n055.extension.map.normalized-reserved",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map",
+      "input": {"kind": "extension_json", "body": {"json": "{\"approvalToken\":\"candidate\"}", "root_path": "extensions", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "extensions.approvalToken", "key": "approvalToken", "normalized_key": "approval_token"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n056.extension.map.blank",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map",
+      "input": {"kind": "extension_json", "body": {"json": "{\" \":\"candidate\"}", "root_path": "extensions", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "blank_extension_key", "path": "extensions. ", "key": " ", "normalized_key": ""}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n057.extension.map.trimmed",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map",
+      "input": {"kind": "extension_json", "body": {"json": "{\" display \":\"candidate\"}", "root_path": "extensions", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "trimmed_extension_key", "path": "extensions. display ", "key": " display ", "normalized_key": "display"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n058.extension.map.nested-reserved",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map",
+      "input": {"kind": "extension_json", "body": {"json": "{\"items\":[{\"display\":\"safe\"},{\"gateway\":\"candidate\"}]}", "root_path": "extensions", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "extensions.items[1].gateway", "key": "gateway", "normalized_key": "gateway"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n059.extension.map-with-reserved.context-key",
+      "subject": "schema_extension_map",
+      "operation": "validate_extension_map_with_reserved_keys",
+      "input": {"kind": "extension_json", "body": {"json": "{\"status\":\"display\"}", "root_path": "extensions", "additional_reserved_keys": ["status"]}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "extensions.status", "key": "status", "normalized_key": "status"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n060.extension.value.normalized-reserved",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value",
+      "input": {"kind": "extension_json", "body": {"json": "{\"items\":[{\"approvalToken\":\"candidate\"}]}", "root_path": "metadata", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "metadata.items[0].approvalToken", "key": "approvalToken", "normalized_key": "approval_token"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n061.extension.value.blank",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value",
+      "input": {"kind": "extension_json", "body": {"json": "{\" \":\"candidate\"}", "root_path": "metadata", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "blank_extension_key", "path": "metadata. ", "key": " ", "normalized_key": ""}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n062.extension.value.trimmed",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value",
+      "input": {"kind": "extension_json", "body": {"json": "{\" display \":\"candidate\"}", "root_path": "metadata", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "trimmed_extension_key", "path": "metadata. display ", "key": " display ", "normalized_key": "display"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n063.extension.value.nested-reserved",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value",
+      "input": {"kind": "extension_json", "body": {"json": "[{\"display\":\"safe\"},{\"secret\":\"candidate\"}]", "root_path": "metadata", "additional_reserved_keys": []}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "metadata[1].secret", "key": "secret", "normalized_key": "secret"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    },
+    {
+      "case_id": "n064.extension.value-with-reserved.context-key",
+      "subject": "schema_extension_value",
+      "operation": "validate_extension_value_with_reserved_keys",
+      "input": {"kind": "extension_json", "body": {"json": "{\"status\":\"display\"}", "root_path": "metadata", "additional_reserved_keys": ["status"]}},
+      "expected": {"execution_result": "rejected", "extension_error": {"reason": "reserved_authority_key", "path": "metadata.status", "key": "status", "normalized_key": "status"}},
+      "live_disposition_status": "not_exercised",
+      "schema_registration_status": "not_exercised"
+    }
+  ]
+}
