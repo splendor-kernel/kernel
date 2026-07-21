@@ -1,0 +1,242 @@
+{
+  "format_id": "splendor.internal.conformance.rfc0021.offline-slice-1-manifest.v1",
+  "profile": "rfc0021_c03_foundation_offline_slice_1",
+  "fixture_contract_revision": 1,
+  "accepted_proposal_sha256": {
+    "rfc_0018": "427028b9fff0fe7d2337095bdb9093fd0966ea0cb4e1e68c8b1ae89a3cf5ae69",
+    "rfc_0020": "a1e94f7df3e2778bf9e1e3724a54398e1141831ef54045ad8d969a93f5c9b561",
+    "rfc_0021": "5ae1424de99729cf25030897d5c487a0de4e13b9aab4cb4acb951e590e3fca0b"
+  },
+  "active_execution_line": "0.2/v2",
+  "program": "V2-FND-0 Foundations",
+  "component": "C03",
+  "task_id": "FND-006",
+  "issue_number": 225,
+  "owner_package": "crates/splendor-types",
+  "dependencies": ["FND-001", "FND-002"],
+  "primary_functional_requirements": ["FR-0.2-01", "FR-0.2-08"],
+  "preserved_requirements": ["FR-0.2-02", "stable_0.1"],
+  "foundation_readiness_status": "foundation_ready",
+  "task_status": "partial_slice_1_not_completed",
+  "slice_status": "offline_characterization_only",
+  "case_id_pattern": "^[a-z0-9][a-z0-9._-]*$",
+  "limits": {
+    "readme_max_bytes": 65536,
+    "manifest_max_bytes": 65536,
+    "case_file_max_bytes": 262144,
+    "builtin_resource_max_bytes": 65536,
+    "cases_per_file_min": 1,
+    "cases_per_file_max": 256,
+    "cases_total_max": 512,
+    "case_id_max_ascii_bytes": 64,
+    "inline_text_max_bytes": 8192,
+    "inline_json_max_bytes": 32768,
+    "serialized_output_max_bytes": 65536,
+    "json_max_depth": 16,
+    "json_object_members_max": 256,
+    "json_array_elements_max": 256,
+    "additional_reserved_keys_max": 16,
+    "metadata_string_max_bytes": 256
+  },
+  "case_files": [
+    {
+      "file_id": "positive_cases",
+      "polarity": "positive",
+      "path": "conformance/0.2/c03-foundation/v1/positive/cases.json"
+    },
+    {
+      "file_id": "negative_cases",
+      "polarity": "negative",
+      "path": "conformance/0.2/c03-foundation/v1/negative/cases.json"
+    }
+  ],
+  "builtin_resource_id": "rfc0013_driver_operation_credential_sinks_v1",
+  "production_surfaces": [
+    {
+      "subject": "canonical_schema_id_v1",
+      "rust_surface": "splendor_types::CanonicalSchemaIdV1",
+      "entry_points": [
+        "splendor_types::CanonicalSchemaIdV1::parse",
+        "splendor_types::CanonicalSchemaIdV1::try_new",
+        "<splendor_types::CanonicalSchemaIdV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalSchemaIdV1::as_str",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_label_v1",
+      "rust_surface": "splendor_types::CanonicalLabelV1",
+      "entry_points": [
+        "splendor_types::CanonicalLabelV1::parse",
+        "splendor_types::CanonicalLabelV1::try_new",
+        "<splendor_types::CanonicalLabelV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalLabelV1::as_str",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "foundation_grammar_code_v1",
+      "rust_surface": "splendor_types::FoundationGrammarCodeV1",
+      "entry_points": [
+        "splendor_types::FoundationGrammarCodeV1::parse",
+        "splendor_types::FoundationGrammarCodeV1::try_new",
+        "<splendor_types::FoundationGrammarCodeV1 as std::str::FromStr>::from_str",
+        "splendor_types::FoundationGrammarCodeV1::as_str",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_timestamp_v1",
+      "rust_surface": "splendor_types::CanonicalTimestampV1",
+      "entry_points": [
+        "splendor_types::CanonicalTimestampV1::parse",
+        "splendor_types::CanonicalTimestampV1::try_new",
+        "<splendor_types::CanonicalTimestampV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalTimestampV1::as_str",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_count_v1",
+      "rust_surface": "splendor_types::CanonicalCountV1",
+      "entry_points": [
+        "splendor_types::CanonicalCountV1::parse",
+        "splendor_types::CanonicalCountV1::try_new",
+        "<splendor_types::CanonicalCountV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalCountV1::get",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_ordinal_v1",
+      "rust_surface": "splendor_types::CanonicalOrdinalV1",
+      "entry_points": [
+        "splendor_types::CanonicalOrdinalV1::parse",
+        "splendor_types::CanonicalOrdinalV1::try_new",
+        "<splendor_types::CanonicalOrdinalV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalOrdinalV1::get",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_sequence_v1",
+      "rust_surface": "splendor_types::CanonicalSequenceV1",
+      "entry_points": [
+        "splendor_types::CanonicalSequenceV1::parse",
+        "splendor_types::CanonicalSequenceV1::try_new",
+        "<splendor_types::CanonicalSequenceV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalSequenceV1::get",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "canonical_positive_revision_v1",
+      "rust_surface": "splendor_types::CanonicalPositiveRevisionV1",
+      "entry_points": [
+        "splendor_types::CanonicalPositiveRevisionV1::parse",
+        "splendor_types::CanonicalPositiveRevisionV1::try_new",
+        "<splendor_types::CanonicalPositiveRevisionV1 as std::str::FromStr>::from_str",
+        "splendor_types::CanonicalPositiveRevisionV1::get",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "foundation_grammar_error",
+      "rust_surface": "splendor_types::FoundationGrammarError",
+      "entry_points": [
+        "splendor_types::FoundationGrammarError::as_str",
+        "std::fmt::Display::fmt",
+        "std::fmt::Debug::fmt",
+        "std::error::Error::source"
+      ]
+    },
+    {
+      "subject": "registry_declaration_digest",
+      "rust_surface": "splendor_types::RegistryDeclarationDigest",
+      "entry_points": [
+        "splendor_types::DriverOperationCredentialSinksV1::from_json_slice",
+        "splendor_types::DriverOperationCredentialSinksV1::driver_declaration_revision",
+        "<splendor_types::RegistryDeclarationDigest as std::convert::TryFrom<&splendor_types::DriverOperationCredentialSinksV1>>::try_from",
+        "splendor_types::RegistryDeclarationDigest::parse",
+        "<splendor_types::RegistryDeclarationDigest as std::str::FromStr>::from_str",
+        "std::fmt::Debug::fmt",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "trace_event",
+      "rust_surface": "splendor_types::TraceEvent",
+      "entry_points": [
+        "serde_json::from_str::<splendor_types::TraceEvent>",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "schema_extension_map",
+      "rust_surface": "std::collections::BTreeMap<String, serde_json::Value>",
+      "entry_points": [
+        "splendor_types::validate_extension_map",
+        "splendor_types::validate_extension_map_with_reserved_keys"
+      ]
+    },
+    {
+      "subject": "schema_extension_value",
+      "rust_surface": "serde_json::Value",
+      "entry_points": [
+        "splendor_types::validate_extension_value",
+        "splendor_types::validate_extension_value_with_reserved_keys"
+      ]
+    },
+    {
+      "subject": "work_order",
+      "rust_surface": "splendor_types::WorkOrder",
+      "entry_points": [
+        "serde_json::from_str::<splendor_types::WorkOrder>",
+        "splendor_types::WorkOrder::signing_payload_bytes",
+        "serde_json::to_writer"
+      ]
+    },
+    {
+      "subject": "caller_credential",
+      "rust_surface": "splendor_types::CallerCredential",
+      "entry_points": [
+        "serde_json::from_str::<splendor_types::CallerCredential>",
+        "serde_json::to_writer"
+      ]
+    }
+  ],
+  "live_disposition_status": "not_exercised",
+  "compatibility_classification_status": "not_exercised",
+  "required_live_relation_case_ids": [
+    "live_relation.stale_work_order",
+    "live_relation.wrong_owner_caller_credential",
+    "live_relation.wrong_tenant_work_order",
+    "live_relation.wrong_audience_caller_credential"
+  ],
+  "gold_statuses": [
+    {
+      "gold_id": "G00",
+      "source_status": "specified_not_implemented",
+      "evidence_status": "not_exercised"
+    },
+    {
+      "gold_id": "G72",
+      "source_status": "specified_not_implemented",
+      "evidence_status": "not_exercised"
+    }
+  ],
+  "non_claims": [
+    "no_fnd_006_completion",
+    "no_issue_225_closure",
+    "no_c03_completion",
+    "no_g00_or_g72_pass",
+    "no_live_disposition",
+    "no_compatibility_classification",
+    "no_schema_registration",
+    "no_public_schema_enum_or_runtime_serde",
+    "no_generated_surface_or_sdk",
+    "no_owner_integration",
+    "no_daemon_store_runtime_or_migration_change",
+    "no_gold_task_conformance_release_or_production_claim"
+  ]
+}
