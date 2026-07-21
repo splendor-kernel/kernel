@@ -2,9 +2,14 @@
 
 ## Status and Binding
 
-**Status:** Proposed, documentation-only
+**Status:** Accepted validation-evidence addendum
 
 **Date:** 2026-07-21
+
+**Accepted:** 2026-07-21
+
+**Accepted proposal SHA-256:**
+`835cb255d21f302b35e4b40748106f501224a3fbb9bfcf1d0c36a3dffb7dc805`
 
 **Active execution line:** `Splendor0.2-dev` / `0.2/v2`
 
