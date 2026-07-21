@@ -2,9 +2,14 @@
 
 ## Status and Binding
 
-**Status:** Proposed planning contract
+**Status:** Accepted planning contract
 
 **Date:** 2026-07-21
+
+**Accepted:** 2026-07-21
+
+**Accepted proposal SHA-256:**
+`6fd479fd6c9392466b63b41ae719a2a8d1e5870d442ce48cdd954c9e282fb55d`
 
 **Active execution line:** `Splendor0.2-dev` / `0.2/v2`
 
