@@ -2,13 +2,14 @@
 
 ## Status and Binding
 
-**Status:** Proposed implementation-blocking contract
+**Status:** Accepted implementation contract
 
 **Date:** 2026-07-21
 
-**Accepted proposal SHA-256:** Not assigned while this RFC is proposed. The
-acceptance process must record the accepted proposal hash here before the
-implementation authorized by this RFC starts.
+**Accepted:** 2026-07-21
+
+**Accepted proposal SHA-256:**
+`5ae1424de99729cf25030897d5c487a0de4e13b9aab4cb4acb951e590e3fca0b`
 
 **Active execution line:** `Splendor0.2-dev` / `0.2/v2`
 
@@ -219,7 +220,7 @@ below. Field order is not semantic, but arrays use the stated order.
 | --- | --- |
 | `rfc_0018` | `427028b9fff0fe7d2337095bdb9093fd0966ea0cb4e1e68c8b1ae89a3cf5ae69` |
 | `rfc_0020` | `a1e94f7df3e2778bf9e1e3724a54398e1141831ef54045ad8d969a93f5c9b561` |
-| `rfc_0021` | The exact 64-character lowercase hexadecimal accepted proposal SHA-256 recorded in this RFC's Status and Binding section after acceptance. The field and accepted value are mandatory in implementation fixtures; no placeholder is legal. |
+| `rfc_0021` | `5ae1424de99729cf25030897d5c487a0de4e13b9aab4cb4acb951e590e3fca0b` |
 
 The loader hard-codes all three accepted values. It does not read arbitrary RFC
 paths or compute acceptance status from fixture metadata.
