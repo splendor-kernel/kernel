@@ -4,6 +4,17 @@
 
 ### Added
 
+- **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
+  behavior-free C03 foundation lexical Rust primitives and the sole accepted
+  `RegistryDeclarationDigest` construction over unchanged RFC 0013 declaration
+  bytes. Exact schema/label/code, UTC microsecond timestamp, safe-integer,
+  code-only error, and redacted digest contracts use checked construction,
+  strict parsing, and deterministic serialization without generic
+  deserialization or normalization. This partial `FND-001` slice adds no
+  reserved IDs/enums/records, budgets, attestations, other digests, generated
+  surfaces, owner/runtime/persistence behavior, issue closure, or gold evidence;
+  `G00` remains `not_exercised`, and existing 0.1 and RFC 0012–0014 behavior and
+  bytes remain unchanged.
 - **status/incomplete:** added RFC 0014's additive behavior-free
   `SecretCredentialAuthorizationV2` and `SecretRefV2` Rust contracts in
   `splendor-types`, with checked construction, deterministic canonical
