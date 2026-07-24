@@ -9,6 +9,14 @@
 //! replace daemon authentication, durable evidence/replay services, gateway
 //! verification, revocation-watch services, production lease renewal, or adapter
 //! execution.
+//!
+//! The incomplete process-local Secret Broker lifecycle is intentionally not a
+//! crate-root API. Only its outbound provider port is public for explicit
+//! adapter implementations:
+//!
+//! ```compile_fail
+//! use splendor_authority::ProcessLocalSecretBroker;
+//! ```
 
 mod capability;
 mod delegation;
@@ -20,6 +28,7 @@ mod obligations;
 mod renewal;
 mod revocation;
 mod run_authority;
+#[cfg_attr(not(test), allow(dead_code))]
 mod secrets;
 
 pub use capability::{
@@ -112,16 +121,7 @@ pub use run_authority::{
     LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
 };
 pub use secrets::{
-    secret_driver_invoke_operation as process_local_secret_driver_invoke_operation,
-    ProcessLocalSecretBroker, ProcessLocalSecretBrokerLimits,
-    SecretBrokerAuthorityContext as ProcessLocalSecretBrokerAuthorityContext,
-    SecretBrokerClock as ProcessLocalSecretBrokerClock,
-    SecretBrokerConfigError as ProcessLocalSecretBrokerConfigError,
-    SecretBrokerError as ProcessLocalSecretBrokerError,
-    SecretBrokerIdKind as ProcessLocalSecretBrokerIdKind,
-    SecretBrokerIdSource as ProcessLocalSecretBrokerIdSource,
-    SecretDeliveryHandle as ProcessLocalSecretDeliveryHandle,
-    SecretLeaseGrant as ProcessLocalSecretLeaseGrant, SecretProvider as ProcessLocalSecretProvider,
+    SecretProvider as ProcessLocalSecretProvider,
     SecretProviderAuditEvidence as ProcessLocalSecretProviderAuditEvidence,
     SecretProviderControlRequest as ProcessLocalSecretProviderControlRequest,
     SecretProviderError as ProcessLocalSecretProviderError,
@@ -131,8 +131,6 @@ pub use secrets::{
     SecretProviderHealthEvidence as ProcessLocalSecretProviderHealthEvidence,
     SecretProviderOperation as ProcessLocalSecretProviderOperation,
     SecretProviderOutcome as ProcessLocalSecretProviderOutcome,
-    SystemSecretBrokerClock as ProcessLocalSystemSecretBrokerClock,
-    SystemSecretBrokerIdSource as ProcessLocalSystemSecretBrokerIdSource,
     SECRET_PROVIDER_AUDIT_EVIDENCE_SCHEMA_LOCAL_V1 as PROCESS_LOCAL_SECRET_PROVIDER_AUDIT_EVIDENCE_SCHEMA_V1,
     SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_LOCAL_V1 as PROCESS_LOCAL_SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_V1,
 };

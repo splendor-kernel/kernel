@@ -80,7 +80,7 @@ fn broker_callback_active_on_current_thread() -> bool {
 }
 
 /// Builds the exact typed driver-invocation operation used for broker authority.
-pub fn secret_driver_invoke_operation(reference: &DriverOperationRef) -> AuthorityOperation {
+pub(crate) fn secret_driver_invoke_operation(reference: &DriverOperationRef) -> AuthorityOperation {
     AuthorityOperation {
         schema_version: AUTHORITY_OPERATION_SCHEMA_VERSION.to_string(),
         namespace: AuthorityOperationNamespace::Driver,
@@ -93,12 +93,12 @@ pub fn secret_driver_invoke_operation(reference: &DriverOperationRef) -> Authori
 
 /// Trusted UTC source sampled through the serialized callback gate without
 /// holding the broker state mutex.
-pub trait SecretBrokerClock: Send + Sync {
+pub(crate) trait SecretBrokerClock: Send + Sync {
     fn now_utc(&self) -> Option<OffsetDateTime>;
 }
 
 #[derive(Debug)]
-pub struct SystemSecretBrokerClock;
+pub(crate) struct SystemSecretBrokerClock;
 
 impl SecretBrokerClock for SystemSecretBrokerClock {
     fn now_utc(&self) -> Option<OffsetDateTime> {
@@ -110,23 +110,22 @@ impl SecretBrokerClock for SystemSecretBrokerClock {
 
 /// Identity classes requested from an injected broker-owned source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SecretBrokerIdKind {
+pub(crate) enum SecretBrokerIdKind {
     Lease,
     DeliveryHandle,
     HandleCapability,
     AccessEvent,
     UseClaim,
-    UseAttempt,
     ClaimCapability,
 }
 
 /// Broker-owned ID source. `None` is treated as fail-closed unavailability.
-pub trait SecretBrokerIdSource: Send + Sync {
+pub(crate) trait SecretBrokerIdSource: Send + Sync {
     fn next_uuid(&self, kind: SecretBrokerIdKind) -> Option<Uuid>;
 }
 
 #[derive(Debug)]
-pub struct SystemSecretBrokerIdSource;
+pub(crate) struct SystemSecretBrokerIdSource;
 
 impl SecretBrokerIdSource for SystemSecretBrokerIdSource {
     fn next_uuid(&self, _kind: SecretBrokerIdKind) -> Option<Uuid> {
@@ -139,7 +138,7 @@ impl SecretBrokerIdSource for SystemSecretBrokerIdSource {
 /// The constructor is crate-private: callers cannot turn arbitrary coordinates
 /// into a broker permit. A future production composition root must obtain these
 /// coordinates from authenticated runtime placement and current Registry data.
-pub struct SecretBrokerAuthorityContext<'a> {
+pub(crate) struct SecretBrokerAuthorityContext<'a> {
     cache: &'a AuthorityGrantCache,
     revocations: Option<&'a RevocationSnapshot>,
     policy: &'a OfflineAuthorityPolicy,
@@ -197,15 +196,15 @@ struct ValidatedSecretBrokerPermit {
 /// Finite process-local resource ceilings. Exhaustion always fails closed and
 /// never falls back to an unbounded allocation path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessLocalSecretBrokerLimits {
-    pub max_secret_refs: usize,
-    pub max_providers: usize,
-    pub max_active_leases: usize,
-    pub max_retained_leases: usize,
-    pub max_command_records: usize,
-    pub max_evidence_events: usize,
-    pub max_generated_ids: usize,
-    pub max_replay_page_size: usize,
+pub(crate) struct ProcessLocalSecretBrokerLimits {
+    pub(crate) max_secret_refs: usize,
+    pub(crate) max_providers: usize,
+    pub(crate) max_active_leases: usize,
+    pub(crate) max_retained_leases: usize,
+    pub(crate) max_command_records: usize,
+    pub(crate) max_evidence_events: usize,
+    pub(crate) max_generated_ids: usize,
+    pub(crate) max_replay_page_size: usize,
 }
 
 impl Default for ProcessLocalSecretBrokerLimits {
@@ -261,27 +260,19 @@ impl ProcessLocalSecretBrokerLimits {
 ///     let _ = serde_json::to_vec(value).unwrap();
 /// }
 /// ```
-pub struct SecretDeliveryHandle {
+pub(crate) struct SecretDeliveryHandle {
     delivery_handle_id: SecretDeliveryHandleId,
     secret_lease_id: SecretLeaseId,
     capability_nonce: Uuid,
 }
 
 impl SecretDeliveryHandle {
-    pub fn delivery_handle_id(&self) -> &SecretDeliveryHandleId {
+    pub(crate) fn delivery_handle_id(&self) -> &SecretDeliveryHandleId {
         &self.delivery_handle_id
     }
 
-    pub fn secret_lease_id(&self) -> &SecretLeaseId {
+    pub(crate) fn secret_lease_id(&self) -> &SecretLeaseId {
         &self.secret_lease_id
-    }
-
-    fn from_stored(stored: &StoredHandle) -> Self {
-        Self {
-            delivery_handle_id: stored.delivery_handle_id.clone(),
-            secret_lease_id: stored.secret_lease_id.clone(),
-            capability_nonce: stored.capability_nonce,
-        }
     }
 }
 
@@ -292,21 +283,21 @@ impl fmt::Debug for SecretDeliveryHandle {
 }
 
 /// Lease issuance result containing one safe snapshot and one opaque handle.
-pub struct SecretLeaseGrant {
+pub(crate) struct SecretLeaseGrant {
     snapshot: SecretLeaseSnapshot,
     handle: SecretDeliveryHandle,
 }
 
 impl SecretLeaseGrant {
-    pub fn snapshot(&self) -> &SecretLeaseSnapshot {
+    pub(crate) fn snapshot(&self) -> &SecretLeaseSnapshot {
         &self.snapshot
     }
 
-    pub fn handle(&self) -> &SecretDeliveryHandle {
+    pub(crate) fn handle(&self) -> &SecretDeliveryHandle {
         &self.handle
     }
 
-    pub fn into_parts(self) -> (SecretLeaseSnapshot, SecretDeliveryHandle) {
+    pub(crate) fn into_parts(self) -> (SecretLeaseSnapshot, SecretDeliveryHandle) {
         (self.snapshot, self.handle)
     }
 }
@@ -348,19 +339,6 @@ impl SecretDeliveryClaim {
     fn revocation_generation(&self) -> u64 {
         self.revocation_generation
     }
-
-    fn from_stored(stored: &StoredClaim) -> Self {
-        Self {
-            secret_use_claim_id: stored.secret_use_claim_id.clone(),
-            secret_use_attempt_id: stored.secret_use_attempt_id.clone(),
-            secret_lease_id: stored.secret_lease_id.clone(),
-            delivery_handle_id: stored.delivery_handle_id.clone(),
-            use_binding: stored.use_binding.clone(),
-            capability_nonce: stored.capability_nonce,
-            expires_at: stored.expires_at,
-            revocation_generation: stored.revocation_generation,
-        }
-    }
 }
 
 impl fmt::Debug for SecretDeliveryClaim {
@@ -386,7 +364,7 @@ struct SecretBrokerReplayPage {
 /// Fixed outward broker failures. Wrong ref, version, tenant, and binding all
 /// use the same `secret_not_available` profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SecretBrokerError {
+pub(crate) enum SecretBrokerError {
     SecretNotAvailable,
     AuthorityDenied,
     ClockUnavailable,
@@ -397,14 +375,13 @@ pub enum SecretBrokerError {
     MaxUsesExceeded,
     RenewalDenied,
     RequestAlreadyUsed,
-    CommandConflict,
     CapacityExceeded,
     InvalidPage,
     StateUnavailable,
 }
 
 impl SecretBrokerError {
-    pub const fn code(self) -> &'static str {
+    pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::SecretNotAvailable => "secret_not_available",
             Self::AuthorityDenied => "secret_authority_denied",
@@ -416,7 +393,6 @@ impl SecretBrokerError {
             Self::MaxUsesExceeded => "secret_lease_max_uses_exceeded",
             Self::RenewalDenied => "secret_lease_renewal_denied",
             Self::RequestAlreadyUsed => "secret_lease_request_already_used",
-            Self::CommandConflict => "secret_broker_command_conflict",
             Self::CapacityExceeded => "secret_broker_capacity_exceeded",
             Self::InvalidPage => "secret_broker_page_invalid",
             Self::StateUnavailable => "secret_broker_state_unavailable",
@@ -434,7 +410,9 @@ impl Error for SecretBrokerError {}
 
 /// Invalid immutable process-local broker composition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SecretBrokerConfigError {
+pub(crate) enum SecretBrokerConfigError {
+    InvalidTenant,
+    MixedTenant,
     DuplicateSecretRef,
     DuplicateProvider,
     MissingProvider,
@@ -445,6 +423,8 @@ pub enum SecretBrokerConfigError {
 impl fmt::Display for SecretBrokerConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidTenant => "secret_broker_tenant_invalid",
+            Self::MixedTenant => "secret_broker_tenant_mismatch",
             Self::DuplicateSecretRef => "duplicate_secret_ref",
             Self::DuplicateProvider => "duplicate_secret_provider",
             Self::MissingProvider => "secret_provider_missing",
@@ -457,7 +437,8 @@ impl fmt::Display for SecretBrokerConfigError {
 impl Error for SecretBrokerConfigError {}
 
 /// Explicit process-local lifecycle owner. State is not restart durable.
-pub struct ProcessLocalSecretBroker {
+pub(crate) struct ProcessLocalSecretBroker {
+    tenant_id: TenantId,
     mutation_gate: Mutex<SecretBrokerMutationState>,
     mutation_ready: Condvar,
     state: Mutex<SecretBrokerState>,
@@ -501,6 +482,11 @@ impl SecretBrokerMutationGuard<'_> {
     }
 }
 
+/// Transaction staging clones this whole process-local state before committing
+/// lifecycle, evidence, and idempotency facts together. Every collection is
+/// capped by `ProcessLocalSecretBrokerLimits`; tests exercise narrowed ceilings
+/// and admission after elapsed leases. This is intentionally bounded local
+/// correctness, not a scalable or durable owner implementation.
 #[derive(Clone, Default)]
 struct SecretBrokerState {
     max_observed_time: Option<OffsetDateTime>,
@@ -580,45 +566,85 @@ struct SecretCommandRecord {
 #[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum SecretCommandTerminal {
-    Issue(Result<StoredGrant, SecretBrokerError>),
-    Claim(Result<StoredClaim, SecretBrokerError>),
-    Renew(Result<StoredGrant, SecretBrokerError>),
-    Revoke(Result<SecretLeaseSnapshot, SecretBrokerError>),
+    Issue(Result<HistoricalSecretBrokerRecord, SecretBrokerError>),
+    Claim(Result<HistoricalSecretBrokerRecord, SecretBrokerError>),
+    Renew(Result<HistoricalSecretBrokerRecord, SecretBrokerError>),
+    Revoke(Result<HistoricalSecretBrokerRecord, SecretBrokerError>),
 }
 
+/// Small retained pointer to already-committed historical evidence. Terminal
+/// command state duplicates neither the large evidence binding nor any live
+/// handle/claim capability nonce.
 #[derive(Clone)]
-struct StoredHandle {
-    delivery_handle_id: SecretDeliveryHandleId,
-    secret_lease_id: SecretLeaseId,
-    capability_nonce: Uuid,
+struct HistoricalSecretBrokerRecord {
+    event_index: usize,
+    event_id: SecretAccessEventId,
 }
 
-#[derive(Clone)]
-struct StoredGrant {
-    snapshot: SecretLeaseSnapshot,
-    handle: StoredHandle,
+/// Historical, non-authorizing result returned for an exact duplicate. It is
+/// materialized from already-committed evidence and cannot recreate a live
+/// handle, claim, permit, or capability nonce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalSecretBrokerReceipt {
+    evidence: SecretAccessEvidence,
 }
 
-impl StoredGrant {
-    fn materialize(&self) -> SecretLeaseGrant {
-        SecretLeaseGrant {
-            snapshot: self.snapshot.clone(),
-            handle: SecretDeliveryHandle::from_stored(&self.handle),
+impl HistoricalSecretBrokerReceipt {
+    fn evidence(&self) -> &SecretAccessEvidence {
+        &self.evidence
+    }
+}
+
+/// A first successful command may return a newly minted live capability. An
+/// exact currently-authorized duplicate can return only historical metadata.
+pub(crate) enum SecretBrokerCommandOutcome<T> {
+    Applied(T),
+    Historical(Box<HistoricalSecretBrokerReceipt>),
+}
+
+impl<T> fmt::Debug for SecretBrokerCommandOutcome<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Applied(_) => {
+                formatter.write_str("SecretBrokerCommandOutcome::Applied(<private>)")
+            }
+            Self::Historical(_) => {
+                formatter.write_str("SecretBrokerCommandOutcome::Historical(<redacted>)")
+            }
         }
     }
 }
 
-#[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct StoredClaim {
-    secret_use_claim_id: SecretUseClaimId,
-    secret_use_attempt_id: SecretUseAttemptId,
-    secret_lease_id: SecretLeaseId,
-    delivery_handle_id: SecretDeliveryHandleId,
-    use_binding: SecretLeaseUseBinding,
-    capability_nonce: Uuid,
-    expires_at: OffsetDateTime,
-    revocation_generation: u64,
+// Existing lifecycle tests predominantly exercise first-application behavior.
+// Keep their metadata assertions concise while forcing duplicate-specific tests
+// to pattern-match `Historical` explicitly. This helper is absent from every
+// non-test build and cannot turn a historical receipt into a live capability.
+#[cfg(test)]
+impl<T> std::ops::Deref for SecretBrokerCommandOutcome<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Applied(value) => value,
+            Self::Historical(_) => panic!("historical receipt is not a live capability"),
+        }
+    }
+}
+
+impl<T> SecretBrokerCommandOutcome<T> {
+    fn into_applied(self) -> Result<T, Box<HistoricalSecretBrokerReceipt>> {
+        match self {
+            Self::Applied(value) => Ok(value),
+            Self::Historical(receipt) => Err(receipt),
+        }
+    }
+
+    fn historical(&self) -> Option<&HistoricalSecretBrokerReceipt> {
+        match self {
+            Self::Applied(_) => None,
+            Self::Historical(receipt) => Some(receipt.as_ref()),
+        }
+    }
 }
 
 struct IssuePlan {
@@ -630,27 +656,37 @@ struct IssuePlan {
 }
 
 impl ProcessLocalSecretBroker {
-    /// Builds an explicit process-local broker with system time and random IDs.
-    pub fn try_new(
+    /// Builds a one-tenant process-local broker with fixed system time and
+    /// random-ID implementations. No custom synchronous callback can enter the
+    /// production construction path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_new(
+        tenant_id: TenantId,
         refs: Vec<SecretRefV2>,
         providers: Vec<Arc<dyn SecretProvider>>,
     ) -> Result<Self, SecretBrokerConfigError> {
-        Self::with_sources(
+        Self::build(
+            tenant_id,
             refs,
             providers,
             Arc::new(SystemSecretBrokerClock),
             Arc::new(SystemSecretBrokerIdSource),
+            ProcessLocalSecretBrokerLimits::default(),
         )
     }
 
-    /// Builds an explicit process-local broker with injected deterministic seams.
-    pub fn with_sources(
+    /// Test-only deterministic clock/ID seams. Production cannot supply custom
+    /// synchronous callbacks that could pin mutation admission.
+    #[cfg(test)]
+    pub(crate) fn with_sources(
+        tenant_id: TenantId,
         refs: Vec<SecretRefV2>,
         providers: Vec<Arc<dyn SecretProvider>>,
         clock: Arc<dyn SecretBrokerClock>,
         ids: Arc<dyn SecretBrokerIdSource>,
     ) -> Result<Self, SecretBrokerConfigError> {
-        Self::with_sources_and_limits(
+        Self::build(
+            tenant_id,
             refs,
             providers,
             clock,
@@ -659,8 +695,21 @@ impl ProcessLocalSecretBroker {
         )
     }
 
-    /// Builds a process-local broker with explicit finite resource ceilings.
-    pub fn with_sources_and_limits(
+    /// Test-only construction with explicit finite resource ceilings.
+    #[cfg(test)]
+    pub(crate) fn with_sources_and_limits(
+        tenant_id: TenantId,
+        refs: Vec<SecretRefV2>,
+        providers: Vec<Arc<dyn SecretProvider>>,
+        clock: Arc<dyn SecretBrokerClock>,
+        ids: Arc<dyn SecretBrokerIdSource>,
+        limits: ProcessLocalSecretBrokerLimits,
+    ) -> Result<Self, SecretBrokerConfigError> {
+        Self::build(tenant_id, refs, providers, clock, ids, limits)
+    }
+
+    fn build(
+        tenant_id: TenantId,
         refs: Vec<SecretRefV2>,
         providers: Vec<Arc<dyn SecretProvider>>,
         clock: Arc<dyn SecretBrokerClock>,
@@ -669,6 +718,9 @@ impl ProcessLocalSecretBroker {
     ) -> Result<Self, SecretBrokerConfigError> {
         if !limits.is_valid() {
             return Err(SecretBrokerConfigError::InvalidLimits);
+        }
+        if tenant_id.is_nil() {
+            return Err(SecretBrokerConfigError::InvalidTenant);
         }
         if refs.len() > limits.max_secret_refs || providers.len() > limits.max_providers {
             return Err(SecretBrokerConfigError::CapacityExceeded);
@@ -682,6 +734,9 @@ impl ProcessLocalSecretBroker {
         }
         let mut ref_map = HashMap::new();
         for secret_ref in refs {
+            if secret_ref.tenant_id() != &tenant_id {
+                return Err(SecretBrokerConfigError::MixedTenant);
+            }
             if !provider_map.contains_key(secret_ref.secret_provider_id()) {
                 return Err(SecretBrokerConfigError::MissingProvider);
             }
@@ -694,6 +749,7 @@ impl ProcessLocalSecretBroker {
             }
         }
         Ok(Self {
+            tenant_id,
             mutation_gate: Mutex::new(SecretBrokerMutationState::default()),
             mutation_ready: Condvar::new(),
             state: Mutex::new(SecretBrokerState {
@@ -709,61 +765,46 @@ impl ProcessLocalSecretBroker {
 
     /// Issues one exact-bound lease and opaque handle after current authority and
     /// ref-policy validation. Provider methods are never called.
-    pub fn issue_lease(
+    pub(crate) fn issue_lease(
         &self,
         request: SecretLeaseRequest,
         authority: &SecretBrokerAuthorityContext<'_>,
-    ) -> Result<SecretLeaseGrant, SecretBrokerError> {
+    ) -> Result<SecretBrokerCommandOutcome<SecretLeaseGrant>, SecretBrokerError> {
         let mut mutation_guard = self.lock_mutation()?;
+        if !self.trusted_scope_matches(authority, request.use_binding()) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let command_id = ProcessLocalSecretBrokerCommandId::LeaseRequest(
             request.secret_lease_request_id().clone(),
         );
-        let command_key = command_key(
+        let command_key = trusted_command_key(
             SecretCommandKind::Issue,
             request.secret_lease_request_id().to_string(),
-            request.use_binding(),
+            authority,
         );
         let semantic_digest = issue_command_digest(&request)?;
-        let state = self.lock_state()?;
-        if let Some(result) = retry_issue(&state, &command_key, &semantic_digest) {
-            return result;
-        }
-        self.ensure_command_capacity(&state)?;
-        let max_observed_time = state.max_observed_time;
-        drop(state);
-        let now = match self.observe_time(&mut mutation_guard, max_observed_time) {
-            Ok(now) => now,
-            Err(error) => {
-                if error == SecretBrokerError::ClockRollback {
-                    let event_id = self.next_event_id(&mut mutation_guard)?;
-                    let mut state = self.lock_state()?;
-                    let recorded_at = state
-                        .max_observed_time
-                        .ok_or(SecretBrokerError::ClockUnavailable)?;
-                    self.commit_denial(
-                        &mut state,
-                        event_id,
-                        command_key,
-                        semantic_digest,
-                        SecretCommandTerminal::Issue(Err(error)),
-                        command_id,
-                        SecretAccessEvidenceKind::LeaseDenied,
-                        request.use_binding().clone(),
-                        None,
-                        None,
-                        0,
-                        request.bound_use_requirement().requested_max_uses(),
-                        1,
-                        SecretAccessDenialCode::ClockRollback,
-                        recorded_at,
-                        None,
-                    )?;
-                }
-                return Err(error);
+        let lookup_now = self.observe_time(&mut mutation_guard)?;
+        {
+            let state = self.lock_state()?;
+            if !self.current_visibility(&state, authority, request.use_binding(), lookup_now) {
+                return Err(SecretBrokerError::SecretNotAvailable);
             }
-        };
+            if let Some(result) = retry_issue(&state, &command_key, &semantic_digest) {
+                return result;
+            }
+            self.ensure_command_capacity(&state)?;
+        }
+
         let event_id = self.next_event_id(&mut mutation_guard)?;
+        let secret_lease_id = self.next_lease_id(&mut mutation_guard)?;
+        let delivery_handle_id = self.next_handle_id(&mut mutation_guard)?;
+        let capability_nonce =
+            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::HandleCapability)?;
+        let now = self.observe_time(&mut mutation_guard)?;
         let mut state = self.lock_state()?;
+        if !self.current_visibility(&state, authority, request.use_binding(), now) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let plan = match self.validate_issue(&state, &request, authority, now) {
             Ok(plan) => plan,
             Err((error, denial)) => {
@@ -788,7 +829,7 @@ impl ProcessLocalSecretBroker {
                 return Err(error);
             }
         };
-        if self.ensure_new_lease_capacity(&state).is_err() {
+        if self.ensure_new_lease_capacity(&state, now).is_err() {
             self.commit_denial(
                 &mut state,
                 event_id,
@@ -810,12 +851,6 @@ impl ProcessLocalSecretBroker {
             return Err(SecretBrokerError::CapacityExceeded);
         }
 
-        drop(state);
-        let secret_lease_id = self.next_lease_id(&mut mutation_guard)?;
-        let delivery_handle_id = self.next_handle_id(&mut mutation_guard)?;
-        let capability_nonce =
-            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::HandleCapability)?;
-        let mut state = self.lock_state()?;
         let event = evidence(
             event_id.clone(),
             command_id,
@@ -850,13 +885,17 @@ impl ProcessLocalSecretBroker {
             last_event_id: event_id.clone(),
         };
         let snapshot = snapshot(&record)?;
-        let stored = StoredGrant {
-            snapshot,
-            handle: StoredHandle {
+        let grant = SecretLeaseGrant {
+            snapshot: snapshot.clone(),
+            handle: SecretDeliveryHandle {
                 delivery_handle_id: delivery_handle_id.clone(),
                 secret_lease_id: secret_lease_id.clone(),
                 capability_nonce,
             },
+        };
+        let historical = HistoricalSecretBrokerRecord {
+            event_index: state.events.len(),
+            event_id: event_id.clone(),
         };
         let mut next = state.clone();
         self.reserve_generated_ids(
@@ -886,11 +925,11 @@ impl ProcessLocalSecretBroker {
             command_key,
             SecretCommandRecord {
                 semantic_digest,
-                terminal: SecretCommandTerminal::Issue(Ok(stored.clone())),
+                terminal: SecretCommandTerminal::Issue(Ok(historical)),
             },
         );
         *state = next;
-        Ok(stored.materialize())
+        Ok(SecretBrokerCommandOutcome::Applied(grant))
     }
 
     /// Atomically claims one use. The final available use has exactly one winner
@@ -902,55 +941,40 @@ impl ProcessLocalSecretBroker {
         handle: &SecretDeliveryHandle,
         use_binding: &SecretLeaseUseBinding,
         authority: &SecretBrokerAuthorityContext<'_>,
-    ) -> Result<SecretDeliveryClaim, SecretBrokerError> {
+    ) -> Result<SecretBrokerCommandOutcome<SecretDeliveryClaim>, SecretBrokerError> {
         let mut mutation_guard = self.lock_mutation()?;
+        if !self.trusted_scope_matches(authority, use_binding) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let command_id =
             ProcessLocalSecretBrokerCommandId::UseAttempt(secret_use_attempt_id.clone());
-        let command_key = command_key(
+        let command_key = trusted_command_key(
             SecretCommandKind::Claim,
             secret_use_attempt_id.to_string(),
-            use_binding,
+            authority,
         );
         let semantic_digest = handle_command_digest("claim", handle, use_binding, None)?;
-        let state = self.lock_state()?;
-        if let Some(result) = retry_claim(&state, &command_key, &semantic_digest) {
-            return result;
-        }
-        self.ensure_command_capacity(&state)?;
-        let max_observed_time = state.max_observed_time;
-        drop(state);
-        let now = match self.observe_time(&mut mutation_guard, max_observed_time) {
-            Ok(now) => now,
-            Err(SecretBrokerError::ClockRollback) => {
-                let event_id = self.next_event_id(&mut mutation_guard)?;
-                let mut state = self.lock_state()?;
-                let recorded_at = state
-                    .max_observed_time
-                    .ok_or(SecretBrokerError::ClockUnavailable)?;
-                self.commit_denial(
-                    &mut state,
-                    event_id,
-                    command_key,
-                    semantic_digest,
-                    SecretCommandTerminal::Claim(Err(SecretBrokerError::ClockRollback)),
-                    command_id,
-                    SecretAccessEvidenceKind::UseDenied,
-                    use_binding.clone(),
-                    None,
-                    None,
-                    0,
-                    1,
-                    1,
-                    SecretAccessDenialCode::ClockRollback,
-                    recorded_at,
-                    None,
-                )?;
-                return Err(SecretBrokerError::ClockRollback);
+        let lookup_now = self.observe_time(&mut mutation_guard)?;
+        {
+            let state = self.lock_state()?;
+            if !self.current_visibility(&state, authority, use_binding, lookup_now) {
+                return Err(SecretBrokerError::SecretNotAvailable);
             }
-            Err(error) => return Err(error),
-        };
+            if let Some(result) = retry_claim(&state, &command_key, &semantic_digest) {
+                return result;
+            }
+            self.ensure_command_capacity(&state)?;
+        }
+
         let event_id = self.next_event_id(&mut mutation_guard)?;
+        let claim_id = self.next_claim_id(&mut mutation_guard)?;
+        let claim_capability =
+            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::ClaimCapability)?;
+        let now = self.observe_time(&mut mutation_guard)?;
         let mut state = self.lock_state()?;
+        if !self.current_visibility(&state, authority, use_binding, now) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let record = match self.valid_handle_record(&state, handle) {
             Ok(record) => record,
             Err(error) => {
@@ -1072,11 +1096,6 @@ impl ProcessLocalSecretBroker {
             )?;
             return Err(SecretBrokerError::AuthorityDenied);
         }
-        drop(state);
-        let claim_id = self.next_claim_id(&mut mutation_guard)?;
-        let claim_capability =
-            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::ClaimCapability)?;
-        let mut state = self.lock_state()?;
         let next_uses = lease.uses_claimed + 1;
         let event = evidence(
             event_id.clone(),
@@ -1093,7 +1112,7 @@ impl ProcessLocalSecretBroker {
             None,
             now,
         )?;
-        let stored = StoredClaim {
+        let claim = SecretDeliveryClaim {
             secret_use_claim_id: claim_id,
             secret_use_attempt_id,
             secret_lease_id: lease_id.clone(),
@@ -1107,88 +1126,78 @@ impl ProcessLocalSecretBroker {
         self.reserve_generated_ids(
             &mut next,
             &[
-                *stored.secret_use_claim_id.as_uuid(),
+                *claim.secret_use_claim_id.as_uuid(),
                 claim_capability,
                 *event_id.as_uuid(),
             ],
             SecretBrokerError::StateUnavailable,
         )?;
-        self.append_event(&mut next, event)?;
-        next.max_observed_time = Some(now);
         let mut updated = lease;
         updated.uses_claimed = next_uses;
-        updated.last_event_id = event_id;
+        updated.last_event_id = event_id.clone();
         if next_uses == updated.max_uses {
             updated.status = SecretLeaseStatus::Exhausted;
         }
+        let historical = HistoricalSecretBrokerRecord {
+            event_index: state.events.len(),
+            event_id: event_id.clone(),
+        };
+        self.append_event(&mut next, event)?;
+        next.max_observed_time = Some(now);
         next.leases.insert(lease_id, updated);
         next.commands.insert(
             command_key,
             SecretCommandRecord {
                 semantic_digest,
-                terminal: SecretCommandTerminal::Claim(Ok(stored.clone())),
+                terminal: SecretCommandTerminal::Claim(Ok(historical)),
             },
         );
         *state = next;
-        Ok(SecretDeliveryClaim::from_stored(&stored))
+        Ok(SecretBrokerCommandOutcome::Applied(claim))
     }
 
     /// Renews into a new lease and handle while carrying the original continuous
     /// lifetime and use count forward. Success invalidates the old handle.
-    pub fn renew_lease(
+    pub(crate) fn renew_lease(
         &self,
         renewal_command_id: SecretRenewalCommandId,
         old_handle: &SecretDeliveryHandle,
         request: SecretLeaseRequest,
         authority: &SecretBrokerAuthorityContext<'_>,
-    ) -> Result<SecretLeaseGrant, SecretBrokerError> {
+    ) -> Result<SecretBrokerCommandOutcome<SecretLeaseGrant>, SecretBrokerError> {
         let mut mutation_guard = self.lock_mutation()?;
+        if !self.trusted_scope_matches(authority, request.use_binding()) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let command_id = ProcessLocalSecretBrokerCommandId::Renewal(renewal_command_id.clone());
-        let command_key = command_key(
+        let command_key = trusted_command_key(
             SecretCommandKind::Renew,
             renewal_command_id.to_string(),
-            request.use_binding(),
+            authority,
         );
         let semantic_digest = renew_command_digest(old_handle, &request)?;
-        let state = self.lock_state()?;
-        if let Some(result) = retry_renew(&state, &command_key, &semantic_digest) {
-            return result;
-        }
-        self.ensure_command_capacity(&state)?;
-        let max_observed_time = state.max_observed_time;
-        drop(state);
-        let now = match self.observe_time(&mut mutation_guard, max_observed_time) {
-            Ok(now) => now,
-            Err(SecretBrokerError::ClockRollback) => {
-                let event_id = self.next_event_id(&mut mutation_guard)?;
-                let mut state = self.lock_state()?;
-                let recorded_at = state
-                    .max_observed_time
-                    .ok_or(SecretBrokerError::ClockUnavailable)?;
-                self.commit_denial(
-                    &mut state,
-                    event_id,
-                    command_key,
-                    semantic_digest,
-                    SecretCommandTerminal::Renew(Err(SecretBrokerError::ClockRollback)),
-                    command_id,
-                    SecretAccessEvidenceKind::RenewalDenied,
-                    request.use_binding().clone(),
-                    None,
-                    None,
-                    0,
-                    1,
-                    1,
-                    SecretAccessDenialCode::ClockRollback,
-                    recorded_at,
-                    None,
-                )?;
-                return Err(SecretBrokerError::ClockRollback);
+        let lookup_now = self.observe_time(&mut mutation_guard)?;
+        {
+            let state = self.lock_state()?;
+            if !self.current_visibility(&state, authority, request.use_binding(), lookup_now) {
+                return Err(SecretBrokerError::SecretNotAvailable);
             }
-            Err(error) => return Err(error),
-        };
+            if let Some(result) = retry_renew(&state, &command_key, &semantic_digest) {
+                return result;
+            }
+            self.ensure_command_capacity(&state)?;
+        }
+
         let event_id = self.next_event_id(&mut mutation_guard)?;
+        let new_lease_id = self.next_lease_id(&mut mutation_guard)?;
+        let new_handle_id = self.next_handle_id(&mut mutation_guard)?;
+        let capability_nonce =
+            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::HandleCapability)?;
+        let now = self.observe_time(&mut mutation_guard)?;
         let mut state = self.lock_state()?;
+        if !self.current_visibility(&state, authority, request.use_binding(), now) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let handle_record = match self.valid_handle_record(&state, old_handle) {
             Ok(record) => record,
             Err(error) => {
@@ -1282,15 +1291,8 @@ impl ProcessLocalSecretBroker {
             return Err(SecretBrokerError::CapacityExceeded);
         }
 
-        let starts_at = parse_canonical(request.starts_at())?;
         let expires_at = parse_canonical(request.expires_at())?;
         let new_max_uses = request.bound_use_requirement().requested_max_uses();
-        drop(state);
-        let new_lease_id = self.next_lease_id(&mut mutation_guard)?;
-        let new_handle_id = self.next_handle_id(&mut mutation_guard)?;
-        let capability_nonce =
-            self.next_non_nil_uuid(&mut mutation_guard, SecretBrokerIdKind::HandleCapability)?;
-        let mut state = self.lock_state()?;
         let event = evidence(
             event_id.clone(),
             command_id,
@@ -1316,7 +1318,7 @@ impl ProcessLocalSecretBroker {
             } else {
                 SecretLeaseStatus::Active
             },
-            starts_at,
+            starts_at: now,
             expires_at,
             continuous_lifetime_started_at: old.continuous_lifetime_started_at,
             max_continuous_expires_at: old.max_continuous_expires_at,
@@ -1328,13 +1330,17 @@ impl ProcessLocalSecretBroker {
             last_event_id: event_id.clone(),
         };
         let snapshot = snapshot(&record)?;
-        let stored = StoredGrant {
-            snapshot,
-            handle: StoredHandle {
+        let grant = SecretLeaseGrant {
+            snapshot: snapshot.clone(),
+            handle: SecretDeliveryHandle {
                 delivery_handle_id: new_handle_id.clone(),
                 secret_lease_id: new_lease_id.clone(),
                 capability_nonce,
             },
+        };
+        let historical = HistoricalSecretBrokerRecord {
+            event_index: state.events.len(),
+            event_id: event_id.clone(),
         };
         let mut next = state.clone();
         self.reserve_generated_ids(
@@ -1372,71 +1378,53 @@ impl ProcessLocalSecretBroker {
             command_key,
             SecretCommandRecord {
                 semantic_digest,
-                terminal: SecretCommandTerminal::Renew(Ok(stored.clone())),
+                terminal: SecretCommandTerminal::Renew(Ok(historical)),
             },
         );
         *state = next;
-        Ok(stored.materialize())
+        Ok(SecretBrokerCommandOutcome::Applied(grant))
     }
 
     /// Atomically commits local admission closure and terminal evidence.
     /// Provider methods are not invoked; a later Gateway control slice must
     /// propagate provider/node revocation.
-    pub fn revoke_lease(
+    pub(crate) fn revoke_lease(
         &self,
         revocation_command_id: SecretRevocationCommandId,
         handle: &SecretDeliveryHandle,
         use_binding: &SecretLeaseUseBinding,
         authority: &SecretBrokerAuthorityContext<'_>,
-    ) -> Result<SecretLeaseSnapshot, SecretBrokerError> {
+    ) -> Result<SecretBrokerCommandOutcome<SecretLeaseSnapshot>, SecretBrokerError> {
         let mut mutation_guard = self.lock_mutation()?;
+        if !self.trusted_scope_matches(authority, use_binding) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let command_id =
             ProcessLocalSecretBrokerCommandId::Revocation(revocation_command_id.clone());
-        let command_key = command_key(
+        let command_key = trusted_command_key(
             SecretCommandKind::Revoke,
             revocation_command_id.to_string(),
-            use_binding,
+            authority,
         );
         let semantic_digest = handle_command_digest("revoke", handle, use_binding, None)?;
-        let state = self.lock_state()?;
-        if let Some(result) = retry_revoke(&state, &command_key, &semantic_digest) {
-            return result;
-        }
-        self.ensure_command_capacity(&state)?;
-        let max_observed_time = state.max_observed_time;
-        drop(state);
-        let now = match self.observe_time(&mut mutation_guard, max_observed_time) {
-            Ok(now) => now,
-            Err(SecretBrokerError::ClockRollback) => {
-                let event_id = self.next_event_id(&mut mutation_guard)?;
-                let mut state = self.lock_state()?;
-                let recorded_at = state
-                    .max_observed_time
-                    .ok_or(SecretBrokerError::ClockUnavailable)?;
-                self.commit_denial(
-                    &mut state,
-                    event_id,
-                    command_key,
-                    semantic_digest,
-                    SecretCommandTerminal::Revoke(Err(SecretBrokerError::ClockRollback)),
-                    command_id,
-                    SecretAccessEvidenceKind::RevocationDenied,
-                    use_binding.clone(),
-                    None,
-                    None,
-                    0,
-                    1,
-                    1,
-                    SecretAccessDenialCode::ClockRollback,
-                    recorded_at,
-                    None,
-                )?;
-                return Err(SecretBrokerError::ClockRollback);
+        let lookup_now = self.observe_time(&mut mutation_guard)?;
+        {
+            let state = self.lock_state()?;
+            if !self.current_visibility(&state, authority, use_binding, lookup_now) {
+                return Err(SecretBrokerError::SecretNotAvailable);
             }
-            Err(error) => return Err(error),
-        };
+            if let Some(result) = retry_revoke(&state, &command_key, &semantic_digest) {
+                return result;
+            }
+            self.ensure_command_capacity(&state)?;
+        }
+
         let event_id = self.next_event_id(&mut mutation_guard)?;
+        let now = self.observe_time(&mut mutation_guard)?;
         let mut state = self.lock_state()?;
+        if !self.current_visibility(&state, authority, use_binding, now) {
+            return Err(SecretBrokerError::SecretNotAvailable);
+        }
         let (lease_id, handle_active) = match self.known_handle_record(&state, handle) {
             Ok(handle_record) => (handle_record.secret_lease_id.clone(), handle_record.active),
             Err(error) => {
@@ -1552,6 +1540,10 @@ impl ProcessLocalSecretBroker {
         updated.status = SecretLeaseStatus::Revoked;
         updated.revocation_generation = next_generation;
         let terminal_snapshot = snapshot(&updated)?;
+        let historical = HistoricalSecretBrokerRecord {
+            event_index: state.events.len(),
+            event_id: event_id.clone(),
+        };
         let mut next = state.clone();
         self.reserve_generated_ids(
             &mut next,
@@ -1568,11 +1560,11 @@ impl ProcessLocalSecretBroker {
             command_key,
             SecretCommandRecord {
                 semantic_digest,
-                terminal: SecretCommandTerminal::Revoke(Ok(terminal_snapshot.clone())),
+                terminal: SecretCommandTerminal::Revoke(Ok(historical)),
             },
         );
         *state = next;
-        Ok(terminal_snapshot)
+        Ok(SecretBrokerCommandOutcome::Applied(terminal_snapshot))
     }
 
     /// Internal exact snapshot lookup. No public inspection surface exists in
@@ -1621,8 +1613,47 @@ impl ProcessLocalSecretBroker {
     }
 
     /// Number of registered provider ports. This is passive configuration only.
-    pub fn registered_provider_count(&self) -> usize {
+    pub(crate) fn registered_provider_count(&self) -> usize {
         self.providers.len()
+    }
+
+    /// Compares untrusted request coordinates to the crate-owned trusted
+    /// context before selecting an idempotency partition or touching owner
+    /// state. All mismatches use the hidden-object outward profile.
+    fn trusted_scope_matches(
+        &self,
+        authority: &SecretBrokerAuthorityContext<'_>,
+        binding: &SecretLeaseUseBinding,
+    ) -> bool {
+        authority.tenant_id == &self.tenant_id
+            && binding.tenant_id() == &self.tenant_id
+            && authority.tenant_id == binding.tenant_id()
+            && authority.principal_id == binding.principal_id()
+            && authority.workload_id == binding.workload_id()
+            && authority.node_id == binding.node_id()
+            && authority.instance_id == binding.instance_id()
+            && authority.audience_id == binding.audience_id()
+            && authority.intent == binding.intent()
+            && authority.purpose == binding.purpose()
+    }
+
+    /// Performs current ref/Driver/Authority visibility for historical ledger
+    /// disclosure. The one-microsecond horizon proves authority at `now` without
+    /// treating the historical lease window as live authority.
+    fn current_visibility(
+        &self,
+        state: &SecretBrokerState,
+        authority: &SecretBrokerAuthorityContext<'_>,
+        binding: &SecretLeaseUseBinding,
+        now: OffsetDateTime,
+    ) -> bool {
+        if !self.trusted_scope_matches(authority, binding) {
+            return false;
+        }
+        let Some(horizon) = now.checked_add(Duration::microseconds(1)) else {
+            return false;
+        };
+        validated_authority_permit(state, authority, binding, now, horizon).is_some()
     }
 
     fn validate_issue(
@@ -1667,7 +1698,10 @@ impl ProcessLocalSecretBroker {
             .delivery_methods()
             .iter()
             .copied()
-            .find(|method| secret_ref.allowed_delivery_methods().contains(method))
+            .find(|method| {
+                *method != SecretDeliveryMethod::EnvironmentVariable
+                    && secret_ref.allowed_delivery_methods().contains(method)
+            })
         else {
             return Err((
                 SecretBrokerError::SecretNotAvailable,
@@ -1792,16 +1826,17 @@ impl ProcessLocalSecretBroker {
         let requested_max_uses = request.bound_use_requirement().requested_max_uses();
         let requested_at = parse_canonical(request.requested_at())
             .map_err(|_| SecretAccessDenialCode::RenewalNotAllowed)?;
-        let duration = expires_at - starts_at;
+        let effective_duration = expires_at - now;
         let maximum_lease_nanos =
             i128::from(secret_ref.lease_policy().max_lease_duration_seconds())
                 .checked_mul(1_000_000_000)
                 .ok_or(SecretAccessDenialCode::RenewalNotAllowed)?;
-        if starts_at != now
+        if starts_at > now
             || requested_at > now
+            || now >= expires_at
             || expires_at > old.max_continuous_expires_at
-            || duration.whole_nanoseconds() <= 0
-            || duration.whole_nanoseconds() > maximum_lease_nanos
+            || effective_duration.whole_nanoseconds() <= 0
+            || effective_duration.whole_nanoseconds() > maximum_lease_nanos
             || requested_max_uses > old.max_uses
             || requested_max_uses <= old.uses_claimed
         {
@@ -1972,12 +2007,13 @@ impl ProcessLocalSecretBroker {
     fn ensure_new_lease_capacity(
         &self,
         state: &SecretBrokerState,
+        now: OffsetDateTime,
     ) -> Result<(), SecretBrokerError> {
         self.ensure_retained_lease_capacity(state)?;
         let active = state
             .leases
             .values()
-            .filter(|lease| lease.status == SecretLeaseStatus::Active)
+            .filter(|lease| lease.status == SecretLeaseStatus::Active && now < lease.expires_at)
             .count();
         (active < self.limits.max_active_leases)
             .then_some(())
@@ -2027,7 +2063,6 @@ impl ProcessLocalSecretBroker {
     fn observe_time(
         &self,
         mutation: &mut SecretBrokerMutationGuard<'_>,
-        max_observed_time: Option<OffsetDateTime>,
     ) -> Result<OffsetDateTime, SecretBrokerError> {
         let now = mutation
             .invoke(|| self.clock.now_utc())?
@@ -2035,9 +2070,21 @@ impl ProcessLocalSecretBroker {
         if !now.nanosecond().is_multiple_of(1_000) {
             return Err(SecretBrokerError::ClockUnavailable);
         }
-        if max_observed_time.is_some_and(|previous| now < previous) {
+        let mut state = self.lock_state()?;
+        if state
+            .max_observed_time
+            .is_some_and(|previous| now < previous)
+        {
             return Err(SecretBrokerError::ClockRollback);
         }
+        // The trusted time fence is a one-way security observation, not part of
+        // a fallible lifecycle transaction. Later ID/evidence/state failure may
+        // roll back the command, but can never roll this high-water backward.
+        state.max_observed_time = Some(
+            state
+                .max_observed_time
+                .map_or(now, |previous| previous.max(now)),
+        );
         Ok(now)
     }
 
@@ -2112,20 +2159,20 @@ impl ProcessLocalSecretBroker {
     }
 }
 
-fn command_key(
+fn trusted_command_key(
     kind: SecretCommandKind,
     command_id: String,
-    binding: &SecretLeaseUseBinding,
+    authority: &SecretBrokerAuthorityContext<'_>,
 ) -> SecretCommandKey {
     SecretCommandKey {
         kind,
         command_id,
-        tenant_id: binding.tenant_id().clone(),
-        principal_id: binding.principal_id().clone(),
-        workload_id: binding.workload_id().clone(),
-        node_id: binding.node_id().clone(),
-        instance_id: binding.instance_id().clone(),
-        audience_id: binding.audience_id().clone(),
+        tenant_id: authority.tenant_id.clone(),
+        principal_id: authority.principal_id.clone(),
+        workload_id: authority.workload_id.clone(),
+        node_id: authority.node_id.clone(),
+        instance_id: authority.instance_id.clone(),
+        audience_id: authority.audience_id.clone(),
     }
 }
 
@@ -2198,13 +2245,13 @@ fn retry_issue(
     state: &SecretBrokerState,
     key: &SecretCommandKey,
     digest: &ContentHash,
-) -> Option<Result<SecretLeaseGrant, SecretBrokerError>> {
+) -> Option<Result<SecretBrokerCommandOutcome<SecretLeaseGrant>, SecretBrokerError>> {
     let record = state.commands.get(key)?;
     if &record.semantic_digest != digest {
-        return Some(Err(SecretBrokerError::CommandConflict));
+        return Some(Err(SecretBrokerError::SecretNotAvailable));
     }
     Some(match &record.terminal {
-        SecretCommandTerminal::Issue(result) => result.clone().map(|grant| grant.materialize()),
+        SecretCommandTerminal::Issue(result) => historical_outcome(state, result),
         _ => Err(SecretBrokerError::StateUnavailable),
     })
 }
@@ -2214,15 +2261,13 @@ fn retry_claim(
     state: &SecretBrokerState,
     key: &SecretCommandKey,
     digest: &ContentHash,
-) -> Option<Result<SecretDeliveryClaim, SecretBrokerError>> {
+) -> Option<Result<SecretBrokerCommandOutcome<SecretDeliveryClaim>, SecretBrokerError>> {
     let record = state.commands.get(key)?;
     if &record.semantic_digest != digest {
-        return Some(Err(SecretBrokerError::CommandConflict));
+        return Some(Err(SecretBrokerError::SecretNotAvailable));
     }
     Some(match &record.terminal {
-        SecretCommandTerminal::Claim(result) => result
-            .clone()
-            .map(|claim| SecretDeliveryClaim::from_stored(&claim)),
+        SecretCommandTerminal::Claim(result) => historical_outcome(state, result),
         _ => Err(SecretBrokerError::StateUnavailable),
     })
 }
@@ -2231,13 +2276,13 @@ fn retry_renew(
     state: &SecretBrokerState,
     key: &SecretCommandKey,
     digest: &ContentHash,
-) -> Option<Result<SecretLeaseGrant, SecretBrokerError>> {
+) -> Option<Result<SecretBrokerCommandOutcome<SecretLeaseGrant>, SecretBrokerError>> {
     let record = state.commands.get(key)?;
     if &record.semantic_digest != digest {
-        return Some(Err(SecretBrokerError::CommandConflict));
+        return Some(Err(SecretBrokerError::SecretNotAvailable));
     }
     Some(match &record.terminal {
-        SecretCommandTerminal::Renew(result) => result.clone().map(|grant| grant.materialize()),
+        SecretCommandTerminal::Renew(result) => historical_outcome(state, result),
         _ => Err(SecretBrokerError::StateUnavailable),
     })
 }
@@ -2246,15 +2291,31 @@ fn retry_revoke(
     state: &SecretBrokerState,
     key: &SecretCommandKey,
     digest: &ContentHash,
-) -> Option<Result<SecretLeaseSnapshot, SecretBrokerError>> {
+) -> Option<Result<SecretBrokerCommandOutcome<SecretLeaseSnapshot>, SecretBrokerError>> {
     let record = state.commands.get(key)?;
     if &record.semantic_digest != digest {
-        return Some(Err(SecretBrokerError::CommandConflict));
+        return Some(Err(SecretBrokerError::SecretNotAvailable));
     }
     Some(match &record.terminal {
-        SecretCommandTerminal::Revoke(result) => result.clone(),
+        SecretCommandTerminal::Revoke(result) => historical_outcome(state, result),
         _ => Err(SecretBrokerError::StateUnavailable),
     })
+}
+
+fn historical_outcome<T>(
+    state: &SecretBrokerState,
+    result: &Result<HistoricalSecretBrokerRecord, SecretBrokerError>,
+) -> Result<SecretBrokerCommandOutcome<T>, SecretBrokerError> {
+    let record = result.as_ref().map_err(|error| *error)?;
+    let evidence = state
+        .events
+        .get(record.event_index)
+        .filter(|event| event.secret_access_event_id() == &record.event_id)
+        .cloned()
+        .ok_or(SecretBrokerError::StateUnavailable)?;
+    Ok(SecretBrokerCommandOutcome::Historical(Box::new(
+        HistoricalSecretBrokerReceipt { evidence },
+    )))
 }
 
 fn credential_binding_matches<'a>(

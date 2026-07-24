@@ -1,12 +1,4 @@
 use super::*;
-use splendor_authority::ProcessLocalSecretBroker;
-use splendor_types::{
-    DriverCredentialDestinationDigest, DriverOperationCredentialSinkV1,
-    DriverOperationCredentialSinksV1, DriverOperationRef, DriverTrustedSendProfileV1,
-    SecretClassification, SecretCredentialAuthorizationV2, SecretCredentialSlotId,
-    SecretDeliveryControlKind, SecretDeliveryExposureProfile, SecretDeliveryMethod,
-    SecretLeasePolicy, SecretOfflineBehavior, SecretUseIntent,
-};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -60,68 +52,6 @@ fn material(provider: &MemorySecretProvider, coordinates: FetchCoordinates<'_>) 
         .unwrap()
 }
 
-fn trusted_profile() -> DriverTrustedSendProfileV1 {
-    DriverTrustedSendProfileV1::try_trusted_injection(
-        1,
-        vec![SecretDeliveryControlKind::TrustedInjectionBoundary],
-    )
-    .unwrap()
-}
-
-fn secret_ref(provider_id: SecretProviderId) -> splendor_types::SecretRefV2 {
-    let operation = DriverOperationRef {
-        driver: "http".to_string(),
-        operation: "fetch".to_string(),
-        schema_version: "splendor.driver.operation.v1".to_string(),
-    };
-    let slot: SecretCredentialSlotId = secret_id(3);
-    let digest: DriverCredentialDestinationDigest =
-        "blake3:1111111111111111111111111111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
-    let authorization = SecretCredentialAuthorizationV2::try_new(
-        operation.clone(),
-        1,
-        slot,
-        "splendor.driver.destination.http.v1",
-        SecretDeliveryExposureProfile::TrustedInjection,
-        trusted_profile(),
-        vec![digest],
-    )
-    .unwrap();
-    let _trusted_declaration = DriverOperationCredentialSinksV1::try_new(
-        operation,
-        1,
-        vec![DriverOperationCredentialSinkV1::try_new(
-            slot,
-            vec![SecretClassification::AuthenticationCredential],
-            vec![SecretUseIntent::Authenticate],
-            "splendor.driver.destination.http.v1",
-            SecretDeliveryExposureProfile::TrustedInjection,
-            trusted_profile(),
-        )
-        .unwrap()],
-    )
-    .unwrap();
-    splendor_types::SecretRefV2::try_new(
-        ref_id(),
-        1,
-        tenant(1),
-        provider_id,
-        "test",
-        "credential",
-        version("version-1"),
-        SecretClassification::AuthenticationCredential,
-        vec![authorization],
-        vec![SecretDeliveryMethod::InheritedFd],
-        SecretLeasePolicy::try_new(60, 120, 2, true, 0).unwrap(),
-        SecretOfflineBehavior::Deny,
-        "2026-07-24T11:00:00.000000Z",
-        None,
-    )
-    .unwrap()
-}
-
 #[test]
 fn construction_is_compile_gated_and_runtime_mode_restricted() {
     for mode in [
@@ -154,7 +84,7 @@ fn construction_is_compile_gated_and_runtime_mode_restricted() {
 }
 
 #[test]
-fn broker_composition_registers_port_without_resolving_material() {
+fn provider_port_registration_is_passive_and_resolves_nothing() {
     let provider = Arc::new(
         MemorySecretProvider::try_new(provider_id(), MemorySecretProviderRuntimeMode::Test)
             .unwrap(),
@@ -169,9 +99,7 @@ fn broker_composition_registers_port_without_resolving_material() {
         )
         .unwrap();
     let port: Arc<dyn SecretProvider> = provider.clone();
-    let broker =
-        ProcessLocalSecretBroker::try_new(vec![secret_ref(provider_id())], vec![port]).unwrap();
-    assert_eq!(broker.registered_provider_count(), 1);
+    assert_eq!(port.provider_id(), &provider_id());
     assert_eq!(provider.fetch_call_count(), 0);
     assert_eq!(provider.control_call_count(), 0);
 }

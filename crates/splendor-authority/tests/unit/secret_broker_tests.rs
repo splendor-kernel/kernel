@@ -249,6 +249,29 @@ fn secret_ref_with_window(
     disabled_at: Option<&str>,
 ) -> SecretRefV2 {
     let binding = use_binding(None);
+    secret_ref_for_binding(
+        &binding,
+        provider_id,
+        policy,
+        classification,
+        binding.secret_ref_revision(),
+        vec![SecretDeliveryMethod::InheritedFd],
+        created_at,
+        disabled_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn secret_ref_for_binding(
+    binding: &SecretLeaseUseBinding,
+    provider_id: SecretProviderId,
+    policy: SecretLeasePolicy,
+    classification: SecretClassification,
+    secret_ref_revision: u64,
+    delivery_methods: Vec<SecretDeliveryMethod>,
+    created_at: &str,
+    disabled_at: Option<&str>,
+) -> SecretRefV2 {
     let authorization = SecretCredentialAuthorizationV2::try_new(
         binding.driver_operation().clone(),
         binding.driver_declaration_revision(),
@@ -261,7 +284,7 @@ fn secret_ref_with_window(
     .unwrap();
     SecretRefV2::try_new(
         binding.secret_ref_id().clone(),
-        binding.secret_ref_revision(),
+        secret_ref_revision,
         binding.tenant_id().clone(),
         provider_id,
         "test",
@@ -269,7 +292,7 @@ fn secret_ref_with_window(
         binding.provider_version_ref().clone(),
         classification,
         vec![authorization],
-        vec![SecretDeliveryMethod::InheritedFd],
+        delivery_methods,
         policy,
         SecretOfflineBehavior::Deny,
         created_at,
@@ -450,6 +473,32 @@ impl SecretBrokerIdSource for ScriptedIds {
     }
 }
 
+#[derive(Debug, Default)]
+struct ToggleFailIds {
+    next: AtomicU64,
+    fail_kind: Mutex<Option<SecretBrokerIdKind>>,
+}
+
+impl ToggleFailIds {
+    fn fail(&self, kind: SecretBrokerIdKind) {
+        *self.fail_kind.lock().unwrap() = Some(kind);
+    }
+
+    fn allow_all(&self) {
+        *self.fail_kind.lock().unwrap() = None;
+    }
+}
+
+impl SecretBrokerIdSource for ToggleFailIds {
+    fn next_uuid(&self, kind: SecretBrokerIdKind) -> Option<Uuid> {
+        if self.fail_kind.lock().ok()?.as_ref() == Some(&kind) {
+            return None;
+        }
+        let ordinal = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        Some(uuid(40_000 + u128::from(ordinal)))
+    }
+}
+
 #[derive(Default)]
 struct BrokerLockProbe {
     broker: Mutex<Option<Weak<ProcessLocalSecretBroker>>>,
@@ -600,6 +649,7 @@ fn broker_fixture(policy: SecretLeasePolicy) -> BrokerFixture {
     let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
     let ids = Arc::new(SequenceIds::default());
     let broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             policy,
@@ -699,6 +749,13 @@ fn validated_test_grant(
 
 fn authority_fixture(state: AuthorityState) -> AuthorityFixture {
     let binding = use_binding(None);
+    authority_fixture_for(&binding, state)
+}
+
+fn authority_fixture_for(
+    binding: &SecretLeaseUseBinding,
+    state: AuthorityState,
+) -> AuthorityFixture {
     let now = parsed_time("2026-07-24T12:00:00.000000Z");
     let policy = OfflineAuthorityPolicy::connected(Duration::hours(1)).unwrap();
     if matches!(state, AuthorityState::Missing) {
@@ -720,7 +777,7 @@ fn authority_fixture(state: AuthorityState) -> AuthorityFixture {
     } else {
         now + Duration::hours(2)
     };
-    let grant = validated_test_grant(&binding, now - Duration::minutes(5), expires_at);
+    let grant = validated_test_grant(binding, now - Duration::minutes(5), expires_at);
     let grant_id = grant.grant().grant_id.clone();
     let mut cache = AuthorityGrantCache::new();
     cache.insert_cached(
@@ -771,6 +828,21 @@ fn authority_fixture(state: AuthorityState) -> AuthorityFixture {
     }
 }
 
+fn active_authority_fixture_at(
+    binding: &SecretLeaseUseBinding,
+    now: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> AuthorityFixture {
+    let grant = validated_test_grant(binding, now - Duration::minutes(1), expires_at);
+    let mut cache = AuthorityGrantCache::new();
+    cache.insert_cached(CachedAuthorityGrant::try_new(grant, now, expires_at).unwrap());
+    AuthorityFixture {
+        cache,
+        revocations: Some(RevocationSnapshot::try_new(Vec::new(), now, expires_at).unwrap()),
+        policy: OfflineAuthorityPolicy::connected(Duration::hours(1)).unwrap(),
+    }
+}
+
 fn active_context<'a>(
     authority: &'a AuthorityFixture,
     binding: &'a SecretLeaseUseBinding,
@@ -793,6 +865,26 @@ fn config_error(
     }
 }
 
+fn applied<T>(result: Result<SecretBrokerCommandOutcome<T>, SecretBrokerError>) -> T {
+    match result.expect("command must succeed") {
+        SecretBrokerCommandOutcome::Applied(value) => value,
+        SecretBrokerCommandOutcome::Historical(_) => {
+            panic!("first command application returned historical metadata")
+        }
+    }
+}
+
+fn historical<T>(
+    result: Result<SecretBrokerCommandOutcome<T>, SecretBrokerError>,
+) -> Box<HistoricalSecretBrokerReceipt> {
+    match result.expect("exact duplicate must pass current visibility") {
+        SecretBrokerCommandOutcome::Historical(receipt) => receipt,
+        SecretBrokerCommandOutcome::Applied(_) => {
+            panic!("exact duplicate minted a second live capability")
+        }
+    }
+}
+
 #[test]
 fn injected_clock_and_id_callbacks_run_without_broker_locks() {
     let probe = Arc::new(BrokerLockProbe::default());
@@ -808,6 +900,7 @@ fn injected_clock_and_id_callbacks_run_without_broker_locks() {
     let provider_port: Arc<dyn SecretProvider> = provider.clone();
     let broker = Arc::new(
         ProcessLocalSecretBroker::with_sources(
+            tenant(2),
             vec![secret_ref(
                 provider.provider_id.clone(),
                 default_policy(1, true),
@@ -831,7 +924,7 @@ fn injected_clock_and_id_callbacks_run_without_broker_locks() {
         )
         .unwrap();
 
-    assert_eq!(probe.callbacks.load(Ordering::SeqCst), 5);
+    assert_eq!(probe.callbacks.load(Ordering::SeqCst), 6);
     assert!(!probe.failed.load(Ordering::SeqCst));
     assert_eq!(provider.calls(), 0);
 }
@@ -841,6 +934,7 @@ fn panicking_clock_callback_fails_closed_without_poisoning_broker_state() {
     let provider = Arc::new(TrapProvider::new(secret_id(10)));
     let provider_port: Arc<dyn SecretProvider> = provider.clone();
     let broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(1, true),
@@ -875,6 +969,7 @@ fn panicking_clock_callback_fails_closed_without_poisoning_broker_state() {
 #[test]
 fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
     let fixture = broker_fixture(default_policy(1, true));
+    assert_eq!(fixture.broker.registered_provider_count(), 1);
     let binding = use_binding(None);
     let declaration = declaration(&binding);
     let authority = authority_fixture(AuthorityState::Active);
@@ -893,12 +988,18 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
         .broker
         .issue_lease(request, &active_context(&authority, &binding, &declaration))
         .unwrap();
-    assert_eq!(retry.snapshot(), grant.snapshot());
+    let receipt = retry
+        .historical()
+        .expect("an exact issue duplicate must be historical only");
     assert_eq!(
-        retry.handle().delivery_handle_id(),
-        grant.handle().delivery_handle_id()
+        receipt.evidence().secret_lease_id(),
+        Some(grant.snapshot().secret_lease_id())
     );
-    assert_eq!(fixture.clock.reads(), reads);
+    assert_eq!(
+        receipt.evidence().kind(),
+        SecretAccessEvidenceKind::LeaseIssued
+    );
+    assert_eq!(fixture.clock.reads(), reads + 1);
     assert_eq!(fixture.ids.count(), ids);
     assert_eq!(all_events(&fixture.broker).len(), event_count);
     let other = fixture
@@ -930,9 +1031,12 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
             &active_context(&authority, &binding, &declaration),
         )
         .unwrap();
+    let claim_receipt = claim_retry
+        .historical()
+        .expect("an exact claim duplicate must be historical only");
     assert_eq!(
-        claim_retry.secret_use_claim_id(),
-        claim.secret_use_claim_id()
+        claim_receipt.evidence().secret_use_claim_id(),
+        Some(claim.secret_use_claim_id())
     );
     assert_eq!(
         claim.secret_use_attempt_id(),
@@ -949,7 +1053,7 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
         parsed_time("2026-07-24T12:05:00.000000Z")
     );
     assert_eq!(claim.revocation_generation(), 1);
-    assert_eq!(format!("{claim:?}"), "SecretDeliveryClaim(<opaque>)");
+    assert_eq!(format!("{:?}", &*claim), "SecretDeliveryClaim(<opaque>)");
     assert_eq!(
         format!("{:?}", grant.handle()),
         "SecretDeliveryHandle(<opaque>)"
@@ -978,7 +1082,7 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
         ),
         Err(SecretBrokerError::MaxUsesExceeded)
     ));
-    assert_eq!(fixture.clock.reads(), denied_reads);
+    assert_eq!(fixture.clock.reads(), denied_reads + 1);
     assert_eq!(fixture.ids.count(), denied_ids);
     assert_eq!(all_events(&fixture.broker).len(), denied_events);
     assert!(matches!(
@@ -988,7 +1092,7 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
             &binding,
             &active_context(&authority, &binding, &declaration),
         ),
-        Err(SecretBrokerError::CommandConflict)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
     assert_eq!(fixture.provider.calls(), 0);
     assert_eq!(
@@ -1043,15 +1147,10 @@ fn every_exact_binding_axis_and_current_declaration_fail_closed() {
             &active_context(&authority, &baseline, &current),
         );
         assert!(
-            matches!(
-                result,
-                Err(SecretBrokerError::SecretNotAvailable | SecretBrokerError::AuthorityDenied)
-            ),
+            matches!(result, Err(SecretBrokerError::SecretNotAvailable)),
             "unexpected result for {change:?}"
         );
-        let event = all_events(&fixture.broker).pop().unwrap();
-        assert!(event.secret_lease_id().is_none());
-        assert!(event.delivery_handle_id().is_none());
+        assert!(all_events(&fixture.broker).is_empty());
     }
 
     let stale_binding = use_binding(Some(BindingChange::DeclarationRevision));
@@ -1083,8 +1182,10 @@ fn missing_expired_revoked_and_unavailable_current_authority_stay_denied() {
                 initial_request(300 + index as u128, 1),
                 &active_context(&authority, &binding, &current),
             ),
-            Err(SecretBrokerError::AuthorityDenied)
+            Err(SecretBrokerError::SecretNotAvailable)
         ));
+        assert!(all_events(&fixture.broker).is_empty());
+        assert_eq!(fixture.ids.count(), 0);
         assert_eq!(fixture.provider.calls(), 0);
     }
 }
@@ -1127,7 +1228,7 @@ fn exact_lease_expiry_is_terminal_and_never_reaches_provider() {
         ),
         Err(SecretBrokerError::LeaseExpired)
     ));
-    assert_eq!(fixture.clock.reads(), reads);
+    assert_eq!(fixture.clock.reads(), reads + 1);
     assert_eq!(fixture.ids.count(), ids);
     assert_eq!(all_events(&fixture.broker).len(), events);
     assert_eq!(
@@ -1189,7 +1290,85 @@ fn delivery_duration_and_use_requests_can_only_narrow_current_ref_policy() {
 }
 
 #[test]
-fn idempotency_conflicts_and_denied_retries_ignore_later_ambient_changes() {
+fn environment_delivery_is_reserved_even_when_allowed_and_safe_fallback_is_selected() {
+    let binding = use_binding(None);
+    let provider = Arc::new(TrapProvider::new(secret_id(10)));
+    let broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
+        vec![secret_ref_for_binding(
+            &binding,
+            provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision(),
+            vec![
+                SecretDeliveryMethod::EnvironmentVariable,
+                SecretDeliveryMethod::InheritedFd,
+            ],
+            "2026-07-24T11:00:00.000000Z",
+            None,
+        )],
+        vec![provider.clone()],
+        Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
+        Arc::new(SequenceIds::default()),
+    )
+    .unwrap();
+    let current = declaration(&binding);
+    let authority = authority_fixture(AuthorityState::Active);
+
+    let environment_only = custom_request(
+        390,
+        binding.clone(),
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:00.000000Z",
+        1,
+        vec![SecretDeliveryMethod::EnvironmentVariable],
+    );
+    assert_eq!(
+        broker
+            .issue_lease(
+                environment_only.clone(),
+                &active_context(&authority, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    let events = all_events(&broker).len();
+    let historical_denial = broker.issue_lease(
+        environment_only,
+        &active_context(&authority, &binding, &current),
+    );
+    assert_eq!(
+        historical_denial.unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    assert_eq!(all_events(&broker).len(), events);
+
+    let safe_fallback = applied(broker.issue_lease(
+        custom_request(
+            391,
+            binding.clone(),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            1,
+            vec![
+                SecretDeliveryMethod::EnvironmentVariable,
+                SecretDeliveryMethod::InheritedFd,
+            ],
+        ),
+        &active_context(&authority, &binding, &current),
+    ));
+    assert_eq!(
+        safe_fallback.snapshot().selected_delivery_method(),
+        SecretDeliveryMethod::InheritedFd
+    );
+    assert_eq!(provider.calls(), 0);
+}
+
+#[test]
+fn idempotency_conflicts_are_hidden_and_unauthorized_probes_do_not_poison_commands() {
     let fixture = broker_fixture(default_policy(3, true));
     let binding = use_binding(None);
     let current = declaration(&binding);
@@ -1206,7 +1385,7 @@ fn idempotency_conflicts_and_denied_retries_ignore_later_ambient_changes() {
             initial_request(400, 2),
             &active_context(&active, &binding, &current),
         ),
-        Err(SecretBrokerError::CommandConflict)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
 
     let missing = authority_fixture(AuthorityState::Missing);
@@ -1216,20 +1395,299 @@ fn idempotency_conflicts_and_denied_retries_ignore_later_ambient_changes() {
             denied_request.clone(),
             &active_context(&missing, &binding, &current),
         ),
-        Err(SecretBrokerError::AuthorityDenied)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
     let reads = fixture.clock.reads();
     let ids = fixture.ids.count();
     let events = all_events(&fixture.broker).len();
+    let applied = fixture
+        .broker
+        .issue_lease(denied_request, &active_context(&active, &binding, &current))
+        .unwrap();
+    assert!(matches!(applied, SecretBrokerCommandOutcome::Applied(_)));
+    assert!(fixture.clock.reads() > reads);
+    assert!(fixture.ids.count() > ids);
+    assert!(all_events(&fixture.broker).len() > events);
+}
+
+#[test]
+fn successful_issue_duplicate_is_historical_only_after_current_visibility() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let request = initial_request(450, 3);
+    let grant = applied(fixture.broker.issue_lease(
+        request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+    let retained_time = fixture.broker.lock_state().unwrap().max_observed_time;
+
+    let receipt = historical(fixture.broker.issue_lease(
+        request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        receipt.evidence().secret_lease_id(),
+        Some(grant.snapshot().secret_lease_id())
+    );
+    assert_eq!(
+        receipt.evidence().occurred_at(),
+        grant.snapshot().issued_at()
+    );
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+    assert_eq!(
+        fixture.broker.lock_state().unwrap().max_observed_time,
+        retained_time
+    );
+
+    for state in [
+        AuthorityState::Missing,
+        AuthorityState::Expired,
+        AuthorityState::Revoked,
+        AuthorityState::MissingSnapshot,
+    ] {
+        let unavailable = authority_fixture(state);
+        assert_eq!(
+            fixture
+                .broker
+                .issue_lease(
+                    request.clone(),
+                    &active_context(&unavailable, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::SecretNotAvailable
+        );
+    }
+
+    let stale_binding = use_binding(Some(BindingChange::DeclarationRevision));
+    let stale_declaration = declaration(&stale_binding);
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                request.clone(),
+                &active_context(&active, &binding, &stale_declaration),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+
+    let ref_key = (binding.tenant_id().clone(), binding.secret_ref_id().clone());
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key.clone(),
+        secret_ref_for_binding(
+            &binding,
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision(),
+            vec![SecretDeliveryMethod::InheritedFd],
+            "2026-07-24T11:00:00.000000Z",
+            Some("2026-07-24T12:00:00.000000Z"),
+        ),
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key.clone(),
+        secret_ref_for_binding(
+            &binding,
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision() + 1,
+            vec![SecretDeliveryMethod::InheritedFd],
+            "2026-07-24T11:00:00.000000Z",
+            None,
+        ),
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key,
+        secret_ref(
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+        ),
+    );
     assert!(matches!(
         fixture
             .broker
-            .issue_lease(denied_request, &active_context(&active, &binding, &current),),
-        Err(SecretBrokerError::AuthorityDenied)
+            .issue_lease(request, &active_context(&active, &binding, &current),),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
     ));
-    assert_eq!(fixture.clock.reads(), reads);
+}
+
+#[test]
+fn command_hit_miss_conflict_and_cross_tenant_probes_share_one_outward_profile() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let victim = initial_request(455, 2);
+    applied(
+        fixture
+            .broker
+            .issue_lease(victim.clone(), &active_context(&active, &binding, &current)),
+    );
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+    let missing = authority_fixture(AuthorityState::Missing);
+
+    let unauthorized_hit = fixture.broker.issue_lease(
+        victim.clone(),
+        &active_context(&missing, &binding, &current),
+    );
+    let unauthorized_miss = fixture.broker.issue_lease(
+        initial_request(456, 2),
+        &active_context(&missing, &binding, &current),
+    );
+    let unauthorized_conflict = fixture.broker.issue_lease(
+        initial_request(455, 3),
+        &active_context(&missing, &binding, &current),
+    );
+    for result in [unauthorized_hit, unauthorized_miss, unauthorized_conflict] {
+        assert_eq!(result.unwrap_err().code(), "secret_not_available");
+    }
+
+    let cross_tenant = use_binding(Some(BindingChange::Tenant));
+    let cross_tenant_authority = authority_fixture_for(&cross_tenant, AuthorityState::Active);
+    let cross_tenant_declaration = declaration(&cross_tenant);
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                lease_request(
+                    455,
+                    cross_tenant.clone(),
+                    "2026-07-24T12:00:00.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:00.000000Z",
+                    2,
+                ),
+                &active_context(
+                    &cross_tenant_authority,
+                    &cross_tenant,
+                    &cross_tenant_declaration,
+                ),
+            )
+            .unwrap_err()
+            .code(),
+        "secret_not_available"
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                initial_request(455, 3),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err()
+            .code(),
+        "secret_not_available"
+    );
     assert_eq!(fixture.ids.count(), ids);
     assert_eq!(all_events(&fixture.broker).len(), events);
+    assert_eq!(fixture.provider.calls(), 0);
+}
+
+#[test]
+fn issue_duplicates_after_expiry_revocation_and_supersession_never_return_handles() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+
+    let expired = broker_fixture(default_policy(3, true));
+    let expired_request = initial_request(460, 3);
+    applied(expired.broker.issue_lease(
+        expired_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    expired
+        .clock
+        .set(parsed_time("2026-07-24T12:05:00.000000Z"));
+    assert!(matches!(
+        expired.broker.issue_lease(
+            expired_request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let revoked = broker_fixture(default_policy(3, true));
+    let revoked_request = initial_request(461, 3);
+    let revoked_grant = applied(revoked.broker.issue_lease(
+        revoked_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    applied(revoked.broker.revoke_lease(
+        secret_id(462),
+        revoked_grant.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    assert!(matches!(
+        revoked.broker.issue_lease(
+            revoked_request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let superseded = broker_fixture(default_policy(3, true));
+    let superseded_request = initial_request(463, 3);
+    let old = applied(superseded.broker.issue_lease(
+        superseded_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    superseded
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    applied(superseded.broker.renew_lease(
+        secret_id(464),
+        old.handle(),
+        lease_request(
+            465,
+            binding.clone(),
+            "2026-07-24T12:00:30.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:30.000000Z",
+            3,
+        ),
+        &active_context(&active, &binding, &current),
+    ));
+    assert!(matches!(
+        superseded.broker.issue_lease(
+            superseded_request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
 }
 
 #[test]
@@ -1245,7 +1703,13 @@ fn concurrent_last_use_has_one_winner_and_each_command_is_terminal() {
             &active_context(&authority, &binding, &current),
         )
         .unwrap();
-    let handle = Arc::new(grant.into_parts().1);
+    let handle = Arc::new(
+        grant
+            .into_applied()
+            .expect("first issue must return a live grant")
+            .into_parts()
+            .1,
+    );
     let barrier = Arc::new(Barrier::new(3));
     let results = std::thread::scope(|scope| {
         let mut joins = Vec::new();
@@ -1330,7 +1794,7 @@ fn renewal_is_an_immediate_gap_free_cutover_and_preserves_lineage_limits() {
         ),
         Err(SecretBrokerError::RequestAlreadyUsed)
     ));
-    assert_eq!(fixture.clock.reads(), denied_reads);
+    assert_eq!(fixture.clock.reads(), denied_reads + 1);
     assert_eq!(fixture.ids.count(), denied_ids);
     assert_eq!(all_events(&fixture.broker).len(), denied_events);
     let renewal_command: SecretRenewalCommandId = secret_id(601);
@@ -1361,7 +1825,14 @@ fn renewal_is_an_immediate_gap_free_cutover_and_preserves_lineage_limits() {
             &active_context(&authority, &binding, &current),
         )
         .unwrap();
-    assert_eq!(renewal_retry.snapshot(), renewed.snapshot());
+    assert_eq!(
+        renewal_retry
+            .historical()
+            .expect("an exact renewal duplicate must be historical only")
+            .evidence()
+            .secret_lease_id(),
+        Some(renewed.snapshot().secret_lease_id())
+    );
     assert_eq!(all_events(&fixture.broker).len(), renewal_events);
     assert!(matches!(
         fixture.broker.renew_lease(
@@ -1377,7 +1848,7 @@ fn renewal_is_an_immediate_gap_free_cutover_and_preserves_lineage_limits() {
             ),
             &active_context(&authority, &binding, &current),
         ),
-        Err(SecretBrokerError::CommandConflict)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
     assert_eq!(
         renewed.snapshot().continuous_lifetime_started_at(),
@@ -1438,6 +1909,424 @@ fn renewal_is_an_immediate_gap_free_cutover_and_preserves_lineage_limits() {
 }
 
 #[test]
+fn successful_renewal_duplicate_is_historical_after_visibility_and_lifecycle_drift() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let fixture = broker_fixture(default_policy(3, true));
+    let old = applied(fixture.broker.issue_lease(
+        initial_request(650, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    fixture
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    let command: SecretRenewalCommandId = secret_id(651);
+    let request = lease_request(
+        652,
+        binding.clone(),
+        "2026-07-24T12:00:30.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:30.000000Z",
+        3,
+    );
+    let renewed = applied(fixture.broker.renew_lease(
+        command.clone(),
+        old.handle(),
+        request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        renewed.snapshot().starts_at().as_str(),
+        "2026-07-24T12:01:00.000000Z"
+    );
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+
+    for state in [
+        AuthorityState::Missing,
+        AuthorityState::Expired,
+        AuthorityState::Revoked,
+        AuthorityState::MissingSnapshot,
+    ] {
+        let unavailable = authority_fixture(state);
+        assert_eq!(
+            fixture
+                .broker
+                .renew_lease(
+                    command.clone(),
+                    old.handle(),
+                    request.clone(),
+                    &active_context(&unavailable, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::SecretNotAvailable
+        );
+    }
+
+    let stale_binding = use_binding(Some(BindingChange::DeclarationRevision));
+    let stale_declaration = declaration(&stale_binding);
+    assert_eq!(
+        fixture
+            .broker
+            .renew_lease(
+                command.clone(),
+                old.handle(),
+                request.clone(),
+                &active_context(&active, &binding, &stale_declaration),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+
+    let ref_key = (binding.tenant_id().clone(), binding.secret_ref_id().clone());
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key.clone(),
+        secret_ref_for_binding(
+            &binding,
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision(),
+            vec![SecretDeliveryMethod::InheritedFd],
+            "2026-07-24T11:00:00.000000Z",
+            Some("2026-07-24T12:01:00.000000Z"),
+        ),
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .renew_lease(
+                command.clone(),
+                old.handle(),
+                request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key.clone(),
+        secret_ref_for_binding(
+            &binding,
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision() + 1,
+            vec![SecretDeliveryMethod::InheritedFd],
+            "2026-07-24T11:00:00.000000Z",
+            None,
+        ),
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .renew_lease(
+                command.clone(),
+                old.handle(),
+                request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+
+    fixture.broker.lock_state().unwrap().refs.insert(
+        ref_key,
+        secret_ref(
+            fixture.provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+        ),
+    );
+    assert_eq!(
+        historical(fixture.broker.renew_lease(
+            command.clone(),
+            old.handle(),
+            request.clone(),
+            &active_context(&active, &binding, &current),
+        ))
+        .evidence()
+        .secret_lease_id(),
+        Some(renewed.snapshot().secret_lease_id())
+    );
+
+    applied(fixture.broker.revoke_lease(
+        secret_id(653),
+        renewed.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    assert!(matches!(
+        fixture.broker.renew_lease(
+            command,
+            old.handle(),
+            request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let expired = broker_fixture(default_policy(3, true));
+    let expired_old = applied(expired.broker.issue_lease(
+        initial_request(659, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    expired
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    let expired_command: SecretRenewalCommandId = secret_id(660);
+    let expired_request = lease_request(
+        661,
+        binding.clone(),
+        "2026-07-24T12:00:30.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:30.000000Z",
+        3,
+    );
+    applied(expired.broker.renew_lease(
+        expired_command.clone(),
+        expired_old.handle(),
+        expired_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    expired
+        .clock
+        .set(parsed_time("2026-07-24T12:05:00.000000Z"));
+    assert!(matches!(
+        expired.broker.renew_lease(
+            expired_command,
+            expired_old.handle(),
+            expired_request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let superseded = broker_fixture(default_policy(3, true));
+    let original = applied(superseded.broker.issue_lease(
+        initial_request(654, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    superseded
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    let first_command: SecretRenewalCommandId = secret_id(655);
+    let first_request = lease_request(
+        656,
+        binding.clone(),
+        "2026-07-24T12:00:30.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:30.000000Z",
+        3,
+    );
+    let first_renewed = applied(superseded.broker.renew_lease(
+        first_command.clone(),
+        original.handle(),
+        first_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    superseded
+        .clock
+        .set(parsed_time("2026-07-24T12:02:00.000000Z"));
+    applied(superseded.broker.renew_lease(
+        secret_id(657),
+        first_renewed.handle(),
+        lease_request(
+            658,
+            binding.clone(),
+            "2026-07-24T12:01:30.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:01:30.000000Z",
+            3,
+        ),
+        &active_context(&active, &binding, &current),
+    ));
+    assert!(matches!(
+        superseded.broker.renew_lease(
+            first_command,
+            original.handle(),
+            first_request,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+}
+
+#[test]
+fn system_clock_renewal_uses_broker_observed_immediate_cutover() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let configured_at = SystemSecretBrokerClock.now_utc().unwrap();
+    let authority = active_authority_fixture_at(
+        &binding,
+        configured_at - Duration::minutes(1),
+        configured_at + Duration::hours(1),
+    );
+    let provider = Arc::new(TrapProvider::new(secret_id(10)));
+    let created_at = canonical_timestamp(configured_at - Duration::hours(1)).unwrap();
+    let broker = ProcessLocalSecretBroker::try_new(
+        tenant(2),
+        vec![secret_ref_for_binding(
+            &binding,
+            provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+            binding.secret_ref_revision(),
+            vec![SecretDeliveryMethod::InheritedFd],
+            created_at.as_str(),
+            None,
+        )],
+        vec![provider.clone()],
+    )
+    .unwrap();
+
+    let mut issued = None;
+    for attempt in 0..3_u128 {
+        let prepared_at = SystemSecretBrokerClock.now_utc().unwrap();
+        let starts_at = prepared_at + Duration::seconds(1);
+        let expires_at = starts_at + Duration::minutes(5);
+        let starts_text = canonical_timestamp(starts_at).unwrap();
+        let expires_text = canonical_timestamp(expires_at).unwrap();
+        let requested_text = canonical_timestamp(prepared_at).unwrap();
+        let request = lease_request(
+            680 + attempt,
+            binding.clone(),
+            starts_text.as_str(),
+            expires_text.as_str(),
+            requested_text.as_str(),
+            3,
+        );
+        if let Ok(SecretBrokerCommandOutcome::Applied(grant)) =
+            broker.issue_lease(request, &active_context(&authority, &binding, &current))
+        {
+            issued = Some((grant, starts_at, expires_at));
+            break;
+        }
+    }
+    let (old, prepared_start, expires_at) =
+        issued.expect("system-clock issuance must complete before its future start");
+    while SystemSecretBrokerClock.now_utc().unwrap() < prepared_start {
+        std::thread::sleep(StdDuration::from_millis(10));
+    }
+    std::thread::sleep(StdDuration::from_millis(1));
+
+    let renewal_request = lease_request(
+        684,
+        binding.clone(),
+        canonical_timestamp(prepared_start).unwrap().as_str(),
+        canonical_timestamp(expires_at).unwrap().as_str(),
+        canonical_timestamp(prepared_start).unwrap().as_str(),
+        3,
+    );
+    let before = SystemSecretBrokerClock.now_utc().unwrap();
+    let renewed = applied(broker.renew_lease(
+        secret_id(685),
+        old.handle(),
+        renewal_request,
+        &active_context(&authority, &binding, &current),
+    ));
+    let after = SystemSecretBrokerClock.now_utc().unwrap();
+    let effective_start = parse_canonical(renewed.snapshot().starts_at()).unwrap();
+    assert!(effective_start >= before);
+    assert!(effective_start <= after);
+    assert!(effective_start > prepared_start);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[test]
+fn successful_claim_duplicate_after_expiry_revocation_or_generation_change_has_no_claim() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+
+    let expired = broker_fixture(default_policy(3, true));
+    let grant = applied(expired.broker.issue_lease(
+        initial_request(670, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    let attempt: SecretUseAttemptId = secret_id(671);
+    applied(expired.broker.claim_use(
+        attempt.clone(),
+        grant.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    expired
+        .clock
+        .set(parsed_time("2026-07-24T12:05:00.000000Z"));
+    assert!(matches!(
+        expired.broker.claim_use(
+            attempt,
+            grant.handle(),
+            &binding,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let revoked = broker_fixture(default_policy(3, true));
+    let grant = applied(revoked.broker.issue_lease(
+        initial_request(672, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    let attempt: SecretUseAttemptId = secret_id(673);
+    applied(revoked.broker.claim_use(
+        attempt.clone(),
+        grant.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    applied(revoked.broker.revoke_lease(
+        secret_id(674),
+        grant.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    assert!(matches!(
+        revoked.broker.claim_use(
+            attempt,
+            grant.handle(),
+            &binding,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+
+    let generation_changed = broker_fixture(default_policy(3, true));
+    let grant = applied(generation_changed.broker.issue_lease(
+        initial_request(675, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    let attempt: SecretUseAttemptId = secret_id(676);
+    applied(generation_changed.broker.claim_use(
+        attempt.clone(),
+        grant.handle(),
+        &binding,
+        &active_context(&active, &binding, &current),
+    ));
+    generation_changed
+        .broker
+        .lock_state()
+        .unwrap()
+        .leases
+        .get_mut(grant.snapshot().secret_lease_id())
+        .unwrap()
+        .revocation_generation += 1;
+    assert!(matches!(
+        generation_changed.broker.claim_use(
+            attempt,
+            grant.handle(),
+            &binding,
+            &active_context(&active, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+}
+
+#[test]
 fn revocation_is_atomic_idempotent_and_never_calls_provider() {
     let fixture = broker_fixture(default_policy(2, true));
     let binding = use_binding(None);
@@ -1466,7 +2355,7 @@ fn revocation_is_atomic_idempotent_and_never_calls_provider() {
             &binding,
             &active_context(&missing, &binding, &current),
         ),
-        Err(SecretBrokerError::AuthorityDenied)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
     let denied_reads = fixture.clock.reads();
     let denied_ids = fixture.ids.count();
@@ -1478,11 +2367,11 @@ fn revocation_is_atomic_idempotent_and_never_calls_provider() {
             &binding,
             &active_context(&authority, &binding, &current),
         ),
-        Err(SecretBrokerError::AuthorityDenied)
+        Ok(SecretBrokerCommandOutcome::Applied(_))
     ));
-    assert_eq!(fixture.clock.reads(), denied_reads);
-    assert_eq!(fixture.ids.count(), denied_ids);
-    assert_eq!(all_events(&fixture.broker).len(), denied_events);
+    assert!(fixture.clock.reads() > denied_reads);
+    assert!(fixture.ids.count() > denied_ids);
+    assert!(all_events(&fixture.broker).len() > denied_events);
     let command: SecretRevocationCommandId = secret_id(701);
     let first = fixture
         .broker
@@ -1503,7 +2392,17 @@ fn revocation_is_atomic_idempotent_and_never_calls_provider() {
             &active_context(&authority, &binding, &current),
         )
         .unwrap();
-    assert_eq!(first, retry);
+    let revocation_receipt = retry
+        .historical()
+        .expect("an exact revocation duplicate must be historical only");
+    assert_eq!(
+        revocation_receipt.evidence().secret_lease_id(),
+        Some(first.secret_lease_id())
+    );
+    assert_eq!(
+        revocation_receipt.evidence().revocation_generation(),
+        first.revocation_generation()
+    );
     assert_eq!(first.status(), SecretLeaseStatus::Revoked);
     assert_eq!(all_events(&fixture.broker).len(), events);
     assert!(matches!(
@@ -1513,7 +2412,7 @@ fn revocation_is_atomic_idempotent_and_never_calls_provider() {
             &binding,
             &active_context(&authority, &binding, &current),
         ),
-        Err(SecretBrokerError::CommandConflict)
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
     assert!(matches!(
         fixture.broker.claim_use(
@@ -1543,6 +2442,7 @@ fn finite_limits_fail_closed_without_partial_state_or_unbounded_replay() {
         max_replay_page_size: 1,
     };
     let broker = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(2, true),
@@ -1577,7 +2477,14 @@ fn finite_limits_fail_closed_without_partial_state_or_unbounded_replay() {
             &active_context(&authority, &binding, &current),
         )
         .unwrap();
-    assert_eq!(retry.snapshot(), first.snapshot());
+    assert_eq!(
+        retry
+            .historical()
+            .expect("an exact duplicate must remain available at capacity")
+            .evidence()
+            .secret_lease_id(),
+        Some(first.snapshot().secret_lease_id())
+    );
     assert!(matches!(
         broker.replay_page(0, 2),
         Err(SecretBrokerError::InvalidPage)
@@ -1592,6 +2499,7 @@ fn finite_limits_fail_closed_without_partial_state_or_unbounded_replay() {
     };
     assert_eq!(
         config_error(ProcessLocalSecretBroker::with_sources_and_limits(
+            tenant(2),
             Vec::new(),
             Vec::new(),
             Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
@@ -1606,6 +2514,7 @@ fn finite_limits_fail_closed_without_partial_state_or_unbounded_replay() {
 fn event_allocation_failure_leaves_state_and_evidence_unchanged() {
     let provider = Arc::new(TrapProvider::new(secret_id(10)));
     let broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(1, true),
@@ -1631,6 +2540,188 @@ fn event_allocation_failure_leaves_state_and_evidence_unchanged() {
     let page = broker.replay_page(0, 128).unwrap();
     assert!(page.leases.is_empty());
     assert!(page.events.is_empty());
+}
+
+fn broker_with_clock_and_ids(
+    clock: Arc<ManualClock>,
+    ids: Arc<dyn SecretBrokerIdSource>,
+) -> ProcessLocalSecretBroker {
+    let provider = Arc::new(TrapProvider::new(secret_id(10)));
+    ProcessLocalSecretBroker::with_sources(
+        tenant(2),
+        vec![secret_ref(
+            provider.provider_id.clone(),
+            default_policy(3, true),
+            SecretClassification::AuthenticationCredential,
+        )],
+        vec![provider],
+        clock,
+        ids,
+    )
+    .unwrap()
+}
+
+#[test]
+fn every_post_sample_id_failure_preserves_the_monotonic_time_fence() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let authority = authority_fixture(AuthorityState::Active);
+    let future = parsed_time("2026-07-24T12:01:00.000000Z");
+    let rollback = parsed_time("2026-07-24T12:00:30.000000Z");
+
+    for kind in [
+        SecretBrokerIdKind::AccessEvent,
+        SecretBrokerIdKind::Lease,
+        SecretBrokerIdKind::DeliveryHandle,
+        SecretBrokerIdKind::HandleCapability,
+    ] {
+        let clock = Arc::new(ManualClock::new(future));
+        let ids = Arc::new(ToggleFailIds::default());
+        ids.fail(kind);
+        let broker = broker_with_clock_and_ids(clock.clone(), ids.clone());
+        assert!(broker
+            .issue_lease(
+                initial_request(920 + kind as u128, 2),
+                &active_context(&authority, &binding, &current),
+            )
+            .is_err());
+        assert_eq!(broker.lock_state().unwrap().max_observed_time, Some(future));
+        assert!(broker.replay_page(0, 128).unwrap().events.is_empty());
+        ids.allow_all();
+        clock.set(rollback);
+        assert_eq!(
+            broker
+                .issue_lease(
+                    initial_request(930 + kind as u128, 2),
+                    &active_context(&authority, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::ClockRollback
+        );
+    }
+
+    for kind in [
+        SecretBrokerIdKind::AccessEvent,
+        SecretBrokerIdKind::UseClaim,
+        SecretBrokerIdKind::ClaimCapability,
+    ] {
+        let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
+        let ids = Arc::new(ToggleFailIds::default());
+        let broker = broker_with_clock_and_ids(clock.clone(), ids.clone());
+        let grant = applied(broker.issue_lease(
+            initial_request(940 + kind as u128, 3),
+            &active_context(&authority, &binding, &current),
+        ));
+        clock.set(future);
+        ids.fail(kind);
+        assert!(broker
+            .claim_use(
+                secret_id(950 + kind as u128),
+                grant.handle(),
+                &binding,
+                &active_context(&authority, &binding, &current),
+            )
+            .is_err());
+        assert_eq!(broker.lock_state().unwrap().max_observed_time, Some(future));
+        ids.allow_all();
+        clock.set(rollback);
+        assert_eq!(
+            broker
+                .claim_use(
+                    secret_id(960 + kind as u128),
+                    grant.handle(),
+                    &binding,
+                    &active_context(&authority, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::ClockRollback
+        );
+    }
+
+    for kind in [
+        SecretBrokerIdKind::AccessEvent,
+        SecretBrokerIdKind::Lease,
+        SecretBrokerIdKind::DeliveryHandle,
+        SecretBrokerIdKind::HandleCapability,
+    ] {
+        let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
+        let ids = Arc::new(ToggleFailIds::default());
+        let broker = broker_with_clock_and_ids(clock.clone(), ids.clone());
+        let old = applied(broker.issue_lease(
+            initial_request(970 + kind as u128, 3),
+            &active_context(&authority, &binding, &current),
+        ));
+        clock.set(future);
+        ids.fail(kind);
+        assert!(broker
+            .renew_lease(
+                secret_id(980 + kind as u128),
+                old.handle(),
+                lease_request(
+                    990 + kind as u128,
+                    binding.clone(),
+                    "2026-07-24T12:00:30.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:30.000000Z",
+                    3,
+                ),
+                &active_context(&authority, &binding, &current),
+            )
+            .is_err());
+        assert_eq!(broker.lock_state().unwrap().max_observed_time, Some(future));
+        ids.allow_all();
+        clock.set(rollback);
+        assert_eq!(
+            broker
+                .renew_lease(
+                    secret_id(1_000 + kind as u128),
+                    old.handle(),
+                    lease_request(
+                        1_010 + kind as u128,
+                        binding.clone(),
+                        "2026-07-24T12:00:00.000000Z",
+                        "2026-07-24T12:05:00.000000Z",
+                        "2026-07-24T12:00:00.000000Z",
+                        3,
+                    ),
+                    &active_context(&authority, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::ClockRollback
+        );
+    }
+
+    let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
+    let ids = Arc::new(ToggleFailIds::default());
+    let broker = broker_with_clock_and_ids(clock.clone(), ids.clone());
+    let grant = applied(broker.issue_lease(
+        initial_request(1_020, 3),
+        &active_context(&authority, &binding, &current),
+    ));
+    clock.set(future);
+    ids.fail(SecretBrokerIdKind::AccessEvent);
+    assert!(broker
+        .revoke_lease(
+            secret_id(1_021),
+            grant.handle(),
+            &binding,
+            &active_context(&authority, &binding, &current),
+        )
+        .is_err());
+    assert_eq!(broker.lock_state().unwrap().max_observed_time, Some(future));
+    ids.allow_all();
+    clock.set(rollback);
+    assert_eq!(
+        broker
+            .revoke_lease(
+                secret_id(1_022),
+                grant.handle(),
+                &binding,
+                &active_context(&authority, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::ClockRollback
+    );
 }
 
 #[test]
@@ -1731,6 +2822,7 @@ fn malformed_configuration_and_classification_mismatch_fail_closed() {
     let provider = Arc::new(TrapProvider::new(secret_id(10)));
     assert_eq!(
         config_error(ProcessLocalSecretBroker::try_new(
+            tenant(2),
             vec![secret_ref(
                 provider.provider_id.clone(),
                 default_policy(1, true),
@@ -1742,6 +2834,7 @@ fn malformed_configuration_and_classification_mismatch_fail_closed() {
     );
     assert_eq!(
         config_error(ProcessLocalSecretBroker::try_new(
+            tenant(2),
             Vec::new(),
             vec![provider.clone(), provider.clone()],
         )),
@@ -1751,6 +2844,7 @@ fn malformed_configuration_and_classification_mismatch_fail_closed() {
     excessive_limits.max_secret_refs += 1;
     assert_eq!(
         config_error(ProcessLocalSecretBroker::with_sources_and_limits(
+            tenant(2),
             Vec::new(),
             Vec::new(),
             Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
@@ -1761,6 +2855,7 @@ fn malformed_configuration_and_classification_mismatch_fail_closed() {
     );
 
     let broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(1, true),
@@ -1784,7 +2879,7 @@ fn malformed_configuration_and_classification_mismatch_fail_closed() {
 }
 
 #[test]
-fn clock_rollback_denial_is_terminal_for_the_command() {
+fn clock_rollback_latches_time_without_poisoning_a_later_command_attempt() {
     let fixture = broker_fixture(default_policy(2, true));
     let binding = use_binding(None);
     let current = declaration(&binding);
@@ -1817,14 +2912,12 @@ fn clock_rollback_denial_is_terminal_for_the_command() {
     fixture
         .clock
         .set(parsed_time("2026-07-24T12:00:01.000000Z"));
-    let reads = fixture.clock.reads();
     assert!(matches!(
         fixture
             .broker
-            .issue_lease(request, &active_context(&authority, &binding, &current),),
-        Err(SecretBrokerError::ClockRollback)
+            .issue_lease(request, &active_context(&authority, &binding, &current)),
+        Err(SecretBrokerError::SecretNotAvailable)
     ));
-    assert_eq!(fixture.clock.reads(), reads);
 }
 
 #[test]
@@ -1890,10 +2983,6 @@ fn process_local_error_limits_and_system_seams_cover_closed_surface() {
         (
             SecretBrokerError::RequestAlreadyUsed,
             "secret_lease_request_already_used",
-        ),
-        (
-            SecretBrokerError::CommandConflict,
-            "secret_broker_command_conflict",
         ),
         (
             SecretBrokerError::CapacityExceeded,
@@ -1981,6 +3070,7 @@ fn process_local_configuration_rejects_duplicate_refs_and_capacity() {
     );
     assert_eq!(
         config_error(ProcessLocalSecretBroker::try_new(
+            tenant(2),
             vec![reference.clone(), reference],
             vec![provider.clone()],
         )),
@@ -1995,6 +3085,7 @@ fn process_local_configuration_rejects_duplicate_refs_and_capacity() {
     let second_provider = Arc::new(TrapProvider::new(secret_id(11)));
     assert_eq!(
         config_error(ProcessLocalSecretBroker::with_sources_and_limits(
+            tenant(2),
             Vec::new(),
             vec![provider, second_provider],
             Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
@@ -2003,6 +3094,203 @@ fn process_local_configuration_rejects_duplicate_refs_and_capacity() {
         )),
         SecretBrokerConfigError::CapacityExceeded
     );
+}
+
+#[test]
+fn process_local_broker_is_single_tenant_and_capacity_is_tenant_local() {
+    let provider = Arc::new(TrapProvider::new(secret_id(10)));
+    assert_eq!(
+        config_error(ProcessLocalSecretBroker::try_new(
+            TenantId::from(Uuid::nil()),
+            Vec::new(),
+            Vec::new(),
+        )),
+        SecretBrokerConfigError::InvalidTenant
+    );
+
+    let tenant_b_binding = use_binding(Some(BindingChange::Tenant));
+    let tenant_b_ref = secret_ref_for_binding(
+        &tenant_b_binding,
+        provider.provider_id.clone(),
+        default_policy(2, true),
+        SecretClassification::AuthenticationCredential,
+        tenant_b_binding.secret_ref_revision(),
+        vec![SecretDeliveryMethod::InheritedFd],
+        "2026-07-24T11:00:00.000000Z",
+        None,
+    );
+    assert_eq!(
+        config_error(ProcessLocalSecretBroker::try_new(
+            tenant(2),
+            vec![tenant_b_ref.clone()],
+            vec![provider.clone()],
+        )),
+        SecretBrokerConfigError::MixedTenant
+    );
+
+    let tenant_a = broker_fixture(default_policy(2, true));
+    let tenant_b_authority = authority_fixture_for(&tenant_b_binding, AuthorityState::Active);
+    let tenant_b_declaration = declaration(&tenant_b_binding);
+    let reads = tenant_a.clock.reads();
+    let ids = tenant_a.ids.count();
+    assert_eq!(
+        tenant_a
+            .broker
+            .issue_lease(
+                lease_request(
+                    1_450,
+                    tenant_b_binding.clone(),
+                    "2026-07-24T12:00:00.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:00.000000Z",
+                    1,
+                ),
+                &active_context(
+                    &tenant_b_authority,
+                    &tenant_b_binding,
+                    &tenant_b_declaration,
+                ),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    assert_eq!(tenant_a.clock.reads(), reads);
+    assert_eq!(tenant_a.ids.count(), ids);
+    assert!(all_events(&tenant_a.broker).is_empty());
+
+    let limits = ProcessLocalSecretBrokerLimits {
+        max_secret_refs: 1,
+        max_providers: 1,
+        max_active_leases: 1,
+        max_retained_leases: 2,
+        max_command_records: 8,
+        max_evidence_events: 8,
+        max_generated_ids: 32,
+        max_replay_page_size: 8,
+    };
+    let tenant_a_provider = Arc::new(TrapProvider::new(secret_id(10)));
+    let tenant_a_broker = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant(2),
+        vec![secret_ref(
+            tenant_a_provider.provider_id.clone(),
+            default_policy(2, true),
+            SecretClassification::AuthenticationCredential,
+        )],
+        vec![tenant_a_provider],
+        Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
+        Arc::new(SequenceIds::default()),
+        limits,
+    )
+    .unwrap();
+    let tenant_b_provider = Arc::new(TrapProvider::new(secret_id(10)));
+    let tenant_b_broker = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant_b_binding.tenant_id().clone(),
+        vec![tenant_b_ref],
+        vec![tenant_b_provider],
+        Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
+        Arc::new(SequenceIds::default()),
+        limits,
+    )
+    .unwrap();
+    let tenant_a_binding = use_binding(None);
+    let tenant_a_declaration = declaration(&tenant_a_binding);
+    let tenant_a_authority = authority_fixture(AuthorityState::Active);
+    applied(tenant_a_broker.issue_lease(
+        initial_request(1_451, 1),
+        &active_context(
+            &tenant_a_authority,
+            &tenant_a_binding,
+            &tenant_a_declaration,
+        ),
+    ));
+    assert_eq!(
+        tenant_a_broker
+            .issue_lease(
+                initial_request(1_452, 1),
+                &active_context(
+                    &tenant_a_authority,
+                    &tenant_a_binding,
+                    &tenant_a_declaration,
+                ),
+            )
+            .unwrap_err(),
+        SecretBrokerError::CapacityExceeded
+    );
+    assert!(matches!(
+        tenant_b_broker.issue_lease(
+            lease_request(
+                1_451,
+                tenant_b_binding.clone(),
+                "2026-07-24T12:00:00.000000Z",
+                "2026-07-24T12:05:00.000000Z",
+                "2026-07-24T12:00:00.000000Z",
+                1,
+            ),
+            &active_context(
+                &tenant_b_authority,
+                &tenant_b_binding,
+                &tenant_b_declaration,
+            ),
+        ),
+        Ok(SecretBrokerCommandOutcome::Applied(_))
+    ));
+}
+
+#[test]
+fn elapsed_active_lease_does_not_hold_active_capacity() {
+    let provider = Arc::new(TrapProvider::new(secret_id(10)));
+    let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
+    let broker = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant(2),
+        vec![secret_ref(
+            provider.provider_id.clone(),
+            default_policy(2, true),
+            SecretClassification::AuthenticationCredential,
+        )],
+        vec![provider],
+        clock.clone(),
+        Arc::new(SequenceIds::default()),
+        ProcessLocalSecretBrokerLimits {
+            max_secret_refs: 1,
+            max_providers: 1,
+            max_active_leases: 1,
+            max_retained_leases: 2,
+            max_command_records: 4,
+            max_evidence_events: 4,
+            max_generated_ids: 16,
+            max_replay_page_size: 4,
+        },
+    )
+    .unwrap();
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let authority = authority_fixture(AuthorityState::Active);
+    applied(broker.issue_lease(
+        lease_request(
+            1_460,
+            binding.clone(),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:01:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            1,
+        ),
+        &active_context(&authority, &binding, &current),
+    ));
+    clock.set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    assert!(matches!(
+        broker.issue_lease(
+            lease_request(
+                1_461,
+                binding.clone(),
+                "2026-07-24T12:01:00.000000Z",
+                "2026-07-24T12:05:00.000000Z",
+                "2026-07-24T12:01:00.000000Z",
+                1,
+            ),
+            &active_context(&authority, &binding, &current),
+        ),
+        Ok(SecretBrokerCommandOutcome::Applied(_))
+    ));
 }
 
 fn forged_handle(grant: &SecretLeaseGrant) -> SecretDeliveryHandle {
@@ -2101,7 +3389,7 @@ fn claim_denials_cover_future_binding_authority_handle_and_rollback_paths() {
                 &active_context(&missing, &binding, &current),
             )
             .unwrap_err(),
-        SecretBrokerError::AuthorityDenied
+        SecretBrokerError::SecretNotAvailable
     );
 
     let rollback = broker_fixture(default_policy(3, true));
@@ -2198,7 +3486,7 @@ fn renewal_denials_cover_handle_binding_authority_policy_capacity_and_rollback()
             )
             .err()
             .unwrap(),
-        SecretBrokerError::RenewalDenied
+        SecretBrokerError::SecretNotAvailable
     );
 
     let authority_denied = broker_fixture(default_policy(3, true));
@@ -2231,7 +3519,7 @@ fn renewal_denials_cover_handle_binding_authority_policy_capacity_and_rollback()
             )
             .err()
             .unwrap(),
-        SecretBrokerError::AuthorityDenied
+        SecretBrokerError::SecretNotAvailable
     );
 
     let nonrenewable = broker_fixture(default_policy(3, false));
@@ -2279,6 +3567,7 @@ fn renewal_denials_cover_handle_binding_authority_policy_capacity_and_rollback()
     };
     let clock = Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z")));
     let capacity = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(3, true),
@@ -2478,6 +3767,209 @@ fn revocation_denials_and_repeat_command_cover_closed_handle_paths() {
 }
 
 #[test]
+fn retained_binding_corruption_fails_closed_for_claim_renew_and_revoke() {
+    let binding = use_binding(None);
+    let changed = use_binding(Some(BindingChange::Principal));
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+
+    let claim = broker_fixture(default_policy(3, true));
+    let grant = applied(claim.broker.issue_lease(
+        initial_request(1_730, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    claim
+        .broker
+        .lock_state()
+        .unwrap()
+        .leases
+        .get_mut(grant.snapshot().secret_lease_id())
+        .unwrap()
+        .request = lease_request(
+        1_731,
+        changed.clone(),
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:00.000000Z",
+        3,
+    );
+    assert_eq!(
+        claim
+            .broker
+            .claim_use(
+                secret_id(1_732),
+                grant.handle(),
+                &binding,
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+
+    let renewal = broker_fixture(default_policy(3, true));
+    let old = applied(renewal.broker.issue_lease(
+        initial_request(1_740, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    renewal
+        .broker
+        .lock_state()
+        .unwrap()
+        .leases
+        .get_mut(old.snapshot().secret_lease_id())
+        .unwrap()
+        .request = lease_request(
+        1_741,
+        changed.clone(),
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:00.000000Z",
+        3,
+    );
+    renewal
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    assert_eq!(
+        renewal
+            .broker
+            .renew_lease(
+                secret_id(1_742),
+                old.handle(),
+                lease_request(
+                    1_743,
+                    binding.clone(),
+                    "2026-07-24T12:00:30.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:30.000000Z",
+                    3,
+                ),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::RenewalDenied
+    );
+
+    let revocation = broker_fixture(default_policy(3, true));
+    let grant = applied(revocation.broker.issue_lease(
+        initial_request(1_750, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    revocation
+        .broker
+        .lock_state()
+        .unwrap()
+        .leases
+        .get_mut(grant.snapshot().secret_lease_id())
+        .unwrap()
+        .request = lease_request(
+        1_751,
+        changed,
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:00.000000Z",
+        3,
+    );
+    assert_eq!(
+        revocation
+            .broker
+            .revoke_lease(
+                secret_id(1_752),
+                grant.handle(),
+                &binding,
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+}
+
+#[test]
+fn short_authority_window_cannot_authorize_full_lease_lifecycle_window() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let now = parsed_time("2026-07-24T12:00:00.000000Z");
+    let narrow = active_authority_fixture_at(&binding, now, now + Duration::minutes(1));
+
+    let issue = broker_fixture(default_policy(3, true));
+    assert_eq!(
+        issue
+            .broker
+            .issue_lease(
+                initial_request(1_760, 3),
+                &active_context(&narrow, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::AuthorityDenied
+    );
+
+    let active = authority_fixture(AuthorityState::Active);
+    let claim = broker_fixture(default_policy(3, true));
+    let grant = applied(claim.broker.issue_lease(
+        initial_request(1_770, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        claim
+            .broker
+            .claim_use(
+                secret_id(1_771),
+                grant.handle(),
+                &binding,
+                &active_context(&narrow, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::AuthorityDenied
+    );
+
+    let renewal = broker_fixture(default_policy(3, true));
+    let old = applied(renewal.broker.issue_lease(
+        initial_request(1_780, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    let renewal_now = now + Duration::minutes(1);
+    renewal.clock.set(renewal_now);
+    let renewal_authority =
+        active_authority_fixture_at(&binding, renewal_now, renewal_now + Duration::minutes(1));
+    assert_eq!(
+        renewal
+            .broker
+            .renew_lease(
+                secret_id(1_781),
+                old.handle(),
+                lease_request(
+                    1_782,
+                    binding.clone(),
+                    "2026-07-24T12:00:30.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:30.000000Z",
+                    3,
+                ),
+                &active_context(&renewal_authority, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::AuthorityDenied
+    );
+
+    let revocation = broker_fixture(default_policy(3, true));
+    let grant = applied(revocation.broker.issue_lease(
+        initial_request(1_790, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        revocation
+            .broker
+            .revoke_lease(
+                secret_id(1_791),
+                grant.handle(),
+                &binding,
+                &active_context(&narrow, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::AuthorityDenied
+    );
+}
+
+#[test]
 fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() {
     let fixture = broker_fixture(default_policy(2, true));
     assert_eq!(
@@ -2524,7 +4016,14 @@ fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() 
     );
 
     let binding = use_binding(None);
-    let key = command_key(SecretCommandKind::Issue, "shape-test".to_string(), &binding);
+    let current = declaration(&binding);
+    let authority = authority_fixture(AuthorityState::Active);
+    let authority = active_context(&authority, &binding, &current);
+    let key = trusted_command_key(
+        SecretCommandKind::Issue,
+        "shape-test".to_string(),
+        &authority,
+    );
     let digest = ContentHash::blake3(b"shape-test");
     state.commands.insert(
         key.clone(),
@@ -2547,19 +4046,19 @@ fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() 
     ));
     assert!(matches!(
         retry_revoke(&state, &key, &ContentHash::blake3(b"changed")),
-        Some(Err(SecretBrokerError::CommandConflict))
+        Some(Err(SecretBrokerError::SecretNotAvailable))
     ));
     assert!(retry_issue(
         &state,
-        &command_key(SecretCommandKind::Issue, "missing".to_string(), &binding),
+        &trusted_command_key(SecretCommandKind::Issue, "missing".to_string(), &authority),
         &digest,
     )
     .is_none());
 
-    let revoke_key = command_key(
+    let revoke_key = trusted_command_key(
         SecretCommandKind::Revoke,
         "wrong-terminal".to_string(),
-        &binding,
+        &authority,
     );
     state.commands.insert(
         revoke_key.clone(),
@@ -2572,6 +4071,136 @@ fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() 
         retry_revoke(&state, &revoke_key, &digest),
         Some(Err(SecretBrokerError::StateUnavailable))
     ));
+
+    let corrupt_history_key = trusted_command_key(
+        SecretCommandKind::Issue,
+        "corrupt-history".to_string(),
+        &authority,
+    );
+    state.commands.insert(
+        corrupt_history_key.clone(),
+        SecretCommandRecord {
+            semantic_digest: digest.clone(),
+            terminal: SecretCommandTerminal::Issue(Ok(HistoricalSecretBrokerRecord {
+                event_index: state.events.len(),
+                event_id: secret_id(2_001),
+            })),
+        },
+    );
+    assert!(matches!(
+        retry_issue(&state, &corrupt_history_key, &digest),
+        Some(Err(SecretBrokerError::StateUnavailable))
+    ));
+}
+
+#[test]
+fn private_result_and_visibility_helpers_are_non_authorizing_and_redacted() {
+    assert_eq!(
+        SecretBrokerConfigError::InvalidTenant.to_string(),
+        "secret_broker_tenant_invalid"
+    );
+    assert_eq!(
+        SecretBrokerConfigError::MixedTenant.to_string(),
+        "secret_broker_tenant_mismatch"
+    );
+
+    let applied_outcome = SecretBrokerCommandOutcome::Applied(());
+    assert_eq!(
+        format!("{applied_outcome:?}"),
+        "SecretBrokerCommandOutcome::Applied(<private>)"
+    );
+    assert!(applied_outcome.historical().is_none());
+
+    let fixture = broker_fixture(default_policy(2, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let authority = authority_fixture(AuthorityState::Active);
+    let request = initial_request(1_795, 2);
+    applied(fixture.broker.issue_lease(
+        request.clone(),
+        &active_context(&authority, &binding, &current),
+    ));
+    let historical_outcome = fixture
+        .broker
+        .issue_lease(
+            request.clone(),
+            &active_context(&authority, &binding, &current),
+        )
+        .unwrap();
+    assert_eq!(
+        format!("{historical_outcome:?}"),
+        "SecretBrokerCommandOutcome::Historical(<redacted>)"
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = historical_outcome.snapshot();
+    }))
+    .is_err());
+    assert!(fixture
+        .broker
+        .issue_lease(request, &active_context(&authority, &binding, &current),)
+        .unwrap()
+        .into_applied()
+        .is_err());
+
+    let state = fixture.broker.lock_state().unwrap();
+    let changed = use_binding(Some(BindingChange::Principal));
+    assert!(!fixture.broker.current_visibility(
+        &state,
+        &active_context(&authority, &binding, &current),
+        &changed,
+        parsed_time("2026-07-24T12:00:00.000000Z"),
+    ));
+    assert!(!fixture.broker.current_visibility(
+        &state,
+        &active_context(&authority, &binding, &current),
+        &binding,
+        parsed_time("9999-12-31T23:59:59.999999999Z"),
+    ));
+
+    let missing = SecretBrokerState::default();
+    assert_eq!(
+        fixture
+            .broker
+            .validate_issue(
+                &missing,
+                &initial_request(1_796, 2),
+                &active_context(&authority, &binding, &current),
+                parsed_time("2026-07-24T12:00:00.000000Z"),
+            )
+            .err()
+            .unwrap(),
+        (
+            SecretBrokerError::SecretNotAvailable,
+            SecretAccessDenialCode::SecretNotAvailable,
+        )
+    );
+
+    let changed = use_binding(Some(BindingChange::RefRevision));
+    let changed_declaration = declaration(&changed);
+    let changed_authority = authority_fixture_for(&changed, AuthorityState::Active);
+    assert_eq!(
+        fixture
+            .broker
+            .validate_issue(
+                &state,
+                &lease_request(
+                    1_797,
+                    changed.clone(),
+                    "2026-07-24T12:00:00.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T12:00:00.000000Z",
+                    2,
+                ),
+                &active_context(&changed_authority, &changed, &changed_declaration),
+                parsed_time("2026-07-24T12:00:00.000000Z"),
+            )
+            .err()
+            .unwrap(),
+        (
+            SecretBrokerError::SecretNotAvailable,
+            SecretAccessDenialCode::BindingMismatch,
+        )
+    );
 }
 
 #[test]
@@ -2603,6 +4232,7 @@ fn private_owner_invariants_cover_reentrancy_timeout_clock_ids_and_event_capacit
         parsed_time("2026-07-24T12:00:00.000000Z") + Duration::nanoseconds(1),
     ));
     let nanosecond_broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         Vec::new(),
         Vec::new(),
         clock,
@@ -2611,14 +4241,13 @@ fn private_owner_invariants_cover_reentrancy_timeout_clock_ids_and_event_capacit
     .unwrap();
     let mut mutation = nanosecond_broker.lock_mutation().unwrap();
     assert_eq!(
-        nanosecond_broker
-            .observe_time(&mut mutation, None)
-            .unwrap_err(),
+        nanosecond_broker.observe_time(&mut mutation).unwrap_err(),
         SecretBrokerError::ClockUnavailable
     );
     drop(mutation);
 
     let nil_id_broker = ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         Vec::new(),
         Vec::new(),
         Arc::new(ManualClock::new(parsed_time("2026-07-24T12:00:00.000000Z"))),
@@ -2645,6 +4274,7 @@ fn private_owner_invariants_cover_reentrancy_timeout_clock_ids_and_event_capacit
         max_replay_page_size: 1,
     };
     let capacity = ProcessLocalSecretBroker::with_sources_and_limits(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(2, true),
@@ -2747,7 +4377,7 @@ fn direct_validation_covers_consumed_request_time_and_current_declaration_denial
             )
             .err()
             .unwrap(),
-        SecretBrokerError::RenewalDenied
+        SecretBrokerError::SecretNotAvailable
     );
 }
 
@@ -2817,6 +4447,7 @@ fn current_secret_ref_windows_and_permit_revalidation_fail_closed() {
 fn broker_with_ids(ids: Arc<dyn SecretBrokerIdSource>) -> ProcessLocalSecretBroker {
     let provider = Arc::new(TrapProvider::new(secret_id(10)));
     ProcessLocalSecretBroker::with_sources(
+        tenant(2),
         vec![secret_ref(
             provider.provider_id.clone(),
             default_policy(3, true),
@@ -2930,7 +4561,7 @@ fn generated_identity_collisions_leave_issue_claim_renew_revoke_and_denial_atomi
         SecretLeaseStatus::Active
     );
 
-    let denial = broker_with_ids(Arc::new(ScriptedIds::new([1, 2, 3, 4, 1])));
+    let denial = broker_with_ids(Arc::new(ScriptedIds::new([1, 2, 3, 4, 1, 5, 6])));
     let grant = denial
         .issue_lease(
             initial_request(2_040, 2),

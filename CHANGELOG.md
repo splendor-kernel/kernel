@@ -9,26 +9,32 @@
   `SECR-005` provider-port progress. Additive ref-safe contracts are exported
   only under `ProcessLocal*` names and bind exact tenant, principal, workload,
   Driver declaration/slot/destination/trusted-send profile, placement, audience,
-  ref/provider version, intent, and purpose coordinates. `splendor-authority`
-  owns finite issuance, an internal atomic max-use reservation, exact current
-  Authority/ref/Driver/revocation rechecks, scoped semantic idempotency retaining
-  first recorded terminal results, exact-expiry and clock-rollback denial,
-  immediate bounded renewal cutover, and absorbing local revocation. Bounded
-  owner-local evidence and lifecycle state commit atomically without an external
-  evidence callback; injected clock/ID callbacks run outside broker locks and
-  fail closed on reentrancy or panic. Inspect/replay and pre-Gateway claims are
-  internal. The Authority context constructor is crate-private and no production
-  composition path is claimed. Provider fetch results validate an exact request/audit digest,
-  retain bytes only in zeroizing request-borrowed `!Send`/`!Sync` storage, and
-  expose no material escape. `splendor-adapter-secrets-memory` is `publish =
-  false`, requires the explicit `memory-secret-provider` feature outside tests,
-  enforces finite exact-version storage, and erases rotated/revoked entries. This
-  slice is process-local and non-restart-durable; it does not invoke a provider
-  from the broker, return material, add Gateway/node delivery, persistence,
-  daemon/API/SDK/generated surfaces, production providers, issue closure, or
-  gold evidence. Its reduced records use explicit `*.local.v1` schemas rather
-  than claiming RFC 0012's complete durable wire records; `G07` and `G08` remain
-  `not_exercised`.
+  ref/provider version, intent, and purpose coordinates. The incomplete broker
+  lifecycle, constructors, handles/claims, clocks/IDs, limits, mutation errors,
+  inspection, and replay are crate-private; there is no callable production
+  lease API or complete live permit. The internal one-tenant prototype performs
+  exact current Authority/ref/Driver/revocation checks before command disclosure,
+  derives command partitions from trusted context, returns historical
+  non-authorizing receipts without retaining/recreating capability nonces, and
+  gives a live opaque capability only to the first successful application.
+  Hidden hit/miss/conflict/cross-scope cases share `secret_not_available`.
+  `environment_variable` is never selected, renewal uses broker-observed current
+  time as its immediate cutover, and every valid clock observation latches a
+  monotonic high-water across later failures. Production compilation uses only
+  fixed local system clock/random-ID sources; custom synchronous sources and
+  narrowed limits are test-only. Bounded owner-local evidence and lifecycle
+  state otherwise commit atomically without an external callback, and elapsed
+  leases do not retain active-admission capacity. Provider fetch results validate
+  an exact request/audit digest, retain bytes only in zeroizing
+  request-borrowed `!Send`/`!Sync` storage, and expose no material escape.
+  `splendor-adapter-secrets-memory` is `publish = false`, requires the explicit
+  `memory-secret-provider` feature outside tests, enforces finite exact-version
+  storage, and erases rotated/revoked entries. This slice remains process-local
+  and non-restart-durable; it does not invoke a provider from the broker, return
+  material, add Gateway/node delivery, persistence, daemon/API/SDK/generated
+  surfaces, production providers, issue closure, or gold evidence. Its reduced
+  records use explicit `*.local.v1` schemas rather than claiming RFC 0012's
+  complete durable wire records; `G07` and `G08` remain `not_exercised`.
 - **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
   behavior-free C03 foundation lexical Rust primitives and the sole accepted
   `RegistryDeclarationDigest` construction over unchanged RFC 0013 declaration
