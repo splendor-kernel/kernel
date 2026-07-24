@@ -100,6 +100,49 @@ impl TraceStore for FailingPolicyTraceStore {
     }
 }
 
+// Simulates a historical pre-ingress-guard payload on reads without changing the
+// live append sequence owned by the daemon runtime.
+#[derive(Default)]
+struct HistoricalSensitiveTraceStore {
+    inner: InMemoryTraceStore,
+}
+
+impl HistoricalSensitiveTraceStore {
+    fn inject_historical_sensitive_payload(mut records: Vec<TraceRecord>) -> Vec<TraceRecord> {
+        if let Some(params) = records.iter_mut().find_map(|record| {
+            record
+                .payload
+                .pointer_mut("/kind/ActionVerificationStarted/action/params")
+        }) {
+            *params = fnd009_sensitive_params();
+        }
+        records
+    }
+}
+
+impl TraceStore for HistoricalSensitiveTraceStore {
+    fn append(&self, run_id: &str, payload: Value) -> Result<u64, TraceStoreError> {
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner
+            .read(run_id)
+            .map(Self::inject_historical_sensitive_payload)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner
+            .read_range(run_id, start, end)
+            .map(Self::inject_historical_sensitive_payload)
+    }
+}
+
 fn principal() -> ClientPrincipal {
     ClientPrincipal::new("app_test", "client_test")
 }
@@ -741,17 +784,23 @@ fn assert_trace_records_preserve_identity_and_reasons(
                     == Some("[REDACTED]")
                 && record
                     .payload
-                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth_key")
+                    .pointer(
+                        "/kind/ActionVerificationStarted/action/params/nested_aliases/auth_key",
+                    )
                     .and_then(Value::as_str)
                     == Some("[REDACTED]")
                 && record
                     .payload
-                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/auth-key")
+                    .pointer(
+                        "/kind/ActionVerificationStarted/action/params/nested_aliases/auth-key",
+                    )
                     .and_then(Value::as_str)
                     == Some("[REDACTED]")
                 && record
                     .payload
-                    .pointer("/kind/ActionVerificationStarted/action/params/nested_aliases/authz")
+                    .pointer(
+                        "/kind/ActionVerificationStarted/action/params/nested_aliases/authz",
+                    )
                     .and_then(Value::as_str)
                     == Some("[REDACTED]")
         }),
@@ -1248,7 +1297,11 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
 
 #[tokio::test]
 async fn trace_read_and_export_redact_sensitive_payload_views() {
-    let app = router(DaemonState::local_dev());
+    let trace_store = Arc::new(HistoricalSensitiveTraceStore::default());
+    let app = router(DaemonState::with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+    ));
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
@@ -1292,7 +1345,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
         credential: Some(action_credential.clone()),
         audit_attribution: Some(action_audit.clone()),
         causal_trace_id: Some(causal_trace_id.clone()),
-        action: fnd009_action("allowed_action"),
+        action: action("allowed_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
@@ -1323,7 +1376,7 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
         credential: Some(action_credential),
         audit_attribution: Some(action_audit),
         causal_trace_id: Some(causal_trace_id),
-        action: fnd009_action("blocked_sensitive_action"),
+        action: action("blocked_sensitive_action"),
         adapter: Some("daemon.local".to_string()),
         quota_usage: Some(QuotaUsage::single_action()),
         satisfied_preconditions: Vec::new(),
@@ -1413,6 +1466,273 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
     assert_eq!(none_export.redaction_policy, "none");
     assert_canaries_absent("none trace export mandatory redaction", &none_export);
     assert_trace_records_preserve_identity_and_reasons(&created.run_id, &none_export.records);
+    assert_trace_export_audit_event_visible(&none_export.records);
+}
+
+#[tokio::test]
+async fn trace_read_export_and_replay_never_persist_raw_action_credentials() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state = DaemonState::with_trace_store(DaemonConfig::local_dev(), trace_store.clone());
+    let app = router(state.clone());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create_request(
+            tenant_id.clone(),
+            agent_id.clone(),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, initial_traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=redacted", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = initial_traces
+        .records
+        .first()
+        .and_then(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .map(|event| event.trace_event_id)
+        .unwrap_or_else(|| TraceId::from_run_sequence(&created.run_id, 0));
+
+    let mut action_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ActionsSubmit]);
+    action_credential.credential_id = format!("{}{}", "ghp_", "synthetic_caller_identifier");
+    let action_audit = matching_attribution(&action_credential);
+    let safe_action_id = ActionId::new();
+    let safe_submit = SubmitActionRequest {
+        action_id: Some(safe_action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        credential: Some(action_credential.clone()),
+        audit_attribution: Some(action_audit.clone()),
+        causal_trace_id: Some(causal_trace_id.clone()),
+        action: action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        requested_at: None,
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let (status, safe_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(safe_submit).expect("safe submit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(safe_outcome.action_id, safe_action_id);
+    assert_eq!(
+        safe_outcome.status,
+        splendor_gateway::ActionStatus::Executed
+    );
+    let authority_evaluations_before_raw = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("authority evaluation count before raw submissions");
+
+    let allowed_action_id = ActionId::new();
+    let allowed_submit = SubmitActionRequest {
+        action_id: Some(allowed_action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        credential: Some(action_credential.clone()),
+        audit_attribution: Some(action_audit.clone()),
+        causal_trace_id: Some(causal_trace_id.clone()),
+        action: fnd009_action("allowed_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        requested_at: None,
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let (status, allowed_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(allowed_submit).expect("allowed submit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(allowed_outcome.action_id, allowed_action_id);
+    assert_eq!(
+        allowed_outcome.status,
+        splendor_gateway::ActionStatus::Denied
+    );
+    assert_eq!(
+        allowed_outcome.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+
+    let denied_action_id = ActionId::new();
+    let denied_submit = SubmitActionRequest {
+        action_id: Some(denied_action_id.clone()),
+        run_id: created.run_id.clone(),
+        tenant_id: tenant_id.clone(),
+        agent_id,
+        credential: Some(action_credential),
+        audit_attribution: Some(action_audit),
+        causal_trace_id: Some(causal_trace_id),
+        action: fnd009_action("blocked_sensitive_action"),
+        adapter: Some("daemon.local".to_string()),
+        quota_usage: Some(QuotaUsage::single_action()),
+        satisfied_preconditions: Vec::new(),
+        requested_at: None,
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let (status, denied_outcome): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(denied_submit).expect("denied submit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied_outcome.action_id, denied_action_id);
+    assert_eq!(
+        denied_outcome.status,
+        splendor_gateway::ActionStatus::Denied
+    );
+    assert_eq!(
+        denied_outcome.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("authority evaluation count after raw submissions"),
+        authority_evaluations_before_raw
+    );
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw trace records");
+    assert_canaries_absent("raw persisted trace", &raw_records);
+    let raw_events = raw_records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .collect::<Vec<_>>();
+    for denied_id in [&allowed_action_id, &denied_action_id] {
+        assert!(raw_events.iter().any(|event| {
+            event.identity.action_id.as_ref() == Some(denied_id)
+                && matches!(
+                    &event.kind,
+                    TraceEventKind::ActionDenied { action, result }
+                        if action == &splendor_gateway::raw_credential_denied_action()
+                            && result.reasons
+                                == vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+                )
+        }));
+    }
+    let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.adapter_executions, 1);
+
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = matching_attribution(&replay_credential);
+    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({
+            "credential": replay_credential,
+            "audit_attribution": replay_audit,
+            "mode": "inspect_only",
+            "side_effects_allowed": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay.mode, "inspect_only");
+    let (status, inspected_after_replay): (StatusCode, RunInspectResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected_after_replay.adapter_executions, 1);
+
+    let (status, redacted_read): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=redacted", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_canaries_absent("redacted trace read", &redacted_read);
+
+    let (status, none_read): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_canaries_absent("none trace read mandatory redaction", &none_read);
+
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = matching_attribution(&trace_credential);
+    let (status, redacted_export): (StatusCode, TraceExportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({
+            "credential": trace_credential.clone(),
+            "audit_attribution": trace_audit.clone(),
+            "redaction_policy": "redacted",
+            "start": null,
+            "end": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(redacted_export.redaction_policy, "redacted");
+    assert_eq!(redacted_export.record_count, redacted_export.records.len());
+    assert!(redacted_export
+        .integrity_hash
+        .starts_with("trace-chain:v1:"));
+    assert_canaries_absent("redacted trace export", &redacted_export);
+    assert_trace_export_audit_event_visible(&redacted_export.records);
+
+    let (status, none_export): (StatusCode, TraceExportResponse) = call_json(
+        app,
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({
+            "credential": trace_credential,
+            "audit_attribution": trace_audit,
+            "redaction_policy": "none",
+            "start": null,
+            "end": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(none_export.redaction_policy, "none");
+    assert_canaries_absent("none trace export mandatory redaction", &none_export);
     assert_trace_export_audit_event_visible(&none_export.records);
 }
 
@@ -3606,6 +3926,92 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error.code, "run_already_exists");
+}
+
+#[tokio::test]
+async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_trace() {
+    const CANARY: &str = "C03_CREATE_RUN_RAW_CREDENTIAL_CANARY";
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let app = router(DaemonState::with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+    ));
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let fixed_run_id = RunId::new();
+    let mut request = create_request(
+        tenant_id,
+        agent_id,
+        vec![DaemonActionCandidate {
+            action_id: Some(ActionId::new()),
+            action: Action {
+                params: json!({"nested": [{"API-KEY": CANARY}]}),
+                ..action("allowed_action")
+            },
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: Some(QuotaUsage::single_action()),
+            satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    request.idempotency_key = "idem_c03_raw_credential_rejection".to_string();
+    request.work_order.work_order.run_id = Some(fixed_run_id.clone());
+    resign_work_order(&mut request.work_order);
+
+    for attempt in 0..2 {
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(request.clone()).expect("raw create request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {attempt}");
+        assert_eq!(
+            error.code,
+            splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED,
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            error.message,
+            splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED,
+            "attempt {attempt}"
+        );
+        assert!(error.details.is_null());
+        assert!(!serde_json::to_string(&error)
+            .expect("error serializes")
+            .contains(CANARY));
+    }
+
+    let (status, missing): (StatusCode, ApiErrorBody) =
+        call_empty(app.clone(), Method::GET, &format!("/runs/{fixed_run_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "invalid_run");
+    assert!(matches!(
+        trace_store.read(&fixed_run_id.to_string()),
+        Err(TraceStoreError::RunNotFound)
+    ));
+
+    request.policy_actions[0].action.params = json!({"resource_ref": "fixture:report"});
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app,
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("credential-free create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created.run_id, fixed_run_id);
+    assert!(!created.duplicate);
+    let persisted = trace_store
+        .read(&fixed_run_id.to_string())
+        .expect("safe run traces");
+    assert!(!serde_json::to_string(&persisted)
+        .expect("persisted traces serialize")
+        .contains(CANARY));
 }
 
 #[tokio::test]

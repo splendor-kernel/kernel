@@ -18,12 +18,13 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
-    ActionRequest, ActionStatus, AdapterError, AdapterResult, AuthorityObligationVerifier,
-    CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary, PolicyApprovalVerifier,
-    PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier, SimulatedRiskLevel,
-    SimulatedSafetySnapshot, SimulatedSafetyVerifier, StaticCircuitBreakerEvaluator,
-    VerifiedActionGateway,
+    authority_pre_effect_evidence_recorded, guard_action_request, guard_action_routing,
+    raw_credential_denied_action, raw_credential_denied_outcome, ActionAdapter, ActionGateway,
+    ActionId, ActionOutcome, ActionRequest, ActionStatus, AdapterError, AdapterResult,
+    AuthorityObligationVerifier, CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary,
+    PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier,
+    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -2030,6 +2031,26 @@ fn require_create_run_token(value: &str, field: &'static str) -> Result<String, 
     Ok(trimmed.to_string())
 }
 
+fn ensure_configured_actions_are_credential_free(
+    request: &CreateRunRequest,
+) -> Result<(), ApiError> {
+    if request.policy_actions.iter().any(|candidate| {
+        guard_action_routing(
+            &candidate.action,
+            candidate.adapter.as_deref(),
+            &candidate.satisfied_preconditions,
+        )
+        .is_err()
+    }) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            RAW_CREDENTIAL_INPUT_DENIED,
+            RAW_CREDENTIAL_INPUT_DENIED,
+        ));
+    }
+    Ok(())
+}
+
 fn create_run_caller_scope(security: &DaemonSecurityDecision) -> serde_json::Value {
     let principal = security.principal.as_ref().or_else(|| {
         security
@@ -2162,7 +2183,6 @@ async fn create_run(
         None,
     )?;
     let validated_work_order = validated_authority_work_order.work_order().clone();
-    ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
     let work_order_authorization = work_order_authorization_for_endpoint(
         &request.work_order,
         vec![splendor_types::EndpointScope::RunsCreate],
@@ -2175,6 +2195,8 @@ async fn create_run(
         Some(work_order_authorization),
         request.audit_attribution.clone(),
     )?;
+    ensure_configured_actions_are_credential_free(&request)?;
+    ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
 
     let existing_run_id_for_scope = {
         let idempotency = state
@@ -3506,7 +3528,7 @@ async fn submit_action(
         authority_obligation_receipts: request.authority_obligation_receipts.clone(),
     };
     let (gateway, pending_approval_retry) = {
-        let slot = run.lock().map_err(|_| lock_error())?;
+        let mut slot = run.lock().map_err(|_| lock_error())?;
         if request.tenant_id != slot.tenant_id || request.agent_id != slot.agent_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -3525,6 +3547,18 @@ async fn submit_action(
             None,
             request.audit_attribution,
         )?;
+        if guard_action_request(&action_request).is_err() {
+            record_daemon_audit(&slot, "splendor.actions.submit", security.audit_attribution)?;
+            let outcome = record_raw_credential_action_denial(
+                &slot,
+                &effective_action_id,
+                RawCredentialIngressSource::Direct {
+                    causal_trace_id: request.causal_trace_id.clone(),
+                },
+            )?;
+            slot.updated_at = OffsetDateTime::now_utc();
+            return Ok(Json(outcome));
+        }
         let effective_adapter = action_request.adapter.clone().or_else(|| {
             slot.action_profiles
                 .iter()
@@ -3950,26 +3984,6 @@ async fn submit_physical_action(
         ));
     }
     let action_name = request.action_request.action.name.clone();
-    if matches_forbidden_physical_action(&action_name) || !is_allowed_physical_action(&action_name)
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "low_level_physical_action_rejected",
-            "physical endpoint accepts only bounded high-level actions",
-        ));
-    }
-    if !profile
-        .allowed_physical_actions
-        .iter()
-        .any(|allowed| allowed == &action_name)
-    {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "physical_action_not_profile_allowed",
-            "device profile does not allow action",
-        ));
-    }
-
     let effective_action_id = request
         .action_request
         .action_id
@@ -3994,14 +4008,13 @@ async fn submit_physical_action(
         authority_obligation_evidence: None,
         authority_obligation_receipts: request.action_request.authority_obligation_receipts.clone(),
     };
-    let safety_snapshot = simulated_safety_snapshot(&request, &profile, &action_name);
-    let offline = effective_device_offline(&request.safety_context, &profile);
     let run = state.run_slot(&request.action_request.run_id)?;
-    let (physical_gateway, pending_approval_retry): (
+    let (physical_gateway, pending_approval_retry, offline): (
         Arc<dyn ActionGateway>,
         Option<ApprovalChallenge>,
+        bool,
     ) = {
-        let slot = run.lock().map_err(|_| lock_error())?;
+        let mut slot = run.lock().map_err(|_| lock_error())?;
         if request.action_request.tenant_id != slot.tenant_id
             || request.action_request.agent_id != slot.agent_id
         {
@@ -4022,6 +4035,42 @@ async fn submit_physical_action(
             None,
             request.action_request.audit_attribution.clone(),
         )?;
+        if guard_action_request(&action_request).is_err() {
+            record_daemon_audit(
+                &slot,
+                "splendor.devices.actions.submit",
+                security.audit_attribution,
+            )?;
+            let outcome = record_raw_credential_action_denial(
+                &slot,
+                &effective_action_id,
+                RawCredentialIngressSource::Physical,
+            )?;
+            slot.updated_at = OffsetDateTime::now_utc();
+            return Ok(Json(outcome));
+        }
+        if matches_forbidden_physical_action(&action_name)
+            || !is_allowed_physical_action(&action_name)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "low_level_physical_action_rejected",
+                "physical endpoint accepts only bounded high-level actions",
+            ));
+        }
+        if !profile
+            .allowed_physical_actions
+            .iter()
+            .any(|allowed| allowed == &action_name)
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "physical_action_not_profile_allowed",
+                "device profile does not allow action",
+            ));
+        }
+        let safety_snapshot = simulated_safety_snapshot(&request, &profile, &action_name);
+        let offline = effective_device_offline(&request.safety_context, &profile);
         slot.run_authority
             .bind_physical_action_resource(&mut action_request, node_id.clone())
             .map_err(run_action_admission_error)?;
@@ -4142,6 +4191,7 @@ async fn submit_physical_action(
                 Arc::new(slot.policy_cache.clone()),
             )),
             pending_approval_retry,
+            offline,
         )
     };
     let mut outcome = physical_gateway.submit(action_request).map_err(|error| {
@@ -5801,6 +5851,64 @@ fn record_run_action_event(
                 error.to_string(),
             )
         })
+}
+
+enum RawCredentialIngressSource {
+    Direct { causal_trace_id: Option<TraceId> },
+    Physical,
+}
+
+fn record_raw_credential_action_denial(
+    slot: &RunSlot,
+    action_id: &ActionId,
+    source: RawCredentialIngressSource,
+) -> Result<ActionOutcome, ApiError> {
+    let action = raw_credential_denied_action();
+    let outcome = raw_credential_denied_outcome(action_id.clone());
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionVerificationStarted {
+            action: action.clone(),
+        },
+    )?;
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionVerificationCompleted {
+            action: action.clone(),
+            result: outcome.verification.clone(),
+        },
+    )?;
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionDenied {
+            action,
+            result: outcome.verification.clone(),
+        },
+    )?;
+    let recorded_outcome = match source {
+        RawCredentialIngressSource::Direct { causal_trace_id } => serde_json::json!({
+            "source": "daemon.action",
+            "causal_trace_id": causal_trace_id,
+            "action_outcome": &outcome,
+        }),
+        RawCredentialIngressSource::Physical => serde_json::json!({
+            "source": "daemon.physical_action",
+            "action_outcome": &outcome,
+        }),
+    };
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::OutcomeRecorded {
+            outcome: recorded_outcome,
+            feedback: None,
+            reward: None,
+        },
+    )?;
+    Ok(outcome)
 }
 
 fn record_run_event_returning_id(

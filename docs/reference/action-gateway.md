@@ -103,8 +103,9 @@ conditions.
 
 `VerifiedActionGateway` runs identity, live authority, approval obligation,
 permission, quota, safety, and invariant checks before executing adapters and
-evaluates postconditions after execution. It
-first validates `action_id`, `tenant_id`, `agent_id`, and `run_id`; missing or nil
+evaluates postconditions after execution. Its first operation is the bounded raw
+credential ingress guard described below. It then validates `action_id`,
+`tenant_id`, `agent_id`, and `run_id`; missing or nil
 identity returns a denied `ActionOutcome` with reason `identity_invalid` and does
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope,
 unsupported-schema, forged, replayed, or exact-binding-mismatched approval
@@ -112,6 +113,50 @@ decisions/receipts also stop before adapter execution. Receipt validation is not
 enough by itself: the gateway re-evaluates the current conditional authority
 decision and atomically claims a one-use receipt immediately before durable
 pre-effect evidence and adapter invocation.
+
+### Raw credential ingress guard
+
+`splendor-gateway` owns one pure, always-on denial guard for the existing
+`Action` / `ActionRequest` path. The guard runs before identity validation,
+adapter lookup, authority/broker/provider evaluation, verifier calls, pre-effect
+recording, or adapter execution. Kernel and daemon pre-persistence ingresses call
+the same Gateway-owned implementation; they do not maintain independent key or
+content rules.
+
+The guard recursively checks action fields, params, requested adapter, and
+satisfied-precondition strings. Case/separator-normalized credential coordinates
+include authorization and proxy authorization, password/passwd, token/API key,
+client secret, private key, cookie/set-cookie, secret/credential,
+connection-string/DSN, common environment credential aliases, URL userinfo and
+credential query keys, and equivalent nested map/list content. Neutral-key
+strings are denied when they contain bounded known Basic/Bearer authorization,
+PEM private-key, repository-known provider-key-prefix, generic secret-reference,
+or unambiguous credential URL/DSN/assignment forms. Malformed percent encoding or
+other ambiguity in a credential-capable parsed coordinate fails closed. Object
+keys containing non-ASCII/confusable characters or residual percent escapes after
+one bounded decode also fail closed; ordinary ASCII keys and valid percent-encoded
+non-credential URLs retain their existing path.
+
+Traversal is bounded to depth 16, 2,048 inspected nodes, 16 KiB per string/key,
+and 64 KiB cumulative inspected UTF-8 bytes. A cap overflow returns the same
+fieldless, non-serializable `RawCredentialInputDenied`; its `Display` and `Debug`
+are exactly `raw_credential_input_denied` and retain no key, value, path, parser
+detail, or derived digest. The matching `ActionOutcome` is `Denied`, has no
+output/artifacts, and uses only that fixed reason/error.
+
+Persisting callers must use `raw_credential_denied_action()` for every action
+trace associated with this denial. The projection is constant: it retains action
+identity only in the enclosing trace identity/outcome and replaces all
+requester-controlled action fields with `credential_input_suppressed` plus the
+fixed suppression marker. The original denied action must never be traced.
+
+This is a bounded denial-only compatibility barrier. It does not claim exhaustive
+high-entropy, arbitrary encoded, encrypted/compressed, or split-secret detection;
+does not implement RFC 0012's operation-specific `CredentialIngressProfile` or
+the future repository scanner; and does not create a typed secret requirement,
+broker permit, provider invocation, material delivery, or exception registry.
+Generic `secret_ref_id` fields and ref-like strings are denied because the stable
+generic action schema is not a typed C03 requirement path.
 
 For physical actions, the gateway rejects forbidden low-level action names such
 as motor PWM, raw actuator writes, firmware safety bypass, flight-controller

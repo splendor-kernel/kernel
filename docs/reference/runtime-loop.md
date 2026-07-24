@@ -17,19 +17,28 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 5. The `Policy` callback receives current state and percepts and returns action
    candidates plus next state.
 6. `PolicyCompleted` records successful policy return.
-7. The `ConstraintEngine` returns an aggregate `VerificationResult`.
-8. Each action candidate receives an `ActionId` and verification starts.
-9. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
+7. The Gateway-owned raw credential guard screens every candidate before any
+   candidate/action payload trace, constraint callback, delegated-authority
+   evaluation, or gateway submission. Each candidate receives its `ActionId` at
+   this boundary.
+8. `CandidatesProposed` records safe actions unchanged and raw-credential
+   denials only as the constant suppression projection.
+9. The `ConstraintEngine` returns an aggregate `VerificationResult` over only
+   credential-free candidates.
+10. Each projected/safe action records verification start in original policy
+    order.
+11. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
    adapter allowlists, permissions, quotas, invariants, and action preconditions.
-10. Only verified actions reach registered adapters.
-11. If an optional 0.04-S3 escalation policy is configured, explicit
+12. Only verified credential-free actions reach registered adapters.
+13. If an optional 0.04-S3 escalation policy is configured, explicit
     verifier/runtime facts can produce `EscalationTriggered` and
     `ActionNeedsIntervention` trace events before final outcome recording.
-12. Adapter output, denial, failure, or intervention need is recorded as an
+14. Adapter output, denial, failure, or intervention need is recorded as an
     action outcome.
-13. The outcome evaluator can attach feedback/reward.
-14. The state graph commits the next state node and optional snapshot.
-15. Trace records are appended in order.
+15. The outcome evaluator can attach feedback/reward for credential-free
+    candidates; it is not invoked with a denied raw action.
+16. The state graph commits the next state node and optional snapshot.
+17. Trace records are appended in order.
 
 ## Identity scope
 
@@ -48,6 +57,14 @@ documented in [`identity.md`](identity.md).
 ## Failure behavior
 
 - Perceptor/policy errors return a loop error and do not execute actions.
+- Raw credential-bearing candidates return the fixed
+  `raw_credential_input_denied` outcome. They skip constraints, delegated
+  authority, gateway/adapters, escalation, and outcome evaluation. Their
+  `CandidatesProposed`, verification-started/completed, and `ActionDenied`
+  records contain only the constant safe projection.
+- In a mixed decision, safe and denied candidates retain original policy order;
+  safe candidates continue through constraints/gateway independently while the
+  raw candidate remains denied.
 - Constraint denial records action denial and skips gateway submission.
 - Gateway verifier denial records action denial and skips adapter execution.
 - Escalation policies consume explicit verifier/runtime facts. Verifier

@@ -38,6 +38,15 @@
 //! assert!(ActionGateway::submit(&gateway, request).is_err());
 //! ```
 
+mod credential_ingress;
+
+pub use credential_ingress::{
+    guard_action, guard_action_request, guard_action_routing, raw_credential_denied_action,
+    raw_credential_denied_outcome, RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH,
+    CREDENTIAL_INGRESS_MAX_NODES, CREDENTIAL_INGRESS_MAX_STRING_BYTES,
+    CREDENTIAL_INGRESS_MAX_TOTAL_BYTES, RAW_CREDENTIAL_INPUT_DENIED,
+};
+
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
     authority_decision_evidence, canonical_authority_request_digest,
@@ -1580,6 +1589,9 @@ impl VerifiedActionGateway {
 
 impl ActionGateway for VerifiedActionGateway {
     fn submit(&self, action: ActionRequest) -> Result<ActionOutcome, GatewayError> {
+        if guard_action_request(&action).is_err() {
+            return Ok(raw_credential_denied_outcome(action.action_id));
+        }
         if let Err(error) = action.validate_identity() {
             return Ok(identity_denied_outcome(action.action_id, error));
         }

@@ -11,7 +11,8 @@ use crate::{
     StateHandoffScope,
 };
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, ActionGateway, ActionId, ActionOutcome, ActionRequest,
+    authority_pre_effect_evidence_recorded, guard_action_routing, raw_credential_denied_action,
+    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
     ActionStatus, GatewayError,
 };
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
@@ -133,6 +134,13 @@ pub struct ActionCandidate {
     pub authority_obligation_receipts: Vec<splendor_types::AuthorityObligationReceipt>,
     /// Exact issued child grant reference required for delegated actions.
     pub delegated_capability_grant_id: Option<CapabilityGrantId>,
+}
+
+struct ScreenedActionCandidate<'a> {
+    candidate: &'a ActionCandidate,
+    action_id: ActionId,
+    trace_action: Action,
+    raw_credential_denied: bool,
 }
 
 impl ActionCandidate {
@@ -811,21 +819,46 @@ impl LoopEngine {
             ));
         }
 
-        let candidate_actions = decision
+        let screened_actions = decision
             .actions
             .iter()
-            .map(|candidate| candidate.action.clone())
+            .map(|candidate| {
+                let raw_credential_denied = guard_action_routing(
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    &candidate.satisfied_preconditions,
+                )
+                .is_err();
+                ScreenedActionCandidate {
+                    candidate,
+                    action_id: candidate.action_id.clone().unwrap_or_default(),
+                    trace_action: if raw_credential_denied {
+                        raw_credential_denied_action()
+                    } else {
+                        candidate.action.clone()
+                    },
+                    raw_credential_denied,
+                }
+            })
             .collect::<Vec<_>>();
         self.record_tick_event(
             tick_id,
             TraceEventKind::CandidatesProposed {
-                actions: candidate_actions,
+                actions: screened_actions
+                    .iter()
+                    .map(|candidate| candidate.trace_action.clone())
+                    .collect(),
             },
         )?;
 
+        let constraint_candidates = screened_actions
+            .iter()
+            .filter(|candidate| !candidate.raw_credential_denied)
+            .map(|candidate| candidate.candidate.clone())
+            .collect::<Vec<_>>();
         let constraint_evaluation =
             self.constraint_engine
-                .evaluate(&self.state, &percepts, &decision.actions);
+                .evaluate(&self.state, &percepts, &constraint_candidates);
         self.record_tick_event(
             tick_id,
             TraceEventKind::ConstraintsEvaluated {
@@ -836,9 +869,10 @@ impl LoopEngine {
 
         let mut outcomes = Vec::new();
         let mut escalations = Vec::new();
-        for candidate in &decision.actions {
-            let action = candidate.action.clone();
-            let action_id = candidate.action_id.clone().unwrap_or_else(ActionId::new);
+        for screened in &screened_actions {
+            let candidate = screened.candidate;
+            let action = screened.trace_action.clone();
+            let action_id = screened.action_id.clone();
             self.record_action_event(
                 tick_id,
                 &action_id,
@@ -847,16 +881,9 @@ impl LoopEngine {
                 },
             )?;
 
-            let mut delegated_scope = self.agent.verify_delegated_action_with_grant(
-                &action,
-                candidate.adapter.as_deref(),
-                self.runtime.run_id(),
-                candidate.delegated_capability_grant_id.as_ref(),
-                candidate.usage,
-                OffsetDateTime::now_utc(),
-                tick_id,
-            );
-            let mut outcome = if !constraint_evaluation.result.allowed {
+            let mut outcome = if screened.raw_credential_denied {
+                raw_credential_denied_outcome(action_id.clone())
+            } else if !constraint_evaluation.result.allowed {
                 ActionOutcome {
                     action_id: action_id.clone(),
                     status: ActionStatus::Denied,
@@ -867,54 +894,74 @@ impl LoopEngine {
                     approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
                 }
-            } else if !delegated_scope.allowed() {
-                ActionOutcome {
-                    action_id: action_id.clone(),
-                    status: ActionStatus::Denied,
-                    verification: delegated_scope.verification.clone(),
-                    post_verification: None,
-                    output: None,
-                    error: Some(delegated_scope.verification.reasons.join(", ")),
-                    approval_challenge: None,
-                    completed_at: OffsetDateTime::now_utc(),
-                }
             } else {
-                let request = ActionRequest {
-                    action_id: action_id.clone(),
-                    tenant_id: self.agent.tenant_id.clone(),
-                    agent_id: self.agent.agent_id.clone(),
-                    run_id: self.runtime.run_id().clone(),
-                    tick_id: Some(TickId::from(tick_id)),
-                    action: action.clone(),
-                    adapter: candidate.adapter.clone(),
-                    quota_usage: candidate.usage,
-                    satisfied_preconditions: candidate.satisfied_preconditions.clone(),
-                    requested_at: candidate
-                        .requested_at
-                        .unwrap_or_else(OffsetDateTime::now_utc),
-                    physical_action_resource_coordinate: None,
-                    approval_evidence: candidate.approval_evidence.clone(),
-                    authority_obligation_evidence: None,
-                    authority_obligation_receipts: candidate.authority_obligation_receipts.clone(),
-                };
+                let mut delegated_scope = self.agent.verify_delegated_action_with_grant(
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    self.runtime.run_id(),
+                    candidate.delegated_capability_grant_id.as_ref(),
+                    candidate.usage,
+                    OffsetDateTime::now_utc(),
+                    tick_id,
+                );
+                if !delegated_scope.allowed() {
+                    ActionOutcome {
+                        action_id: action_id.clone(),
+                        status: ActionStatus::Denied,
+                        verification: delegated_scope.verification.clone(),
+                        post_verification: None,
+                        output: None,
+                        error: Some(delegated_scope.verification.reasons.join(", ")),
+                        approval_challenge: None,
+                        completed_at: OffsetDateTime::now_utc(),
+                    }
+                } else {
+                    let request = ActionRequest {
+                        action_id: action_id.clone(),
+                        tenant_id: self.agent.tenant_id.clone(),
+                        agent_id: self.agent.agent_id.clone(),
+                        run_id: self.runtime.run_id().clone(),
+                        tick_id: Some(TickId::from(tick_id)),
+                        action: candidate.action.clone(),
+                        adapter: candidate.adapter.clone(),
+                        quota_usage: candidate.usage,
+                        satisfied_preconditions: candidate.satisfied_preconditions.clone(),
+                        requested_at: candidate
+                            .requested_at
+                            .unwrap_or_else(OffsetDateTime::now_utc),
+                        physical_action_resource_coordinate: None,
+                        approval_evidence: candidate.approval_evidence.clone(),
+                        authority_obligation_evidence: None,
+                        authority_obligation_receipts: candidate
+                            .authority_obligation_receipts
+                            .clone(),
+                    };
 
-                // Keep the live authority permit through gateway entry. The
-                // permit linearizes cleanup/revocation against this effect.
-                let _delegated_permit = delegated_scope.take_permit();
-                match self.gateway.submit(request) {
-                    Ok(outcome) => outcome,
-                    Err(error) => outcome_from_gateway_error(action_id.clone(), error),
+                    // Keep the live authority permit through gateway entry. The
+                    // permit linearizes cleanup/revocation against this effect.
+                    let _delegated_permit = delegated_scope.take_permit();
+                    match self.gateway.submit(request) {
+                        Ok(outcome) => outcome,
+                        Err(error) => outcome_from_gateway_error(action_id.clone(), error),
+                    }
                 }
             };
 
-            let action_escalations = self.evaluate_escalations(
-                &action_id,
-                &action,
-                candidate.adapter.as_deref(),
-                &mut outcome,
-            );
+            let action_escalations = if screened.raw_credential_denied {
+                Vec::new()
+            } else {
+                self.evaluate_escalations(
+                    &action_id,
+                    &candidate.action,
+                    candidate.adapter.as_deref(),
+                    &mut outcome,
+                )
+            };
 
-            if let Some(policy_expired) = action_policy_expired_trace_kind(&action, &outcome) {
+            if let Some(policy_expired) = (!screened.raw_credential_denied)
+                .then(|| action_policy_expired_trace_kind(&candidate.action, &outcome))
+                .flatten()
+            {
                 self.record_action_event(tick_id, &action_id, policy_expired)?;
             }
 
@@ -941,7 +988,9 @@ impl LoopEngine {
 
             match outcome.status {
                 ActionStatus::Executed => {
-                    self.record_approval_event_if_present(tick_id, &action_id, &outcome)?;
+                    if !screened.raw_credential_denied {
+                        self.record_approval_event_if_present(tick_id, &action_id, &outcome)?;
+                    }
                     self.record_action_event(
                         tick_id,
                         &action_id,
@@ -1026,7 +1075,12 @@ impl LoopEngine {
             outcomes.push(outcome);
         }
 
-        let (feedback, reward) = self.evaluate_outcomes(&decision, &outcomes);
+        let raw_credential_denials = screened_actions
+            .iter()
+            .map(|candidate| candidate.raw_credential_denied)
+            .collect::<Vec<_>>();
+        let (feedback, reward) =
+            self.evaluate_outcomes(&decision, &outcomes, &raw_credential_denials);
         let duration_ms = start.elapsed().as_millis() as u64;
         let needs_intervention = escalations_require_intervention(&escalations)
             || outcomes.iter().any(|outcome| {
@@ -1128,10 +1182,19 @@ impl LoopEngine {
         &self,
         decision: &PolicyDecision,
         outcomes: &[ActionOutcome],
+        raw_credential_denials: &[bool],
     ) -> (Option<Feedback>, Option<Reward>) {
         let mut feedback = None;
         let mut reward = None;
-        for (candidate, outcome) in decision.actions.iter().zip(outcomes.iter()) {
+        for ((candidate, outcome), raw_credential_denied) in decision
+            .actions
+            .iter()
+            .zip(outcomes.iter())
+            .zip(raw_credential_denials.iter().copied())
+        {
+            if raw_credential_denied {
+                continue;
+            }
             let signal = self.outcome_evaluator.evaluate(&candidate.action, outcome);
             if feedback.is_none() {
                 feedback = signal.feedback;

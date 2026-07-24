@@ -307,6 +307,35 @@ fn non_enforced_empty_cache_allows_policy_and_gateway_forwarding() {
 }
 
 #[test]
+fn raw_credential_denial_precedes_policy_distribution_projection() {
+    let cache = PolicyCache::new(
+        PolicyCacheConfig {
+            enforcement_required: true,
+        },
+        cache_owner(),
+    );
+    let calls = Arc::new(Mutex::new(0));
+    let gateway = PolicyDistributionGateway::new(
+        Arc::new(CountingGateway {
+            calls: calls.clone(),
+        }),
+        Arc::new(cache),
+    );
+    let mut raw = request(SideEffectClass::External);
+    raw.action.params = serde_json::json!({"authorization": "synthetic"});
+
+    let outcome = gateway.submit(raw).expect("credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert!(outcome.verification.artifacts.is_null());
+    assert_eq!(*calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
 fn missing_required_policy_fails_closed_before_policy_invocation() {
     let cache = PolicyCache::new(
         PolicyCacheConfig {

@@ -4,6 +4,23 @@
 
 ### Added
 
+- **status/incomplete:** added a Gateway-owned, always-on, bounded
+  pre-persistence raw-credential ingress denial across direct
+  `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run
+  admission, direct/physical action handlers, and Gateway policy/trace-durability
+  wrappers. Normalized credential coordinates, nested map/list content,
+  URL/userinfo/query, connection/environment assignments, Basic/Bearer, PEM,
+  common provider prefixes, generic secret refs, malformed parsed coordinates,
+  and depth/node/string/byte overflow all return only
+  `raw_credential_input_denied`. Denied traces retain action identity/order but
+  use one constant action projection; raw input is excluded from constraints,
+  delegated authority, request fingerprints/idempotency, action traces,
+  feedback, adapters/simulators, and inspect-only replay. Existing wire schemas,
+  trace variants, `ActionStatus`, and credential-free behavior remain unchanged.
+  This is only a denial slice of `SECR-004`/`SECR-006`: it adds no typed secret
+  delivery, broker/provider Gateway session, operation-specific
+  `CredentialIngressProfile`, exhaustive entropy/encoded/split detection,
+  repository scanner, quarantine/incident workflow, issue closure, or gold pass.
 - **status/incomplete:** added the first process-local C03 Secret Broker owner
   slice for `SECR-001`, with bounded `SECR-003` renewal/revocation and
   `SECR-005` provider-port progress. Additive ref-safe contracts are exported

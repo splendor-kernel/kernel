@@ -285,6 +285,10 @@ struct CountingAdapter {
 
 struct DenyResourceVerifier;
 
+struct CountingResourceVerifier {
+    calls: Arc<AtomicUsize>,
+}
+
 struct DefaultPostSafetyVerifier;
 
 impl SafetyVerifier for DefaultPostSafetyVerifier {
@@ -323,6 +327,17 @@ impl ResourceBoundaryVerifier for DenyResourceVerifier {
                 "adapter_execution": "not_attempted",
             }),
         }
+    }
+}
+
+impl ResourceBoundaryVerifier for CountingResourceVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        VerificationResult::allow()
     }
 }
 
@@ -383,6 +398,56 @@ fn resource_boundary_denial_prevents_adapter_execution() {
         .reasons
         .contains(&"resource_scope_denied".to_string()));
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    request.action.params = serde_json::json!({
+        "nested": [{"Pass-Word": "RAW_CREDENTIAL_GATEWAY_CANARY"}]
+    });
+
+    let now = OffsetDateTime::now_utc();
+    let mut decision = authority_decision_for(&request, "adapter", PrincipalId::new(), now);
+    decision.status = AuthorityDecisionStatus::Allowed;
+    decision.reasons = vec!["capability_allowed".to_string()];
+    decision.obligations.clear();
+    bind_gateway_authority_decision_digest(&mut decision);
+
+    let authority_calls = Arc::new(AtomicUsize::new(0));
+    let resource_verifier_calls = Arc::new(AtomicUsize::new(0));
+    let recorder_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: vec![decision],
+        calls: Arc::clone(&authority_calls),
+    }));
+    gateway.set_resource_boundary_verifier(Arc::new(CountingResourceVerifier {
+        calls: Arc::clone(&resource_verifier_calls),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::clone(&recorder_calls),
+        adapter: Arc::clone(&adapter),
+    }));
+    gateway.register_adapter("noop", "adapter", adapter.clone());
+
+    let outcome = gateway.submit(request).expect("fixed credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.error.as_deref(), Some(RAW_CREDENTIAL_INPUT_DENIED));
+    assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resource_verifier_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
 }
 
 #[test]

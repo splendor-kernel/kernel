@@ -1479,6 +1479,163 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
 }
 
 #[tokio::test]
+async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator() {
+    const CANARY: &str = "C03_PHYSICAL_RAW_CREDENTIAL_CANARY";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind credential guard simulator");
+    listener
+        .set_nonblocking(true)
+        .expect("set simulator nonblocking");
+    let simulator_url = format!(
+        "http://{}",
+        listener.local_addr().expect("simulator address")
+    );
+    let device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state = DaemonState::with_trace_store(DaemonConfig::local_dev(), trace_store.clone());
+    let app = router(state.clone());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let node_id = NodeId::new();
+    let create = physical_create_request(
+        "wo_c02_physical_raw_credential",
+        tenant_id.clone(),
+        agent_id.clone(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", create).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(node_id.clone(), tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("physical causal trace");
+    let mut raw = physical_submit_request(
+        &created,
+        tenant_id.clone(),
+        agent_id.clone(),
+        causal_trace_id.clone(),
+    );
+    let action_id = ActionId::new();
+    raw.action_request.action_id = Some(action_id.clone());
+    raw.action_request.action.params = json!({
+        "zone_ref": "zone_a",
+        "headers": {"Proxy-Authorization": format!("Bearer {CANARY}")}
+    });
+    let evaluations_before = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("authority evaluation count");
+    let uri = format!("/devices/{node_id}/actions");
+
+    let (status, denied): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, raw).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied.action_id, action_id);
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-denial authority evaluation count"),
+        evaluations_before
+    );
+    let simulator_error = listener
+        .accept()
+        .expect_err("raw credential denial must not contact simulator");
+    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw physical traces");
+    let encoded = serde_json::to_string(&raw_records).expect("raw traces serialize");
+    assert!(!encoded.contains(CANARY));
+    let action_events = raw_records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .filter(|event| event.identity.action_id.as_ref() == Some(&action_id))
+        .collect::<Vec<_>>();
+    assert_eq!(action_events.len(), 4);
+    assert!(action_events.iter().all(|event| match &event.kind {
+        TraceEventKind::ActionVerificationStarted { action }
+        | TraceEventKind::ActionVerificationCompleted { action, .. }
+        | TraceEventKind::ActionDenied { action, .. } => {
+            action == &splendor_gateway::raw_credential_denied_action()
+        }
+        TraceEventKind::OutcomeRecorded { .. } => true,
+        _ => false,
+    }));
+
+    let replay_caller = replay_credential(tenant_id.clone());
+    let executions_before_replay = inspect(app.clone(), &created.run_id)
+        .await
+        .adapter_executions;
+    let evaluations_before_replay = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-replay authority evaluations");
+    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({
+            "mode": "inspect_only",
+            "side_effects_allowed": false,
+            "audit_attribution": credential_audit(&replay_caller),
+            "credential": replay_caller,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay.mode, "inspect_only");
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        executions_before_replay
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-replay authority evaluations"),
+        evaluations_before_replay
+    );
+
+    drop(device_sim_env);
+    drop(listener);
+    let _device_sim_disabled = DeviceSimEnvGuard::disabled();
+    let safe = physical_submit_request(&created, tenant_id, agent_id, causal_trace_id);
+    let (status, executed): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, safe).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(executed.status, ActionStatus::Executed);
+    assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
+}
+
+#[tokio::test]
 async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
     let _device_sim_env = DeviceSimEnvGuard::disabled();
     let app = router(DaemonState::local_dev());
