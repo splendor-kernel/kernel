@@ -1361,6 +1361,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "splendor-acceptance-action-host"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "splendor-daemon",
+ "splendor-gateway",
+ "splendor-types",
+ "time",
+ "tokio",
+ "ureq",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "splendor-adapter-filesystem"
 version = "0.1.0"
 dependencies = [

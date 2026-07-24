@@ -2,9 +2,55 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import importlib.util
+import subprocess
+import sys
+import tempfile
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
 
 import aggregate_report as ar
+import action_provider
+import test_action_provider as provider_fixture
+from acceptance_provider_evidence import (
+    VERIFICATION_MATERIAL_FIELD,
+    verify_evidence_envelope,
+)
+from acceptance_provider_output import project_private_v3_output
+from acceptance_scenario_expectations import (
+    PHYSICAL_COORDINATE,
+    ROLE_BINDINGS,
+    expectation_for,
+    make_output_expectation,
+)
+from acceptance_provider_protocol import (
+    OPERATION_MANIFEST,
+    b64url_decode,
+    b64url_encode,
+    evidence_auth_signature,
+    strict_loads,
+)
+
+
+def load_s10_scenario_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scenarios"
+        / "uc_e2e_s10_final_journey"
+        / "run.py"
+    )
+    spec = importlib.util.spec_from_file_location("uc_e2e_s10_final_journey_run", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load S10 scenario helper module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+S10_SCENARIO = load_s10_scenario_module()
 
 
 VPC_INSTANCE = "00000000-0000-4000-8000-000000000302"
@@ -15,6 +61,232 @@ PUBLISH_ACTION_ID = "55555555-5555-4555-8555-555555558821"
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
 AGENT_ID = "22222222-2222-4222-8222-222222222210"
 PUBLISH_STATE_HEAD = "blake3:" + "1" * 64
+
+
+def production_private_v3_output(
+    operation_id: str,
+    *,
+    action_id: str,
+    role: str,
+    params: dict,
+    expected_resource: object,
+    expectation: dict | None = None,
+) -> tuple[dict, dict, bytes]:
+    tool = provider_fixture._verifier_path()
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        private_path = root / "private.pk8"
+        public_path = root / "public.raw"
+        subprocess.run(
+            [str(tool), "generate", str(private_path), str(public_path)],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        output_expectation = expectation or make_output_expectation(
+            "UNIT",
+            operation_id,
+            operation_id,
+            role,
+            provider_fixture.AGENT,
+            provider_fixture.RUN,
+            action_id,
+            expected_resource,
+        )
+        operation = OPERATION_MANIFEST.by_operation_id[operation_id]
+        keys = provider_fixture.request_keys()
+        resource_kind = None
+        resource_id = None
+        if operation["coordinate_rule"] == "physical_node":
+            resource_kind = "physical_node"
+            resource_id = expected_resource.get("node_id")
+        elif operation["parameter_profile"] in {"artifact_create", "artifact_publish"}:
+            resource_kind = "artifact_ref"
+            resource_id = expected_resource
+        elif operation["parameter_profile"] == "data_read":
+            resource_kind = "data_ref"
+            resource_id = expected_resource
+        if resource_kind is not None:
+            key_id = ROLE_BINDINGS[role]["request_key_id"]
+            key = keys[key_id]
+            scope = (operation_id, resource_kind, resource_id)
+            keys[key_id] = action_provider.RequestKey(
+                **{
+                    **key.__dict__,
+                    "allowed_resource_scopes": tuple(
+                        sorted(set((*key.allowed_resource_scopes, scope)))
+                    ),
+                }
+            )
+        provider = provider_fixture.runtime(
+            signer=action_provider.SubprocessSigner(tool, private_path),
+            keys=keys,
+        )
+        request = provider_fixture.make_request(
+            operation_id,
+            role=role,
+            action_id=action_id,
+            request_id="66666666-6666-4666-8666-777777777777",
+            agent_id=output_expectation["agent_id"],
+            run_id=output_expectation["run_id"],
+            params=params,
+        )
+        if operation["coordinate_rule"] == "physical_node":
+            request["physical_action_resource_coordinate"] = copy.deepcopy(
+                expected_resource
+            )
+            request = provider_fixture.finalize_request(request)
+        response = provider_fixture.handle(provider, request)
+        if response.status != 200:
+            raise AssertionError(
+                f"private-v3 fixture operation failed: {operation_id}: {response.status}"
+            )
+        envelope = provider_fixture.response_json(response)
+        payload = provider_fixture.receipt_payload(response)
+        output = strict_loads(
+            b64url_decode(payload["output_b64"]),
+            max_bytes=operation["bounds"]["max_output_bytes"],
+            require_canonical=True,
+        )
+        output["provider_receipt"] = envelope
+        projection = project_private_v3_output(
+            output,
+            expectation=output_expectation,
+            public_key_path=public_path,
+            now_ms=provider_fixture.NOW,
+        )
+        public_key = public_path.read_bytes()
+    return output, projection, public_key
+
+
+def production_private_v3_scenario_evidence(
+    *, restart_second: bool = False
+) -> tuple[dict, dict[str, dict], bytes]:
+    tool = provider_fixture._verifier_path()
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        private_path = root / "private.pk8"
+        public_path = root / "public.raw"
+        subprocess.run(
+            [str(tool), "generate", str(private_path), str(public_path)],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        signer = action_provider.SubprocessSigner(tool, private_path)
+        provider = provider_fixture.runtime(signer=signer)
+        operation_id = "daemon.local/daemon_management_action"
+        action_id = "55555555-5555-4555-8555-555555558800"
+        expectation = make_output_expectation(
+            "UNIT",
+            "management_action",
+            operation_id,
+            "local",
+            provider_fixture.AGENT,
+            provider_fixture.RUN,
+            action_id,
+        )
+        response = provider_fixture.handle(
+            provider,
+            provider_fixture.make_request(operation_id, action_id=action_id),
+        )
+        if response.status != 200:
+            raise AssertionError(f"private-v3 marker failed: {response.status}")
+        envelope = provider_fixture.response_json(response)
+        payload = provider_fixture.receipt_payload(response)
+        operation = OPERATION_MANIFEST.by_operation_id[operation_id]
+        output = strict_loads(
+            b64url_decode(payload["output_b64"]),
+            max_bytes=operation["bounds"]["max_output_bytes"],
+            require_canonical=True,
+        )
+        output["provider_receipt"] = envelope
+        projection = project_private_v3_output(
+            output,
+            expectation=expectation,
+            public_key_path=public_path,
+            now_ms=provider_fixture.NOW,
+        )
+        public_key = public_path.read_bytes()
+
+        def retained_evidence(
+            source: action_provider.ProviderRuntime, nonce: str, now_ms: int
+        ) -> dict:
+            key = next(iter(source.evidence_keys.values()))
+            binding = {
+                "method": "GET",
+                "path": "/evidence",
+                "query": "view=bounded",
+                "view": "bounded",
+                "timestamp_unix_ms": now_ms,
+                "nonce": nonce,
+                "audience": key.audience,
+                "key_id": key.key_id,
+                "client_principal_id": key.client_principal_id,
+                "provider_epoch": source.epoch,
+            }
+            evidence_response = source.handle_evidence(
+                method="GET",
+                target=action_provider.EVIDENCE_PATH,
+                key_id=key.key_id,
+                client_principal_id=key.client_principal_id,
+                audience=key.audience,
+                timestamp_ms=now_ms,
+                nonce=nonce,
+                provider_epoch=source.epoch,
+                view="bounded",
+                signature=evidence_auth_signature(binding, key.secret),
+                now_ms=now_ms,
+            )
+            if evidence_response.status != 200:
+                raise AssertionError(
+                    f"private-v3 evidence failed: {evidence_response.status}"
+                )
+            verified = verify_evidence_envelope(
+                evidence_response.body,
+                public_path,
+                request_binding=binding,
+                now_ms=now_ms,
+            )
+            retained = dict(verified)
+            retained[VERIFICATION_MATERIAL_FIELD] = {
+                "envelope": provider_fixture.response_json(evidence_response),
+                "request_binding": binding,
+                "public_key_b64": b64url_encode(public_key),
+                "public_key_fingerprint": "sha256:"
+                + hashlib.sha256(public_key).hexdigest(),
+            }
+            return retained
+
+        before = retained_evidence(
+            provider, "AAECAwQFBgcICQoLDA0ODw", provider_fixture.NOW + 1
+        )
+        after_provider = provider
+        if restart_second:
+            after_provider = provider_fixture.runtime(
+                signer=signer,
+                epoch="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+            )
+        after = retained_evidence(
+            after_provider, "AQECAwQFBgcICQoLDA0ODw", provider_fixture.NOW + 2
+        )
+    return (
+        {
+            "private_v3_outputs": [projection],
+            "provider_evidence": [before, after],
+        },
+        {"management_action": expectation},
+        public_key,
+    )
+
+
+@contextmanager
+def trusted_public_key_file(public_key: bytes):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "receipt-public-key.raw"
+        path.write_bytes(public_key)
+        path.chmod(0o644)
+        yield path
 
 
 def valid_security_fixture() -> tuple[dict, dict, list[dict]]:
@@ -147,10 +419,19 @@ def valid_security_fixture() -> tuple[dict, dict, list[dict]]:
     return security, profiles, api_rows
 
 
-def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict]]:
+def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict], bytes]:
+    artifact_ref = f"artifact://{TENANT_ID}/field-intelligence/s10-public.md"
+    private_v3_output, private_v3_projection, public_key = production_private_v3_output(
+        "artifact-store/artifact.publish_external",
+        action_id=PUBLISH_ACTION_ID,
+        role="vpc",
+        params={"publish_ref": artifact_ref},
+        expected_resource=artifact_ref,
+        expectation=expectation_for("UC-E2E-S10", "approved_publish"),
+    )
     action = {
         "name": "artifact.publish_external",
-        "params": {"publish_ref": f"artifact://{TENANT_ID}/field-intelligence/s10-public.md"},
+        "params": {"publish_ref": artifact_ref},
         "side_effect_class": "External",
         "required_permissions": ["artifact.publish_external"],
         "preconditions": [],
@@ -224,7 +505,7 @@ def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict]]:
         "action_id": PUBLISH_ACTION_ID,
         "status": "Executed",
         "error": None,
-        "output": {"execution": 1, "action": "artifact.publish_external"},
+        "output": copy.deepcopy(private_v3_output),
         "verification": {
             "allowed": True,
             "artifacts": {
@@ -281,6 +562,10 @@ def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict]]:
         "approval_grant": copy.deepcopy(approval_grant),
         "approved_publish": copy.deepcopy(approved_response),
         "publish_exact_action_retry": copy.deepcopy(approved_response),
+        "approved_publish_evidence": {
+            "private_v3_projection": copy.deepcopy(private_v3_projection),
+            "trace_private_v3_projection": copy.deepcopy(private_v3_projection),
+        },
         "publish_execution_count_for_positive_run": 1,
         "publish_work_order_id": "wo-publish",
         "publish_manager_submission": {
@@ -445,7 +730,10 @@ def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict]]:
         trace_record(
             20,
             "ActionExecuted",
-            {"action": copy.deepcopy(action), "outcome": {"execution": 1}},
+            {
+                "action": copy.deepcopy(action),
+                "outcome": copy.deepcopy(private_v3_output),
+            },
             include_action=True,
         ),
         trace_record(
@@ -455,7 +743,223 @@ def valid_approval_retry_fixture() -> tuple[dict, list[dict], list[dict]]:
             include_action=False,
         ),
     ]
-    return artifact, api_rows, traces
+    return artifact, api_rows, traces, public_key
+
+
+def validate_approval_retry_fixture(
+    artifact: dict, api_rows: list[dict], traces: list[dict], public_key: bytes
+) -> list[str]:
+    with trusted_public_key_file(public_key) as trusted_key:
+        return ar.validate_s10_approval_exact_retry(
+            artifact, api_rows, traces, trusted_key
+        )
+
+
+class PrivateV3AggregateEvidenceTests(unittest.TestCase):
+    def test_accepts_production_signed_output_and_evidence(self) -> None:
+        scenario, expectations, public_key = production_private_v3_scenario_evidence()
+        with trusted_public_key_file(public_key) as trusted_key:
+            self.assertEqual(
+                ar.validate_private_v3_scenario_evidence(
+                    scenario,
+                    expectations,
+                    trusted_key,
+                    "unit",
+                ),
+                [],
+            )
+
+    def test_rejects_restart_epoch_substitution(self) -> None:
+        scenario, expectations, public_key = production_private_v3_scenario_evidence(
+            restart_second=True
+        )
+        with trusted_public_key_file(public_key) as trusted_key:
+            failures = ar.validate_private_v3_scenario_evidence(
+                scenario,
+                expectations,
+                trusted_key,
+                "unit",
+            )
+        self.assertIn("unit_provider_evidence_epoch_inconsistent:1", failures)
+        self.assertIn("unit_provider_output_evidence_epoch_mismatch", failures)
+
+    def test_rejects_missing_wrong_and_attacker_selected_trust(self) -> None:
+        legitimate, expectations, legitimate_key = production_private_v3_scenario_evidence()
+        attacker, attacker_expectations, attacker_key = (
+            production_private_v3_scenario_evidence()
+        )
+        self.assertNotEqual(legitimate_key, attacker_key)
+
+        missing = ar.validate_private_v3_scenario_evidence(
+            legitimate,
+            expectations,
+            Path("/definitely/missing/private-v3-trust-root.raw"),
+            "missing",
+        )
+        self.assertTrue(
+            any(item.startswith("missing_private_v3_output_invalid:") for item in missing)
+        )
+        self.assertTrue(
+            any(item.startswith("missing_signed_provider_evidence_invalid:") for item in missing)
+        )
+
+        with trusted_public_key_file(attacker_key) as wrong_key:
+            wrong = ar.validate_private_v3_scenario_evidence(
+                legitimate, expectations, wrong_key, "wrong"
+            )
+        self.assertTrue(
+            any(item.startswith("wrong_private_v3_output_invalid:") for item in wrong)
+        )
+        self.assertTrue(
+            any(item.startswith("wrong_signed_provider_evidence_invalid:") for item in wrong)
+        )
+
+        with trusted_public_key_file(legitimate_key) as trusted_key:
+            forged = ar.validate_private_v3_scenario_evidence(
+                attacker, attacker_expectations, trusted_key, "attacker"
+            )
+        self.assertTrue(
+            any(item.startswith("attacker_private_v3_output_invalid:") for item in forged)
+        )
+        self.assertTrue(
+            any(item.startswith("attacker_signed_provider_evidence_invalid:") for item in forged)
+        )
+
+    def test_rejects_embedded_key_id_and_fingerprint_substitution(self) -> None:
+        scenario, expectations, public_key = production_private_v3_scenario_evidence()
+        mutations = {
+            "projection_fingerprint": lambda value: value["private_v3_outputs"][0].__setitem__(
+                "public_key_fingerprint", "sha256:" + "0" * 64
+            ),
+            "projection_key_id": lambda value: value["private_v3_outputs"][0][
+                "output"
+            ]["provider_receipt"].__setitem__("signing_key_id", "attacker-key"),
+            "evidence_fingerprint": lambda value: value["provider_evidence"][0][
+                "_evidence_verification"
+            ].__setitem__("public_key_fingerprint", "sha256:" + "0" * 64),
+            "evidence_key_id": lambda value: value["provider_evidence"][0][
+                "_evidence_verification"
+            ]["envelope"].__setitem__("signing_key_id", "attacker-key"),
+        }
+        with trusted_public_key_file(public_key) as trusted_key:
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(scenario)
+                    mutate(changed)
+                    failures = ar.validate_private_v3_scenario_evidence(
+                        changed, expectations, trusted_key, label
+                    )
+                    self.assertTrue(
+                        any("invalid" in failure for failure in failures), failures
+                    )
+
+    def test_rejects_genuine_receipts_for_wrong_bound_identity_or_resource(self) -> None:
+        canonical = expectation_for("UC-E2E-S10", "approved_publish")
+        variants = {
+            "artifact": make_output_expectation(
+                canonical["scenario_id"],
+                canonical["expectation_id"],
+                canonical["operation_id"],
+                "vpc",
+                canonical["agent_id"],
+                canonical["run_id"],
+                canonical["action_id"],
+                f"artifact://{canonical['tenant_id']}/field-intelligence/other.md",
+            ),
+            "run": make_output_expectation(
+                canonical["scenario_id"], canonical["expectation_id"],
+                canonical["operation_id"], "vpc", canonical["agent_id"],
+                "44444444-4444-4444-8444-444444448899",
+                canonical["action_id"], canonical["resource"],
+            ),
+            "agent": make_output_expectation(
+                canonical["scenario_id"], canonical["expectation_id"],
+                canonical["operation_id"], "vpc",
+                "22222222-2222-4222-8222-222222222299",
+                canonical["run_id"], canonical["action_id"], canonical["resource"],
+            ),
+            "action": make_output_expectation(
+                canonical["scenario_id"], canonical["expectation_id"],
+                canonical["operation_id"], "vpc", canonical["agent_id"],
+                canonical["run_id"], "55555555-5555-4555-8555-555555558899",
+                canonical["resource"],
+            ),
+            "role": make_output_expectation(
+                canonical["scenario_id"], canonical["expectation_id"],
+                canonical["operation_id"], "local", canonical["agent_id"],
+                canonical["run_id"], canonical["action_id"], canonical["resource"],
+            ),
+        }
+        for label, variant in variants.items():
+            with self.subTest(label=label):
+                output, projection, public_key = production_private_v3_output(
+                    variant["operation_id"],
+                    action_id=variant["action_id"],
+                    role=variant["request_principal_role"],
+                    params={"publish_ref": variant["resource"]},
+                    expected_resource=variant["resource"],
+                    expectation=variant,
+                )
+                with trusted_public_key_file(public_key) as trusted_key:
+                    self.assertEqual(
+                        ar.validate_exact_private_v3_output(
+                            output,
+                            projection,
+                            canonical,
+                            trusted_key,
+                            f"wrong_{label}",
+                        ),
+                        [f"wrong_{label}"],
+                    )
+
+        for label, scenario_id, expectation_id, resource, params in (
+            (
+                "data_ref",
+                "UC-E2E-S10",
+                "orchestrator_data_read",
+                "dataset:tenant-a.field-intel.other.v1",
+                {"data_ref": "dataset:tenant-a.field-intel.other.v1"},
+            ),
+            (
+                "physical_node",
+                "UC-E2E-S6",
+                "approved_capture",
+                {"resource_kind": "physical_node", "node_id": "00000000-0000-4000-8000-000000000605"},
+                {"physical_action": True},
+            ),
+        ):
+            canonical_resource = expectation_for(scenario_id, expectation_id)
+            variant = make_output_expectation(
+                canonical_resource["scenario_id"],
+                canonical_resource["expectation_id"],
+                canonical_resource["operation_id"],
+                canonical_resource["request_principal_role"],
+                canonical_resource["agent_id"],
+                canonical_resource["run_id"],
+                canonical_resource["action_id"],
+                resource,
+            )
+            output, projection, public_key = production_private_v3_output(
+                variant["operation_id"],
+                action_id=variant["action_id"],
+                role=variant["request_principal_role"],
+                params=params,
+                expected_resource=resource,
+                expectation=variant,
+            )
+            with self.subTest(label=label), trusted_public_key_file(
+                public_key
+            ) as trusted_key:
+                self.assertEqual(
+                    ar.validate_exact_private_v3_output(
+                        output,
+                        projection,
+                        canonical_resource,
+                        trusted_key,
+                        f"wrong_{label}",
+                    ),
+                    [f"wrong_{label}"],
+                )
 
 
 class S2CanonicalOperationTests(unittest.TestCase):
@@ -552,23 +1056,23 @@ class S10ResidentSecurityReportTests(unittest.TestCase):
 
 class S10ApprovalExactRetryTests(unittest.TestCase):
     def test_accepts_independently_correlated_exact_retry(self) -> None:
-        artifact, api_rows, traces = valid_approval_retry_fixture()
+        artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
         self.assertEqual(
-            [], ar.validate_s10_approval_exact_retry(artifact, api_rows, traces)
+            [], validate_approval_retry_fixture(artifact, api_rows, traces, public_key)
         )
 
     def test_rejects_changed_action_payload(self) -> None:
-        artifact, api_rows, traces = valid_approval_retry_fixture()
+        artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
         retry = next(
             row for row in api_rows if row["operation_id"] == "submitApprovedExactAction"
         )
         retry["request"]["action"]["params"]["publish_ref"] = "artifact://wrong/payload"
-        failures = ar.validate_s10_approval_exact_retry(artifact, api_rows, traces)
+        failures = validate_approval_retry_fixture(artifact, api_rows, traces, public_key)
         self.assertIn("s10_approved_exact_action_proposal_mismatch:action", failures)
         self.assertIn("s10_approved_exact_action_artifact_mismatch:action", failures)
 
     def test_rejects_wrong_receipt_audience(self) -> None:
-        artifact, api_rows, traces = valid_approval_retry_fixture()
+        artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
         retry = next(
             row for row in api_rows if row["operation_id"] == "submitApprovedExactAction"
         )
@@ -577,22 +1081,22 @@ class S10ApprovalExactRetryTests(unittest.TestCase):
         )
         self.assertIn(
             "s10_approved_exact_action_receipt_not_manager_issued",
-            ar.validate_s10_approval_exact_retry(artifact, api_rows, traces),
+            validate_approval_retry_fixture(artifact, api_rows, traces, public_key),
         )
 
     def test_rejects_raw_approval_evidence(self) -> None:
-        artifact, api_rows, traces = valid_approval_retry_fixture()
+        artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
         retry = next(
             row for row in api_rows if row["operation_id"] == "submitApprovedExactAction"
         )
         retry["request"]["approval_evidence"] = {"decision": "Granted"}
         self.assertIn(
             "s10_approved_exact_action_used_raw_approval_evidence",
-            ar.validate_s10_approval_exact_retry(artifact, api_rows, traces),
+            validate_approval_retry_fixture(artifact, api_rows, traces, public_key),
         )
 
     def test_rejects_publish_lifecycle_resume(self) -> None:
-        artifact, api_rows, traces = valid_approval_retry_fixture()
+        artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
         api_rows.append(
             {
                 "operation_id": "resumeRun",
@@ -605,7 +1109,7 @@ class S10ApprovalExactRetryTests(unittest.TestCase):
         )
         self.assertIn(
             "s10_approved_publish_used_lifecycle_resume",
-            ar.validate_s10_approval_exact_retry(artifact, api_rows, traces),
+            validate_approval_retry_fixture(artifact, api_rows, traces, public_key),
         )
 
     def test_rejects_tick_or_state_head_change(self) -> None:
@@ -618,7 +1122,7 @@ class S10ApprovalExactRetryTests(unittest.TestCase):
             ),
         ]:
             with self.subTest(field=field):
-                artifact, api_rows, traces = valid_approval_retry_fixture()
+                artifact, api_rows, traces, public_key = valid_approval_retry_fixture()
                 after = next(
                     row
                     for row in api_rows
@@ -627,7 +1131,9 @@ class S10ApprovalExactRetryTests(unittest.TestCase):
                 after["response"][field] = value
                 self.assertIn(
                     expected,
-                    ar.validate_s10_approval_exact_retry(artifact, api_rows, traces),
+                    validate_approval_retry_fixture(
+                        artifact, api_rows, traces, public_key
+                    ),
                 )
 
 
@@ -1087,10 +1593,12 @@ class S5ApprovalRemediationReportTests(unittest.TestCase):
 
 
 def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
-    run_id = "00000000-0000-4000-8000-000000000601"
-    action_id = "00000000-0000-4000-8000-000000000602"
-    node_a = "00000000-0000-4000-8000-000000000603"
-    node_b = "00000000-0000-4000-8000-000000000604"
+    output_expectation = expectation_for("UC-E2E-S6", "approved_capture")
+    run_id = output_expectation["run_id"]
+    action_id = output_expectation["action_id"]
+    agent_id = output_expectation["agent_id"]
+    node_a = "00000000-0000-4000-8000-000000000604"
+    node_b = "00000000-0000-4000-8000-000000000605"
     instance_id = "00000000-0000-4000-8000-000000000605"
     work_order_id = "00000000-0000-4000-8000-000000000606"
     audience = (
@@ -1130,9 +1638,52 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
     coordinate_error = {"code": "unknown_field", "field": "physical_action_resource_coordinate"}
     authority_error = {"code": "unknown_field", "field": "authority_override"}
     wrong_body = {"code": "approval_challenge_retry_mismatch"}
+    physical_coordinate = {"resource_kind": "physical_node", "node_id": node_a}
+    private_v3_output, _, _ = production_private_v3_output(
+        "device-sim/capture_image",
+        action_id=action_id,
+        role="edge",
+        params={"physical_action": True},
+        expected_resource=physical_coordinate,
+        expectation=output_expectation,
+    )
+    exact_action = {
+        "name": "capture_image",
+        "params": {"physical_action": True},
+        "side_effect_class": {"Custom": "physical.high_level"},
+        "cost_estimate": None,
+        "required_permissions": ["physical.high_level"],
+        "preconditions": [],
+        "postconditions": ["device_state_updated"],
+    }
+    exact_quota = {
+        "actions": 1,
+        "action_duration_ms": 0,
+        "filesystem_read_bytes": 0,
+        "filesystem_write_bytes": 0,
+        "network_read_bytes": 0,
+        "network_write_bytes": 0,
+        "http_requests": 0,
+    }
+    challenge_request = {
+        "action_id": action_id,
+        "run_id": run_id,
+        "tenant_id": output_expectation["tenant_id"],
+        "agent_id": agent_id,
+        "causal_trace_id": "55555555-5555-4555-8555-555555555651",
+        "action": exact_action,
+        "adapter": "device-sim",
+        "quota_usage": exact_quota,
+        "satisfied_preconditions": [],
+        "requested_at": "2026-07-15T08:47:26Z",
+        "approval_evidence": None,
+        "authority_obligation_receipts": [],
+        "safety_context": {"offline": False, "high_risk": False},
+        "operator_intervention_evidence": None,
+    }
     executed = {
         "status": "Executed",
-        "output": {"execution": 1},
+        "output": private_v3_output,
         "verification": {"artifacts": {"safety": {"source": "safety_verifier"}}},
         "post_verification": {
             "artifacts": {"safety": {"source": "safety_verifier"}}
@@ -1142,6 +1693,9 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
         "status": "Denied",
         "error": "authority_obligation_receipt_replayed",
     }
+    retry_request = copy.deepcopy(challenge_request)
+    retry_request["causal_trace_id"] = "55555555-5555-4555-8555-555555555652"
+    retry_request["authority_obligation_receipts"] = [receipt]
     artifact = {
         "ids": {
             "run_id": run_id,
@@ -1158,12 +1712,20 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
         "closed_schema": {
             "physical_action_resource_coordinate": {"body": coordinate_error},
             "unknown_authority_field": {"body": authority_error},
+            "reserved_node_action_param": {
+                "status": 200,
+                "body": {
+                    "status": "Failed",
+                    "error": "acceptance_operation_reserved_field",
+                },
+            },
             "simulator_unchanged": True,
         },
         "challenge": challenge
         | {
             "status": "NeedsApproval",
-            "caller_action_param_node_id": node_b,
+            "request": copy.deepcopy(challenge_request),
+            "caller_action_param_node_id": None,
             "caller_param_did_not_override_server_coordinate": True,
             "simulator_counter_before": {"total": 0},
             "simulator_counter_after": {"total": 0},
@@ -1183,6 +1745,7 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
             "receipt_unclaimed": True,
         },
         "exact_node_execution": {
+            "request": copy.deepcopy(retry_request),
             "response": executed,
             "simulator_counter_before": {"total": 0},
             "simulator_counter_after": {"total": 1},
@@ -1258,7 +1821,7 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
             "submitPhysicalForApproval",
             node_a,
             200,
-            {"action": {"name": "inspect_zone", "params": {"node_id": node_b}}},
+            challenge_request,
             {"status": "NeedsApproval", "approval_challenge": challenge},
         ),
         *manager_rows,
@@ -1266,21 +1829,21 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
             "retryPhysicalWrongNode",
             node_b,
             409,
-            {"authority_obligation_receipts": [receipt]},
+            retry_request,
             wrong_body,
         ),
         physical_row(
             "retryPhysicalExactNode",
             node_a,
             200,
-            {"authority_obligation_receipts": [receipt]},
+            retry_request,
             executed,
         ),
         physical_row(
             "replayPhysicalReceipt",
             node_a,
             200,
-            {"authority_obligation_receipts": [receipt]},
+            retry_request,
             replay_denial,
         ),
     ]
@@ -1326,6 +1889,58 @@ class S6PhysicalApprovalBindingReportTests(unittest.TestCase):
         failures = ar.validate_s6_physical_approval_binding(artifact, manager_auth, rows)
         self.assertIn("s6_retained_evidence_contains_receipt_signature", failures)
         self.assertIn("s6_physical_approval_api_cardinality_invalid", failures)
+
+    def test_rejects_changed_exact_retry_action(self) -> None:
+        artifact, manager_auth, rows = valid_s6_physical_approval_fixture()
+        exact = next(row for row in rows if row["operation_id"] == "retryPhysicalExactNode")
+        exact["request"]["action"]["params"]["node_id"] = artifact["ids"]["node_b_id"]
+        self.assertIn(
+            "s6_exact_node_did_not_execute_once_with_safety",
+            ar.validate_s6_physical_approval_binding(artifact, manager_auth, rows),
+        )
+
+    def test_rejects_invalid_provider_signature_in_exact_execution(self) -> None:
+        expectation = expectation_for("UC-E2E-S6", "approved_capture")
+        output, projection, public_key = production_private_v3_output(
+            expectation["operation_id"],
+            action_id=expectation["action_id"],
+            role=expectation["request_principal_role"],
+            params={"physical_action": True},
+            expected_resource=PHYSICAL_COORDINATE,
+            expectation=expectation,
+        )
+        exact_execution = {"status": "Executed", "output": copy.deepcopy(output)}
+        with trusted_public_key_file(public_key) as trusted_key:
+            self.assertEqual(
+                ar.validate_exact_private_v3_output(
+                    exact_execution,
+                    projection,
+                    expectation,
+                    trusted_key,
+                    "s6_invalid_signature",
+                ),
+                [],
+            )
+            signature = bytearray(
+                b64url_decode(
+                    exact_execution["output"]["provider_receipt"]["signature_b64"],
+                    expected_length=64,
+                )
+            )
+            signature[0] ^= 1
+            exact_execution["output"]["provider_receipt"]["signature_b64"] = (
+                b64url_encode(bytes(signature))
+            )
+            self.assertEqual(
+                ar.validate_exact_private_v3_output(
+                    exact_execution,
+                    projection,
+                    expectation,
+                    trusted_key,
+                    "s6_invalid_signature",
+                ),
+                ["s6_invalid_signature"],
+            )
 
 
 def valid_s10_revocation_fixture() -> tuple[dict, dict, dict, list[dict], list[dict]]:
@@ -1641,6 +2256,31 @@ class S10TraceSyncReportTests(unittest.TestCase):
         self.assertIn(
             "s10_edge_redacted_trace_integrity_boundary_missing",
             ar.validate_s10_trace_sync_evidence(trace_sync),
+        )
+
+
+class S10ScenarioActionProfileTests(unittest.TestCase):
+    def test_physical_actions_use_closed_host_postconditions(self) -> None:
+        for name in S10_SCENARIO.ALLOWED_PHYSICAL_ACTIONS:
+            expected = (
+                "sensor_read"
+                if name in {"read_battery", "read_sensor_summary"}
+                else "device_state_updated"
+            )
+            self.assertEqual(
+                [expected],
+                S10_SCENARIO.physical_action(name)["postconditions"],
+                name,
+            )
+
+    def test_nonphysical_postconditions_remain_unchanged(self) -> None:
+        self.assertEqual(
+            ["artifact_published"],
+            S10_SCENARIO.action("artifact.publish_external")["postconditions"],
+        )
+        self.assertEqual(
+            ["marker_recorded"],
+            S10_SCENARIO.action("orchestrator.marker")["postconditions"],
         )
 
 

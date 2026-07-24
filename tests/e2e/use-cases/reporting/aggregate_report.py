@@ -7,10 +7,25 @@ import json
 import os
 import re
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fixtures"))
+from acceptance_provider_evidence import (  # noqa: E402
+    VERIFICATION_MATERIAL_FIELD,
+    verify_retained_provider_evidence,
+)
+from acceptance_provider_output import (  # noqa: E402
+    project_private_v3_output,
+    verify_retained_private_v3_projection,
+)
+from acceptance_scenario_expectations import (  # noqa: E402
+    expectation_for,
+    expectations_for,
+)
 
 from source_identity import (
     SOURCE_TREE_DIGEST_ALGORITHM,
@@ -20,6 +35,176 @@ from source_identity import (
 
 
 FUTURE_SCENARIOS = [f"UC-E2E-S{i}" for i in range(1, 11)]
+
+
+def validate_private_v3_scenario_evidence(
+    scenario: dict,
+    expectations: dict[str, dict],
+    trusted_public_key_path: Path,
+    prefix: str,
+) -> list[str]:
+    failures: list[str] = []
+    projections = scenario.get("private_v3_outputs")
+    if not isinstance(projections, list) or not projections:
+        return [f"{prefix}_private_v3_outputs_missing"]
+    if len(projections) != len(expectations):
+        failures.append(f"{prefix}_private_v3_output_cardinality_invalid")
+    verified_by_id: dict[str, dict] = {}
+    projection_keys: set[str] = set()
+    for index, projection in enumerate(projections):
+        expectation_id = (
+            projection.get("expectation_id") if isinstance(projection, dict) else None
+        )
+        expectation = expectations.get(str(expectation_id))
+        if expectation is None or expectation_id in verified_by_id:
+            failures.append(
+                f"{prefix}_private_v3_output_expectation_invalid:{index}"
+            )
+            continue
+        try:
+            verified = verify_retained_private_v3_projection(
+                projection,
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation,
+            )
+        except Exception as error:  # noqa: BLE001 - aggregate records bounded verifier failure
+            failures.append(
+                f"{prefix}_private_v3_output_invalid:{index}:{type(error).__name__}"
+            )
+            continue
+        verified_by_id[expectation_id] = verified
+        projection_keys.add(verified["public_key_fingerprint"])
+    missing = sorted(set(expectations) - set(verified_by_id))
+    if missing:
+        failures.append(f"{prefix}_private_v3_expectations_missing:" + ",".join(missing))
+    if len(projection_keys) != 1:
+        failures.append(f"{prefix}_private_v3_signing_key_inconsistent")
+    projection_epochs = {
+        projection["provider_epoch"] for projection in verified_by_id.values()
+    }
+    if len(projection_epochs) != 1:
+        failures.append(f"{prefix}_private_v3_provider_epoch_inconsistent")
+    request_ids = [projection["request_id"] for projection in verified_by_id.values()]
+    if len(request_ids) != len(set(request_ids)):
+        failures.append(f"{prefix}_private_v3_request_id_reused")
+    receipt_ids = [
+        projection["provider_receipt_id"] for projection in verified_by_id.values()
+    ]
+    if len(receipt_ids) != len(set(receipt_ids)):
+        failures.append(f"{prefix}_private_v3_provider_receipt_id_reused")
+
+    retained = scenario.get("provider_evidence")
+    if not isinstance(retained, list) or len(retained) != 2:
+        failures.append(f"{prefix}_signed_provider_evidence_missing")
+        return failures
+    provider_epoch: str | None = None
+    seen_nonces: set[str] = set()
+    sequence_by_epoch: dict[tuple[str, str], int] = {}
+    evidence_keys: set[str] = set()
+    verified_evidence: list[dict] = []
+    for index, evidence in enumerate(retained):
+        try:
+            payload = verify_retained_provider_evidence(
+                evidence, trusted_public_key_path=trusted_public_key_path
+            )
+        except Exception as error:  # noqa: BLE001 - aggregate records bounded verifier failure
+            failures.append(
+                f"{prefix}_signed_provider_evidence_invalid:{index}:{type(error).__name__}"
+            )
+            continue
+        verified_evidence.append(payload)
+        binding = payload["request_binding"]
+        if provider_epoch is None:
+            provider_epoch = payload["provider_epoch"]
+        elif payload["provider_epoch"] != provider_epoch:
+            failures.append(f"{prefix}_provider_evidence_epoch_inconsistent:{index}")
+        if binding["nonce"] in seen_nonces:
+            failures.append(f"{prefix}_provider_evidence_nonce_reused:{index}")
+        seen_nonces.add(binding["nonce"])
+        evidence_keys.add(
+            evidence[VERIFICATION_MATERIAL_FIELD]["public_key_fingerprint"]
+        )
+        key = (payload["provider_epoch"], binding["key_id"])
+        previous = sequence_by_epoch.get(key, 0)
+        if payload["snapshot_sequence"] <= previous:
+            failures.append(f"{prefix}_provider_evidence_sequence_not_monotonic:{index}")
+        sequence_by_epoch[key] = payload["snapshot_sequence"]
+    if evidence_keys != projection_keys:
+        failures.append(f"{prefix}_provider_evidence_signing_key_mismatch")
+    evidence_epochs = {payload["provider_epoch"] for payload in verified_evidence}
+    if projection_epochs and evidence_epochs != projection_epochs:
+        failures.append(f"{prefix}_provider_output_evidence_epoch_mismatch")
+    for expectation_id, projection in verified_by_id.items():
+        expected_receipt = {
+            "provider_receipt_id": projection["provider_receipt_id"],
+            "request_body_digest": projection["request_body_digest"],
+            "client_principal_id": projection["client_principal_id"],
+            "operation_id": projection["operation_id"],
+            "action_id": projection["action_id"],
+            "effect_id": projection["effect_id"],
+            "state_digest": projection["state_digest"],
+            "output_digest": projection["output_digest"],
+            "status": projection["status"],
+            "issued_at_unix_ms": projection["receipt_issued_at_unix_ms"],
+            "expires_at_unix_ms": projection["receipt_expires_at_unix_ms"],
+        }
+        for index, payload in enumerate(verified_evidence):
+            receipt_matches = [
+                row for row in payload["receipts"] if row == expected_receipt
+            ]
+            action_matches = [
+                row
+                for row in payload["actions"]
+                if row.get("provider_receipt_id") == projection["provider_receipt_id"]
+                and row.get("request_body_digest") == projection["request_body_digest"]
+                and row.get("client_principal_id")
+                == projection["client_principal_id"]
+                and row.get("tenant_id") == projection["tenant_id"]
+                and row.get("agent_id") == projection["agent_id"]
+                and row.get("run_id") == projection["run_id"]
+                and row.get("action_id") == projection["action_id"]
+                and row.get("effect_id") == projection["effect_id"]
+                and row.get("state_digest") == projection["state_digest"]
+                and row.get("result") == projection["status"]
+            ]
+            if len(receipt_matches) != 1 or len(action_matches) != 1:
+                failures.append(
+                    f"{prefix}_provider_evidence_receipt_chain_mismatch:"
+                    f"{expectation_id}:{index}"
+                )
+    return failures
+
+
+def retained_projection(scenario: dict, expectation_id: str) -> dict:
+    projections = scenario.get("private_v3_outputs", [])
+    matches = [
+        projection
+        for projection in projections
+        if isinstance(projection, dict)
+        and projection.get("expectation_id") == expectation_id
+    ]
+    return matches[0] if len(matches) == 1 else {}
+
+
+def validate_exact_private_v3_output(
+    value: dict,
+    projection: dict,
+    expectation: dict,
+    trusted_public_key_path: Path,
+    failure: str,
+) -> list[str]:
+    try:
+        verified = project_private_v3_output(
+            value,
+            expectation=expectation,
+            public_key_path=trusted_public_key_path,
+            now_ms=projection.get("verified_at_unix_ms"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate reports a bounded verifier failure
+        return [failure]
+    return [] if verified == projection else [failure]
+
+
 S1_REQUIRED_EVENTS = {
     "tick.started",
     "percepts.received",
@@ -208,6 +393,7 @@ S6_REQUIRED_OPERATIONS = {
 }
 S6_REQUIRED_NEGATIVES = {
     "forbidden_low_level_actions_rejected",
+    "physical_reserved_node_param_rejected",
     "geofence_breach_denied_before_adapter",
     "low_battery_forces_return_to_base_or_intervention",
     "expired_policy_cache_denies_high_risk_offline",
@@ -243,6 +429,7 @@ S6_REQUIRED_EVENTS = {
     "trace.sync.failed",
 }
 S6_REQUIRED_SIMULATED_ACTION_LABELS = {
+    "physical_reserved_node_param_rejected": 0,
     "read_battery_policy_warmup": 1,
     "inspect_zone_from_typed_cloud_proposal": 1,
     "move_to_waypoint_from_typed_cloud_proposal": 1,
@@ -2376,18 +2563,29 @@ def validate_s5_approval_remediation(
     return failures
 
 
-def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def load_s5_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S5"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S5"),
+            trusted_public_key_path,
+            "s5",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
         "trace-export.jsonl",
         "approval-flow.json",
+        "internal-artifact-report.json",
         "policy-bundle-report.json",
         "circuit-breaker-report.json",
         "kill-switch-report.json",
@@ -2452,6 +2650,22 @@ def load_s5_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if positive.get(key) is not True:
             failures.append(f"s5_positive_check_missing:{key}")
     approval_flow = read_json(artifact_dir / "approval-flow.json")
+    internal_artifact_report = read_json(
+        artifact_dir / "internal-artifact-report.json"
+    )
+    for expectation_id, value in {
+        "internal_artifact": internal_artifact_report.get("outcome", {}),
+        "approved_publish": approval_flow.get("approved_exact_action_retry", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S5", expectation_id),
+                trusted_public_key_path,
+                f"s5_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     failures.extend(validate_s5_approval_remediation(approval_flow, api_rows))
     grant_evidence = approval_flow.get("grant", {}).get("evidence", {})
     request_approval = approval_flow.get("request", {})
@@ -2590,6 +2804,24 @@ def validate_s6_physical_approval_binding(
         f"splendor.daemon.approval_receipt.v2:instance:{instance_id}:run:{run_id}"
     )
 
+    def action_binding(request: dict) -> dict:
+        return {
+            key: request.get(key)
+            for key in (
+                "action_id",
+                "run_id",
+                "tenant_id",
+                "agent_id",
+                "action",
+                "adapter",
+                "quota_usage",
+                "satisfied_preconditions",
+                "requested_at",
+                "safety_context",
+                "operator_intervention_evidence",
+            )
+        }
+
     submit_rows = [
         (index, row)
         for index, row in operation_rows(api_rows, "submitWorkOrder")
@@ -2684,6 +2916,7 @@ def validate_s6_physical_approval_binding(
         if indexes != sorted(indexes):
             failures.append("s6_physical_approval_api_order_invalid")
         closed = artifact.get("closed_schema", {})
+        reserved_node = closed.get("reserved_node_action_param", {})
         if (
             coordinate_row.get("status") != 422
             or unknown_row.get("status") != 422
@@ -2691,12 +2924,17 @@ def validate_s6_physical_approval_binding(
             != closed.get("physical_action_resource_coordinate", {}).get("body")
             or unknown_row.get("response")
             != closed.get("unknown_authority_field", {}).get("body")
+            or reserved_node.get("status") != 200
+            or reserved_node.get("body", {}).get("status") != "Failed"
+            or "acceptance_operation_reserved_field"
+            not in str(reserved_node.get("body", {}).get("error", ""))
             or closed.get("simulator_unchanged") is not True
         ):
             failures.append("s6_physical_action_transport_schema_not_closed")
         challenge = artifact.get("challenge", {})
         challenge_body = challenge_row.get("response", {})
         exact_challenge = challenge_body.get("approval_challenge", {})
+        challenge_request = challenge_row.get("request", {})
         if (
             challenge_row.get("status") != 200
             or challenge_body.get("status") != "NeedsApproval"
@@ -2712,9 +2950,14 @@ def validate_s6_physical_approval_binding(
             or exact_challenge.get("authority_decision_digest")
             != challenge.get("authority_decision_digest")
             or exact_challenge.get("receipt_audience") != expected_audience
-            or challenge.get("caller_action_param_node_id") != node_b
+            or challenge.get("caller_action_param_node_id") is not None
             or challenge.get("caller_param_did_not_override_server_coordinate")
             is not True
+            or action_binding(challenge_request)
+            != action_binding(challenge.get("request", {}))
+            or challenge_request.get("action", {}).get("name") != "capture_image"
+            or challenge_request.get("action", {}).get("params")
+            != {"physical_action": True}
             or challenge.get("simulator_counter_before")
             != challenge.get("simulator_counter_after")
         ):
@@ -2761,11 +3004,25 @@ def validate_s6_physical_approval_binding(
             failures.append("s6_wrong_node_retry_not_preclaim_rejected")
         execution = artifact.get("exact_node_execution", {})
         execution_response = exact_row.get("response", {})
+        execution_output = execution_response.get("output", {})
+        execution_result = execution_output.get("result", {})
+        execution_request = exact_row.get("request", {})
         if (
             exact_row.get("status") != 200
             or execution_response != execution.get("response")
+            or action_binding(execution_request)
+            != action_binding(execution.get("request", {}))
+            or action_binding(execution_request) != action_binding(challenge_request)
+            or execution_request.get("action", {}).get("params")
+            != {"physical_action": True}
             or execution_response.get("status") != "Executed"
-            or execution_response.get("output", {}).get("execution") != 1
+            or execution_output.get("operation_id") != "device-sim/capture_image"
+            or execution_output.get("proof_type") != "physical_image"
+            or execution_result.get("coordinate")
+            != {"resource_kind": "physical_node", "node_id": node_a}
+            or type(execution_result.get("images_captured")) is not int
+            or execution_result.get("images_captured", 0) <= 0
+            or not isinstance(execution_output.get("provider_receipt"), dict)
             or execution_response.get("verification", {})
             .get("artifacts", {})
             .get("safety", {})
@@ -2832,13 +3089,23 @@ def validate_s6_physical_approval_binding(
     return failures
 
 
-def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def load_s6_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S6"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S6"),
+            trusted_public_key_path,
+            "s6",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
@@ -2888,9 +3155,38 @@ def load_s6_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if negatives.get(case, {}).get("passed") is not True:
             failures.append(f"s6_negative_case_not_asserted:{case}")
     api_rows = read_jsonl(artifact_dir / "api-traffic.ndjson")
+    physical_approval = read_json(
+        artifact_dir / "physical-approval-node-binding.json"
+    )
+    safety_evidence = read_json(artifact_dir / "device-safety-evidence.json")
+    operator_intervention = read_json(artifact_dir / "operator-intervention.json")
+    safe_actions = safety_evidence.get("safe_actions", {})
+    exact_outputs = {
+        "approved_capture": physical_approval.get("exact_node_execution", {}).get(
+            "response", {}
+        ),
+        "read_battery": safe_actions.get("read_battery", {}),
+        "inspect_zone": safe_actions.get("inspect_zone", {}),
+        "move_to_waypoint": safe_actions.get("move_to_waypoint", {}),
+        "capture_image": safe_actions.get("capture_image", {}),
+        "read_sensor_summary": safe_actions.get("offline_sensor", {}),
+        "return_to_base": safe_actions.get("return_to_base", {}),
+        "upload_trace_summary": safe_actions.get("upload_trace_summary", {}),
+        "operator_capture": operator_intervention.get("granted_capture", {}),
+    }
+    for expectation_id, value in exact_outputs.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S6", expectation_id),
+                trusted_public_key_path,
+                f"s6_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     failures.extend(
         validate_s6_physical_approval_binding(
-            read_json(artifact_dir / "physical-approval-node-binding.json"),
+            physical_approval,
             read_json(artifact_dir / "manager-approval-auth.json"),
             api_rows,
         )
@@ -3120,13 +3416,23 @@ def validate_s7_manager_approval_auth(
     return failures
 
 
-def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def load_s7_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S7"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S7"),
+            trusted_public_key_path,
+            "s7",
+        )
+    )
     required = [
         "scenario-report.json",
         "api-traffic.ndjson",
@@ -3183,6 +3489,21 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         if raw in trace_text:
             failures.append("s7_trace_export_contains_raw_protected_fixture")
     artifact = read_json(artifact_dir / "artifact-report.json")
+    data_scope_artifact = read_json(artifact_dir / "data-scope-report.json")
+    for expectation_id, value in {
+        "specialist_data_read": data_scope_artifact.get("allowed_data_read", {}),
+        "internal_artifact": artifact.get("internal_artifact", {}),
+        "approved_publish": artifact.get("approved_exact_action_response", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S7", expectation_id),
+                trusted_public_key_path,
+                f"s7_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     internal = artifact.get("internal_artifact_evidence", {})
     if artifact.get("internal_artifact", {}).get("status") != "Executed":
         failures.append("s7_internal_artifact_not_executed")
@@ -3200,15 +3521,23 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     else:
         payload = trace_record_kind_payload(trace_by_id[internal_trace_id])
         action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
-        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
         if trace_record_kind(trace_by_id[internal_trace_id]) != "action.executed" or action.get("name") != "artifact.create_internal":
             failures.append("s7_internal_artifact_trace_not_create_execution")
-        if output.get("artifact_path") != internal.get("artifact_path"):
-            failures.append("s7_internal_artifact_trace_path_mismatch")
-        if output.get("tenant_id") != internal.get("tenant_id"):
-            failures.append("s7_internal_artifact_trace_tenant_mismatch")
-        if output.get("integrity") != internal.get("integrity"):
-            failures.append("s7_internal_artifact_trace_integrity_mismatch")
+        try:
+            trace_projection = verify_retained_private_v3_projection(
+                internal.get("trace_private_v3_projection", {}),
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation_for("UC-E2E-S7", "internal_artifact"),
+            )
+        except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+            failures.append("s7_internal_artifact_trace_projection_invalid")
+        else:
+            if trace_projection.get("resource_id") != internal.get("artifact_path"):
+                failures.append("s7_internal_artifact_trace_path_mismatch")
+            if trace_projection.get("tenant_id") != internal.get("tenant_id"):
+                failures.append("s7_internal_artifact_trace_tenant_mismatch")
+            if trace_projection.get("state_digest") != internal.get("integrity"):
+                failures.append("s7_internal_artifact_trace_integrity_mismatch")
     if internal.get("outcome_action_id") and internal.get("outcome_action_id") != internal.get("action_id"):
         failures.append("s7_internal_artifact_outcome_action_mismatch")
     if internal.get("outcome_artifact_path") and internal.get("outcome_artifact_path") != internal.get("artifact_path"):
@@ -3388,25 +3717,28 @@ def load_s7_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     else:
         payload = trace_record_kind_payload(trace_by_id[publish_trace_id])
         action = payload.get("action", {}) if isinstance(payload.get("action"), dict) else {}
-        params = action.get("params", {}) if isinstance(action.get("params"), dict) else {}
-        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
         if trace_record_kind(trace_by_id[publish_trace_id]) != "action.executed" or action.get("name") != "artifact.publish_external":
             failures.append("s7_approved_publish_trace_not_publish_execution")
-        trace_publish_path = output.get("publish_ref") or output.get("artifact_path") or params.get("publish_ref")
-        if trace_publish_path != publish_evidence.get("artifact_path"):
-            failures.append("s7_approved_publish_trace_path_mismatch")
-        trace_tenant_id = output.get("tenant_id")
-        if not trace_tenant_id and isinstance(trace_publish_path, str) and trace_publish_path.startswith("artifact://"):
-            trace_tenant_id = trace_publish_path.removeprefix("artifact://").split("/", 1)[0]
-        if trace_tenant_id != publish_evidence.get("tenant_id"):
-            failures.append("s7_approved_publish_trace_tenant_mismatch")
-        if output.get("integrity") != publish_evidence.get("integrity"):
-            failures.append("s7_approved_publish_trace_integrity_mismatch")
+        try:
+            trace_projection = verify_retained_private_v3_projection(
+                publish_evidence.get("trace_private_v3_projection", {}),
+                trusted_public_key_path=trusted_public_key_path,
+                expectation=expectation_for("UC-E2E-S7", "approved_publish"),
+            )
+        except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+            failures.append("s7_approved_publish_trace_projection_invalid")
+        else:
+            if trace_projection.get("resource_id") != publish_evidence.get("artifact_path"):
+                failures.append("s7_approved_publish_trace_path_mismatch")
+            if trace_projection.get("tenant_id") != publish_evidence.get("tenant_id"):
+                failures.append("s7_approved_publish_trace_tenant_mismatch")
+            if trace_projection.get("state_digest") != publish_evidence.get("integrity"):
+                failures.append("s7_approved_publish_trace_integrity_mismatch")
     if artifact.get("collision", {}).get("status") != "Denied":
         failures.append("s7_artifact_collision_not_denied")
     if artifact.get("specialist_publish_denial", {}).get("status") != "Denied":
         failures.append("s7_specialist_publish_not_denied")
-    data_scope = read_json(artifact_dir / "data-scope-report.json")
+    data_scope = data_scope_artifact
     if data_scope.get("tenant_b_denial", {}).get("status") != "Denied":
         failures.append("s7_tenant_b_data_ref_not_denied")
     if data_scope.get("manager_permission_denial", {}).get("status") != 403:
@@ -4361,7 +4693,10 @@ def validate_s10_manager_approval_auth(
 
 
 def validate_s10_approval_exact_retry(
-    artifact: dict, api_rows: list[dict], trace_records: list[dict]
+    artifact: dict,
+    api_rows: list[dict],
+    trace_records: list[dict],
+    trusted_public_key_path: Path,
 ) -> list[str]:
     failures: list[str] = []
     needs_approval = artifact.get("publish_needs_approval", {})
@@ -4402,6 +4737,17 @@ def validate_s10_approval_exact_retry(
     run_id = challenge.get("run_id")
     action_id = challenge.get("action_id")
     action_name = challenge.get("action_name")
+    try:
+        approved_projection = verify_retained_private_v3_projection(
+            artifact.get("approved_publish_evidence", {}).get(
+                "private_v3_projection", {}
+            ),
+            trusted_public_key_path=trusted_public_key_path,
+            expectation=expectation_for("UC-E2E-S10", "approved_publish"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+        approved_projection = {}
+        failures.append("s10_approved_publish_projection_invalid")
     work_order_id = artifact.get("publish_work_order_id")
     target_instance_id = artifact.get("publish_manager_dispatch", {}).get(
         "selected_instance_id"
@@ -4617,7 +4963,11 @@ def validate_s10_approval_exact_retry(
         and retry_response.get("error") is None
         and verification.get("allowed") is True
         and retry_response.get("post_verification", {}).get("allowed") is True
-        and retry_response.get("output", {}).get("execution") == 1
+        and approved_projection.get("operation_id")
+        == "artifact-store/artifact.publish_external"
+        and approved_projection.get("action_id") == action_id
+        and approved_projection.get("resource_id")
+        == proposal_request.get("action", {}).get("params", {}).get("publish_ref")
         and obligation.get("authority_obligation_status") == "satisfied"
         and obligation.get("decision_id") == challenge.get("authority_decision_id")
         and obligation.get("authority_decision_digest")
@@ -4701,15 +5051,26 @@ def validate_s10_approval_exact_retry(
         and trace_record_kind(record) == "action.executed"
         and trace_record_action_name(record) == action_name
     ]
+    trace_projection = {}
+    try:
+        trace_projection = verify_retained_private_v3_projection(
+            artifact.get("approved_publish_evidence", {}).get(
+                "trace_private_v3_projection", {}
+            ),
+            trusted_public_key_path=trusted_public_key_path,
+            expectation=expectation_for("UC-E2E-S10", "approved_publish"),
+        )
+    except Exception:  # noqa: BLE001 - aggregate records a bounded failure
+        failures.append("s10_approved_publish_trace_projection_invalid")
     if (
         len(execution_records) != 1
         or trace_record_kind_payload(execution_records[0]).get("action")
         != proposal_request.get("action")
-        or execution_records
-        and trace_record_kind_payload(execution_records[0])
-        .get("outcome", {})
-        .get("execution")
-        != 1
+        or trace_projection.get("operation_id")
+        != "artifact-store/artifact.publish_external"
+        or trace_projection.get("action_id") != action_id
+        or trace_projection.get("resource_id")
+        != proposal_request.get("action", {}).get("params", {}).get("publish_ref")
     ):
         failures.append("s10_approved_publish_execution_trace_count_not_one")
 
@@ -5144,13 +5505,23 @@ def validate_s10_trace_sync_evidence(trace_sync: dict) -> list[str]:
     return failures
 
 
-def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
+def load_s10_scenario(
+    report_dir: Path, trusted_public_key_path: Path
+) -> tuple[dict | None, list[str]]:
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S10"
     scenario_path = artifact_dir / "scenario-report.json"
     if not scenario_path.exists():
         return None, []
     scenario = read_json(scenario_path)
     failures: list[str] = []
+    failures.extend(
+        validate_private_v3_scenario_evidence(
+            scenario,
+            expectations_for("UC-E2E-S10"),
+            trusted_public_key_path,
+            "s10",
+        )
+    )
     required = [
         "scenario-report.json",
         "human-summary.md",
@@ -5324,6 +5695,19 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
         )
     )
     journey = read_json(artifact_dir / "journey-report.json")
+    for expectation_id, value in {
+        "orchestrator_data_read": journey.get("data_analysis", {}),
+        "specialist_data_read": journey.get("specialist_data", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     if journey.get("data_analysis", {}).get("status") != "Executed":
         failures.append("s10_journey_data_analysis_not_executed")
     message_api = read_json(artifact_dir / "message-api-report.json")
@@ -5349,6 +5733,19 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if message_api.get("causal_graph", {}).get("node_count", 0) < 2:
         failures.append("s10_message_causal_graph_missing_nodes")
     artifact = read_json(artifact_dir / "artifact-publication-report.json")
+    for expectation_id, value in {
+        "internal_artifact": artifact.get("internal_artifact", {}),
+        "approved_publish": artifact.get("approved_publish", {}),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     if artifact.get("publish_needs_approval", {}).get("status") != "NeedsApproval":
         failures.append("s10_publish_did_not_pause_for_approval")
     if artifact.get("approved_publish", {}).get("status") != "Executed" or artifact.get("publish_execution_count_for_positive_run") != 1:
@@ -5356,7 +5753,9 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if artifact.get("internal_run_id") == artifact.get("publish_run_id"):
         failures.append("s10_publish_artifact_runs_not_split")
     failures.extend(
-        validate_s10_approval_exact_retry(artifact, api_rows, trace_records)
+        validate_s10_approval_exact_retry(
+            artifact, api_rows, trace_records, trusted_public_key_path
+        )
     )
     failures.extend(validate_s10_active_raw_rejection(artifact, api_rows))
     failures.extend(
@@ -5381,6 +5780,24 @@ def load_s10_scenario(report_dir: Path) -> tuple[dict | None, list[str]]:
     if cloud.get("publish_denial", {}).get("status") != "Denied" or cloud.get("device_direct_denial", {}).get("status") != "Denied":
         failures.append("s10_cloud_helper_direct_authority_not_denied")
     edge = read_json(artifact_dir / "edge-inspection-report.json")
+    for expectation_id, value in {
+        "inspect_zone": edge.get("inspect_zone", {}),
+        "move_to_waypoint": edge.get("move_to_waypoint", {}),
+        "read_sensor_summary": edge.get("offline_sensor", {}),
+        "upload_trace_summary": edge.get("upload_summary", {}),
+        "operator_capture": edge.get("operator_intervention", {}).get(
+            "capture", {}
+        ),
+    }.items():
+        failures.extend(
+            validate_exact_private_v3_output(
+                value,
+                retained_projection(scenario, expectation_id),
+                expectation_for("UC-E2E-S10", expectation_id),
+                trusted_public_key_path,
+                f"s10_exact_private_v3_output_invalid:{expectation_id}",
+            )
+        )
     simulator_evidence = edge.get("simulator_evidence", [])
     for item in simulator_evidence:
         if item.get("total_delta") != item.get("expected_sim_delta"):
@@ -5441,10 +5858,12 @@ def main() -> int:
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--mode", required=True)
     parser.add_argument("--compose-file", required=True)
+    parser.add_argument("--trusted-provider-public-key", required=True)
     args = parser.parse_args()
 
     root = Path(args.root)
     report_dir = Path(args.report_dir)
+    trusted_public_key_path = Path(args.trusted_provider_public_key)
     artifact_dir = report_dir / "artifacts" / "UC-E2E-S0"
     contract = read_json(report_dir / "contract-status.json")
     anti = read_json(report_dir / "anti-drift-results.json")
@@ -5516,12 +5935,20 @@ def main() -> int:
     s2_scenario, s2_failures = load_s2_scenario(report_dir)
     s3_scenario, s3_failures = load_s3_scenario(report_dir)
     s4_scenario, s4_failures = load_s4_scenario(report_dir)
-    s5_scenario, s5_failures = load_s5_scenario(report_dir)
-    s6_scenario, s6_failures = load_s6_scenario(report_dir)
-    s7_scenario, s7_failures = load_s7_scenario(report_dir)
+    s5_scenario, s5_failures = load_s5_scenario(
+        report_dir, trusted_public_key_path
+    )
+    s6_scenario, s6_failures = load_s6_scenario(
+        report_dir, trusted_public_key_path
+    )
+    s7_scenario, s7_failures = load_s7_scenario(
+        report_dir, trusted_public_key_path
+    )
     s8_scenario, s8_failures = load_s8_scenario(report_dir)
     s9_scenario, s9_failures = load_s9_scenario(report_dir)
-    s10_scenario, s10_failures = load_s10_scenario(report_dir)
+    s10_scenario, s10_failures = load_s10_scenario(
+        report_dir, trusted_public_key_path
+    )
     active_ids: set[str] = set()
     if args.scenario in {"UC-E2E-S1", "UC-E2E-S8", "UC-E2E-S9", "UC-E2E-S10"} or args.mode == "all":
         active_ids.add("UC-E2E-S1")

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fixtures"))
+from acceptance_provider_evidence import read_provider_evidence  # noqa: E402
 from resident_http import request_json_no_redirect  # noqa: E402
 
 FLEET_ID = "00000000-0000-4000-8000-000000000104"
@@ -27,6 +28,11 @@ HELPER_AGENT_ID = "33333333-3333-4333-8333-333333333333"
 RUN_ID = "44444444-4444-4444-8444-444444449900"
 QUOTA_RUN_ID = "44444444-4444-4444-8444-444444449901"
 ADAPTER_FAIL_RUN_ID = "44444444-4444-4444-8444-444444449902"
+ACTION_PROVIDER_ADAPTER = "acceptance-fixture"
+S9_STANDALONE_READ_IDEMPOTENCY_KEY = "s9-read-once"
+S9_BOUNDED_RETRY_IDEMPOTENCY_KEY = "s9-bounded-retry-read-once"
+S9_BOUNDED_RETRY_MAX_ATTEMPTS = 2
+S9_BOUNDED_RETRY_ATTEMPTS = (1, 2, 3)
 VERIFIER_RUN_ID = "44444444-4444-4444-8444-444444449903"
 CB_RACE_RUN_ID = "44444444-4444-4444-8444-444444449904"
 KILL_RACE_RUN_ID = "44444444-4444-4444-8444-444444449905"
@@ -62,6 +68,11 @@ REQUIRED_TRACE_EVENTS = {
     "run.paused",
     "run.denied",
     "run.cancelled",
+}
+
+RETIRED_ADAPTER_AUTHORITY_SCHEMAS = {
+    "splendor.adapter_failure.v1",
+    "splendor.adapter_failure_evidence.v1",
 }
 
 
@@ -119,6 +130,65 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
         headers,
         context,
         timeout=20,
+    )
+
+
+def provider_counters(base_url: str) -> dict[str, Any]:
+    return read_provider_evidence(base_url)
+
+
+def contains_retired_adapter_authority_schema(value: object) -> bool:
+    if isinstance(value, str):
+        return value in RETIRED_ADAPTER_AUTHORITY_SCHEMAS
+    if isinstance(value, dict):
+        return any(
+            contains_retired_adapter_authority_schema(key)
+            or contains_retired_adapter_authority_schema(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(contains_retired_adapter_authority_schema(item) for item in value)
+    return False
+
+
+def conservative_adapter_failure_evidence(
+    outcome: dict[str, Any],
+    run_before: dict[str, Any],
+    run_after: dict[str, Any],
+    provider_before: dict[str, Any],
+    provider_after: dict[str, Any],
+    submission_count: int,
+) -> bool:
+    """Checks public evidence without trusting adapter-controlled failure prose."""
+    action_id = outcome.get("action_id")
+    verification = outcome.get("verification", {})
+    artifacts = verification.get("artifacts", {}) if isinstance(verification, dict) else {}
+    executions_before = run_before.get("adapter_executions")
+    executions_after = run_after.get("adapter_executions")
+    provider_entries = [
+        entry
+        for entry in provider_after.get("actions", [])
+        if entry.get("action_id") == action_id
+    ]
+    return (
+        outcome.get("status") == "Failed"
+        and outcome.get("error") == "adapter failed"
+        and outcome.get("output") is None
+        and outcome.get("post_verification") is None
+        and isinstance(artifacts, dict)
+        and "adapter_failure" not in artifacts
+        and not contains_retired_adapter_authority_schema(artifacts)
+        and "splendor.adapter_failure.v1" not in str(outcome)
+        and type(executions_before) is int
+        and type(executions_after) is int
+        and executions_before == executions_after
+        and provider_after.get("by_action", {}).get("s9.adapter_failure", 0)
+        - provider_before.get("by_action", {}).get("s9.adapter_failure", 0)
+        == 1
+        and submission_count == 1
+        and len(provider_entries) == 1
+        and provider_entries[0].get("result") == "failed"
+        and provider_entries[0].get("provider_receipt_id") is None
     )
 
 
@@ -232,7 +302,7 @@ def resident_credential_header(auth: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def work_order(run_id: str = RUN_ID, *, quota_max: int = 6, actions: list[str] | None = None, permissions: list[str] | None = None, adapter: str = "daemon.recording", work_order_suffix: str = "", placement_target: str = "resident_cloud_pool", data_locality: str = "cloud") -> dict[str, Any]:
+def work_order(run_id: str = RUN_ID, *, quota_max: int = 6, actions: list[str] | None = None, permissions: list[str] | None = None, adapter: str = ACTION_PROVIDER_ADAPTER, work_order_suffix: str = "", placement_target: str = "resident_cloud_pool", data_locality: str = "cloud") -> dict[str, Any]:
     allowed = actions or ["s9.idempotent_read"]
     return {
         "schema_version": "splendor.work_order.v1",
@@ -285,11 +355,101 @@ def sign_acceptance_work_order(root: Path, artifact_dir: Path, commands: Path, a
 
 
 def action(name: str, params: dict[str, Any] | None = None, permissions: list[str] | None = None, side_effect_class: str = "External") -> dict[str, Any]:
-    return {"name": name, "params": params or {}, "side_effect_class": side_effect_class, "cost_estimate": None, "required_permissions": permissions or [name], "preconditions": [], "postconditions": []}
+    postcondition = {
+        "s9.idempotent_read": "fixture_read",
+        "s9.adapter_failure": "failure_recorded",
+        "s9.unsafe_retry": "failure_recorded",
+        "s9.quota_once": "marker_recorded",
+        "s9.approval_required": "marker_recorded",
+    }.get(name, "marker_recorded")
+    return {"name": name, "params": params or {}, "side_effect_class": side_effect_class, "cost_estimate": None, "required_permissions": permissions or [name], "preconditions": [], "postconditions": [postcondition]}
 
 
 def quota(actions: int = 1, http_requests: int = 0) -> dict[str, int]:
     return {"actions": actions, "action_duration_ms": 0, "filesystem_read_bytes": 0, "filesystem_write_bytes": 0, "network_read_bytes": 0, "network_write_bytes": 0, "http_requests": http_requests}
+
+
+def _s9_idempotent_read_action_request(
+    *,
+    run_id: str,
+    credential: dict[str, Any],
+    requested_at: str,
+    causal_trace_id: str,
+    external_idempotency_key: str,
+    retry_attempt: int,
+    bounded_retry: bool,
+    action_id: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "idempotency_key": external_idempotency_key,
+        "retry_attempt": retry_attempt,
+    }
+    if bounded_retry:
+        params.update({"retryable": True, "max_attempts": S9_BOUNDED_RETRY_MAX_ATTEMPTS})
+    audit_attribution = audit(credential)
+    audit_attribution["requested_at"] = requested_at
+    request = {
+        "run_id": run_id,
+        "tenant_id": TENANT_ID,
+        "agent_id": AGENT_ID,
+        "credential": credential,
+        "audit_attribution": audit_attribution,
+        "causal_trace_id": causal_trace_id,
+        "action": action(
+            "s9.idempotent_read",
+            params,
+            ["s9.idempotent_read"],
+            "ReadOnly",
+        ),
+        "adapter": ACTION_PROVIDER_ADAPTER,
+        "quota_usage": quota(actions=1, http_requests=1),
+        "satisfied_preconditions": [],
+        "requested_at": requested_at,
+    }
+    if action_id is not None:
+        request["action_id"] = action_id
+    return request
+
+
+def s9_standalone_success_action_request(
+    credential: dict[str, Any],
+    *,
+    requested_at: str,
+    causal_trace_id: str,
+    action_id: str | None = None,
+) -> dict[str, Any]:
+    return _s9_idempotent_read_action_request(
+        run_id=RUN_ID,
+        credential=credential,
+        requested_at=requested_at,
+        causal_trace_id=causal_trace_id,
+        external_idempotency_key=S9_STANDALONE_READ_IDEMPOTENCY_KEY,
+        retry_attempt=1,
+        bounded_retry=False,
+        action_id=action_id,
+    )
+
+
+def s9_bounded_retry_action_request(
+    credential: dict[str, Any],
+    *,
+    retry_attempt: int,
+    requested_at: str,
+    causal_trace_id: str,
+    action_id: str,
+) -> dict[str, Any]:
+    if retry_attempt not in S9_BOUNDED_RETRY_ATTEMPTS:
+        raise ValueError("S9 bounded retry attempt is outside the scenario sequence")
+    return _s9_idempotent_read_action_request(
+        run_id=RETRY_RUN_ID,
+        credential=credential,
+        requested_at=requested_at,
+        causal_trace_id=causal_trace_id,
+        external_idempotency_key=S9_BOUNDED_RETRY_IDEMPOTENCY_KEY,
+        retry_attempt=retry_attempt,
+        bounded_retry=True,
+        action_id=action_id,
+    )
 
 
 def create_run_payload(run_id: str, envelope: dict[str, Any], *, quota_max: int = 6, policy_actions: list[dict[str, Any]] | None = None, policy_bundle: dict[str, Any] | None = None, approval_policies: list[dict[str, Any]] | None = None, circuit_breakers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -306,7 +466,7 @@ def create_run_payload(run_id: str, envelope: dict[str, Any], *, quota_max: int 
         "allowed_actions": envelope.get("allowed_actions", []),
         "allowed_adapters": envelope.get("allowed_adapters", []),
         "allowed_permissions": envelope.get("allowed_permissions", []),
-        "registered_actions": [{"name": name, "adapter": envelope.get("allowed_adapters", ["daemon.recording"])[0]} for name in envelope.get("allowed_actions", [])],
+        "registered_actions": [{"name": name, "adapter": envelope.get("allowed_adapters", [ACTION_PROVIDER_ADAPTER])[0]} for name in envelope.get("allowed_actions", [])],
         "policy_actions": policy_actions or [],
         "policy_bundle_required": policy_bundle is not None,
         "policy_bundle": policy_bundle,
@@ -326,7 +486,7 @@ def approval_policy(action_name: str, permission: str, *, expires_minutes: int =
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "action_name": action_name,
-        "adapter": "daemon.recording",
+        "adapter": ACTION_PROVIDER_ADAPTER,
         "required_permission": permission,
         "side_effect_class": "External",
         "risk_level": "high",
@@ -554,6 +714,7 @@ def main() -> int:
     parser.add_argument("--manager-url", default="http://central-manager:8081")
     parser.add_argument("--vpc-url", default="http://resident-vpc-node:8092")
     parser.add_argument("--cloud-url", default="https://resident-cloud-node:8091")
+    parser.add_argument("--action-provider-url", default="http://acceptance-action-provider:8086")
     parser.add_argument("--resident-auth-dir", default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"))
     parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-root-ca.pem"))
     args = parser.parse_args()
@@ -651,19 +812,46 @@ def main() -> int:
     require_status("submitWorkOrder(message)", call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(manager), "work_order": message_envelope, "expected_audience": "central-manager"}))
     create = require_status("createRun(main)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(RUN_ID, envelope)))
     run_cred = daemon_credential(RUN_ID)
-    success_action = call("submitAction", "POST", args.base_url, "/actions", {"run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": run_cred, "audit_attribution": audit(run_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.idempotent_read", {"idempotency_key": "s9-read-once"}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(actions=1, http_requests=1), "satisfied_preconditions": []})
+    success_action = call(
+        "submitAction",
+        "POST",
+        args.base_url,
+        "/actions",
+        s9_standalone_success_action_request(
+            run_cred,
+            requested_at=utc(0),
+            causal_trace_id=str(uuid.uuid4()),
+        ),
+    )
 
     retry_envelope = sign_work_order(root, artifact_dir, commands, work_order(RETRY_RUN_ID, quota_max=2, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]))
     require_status("createRun(retry)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(RETRY_RUN_ID, retry_envelope, quota_max=2)))
     retry_cred = daemon_credential(RETRY_RUN_ID)
     retry_attempts = []
-    for attempt in [1, 2, 3]:
-        retry_attempts.append(call("submitAction", "POST", args.base_url, "/actions", {"action_id": f"55555555-5555-4555-8555-5555555598{attempt:02d}", "run_id": RETRY_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": retry_cred, "audit_attribution": audit(retry_cred), "causal_trace_id": f"55555555-5555-4555-8555-5555555597{attempt:02d}", "action": action("s9.idempotent_read", {"idempotency_key": "s9-read-once", "retry_attempt": attempt, "retryable": True, "max_attempts": 2}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(actions=1, http_requests=1), "satisfied_preconditions": []}))
+    retry_requested_at = utc(0)
+    for attempt in S9_BOUNDED_RETRY_ATTEMPTS:
+        retry_attempts.append(
+            call(
+                "submitAction",
+                "POST",
+                args.base_url,
+                "/actions",
+                s9_bounded_retry_action_request(
+                    retry_cred,
+                    retry_attempt=attempt,
+                    requested_at=retry_requested_at,
+                    action_id=f"55555555-5555-4555-8555-5555555598{attempt:02d}",
+                    causal_trace_id=f"55555555-5555-4555-8555-5555555597{attempt:02d}",
+                ),
+            )
+        )
     unsafe_envelope = sign_work_order(root, artifact_dir, commands, work_order(UNSAFE_RETRY_RUN_ID, quota_max=2, actions=["s9.unsafe_retry"], permissions=["s9.unsafe_retry"]))
     require_status("createRun(non-idempotent)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(UNSAFE_RETRY_RUN_ID, unsafe_envelope, quota_max=2)))
     unsafe_cred = daemon_credential(UNSAFE_RETRY_RUN_ID)
     unsafe_before = require_status("inspectRun(non-idempotent-before)", call("inspectRun", "GET", args.base_url, f"/runs/{UNSAFE_RETRY_RUN_ID}", headers=credential_header(unsafe_cred)))
-    unsafe_retry = require_status("submitAction(non-idempotent-failure)", call("submitAction", "POST", args.base_url, "/actions", {"action_id": "55555555-5555-4555-8555-555555559899", "run_id": UNSAFE_RETRY_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": unsafe_cred, "audit_attribution": audit(unsafe_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559798", "action": action("s9.unsafe_retry", {"fail_adapter": True, "retry_attempt": 1, "retryable": False, "idempotency_key": None}, ["s9.unsafe_retry"], "External"), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []}))
+    provider_before_unsafe_failure = provider_counters(args.action_provider_url)
+    unsafe_retry = require_status("submitAction(non-idempotent-failure)", call("submitAction", "POST", args.base_url, "/actions", {"action_id": "55555555-5555-4555-8555-555555559899", "run_id": UNSAFE_RETRY_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": unsafe_cred, "audit_attribution": audit(unsafe_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559798", "action": action("s9.unsafe_retry", {"retry_attempt": 1, "retryable": False, "idempotency_key": None}, ["s9.unsafe_retry"], "External"), "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": quota(), "satisfied_preconditions": []}))
+    provider_after_unsafe_failure = provider_counters(args.action_provider_url)
     unsafe_after = require_status("inspectRun(non-idempotent-after)", call("inspectRun", "GET", args.base_url, f"/runs/{UNSAFE_RETRY_RUN_ID}", headers=credential_header(unsafe_cred)))
     duplicate_message = {"message": {"message_id": "55555555-5555-4555-8555-555555559902", "source_agent_id": AGENT_ID, "target_agent_id": HELPER_AGENT_ID, "run_id": RUN_ID, "schema": "splendor.message.proposal_request.v1", "payload": {"request": "idempotent side-effect marker", "mutation_authority": False}, "causal_parent": None, "requires_response": True, "created_at": utc(0)}, "schema_version": "v1", "delivery_status": "pending", "trace_links": {}}
     delivered = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": message_envelope["work_order_id"], "message_envelope": duplicate_message, "source_instance_id": VPC_INSTANCE_ID, "target_instance_id": CLOUD_INSTANCE_ID, "idempotency_key": "s9-side-effect-once", "simulate_failure": None})
@@ -673,14 +861,16 @@ def main() -> int:
     require_status("createRun(adapter-failure)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(ADAPTER_FAIL_RUN_ID, adapter_envelope)))
     adapter_cred = daemon_credential(ADAPTER_FAIL_RUN_ID)
     before_adapter = call("inspectRun", "GET", args.base_url, f"/runs/{ADAPTER_FAIL_RUN_ID}", headers=credential_header(adapter_cred))
-    adapter_failure = call("submitAction", "POST", args.base_url, "/actions", {"run_id": ADAPTER_FAIL_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": adapter_cred, "audit_attribution": audit(adapter_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.adapter_failure", {"fail_adapter": True}, ["s9.adapter_failure"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
+    provider_before_adapter_failure = provider_counters(args.action_provider_url)
+    adapter_failure = call("submitAction", "POST", args.base_url, "/actions", {"run_id": ADAPTER_FAIL_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": adapter_cred, "audit_attribution": audit(adapter_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.adapter_failure", {}, ["s9.adapter_failure"]), "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": quota(), "satisfied_preconditions": []})
+    provider_after_adapter_failure = provider_counters(args.action_provider_url)
     after_adapter = call("inspectRun", "GET", args.base_url, f"/runs/{ADAPTER_FAIL_RUN_ID}", headers=credential_header(adapter_cred))
 
     quota_envelope = sign_work_order(root, artifact_dir, commands, work_order(QUOTA_RUN_ID, quota_max=1, actions=["s9.quota_once"], permissions=["s9.quota_once"]))
     require_status("createRun(quota)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(QUOTA_RUN_ID, quota_envelope, quota_max=1)))
     quota_cred = daemon_credential(QUOTA_RUN_ID)
-    quota_first = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
-    quota_second = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
+    quota_first = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": quota(), "satisfied_preconditions": []})
+    quota_second = call("submitAction", "POST", args.base_url, "/actions", {"run_id": QUOTA_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": quota_cred, "audit_attribution": audit(quota_cred), "causal_trace_id": str(uuid.uuid4()), "action": action("s9.quota_once", {}, ["s9.quota_once"]), "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": quota(), "satisfied_preconditions": []})
 
     stale_placement = call("evaluatePlacement", "POST", args.manager_url, "/fleet/placement/evaluate", {**sec(manager), "work_order_id": STALE_WORK_ORDER_ID, "request": {"target": "customer_vpc", "required_capabilities": ["stale.only"], "data_locality": "vpc", "dedicated_instance": False, "required_runtime_version": None, "max_runtime_ms": 30000, "execution_mode": "live"}})
     failed_message = {**duplicate_message, "message": {**duplicate_message["message"], "message_id": "55555555-5555-4555-8555-555555559904"}}
@@ -691,7 +881,7 @@ def main() -> int:
     deny_action = action("s9.approval_required", {}, ["s9.approval_required"])
     deny_quota = quota()
     deny_preconditions: list[str] = []
-    deny_policy_actions = [{"action_id": deny_action_id, "action": deny_action, "adapter": "daemon.recording", "quota_usage": deny_quota, "satisfied_preconditions": deny_preconditions}]
+    deny_policy_actions = [{"action_id": deny_action_id, "action": deny_action, "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": deny_quota, "satisfied_preconditions": deny_preconditions}]
     require_status("createRun(approval-denial)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(DENY_RUN_ID, deny_envelope, policy_actions=deny_policy_actions, approval_policies=[approval_policy("s9.approval_required", "s9.approval_required")])))
     deny_cred = daemon_credential(DENY_RUN_ID)
     deny_start = require_status("startRun(approval-denial)", call("startRun", "POST", args.base_url, f"/runs/{DENY_RUN_ID}/start", {"credential": deny_cred, "audit_attribution": audit(deny_cred), "reason": "uc_e2e_s9_pending_approval"}))
@@ -699,24 +889,24 @@ def main() -> int:
     if len(deny_outcomes) != 1 or deny_outcomes[0].get("status") != "NeedsApproval":
         raise SystemExit(f"S9 approval-denial action did not enter needs_approval: body={deny_start['body']}")
     approval_challenge = extract_approval_challenge(deny_outcomes[0])
-    if approval_challenge["tenant_id"] != TENANT_ID or approval_challenge["agent_id"] != AGENT_ID or approval_challenge["run_id"] != DENY_RUN_ID or approval_challenge["action_id"] != deny_action_id or approval_challenge["action_name"] != "s9.approval_required" or approval_challenge["adapter"] != "daemon.recording":
+    if approval_challenge["tenant_id"] != TENANT_ID or approval_challenge["agent_id"] != AGENT_ID or approval_challenge["run_id"] != DENY_RUN_ID or approval_challenge["action_id"] != deny_action_id or approval_challenge["action_name"] != "s9.approval_required" or approval_challenge["adapter"] != ACTION_PROVIDER_ADAPTER:
         raise SystemExit("S9 approval challenge does not match the exact pending action")
     approval_request = require_status("requestApproval(denial)", manager_approval_call("requestApproval", "/approvals", {"approval_id": approval_challenge["approval_id"], "tenant_id": approval_challenge["tenant_id"], "agent_id": approval_challenge["agent_id"], "run_id": approval_challenge["run_id"], "action_id": approval_challenge["action_id"], "action_name": approval_challenge["action_name"], "adapter": approval_challenge["adapter"], "policy_id": approval_challenge["policy_id"], "risk_level": approval_challenge["risk_level"], "audience": approval_challenge["receipt_audience"], "expires_at": approval_challenge["expires_at"], "reason": "S9 pending approval branch", "challenge": approval_challenge}))
     approval_denial = require_status("denyApproval", manager_approval_call("denyApproval", f"/approvals/{approval_challenge['approval_id']}/deny", {"reason": "S9 operator denial for fail-closed run"}))
     denial_evidence = approval_denial["body"].get("evidence")
     if not isinstance(denial_evidence, dict):
         raise SystemExit("S9 manager denial did not return raw denial evidence")
-    deny_retry = require_status("submitAction(approval-denial-exact-retry)", call("submitAction", "POST", args.base_url, "/actions", {"action_id": approval_challenge["action_id"], "run_id": approval_challenge["run_id"], "tenant_id": approval_challenge["tenant_id"], "agent_id": approval_challenge["agent_id"], "credential": deny_cred, "audit_attribution": audit(deny_cred), "causal_trace_id": approval_denial["body"].get("trace_event_id"), "action": deny_action, "adapter": "daemon.recording", "quota_usage": deny_quota, "satisfied_preconditions": deny_preconditions, "requested_at": approval_challenge["requested_at"], "approval_evidence": denial_evidence}))
+    deny_retry = require_status("submitAction(approval-denial-exact-retry)", call("submitAction", "POST", args.base_url, "/actions", {"action_id": approval_challenge["action_id"], "run_id": approval_challenge["run_id"], "tenant_id": approval_challenge["tenant_id"], "agent_id": approval_challenge["agent_id"], "credential": deny_cred, "audit_attribution": audit(deny_cred), "causal_trace_id": approval_denial["body"].get("trace_event_id"), "action": deny_action, "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": deny_quota, "satisfied_preconditions": deny_preconditions, "requested_at": approval_challenge["requested_at"], "approval_evidence": denial_evidence}))
     deny_after = require_status("inspectRun(approval-denial-terminal)", call("inspectRun", "GET", args.base_url, f"/runs/{DENY_RUN_ID}", headers=credential_header(deny_cred)))
 
     cb_breaker_id = "55555555-5555-4555-8555-555555559911"
     cb_envelope = sign_work_order(root, artifact_dir, commands, work_order(CB_RACE_RUN_ID, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]))
     require_status("createRun(circuit-breaker)", call("createRun", "POST", args.base_url, "/runs", create_run_payload(CB_RACE_RUN_ID, cb_envelope)))
     cb_cred = daemon_credential(CB_RACE_RUN_ID)
-    cb_created = call("createCircuitBreaker", "POST", args.manager_url, "/governance/circuit-breakers", {**sec(manager), "breaker_id": cb_breaker_id, "tenant_id": TENANT_ID, "adapter": "daemon.recording", "action": "s9.idempotent_read", "reason": "S9 circuit breaker race wins"})
+    cb_created = call("createCircuitBreaker", "POST", args.manager_url, "/governance/circuit-breakers", {**sec(manager), "breaker_id": cb_breaker_id, "tenant_id": TENANT_ID, "adapter": ACTION_PROVIDER_ADAPTER, "action": "s9.idempotent_read", "reason": "S9 circuit breaker race wins"})
     cb_payload = call("readCircuitBreakerSyncPayload", "POST", args.manager_url, f"/governance/circuit-breakers/{cb_breaker_id}/sync-payload", {**sec(manager), "run_id": CB_RACE_RUN_ID, "reason": "S9 manager-propagated breaker"})
     cb_sync = call("syncCircuitBreakers", "POST", args.base_url, f"/runs/{CB_RACE_RUN_ID}/governance/circuit-breakers/sync", {"credential": cb_cred, "audit_attribution": audit(cb_cred), "circuit_breakers": cb_payload["body"].get("circuit_breakers", []), "reason": cb_payload["body"].get("reason")})
-    cb_blocked = call("submitAction", "POST", args.base_url, "/actions", {"run_id": CB_RACE_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": cb_cred, "audit_attribution": audit(cb_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559912", "action": action("s9.idempotent_read", {"idempotency_key": "s9-cb-race"}, ["s9.idempotent_read"], "ReadOnly"), "adapter": "daemon.recording", "quota_usage": quota(), "satisfied_preconditions": []})
+    cb_blocked = call("submitAction", "POST", args.base_url, "/actions", {"run_id": CB_RACE_RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": cb_cred, "audit_attribution": audit(cb_cred), "causal_trace_id": "55555555-5555-4555-8555-555555559912", "action": action("s9.idempotent_read", {"idempotency_key": "s9-cb-race"}, ["s9.idempotent_read"], "ReadOnly"), "adapter": ACTION_PROVIDER_ADAPTER, "quota_usage": quota(), "satisfied_preconditions": []})
 
     kill_envelope = sign_acceptance_work_order(root, artifact_dir, commands, auth_dir, work_order(KILL_RACE_RUN_ID, actions=["s9.idempotent_read"], permissions=["s9.idempotent_read"]), CLOUD_INSTANCE_ID, CLOUD_WORK_ORDER_KEY_ID)
     kill_auth = resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["runs_create"])
@@ -757,9 +947,11 @@ def main() -> int:
     governance_audit = call("exportGovernanceAudit", "POST", args.manager_url, "/governance/audit/export", {**sec(manager), "run_id": RUN_ID})
     message_before = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", message_scope(manager, RUN_ID, HELPER_AGENT_ID))
     replay_before = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
+    provider_before_replay = provider_counters(args.action_provider_url)
     replay_audit_before = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     replay = call("replayRun", "POST", args.base_url, f"/runs/{RUN_ID}/replay", {"credential": run_cred, "audit_attribution": audit(run_cred), "mode": "inspect_only", "side_effects_allowed": False})
     replay_after = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(run_cred))
+    provider_after_replay = provider_counters(args.action_provider_url)
     replay_audit_after = call("auditEvents", "POST", args.manager_url, "/fleet/audit/read", sec(manager))
     message_after = call("getMessage", "POST", args.manager_url, f"/messages/{duplicate_message['message']['message_id']}/read", message_scope(manager, RUN_ID, HELPER_AGENT_ID))
 
@@ -893,9 +1085,27 @@ def main() -> int:
     retry_statuses = [attempt["body"].get("status") for attempt in retry_attempts]
     retry_executed = sum(1 for status in retry_statuses[:2] if status == "Executed")
     retry_third_denied = retry_statuses[2] in {"Denied", "NeedsIntervention"}
-    bounded_retry_counts = {"s9.idempotent_read": retry_executed, "max_attempts": 2, "attempts_submitted": len(retry_attempts), "attempt_statuses": retry_statuses, "third_attempt_status": retry_statuses[2], "enforced_by": "gateway_quota", "quota_consumed_attempts": retry_executed}
+    external_idempotency_identities = {
+        "standalone_success": S9_STANDALONE_READ_IDEMPOTENCY_KEY,
+        "bounded_retry": S9_BOUNDED_RETRY_IDEMPOTENCY_KEY,
+    }
+    bounded_retry_counts = {"s9.idempotent_read": retry_executed, "max_attempts": S9_BOUNDED_RETRY_MAX_ATTEMPTS, "attempts_submitted": len(retry_attempts), "attempt_statuses": retry_statuses, "third_attempt_status": retry_statuses[2], "enforced_by": "gateway_quota", "quota_consumed_attempts": retry_executed, "external_idempotency_key": S9_BOUNDED_RETRY_IDEMPOTENCY_KEY, "fixed_requested_at": retry_requested_at}
     unsafe_submission_count = sum(1 for row in api_rows if row.get("operation_id") == "submitAction" and row.get("request", {}).get("run_id") == UNSAFE_RETRY_RUN_ID)
     unsafe_failure_events = [record for record in unsafe_traces["body"].get("records", []) if trace_kind(record) == "action.failed" and trace_action(record).get("name") == "s9.unsafe_retry"]
+    adapter_submission_count = sum(1 for row in api_rows if row.get("operation_id") == "submitAction" and row.get("request", {}).get("run_id") == ADAPTER_FAIL_RUN_ID)
+    adapter_provider_entries = [
+        entry
+        for entry in provider_after_adapter_failure.get("actions", [])
+        if entry.get("action_id") == adapter_failure["body"].get("action_id")
+    ]
+    adapter_failure_is_conservative = conservative_adapter_failure_evidence(
+        adapter_failure["body"],
+        before_adapter["body"],
+        after_adapter["body"],
+        provider_before_adapter_failure,
+        provider_after_adapter_failure,
+        adapter_submission_count,
+    )
     outcome_trace_events = outcome_trace_failure_cli["events"]
     outcome_trace_effect_count = outcome_trace_events.count("action.executed")
     outcome_trace_stopped = outcome_trace_events.count("tick.started") == 1 and all(event not in outcome_trace_events for event in ["outcome.recorded", "state.committed", "tick.completed"])
@@ -903,7 +1113,7 @@ def main() -> int:
     s4_trace_sync_tamper_rejected = s4_tampered_sync.get("status") == 403 and s4_tampered_sync.get("body", {}).get("code") == "trace_sync_rejected"
     s4_trace_sync_accepted = s4_trace_sync.get("accepted_records", 0) > 0
     negative_cases = [
-        {"case": "adapter_returns_failure_no_fake_success_committed", "passed": adapter_failure["body"].get("status") == "Failed" and before_adapter["body"].get("adapter_executions") == after_adapter["body"].get("adapter_executions"), "reason_codes": ["adapter_failed"]},
+        {"case": "adapter_returns_failure_no_fake_success_committed", "passed": adapter_failure_is_conservative, "reason_codes": ["adapter_failed", "conservative_unknown_adapter_failure"], "evidence": {"public_error": adapter_failure["body"].get("error"), "submission_count": adapter_submission_count, "provider_attempt_delta": provider_after_adapter_failure.get("by_action", {}).get("s9.adapter_failure", 0) - provider_before_adapter_failure.get("by_action", {}).get("s9.adapter_failure", 0), "self_asserted_failure_artifact_present": "adapter_failure" in adapter_failure["body"].get("verification", {}).get("artifacts", {})}},
         {"case": "verifier_unavailable_denies_or_intervenes", "passed": verifier_unavailable_cli["trace_export_exit"] == 0 and verifier_unavailable_cli["http_counter_before"] == verifier_unavailable_cli["http_counter_after"] and bool(event_ids.get("verifier.unavailable")), "reason_codes": ["verifier_unavailable"]},
         {"case": "policy_unavailable_or_expired_denies_high_risk", "passed": s5_policy.get("runtime_expired_policy", {}).get("reason_code") == "policy_expired", "reason_codes": ["policy_expired"]},
         {"case": "trace_write_failure_before_side_effect_blocks_execution", "passed": trace_failure_cli["exit"] != 0 and trace_failure_cli["http_counter_before"] == trace_failure_cli["http_counter_after"] and bool(event_ids.get("trace.write_failed")), "reason_codes": ["trace_write_failed"]},
@@ -912,7 +1122,7 @@ def main() -> int:
         {"case": "remote_message_transport_failure_records_delivery_failure", "passed": remote_failure["body"].get("delivery_status") == "failed" and remote_failure["body"].get("remote_state_mutated") is False and bool(event_ids.get("message.delivery_failed")), "reason_codes": ["message_delivery_failed"]},
         {"case": "node_heartbeat_stale_denies_placement", "passed": stale_placement["body"].get("status") == "rejected", "reason_codes": stale_placement["body"].get("reasons", []) or ["node_stale"]},
         {"case": "quota_exceeded_denies_not_silently_retried", "passed": quota_first["body"].get("status") == "Executed" and quota_second["body"].get("status") in {"Denied", "NeedsIntervention"}, "reason_codes": quota_second["body"].get("verification", {}).get("reasons", []) or ["quota_exceeded"]},
-        {"case": "non_idempotent_adapter_failure_not_automatically_retried", "passed": unsafe_retry["body"].get("status") == "Failed" and unsafe_submission_count == 1 and len(unsafe_failure_events) == 1 and unsafe_before["body"].get("adapter_executions") == unsafe_after["body"].get("adapter_executions"), "reason_codes": ["adapter_failed_no_automatic_retry"]},
+        {"case": "non_idempotent_adapter_failure_not_automatically_retried", "passed": unsafe_retry["body"].get("status") == "Failed" and unsafe_submission_count == 1 and len(unsafe_failure_events) == 1 and unsafe_before["body"].get("adapter_executions") == unsafe_after["body"].get("adapter_executions") and provider_after_unsafe_failure.get("by_action", {}).get("s9.unsafe_retry", 0) - provider_before_unsafe_failure.get("by_action", {}).get("s9.unsafe_retry", 0) == 1, "reason_codes": ["adapter_failed_no_automatic_retry"]},
         {"case": "approval_denial_exact_action_retry_fails_closed_zero_effect", "passed": approval_denial_fail_closed, "reason_codes": ["approval_denied"], "trace_event_ids": {"approval.denied": deny_approval_trace_ids, "action.denied": deny_action_trace_ids}},
         {"case": "circuit_breaker_wins_pending_approval_race", "passed": cb_payload["status"] == 200 and cb_sync["body"].get("accepted") is True and cb_blocked["body"].get("status") == "Denied" and bool(event_ids.get("circuit_breaker.tripped")), "reason_codes": ["circuit_breaker_tripped"]},
         {"case": "kill_switch_wins_resume_race_fail_closed", "passed": kill_resume_race_fail_closed and kill_missing_ack["body"].get("fail_closed") is True, "reason_codes": ["kill_switch_activated", "invalid_run_state"], "evidence": kill_resume_race_evidence},
@@ -930,8 +1140,8 @@ def main() -> int:
     missing_events = sorted(event for event in REQUIRED_TRACE_EVENTS if not event_ids.get(event))
     failures.extend(f"missing_required_trace_event:{event}" for event in missing_events)
 
-    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "manager_audit_events": len(replay_audit_before["body"]), "message_delivery_status": message_before["body"].get("delivery_status"), "message_duplicate": message_before["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": {"adapter": "GET /runs/{run_id}", "message": "POST /messages/{message_id}/read", "audit": "POST /fleet/audit/read", "artifact": "not_used_by_s9"}}
-    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "manager_audit_events": len(replay_audit_after["body"]), "message_delivery_status": message_after["body"].get("delivery_status"), "message_duplicate": message_after["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": before_counts["counter_sources"]}
+    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "provider_calls": provider_before_replay, "manager_audit_events": len(replay_audit_before["body"]), "message_delivery_status": message_before["body"].get("delivery_status"), "message_duplicate": message_before["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": {"adapter": "GET /runs/{run_id}", "provider": "GET /evidence", "message": "POST /messages/{message_id}/read", "audit": "POST /fleet/audit/read", "artifact": "not_used_by_s9"}}
+    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "provider_calls": provider_after_replay, "manager_audit_events": len(replay_audit_after["body"]), "message_delivery_status": message_after["body"].get("delivery_status"), "message_duplicate": message_after["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": before_counts["counter_sources"]}
     replay_report = {
         **replay["body"],
         "mode": "inspect_only",
@@ -940,7 +1150,8 @@ def main() -> int:
         "action_execution_counts_before_replay": before_counts,
         "action_execution_counts_after_replay": after_counts,
         "bounded_retry_counts": bounded_retry_counts,
-        "idempotency_markers": ["s9-read-once", "s9-side-effect-once", "s9-transport-fail"],
+        "external_idempotency_identities": external_idempotency_identities,
+        "idempotency_markers": [*external_idempotency_identities.values(), "s9-side-effect-once", "s9-transport-fail"],
         "public_replay_api": {"before_status": replay_before["status"], "replay_status": replay["status"], "after_status": replay_after["status"]},
         "failure_modes_explained": [item["case"] for item in negative_cases if item.get("passed") is True],
     }
@@ -955,6 +1166,7 @@ def main() -> int:
         "negative_cases": negative_cases,
         "positive_checks": positive_checks,
         "bounded_retry_counts": replay_report["bounded_retry_counts"],
+        "external_idempotency_identities": external_idempotency_identities,
         "idempotency_markers": replay_report["idempotency_markers"],
         "required_event_evidence": event_evidence,
         "manager_audit_events": manager_events,
@@ -994,8 +1206,9 @@ def main() -> int:
         "scenario-report.json": scenario,
         "fault-injection-report.json": {"positive_checks": positive_checks, "negative_cases": negative_cases, "required_trace_event_ids": event_ids, "required_event_evidence": event_evidence, "source_scenarios": scenario["source_scenarios"], "cli_trace_failure": {k: v for k, v in trace_failure_cli.items() if k != "records"}, "cli_outcome_trace_failure": {k: v for k, v in outcome_trace_failure_cli.items() if k != "records"}, "cli_state_failure": {k: v for k, v in state_failure_cli.items() if k != "records"}, "cli_verifier_unavailable": {k: v for k, v in verifier_unavailable_cli.items() if k != "records"}},
         "verifier-unavailable-report.json": {"public_path": "splendorctl run --config + splendorctl trace export", "case": {k: v for k, v in verifier_unavailable_cli.items() if k != "records"}, "denied_action": "http_get", "adapter_counter": {"http_counter_before": verifier_unavailable_cli["http_counter_before"], "http_counter_after": verifier_unavailable_cli["http_counter_after"]}, "required_event_evidence": event_evidence.get("verifier.unavailable", [])},
-        "quota-retry-report.json": {"quota_first": quota_first["body"], "quota_second": quota_second["body"], "retry_attempts": [attempt["body"] for attempt in retry_attempts], "unsafe_retry": unsafe_retry["body"], "bounded_retry_counts": replay_report["bounded_retry_counts"], "retry_policy": {"mode": "explicit_public_retry_policy", "max_attempts": 2, "retryable_action": "s9.idempotent_read", "idempotency_key": "s9-read-once", "enforced_by": "gateway_quota", "non_idempotent_action": "s9.unsafe_retry", "non_idempotent_submissions": unsafe_submission_count, "non_idempotent_failure_events": len(unsafe_failure_events), "automatic_retry_observed": False}},
-        "idempotency-report.json": {"delivered": delivered["body"], "duplicate": duplicate["body"], "markers": replay_report["idempotency_markers"]},
+        "quota-retry-report.json": {"quota_first": quota_first["body"], "quota_second": quota_second["body"], "retry_attempts": [attempt["body"] for attempt in retry_attempts], "unsafe_retry": unsafe_retry["body"], "bounded_retry_counts": replay_report["bounded_retry_counts"], "external_idempotency_identities": external_idempotency_identities, "retry_policy": {"mode": "explicit_public_retry_policy", "max_attempts": S9_BOUNDED_RETRY_MAX_ATTEMPTS, "retryable_action": "s9.idempotent_read", "idempotency_key": S9_BOUNDED_RETRY_IDEMPOTENCY_KEY, "fixed_requested_at": retry_requested_at, "enforced_by": "gateway_quota", "non_idempotent_action": "s9.unsafe_retry", "non_idempotent_submissions": unsafe_submission_count, "non_idempotent_failure_events": len(unsafe_failure_events), "automatic_retry_observed": False}},
+        "action-provider-evidence.json": {"adapter_failure": {"before": provider_before_adapter_failure, "after": provider_after_adapter_failure, "entries": adapter_provider_entries, "outcome": adapter_failure["body"]}, "non_idempotent_failure": {"before": provider_before_unsafe_failure, "after": provider_after_unsafe_failure, "outcome": unsafe_retry["body"]}, "replay": {"before": provider_before_replay, "after": provider_after_replay}},
+        "idempotency-report.json": {"delivered": delivered["body"], "duplicate": duplicate["body"], "external_idempotency_identities": external_idempotency_identities, "markers": replay_report["idempotency_markers"]},
         "failure-matrix.json": {item["case"]: item for item in negative_cases},
         "trace-sync-report.json": {"failed": s4_tampered_sync.get("body", {}), "failed_status": s4_tampered_sync.get("status"), "recovered": {"accepted_records": s4_trace_sync.get("accepted_records", 0), "duplicate_records": s4_trace_sync.get("duplicate_sync", {}).get("duplicate_records", 0)}, "source_scenario": "UC-E2E-S4", "source_artifact": "UC-E2E-S4/trace-sync-report.json", "raw_sync_accepted_by_s4": s4_trace_sync_accepted, "tamper_rejected_by_s4": s4_trace_sync_tamper_rejected, "redacted_records_resynced_by_s9": False, "trace_hashes_rewritten": False},
         "fleet-telemetry.json": {"authority": telemetry_read["body"].get("authority"), "stale_placement": stale_placement["body"], "telemetry": telemetry_read["body"], "source": "S9 evaluation of S4 stale work order and public fleet telemetry", "stale_work_order_id": STALE_WORK_ORDER_ID, "stale_node_id": STALE_NODE_ID},

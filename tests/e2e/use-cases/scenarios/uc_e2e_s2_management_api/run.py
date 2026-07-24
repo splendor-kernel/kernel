@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -14,18 +15,30 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fixtures"))
+from acceptance_provider_evidence import (  # noqa: E402
+    provider_effect_state,
+    read_provider_evidence,
+)
 
-TENANT_ID = "44444444-4444-4444-8444-444444444444"
+
+TENANT_ID = "11111111-1111-4111-8111-111111111111"
 AGENT_ID = "55555555-5555-4555-8555-555555555555"
 RUN_ID = "66666666-6666-4666-8666-666666666666"
 TS_RUN_ID = "77777777-7777-4777-8777-777777777777"
 PY_RUN_ID = "88888888-8888-4888-8888-888888888888"
 CLI_RUN_ID = "99999999-9999-4999-8999-999999999999"
+PROVIDER_FAILURE_RUN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2"
+MISSING_PROVIDER_RUN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3"
 WORK_ORDER_ID = "wo_uc_e2e_s2_management_api"
 SECRET = "splendor-local-work-order-secret"
 KEY_ID = "work-order-local-key"
 ACTION_NAME = "daemon_management_action"
 ADAPTER = "daemon.local"
+PROVIDER_FAILURE_ACTION = "s9.adapter_failure"
+PROVIDER_FAILURE_ADAPTER = "acceptance-fixture"
+MISSING_PROVIDER_ACTION = "missing.provider.action"
+MISSING_PROVIDER_ADAPTER = "missing-provider"
 BASE_SCOPES = [
     "health_read",
     "capabilities_read",
@@ -149,14 +162,22 @@ def sign_work_order(root: Path, artifact_dir: Path, commands: Path, payload: dic
 
 
 def action(name: str = ACTION_NAME) -> dict[str, Any]:
+    if name == PROVIDER_FAILURE_ACTION:
+        params = {}
+        permissions = [name]
+        postconditions = ["failure_recorded"]
+    else:
+        params = {"source": "uc-e2e-s2", "ok": True}
+        permissions = []
+        postconditions = ["marker_recorded"]
     return {
         "name": name,
-        "params": {"source": "uc-e2e-s2", "ok": True},
+        "params": params,
         "side_effect_class": "External",
         "cost_estimate": None,
-        "required_permissions": [],
+        "required_permissions": permissions,
         "preconditions": [],
-        "postconditions": [],
+        "postconditions": postconditions,
     }
 
 
@@ -226,6 +247,7 @@ def event_type(record: dict[str, Any]) -> str:
         "ActionVerificationStarted": "verification.started",
         "ActionVerificationCompleted": "verification.completed",
         "ActionExecuted": "action.executed",
+        "ActionFailed": "action.failed",
         "ActionDenied": "action.denied",
         "OutcomeRecorded": "outcome.recorded",
         "StateCommitted": "state.committed",
@@ -308,6 +330,24 @@ def wait_for_daemon(client: ApiClient, credential: dict[str, Any]) -> dict[str, 
             last = exc
         time.sleep(0.5)
     raise SystemExit(f"daemon did not become ready: {last}")
+
+
+def provider_counters(base_url: str) -> dict[str, Any]:
+    return read_provider_evidence(base_url)
+
+
+def unauthenticated_provider_mutation(base_url: str) -> tuple[int, dict[str, Any]]:
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/actions",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read().decode("utf-8"))
 
 
 def load_ts_client_contract(root: Path) -> dict[str, Any]:
@@ -504,6 +544,7 @@ def main() -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--base-url", default=os.environ.get("SPLENDOR_DAEMON_URL", "http://127.0.0.1:8077"))
+    parser.add_argument("--action-provider-url", default="http://acceptance-action-provider:8086")
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -565,6 +606,34 @@ def main() -> int:
         failures.append("s2_missing_causal_trace_id")
 
     action_cred = caller_credential(["actions_submit"], credential_id="cred_uc_e2e_s2_action")
+    provider_before_unauthenticated = provider_counters(args.action_provider_url)
+    unauthenticated_status, unauthenticated_body = unauthenticated_provider_mutation(
+        args.action_provider_url
+    )
+    provider_after_unauthenticated = provider_counters(args.action_provider_url)
+    unauthenticated_denied = (
+        unauthenticated_status == 401
+        and unauthenticated_body.get("error")
+        == "request_authentication_failed"
+        and provider_after_unauthenticated.get("requests_total")
+        == provider_before_unauthenticated.get("requests_total")
+        and provider_after_unauthenticated.get("effects_applied")
+        == provider_before_unauthenticated.get("effects_applied")
+        and provider_after_unauthenticated.get("authenticated_requests")
+        == provider_before_unauthenticated.get("authenticated_requests")
+    )
+    negative_cases.append(
+        {
+            "case": "direct_unauthenticated_provider_mutation_rejected",
+            "passed": unauthenticated_denied,
+            "status": unauthenticated_status,
+            "before": provider_before_unauthenticated,
+            "after": provider_after_unauthenticated,
+        }
+    )
+    if not unauthenticated_denied:
+        failures.append("s2_provider_mutation_was_not_authenticated")
+    provider_before_action = provider_counters(args.action_provider_url)
     _, action_outcome = client.request(
         "POST",
         "/actions",
@@ -585,7 +654,220 @@ def main() -> int:
     )
     operation_ids.append("submitAction")
     if action_outcome.get("status") != "Executed":
-        failures.append(f"s2_allowed_action_not_executed:{action_outcome.get('status')}")
+        failures.append(
+            f"s2_allowed_action_not_executed:{action_outcome.get('status')}:{action_outcome.get('error')}"
+        )
+    provider_after_action = provider_counters(args.action_provider_url)
+    provider_receipts = provider_after_action.get("receipts", [])
+    provider_receipt = next(
+        (
+            receipt
+            for receipt in provider_receipts
+            if receipt.get("action_id") == action_outcome.get("action_id")
+        ),
+        {},
+    )
+    provider_action_delta = (
+        provider_after_action.get("by_action", {}).get(ACTION_NAME, 0)
+        - provider_before_action.get("by_action", {}).get(ACTION_NAME, 0)
+    )
+    if (
+        provider_action_delta != 1
+        or provider_receipt.get("action_id") != action_outcome.get("action_id")
+        or provider_receipt.get("operation_id") != f"{ADAPTER}/{ACTION_NAME}"
+    ):
+        failures.append("s2_action_provider_receipt_or_call_count_missing")
+
+    failure_work_order = work_order(PROVIDER_FAILURE_RUN_ID, "provider-failure")
+    failure_work_order["allowed_actions"] = [PROVIDER_FAILURE_ACTION]
+    failure_work_order["allowed_adapters"] = [PROVIDER_FAILURE_ADAPTER]
+    failure_work_order["allowed_permissions"] = [PROVIDER_FAILURE_ACTION]
+    failure_envelope = sign_work_order(root, artifact_dir, commands, failure_work_order)
+    failure_create_cred = caller_credential(
+        ["runs_create"], credential_id="cred_uc_e2e_s2_provider_failure_create"
+    )
+    failure_create = create_run_request(
+        failure_envelope,
+        failure_create_cred,
+        PROVIDER_FAILURE_RUN_ID,
+    )
+    failure_create["allowed_actions"] = [PROVIDER_FAILURE_ACTION]
+    failure_create["allowed_adapters"] = [PROVIDER_FAILURE_ADAPTER]
+    failure_create["allowed_permissions"] = [PROVIDER_FAILURE_ACTION]
+    failure_create["registered_actions"] = [
+        {"name": PROVIDER_FAILURE_ACTION, "adapter": PROVIDER_FAILURE_ADAPTER}
+    ]
+    client.request("POST", "/runs", body=failure_create, expected=200)
+    failure_action_cred = caller_credential(
+        ["actions_submit"], credential_id="cred_uc_e2e_s2_provider_failure_action"
+    )
+    provider_before_failure = provider_counters(args.action_provider_url)
+    _, provider_failure = client.request(
+        "POST",
+        "/actions",
+        body={
+            "run_id": PROVIDER_FAILURE_RUN_ID,
+            "tenant_id": TENANT_ID,
+            "agent_id": AGENT_ID,
+            "credential": failure_action_cred,
+            "audit_attribution": audit(failure_action_cred),
+            "causal_trace_id": causal_trace_id,
+            "action": action(PROVIDER_FAILURE_ACTION),
+            "adapter": PROVIDER_FAILURE_ADAPTER,
+            "quota_usage": None,
+            "satisfied_preconditions": [],
+            "approval_evidence": None,
+        },
+        expected=200,
+    )
+    provider_after_failure = provider_counters(args.action_provider_url)
+    failure_read_cred = caller_credential(
+        ["runs_read"], credential_id="cred_uc_e2e_s2_provider_failure_read"
+    )
+    _, failure_inspect = client.request(
+        "GET",
+        f"/runs/{PROVIDER_FAILURE_RUN_ID}",
+        header_credential=failure_read_cred,
+        expected=200,
+    )
+    failure_trace_cred = caller_credential(
+        ["traces_read"], credential_id="cred_uc_e2e_s2_provider_failure_trace"
+    )
+    _, failure_traces = client.request(
+        "GET",
+        f"/runs/{PROVIDER_FAILURE_RUN_ID}/traces?redaction_policy=tenant-default",
+        header_credential=failure_trace_cred,
+        expected=200,
+    )
+    failure_event_types = [event_type(record) for record in failure_traces.get("records", [])]
+    provider_failure_artifacts = provider_failure.get("verification", {}).get(
+        "artifacts", {}
+    )
+    provider_failure_entries = [
+        entry
+        for entry in provider_after_failure.get("actions", [])
+        if entry.get("action_id") == provider_failure.get("action_id")
+    ]
+    provider_failure_valid = (
+        provider_failure.get("status") == "Failed"
+        and provider_failure.get("error") == "adapter failed"
+        and provider_failure.get("output") is None
+        and provider_failure.get("post_verification") is None
+        and isinstance(provider_failure_artifacts, dict)
+        and "adapter_failure" not in provider_failure_artifacts
+        and "splendor.adapter_failure.v1" not in json.dumps(provider_failure)
+        and failure_inspect.get("adapter_executions") == 0
+        and provider_after_failure.get("by_action", {}).get(PROVIDER_FAILURE_ACTION, 0)
+        - provider_before_failure.get("by_action", {}).get(PROVIDER_FAILURE_ACTION, 0)
+        == 1
+        and len(provider_failure_entries) == 1
+        and provider_failure_entries[0].get("result") == "failed"
+        and provider_failure_entries[0].get("provider_receipt_id") is None
+        and "action.failed" in failure_event_types
+        and "action.executed" not in failure_event_types
+    )
+    negative_cases.append(
+        {
+            "case": "provider_failure_is_conservative_without_fake_execution",
+            "passed": provider_failure_valid,
+            "outcome": provider_failure,
+            "provider_calls_before": provider_before_failure,
+            "provider_calls_after": provider_after_failure,
+            "trace_event_types": failure_event_types,
+        }
+    )
+    if not provider_failure_valid:
+        failures.append("s2_provider_failure_not_fail_closed")
+
+    missing_work_order = work_order(MISSING_PROVIDER_RUN_ID, "missing-provider")
+    missing_work_order["allowed_actions"] = [MISSING_PROVIDER_ACTION]
+    missing_work_order["allowed_adapters"] = [MISSING_PROVIDER_ADAPTER]
+    missing_envelope = sign_work_order(root, artifact_dir, commands, missing_work_order)
+    missing_create_cred = caller_credential(
+        ["runs_create"], credential_id="cred_uc_e2e_s2_missing_provider_create"
+    )
+    missing_create = create_run_request(
+        missing_envelope,
+        missing_create_cred,
+        MISSING_PROVIDER_RUN_ID,
+    )
+    missing_create["allowed_actions"] = [MISSING_PROVIDER_ACTION]
+    missing_create["allowed_adapters"] = [MISSING_PROVIDER_ADAPTER]
+    missing_create["registered_actions"] = [
+        {"name": MISSING_PROVIDER_ACTION, "adapter": MISSING_PROVIDER_ADAPTER}
+    ]
+    provider_before_missing = provider_counters(args.action_provider_url)
+    _, missing_provider = client.request("POST", "/runs", body=missing_create, expected=503)
+
+    alternate_action = "missing.provider.action.second"
+    alternate_adapter = "missing-provider-second"
+    alternate_work_order = work_order(
+        MISSING_PROVIDER_RUN_ID, "missing-provider-second"
+    )
+    alternate_work_order["allowed_actions"] = [alternate_action]
+    alternate_work_order["allowed_adapters"] = [alternate_adapter]
+    alternate_envelope = sign_work_order(
+        root, artifact_dir, commands, alternate_work_order
+    )
+    alternate_create = create_run_request(
+        alternate_envelope, missing_create_cred, MISSING_PROVIDER_RUN_ID
+    )
+    alternate_create["idempotency_key"] = missing_create["idempotency_key"]
+    alternate_create["allowed_actions"] = [alternate_action]
+    alternate_create["allowed_adapters"] = [alternate_adapter]
+    alternate_create["registered_actions"] = [
+        {"name": alternate_action, "adapter": alternate_adapter}
+    ]
+    _, missing_provider_retry = client.request(
+        "POST", "/runs", body=alternate_create, expected=503
+    )
+    provider_after_missing = provider_counters(args.action_provider_url)
+
+    missing_read_cred = caller_credential(
+        ["runs_read"], credential_id="cred_uc_e2e_s2_missing_provider_read"
+    )
+    _, missing_inspect = client.request(
+        "GET",
+        f"/runs/{MISSING_PROVIDER_RUN_ID}",
+        header_credential=missing_read_cred,
+        expected=404,
+    )
+    missing_trace_cred = caller_credential(
+        ["traces_read"], credential_id="cred_uc_e2e_s2_missing_provider_trace"
+    )
+    _, missing_traces = client.request(
+        "GET",
+        f"/runs/{MISSING_PROVIDER_RUN_ID}/traces?redaction_policy=tenant-default",
+        header_credential=missing_trace_cred,
+        expected=404,
+    )
+    missing_event_types: list[str] = []
+    missing_provider_valid = (
+        missing_provider.get("code") == "action_adapter_unavailable"
+        and missing_provider.get("details", {}).get("effect_certainty") == "none"
+        and missing_provider.get("details", {}).get("admission_stage")
+        == "before_run_and_idempotency_commit"
+        and missing_provider.get("details", {}).get("run_id") == MISSING_PROVIDER_RUN_ID
+        and missing_provider_retry.get("code") == "action_adapter_unavailable"
+        and missing_provider_retry.get("details", {}).get("adapter") == alternate_adapter
+        and missing_inspect.get("code") == "invalid_run"
+        and missing_traces.get("code") == "invalid_run"
+        and provider_effect_state(provider_before_missing)
+        == provider_effect_state(provider_after_missing)
+    )
+    negative_cases.append(
+        {
+            "case": "missing_provider_rejects_before_run_and_idempotency_commit",
+            "passed": missing_provider_valid,
+            "error": missing_provider,
+            "same_idempotency_key_retry": missing_provider_retry,
+            "provider_calls_before": provider_before_missing,
+            "provider_calls_after": provider_after_missing,
+            "trace_event_types": missing_event_types,
+        }
+    )
+    if not missing_provider_valid:
+        failures.append("s2_missing_provider_not_fail_closed")
     _, after_action_inspect = client.request("GET", f"/runs/{RUN_ID}", header_credential=read_cred, expected=200)
 
     denied_before = after_action_inspect.get("adapter_executions")
@@ -681,6 +963,7 @@ def main() -> int:
     operation_ids.append("exportTraces")
     replay_cred = caller_credential(["replay_create"], credential_id="cred_uc_e2e_s2_replay")
     before_replay_executions = denied_after_inspect.get("adapter_executions")
+    provider_before_replay = provider_counters(args.action_provider_url)
     _, replay = client.request(
         "POST",
         f"/runs/{RUN_ID}/replay",
@@ -689,18 +972,49 @@ def main() -> int:
     )
     operation_ids.append("replayRun")
     _, after_replay = client.request("GET", f"/runs/{RUN_ID}", header_credential=read_cred, expected=200)
+    provider_after_replay = provider_counters(args.action_provider_url)
     replay_report = {
         "mode": replay.get("mode"),
         "side_effects_allowed_default": False,
         "adapter_executions_before": before_replay_executions,
         "adapter_executions_after": after_replay.get("adapter_executions"),
         "adapter_suppressed": before_replay_executions == after_replay.get("adapter_executions"),
+        "provider_calls_before": provider_before_replay,
+        "provider_calls_after": provider_after_replay,
+        "provider_suppressed": provider_effect_state(provider_before_replay)
+        == provider_effect_state(provider_after_replay),
         "event_count": replay.get("event_count"),
         "action_event_count": replay.get("action_event_count"),
     }
     write_json(artifact_dir / "replay-report.json", replay_report)
-    if not replay_report["adapter_suppressed"]:
+    if not replay_report["adapter_suppressed"] or not replay_report["provider_suppressed"]:
         failures.append("s2_replay_executed_adapter")
+
+    provider_evidence = {
+        "schema_version": "splendor.uc_e2e_s2.action_provider_evidence.v1",
+        "before_action": provider_before_action,
+        "after_action": provider_after_action,
+        "action_call_delta": provider_action_delta,
+        "provider_receipt": provider_receipt,
+        "provider_failure": {
+            "before": provider_before_failure,
+            "after": provider_after_failure,
+            "outcome": provider_failure,
+            "run": failure_inspect,
+            "trace_event_types": failure_event_types,
+        },
+        "missing_provider": {
+            "before": provider_before_missing,
+            "after": provider_after_missing,
+            "error": missing_provider,
+            "run": missing_inspect,
+            "traces": missing_traces,
+            "trace_event_types": missing_event_types,
+        },
+        "before_replay": provider_before_replay,
+        "after_replay": provider_after_replay,
+    }
+    write_json(artifact_dir / "action-provider-evidence.json", provider_evidence)
 
     pause_cred = caller_credential(["runs_pause"], credential_id="cred_uc_e2e_s2_pause")
     _, paused = client.request("POST", f"/runs/{RUN_ID}/pause", body=lifecycle(pause_cred, "pause-for-contract"), expected=200)
@@ -874,7 +1188,11 @@ def main() -> int:
     trace_ids = [trace_event_id(record) for record in final_records if trace_event_id(record)]
     action_ids = [
         value
-        for value in [action_outcome.get("action_id"), denied_outcome.get("action_id")]
+        for value in [
+            action_outcome.get("action_id"),
+            denied_outcome.get("action_id"),
+            provider_failure.get("action_id"),
+        ]
         if value
     ]
     scenario = {
@@ -885,12 +1203,12 @@ def main() -> int:
         "positive_evidence": [
             "scoped caller credentials exercised health/version/capabilities/run/percept/state/trace/replay/action endpoints",
             "signed work order created a run without executing side effects",
-            "documented /actions endpoint returned an Executed action through the gateway",
+            "documented /actions endpoint returned an Executed action with a provider-returned fixture record",
             "pause/resume/cancel lifecycle operations emitted daemon audit trace evidence",
             "trace export required redaction policy and returned integrity metadata",
         ],
         "negative_evidence": [case["case"] for case in negative_cases],
-        "replay_evidence": ["inspect_only API replay left adapter execution count unchanged"],
+        "replay_evidence": ["inspect_only API replay left daemon and provider execution counts unchanged"],
         "required_trace_event_ids": event_ids_by_type,
         "api_operations": sorted(set(operation_ids)),
         "negative_cases": negative_cases,
@@ -900,7 +1218,7 @@ def main() -> int:
         "replay_side_effect_suppression": {"required": True, "evidence_present": replay_report["adapter_suppressed"], "side_effects_allowed_default": False},
         "replay_artifacts": [str(artifact_dir / "replay-report.json")],
         "anti_drift_checks": anti_drift["checks"],
-        "run_ids": [RUN_ID, TS_RUN_ID, PY_RUN_ID, CLI_RUN_ID],
+        "run_ids": [RUN_ID, TS_RUN_ID, PY_RUN_ID, CLI_RUN_ID, PROVIDER_FAILURE_RUN_ID, MISSING_PROVIDER_RUN_ID],
         "trace_event_ids": trace_ids,
         "state_node_ids": [state_head.get("state_node_id")],
         "state_hashes": [state_head.get("data_hash")],
@@ -916,6 +1234,7 @@ def main() -> int:
             str(trace_export_path),
             str(artifact_dir / "state-export.json"),
             str(artifact_dir / "replay-report.json"),
+            str(artifact_dir / "action-provider-evidence.json"),
             str(artifact_dir / "audit-report.json"),
             str(artifact_dir / "anti-drift-results.json"),
             str(artifact_dir / "schema-parity.json"),
@@ -926,7 +1245,7 @@ def main() -> int:
         "blocking_failures": all_blockers,
     }
     write_json(artifact_dir / "scenario-report.json", scenario)
-    return 0
+    return 0 if not all_blockers else 1
 
 
 if __name__ == "__main__":

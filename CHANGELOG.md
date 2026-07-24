@@ -131,6 +131,44 @@
   permission operations, fail closed on live expiry/revocation, persist redacted
   authority allow evidence before adapter execution, and expose inspect-only
   replay summaries. Gold evidence remains `not_exercised`.
+- Removed daemon-owned concrete/fake action-provider execution from local and
+  resident production composition. The production daemon binary is adapterless;
+  missing direct, policy, or physical profiles fail with
+  `action_adapter_unavailable` before run/idempotency commit. The daemon library
+  retains only generic trait-object injection for tests and outer process owners.
+  An unpublished `splendor-acceptance-action-host` and dedicated Docker target
+  own the closed fixture adapter composition. Generic adapter failure text is
+  not parsed for retry or effect authority; gateway outcomes redact provider
+  prose and retain the existing non-retryable, effect-uncertain fallback. Exact
+  Cargo package features, target/dependency shape, provider-client ownership,
+  internal edges/cycles, and adapter direction guard the current package graph.
+  Adapterless production selection, outer-host image separation, zero-I/O
+  missing-provider rejection, gateway mediation, and replay suppression are
+  covered by focused tests. Source-wide effect scanning and universal duplicate
+  semantic-owner detection remain future and unimplemented.
+  Resident dispatch is limited to four typed operations, and S9 rejects missing
+  or non-integer execution counters and nested retired authority schemas. The
+  acceptance fixture now uses one strict 18-operation private-v3 manifest,
+  role-separated local/cloud/VPC/edge HMAC request credentials, provider-only
+  Ed25519 receipt signing, signature-before-parse host verification, exact output
+  family and postcondition proof, exact fixture resource scopes, per-principal
+  reserves inside global bounds, and bounded process-epoch idempotency. Signed
+  evidence now binds the reader, request method/path/query/view, nonce, time,
+  audience, provider epoch, and monotonic snapshot sequence; retained scenario
+  reports carry independently verifiable envelopes and compare-only public
+  material; aggregate verification requires a setup-owned trust key, checked-in
+  exact scenario expectations, the exact reader scope, one signing key/provider
+  epoch, unique nonces, and increasing in-report sequences. Live verifier replay
+  state is bounded and process-local, not durable. One canonical output projection
+  verifies S5/S6/S7/S10 and aggregate evidence. The fixture semantic retry now
+  declares a required `retry_attempt` transition, four optional companion-varying
+  fields, and a separate external idempotency identity.
+  Signer execution pins material identity and bounds process lifetime/output.
+  There is no v2 or restart-durable fallback. Stable daemon wire, gateway,
+  trace/state, approval, and replay schemas are unchanged. Native S2 is
+  functional-only and generates local authority after cleaning its runtime tree;
+  it is not role-isolation evidence. Docker scenarios, container isolation, and
+  G00 remain `not_exercised` when Docker is unavailable.
 - Corrected the bounded AUTH-004 approval path so raw `ApprovalEvidence` is
   compatibility/replay data and can never authorize an effect. Approval-required
   outcomes now expose an exact non-authorizing challenge; the local manager can

@@ -2189,17 +2189,20 @@ impl ActionGateway for VerifiedActionGateway {
 
         let adapter_result = match registration.adapter.execute(&action) {
             Ok(result) => result,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(ActionOutcome {
                     action_id: action.action_id,
                     status: ActionStatus::Failed,
                     verification,
                     post_verification: None,
                     output: None,
-                    error: Some(error.to_string()),
+                    // AdapterError::Failed contains provider-controlled human text.
+                    // Keep public outcomes bounded and non-authorizing; the stable
+                    // taxonomy remains unknown/non-retryable/effect-uncertain.
+                    error: Some("adapter failed".to_string()),
                     approval_challenge: None,
                     completed_at: OffsetDateTime::now_utc(),
-                })
+                });
             }
         };
         drop((effect_permit, obligation_effect_permit));

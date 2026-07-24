@@ -122,9 +122,8 @@ The acceptance topology should be deterministic and local-first. It may use fake
 | `resident-cloud-node` | General compute node. | Node/instance identity, remote run execution, trace sync, remote messaging. |
 | `resident-vpc-node` | Data-local node. | Data-local placement, data refs, scoped permissions, artifact creation. |
 | `resident-edge-node` | Edge/physical runtime target. | Offline policy cache, local trace buffer, device profile, safety verifiers. |
-| `device-sim` | Deterministic robot/drone/edge simulator. | High-level physical actions only, safety-state fixtures, no direct actuator authority. |
+| `acceptance-action-provider` | Controlled receipt-bearing provider beyond the acceptance-host adapter boundary. | Data/artifact fixture effects, high-level physical actions only, deterministic failures, receipt/read-only observations, and no direct actuator authority. |
 | `fake-http-service` | Controlled external HTTP endpoint. | HTTP adapter allowlist/denylist, quota, retry, failure outcomes. |
-| `fake-artifact-store` | Controlled artifact sink. | Artifact creation, approval-gated external publish, integrity metadata. |
 | `fake-governance-plane` | External approval/control-plane simulator. | Approval request/grant/deny/expiry/revocation without owning runtime internals. |
 | `fake-telemetry-sink` | Receives telemetry snapshots. | Non-authoritative telemetry, fleet health, trace-sync status. |
 | `toxiproxy` or equivalent fault proxy | Deterministic transport failures and latency. | Remote message failures, trace sync retries, bounded retry behavior. |
@@ -1090,7 +1089,7 @@ Validate that Splendor fails safely under realistic runtime failures: adapter er
 
 ## Use case
 
-The runner injects deterministic failures into fake HTTP, artifact store, message transport, trace sync, state store, policy distribution, and device simulator. The runtime must either complete safely, deny, pause, request intervention, or cancel with traceable evidence. It must never silently continue, retry unboundedly, double-apply side effects, or convert errors into allow.
+The runner injects deterministic failures into fake HTTP, the controlled action provider, message transport, trace sync, state store, and policy distribution. The runtime must either complete safely, deny, pause, request intervention, or cancel with traceable evidence. It must never silently continue, retry unboundedly, double-apply side effects, or convert errors into allow.
 
 ## Components exercised
 
@@ -1179,7 +1178,7 @@ A central manager receives a signed work order for a governed field-intelligence
 
 - a data-local resident node analyzes a scoped fixture dataset;
 - a shared specialist provides a typed analysis response;
-- an edge device simulator performs a bounded inspection under local safety verifiers;
+- a controlled action provider executes one bounded edge inspection under local safety verifiers and returns fixture receipt evidence;
 - a cloud helper proposes, but cannot authorize, a route or publication;
 - the orchestrator creates an internal artifact;
 - external publication requires approval;
@@ -1232,7 +1231,7 @@ All available components in the acceptance topology:
 6. Delegate document/data analysis to shared specialist with scoped authority.
 7. Send remote proposal request to cloud helper.
 8. Send physical inspection request to edge node.
-9. Edge node validates cloud proposal locally, performs bounded high-level inspection through device simulator, buffers traces during a network partition, and syncs after reconnect.
+9. Edge node validates the cloud proposal locally, performs bounded high-level inspection through the explicitly composed `device-sim` adapter and controlled receipt-bearing provider, buffers traces during a network partition, and syncs after reconnect.
 10. Orchestrator collects typed messages, commits state, and creates an internal artifact under an internal-create-only work order.
 11. A separate publish-only VPC run is created with one exact approval-policy action and pauses with a daemon-issued approval challenge. The manager records that exact challenge and issues one authority obligation receipt whose v2 audience binds the server-derived target `InstanceId` and exact `RunId`. The exact challenged action is then retried once through canonical `POST /actions` (`submitAction`; the retained traffic labels this specific evidence row `submitApprovedExactAction`). The retry contains the unchanged action payload, effective adapter, request time, quota, and preconditions; contains no raw approval evidence; executes once; leaves the tick and state head unchanged; and emits `run.resumed` only after `action.executed`. No publish-run lifecycle resume call is allowed. Every manager approval mutation uses a fresh exact-audience, fleet-bound, one-scope bearer and matching non-authoritative request mirrors.
 12. Export state, create a receiver run with a cloud-signed envelope, use that exact admitted envelope for import and resume, prove resident import denies with `state_handoff_proof_unavailable` before mutation, then resume only the receiver's own committed state.

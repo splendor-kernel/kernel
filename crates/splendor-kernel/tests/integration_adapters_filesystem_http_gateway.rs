@@ -396,7 +396,7 @@ fn assert_action_failed_trace(
     run: &AdapterHarnessRun,
     outcome_index: usize,
     action_name: &str,
-    reason: &str,
+    provider_detail: &str,
 ) {
     let action_id = &run.outcome.action_outcomes[outcome_index].action_id;
     assert_verification_completed_allowed(run, action_id, action_name);
@@ -410,19 +410,21 @@ fn assert_action_failed_trace(
     } = &failed.kind
     {
         assert_eq!(action.name, action_name);
-        assert!(
-            error.contains(reason),
-            "error did not contain {reason:?}: {error}"
-        );
+        assert_eq!(error, "adapter failed");
+        assert!(!error.contains(provider_detail));
         assert!(!result.allowed);
         assert!(
             result
                 .reasons
                 .iter()
-                .any(|recorded| recorded.contains(reason)),
-            "failure reasons did not contain {reason:?}: {:?}",
+                .any(|recorded| recorded == "adapter failed"),
+            "failure reasons did not contain the redacted adapter error: {:?}",
             result.reasons
         );
+        assert!(!result
+            .reasons
+            .iter()
+            .any(|recorded| recorded.contains(provider_detail)));
     } else {
         unreachable!("predicate matched a different event kind");
     }

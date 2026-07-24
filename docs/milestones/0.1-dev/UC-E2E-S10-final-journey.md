@@ -8,13 +8,13 @@ Validate the final `0.1-dev` use-case acceptance journey after prior UC-E2E scen
 
 - Adds `tests/e2e/use-cases/scenarios/uc_e2e_s10_final_journey/run.py` as the S10 scenario runner.
 - Runs after S1-S9 when invoked directly and as part of `--all`.
-- Uses public manager, verified-TLS resident daemon, edge-device, device simulator, `splendorctl work-order sign`, contract, trace/state export, telemetry, governance audit, and replay surfaces.
+- Uses public manager, verified-TLS resident daemon, edge-device, the controlled receipt-bearing action provider, `splendorctl work-order sign`, contract, trace/state export, telemetry, governance audit, and replay surfaces.
 - Mints a fresh one-scope, target-instance bearer for every resident request, mirrors only the verified credential/audit projection, and rejects any mutating JTI reuse in fixture evidence. Credentialed resident clients use CA-verified HTTPS with an explicit no-redirect opener; a 3xx is returned as an error response and cannot forward the bearer to another origin or plaintext URL.
 - Mints a separate fresh one-scope, fleet-bound bearer for every manager approval mutation. Its exact manager audience, verified credential/audit mirrors, and one-use JTI are checked before any approval/audit mutation or receipt issuance.
 - Signs each VPC, cloud, and edge work-order envelope with the corresponding acceptance instance key; command/evidence artifacts redact signing secrets and never admit the local-development work-order key.
 - Reuses the canonical S4 node/instance registrations and refreshes both node and instance health without changing immutable identity metadata.
 - Splits internal artifact creation and external publication into separate exact action/adapter/permission profiles. The manager submits and dispatches both signed work orders to the selected VPC resident; the publish-only run has one exact policy action and approval policy, pauses with an exact challenge, then retries that exact action through canonical `POST /actions` with one manager-issued authority obligation receipt. The publish retry does not call the lifecycle resume endpoint. Data-analysis and specialist profiles retain manager dispatch through the canonical `sql.read_fixture` placement capability.
-- Uses the shared `physical.high_level` permission with the bounded action allowlist and `device-sim` adapter instead of per-action physical permissions.
+- Uses the shared `physical.high_level` permission with the bounded action allowlist and the acceptance-host-composed `device-sim` adapter instead of per-action physical permissions. The provider fixture exposes receipt and device observations for scenario assertions; those observations are not kernel authority.
 - Syncs the edge trace buffer through the resident device reconnect boundary. The fixture does not resubmit redacted edge export records or rewrite their integrity hashes; the central manager's rejection of that redacted batch is retained alongside successful central VPC/cloud aggregation.
 - Uses the dedicated one-use `splendor.device.trace_sync` resident scope and
   proves resident payload-tamper and cross-run trace batches are rejected with
@@ -92,7 +92,10 @@ S10 includes independent negative branches for invalid work order, unauthorized 
 - Replay mode is `inspect_only`.
 - `side_effects_allowed_default` is `false`.
 - Unsafe side-effect replay is rejected.
-- Public daemon adapter counters and device simulator counters must not change across replay.
+- Public daemon successful-execution counts and external action-provider evidence must not change across replay.
+- CORR-002A validates the deterministic action-profile helpers without Docker;
+  the S10 container runtime remains `not_exercised` until the scenario command
+  completes in an available Docker environment.
 
 ## Tests and Evidence
 

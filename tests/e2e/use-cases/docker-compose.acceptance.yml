@@ -26,7 +26,9 @@ services:
       SPLENDOR_CLOUD_NODE_URL: https://resident-cloud-node:8091
       SPLENDOR_EDGE_NODE_URL: https://resident-edge-node:8093
       SPLENDOR_HTTP_FIXTURE_URL: http://fake-http-service:8082
-      SPLENDOR_ARTIFACT_FIXTURE_URL: http://fake-artifact-store:8083
+      SPLENDOR_ACTION_PROVIDER_URL: http://acceptance-action-provider:8086
+      SPLENDOR_ACCEPTANCE_EVIDENCE_CREDENTIAL_FILE: /run/splendor-provider-evidence/action-provider-evidence-credential.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: /run/splendor-provider-evidence/receipt-public-key.raw
       SPLENDOR_GOVERNANCE_FIXTURE_URL: http://fake-governance-plane:8084
       SPLENDOR_TELEMETRY_FIXTURE_URL: http://fake-telemetry-sink:8085
       SPLENDOR_E2E_SCENARIO: ${SPLENDOR_E2E_SCENARIO:-UC-E2E-S0}
@@ -35,6 +37,8 @@ services:
       - bash
       - -lc
       - |
+        python3 tests/e2e/use-cases/fixtures/acceptance_provider_evidence.py \
+          --smoke-url "$${SPLENDOR_ACTION_PROVIDER_URL}"
         if [[ "$${SPLENDOR_E2E_MODE_ARG:-scenario}" == "all" ]]; then
           exec bash scripts/e2e/verify-use-case-acceptance.sh --inside-compose --all --reuse-build
         fi
@@ -46,15 +50,15 @@ services:
       - resident-vpc-node
       - resident-edge-node
       - fake-http-service
-      - fake-artifact-store
+      - acceptance-action-provider
       - fake-governance-plane
       - fake-telemetry-sink
-      - device-sim
       - toxiproxy
     network_mode: service:splendor-daemon-local
     volumes:
       - ../../..:/workspace
       - e2e-runner-auth:/run/splendor-auth:ro
+      - e2e-provider-runner-auth:/run/splendor-provider-evidence:ro
 
   resident-auth-fixture:
     profiles: ["setup"]
@@ -68,18 +72,45 @@ services:
       - bash
       - -lc
       - |
+        chown -R root:root \
+          /run/splendor-provider-auth \
+          /run/splendor-provider-runner-auth \
+          /run/splendor-provider-local-auth \
+          /run/splendor-provider-cloud-auth \
+          /run/splendor-provider-vpc-auth \
+          /run/splendor-provider-edge-auth
+        chmod 700 \
+          /run/splendor-provider-auth \
+          /run/splendor-provider-runner-auth \
+          /run/splendor-provider-local-auth \
+          /run/splendor-provider-cloud-auth \
+          /run/splendor-provider-vpc-auth \
+          /run/splendor-provider-edge-auth
         python3 tests/e2e/use-cases/fixtures/resident_auth_fixture.py init \
           --manager-out /run/splendor-manager-auth \
           --runner-out /run/splendor-runner-auth \
           --vpc-out /run/splendor-vpc-auth \
           --cloud-out /run/splendor-cloud-auth \
           --edge-out /run/splendor-edge-auth
+        python3 tests/e2e/use-cases/fixtures/acceptance_provider_auth.py \
+          --provider-out /run/splendor-provider-auth \
+          --runner-out /run/splendor-provider-runner-auth \
+          --local-out /run/splendor-provider-local-auth \
+          --cloud-out /run/splendor-provider-cloud-auth \
+          --vpc-out /run/splendor-provider-vpc-auth \
+          --edge-out /run/splendor-provider-edge-auth
         chown -R splendor:splendor \
           /run/splendor-manager-auth \
           /run/splendor-runner-auth \
           /run/splendor-vpc-auth \
           /run/splendor-cloud-auth \
-          /run/splendor-edge-auth
+          /run/splendor-edge-auth \
+          /run/splendor-provider-auth \
+          /run/splendor-provider-local-auth \
+          /run/splendor-provider-cloud-auth \
+          /run/splendor-provider-vpc-auth \
+          /run/splendor-provider-edge-auth
+        chown -R root:root /run/splendor-provider-runner-auth
     volumes:
       - ../../..:/workspace:ro
       - e2e-manager-auth:/run/splendor-manager-auth
@@ -87,6 +118,12 @@ services:
       - e2e-vpc-auth:/run/splendor-vpc-auth
       - e2e-cloud-auth:/run/splendor-cloud-auth
       - e2e-edge-auth:/run/splendor-edge-auth
+      - e2e-action-provider-auth:/run/splendor-provider-auth
+      - e2e-provider-runner-auth:/run/splendor-provider-runner-auth
+      - e2e-provider-local-auth:/run/splendor-provider-local-auth
+      - e2e-provider-cloud-auth:/run/splendor-provider-cloud-auth
+      - e2e-provider-vpc-auth:/run/splendor-provider-vpc-auth
+      - e2e-provider-edge-auth:/run/splendor-provider-edge-auth
 
   fake-http-service:
     image: python:3.12-slim
@@ -95,12 +132,26 @@ services:
     volumes:
       - ./fixtures:/fixtures:ro
 
-  fake-artifact-store:
-    image: python:3.12-slim
-    working_dir: /var/lib/splendor-artifacts
-    command: ["python", "-m", "http.server", "8083"]
+  acceptance-action-provider:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      target: acceptance-action-provider
+    working_dir: /opt/splendor-provider
+    environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_REQUEST_KEYRING_FILE: /run/splendor-provider-auth/action-provider-request-keyring.json
+      SPLENDOR_ACCEPTANCE_EVIDENCE_KEYRING_FILE: /run/splendor-provider-auth/action-provider-evidence-keyring.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_SIGNING_KEY_FILE: /run/splendor-provider-auth/receipt-signing-key.pk8
+      SPLENDOR_ACCEPTANCE_SIGNER: /usr/local/bin/resident_auth_key_tool
+    command: ["python3", "action_provider.py"]
     volumes:
-      - e2e-state:/var/lib/splendor-artifacts
+      - e2e-action-provider-auth:/run/splendor-provider-auth:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/health', timeout=2)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   fake-governance-plane:
     image: python:3.12-slim
@@ -116,34 +167,35 @@ services:
     volumes:
       - e2e-state:/var/lib/splendor-telemetry
 
-  device-sim:
-    image: python:3.12-slim
-    working_dir: /fixtures
-    command: ["python", "device_sim.py"]
-    volumes:
-      - ./fixtures:/fixtures:ro
-
   splendor-daemon-local:
     build:
       context: ../../..
       dockerfile: Dockerfile
-      target: runtime
-    working_dir: /workspace
+      target: acceptance-action-host
+    working_dir: /opt/splendor
     environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: http://acceptance-action-provider:8086/actions
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: /run/splendor-provider-client/action-provider-request-credential.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: /run/splendor-provider-client/receipt-public-key.raw
+      SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000300
       SPLENDOR_DAEMON_MODE: local_dev
       SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
-    command: ["splendor-daemon"]
+    command: ["splendor-acceptance-action-host"]
+    depends_on:
+      acceptance-action-provider:
+        condition: service_healthy
     volumes:
-      - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-manager-auth:/run/splendor-auth:ro
+      - e2e-provider-local-auth:/run/splendor-provider-client:ro
 
   central-manager:
     build:
       context: ../../..
       dockerfile: Dockerfile
       target: runtime
-    working_dir: /workspace
+    working_dir: /opt/splendor
     environment:
       SPLENDOR_MANAGER_MODE: local_acceptance
       SPLENDOR_MANAGER_BIND_ADDR: 0.0.0.0:8081
@@ -162,7 +214,6 @@ services:
       SPLENDOR_MANAGER_RESIDENT_ALLOWED_ORIGINS: https://resident-cloud-node:8091,https://resident-vpc-node:8092,https://resident-edge-node:8093
     command: ["splendor-manager"]
     volumes:
-      - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-manager-auth:/run/splendor-auth:ro
 
@@ -170,9 +221,13 @@ services:
     build:
       context: ../../..
       dockerfile: Dockerfile
-      target: runtime
-    working_dir: /workspace
+      target: acceptance-action-host
+    working_dir: /opt/splendor
     environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: http://acceptance-action-provider:8086/actions
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: /run/splendor-provider-client/action-provider-request-credential.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: /run/splendor-provider-client/receipt-public-key.raw
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8091
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000304
@@ -182,19 +237,26 @@ services:
       SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
-    command: ["splendor-daemon"]
+    command: ["splendor-acceptance-action-host"]
+    depends_on:
+      acceptance-action-provider:
+        condition: service_healthy
     volumes:
-      - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-cloud-auth:/run/splendor-auth:ro
+      - e2e-provider-cloud-auth:/run/splendor-provider-client:ro
 
   resident-vpc-node:
     build:
       context: ../../..
       dockerfile: Dockerfile
-      target: runtime
-    working_dir: /workspace
+      target: acceptance-action-host
+    working_dir: /opt/splendor
     environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: http://acceptance-action-provider:8086/actions
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: /run/splendor-provider-client/action-provider-request-credential.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: /run/splendor-provider-client/receipt-public-key.raw
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8092
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000302
@@ -204,34 +266,43 @@ services:
       SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
-    command: ["splendor-daemon"]
+    command: ["splendor-acceptance-action-host"]
+    depends_on:
+      acceptance-action-provider:
+        condition: service_healthy
     volumes:
-      - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-vpc-auth:/run/splendor-auth:ro
+      - e2e-provider-vpc-auth:/run/splendor-provider-client:ro
 
   resident-edge-node:
     build:
       context: ../../..
       dockerfile: Dockerfile
-      target: runtime
-    working_dir: /workspace
+      target: acceptance-action-host
+    working_dir: /opt/splendor
     environment:
+      SPLENDOR_ACCEPTANCE_ONLY: "1"
+      SPLENDOR_ACCEPTANCE_PROVIDER_ENDPOINT: http://acceptance-action-provider:8086/actions
+      SPLENDOR_ACCEPTANCE_REQUEST_CREDENTIAL_FILE: /run/splendor-provider-client/action-provider-request-credential.json
+      SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE: /run/splendor-provider-client/receipt-public-key.raw
       SPLENDOR_DAEMON_MODE: resident
       SPLENDOR_DAEMON_BIND_ADDR: 0.0.0.0:8093
       SPLENDOR_INSTANCE_ID: 00000000-0000-4000-8000-000000000306
-      SPLENDOR_DEVICE_SIM_URL: http://device-sim:8086
       SPLENDOR_CALLER_TRUST_FILE: /run/splendor-auth/caller-trust.json
       SPLENDOR_WORK_ORDER_KEYRING_FILE: /run/splendor-auth/work-order-keyring.json
       SPLENDOR_POLICY_KEYRING_FILE: /run/splendor-auth/policy-keyring.json
       SPLENDOR_AUTHORITY_OBLIGATION_RECEIPT_CONFIG_FILE: /run/splendor-auth/authority-obligation-receipt-config.json
       SPLENDOR_TLS_CERT_FILE: /run/splendor-auth/resident-tls-cert.pem
       SPLENDOR_TLS_KEY_FILE: /run/splendor-auth/resident-tls-key.pem
-    command: ["splendor-daemon"]
+    command: ["splendor-acceptance-action-host"]
+    depends_on:
+      acceptance-action-provider:
+        condition: service_healthy
     volumes:
-      - ../../..:/workspace
       - e2e-state:/var/lib/splendor
       - e2e-edge-auth:/run/splendor-auth:ro
+      - e2e-provider-edge-auth:/run/splendor-provider-client:ro
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest
@@ -242,4 +313,10 @@ volumes:
   e2e-vpc-auth:
   e2e-cloud-auth:
   e2e-edge-auth:
+  e2e-action-provider-auth:
+  e2e-provider-runner-auth:
+  e2e-provider-local-auth:
+  e2e-provider-cloud-auth:
+  e2e-provider-vpc-auth:
+  e2e-provider-edge-auth:
   e2e-state:
