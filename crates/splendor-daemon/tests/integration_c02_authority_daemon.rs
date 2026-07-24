@@ -1515,10 +1515,8 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         .expect("physical causal trace");
     let profile_canary = "C03_DEVICE_PROFILE_SAFETY_EVIDENCE_CANARY";
     let mut rejected_profile = device_profile(node_id.clone(), tenant_id.clone());
-    rejected_profile.safety_constraints["allowed_zones"] = json!([
-        "zone_a",
-        format!("https://example.invalid/form?value=Basic+dTpw&label={profile_canary}")
-    ]);
+    rejected_profile.safety_constraints["allowed_zones"] =
+        json!(["zone_a", format!("\u{feff}Basic dTpw {profile_canary}")]);
     let (status, error): (StatusCode, ApiErrorBody) = call_json(
         app.clone(),
         Method::POST,

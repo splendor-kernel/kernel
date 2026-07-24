@@ -9057,6 +9057,10 @@ mod tests {
             "policy_expires_at",
             "trace_integrity",
             "registered_at",
+            "safety_constraints_structured_coordinate",
+            "safety_status_bom",
+            "policy_id_nul",
+            "trace_integrity_form",
         ] {
             let node_id = NodeId::new();
             let canary = format!("C03_DEVICE_PROFILE_{}_CANARY", field.to_ascii_uppercase());
@@ -9101,6 +9105,23 @@ mod tests {
                 "policy_expires_at" => profile.policy_cache.expires_at = credential_value.clone(),
                 "trace_integrity" => profile.trace_buffer.integrity = credential_value.clone(),
                 "registered_at" => profile.registered_at = credential_value.clone(),
+                "safety_constraints_structured_coordinate" => {
+                    profile.safety_constraints = serde_json::json!({
+                        "allowed_zones": [{"name": "VAULT_TOKEN", "value": canary.clone()}]
+                    })
+                }
+                "safety_status_bom" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": format!("\u{feff}Basic dTpw {canary}")
+                    })
+                }
+                "policy_id_nul" => {
+                    profile.policy_cache.policy_id = format!("B\0e\0a\0r\0e\0r\0 \0x\0 {canary}")
+                }
+                "trace_integrity_form" => {
+                    profile.trace_buffer.integrity =
+                        format!("safe=1&value=Basic+dTpw&label={canary}")
+                }
                 _ => unreachable!("closed device profile field matrix"),
             }
 

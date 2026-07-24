@@ -53,14 +53,17 @@ The bounded guard recognizes RFC 0012's normalized authorization/password/token/
 API-key/client-secret/private-key/cookie/secret/credential/connection/DSN and
 structured cloud/device environment coordinates in nested action data and object
 keys, URL userinfo/path/query and quoted/spaced assignment forms, plus
-structurally decoded Basic, short Bearer, PEM, realistically bounded
-path-delimited provider, credential URL/DSN, and embedded/encoded generic
-ref-like content under neutral keys. URL/form handling has explicit nested/decode
-bounds and preserves ordinary embedded URLs and provider-like resource names. It
+structurally decoded Basic, short Bearer, PEM, provider-specific realistically
+bounded path-delimited tokens, credential URL/DSN, and embedded/encoded generic
+ref-like content under neutral keys. Closed name/key/value credential coordinate
+objects are normalized by the same owner grammar. URL/form handling covers
+standalone fields and encoded non-URL spans with explicit nested/decode bounds,
+while preserving ordinary embedded URLs and provider-like resource names. It
 also screens raw receipt strings, physical/operator envelope strings, complete
 device-profile values/keys, and every top-level numeric `params.bytes` body,
-independent of action labels or adapter routing. Such bytes must be unambiguous UTF-8;
-BOM, UTF-16, invalid/control encodings fail closed. This screening never
+independent of action labels or adapter routing. Every inspected string rejects
+BOM and NUL/control ambiguity; numeric bytes additionally require unambiguous
+UTF-8, so UTF-16 and invalid encodings fail closed. This screening never
 validates receipt authority. It denies malformed parsed
 coordinates and depth/node/string/cumulative-byte overflow with the sole fixed
 reason `raw_credential_input_denied`. Its error type is fieldless,

@@ -484,6 +484,12 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"input": "Basic dTpw"}),
         serde_json::json!({"input": "Basic YTpi"}),
         serde_json::json!({"input": "Bearer x"}),
+        serde_json::json!({"body": "safe=1&value=Basic+dTpw"}),
+        serde_json::json!({"body": "safe=1&X-Auth-Token=synthetic"}),
+        serde_json::json!({"json": {"name": "VAULT_TOKEN", "value": "synthetic"}}),
+        serde_json::json!({"body": "\u{feff}Basic dTpw"}),
+        serde_json::json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
+        serde_json::json!({"input": "Bearer%20x see https://example.invalid/docs"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -579,6 +585,8 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         "hf_transformer",
         "models/hf_transformer",
         "see https://example.invalid/docs",
+        "models/sk-learn-sentiment-classifier-v2",
+        "topic=Basic+planning&mode=monthly",
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());

@@ -4040,6 +4040,23 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             "short_basic_form",
             json!({"url": "https://example.invalid/form?value=Basic+dTpw"}),
         ),
+        (
+            "standalone_basic_form",
+            json!({"body": "safe=1&value=Basic+dTpw"}),
+        ),
+        (
+            "structured_environment_coordinate",
+            json!({"json": {"name": "VAULT_TOKEN", "value": CANARY}}),
+        ),
+        ("bom_prefixed_basic", json!({"body": "\u{feff}Basic dTpw"})),
+        (
+            "nul_interleaved_bearer",
+            json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
+        ),
+        (
+            "encoded_credential_before_url",
+            json!({"input": "Bearer%20x see https://example.invalid/docs"}),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(

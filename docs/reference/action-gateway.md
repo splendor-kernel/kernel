@@ -139,21 +139,26 @@ screened as content as well as by normalized key name.
 Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
 authorization form, PEM private-key block, boundary-delimited provider token,
 embedded generic secret reference, or unambiguous credential URL/DSN/assignment
-form. Basic tokens are locally base64-decoded within the scanner limit and deny
-only when the decoded credential has the required colon structure; short valid
-Basic/Bearer credentials still deny. Provider profiles use provider-specific
-realistic minimum/maximum lengths and alphabets, including after a path `/`.
-Ordinary prose such as `Basic planning`, standalone `hf_transformer`, and paths
-such as `models/hf_transformer` remain accepted.
+form. Closed coordinate objects such as `{ "name": "VAULT_TOKEN", "value":
+"..." }` are screened by the same normalized Gateway vocabulary. Basic tokens
+are locally base64-decoded within the scanner limit and deny only when the
+decoded credential has the required colon structure; short valid Basic/Bearer
+credentials still deny. Provider profiles use provider-specific prefixes,
+realistic minimum/maximum lengths, and alphabets—including exact legacy `sk-`
+and named modern variants rather than one broad `sk-` family. Ordinary prose
+such as `Basic planning`, standalone `hf_transformer`, and resource paths such
+as `models/hf_transformer` or `models/sk-learn-sentiment-classifier-v2` remain
+accepted.
 
 URL scanning extracts bounded candidates instead of treating surrounding prose as
-part of a scheme. It screens decoded path/fragment components, form/query keys and
-plus-as-space values, query-bearing secret refs, and nested credential URLs with a
-maximum nesting depth of four. Residual or ambiguous percent encodings fail
-closed. Thus `see https://example.invalid/docs` remains accepted while encoded
-refs, presigned signatures, provider tokens in paths, and nested credential URLs
-deny. Object keys containing non-ASCII/confusable characters or residual percent
-escapes after one bounded decode also fail closed.
+part of a scheme. It screens decoded path/fragment components, standalone and URL
+form/query fields, plus-as-space values, encoded non-URL spans beside benign URLs,
+query-bearing secret refs, and nested credential URLs with a maximum nesting depth
+of four. Residual or ambiguous percent encodings fail closed. Thus `see
+https://example.invalid/docs` remains accepted while encoded refs, presigned
+signatures, provider tokens in paths, and nested credential URLs deny. Object keys
+containing non-ASCII/confusable characters or residual percent escapes after one
+bounded decode also fail closed.
 
 Top-level numeric `params.bytes` content is always a strict credential-capable
 coordinate, independent of action labels, declared side-effect class, optional
@@ -163,6 +168,11 @@ UTF-8 BOM, UTF-16LE/BE, invalid UTF-8, NUL/control data, non-array, non-integer,
 out-of-range, or over-budget shapes fail closed. Credential-free bounded UTF-8
 bodies remain accepted. Numeric arrays under other field names retain ordinary
 non-byte semantics.
+
+All inspected string and object-key coordinates must also be unambiguous text.
+UTF BOM markers and non-whitespace control/NUL characters fail closed before a
+string can enter traces, persistence, safety evidence, or an adapter. Tabs and
+ordinary line endings remain valid credential-free text.
 
 The Gateway also exposes the same recursive bounded value entry point for an
 owning service to screen a complete closed JSON envelope. The daemon uses it for

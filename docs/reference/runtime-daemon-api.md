@@ -346,8 +346,10 @@ allowed/forbidden action strings, every nested constraint/status string and obje
 key, policy-cache strings, trace-buffer strings, zone refs, and caller-supplied
 registration metadata. Rejection is HTTP `400` with fixed null-detail
 `raw_credential_input_denied`; the profile cannot subsequently be read or copied
-into safety evidence. Credential-free profiles preserve registration/read and
-physical execution behavior.
+into safety evidence. Closed name/key/value credential coordinates, standalone
+form representations, BOM, and NUL/control ambiguity receive the same denial as
+direct credential forms. Credential-free profiles preserve registration/read
+and physical execution behavior.
 
 The physical handler additionally screens every caller-controlled string in
 `SafetyContext` (`allowed_zone_refs`, `zone_ref`, and cloud-helper proposal ID)

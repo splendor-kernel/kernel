@@ -10,15 +10,17 @@
   admission, direct/physical action handlers, and Gateway policy/trace-durability
   wrappers. Normalized credential coordinates, nested map/list content,
   URL/userinfo/path/query, quoted/spaced connection/environment assignments,
-  structured cloud/device aliases, decoded colon-bearing Basic, short Bearer,
-  realistically bounded provider forms, PEM, embedded/encoded generic secret
-  refs, credential-bearing object keys, raw receipt metadata, physical/operator
+  structured cloud/device aliases, closed name/key/value coordinate objects,
+  decoded colon-bearing Basic, short Bearer, provider-specific realistically
+  bounded token forms, PEM, embedded/encoded generic secret refs,
+  credential-bearing object keys, raw receipt metadata, physical/operator
   envelope strings, and complete device-profile envelopes are covered. URL/form
-  parsing handles bounded nested URLs and plus-as-space values while preserving
-  ordinary embedded URLs and provider-like resource names. Every top-level
-  numeric `params.bytes` body requires unambiguous UTF-8 regardless of action
-  label or adapter routing; UTF BOM, UTF-16, invalid UTF-8, NUL/control,
-  malformed parsed coordinates, and
+  parsing handles bounded nested URLs, standalone form bodies, encoded non-URL
+  spans, and plus-as-space values while preserving ordinary embedded URLs and
+  provider-like resource names. Every inspected string rejects BOM and ambiguous
+  NUL/control encodings. Every top-level numeric `params.bytes` body additionally
+  requires unambiguous UTF-8 regardless of action label or adapter routing;
+  UTF-16, invalid UTF-8, malformed parsed coordinates, and
   depth/node/string/byte overflow all return only
   `raw_credential_input_denied`. Denied traces retain action identity/order but
   use one constant action projection; raw input is excluded from constraints,

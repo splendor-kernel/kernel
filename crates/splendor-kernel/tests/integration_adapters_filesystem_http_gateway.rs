@@ -595,7 +595,7 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
 }
 
 #[test]
-fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes() {
+fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
         FilesystemAdapterConfig {
@@ -626,6 +626,7 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
         utf8_bom,
         vec![0xff, 0xfe, b'x'],
         vec![b'o', b'k', 0, b'x'],
+        b"safe=1&value=Basic+dTpw".to_vec(),
     ];
     let mut candidates = Vec::new();
     let mut serialized_bodies = Vec::new();
@@ -676,9 +677,42 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
         ),
         "http",
     ));
+    candidates.push(action_candidate(
+        action(
+            "write_file",
+            serde_json::json!({
+                "path": "credential-contents.txt",
+                "contents": "B\0e\0a\0r\0e\0r\0 \0x\0",
+            }),
+            SideEffectClass::Filesystem,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "body": "safe=1&value=Basic+dTpw",
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "json": {"name": "VAULT_TOKEN", "value": "C03_STRUCTURED_CANARY"},
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
     let expected_denials = candidates.len();
     let run = run_adapter_case(AdapterHarnessCase::new(
-        "numeric-byte-credential-denial",
+        "credential-encoding-denial",
         vec![
             HarnessRegistration::new("write_file", "filesystem", filesystem.clone()),
             HarnessRegistration::new("http_post", "http", http.clone()),
@@ -701,8 +735,12 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
         assert!(!temp.path().join(format!("credential-{index}.txt")).exists());
     }
     assert!(!temp.path().join("credential-alias.txt").exists());
+    assert!(!temp.path().join("credential-contents.txt").exists());
     let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
     assert!(!encoded_events.contains(&provider_canary));
+    assert!(!encoded_events.contains("safe=1&value=Basic+dTpw"));
+    assert!(!encoded_events.contains("VAULT_TOKEN"));
+    assert!(!encoded_events.contains("C03_STRUCTURED_CANARY"));
     for body in serialized_bodies {
         assert!(
             !encoded_events.contains(&body),
