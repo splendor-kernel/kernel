@@ -32,6 +32,7 @@ fn content_hash_parse_round_trip() {
 
     let sha256 = ContentHash::new(HashAlgorithm::Sha256, "abc123");
     assert_eq!(ContentHash::parse("sha256:abc123"), Some(sha256));
+    assert!(ContentHash::parse("missing-separator").is_none());
     assert!(ContentHash::parse("sha256:").is_none());
     assert!(ContentHash::parse("unknown:abc123").is_none());
 }

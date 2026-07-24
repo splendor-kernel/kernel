@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    DriverOperationRef, SecretDeliveryMethod, SecretPurpose, SecretUseIntent,
-    SECRET_USE_REQUIREMENT_SCHEMA_V1,
+    DriverOperationRef, DriverTrustedSendProfileV1, SecretDeliveryControlKind,
+    SecretDeliveryMethod, SecretPurpose, SecretUseIntent, SECRET_USE_REQUIREMENT_SCHEMA_V1,
 };
 
 const TENANT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001";
@@ -17,6 +17,8 @@ const LEASE_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4010";
 const HANDLE_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4011";
 const EVENT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4012";
 const CLAIM_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4013";
+const ATTEMPT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4014";
+const PROVIDER_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4015";
 const DESTINATION_DIGEST: &str =
     "blake3:1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -35,11 +37,17 @@ fn binding() -> SecretLeaseUseBinding {
         "splendor.driver.destination.http.v1",
         DESTINATION_DIGEST.parse().unwrap(),
         SecretDeliveryExposureProfile::TrustedInjection,
+        DriverTrustedSendProfileV1::try_trusted_injection(
+            1,
+            vec![SecretDeliveryControlKind::TrustedInjectionBoundary],
+        )
+        .unwrap(),
         NODE_ID.parse().unwrap(),
         INSTANCE_ID.parse().unwrap(),
         AUDIENCE_ID.parse().unwrap(),
         SECRET_REF_ID.parse().unwrap(),
         3,
+        PROVIDER_ID.parse().unwrap(),
         "version-3".parse().unwrap(),
         SecretUseIntent::Authenticate,
         SecretPurpose::ExternalServiceAccess,
@@ -182,6 +190,7 @@ fn snapshot_and_access_evidence_serialize_only_safe_coordinates() {
     .unwrap();
     let event = SecretAccessEvidence::try_new(
         EVENT_ID.parse().unwrap(),
+        ProcessLocalSecretBrokerCommandId::UseAttempt(ATTEMPT_ID.parse().unwrap()),
         SecretAccessEvidenceKind::UseClaimed,
         SecretAccessEvidenceOutcome::Succeeded,
         binding(),
@@ -220,11 +229,17 @@ fn errors_are_fixed_and_do_not_echo_candidates() {
         "splendor.driver.destination.http.v1",
         DESTINATION_DIGEST.parse().unwrap(),
         SecretDeliveryExposureProfile::TrustedInjection,
+        DriverTrustedSendProfileV1::try_trusted_injection(
+            1,
+            vec![SecretDeliveryControlKind::TrustedInjectionBoundary],
+        )
+        .unwrap(),
         NODE_ID.parse().unwrap(),
         INSTANCE_ID.parse().unwrap(),
         AUDIENCE_ID.parse().unwrap(),
         SECRET_REF_ID.parse().unwrap(),
         1,
+        PROVIDER_ID.parse().unwrap(),
         "PRIVATE_SECRET_CANARY".parse().unwrap(),
         SecretUseIntent::Authenticate,
         SecretPurpose::ExternalServiceAccess,
@@ -259,9 +274,18 @@ fn binding_getters_and_each_checked_boundary_are_covered() {
     assert_eq!(value.audience_id().to_string(), AUDIENCE_ID);
     assert_eq!(value.secret_ref_id().to_string(), SECRET_REF_ID);
     assert_eq!(value.secret_ref_revision(), 3);
+    assert_eq!(value.secret_provider_id().to_string(), PROVIDER_ID);
     assert_eq!(value.provider_version_ref().as_str(), "version-3");
+    assert_eq!(
+        value.trusted_send_profile().max_credential_bearing_sends(),
+        Some(1)
+    );
     assert_eq!(value.intent(), SecretUseIntent::Authenticate);
     assert_eq!(value.purpose(), SecretPurpose::ExternalServiceAccess);
+    assert_eq!(
+        serde_json::to_value(&value).unwrap()["driver_declaration_revision"],
+        7
+    );
 
     let make = |tenant_id: TenantId,
                 principal_id: PrincipalId,
@@ -282,11 +306,17 @@ fn binding_getters_and_each_checked_boundary_are_covered() {
             destination_schema,
             DESTINATION_DIGEST.parse().unwrap(),
             SecretDeliveryExposureProfile::TrustedInjection,
+            DriverTrustedSendProfileV1::try_trusted_injection(
+                1,
+                vec![SecretDeliveryControlKind::TrustedInjectionBoundary],
+            )
+            .unwrap(),
             node_id,
             instance_id,
             AUDIENCE_ID.parse().unwrap(),
             SECRET_REF_ID.parse().unwrap(),
             ref_revision,
+            PROVIDER_ID.parse().unwrap(),
             "version-3".parse().unwrap(),
             SecretUseIntent::Authenticate,
             SecretPurpose::ExternalServiceAccess,
@@ -431,6 +461,31 @@ fn binding_getters_and_each_checked_boundary_are_covered() {
             Err(expected)
         );
     }
+
+    assert_eq!(
+        SecretLeaseUseBinding::try_new(
+            TENANT_ID.parse().unwrap(),
+            PRINCIPAL_ID.parse().unwrap(),
+            WORKLOAD_ID.parse().unwrap(),
+            valid_operation(),
+            1,
+            SLOT_ID.parse().unwrap(),
+            "splendor.driver.destination.http.v1",
+            DESTINATION_DIGEST.parse().unwrap(),
+            SecretDeliveryExposureProfile::TrustedInjection,
+            DriverTrustedSendProfileV1::not_applicable(),
+            NODE_ID.parse().unwrap(),
+            INSTANCE_ID.parse().unwrap(),
+            AUDIENCE_ID.parse().unwrap(),
+            SECRET_REF_ID.parse().unwrap(),
+            1,
+            PROVIDER_ID.parse().unwrap(),
+            "version-3".parse().unwrap(),
+            SecretUseIntent::Authenticate,
+            SecretPurpose::ExternalServiceAccess,
+        ),
+        Err(SecretLeaseContractError::InvalidTrustedSendProfile)
+    );
 }
 
 #[test]
@@ -509,6 +564,10 @@ fn request_snapshot_and_evidence_getters_and_invalid_shapes_are_covered() {
     assert_eq!(snapshot.issued_at().as_str(), "2026-07-24T12:00:00.000000Z");
     assert_eq!(snapshot.renewed_from_lease_id(), None);
     assert_eq!(snapshot.last_event_id().to_string(), EVENT_ID);
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap()["continuous_lifetime_started_at"],
+        "2026-07-24T12:00:00.000000Z"
+    );
 
     assert_eq!(
         make_snapshot(
@@ -591,8 +650,17 @@ fn request_snapshot_and_evidence_getters_and_invalid_shapes_are_covered() {
 
     let make_event =
         |kind, outcome, claim_id, denial_code, max_uses, uses_claimed, revocation_generation| {
+            let command_id = if matches!(
+                kind,
+                SecretAccessEvidenceKind::UseClaimed | SecretAccessEvidenceKind::UseDenied
+            ) {
+                ProcessLocalSecretBrokerCommandId::UseAttempt(ATTEMPT_ID.parse().unwrap())
+            } else {
+                ProcessLocalSecretBrokerCommandId::LeaseRequest(REQUEST_ID.parse().unwrap())
+            };
             SecretAccessEvidence::try_new(
                 EVENT_ID.parse().unwrap(),
+                command_id,
                 kind,
                 outcome,
                 binding(),
@@ -618,6 +686,10 @@ fn request_snapshot_and_evidence_getters_and_invalid_shapes_are_covered() {
     .unwrap();
     assert_eq!(event.schema_version(), SECRET_ACCESS_EVIDENCE_SCHEMA_V1);
     assert_eq!(event.secret_access_event_id().to_string(), EVENT_ID);
+    assert_eq!(
+        event.command_id(),
+        &ProcessLocalSecretBrokerCommandId::UseAttempt(ATTEMPT_ID.parse().unwrap())
+    );
     assert_eq!(event.kind(), SecretAccessEvidenceKind::UseClaimed);
     assert_eq!(event.outcome(), SecretAccessEvidenceOutcome::Succeeded);
     assert_eq!(event.use_binding(), &binding());
@@ -642,6 +714,25 @@ fn request_snapshot_and_evidence_getters_and_invalid_shapes_are_covered() {
     assert!(serde_json::to_string(&denied)
         .unwrap()
         .contains("authority_denied"));
+    let sparse_denial = SecretAccessEvidence::try_new(
+        "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4601".parse().unwrap(),
+        ProcessLocalSecretBrokerCommandId::LeaseRequest(REQUEST_ID.parse().unwrap()),
+        SecretAccessEvidenceKind::LeaseDenied,
+        SecretAccessEvidenceOutcome::Denied,
+        binding(),
+        None,
+        None,
+        None,
+        0,
+        1,
+        1,
+        Some(SecretAccessDenialCode::SecretNotAvailable),
+        "2026-07-24T12:01:00.000000Z".parse().unwrap(),
+    )
+    .unwrap();
+    let sparse_json = serde_json::to_value(&sparse_denial).unwrap();
+    assert!(sparse_json.get("delivery_handle_id").is_none());
+    assert!(sparse_json.get("secret_lease_id").is_none());
 
     for (invalid, expected) in [
         (
@@ -720,6 +811,7 @@ fn every_contract_error_has_a_fixed_code() {
         SecretLeaseContractError::InvalidDriverOperation,
         SecretLeaseContractError::InvalidDriverDeclarationRevision,
         SecretLeaseContractError::InvalidDestinationSchema,
+        SecretLeaseContractError::InvalidTrustedSendProfile,
         SecretLeaseContractError::InvalidSecretRefRevision,
         SecretLeaseContractError::RequirementBindingMismatch,
         SecretLeaseContractError::InvalidTimeWindow,

@@ -1,98 +1,120 @@
 use super::*;
-use splendor_authority::{InMemorySecretBrokerEventSink, ProcessLocalSecretBroker};
+use splendor_authority::ProcessLocalSecretBroker;
 use splendor_types::{
-    DriverCredentialDestinationDigest, DriverOperationRef, DriverTrustedSendProfileV1,
+    DriverCredentialDestinationDigest, DriverOperationCredentialSinkV1,
+    DriverOperationCredentialSinksV1, DriverOperationRef, DriverTrustedSendProfileV1,
     SecretClassification, SecretCredentialAuthorizationV2, SecretCredentialSlotId,
-    SecretDeliveryExposureProfile, SecretDeliveryMethod, SecretLeasePolicy, SecretOfflineBehavior,
-    SecretRefV2,
+    SecretDeliveryControlKind, SecretDeliveryExposureProfile, SecretDeliveryMethod,
+    SecretLeasePolicy, SecretOfflineBehavior, SecretUseIntent,
 };
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const CANARY: &str = "PRIVATE_SECRET_CANARY_684f";
-
 fn uuid(index: u128) -> Uuid {
-    Uuid::from_u128(0x018f_0a1b_2c3d_4e5f_8a9b_0000_0000_0000 + index)
-}
-
-fn provider_id() -> SecretProviderId {
-    SecretProviderId::try_from(uuid(1)).unwrap()
+    Uuid::from_u128(0x018f_0a1b_2c3d_4e5f_8a9b_1000_0000_0000 + index)
 }
 
 fn tenant(index: u128) -> TenantId {
     TenantId::from(uuid(index))
 }
 
-fn secret_ref(index: u128) -> SecretRefId {
-    SecretRefId::try_from(uuid(index)).unwrap()
+fn secret_id<T>(index: u128) -> T
+where
+    T: TryFrom<Uuid>,
+    T::Error: fmt::Debug,
+{
+    T::try_from(uuid(index)).unwrap()
+}
+
+fn provider_id() -> SecretProviderId {
+    secret_id(1)
+}
+
+fn ref_id() -> SecretRefId {
+    secret_id(2)
+}
+
+fn version(value: &str) -> SecretProviderVersionRef {
+    value.parse().unwrap()
 }
 
 fn coordinates<'a>(
     provider_id: &'a SecretProviderId,
     tenant_id: &'a TenantId,
-    secret_ref_id: &'a SecretRefId,
+    ref_id: &'a SecretRefId,
     version: &'a SecretProviderVersionRef,
 ) -> FetchCoordinates<'a> {
     FetchCoordinates {
         provider_id,
         tenant_id,
-        secret_ref_id,
+        secret_ref_id: ref_id,
         secret_ref_revision: 1,
         provider_version_ref: version,
     }
 }
 
-fn audit_coordinates<'a>(
-    audit_id: &'a SecretProviderAuditId,
-    provider_id: &'a SecretProviderId,
-    tenant_id: &'a TenantId,
-    secret_ref_id: &'a SecretRefId,
-    version: &'a SecretProviderVersionRef,
-    observed_at: &'a CanonicalTimestampV1,
-) -> AuditCoordinates<'a> {
-    AuditCoordinates {
-        provider_audit_id: audit_id,
-        provider_id,
-        tenant_id,
-        secret_ref_id,
-        secret_ref_revision: 1,
-        provider_version_ref: version,
-        observed_at,
-    }
+fn material(provider: &MemorySecretProvider, coordinates: FetchCoordinates<'_>) -> Vec<u8> {
+    provider
+        .with_entry(coordinates, |entry| Ok(entry.material.as_slice().to_vec()))
+        .unwrap()
 }
 
-fn configured_secret_ref(provider_id: SecretProviderId) -> SecretRefV2 {
-    let credential_slot_id = SecretCredentialSlotId::try_from(uuid(5)).unwrap();
-    let destination_digest: DriverCredentialDestinationDigest =
+fn trusted_profile() -> DriverTrustedSendProfileV1 {
+    DriverTrustedSendProfileV1::try_trusted_injection(
+        1,
+        vec![SecretDeliveryControlKind::TrustedInjectionBoundary],
+    )
+    .unwrap()
+}
+
+fn secret_ref(provider_id: SecretProviderId) -> splendor_types::SecretRefV2 {
+    let operation = DriverOperationRef {
+        driver: "http".to_string(),
+        operation: "fetch".to_string(),
+        schema_version: "splendor.driver.operation.v1".to_string(),
+    };
+    let slot: SecretCredentialSlotId = secret_id(3);
+    let digest: DriverCredentialDestinationDigest =
         "blake3:1111111111111111111111111111111111111111111111111111111111111111"
             .parse()
             .unwrap();
     let authorization = SecretCredentialAuthorizationV2::try_new(
-        DriverOperationRef {
-            driver: "http".to_string(),
-            operation: "fetch".to_string(),
-            schema_version: "splendor.driver.operation.v1".to_string(),
-        },
+        operation.clone(),
         1,
-        credential_slot_id,
+        slot,
         "splendor.driver.destination.http.v1",
-        SecretDeliveryExposureProfile::MaterialExposed,
-        DriverTrustedSendProfileV1::not_applicable(),
-        vec![destination_digest],
+        SecretDeliveryExposureProfile::TrustedInjection,
+        trusted_profile(),
+        vec![digest],
     )
     .unwrap();
-    SecretRefV2::try_new(
-        secret_ref(3),
+    let _trusted_declaration = DriverOperationCredentialSinksV1::try_new(
+        operation,
         1,
-        tenant(2),
+        vec![DriverOperationCredentialSinkV1::try_new(
+            slot,
+            vec![SecretClassification::AuthenticationCredential],
+            vec![SecretUseIntent::Authenticate],
+            "splendor.driver.destination.http.v1",
+            SecretDeliveryExposureProfile::TrustedInjection,
+            trusted_profile(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    splendor_types::SecretRefV2::try_new(
+        ref_id(),
+        1,
+        tenant(1),
         provider_id,
         "test",
-        "http-credential",
-        "version-1".parse().unwrap(),
+        "credential",
+        version("version-1"),
         SecretClassification::AuthenticationCredential,
         vec![authorization],
         vec![SecretDeliveryMethod::InheritedFd],
-        SecretLeasePolicy::try_new(300, 600, 1, true, 0).unwrap(),
+        SecretLeasePolicy::try_new(60, 120, 2, true, 0).unwrap(),
         SecretOfflineBehavior::Deny,
         "2026-07-24T11:00:00.000000Z",
         None,
@@ -101,14 +123,8 @@ fn configured_secret_ref(provider_id: SecretProviderId) -> SecretRefV2 {
 }
 
 #[test]
-fn construction_is_explicitly_test_or_local_dev_only() {
-    for allowed in [
-        MemorySecretProviderRuntimeMode::Test,
-        MemorySecretProviderRuntimeMode::LocalDevelopment,
-    ] {
-        assert!(MemorySecretProvider::try_new(provider_id(), allowed).is_ok());
-    }
-    for denied in [
+fn construction_is_compile_gated_and_runtime_mode_restricted() {
+    for mode in [
         MemorySecretProviderRuntimeMode::Resident,
         MemorySecretProviderRuntimeMode::Remote,
         MemorySecretProviderRuntimeMode::Fleet,
@@ -116,97 +132,104 @@ fn construction_is_explicitly_test_or_local_dev_only() {
         MemorySecretProviderRuntimeMode::Unknown,
     ] {
         assert_eq!(
-            MemorySecretProvider::try_new(provider_id(), denied).unwrap_err(),
+            MemorySecretProvider::try_new(provider_id(), mode).unwrap_err(),
             MemorySecretProviderConfigError::UnsupportedRuntimeMode
         );
     }
+    MemorySecretProvider::try_new(provider_id(), MemorySecretProviderRuntimeMode::Test).unwrap();
+    MemorySecretProvider::try_new(
+        provider_id(),
+        MemorySecretProviderRuntimeMode::LocalDevelopment,
+    )
+    .unwrap();
+    assert_eq!(
+        MemorySecretProvider::try_new_with_capacity(
+            provider_id(),
+            MemorySecretProviderRuntimeMode::Test,
+            0,
+        )
+        .unwrap_err(),
+        MemorySecretProviderConfigError::CapacityExceeded
+    );
 }
 
 #[test]
-fn real_broker_composition_registers_memory_provider_without_resolving_material() {
-    let provider_id = provider_id();
+fn broker_composition_registers_port_without_resolving_material() {
     let provider = Arc::new(
-        MemorySecretProvider::try_new(provider_id.clone(), MemorySecretProviderRuntimeMode::Test)
+        MemorySecretProvider::try_new(provider_id(), MemorySecretProviderRuntimeMode::Test)
             .unwrap(),
     );
     provider
         .insert_synthetic(
-            tenant(2),
-            secret_ref(3),
+            tenant(1),
+            ref_id(),
             1,
-            "version-1".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
+            version("version-1"),
+            b"synthetic".to_vec(),
         )
         .unwrap();
-    let provider_port: Arc<dyn SecretProvider> = provider.clone();
-    let broker = ProcessLocalSecretBroker::try_new(
-        vec![configured_secret_ref(provider_id)],
-        vec![provider_port],
-        Arc::new(InMemorySecretBrokerEventSink::new()),
-    )
-    .unwrap();
-
+    let port: Arc<dyn SecretProvider> = provider.clone();
+    let broker =
+        ProcessLocalSecretBroker::try_new(vec![secret_ref(provider_id())], vec![port]).unwrap();
     assert_eq!(broker.registered_provider_count(), 1);
-    assert!(broker.replay().unwrap().leases.is_empty());
     assert_eq!(provider.fetch_call_count(), 0);
     assert_eq!(provider.control_call_count(), 0);
 }
 
 #[test]
-fn exact_lookup_enforces_tenant_ref_revision_and_version() {
+fn exact_lookup_denies_wrong_provider_tenant_ref_revision_and_version() {
     let provider_id = provider_id();
+    let tenant_id = tenant(1);
+    let ref_id = ref_id();
+    let current_version = version("version-1");
     let provider =
         MemorySecretProvider::try_new(provider_id.clone(), MemorySecretProviderRuntimeMode::Test)
             .unwrap();
-    let tenant_id = tenant(2);
-    let ref_id = secret_ref(3);
-    let version: SecretProviderVersionRef = "version-1".parse().unwrap();
     provider
         .insert_synthetic(
             tenant_id.clone(),
             ref_id.clone(),
             1,
-            version.clone(),
-            CANARY.as_bytes().to_vec(),
+            current_version.clone(),
+            b"exact".to_vec(),
         )
         .unwrap();
-
-    let material = provider
-        .fetch_coordinates(coordinates(&provider_id, &tenant_id, &ref_id, &version))
-        .unwrap();
-    material.expose_borrowed(|bytes| assert_eq!(bytes, CANARY.as_bytes()));
-    assert!(!format!("{material:?}").contains(CANARY));
-    assert!(!format!("{provider:?}").contains(CANARY));
-
-    let wrong_version: SecretProviderVersionRef = "version-2".parse().unwrap();
     assert_eq!(
-        provider
-            .fetch_coordinates(coordinates(
-                &provider_id,
-                &tenant_id,
-                &ref_id,
-                &wrong_version,
-            ))
-            .unwrap_err()
-            .code(),
-        SecretProviderErrorCode::VersionNotAvailable
+        material(
+            &provider,
+            coordinates(&provider_id, &tenant_id, &ref_id, &current_version)
+        ),
+        b"exact"
     );
+
+    let wrong_provider = secret_id(99);
+    let wrong_ref = secret_id(98);
+    for coordinate in [
+        coordinates(&wrong_provider, &tenant_id, &ref_id, &current_version),
+        coordinates(&provider_id, &tenant(2), &ref_id, &current_version),
+        coordinates(&provider_id, &tenant_id, &wrong_ref, &current_version),
+        coordinates(&provider_id, &tenant_id, &ref_id, &version("version-2")),
+    ] {
+        assert_eq!(
+            provider
+                .with_entry(coordinate, |_| Ok(()))
+                .unwrap_err()
+                .code(),
+            SecretProviderErrorCode::VersionNotAvailable
+        );
+    }
     assert_eq!(
         provider
-            .fetch_coordinates(coordinates(&provider_id, &tenant(99), &ref_id, &version,))
-            .unwrap_err()
-            .code(),
-        SecretProviderErrorCode::VersionNotAvailable
-    );
-    assert_eq!(
-        provider
-            .fetch_coordinates(FetchCoordinates {
-                provider_id: &provider_id,
-                tenant_id: &tenant_id,
-                secret_ref_id: &ref_id,
-                secret_ref_revision: 2,
-                provider_version_ref: &version,
-            })
+            .with_entry(
+                FetchCoordinates {
+                    provider_id: &provider_id,
+                    tenant_id: &tenant_id,
+                    secret_ref_id: &ref_id,
+                    secret_ref_revision: 2,
+                    provider_version_ref: &current_version,
+                },
+                |_| Ok(()),
+            )
             .unwrap_err()
             .code(),
         SecretProviderErrorCode::VersionNotAvailable
@@ -214,333 +237,363 @@ fn exact_lookup_enforces_tenant_ref_revision_and_version() {
 }
 
 #[test]
-fn outage_revocation_and_rotation_are_deterministic_and_redacted() {
+fn outage_rotation_and_revocation_erase_old_entries() {
     let provider_id = provider_id();
+    let tenant_id = tenant(1);
+    let ref_id = ref_id();
+    let old = version("version-1");
+    let new = version("version-2");
     let provider =
         MemorySecretProvider::try_new(provider_id.clone(), MemorySecretProviderRuntimeMode::Test)
             .unwrap();
-    let tenant_id = tenant(2);
-    let ref_id = secret_ref(3);
-    let old_version: SecretProviderVersionRef = "version-1".parse().unwrap();
-    let new_version: SecretProviderVersionRef = "version-2".parse().unwrap();
     provider
         .insert_synthetic(
             tenant_id.clone(),
             ref_id.clone(),
             1,
-            old_version.clone(),
-            CANARY.as_bytes().to_vec(),
+            old.clone(),
+            b"old-material".to_vec(),
         )
         .unwrap();
-
     provider.set_available(false);
-    let outage = provider
-        .fetch_coordinates(coordinates(&provider_id, &tenant_id, &ref_id, &old_version))
-        .unwrap_err();
-    assert_eq!(outage.code(), SecretProviderErrorCode::Unavailable);
-    assert!(!outage.to_string().contains(CANARY));
+    assert_eq!(
+        provider
+            .with_entry(
+                coordinates(&provider_id, &tenant_id, &ref_id, &old),
+                |_| Ok(()),
+            )
+            .unwrap_err()
+            .code(),
+        SecretProviderErrorCode::Unavailable
+    );
     provider.set_available(true);
-
     provider
         .rotate_synthetic(
             tenant_id.clone(),
             ref_id.clone(),
             1,
-            &old_version,
-            new_version.clone(),
-            b"rotated-canary".to_vec(),
+            &old,
+            new.clone(),
+            b"new-material".to_vec(),
         )
         .unwrap();
     assert_eq!(
         provider
-            .fetch_coordinates(coordinates(&provider_id, &tenant_id, &ref_id, &old_version,))
+            .with_entry(
+                coordinates(&provider_id, &tenant_id, &ref_id, &old),
+                |_| Ok(()),
+            )
             .unwrap_err()
             .code(),
-        SecretProviderErrorCode::Revoked
+        SecretProviderErrorCode::VersionNotAvailable
     );
-    let rotated = provider
-        .fetch_coordinates(coordinates(&provider_id, &tenant_id, &ref_id, &new_version))
+    assert_eq!(
+        material(
+            &provider,
+            coordinates(&provider_id, &tenant_id, &ref_id, &new)
+        ),
+        b"new-material"
+    );
+    provider
+        .erase_coordinates(coordinates(&provider_id, &tenant_id, &ref_id, &new))
         .unwrap();
-    rotated.expose_borrowed(|bytes| assert_eq!(bytes, b"rotated-canary"));
+    assert_eq!(
+        provider
+            .with_entry(
+                coordinates(&provider_id, &tenant_id, &ref_id, &new),
+                |_| Ok(()),
+            )
+            .unwrap_err()
+            .code(),
+        SecretProviderErrorCode::VersionNotAvailable
+    );
 }
 
 #[test]
-fn config_errors_do_not_echo_material_and_trait_object_is_real() {
-    let provider = MemorySecretProvider::try_new(
+fn finite_entry_capacity_and_invalid_material_fail_without_candidate_echo() {
+    let provider = MemorySecretProvider::try_new_with_capacity(
         provider_id(),
-        MemorySecretProviderRuntimeMode::LocalDevelopment,
+        MemorySecretProviderRuntimeMode::Test,
+        1,
     )
     .unwrap();
-    let port: &dyn SecretProvider = &provider;
-    assert_eq!(port.provider_id(), &provider_id());
-    assert_eq!(
-        provider.insert_synthetic(
-            tenant(2),
-            secret_ref(3),
-            0,
-            "version-1".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::InvalidCoordinates)
-    );
-    assert_eq!(
-        provider.insert_synthetic(
-            TenantId::from(Uuid::nil()),
-            secret_ref(3),
-            1,
-            "version-1".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::InvalidCoordinates)
-    );
-    let error = provider
+    provider
         .insert_synthetic(
-            tenant(2),
-            secret_ref(3),
+            tenant(1),
+            ref_id(),
             1,
-            "version-1".parse().unwrap(),
-            Vec::new(),
+            version("version-1"),
+            b"first".to_vec(),
         )
+        .unwrap();
+    assert_eq!(
+        provider
+            .insert_synthetic(
+                tenant(2),
+                secret_id(20),
+                1,
+                version("version-1"),
+                b"PRIVATE_SECRET_CANARY".to_vec(),
+            )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::CapacityExceeded
+    );
+    let invalid =
+        MemorySecretProvider::try_new(secret_id(21), MemorySecretProviderRuntimeMode::Test)
+            .unwrap();
+    let error = invalid
+        .insert_synthetic(tenant(1), ref_id(), 1, version("version-1"), Vec::new())
         .unwrap_err();
     assert_eq!(error, MemorySecretProviderConfigError::InvalidMaterial);
-    assert!(!error.to_string().contains(CANARY));
-    assert_eq!(provider.fetch_call_count(), 0);
-    assert_eq!(provider.control_call_count(), 0);
+    assert!(!format!("{error:?}").contains("PRIVATE_SECRET_CANARY"));
+}
 
+#[test]
+fn duplicate_rotation_and_poisoned_state_fail_closed() {
+    let provider =
+        MemorySecretProvider::try_new(provider_id(), MemorySecretProviderRuntimeMode::Test)
+            .unwrap();
+    provider
+        .insert_synthetic(
+            tenant(1),
+            ref_id(),
+            1,
+            version("version-1"),
+            b"first".to_vec(),
+        )
+        .unwrap();
+    assert_eq!(
+        provider
+            .insert_synthetic(
+                tenant(1),
+                ref_id(),
+                1,
+                version("version-1"),
+                b"duplicate".to_vec(),
+            )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::DuplicateEntry
+    );
+    assert_eq!(
+        provider
+            .rotate_synthetic(
+                tenant(1),
+                ref_id(),
+                1,
+                &version("missing"),
+                version("version-2"),
+                b"new".to_vec(),
+            )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::EntryNotAvailable
+    );
+
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = provider.state.lock().unwrap();
+        panic!("poison test lock");
+    }));
+    assert_eq!(
+        provider
+            .insert_synthetic(
+                tenant(2),
+                secret_id(30),
+                1,
+                version("version-1"),
+                b"after-poison".to_vec(),
+            )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::StateUnavailable
+    );
+}
+
+#[test]
+fn debug_and_errors_are_redacted_and_trait_object_is_real() {
+    let provider = Arc::new(
+        MemorySecretProvider::try_new(provider_id(), MemorySecretProviderRuntimeMode::Test)
+            .unwrap(),
+    );
+    let rendered = format!("{provider:?}");
+    assert!(rendered.contains("<redacted>"));
+    assert!(!rendered.contains("material"));
+    let port: Arc<dyn SecretProvider> = provider;
+    assert_eq!(port.provider_id(), &provider_id());
     for error in [
         MemorySecretProviderConfigError::UnsupportedRuntimeMode,
         MemorySecretProviderConfigError::InvalidCoordinates,
         MemorySecretProviderConfigError::InvalidMaterial,
         MemorySecretProviderConfigError::DuplicateEntry,
         MemorySecretProviderConfigError::EntryNotAvailable,
+        MemorySecretProviderConfigError::CapacityExceeded,
         MemorySecretProviderConfigError::StateUnavailable,
     ] {
         assert_eq!(error.to_string(), error.code());
-        assert!(!error.code().contains(CANARY));
     }
 }
 
 #[test]
-fn scoped_provider_operations_cover_fetch_controls_health_and_failures() {
+fn private_provider_helpers_cover_health_erasure_and_fixed_failures() {
+    assert_eq!(
+        MemorySecretProvider::try_new_with_capacity(
+            provider_id(),
+            MemorySecretProviderRuntimeMode::Test,
+            MAX_CONFIGURED_ENTRIES + 1,
+        )
+        .unwrap_err(),
+        MemorySecretProviderConfigError::CapacityExceeded
+    );
+
     let provider_id = provider_id();
+    let tenant_id = tenant(1);
+    let ref_id = ref_id();
+    let current_version = version("version-1");
     let provider =
         MemorySecretProvider::try_new(provider_id.clone(), MemorySecretProviderRuntimeMode::Test)
             .unwrap();
-    let tenant_id = tenant(2);
-    let ref_id = secret_ref(3);
-    let version: SecretProviderVersionRef = "version-1".parse().unwrap();
-    let audit_id = SecretProviderAuditId::try_from(uuid(4)).unwrap();
-    let observed_at: CanonicalTimestampV1 = "2026-07-24T12:00:00.000000Z".parse().unwrap();
+    for result in [
+        provider.insert_synthetic(
+            TenantId::from(Uuid::nil()),
+            ref_id.clone(),
+            1,
+            current_version.clone(),
+            b"private".to_vec(),
+        ),
+        provider.insert_synthetic(
+            tenant_id.clone(),
+            ref_id.clone(),
+            0,
+            current_version.clone(),
+            b"private".to_vec(),
+        ),
+        provider.insert_synthetic(
+            tenant_id.clone(),
+            ref_id.clone(),
+            MAX_SAFE_INTEGER + 1,
+            current_version.clone(),
+            b"private".to_vec(),
+        ),
+    ] {
+        assert_eq!(
+            result.unwrap_err(),
+            MemorySecretProviderConfigError::InvalidCoordinates
+        );
+    }
+    assert_eq!(
+        provider
+            .insert_synthetic(
+                tenant_id.clone(),
+                ref_id.clone(),
+                1,
+                current_version.clone(),
+                vec![0; MAX_MATERIAL_BYTES + 1],
+            )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::InvalidMaterial
+    );
     provider
         .insert_synthetic(
             tenant_id.clone(),
             ref_id.clone(),
             1,
-            version.clone(),
-            CANARY.as_bytes().to_vec(),
+            current_version.clone(),
+            b"private".to_vec(),
         )
         .unwrap();
-    assert_eq!(
-        provider.insert_synthetic(
+    provider
+        .insert_synthetic(
             tenant_id.clone(),
             ref_id.clone(),
             1,
-            version.clone(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::DuplicateEntry)
-    );
-
-    let fetched = provider
-        .fetch_scoped(
-            coordinates(&provider_id, &tenant_id, &ref_id, &version),
-            audit_coordinates(
-                &audit_id,
-                &provider_id,
-                &tenant_id,
-                &ref_id,
-                &version,
-                &observed_at,
-            ),
+            version("version-2"),
+            b"replacement".to_vec(),
         )
         .unwrap();
-    let (material, audit) = fetched.into_parts();
-    material.expose_borrowed(|bytes| assert_eq!(bytes, CANARY.as_bytes()));
-    assert_eq!(audit.operation(), SecretProviderOperation::Fetch);
-    assert_eq!(provider.fetch_call_count(), 1);
-    let nil_tenant = TenantId::from(Uuid::nil());
     assert_eq!(
         provider
-            .fetch_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &nil_tenant,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
+            .rotate_synthetic(
+                tenant_id.clone(),
+                ref_id.clone(),
+                1,
+                &current_version,
+                version("version-2"),
+                b"duplicate".to_vec(),
             )
+            .unwrap_err(),
+        MemorySecretProviderConfigError::DuplicateEntry
+    );
+
+    let observed_at: CanonicalTimestampV1 = "2026-07-24T12:00:00.000000Z".parse().unwrap();
+    let health = provider.health_scoped(&provider_id, &observed_at).unwrap();
+    assert_eq!(health.secret_provider_id(), &provider_id);
+    assert!(health.available());
+    assert_eq!(health.observed_at(), &observed_at);
+    assert_eq!(
+        health.schema_version(),
+        splendor_authority::PROCESS_LOCAL_SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_V1
+    );
+    assert_eq!(provider.control_call_count(), 1);
+    let wrong_provider = secret_id(900);
+    assert_eq!(
+        provider
+            .health_scoped(&wrong_provider, &observed_at)
             .unwrap_err()
             .code(),
-        SecretProviderErrorCode::IntegrityFailure
+        SecretProviderErrorCode::VersionNotAvailable
     );
     assert_eq!(
         provider
-            .fetch_coordinates(coordinates(
-                &SecretProviderId::try_from(uuid(98)).unwrap(),
+            .erase_coordinates(coordinates(
+                &wrong_provider,
                 &tenant_id,
                 &ref_id,
-                &version,
+                &current_version,
             ))
             .unwrap_err()
             .code(),
         SecretProviderErrorCode::VersionNotAvailable
     );
-    assert_eq!(provider.fetch_call_count(), 2);
-
-    for operation in [
-        SecretProviderOperation::Renew,
-        SecretProviderOperation::Audit,
-    ] {
-        let evidence = provider
-            .inspect_control_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
-                operation,
-            )
-            .unwrap();
-        assert_eq!(evidence.operation(), operation);
-        assert_eq!(evidence.outcome(), SecretProviderOutcome::Succeeded);
-    }
-    let health = provider.health_scoped(&provider_id, &observed_at).unwrap();
-    assert!(health.available());
-    assert_eq!(health.secret_provider_id(), &provider_id);
     assert_eq!(
         provider
-            .health_scoped(&SecretProviderId::try_from(uuid(99)).unwrap(), &observed_at)
-            .unwrap_err()
-            .code(),
-        SecretProviderErrorCode::VersionNotAvailable
-    );
-    assert_eq!(
-        provider
-            .revoke_scoped(
-                coordinates(
-                    &SecretProviderId::try_from(uuid(97)).unwrap(),
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                ),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
+            .with_entry(
+                coordinates(&provider_id, &tenant_id, &ref_id, &current_version),
+                |_| Err::<(), _>(provider_error(SecretProviderErrorCode::RateLimited)),
             )
             .unwrap_err()
             .code(),
-        SecretProviderErrorCode::VersionNotAvailable
+        SecretProviderErrorCode::RateLimited
     );
 
     provider.set_available(false);
+    let health = provider.health_scoped(&provider_id, &observed_at).unwrap();
+    assert!(!health.available());
     assert_eq!(
         provider
-            .inspect_control_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
-                SecretProviderOperation::Audit,
-            )
-            .unwrap_err()
-            .code(),
-        SecretProviderErrorCode::Unavailable
-    );
-    let unavailable_health = provider.health_scoped(&provider_id, &observed_at).unwrap();
-    assert!(!unavailable_health.available());
-    assert_eq!(
-        provider
-            .revoke_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
-            )
+            .erase_coordinates(coordinates(
+                &provider_id,
+                &tenant_id,
+                &ref_id,
+                &current_version,
+            ))
             .unwrap_err()
             .code(),
         SecretProviderErrorCode::Unavailable
     );
     provider.set_available(true);
-
-    let revoke = provider
-        .revoke_scoped(
-            coordinates(&provider_id, &tenant_id, &ref_id, &version),
-            audit_coordinates(
-                &audit_id,
+    provider
+        .erase_coordinates(coordinates(
+            &provider_id,
+            &tenant_id,
+            &ref_id,
+            &current_version,
+        ))
+        .unwrap();
+    assert_eq!(
+        provider
+            .erase_coordinates(coordinates(
                 &provider_id,
                 &tenant_id,
                 &ref_id,
-                &version,
-                &observed_at,
-            ),
-        )
-        .unwrap();
-    assert_eq!(revoke.operation(), SecretProviderOperation::Revoke);
-    assert_eq!(
-        provider
-            .fetch_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &version,
-                    &observed_at,
-                ),
-            )
-            .unwrap_err()
-            .code(),
-        SecretProviderErrorCode::Revoked
-    );
-    assert_eq!(provider.control_call_count(), 9);
-
-    let missing_version: SecretProviderVersionRef = "missing".parse().unwrap();
-    assert_eq!(
-        provider
-            .revoke_scoped(
-                coordinates(&provider_id, &tenant_id, &ref_id, &missing_version),
-                audit_coordinates(
-                    &audit_id,
-                    &provider_id,
-                    &tenant_id,
-                    &ref_id,
-                    &missing_version,
-                    &observed_at,
-                ),
-            )
+                &current_version,
+            ))
             .unwrap_err()
             .code(),
         SecretProviderErrorCode::VersionNotAvailable
@@ -548,104 +601,39 @@ fn scoped_provider_operations_cover_fetch_controls_health_and_failures() {
 }
 
 #[test]
-fn mutation_failures_and_poisoned_state_are_closed() {
+fn poisoned_private_provider_helpers_fail_closed() {
     let provider_id = provider_id();
-    let provider = MemorySecretProvider::try_new(
-        provider_id.clone(),
-        MemorySecretProviderRuntimeMode::LocalDevelopment,
-    )
-    .unwrap();
-    let tenant_id = tenant(2);
-    let ref_id = secret_ref(3);
-    let old_version: SecretProviderVersionRef = "version-1".parse().unwrap();
-    let new_version: SecretProviderVersionRef = "version-2".parse().unwrap();
-    assert_eq!(
-        provider.rotate_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            &old_version,
-            new_version.clone(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::EntryNotAvailable)
-    );
-    provider
-        .insert_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            old_version.clone(),
-            CANARY.as_bytes().to_vec(),
-        )
-        .unwrap();
-    provider
-        .insert_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            new_version.clone(),
-            CANARY.as_bytes().to_vec(),
-        )
-        .unwrap();
-    assert_eq!(
-        provider.rotate_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            &old_version,
-            new_version,
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::DuplicateEntry)
-    );
-    assert_eq!(
-        provider.rotate_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            0,
-            &old_version,
-            "version-3".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::InvalidCoordinates)
-    );
-    assert_eq!(
-        provider.rotate_synthetic(
-            TenantId::from(Uuid::nil()),
-            ref_id.clone(),
-            1,
-            &old_version,
-            "version-3".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::InvalidCoordinates)
-    );
-    assert_eq!(
-        provider.rotate_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            &old_version,
-            "version-3".parse().unwrap(),
-            Vec::new(),
-        ),
-        Err(MemorySecretProviderConfigError::InvalidMaterial)
-    );
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let tenant_id = tenant(1);
+    let ref_id = ref_id();
+    let current_version = version("version-1");
+    let provider =
+        MemorySecretProvider::try_new(provider_id.clone(), MemorySecretProviderRuntimeMode::Test)
+            .unwrap();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
         let _guard = provider.state.lock().unwrap();
-        panic!("poison memory provider state for fail-closed test");
+        panic!("poison private helper lock");
     }));
     assert_eq!(
-        provider.insert_synthetic(
-            tenant_id.clone(),
-            ref_id.clone(),
-            1,
-            "version-4".parse().unwrap(),
-            CANARY.as_bytes().to_vec(),
-        ),
-        Err(MemorySecretProviderConfigError::StateUnavailable)
+        provider
+            .with_entry(
+                coordinates(&provider_id, &tenant_id, &ref_id, &current_version),
+                |_| Ok(()),
+            )
+            .unwrap_err()
+            .code(),
+        SecretProviderErrorCode::InternalFailure
+    );
+    assert_eq!(
+        provider
+            .erase_coordinates(coordinates(
+                &provider_id,
+                &tenant_id,
+                &ref_id,
+                &current_version,
+            ))
+            .unwrap_err()
+            .code(),
+        SecretProviderErrorCode::InternalFailure
     );
     let observed_at: CanonicalTimestampV1 = "2026-07-24T12:00:00.000000Z".parse().unwrap();
     assert_eq!(
@@ -655,4 +643,5 @@ fn mutation_failures_and_poisoned_state_are_closed() {
             .code(),
         SecretProviderErrorCode::InternalFailure
     );
+    provider.set_available(false);
 }

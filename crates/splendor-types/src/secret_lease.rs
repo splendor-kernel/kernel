@@ -8,11 +8,12 @@
 use crate::driver::is_driver_destination_schema_v1;
 use crate::{
     validate_driver_operation_ref_v1, CanonicalTimestampV1, DriverCredentialDestinationDigest,
-    DriverOperationRef, InstanceId, NodeId, PrincipalId, SecretAccessEventId, SecretAudienceId,
-    SecretCredentialSlotId, SecretDeliveryExposureProfile, SecretDeliveryHandleId,
-    SecretDeliveryMethod, SecretLeaseId, SecretLeaseRequestId, SecretProviderVersionRef,
-    SecretPurpose, SecretRefId, SecretUseClaimId, SecretUseIntent, SecretUseRequirement, TenantId,
-    WorkloadId,
+    DriverOperationRef, DriverTrustedSendProfileV1, InstanceId, NodeId, PrincipalId,
+    SecretAccessEventId, SecretAudienceId, SecretCredentialSlotId, SecretDeliveryExposureProfile,
+    SecretDeliveryHandleId, SecretDeliveryMethod, SecretLeaseId, SecretLeaseRequestId,
+    SecretProviderId, SecretProviderVersionRef, SecretPurpose, SecretRefId, SecretRenewalCommandId,
+    SecretRevocationCommandId, SecretUseAttemptId, SecretUseClaimId, SecretUseIntent,
+    SecretUseRequirement, TenantId, WorkloadId,
 };
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -37,7 +38,7 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// This value is safe to persist, but it is not authority and cannot resolve a
 /// secret. Fields are private so invalid or partially bound values cannot be
 /// assembled with a struct literal.
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecretLeaseUseBinding {
     tenant_id: TenantId,
     principal_id: PrincipalId,
@@ -48,11 +49,13 @@ pub struct SecretLeaseUseBinding {
     destination_schema: String,
     destination_digest: DriverCredentialDestinationDigest,
     delivery_exposure_profile: SecretDeliveryExposureProfile,
+    trusted_send_profile: DriverTrustedSendProfileV1,
     node_id: NodeId,
     instance_id: InstanceId,
     audience_id: SecretAudienceId,
     secret_ref_id: SecretRefId,
     secret_ref_revision: u64,
+    secret_provider_id: SecretProviderId,
     provider_version_ref: SecretProviderVersionRef,
     intent: SecretUseIntent,
     purpose: SecretPurpose,
@@ -72,11 +75,13 @@ impl SecretLeaseUseBinding {
         destination_schema: impl Into<String>,
         destination_digest: DriverCredentialDestinationDigest,
         delivery_exposure_profile: SecretDeliveryExposureProfile,
+        trusted_send_profile: DriverTrustedSendProfileV1,
         node_id: NodeId,
         instance_id: InstanceId,
         audience_id: SecretAudienceId,
         secret_ref_id: SecretRefId,
         secret_ref_revision: u64,
+        secret_provider_id: SecretProviderId,
         provider_version_ref: SecretProviderVersionRef,
         intent: SecretUseIntent,
         purpose: SecretPurpose,
@@ -108,6 +113,9 @@ impl SecretLeaseUseBinding {
         if !is_driver_destination_schema_v1(&destination_schema) {
             return Err(SecretLeaseContractError::InvalidDestinationSchema);
         }
+        if !trusted_send_profile.matches_exposure(delivery_exposure_profile) {
+            return Err(SecretLeaseContractError::InvalidTrustedSendProfile);
+        }
         Ok(Self {
             tenant_id,
             principal_id,
@@ -118,11 +126,13 @@ impl SecretLeaseUseBinding {
             destination_schema,
             destination_digest,
             delivery_exposure_profile,
+            trusted_send_profile,
             node_id,
             instance_id,
             audience_id,
             secret_ref_id,
             secret_ref_revision,
+            secret_provider_id,
             provider_version_ref,
             intent,
             purpose,
@@ -169,6 +179,10 @@ impl SecretLeaseUseBinding {
         self.delivery_exposure_profile
     }
 
+    pub const fn trusted_send_profile(&self) -> &DriverTrustedSendProfileV1 {
+        &self.trusted_send_profile
+    }
+
     pub const fn node_id(&self) -> &NodeId {
         &self.node_id
     }
@@ -187,6 +201,10 @@ impl SecretLeaseUseBinding {
 
     pub const fn secret_ref_revision(&self) -> u64 {
         self.secret_ref_revision
+    }
+
+    pub const fn secret_provider_id(&self) -> &SecretProviderId {
+        &self.secret_provider_id
     }
 
     pub const fn provider_version_ref(&self) -> &SecretProviderVersionRef {
@@ -213,7 +231,7 @@ impl Serialize for SecretLeaseUseBinding {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("SecretLeaseUseBinding", 18)?;
+        let mut state = serializer.serialize_struct("SecretLeaseUseBinding", 20)?;
         state.serialize_field("audience_id", &self.audience_id)?;
         state.serialize_field("credential_slot_id", &self.credential_slot_id)?;
         state.serialize_field("delivery_exposure_profile", &self.delivery_exposure_profile)?;
@@ -233,7 +251,9 @@ impl Serialize for SecretLeaseUseBinding {
         state.serialize_field("schema_version", SECRET_LEASE_USE_BINDING_SCHEMA_V1)?;
         state.serialize_field("secret_ref_id", &self.secret_ref_id)?;
         state.serialize_field("secret_ref_revision", &self.secret_ref_revision)?;
+        state.serialize_field("secret_provider_id", &self.secret_provider_id)?;
         state.serialize_field("tenant_id", &self.tenant_id)?;
+        state.serialize_field("trusted_send_profile", &self.trusted_send_profile)?;
         state.serialize_field("workload_id", &self.workload_id)?;
         state.end()
     }
@@ -585,12 +605,28 @@ pub enum SecretAccessDenialCode {
     RenewalNotAllowed,
     ContinuousLifetimeExceeded,
     RequestAlreadyUsed,
+    CommandConflict,
+    CapacityExceeded,
+}
+
+/// Typed identity of the process-local command represented by one evidence row.
+///
+/// The variants keep issue, use, renewal, and revocation command identities
+/// distinct while allowing one bounded local evidence shape.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ProcessLocalSecretBrokerCommandId {
+    LeaseRequest(SecretLeaseRequestId),
+    UseAttempt(SecretUseAttemptId),
+    Renewal(SecretRenewalCommandId),
+    Revocation(SecretRevocationCommandId),
 }
 
 /// Structured, serializable, ref-only evidence emitted at the broker seam.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretAccessEvidence {
     secret_access_event_id: SecretAccessEventId,
+    command_id: ProcessLocalSecretBrokerCommandId,
     kind: SecretAccessEvidenceKind,
     outcome: SecretAccessEvidenceOutcome,
     use_binding: SecretLeaseUseBinding,
@@ -608,6 +644,7 @@ impl SecretAccessEvidence {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         secret_access_event_id: SecretAccessEventId,
+        command_id: ProcessLocalSecretBrokerCommandId,
         kind: SecretAccessEvidenceKind,
         outcome: SecretAccessEvidenceOutcome,
         use_binding: SecretLeaseUseBinding,
@@ -645,6 +682,7 @@ impl SecretAccessEvidence {
         }
         Ok(Self {
             secret_access_event_id,
+            command_id,
             kind,
             outcome,
             use_binding,
@@ -665,6 +703,10 @@ impl SecretAccessEvidence {
 
     pub const fn secret_access_event_id(&self) -> &SecretAccessEventId {
         &self.secret_access_event_id
+    }
+
+    pub const fn command_id(&self) -> &ProcessLocalSecretBrokerCommandId {
+        &self.command_id
     }
 
     pub const fn kind(&self) -> SecretAccessEvidenceKind {
@@ -717,12 +759,13 @@ impl Serialize for SecretAccessEvidence {
     where
         S: Serializer,
     {
-        let field_count = 9
+        let field_count = 10
             + usize::from(self.delivery_handle_id.is_some())
             + usize::from(self.denial_code.is_some())
             + usize::from(self.secret_lease_id.is_some())
             + usize::from(self.secret_use_claim_id.is_some());
         let mut state = serializer.serialize_struct("SecretAccessEvidence", field_count)?;
+        state.serialize_field("command_id", &self.command_id)?;
         if let Some(handle_id) = &self.delivery_handle_id {
             state.serialize_field("delivery_handle_id", handle_id)?;
         }
@@ -759,6 +802,7 @@ pub enum SecretLeaseContractError {
     InvalidDriverOperation,
     InvalidDriverDeclarationRevision,
     InvalidDestinationSchema,
+    InvalidTrustedSendProfile,
     InvalidSecretRefRevision,
     RequirementBindingMismatch,
     InvalidTimeWindow,
@@ -780,6 +824,7 @@ impl SecretLeaseContractError {
             Self::InvalidDriverOperation => "invalid_driver_operation",
             Self::InvalidDriverDeclarationRevision => "invalid_driver_declaration_revision",
             Self::InvalidDestinationSchema => "invalid_destination_schema",
+            Self::InvalidTrustedSendProfile => "invalid_trusted_send_profile",
             Self::InvalidSecretRefRevision => "invalid_secret_ref_revision",
             Self::RequirementBindingMismatch => "requirement_binding_mismatch",
             Self::InvalidTimeWindow => "invalid_time_window",

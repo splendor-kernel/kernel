@@ -1,3 +1,5 @@
+#![cfg(any(feature = "memory-secret-provider", test))]
+
 //! Deterministic in-memory Secret Provider for tests and explicit local use.
 //!
 //! The provider opens no listener, has no environment fallback, and cannot be
@@ -6,14 +8,20 @@
 //! does not expose an independent material-resolution API.
 
 use splendor_authority::{
-    SecretMaterial, SecretProvider, SecretProviderAuditEvidence, SecretProviderControlRequest,
-    SecretProviderError, SecretProviderErrorCode, SecretProviderFetchRequest,
-    SecretProviderFetchResult, SecretProviderHealthEvidence, SecretProviderOperation,
-    SecretProviderOutcome,
+    ProcessLocalSecretProvider as SecretProvider,
+    ProcessLocalSecretProviderAuditEvidence as SecretProviderAuditEvidence,
+    ProcessLocalSecretProviderControlRequest as SecretProviderControlRequest,
+    ProcessLocalSecretProviderError as SecretProviderError,
+    ProcessLocalSecretProviderErrorCode as SecretProviderErrorCode,
+    ProcessLocalSecretProviderFetchRequest as SecretProviderFetchRequest,
+    ProcessLocalSecretProviderFetchResult as SecretProviderFetchResult,
+    ProcessLocalSecretProviderHealthEvidence as SecretProviderHealthEvidence,
+    ProcessLocalSecretProviderOperation as SecretProviderOperation,
+    ProcessLocalSecretProviderOutcome as SecretProviderOutcome,
 };
 use splendor_types::{
-    CanonicalTimestampV1, EffectCertainty, SecretProviderAuditId, SecretProviderId,
-    SecretProviderVersionRef, SecretRefId, TenantId,
+    CanonicalTimestampV1, EffectCertainty, SecretProviderId, SecretProviderVersionRef, SecretRefId,
+    TenantId,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -24,6 +32,8 @@ use zeroize::Zeroizing;
 
 const MAX_MATERIAL_BYTES: usize = 65_536;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const DEFAULT_MAX_ENTRIES: usize = 256;
+const MAX_CONFIGURED_ENTRIES: usize = 4_096;
 
 /// Explicit runtime modes accepted or rejected by the test/dev provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +55,7 @@ pub enum MemorySecretProviderConfigError {
     InvalidMaterial,
     DuplicateEntry,
     EntryNotAvailable,
+    CapacityExceeded,
     StateUnavailable,
 }
 
@@ -56,6 +67,7 @@ impl MemorySecretProviderConfigError {
             Self::InvalidMaterial => "memory_secret_provider_material_invalid",
             Self::DuplicateEntry => "memory_secret_provider_entry_duplicate",
             Self::EntryNotAvailable => "memory_secret_provider_entry_not_available",
+            Self::CapacityExceeded => "memory_secret_provider_capacity_exceeded",
             Self::StateUnavailable => "memory_secret_provider_state_unavailable",
         }
     }
@@ -73,6 +85,7 @@ impl Error for MemorySecretProviderConfigError {}
 pub struct MemorySecretProvider {
     provider_id: SecretProviderId,
     state: Mutex<MemoryProviderState>,
+    max_entries: usize,
     fetch_calls: AtomicU64,
     control_calls: AtomicU64,
 }
@@ -93,7 +106,6 @@ struct MemoryEntryKey {
 
 struct MemoryEntry {
     material: Zeroizing<Vec<u8>>,
-    revoked: bool,
 }
 
 struct FetchCoordinates<'a> {
@@ -104,21 +116,20 @@ struct FetchCoordinates<'a> {
     provider_version_ref: &'a SecretProviderVersionRef,
 }
 
-struct AuditCoordinates<'a> {
-    provider_audit_id: &'a SecretProviderAuditId,
-    provider_id: &'a SecretProviderId,
-    tenant_id: &'a TenantId,
-    secret_ref_id: &'a SecretRefId,
-    secret_ref_revision: u64,
-    provider_version_ref: &'a SecretProviderVersionRef,
-    observed_at: &'a CanonicalTimestampV1,
-}
-
 impl MemorySecretProvider {
     /// Constructs only in explicit test or local-development mode.
     pub fn try_new(
         provider_id: SecretProviderId,
         mode: MemorySecretProviderRuntimeMode,
+    ) -> Result<Self, MemorySecretProviderConfigError> {
+        Self::try_new_with_capacity(provider_id, mode, DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Constructs with one explicit finite entry ceiling.
+    pub fn try_new_with_capacity(
+        provider_id: SecretProviderId,
+        mode: MemorySecretProviderRuntimeMode,
+        max_entries: usize,
     ) -> Result<Self, MemorySecretProviderConfigError> {
         if !matches!(
             mode,
@@ -127,12 +138,16 @@ impl MemorySecretProvider {
         ) {
             return Err(MemorySecretProviderConfigError::UnsupportedRuntimeMode);
         }
+        if max_entries == 0 || max_entries > MAX_CONFIGURED_ENTRIES {
+            return Err(MemorySecretProviderConfigError::CapacityExceeded);
+        }
         Ok(Self {
             provider_id,
             state: Mutex::new(MemoryProviderState {
                 available: true,
                 entries: HashMap::new(),
             }),
+            max_entries,
             fetch_calls: AtomicU64::new(0),
             control_calls: AtomicU64::new(0),
         })
@@ -148,9 +163,10 @@ impl MemorySecretProvider {
         provider_version_ref: SecretProviderVersionRef,
         material: Vec<u8>,
     ) -> Result<(), MemorySecretProviderConfigError> {
+        let material = Zeroizing::new(material);
         validate_tenant(&tenant_id)?;
         validate_revision(secret_ref_revision)?;
-        validate_material(&material)?;
+        validate_material(material.as_slice())?;
         let mut state = self
             .state
             .lock()
@@ -164,17 +180,14 @@ impl MemorySecretProvider {
         if state.entries.contains_key(&key) {
             return Err(MemorySecretProviderConfigError::DuplicateEntry);
         }
-        state.entries.insert(
-            key,
-            MemoryEntry {
-                material: Zeroizing::new(material),
-                revoked: false,
-            },
-        );
+        if state.entries.len() >= self.max_entries {
+            return Err(MemorySecretProviderConfigError::CapacityExceeded);
+        }
+        state.entries.insert(key, MemoryEntry { material });
         Ok(())
     }
 
-    /// Rotates to a new exact version and marks the old provider entry revoked.
+    /// Rotates to a new exact version and erases the old provider entry.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_synthetic(
         &self,
@@ -185,9 +198,10 @@ impl MemorySecretProvider {
         new_provider_version_ref: SecretProviderVersionRef,
         material: Vec<u8>,
     ) -> Result<(), MemorySecretProviderConfigError> {
+        let material = Zeroizing::new(material);
         validate_tenant(&tenant_id)?;
         validate_revision(secret_ref_revision)?;
-        validate_material(&material)?;
+        validate_material(material.as_slice())?;
         let mut state = self
             .state
             .lock()
@@ -207,18 +221,11 @@ impl MemorySecretProvider {
         if state.entries.contains_key(&new_key) {
             return Err(MemorySecretProviderConfigError::DuplicateEntry);
         }
-        let old = state
+        state
             .entries
-            .get_mut(&old_key)
+            .remove(&old_key)
             .ok_or(MemorySecretProviderConfigError::EntryNotAvailable)?;
-        old.revoked = true;
-        state.entries.insert(
-            new_key,
-            MemoryEntry {
-                material: Zeroizing::new(material),
-                revoked: false,
-            },
-        );
+        state.entries.insert(new_key, MemoryEntry { material });
         Ok(())
     }
 
@@ -239,29 +246,21 @@ impl MemorySecretProvider {
         self.control_calls.load(Ordering::SeqCst)
     }
 
-    fn fetch_coordinates(
+    fn fetch_scoped<'session>(
         &self,
-        coordinates: FetchCoordinates<'_>,
-    ) -> Result<SecretMaterial, SecretProviderError> {
-        self.with_entry(coordinates, |entry| {
-            SecretMaterial::try_new(entry.material.as_slice().to_vec())
-        })
-    }
-
-    fn fetch_scoped(
-        &self,
-        coordinates: FetchCoordinates<'_>,
-        audit: AuditCoordinates<'_>,
-    ) -> Result<SecretProviderFetchResult, SecretProviderError> {
+        request: &'session SecretProviderFetchRequest,
+    ) -> Result<SecretProviderFetchResult<'session>, SecretProviderError> {
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
-        let material = self.fetch_coordinates(coordinates)?;
-        let audit = audit_evidence(
-            audit,
-            SecretProviderOperation::Fetch,
+        let audit = SecretProviderAuditEvidence::for_fetch_request(
+            request,
             SecretProviderOutcome::Succeeded,
             EffectCertainty::Known,
+            request.requested_at().clone(),
         )?;
-        SecretProviderFetchResult::try_new(material, audit)
+        let material = self.with_entry(fetch_coordinates(request), |entry| {
+            Ok(entry.material.as_slice().to_vec())
+        })?;
+        SecretProviderFetchResult::try_new(request, material, audit)
     }
 
     fn with_entry<R>(
@@ -289,34 +288,44 @@ impl MemorySecretProvider {
             .entries
             .get(&key)
             .ok_or_else(|| provider_error(SecretProviderErrorCode::VersionNotAvailable))?;
-        if entry.revoked {
-            return Err(provider_error(SecretProviderErrorCode::Revoked));
-        }
         inspect(entry)
     }
 
     fn inspect_control_scoped(
         &self,
-        coordinates: FetchCoordinates<'_>,
-        audit: AuditCoordinates<'_>,
+        request: &SecretProviderControlRequest,
         operation: SecretProviderOperation,
     ) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
         self.control_calls.fetch_add(1, Ordering::SeqCst);
-        self.with_entry(coordinates, |_| Ok(()))?;
-        audit_evidence(
-            audit,
+        self.with_entry(control_coordinates(request), |_| Ok(()))?;
+        SecretProviderAuditEvidence::for_control_request(
+            request,
             operation,
             SecretProviderOutcome::Succeeded,
             EffectCertainty::Known,
+            request.requested_at().clone(),
         )
     }
 
     fn revoke_scoped(
         &self,
-        coordinates: FetchCoordinates<'_>,
-        audit: AuditCoordinates<'_>,
+        request: &SecretProviderControlRequest,
     ) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
         self.control_calls.fetch_add(1, Ordering::SeqCst);
+        self.erase_coordinates(control_coordinates(request))?;
+        SecretProviderAuditEvidence::for_control_request(
+            request,
+            SecretProviderOperation::Revoke,
+            SecretProviderOutcome::Succeeded,
+            EffectCertainty::Known,
+            request.requested_at().clone(),
+        )
+    }
+
+    fn erase_coordinates(
+        &self,
+        coordinates: FetchCoordinates<'_>,
+    ) -> Result<(), SecretProviderError> {
         if coordinates.provider_id != &self.provider_id {
             return Err(provider_error(SecretProviderErrorCode::VersionNotAvailable));
         }
@@ -333,17 +342,11 @@ impl MemorySecretProvider {
             secret_ref_revision: coordinates.secret_ref_revision,
             provider_version_ref: coordinates.provider_version_ref.clone(),
         };
-        let entry = state
+        state
             .entries
-            .get_mut(&key)
+            .remove(&key)
             .ok_or_else(|| provider_error(SecretProviderErrorCode::VersionNotAvailable))?;
-        entry.revoked = true;
-        audit_evidence(
-            audit,
-            SecretProviderOperation::Revoke,
-            SecretProviderOutcome::Succeeded,
-            EffectCertainty::Known,
-        )
+        Ok(())
     }
 
     fn health_scoped(
@@ -382,43 +385,32 @@ impl SecretProvider for MemorySecretProvider {
         &self.provider_id
     }
 
-    fn fetch(
+    fn fetch<'session>(
         &self,
-        request: &SecretProviderFetchRequest,
-    ) -> Result<SecretProviderFetchResult, SecretProviderError> {
-        self.fetch_scoped(fetch_coordinates(request), audit_coordinates(request))
+        request: &'session SecretProviderFetchRequest,
+    ) -> Result<SecretProviderFetchResult<'session>, SecretProviderError> {
+        self.fetch_scoped(request)
     }
 
     fn renew(
         &self,
         request: &SecretProviderControlRequest,
     ) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
-        self.inspect_control_scoped(
-            control_coordinates(request),
-            control_audit_coordinates(request),
-            SecretProviderOperation::Renew,
-        )
+        self.inspect_control_scoped(request, SecretProviderOperation::Renew)
     }
 
     fn revoke(
         &self,
         request: &SecretProviderControlRequest,
     ) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
-        self.revoke_scoped(
-            control_coordinates(request),
-            control_audit_coordinates(request),
-        )
+        self.revoke_scoped(request)
     }
 
     fn audit(
         &self,
         request: &SecretProviderControlRequest,
     ) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
-        self.inspect_control_scoped(
-            control_coordinates(request),
-            control_audit_coordinates(request),
-            SecretProviderOperation::Audit,
-        )
+        self.inspect_control_scoped(request, SecretProviderOperation::Audit)
     }
 
     fn health(
@@ -467,18 +459,6 @@ fn fetch_coordinates(request: &SecretProviderFetchRequest) -> FetchCoordinates<'
     }
 }
 
-fn audit_coordinates(request: &SecretProviderFetchRequest) -> AuditCoordinates<'_> {
-    AuditCoordinates {
-        provider_audit_id: request.provider_audit_id(),
-        provider_id: request.secret_provider_id(),
-        tenant_id: request.tenant_id(),
-        secret_ref_id: request.secret_ref_id(),
-        secret_ref_revision: request.secret_ref_revision(),
-        provider_version_ref: request.provider_version_ref(),
-        observed_at: request.requested_at(),
-    }
-}
-
 fn control_coordinates(request: &SecretProviderControlRequest) -> FetchCoordinates<'_> {
     FetchCoordinates {
         provider_id: request.secret_provider_id(),
@@ -487,38 +467,6 @@ fn control_coordinates(request: &SecretProviderControlRequest) -> FetchCoordinat
         secret_ref_revision: request.secret_ref_revision(),
         provider_version_ref: request.provider_version_ref(),
     }
-}
-
-fn control_audit_coordinates(request: &SecretProviderControlRequest) -> AuditCoordinates<'_> {
-    AuditCoordinates {
-        provider_audit_id: request.provider_audit_id(),
-        provider_id: request.secret_provider_id(),
-        tenant_id: request.tenant_id(),
-        secret_ref_id: request.secret_ref_id(),
-        secret_ref_revision: request.secret_ref_revision(),
-        provider_version_ref: request.provider_version_ref(),
-        observed_at: request.requested_at(),
-    }
-}
-
-fn audit_evidence(
-    coordinates: AuditCoordinates<'_>,
-    operation: SecretProviderOperation,
-    outcome: SecretProviderOutcome,
-    effect_certainty: EffectCertainty,
-) -> Result<SecretProviderAuditEvidence, SecretProviderError> {
-    SecretProviderAuditEvidence::try_new(
-        coordinates.provider_audit_id.clone(),
-        coordinates.provider_id.clone(),
-        coordinates.tenant_id.clone(),
-        coordinates.secret_ref_id.clone(),
-        coordinates.secret_ref_revision,
-        coordinates.provider_version_ref.clone(),
-        operation,
-        outcome,
-        effect_certainty,
-        coordinates.observed_at.clone(),
-    )
 }
 
 #[cfg(test)]

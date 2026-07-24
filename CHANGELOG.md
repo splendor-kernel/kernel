@@ -6,23 +6,28 @@
 
 - **status/incomplete:** added the first process-local C03 Secret Broker owner
   slice for `SECR-001`, with bounded `SECR-003` renewal/revocation and
-  `SECR-005` provider-port progress. Additive local-only, ref-safe lease request,
-  snapshot, binding, and access-evidence contracts support exact
-  tenant/principal/workload/Driver/placement/audience/ref/version/purpose scope.
-  `splendor-authority` now owns finite issuance, atomic max-use claims, current
-  Authority/revocation rechecks, exact-expiry and clock-rollback denial, bounded
-  continuous renewal with old-handle invalidation, absorbing local revocation,
-  event-before-mutation fail-closed behavior, and inspect-only replay. Opaque
-  handles/claims and zeroizing provider material are non-cloneable,
-  non-serializable, and redacted. The Rust-only provider port has private request
-  construction and fixed errors; `splendor-adapter-secrets-memory` supplies a
-  deterministic test/local-development-only exact-version provider, with the
-  dependency guard permitting only its Authority/types edges. This slice is
-  process-local and non-restart-durable; it does not invoke a provider from the
-  broker, return material, add Gateway/node delivery, persistence,
+  `SECR-005` provider-port progress. Additive ref-safe contracts are exported
+  only under `ProcessLocal*` names and bind exact tenant, principal, workload,
+  Driver declaration/slot/destination/trusted-send profile, placement, audience,
+  ref/provider version, intent, and purpose coordinates. `splendor-authority`
+  owns finite issuance, an internal atomic max-use reservation, exact current
+  Authority/ref/Driver/revocation rechecks, scoped semantic idempotency retaining
+  first recorded terminal results, exact-expiry and clock-rollback denial,
+  immediate bounded renewal cutover, and absorbing local revocation. Bounded
+  owner-local evidence and lifecycle state commit atomically without an external
+  evidence callback; injected clock/ID callbacks run outside broker locks and
+  fail closed on reentrancy or panic. Inspect/replay and pre-Gateway claims are
+  internal. The Authority context constructor is crate-private and no production
+  composition path is claimed. Provider fetch results validate an exact request/audit digest,
+  retain bytes only in zeroizing request-borrowed `!Send`/`!Sync` storage, and
+  expose no material escape. `splendor-adapter-secrets-memory` is `publish =
+  false`, requires the explicit `memory-secret-provider` feature outside tests,
+  enforces finite exact-version storage, and erases rotated/revoked entries. This
+  slice is process-local and non-restart-durable; it does not invoke a provider
+  from the broker, return material, add Gateway/node delivery, persistence,
   daemon/API/SDK/generated surfaces, production providers, issue closure, or
   gold evidence. Its reduced records use explicit `*.local.v1` schemas rather
-  than claiming RFC 0012's complete durable wire records; `G08` and `G88` remain
+  than claiming RFC 0012's complete durable wire records; `G07` and `G08` remain
   `not_exercised`.
 - **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
   behavior-free C03 foundation lexical Rust primitives and the sole accepted
