@@ -2,34 +2,112 @@
 
 ## Status
 
-**status/incomplete — behavior-free C03 identities, pre-placement grammar,
-non-authorizing secret-use requirements, revision-bound secret references, and
-historical-v1 read/deny views only.**
+**status/incomplete — first process-local Secret Broker owner slice, with no
+material delivery or production durability.**
 
-The current implementation adds 40 behavior-free nominal UUID identity types,
-seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, a
-valid-by-construction `SecretLeasePolicy`, the strict `SecretUseRequirement` v1
-Rust contract, and RFC 0014's additive `SecretCredentialAuthorizationV2` and
-`SecretRefV2` contracts in `splendor-types`. It also decodes frozen v1 ref bytes
-into closed historical views that always deny live use. These contracts import
-the Driver Registry-owned operation, slot, destination-digest, declaration, and
-trusted-send types rather than copying them. They do not implement a provider
-port, broker or lease lifecycle, ref persistence/head mutation, migration
-execution, lease or delivery records, secret material handling, Authority or
-Gateway decisions, daemon/API/SDK integration, a scanner, side effects, feature
-activation, issue closure, or gold evidence. No generated public surface is
-claimed.
+The current implementation retains the behavior-free C03 identities,
+pre-placement grammar, revision-bound `SecretRefV2`, and historical-v1 read/deny
+views described below. It now also provides additive process-local lease
+request/snapshot/access-evidence contracts, an Authority-owned broker lifecycle,
+an outbound Rust `SecretProvider` port, a zeroizing non-serializable material
+wrapper, and a deterministic test/local-development memory provider.
+
+This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`. It does not
+implement RFC 0012's complete durable lease, exposure-lineage, delivery,
+provider-control, node-control, outer-submission, or terminal publication
+records. It adds no provider invocation from the broker, material-returning
+broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
+surface, scanner, production provider, issue closure, or gold pass. The reduced
+wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
+the complete RFC 0012 wire schemas. `G08` and `G88` remain `not_exercised`.
 
 ## Purpose and boundary
 
-These values reserve distinct identities and closed policy vocabulary and let
-typed callers describe non-authorizing secret-use requirements and
-revision-bound ref declarations without creating an authority, lease, provider,
-or allocation owner.
-Possessing an identity, enum value, provider version reference, or lease policy
-does not authorize access, delivery, publication, reconciliation, retry,
-renewal, or any other operation. The implemented values contain no secret
-material, provider locator, credential, authority, lifecycle, or runtime state.
+The behavior-free values reserve distinct identities and closed policy
+vocabulary. The process-local broker is the sole mutation owner for the bounded
+lease lifecycle implemented here. Possessing an identity, ref, request,
+snapshot, access event, handle ID, or provider version does not authorize secret
+use. Every issue, claim, renewal, and revocation call requires current Authority
+evaluation over the exact tenant, principal, workload, operation, destination,
+placement, audience, ref revision/version, intent, and purpose binding.
+
+## Implemented process-local owner slice
+
+### Safe contracts
+
+`splendor-types` exports four checked, serialize-only local contracts:
+
+| Type | Local schema | Role |
+| --- | --- | --- |
+| `SecretLeaseUseBinding` | `splendor.secret.lease_use_binding.local.v1` | Exact tenant/principal/workload, Driver operation/declaration/slot/destination, exposure profile, node/instance/audience, ref revision/version, intent, and purpose binding. |
+| `SecretLeaseRequest` | `splendor.secret.lease_request.local.v1` | One idempotent request retaining the complete `SecretUseRequirement`, finite window, and request time. |
+| `SecretLeaseSnapshot` | `splendor.secret.lease_snapshot.local.v1` | Read-only safe lease state, counters, renewal lineage times, selected delivery method, and event/handle IDs. |
+| `SecretAccessEvidence` | `splendor.secret.access_evidence.local.v1` | Ref-only issuance, claim, denial, renewal, and revocation evidence. |
+
+All fields are private and construction is checked. These values implement
+`Serialize`, not generic `Deserialize`, and contain no material, provider
+locator/request/response, delivery endpoint, bearer capability, arbitrary JSON,
+or raw error. They are non-authorizing process-local projections, not the full
+RFC 0012 durable contracts.
+
+### Broker lifecycle
+
+`ProcessLocalSecretBroker` in `splendor-authority` is explicitly process-local
+and non-restart-durable. Immutable startup configuration supplies validated
+`SecretRefV2` records, matching provider registrations, a trusted clock, an ID
+source, and a required event sink. Duplicate refs/providers and refs without a
+matching provider fail construction.
+
+The owner supports:
+
+- `issue_lease`: validates an unused request ID, current exact ref revision and
+  provider version, Driver credential destination, delivery preference, finite
+  policy bounds, trusted time, and current cached Authority plus revocation
+  evidence before emitting evidence and committing the lease;
+- `claim_use`: atomically checks an opaque live handle, every immutable binding,
+  exact start/expiry, current Authority, revocation, and the finite use count,
+  then returns only an opaque non-serializable `SecretDeliveryClaim`;
+- `renew_lease`: preserves the original continuous-lifetime start and use count,
+  narrows the remaining maximum, requires a contiguous finite window and current
+  Authority, emits evidence before mutation, then supersedes the old handle;
+- `revoke_lease`: closes local admission and increments the revocation generation
+  before attempting terminal evidence, so event failure can never reactivate the
+  handle; a same-handle retry may complete pending terminal evidence; and
+- `inspect_lease` and `replay`: clone safe snapshots/evidence only, without time
+  reads, ID allocation, authority evaluation, provider calls, or lifecycle
+  mutation.
+
+The live `SecretDeliveryHandle` and `SecretDeliveryClaim` have private
+capability nonces, private construction, fixed redacted `Debug`, and no `Clone`
+or `Serialize`. Generated identity reuse fails closed rather than replacing an
+existing lease, handle, claim, or event.
+
+### Provider boundary and test adapter
+
+`splendor-authority::SecretProvider` is an object-safe outbound Rust port with
+`fetch`, `renew`, `revoke`, `audit`, and `health` methods. Fetch/control request
+types have private construction. Provider errors are closed fixed codes and
+discard vendor text. `SecretMaterial` is bounded, non-empty,
+non-cloneable/non-serializable, redacted under `Debug`, and backed by
+`zeroize::Zeroizing<Vec<u8>>`; zeroization reduces exposure but is not a
+perfect-erasure claim.
+
+The broker lifecycle in this slice only registers provider ports and never
+invokes them. A future Gateway-owned live session must construct the private
+request and retain its permit before provider access or delivery is possible.
+
+`splendor-adapter-secrets-memory` is a deterministic provider for tests and
+explicit local development. Construction rejects resident, remote, fleet,
+production, and unknown modes. Synthetic entries are exactly keyed by provider,
+tenant, ref ID/revision, and provider version; cross-tenant/wrong-version lookup,
+outage, revoked versions, duplicate insertion, and invalid material fail with
+fixed redacted errors. Rotation installs a new exact version and revokes the old
+entry. The adapter opens no listener, reads no environment fallback, and exposes
+no public independent resolve method.
+
+The dependency guard recognizes `adapters/secrets-*` before the ordinary adapter
+rule and permits exactly `splendor-authority` plus `splendor-types`. It rejects
+direct dependencies on Gateway, kernel, store, daemon, node, or another adapter.
 
 ## Canonical identity contract
 
@@ -317,13 +395,24 @@ assert_eq!(
 
 ## Lifecycle, trace, and replay
 
-No lifecycle is implemented. Creating or parsing any value in this reference,
-including a v2 ref, does not make it current, create Authority, select a Driver
-declaration, migrate history, issue a lease, resolve a provider, or perform
-delivery. This slice emits no trace/evidence event, changes no state, and
-performs no side effect. There is no C03 runtime replay path; code may only
-round-trip and inspect these behavior-free contracts. Inspecting historical v1
-never converts it into live authority.
+Creating or parsing a value, including a v2 ref or local lease request, does not
+make it current or grant authority. Only `ProcessLocalSecretBroker` mutates the
+bounded local lifecycle, and it accepts only startup-configured current v2 refs.
+Historical v1 views always deny and never enter the broker.
+
+The injected `SecretBrokerEventSink` receives structured ref-only evidence for
+issuance, claim, denial, renewal, and revocation. It is an event seam, not a log.
+This slice does not claim durable Event/Evidence integration: successful sink
+append is required before issuance, claim, or renewal mutation, while revocation
+first commits its absorbing local denial and records terminal evidence
+afterward. Sink failure returns `secret_broker_evidence_unavailable`; for
+revocation, the handle remains unusable and pending evidence can be retried.
+
+`replay()` returns the broker's already-recorded safe local lease snapshots and
+events in deterministic lease-ID and append order. Replay is inspect-only and
+does not read the clock, allocate IDs, evaluate Authority, invoke a provider,
+claim a use, renew/revoke a lease, or perform a side effect. This is not durable
+cross-process reconstruction, and restart invalidates live handles and claims.
 
 ## Failure and security behavior
 
@@ -345,8 +434,24 @@ only RFC 0014's closed fixed codes. `Debug` for validated v2 and historical
 records emits only a fixed type label; comparison `Display`/`Debug` emits only
 `matched` or one fixed mismatch code. Rejected candidates and approved
 destination coordinates are not retained in errors or source chains. No
-implemented primitive contains a secret value/material/byte field, provider
+serializable primitive contains a secret value/material/byte field, provider
 request, raw provider error, credential value, token, password, or API key.
+
+Broker failures are closed fixed codes. Wrong tenant, principal, workload,
+operation, slot, destination, node, instance, audience, purpose, intent, ref, or
+provider version never reaches a provider. Missing/expired/revoked/stale
+Authority or revocation evidence denies. Exact expiry has no grace, clock
+rollback denies without reactivation, non-microsecond or unavailable trusted
+time fails closed, and a poisoned state lock cannot continue. Required denial
+evidence failure remains a denial and returns evidence unavailability rather
+than the underlying oracle-sensitive reason.
+
+The provider material type is the only implemented primitive containing secret
+bytes. It is deliberately non-serializable and lives only behind the outbound
+provider port; the broker has no method that returns it. Public/debug/error/event
+surfaces are covered by canary tests. The memory provider duplicates material
+into one zeroizing return allocation only when its private provider request path
+is invoked; this owner slice never invokes that path.
 
 ## Compatibility and versioning
 
@@ -361,6 +466,14 @@ and aliases remain unchanged. Existing C03 pre-placement and Driver Registry
 credential-sink fixture bytes are also unchanged. RFC 0014's authorization/ref
 v2 schemas are additive experimental successors; revision-less v1 remains
 historical read/deny only and there is no dual live-reader fallback. Persisted
-records, Authority/Gateway consumption, historical migration execution,
-provider resolution, daemon/API/SDK surfaces, and generated schemas remain
-blocked on separately accepted owner contracts and production-path evidence.
+records and bytes remain unchanged.
+
+The new lease/binding/snapshot/access-evidence records are explicitly local v1
+profiles. They do not claim compatibility with RFC 0012's complete canonical
+`SecretLeaseRequest`, `SecretLease`, `SecretDeliveryHandle`, or
+`SecretAccessEvent` schemas, and no generic wire ingress or generated client is
+published for them. The broker and memory provider are Rust-only process-local
+surfaces. Durable persistence, complete Authority/Gateway consumption,
+historical migration execution, provider control ledgers, node delivery,
+daemon/API/SDK surfaces, and generated schemas remain downstream work requiring
+their separately accepted owner contracts and production-path evidence.

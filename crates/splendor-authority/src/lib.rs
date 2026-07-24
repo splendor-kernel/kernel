@@ -20,6 +20,7 @@ mod obligations;
 mod renewal;
 mod revocation;
 mod run_authority;
+mod secrets;
 
 pub use capability::{
     compatibility_permission_operation, ensure_child_grant_narrows, evaluate_capability_request,
@@ -109,6 +110,19 @@ pub use revocation::{
 pub use run_authority::{
     LocalRunAuthorityAdmissionError, LocalRunAuthorityEffectPermit,
     LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
+};
+pub use secrets::{
+    grant_from_local_secret_broker_scope, secret_driver_invoke_operation,
+    InMemorySecretBrokerEventSink, ProcessLocalSecretBroker, SecretBrokerAuthorityContext,
+    SecretBrokerClock, SecretBrokerConfigError, SecretBrokerError, SecretBrokerEventSink,
+    SecretBrokerEventSinkError, SecretBrokerIdKind, SecretBrokerIdSource, SecretBrokerReplayView,
+    SecretDeliveryClaim, SecretDeliveryHandle, SecretLeaseGrant, SecretMaterial, SecretProvider,
+    SecretProviderAuditEvidence, SecretProviderControlRequest, SecretProviderError,
+    SecretProviderErrorCode, SecretProviderFetchRequest, SecretProviderFetchResult,
+    SecretProviderHealthEvidence, SecretProviderOperation, SecretProviderOutcome,
+    SystemSecretBrokerClock, SystemSecretBrokerIdSource,
+    SECRET_PROVIDER_AUDIT_EVIDENCE_SCHEMA_LOCAL_V1,
+    SECRET_PROVIDER_HEALTH_EVIDENCE_SCHEMA_LOCAL_V1,
 };
 
 #[cfg(test)]

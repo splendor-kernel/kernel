@@ -1,0 +1,10 @@
+[package]
+name = "splendor-adapter-secrets-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+splendor-authority = { path = "../../crates/splendor-authority" }
+splendor-types = { path = "../../crates/splendor-types" }
+uuid = { workspace = true }
+zeroize = { workspace = true }

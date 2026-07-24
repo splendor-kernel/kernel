@@ -53,6 +53,7 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
 }
 
 ADAPTER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-gateway"}
+SECRET_PROVIDER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-authority"}
 CHECKED_DEP_KINDS = {None, "build"}
 
 RULE_NOTES: dict[str, str] = {
@@ -65,6 +66,7 @@ RULE_NOTES: dict[str, str] = {
     "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL allows existing embedded-local CLI edges to kernel/store/gateway/types and filesystem/http adapters only.",
     "splendor-bindings": "Python bindings may bind the kernel facade directly; transitive core deps must remain Cargo transitive, not direct.",
     "adapter": "Adapter crates may directly depend only on splendor-types and splendor-gateway; no adapter -> kernel/store/daemon/adapter core edge.",
+    "secret_provider": "RFC 0012 permits only adapters/secrets-* -> splendor-authority + splendor-types; secret providers may not import gateway/kernel/store/daemon/node or another adapter.",
 }
 
 
@@ -223,6 +225,8 @@ def count_names(names: Iterable[str]) -> dict[str, int]:
 
 
 def allowed_deps_for(package: dict[str, Any]) -> set[str] | None:
+    if is_secret_provider_package(package):
+        return set(SECRET_PROVIDER_ALLOWED_INTERNAL_DEPS)
     if is_adapter_package(package):
         return set(ADAPTER_ALLOWED_INTERNAL_DEPS)
     allowed = ALLOWED_INTERNAL_DEPS.get(package["name"])
@@ -238,6 +242,16 @@ def is_adapter_package(package: dict[str, Any]) -> bool:
     return "adapters" in Path(manifest_path).parts
 
 
+def is_secret_provider_package(package: dict[str, Any]) -> bool:
+    manifest_path = package.get("manifest_path") or ""
+    parts = Path(manifest_path).parts
+    return (
+        package["name"].startswith("splendor-adapter-secrets-")
+        and "adapters" in parts
+        and any(part.startswith("secrets-") for part in parts)
+    )
+
+
 def dependency_kind_label(dependency: dict[str, Any]) -> str:
     return dependency.get("kind") or "normal"
 
@@ -246,7 +260,12 @@ def forbidden_edge_violation(
     package: dict[str, Any], dep_name: str, dependency: dict[str, Any]
 ) -> Violation:
     source = package["name"]
-    rule_key = "adapter" if is_adapter_package(package) else source
+    if is_secret_provider_package(package):
+        rule_key = "secret_provider"
+    elif is_adapter_package(package):
+        rule_key = "adapter"
+    else:
+        rule_key = source
     note = RULE_NOTES.get(rule_key, "No rule note found; update dependency guard policy.")
     allowed = sorted(allowed_deps_for(package) or [])
     allowed_text = ", ".join(allowed) if allowed else "no internal packages"
@@ -350,6 +369,47 @@ def run_self_test() -> int:
             "splendor-adapter-http -> splendor-kernel",
         ),
         (
+            "ordinary_adapter_depends_on_authority",
+            metadata_fixture(
+                {
+                    "splendor-types": [],
+                    "splendor-authority": ["splendor-types"],
+                    "splendor-adapter-http": ["splendor-types", "splendor-authority"],
+                }
+            ),
+            "splendor-adapter-http -> splendor-authority",
+        ),
+        (
+            "secret_provider_depends_on_gateway",
+            metadata_fixture(
+                {
+                    "splendor-types": [],
+                    "splendor-authority": ["splendor-types"],
+                    "splendor-gateway": ["splendor-types", "splendor-authority"],
+                    "splendor-adapter-secrets-memory": [
+                        "splendor-types",
+                        "splendor-authority",
+                        "splendor-gateway",
+                    ],
+                }
+            ),
+            "splendor-adapter-secrets-memory -> splendor-gateway",
+        ),
+        (
+            "secret_provider_exact_dependencies_allowed",
+            metadata_fixture(
+                {
+                    "splendor-types": [],
+                    "splendor-authority": ["splendor-types"],
+                    "splendor-adapter-secrets-memory": [
+                        "splendor-types",
+                        "splendor-authority",
+                    ],
+                }
+            ),
+            None,
+        ),
+        (
             "daemon_depends_on_authority",
             metadata_fixture(
                 {
@@ -399,11 +459,42 @@ def run_self_test() -> int:
         ),
     ]
 
+    forbidden_secret_provider_edges = [
+        "splendor-kernel",
+        "splendor-store",
+        "splendor-daemon",
+        "splendor-node",
+        "splendor-adapter-http",
+    ]
+    for dependency in forbidden_secret_provider_edges:
+        cases.append(
+            (
+                f"secret_provider_depends_on_{dependency.removeprefix('splendor-').replace('-', '_')}",
+                metadata_fixture(
+                    {
+                        "splendor-types": [],
+                        "splendor-authority": ["splendor-types"],
+                        dependency: [],
+                        "splendor-adapter-secrets-memory": [
+                            "splendor-types",
+                            "splendor-authority",
+                            dependency,
+                        ],
+                    }
+                ),
+                f"splendor-adapter-secrets-memory -> {dependency}",
+            )
+        )
+
     failures = 0
     for name, metadata, expected in cases:
         violations, _stats = check_metadata(metadata)
         messages = "\n".join(violation.message for violation in violations)
-        if expected not in messages:
+        if expected is None and violations:
+            failures += 1
+            print(f"self-test {name}: FAIL (expected no violations)", file=sys.stderr)
+            print(messages, file=sys.stderr)
+        elif expected is not None and expected not in messages:
             failures += 1
             print(f"self-test {name}: FAIL (expected {expected!r})", file=sys.stderr)
             print(messages or "no violations", file=sys.stderr)
@@ -422,7 +513,12 @@ def metadata_fixture(edges: dict[str, list[str | tuple[str, str | None]]]) -> di
     for name, deps in edges.items():
         package_id = f"fixture://{name}#0.1.0"
         workspace_members.append(package_id)
-        manifest_parent = "adapters/http" if name.startswith("splendor-adapter-") else f"crates/{name}"
+        if name.startswith("splendor-adapter-secrets-"):
+            manifest_parent = f"adapters/{name.removeprefix('splendor-adapter-')}"
+        elif name.startswith("splendor-adapter-"):
+            manifest_parent = "adapters/http"
+        else:
+            manifest_parent = f"crates/{name}"
         packages.append(
             {
                 "id": package_id,
