@@ -1398,6 +1398,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "splendor-adapter-secrets-memory"
+version = "0.1.0"
+dependencies = [
+ "splendor-authority",
+ "splendor-types",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "splendor-authority"
 version = "0.1.0"
 dependencies = [
@@ -1408,6 +1418,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

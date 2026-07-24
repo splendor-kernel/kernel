@@ -9,5 +9,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 splendor-store = { path = "../splendor-store" }
 splendor-types = { path = "../splendor-types" }

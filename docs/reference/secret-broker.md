@@ -2,34 +2,173 @@
 
 ## Status
 
-**status/incomplete — behavior-free C03 identities, pre-placement grammar,
-non-authorizing secret-use requirements, revision-bound secret references, and
-historical-v1 read/deny views only.**
+**status/incomplete — first process-local Secret Broker owner slice, with no
+material delivery or production durability.**
 
-The current implementation adds 40 behavior-free nominal UUID identity types,
-seven closed enums, a strictly validated opaque `SecretProviderVersionRef`, a
-valid-by-construction `SecretLeasePolicy`, the strict `SecretUseRequirement` v1
-Rust contract, and RFC 0014's additive `SecretCredentialAuthorizationV2` and
-`SecretRefV2` contracts in `splendor-types`. It also decodes frozen v1 ref bytes
-into closed historical views that always deny live use. These contracts import
-the Driver Registry-owned operation, slot, destination-digest, declaration, and
-trusted-send types rather than copying them. They do not implement a provider
-port, broker or lease lifecycle, ref persistence/head mutation, migration
-execution, lease or delivery records, secret material handling, Authority or
-Gateway decisions, daemon/API/SDK integration, a scanner, side effects, feature
-activation, issue closure, or gold evidence. No generated public surface is
-claimed.
+The current implementation retains the behavior-free C03 identities,
+pre-placement grammar, revision-bound `SecretRefV2`, and historical-v1 read/deny
+views described below. It also provides additive `ProcessLocal*` lease, binding,
+and access-evidence exports, an internal Authority-owned broker prototype, an
+outbound Rust `ProcessLocalSecretProvider` port with request-bound session-local
+results, and an explicitly feature-gated test/local-development memory provider.
+The broker lifecycle, constructors, authority context, handles, grants, claims,
+clocks/ID sources, limits, mutation errors, inspection, and replay are all
+crate-private. There is no callable production lease API or complete live secret
+permit in this slice.
+
+This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`. It does not
+implement RFC 0012's complete durable lease, exposure-lineage, delivery,
+provider-control, node-control, outer-submission, or terminal publication
+records. It adds no provider invocation from the broker, material-returning
+broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
+surface, scanner, production provider, issue closure, or gold pass. The reduced
+wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
+the complete RFC 0012 wire schemas. `G07` and `G08` remain `not_exercised`.
 
 ## Purpose and boundary
 
-These values reserve distinct identities and closed policy vocabulary and let
-typed callers describe non-authorizing secret-use requirements and
-revision-bound ref declarations without creating an authority, lease, provider,
-or allocation owner.
-Possessing an identity, enum value, provider version reference, or lease policy
-does not authorize access, delivery, publication, reconciliation, retry,
-renewal, or any other operation. The implemented values contain no secret
-material, provider locator, credential, authority, lifecycle, or runtime state.
+The behavior-free values reserve distinct identities and closed policy
+vocabulary. The crate-private process-local prototype is the sole mutation owner
+for the bounded lease lifecycle exercised by Authority unit tests. Possessing an identity, ref, request,
+snapshot, access event, handle ID, or provider version does not authorize secret
+use. Lease issuance, internal use reservation, renewal, and revocation require
+current Authority evaluation over the exact tenant, principal, workload,
+operation and current Driver declaration, destination and trusted-send profile,
+placement, audience, ref revision/provider version, intent, and purpose binding.
+The Authority context constructor is crate-private and there is no production
+composition path in this slice; external callers cannot manufacture one from
+arbitrary coordinates.
+
+## Implemented process-local owner slice
+
+### Safe contracts
+
+`splendor-types` exports four checked, serialize-only local contracts under
+explicit process-local names:
+
+| Type | Local schema | Role |
+| --- | --- | --- |
+| `ProcessLocalSecretLeaseUseBinding` | `splendor.secret.lease_use_binding.local.v1` | Exact tenant/principal/workload, Driver operation/declaration/slot/destination, exposure and trusted-send profile, node/instance/audience, ref revision/provider version, intent, and purpose binding. |
+| `ProcessLocalSecretLeaseRequest` | `splendor.secret.lease_request.local.v1` | One idempotent request retaining the complete `SecretUseRequirement`, finite window, and request time. |
+| `ProcessLocalSecretLeaseSnapshot` | `splendor.secret.lease_snapshot.local.v1` | Read-only safe lease state, counters, renewal lineage times, selected delivery method, and event/handle IDs. |
+| `ProcessLocalSecretAccessEvidence` | `splendor.secret.access_evidence.local.v1` | Ref-only issuance, internal claim, denial, renewal, and revocation evidence. |
+
+All fields are private and construction is checked. These values implement
+`Serialize`, not generic `Deserialize`, and contain no material, provider
+locator/request/response, delivery endpoint, bearer capability, arbitrary JSON,
+or raw error. They are non-authorizing process-local projections, not the full
+RFC 0012 durable contracts. Their crate-root schema constants likewise use the
+`PROCESS_LOCAL_SECRET_*` prefix; no reduced canonical-name alias is exported.
+
+### Broker lifecycle
+
+The internal broker prototype in `splendor-authority::secrets` is explicitly
+process-local and non-restart-durable. It is configured for exactly one tenant;
+nil tenant IDs, mixed-tenant refs, and cross-tenant bindings fail closed.
+Production compilation fixes it to the local system UTC clock and random UUID
+source. Custom synchronous clock/ID sources and narrowed limits are available
+only to same-module tests. Immutable startup configuration supplies validated
+`SecretRefV2` records and matching provider registrations. Duplicate
+refs/providers, refs without a matching provider, invalid limits, and
+over-capacity configuration fail construction.
+
+The owner supports:
+
+- `issue_lease`: validates the exact current ref/provider/Driver declaration,
+  destination and trusted-send profile, delivery preference, finite policy
+  bounds, trusted time, and cached Authority plus revocation state before one
+  atomic lease/evidence/command commit;
+- internal `claim_use`: atomically checks an opaque live handle, every immutable
+  binding, exact start/expiry, current Authority and revocation state, and the
+  finite use count, then retains only an opaque non-serializable claim carrying
+  expiry and revocation generation; no public pre-Gateway claim API exists;
+- `renew_lease`: accepts a request prepared at `starts_at <=` broker-observed
+  trusted time, uses that observed time as the effective immediate cutover,
+  preserves the original continuous-lifetime start and consumed-use count,
+  narrows lineage limits, and invalidates the old handle only in the same atomic
+  commit that installs the replacement and its evidence;
+- `revoke_lease`: atomically commits local admission closure, revocation
+  generation, terminal command result, and ref-only evidence without invoking a
+  provider; and
+- internal `inspect_lease` and bounded `replay_page`: inspect safe local
+  snapshots/evidence without time reads, ID allocation, Authority evaluation,
+  provider calls, or lifecycle mutation. No public visibility/replay surface is
+  exposed before a trusted visibility policy exists.
+
+Issue, internal claim, renewal, and revocation command keys are derived from the
+crate-owned trusted context and scoped only by command kind, nominal command ID,
+and trusted tenant/principal/workload. Lease-request reuse uses the same trusted
+scope. Node, instance, audience, and every other placement/binding field remain
+in semantic equality, so the same nominal ID under another valid placement
+conflicts instead of selecting a new partition. Caller request bytes cannot
+select a ledger partition. Current authenticated Authority/capability/revocation
+evaluation occurs before SecretRef/current-Driver, command, or handle lookup.
+
+The broker stores an explicit
+`splendor.secret.semantic_idempotency_projection.v1` digest containing command
+kind/ID, trusted ledger scope, and the complete lease request except
+`requested_at`; renewal additionally binds the old opaque handle metadata. A
+successful terminal record contains only a small integrity-bound pointer to
+already committed historical non-authorizing evidence. The pointer binds the
+expected command, event kind/outcome, and complete safe event integrity without
+retaining a handle, snapshot, claim, or capability nonce. The first success
+alone returns a newly minted live opaque capability. An exact currently-visible
+retry, including one with only a different `requested_at`, returns the original
+historical receipt or denial and creates no ID, evidence, lease/use counter, or
+result timestamp. It still samples trusted time for current Authority
+evaluation, and that valid observation obeys the monotonic high-water fence.
+Changed reuse, hidden hit/miss, unauthorized scope, and conflict all return the
+same `secret_not_available` outward code.
+
+Default finite ceilings cover refs, providers, active and retained leases,
+command records, local evidence, generated identities, and replay page size.
+Explicit test limits may narrow those defaults. Exhaustion fails closed instead
+of switching to an unbounded path. Transaction preparation currently clones the
+whole local owner state so lifecycle/evidence/idempotency commit together; that
+cost is deliberately bounded by these hard ceilings and covered by narrow-limit
+tests. Elapsed active leases no longer consume the active-admission count,
+although retained history and command identities are never evicted unsafely.
+
+The crate-private live delivery handle and internal delivery claim have private
+capability nonces, private construction, fixed redacted `Debug`, and no `Clone`
+or `Serialize`. Generated identity reuse fails closed rather than replacing an
+existing lease, handle, claim, or event.
+
+### Provider boundary and test adapter
+
+`splendor-authority::ProcessLocalSecretProvider` is an object-safe outbound Rust
+port with `fetch`, `renew`, `revoke`, `audit`, and `health` methods.
+Fetch/control request types have private construction. Provider errors are
+closed fixed codes and discard vendor text. A successful fetch result is
+borrowed from its exact request and validates matching request-digest audit
+evidence. Its private material storage is bounded, non-empty,
+non-cloneable/non-serializable, redacted,
+`!Send`, `!Sync`, and backed by `zeroize::Zeroizing<Vec<u8>>`. The result exposes
+only material length and safe audit evidence; no byte or `into_parts` escape is
+available. Zeroization reduces exposure but is not a perfect-erasure claim.
+Provider audit evidence, provider health evidence, and the memory provider use
+fixed redacted `Debug` output with no tenant, ref, provider, version, digest, or
+timestamp coordinates.
+All reduced provider request/result/evidence/error symbols and schema constants
+are exported under `ProcessLocal*` / `PROCESS_LOCAL_*` names.
+
+The broker lifecycle in this slice only registers provider ports and never
+invokes them. A future Gateway-owned live session must construct the private
+request and retain its permit before provider access or delivery is possible.
+
+`splendor-adapter-secrets-memory` is `publish = false` and compiles for consumers
+only with the explicit `memory-secret-provider` feature (tests enable the source
+through `cfg(test)`). Construction rejects resident, remote, fleet, production,
+and unknown modes. Synthetic entries are finite and exactly keyed by provider,
+tenant, ref ID/revision, and provider version; cross-tenant/wrong-version lookup,
+outage, duplicate insertion, invalid material, and poisoned state fail with
+fixed redacted errors. Rotation and provider-port revocation remove the old
+entry so its zeroizing storage is dropped. The adapter opens no listener, reads
+no environment fallback, and exposes no public independent resolve method.
+
+The dependency guard recognizes `adapters/secrets-*` before the ordinary adapter
+rule and permits exactly `splendor-authority` plus `splendor-types`. It rejects
+direct dependencies on Gateway, kernel, store, daemon, node, or another adapter.
 
 ## Canonical identity contract
 
@@ -65,8 +204,10 @@ Case changes, unknown strings, externally tagged objects, and every non-string
 form reject with fixed non-reflecting errors. Their Rust ordering compares exact
 ASCII wire spellings rather than declaration order.
 
-`environment_variable` is compatibility vocabulary only. Its presence grants no
-permission and does not add delivery behavior.
+`environment_variable` is compatibility vocabulary only. The current v1 broker
+prototype always filters it, even when both a ref and request list it. A later
+safe requested method may be selected in caller order; an environment-only
+intersection denies with the uniform restricted outward profile.
 
 `SecretDeliveryControlKind` is the C03-owned trusted-send control vocabulary for
 future driver credential-sink declarations. A value describes a control kind
@@ -248,10 +389,10 @@ other foreign-owner or V1b identities remain unimplemented.
 ```rust
 use splendor_types::{SecretIdParseError, SecretRefId};
 
-let id: SecretRefId = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001".parse()?;
+let id: SecretRefId = "11111111-1111-4111-8111-111111111111".parse()?;
 assert_eq!(
     serde_json::to_string(&id)?,
-    "\"018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001\""
+    "\"11111111-1111-4111-8111-111111111111\""
 );
 
 let nil = SecretRefId::parse("00000000-0000-0000-0000-000000000000");
@@ -278,8 +419,8 @@ use splendor_types::{
 };
 
 let requirement = SecretUseRequirement::try_new(
-    "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001".parse::<SecretRefId>()?,
-    "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4101".parse::<SecretCredentialSlotId>()?,
+    "11111111-1111-4111-8111-111111111111".parse::<SecretRefId>()?,
+    "22222222-2222-4222-8222-222222222222".parse::<SecretCredentialSlotId>()?,
     SecretUseIntent::Authenticate,
     SecretPurpose::ExternalServiceAccess,
     vec![SecretDeliveryMethod::InheritedFd],
@@ -317,13 +458,32 @@ assert_eq!(
 
 ## Lifecycle, trace, and replay
 
-No lifecycle is implemented. Creating or parsing any value in this reference,
-including a v2 ref, does not make it current, create Authority, select a Driver
-declaration, migrate history, issue a lease, resolve a provider, or perform
-delivery. This slice emits no trace/evidence event, changes no state, and
-performs no side effect. There is no C03 runtime replay path; code may only
-round-trip and inspect these behavior-free contracts. Inspecting historical v1
-never converts it into live authority.
+Creating or parsing a value, including a v2 ref or local lease request, does not
+make it current or grant authority. Only the crate-private broker prototype
+mutates the bounded local lifecycle, and it accepts only startup-configured
+current v2 refs for its single tenant. Historical v1 views always deny and never
+enter the broker.
+
+The broker owns a bounded in-memory sequence of structured ref-only evidence for
+issuance, internal claim, denial, renewal, and revocation. There is no external
+evidence callback. Test-only injected clock and ID-source callbacks run without
+either broker mutex; mutation admission is temporarily closed while they run,
+reentrant mutation fails closed, and callback panic becomes a fixed broker
+failure without poisoning lifecycle state. Every valid trusted-clock sample is
+latched immediately into a one-way maximum-observed-time fence. Later ID,
+evidence, or lifecycle preparation failure may leave the command/effect
+unchanged, but cannot roll that security fence back. Lifecycle state, evidence,
+generated-ID reservations, and terminal idempotency records are otherwise
+prepared against a bounded cloned state and committed together. This is local
+owner evidence, not durable Event/Evidence integration.
+
+Internal `replay_page(cursor, limit)` returns at most the configured number of
+already-recorded safe snapshots/events in deterministic lease-ID and append
+order. Replay is inspect-only and does not read the clock, allocate IDs,
+evaluate Authority, invoke a provider, claim a use, renew/revoke a lease, or
+perform a side effect. It is deliberately non-public until a trusted visibility
+policy exists. This is not durable cross-process reconstruction, and restart
+invalidates live handles and internal claims.
 
 ## Failure and security behavior
 
@@ -345,8 +505,31 @@ only RFC 0014's closed fixed codes. `Debug` for validated v2 and historical
 records emits only a fixed type label; comparison `Display`/`Debug` emits only
 `matched` or one fixed mismatch code. Rejected candidates and approved
 destination coordinates are not retained in errors or source chains. No
-implemented primitive contains a secret value/material/byte field, provider
+serializable primitive contains a secret value/material/byte field, provider
 request, raw provider error, credential value, token, password, or API key.
+
+Broker failures are internal closed fixed codes. Wrong tenant, principal,
+workload, operation, slot, destination, node, instance, audience, purpose,
+intent, ref, provider version, hidden command hit/miss, and semantic conflict
+never reach a provider and share `secret_not_available` where disclosure would
+create an oracle. Missing/expired/revoked/stale Authority or revocation evidence
+denies before prior-result disclosure. Exact expiry has no grace, clock
+rollback denies without reactivation, non-microsecond or unavailable trusted
+time fails closed, and a poisoned state lock cannot continue. Evidence or
+generated-ID exhaustion returns a fixed failure without partially committing
+the command or lifecycle transition; an already-observed monotonic time
+high-water remains latched. Recorded mismatch evidence uses the
+caller-supplied binding without linking it to an existing lease or handle, which
+avoids a target-existence oracle.
+
+The private provider material storage is the only implemented value containing
+secret bytes. It is deliberately request-borrowed, non-serializable, `!Send`, and
+`!Sync`, and lives only inside a fetch result behind the outbound provider port;
+the broker has no method that returns it and the result has no byte escape.
+Public/debug/error/evidence surfaces are covered by canary tests. The memory
+provider duplicates material into one zeroizing request-lifetime allocation only
+when its private provider request path is invoked; this owner slice never invokes
+that path.
 
 ## Compatibility and versioning
 
@@ -361,6 +544,18 @@ and aliases remain unchanged. Existing C03 pre-placement and Driver Registry
 credential-sink fixture bytes are also unchanged. RFC 0014's authorization/ref
 v2 schemas are additive experimental successors; revision-less v1 remains
 historical read/deny only and there is no dual live-reader fallback. Persisted
-records, Authority/Gateway consumption, historical migration execution,
-provider resolution, daemon/API/SDK surfaces, and generated schemas remain
-blocked on separately accepted owner contracts and production-path evidence.
+records and bytes remain unchanged.
+
+The `ProcessLocalSecretLease*` and `ProcessLocalSecretAccess*` exports are
+explicitly local v1 profiles. They do not claim compatibility with RFC 0012's
+complete canonical `SecretLeaseRequest`, `SecretLease`, `SecretDeliveryHandle`,
+or `SecretAccessEvent` schemas, and no generic wire ingress or generated client
+is published for them. Only the provider port and feature-gated memory provider
+are Rust adapter surfaces; the lifecycle prototype is not exported from
+`splendor-authority`. The memory provider additionally requires an explicit
+non-default feature. Durable persistence, a callable lease lifecycle, public
+visibility/replay, complete Authority/Gateway composition and provider
+invocation, historical migration execution, provider control ledgers, node
+delivery, daemon/API/SDK surfaces, and generated schemas remain downstream work
+requiring their separately accepted owner contracts and production-path
+evidence.
