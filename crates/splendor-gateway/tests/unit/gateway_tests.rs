@@ -408,6 +408,12 @@ fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
         "nested": [{"Pass-Word": "RAW_CREDENTIAL_GATEWAY_CANARY"}]
     });
 
+    assert_raw_credential_guard_is_first(request);
+}
+
+fn assert_raw_credential_guard_is_first(request: ActionRequest) {
+    let action_name = request.action.name.clone();
+
     let now = OffsetDateTime::now_utc();
     let mut decision = authority_decision_for(&request, "adapter", PrincipalId::new(), now);
     decision.status = AuthorityDecisionStatus::Allowed;
@@ -434,7 +440,7 @@ fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
         calls: Arc::clone(&recorder_calls),
         adapter: Arc::clone(&adapter),
     }));
-    gateway.register_adapter("noop", "adapter", adapter.clone());
+    gateway.register_adapter(action_name, "adapter", adapter.clone());
 
     let outcome = gateway.submit(request).expect("fixed credential denial");
 
@@ -448,6 +454,68 @@ fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
     assert_eq!(resource_verifier_calls.load(Ordering::SeqCst), 0);
     assert_eq!(recorder_calls.load(Ordering::SeqCst), 0);
     assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_seam() {
+    let mut vectors = Vec::new();
+    for params in [
+        serde_json::json!({"authKey": "synthetic"}),
+        serde_json::json!({"apiToken": "synthetic"}),
+        serde_json::json!({"X-API-Key": "synthetic"}),
+        serde_json::json!({"authz": "synthetic"}),
+        serde_json::json!({"POSTGRES_PASSWORD": "synthetic"}),
+        serde_json::json!({"Bearer synthetic-value": "ordinary"}),
+        serde_json::json!({"input": r#"export "POSTGRES_PASSWORD" = synthetic"#}),
+        serde_json::json!({"input": "read vault:team/service now"}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        vectors.push(request);
+    }
+
+    let mut numeric_bytes = base_request();
+    numeric_bytes.adapter = Some("adapter".to_string());
+    numeric_bytes.action.name = "http_post".to_string();
+    numeric_bytes.action.params = serde_json::json!({"bytes": b"Bearer synthetic-value".to_vec()});
+    vectors.push(numeric_bytes);
+
+    let mut receipt_request = base_request();
+    receipt_request.adapter = Some("adapter".to_string());
+    let decision = authority_decision_for(
+        &receipt_request,
+        "adapter",
+        PrincipalId::new(),
+        OffsetDateTime::now_utc(),
+    );
+    let mut receipt =
+        unsigned_obligation_receipt(&decision, PrincipalId::new(), OffsetDateTime::now_utc());
+    receipt.evidence_ref = Some("Bearer synthetic-value".to_string());
+    receipt_request.authority_obligation_receipts = vec![receipt];
+    vectors.push(receipt_request);
+
+    for request in vectors {
+        assert_raw_credential_guard_is_first(request);
+    }
+}
+
+#[test]
+fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
+    for value in ["Basic monthly reporting", "models/hf_transformer"] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": value});
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed, "{value}");
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1, "{value}");
+    }
 }
 
 #[test]

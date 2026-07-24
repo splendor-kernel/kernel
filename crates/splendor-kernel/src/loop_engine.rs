@@ -11,9 +11,9 @@ use crate::{
     StateHandoffScope,
 };
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, guard_action_routing, raw_credential_denied_action,
-    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
-    ActionStatus, GatewayError,
+    authority_pre_effect_evidence_recorded, guard_action_routing_and_receipts,
+    raw_credential_denied_action, raw_credential_denied_outcome, ActionGateway, ActionId,
+    ActionOutcome, ActionRequest, ActionStatus, GatewayError,
 };
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
@@ -823,10 +823,11 @@ impl LoopEngine {
             .actions
             .iter()
             .map(|candidate| {
-                let raw_credential_denied = guard_action_routing(
+                let raw_credential_denied = guard_action_routing_and_receipts(
                     &candidate.action,
                     candidate.adapter.as_deref(),
                     &candidate.satisfied_preconditions,
+                    &candidate.authority_obligation_receipts,
                 )
                 .is_err();
                 ScreenedActionCandidate {

@@ -14,12 +14,14 @@ use splendor_kernel::LocalAuthorityObligationReceiptConfig;
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
-    AuditAttribution, CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
-    ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope, NodeId, Percept,
-    PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId, PolicyDegradedMode,
-    PrincipalId, QuotaUsage, RevocationStatus, RunId, SideEffectClass, TenantId, TraceEvent,
-    TraceEventId, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope, WorkOrderId,
-    WorkOrderPlacement, WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION,
+    AuditAttribution, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
+    AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
+    AuthorityObligationReceiptValidationKind, CallerCredential, CircuitBreaker, CircuitBreakerId,
+    CircuitBreakerScope, ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope,
+    NodeId, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
+    PolicyDegradedMode, PrincipalId, QuotaUsage, RevocationStatus, RunId, SideEffectClass,
+    TenantId, TraceEvent, TraceEventId, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope,
+    WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION,
     POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::sync::{Arc, Mutex};
@@ -266,6 +268,36 @@ fn local_approval_receipt_config() -> LocalAuthorityObligationReceiptConfig {
         "local-approval-receipts",
     )
     .expect("local approval receipt config")
+}
+
+fn ordinary_unvalidated_obligation_receipt() -> AuthorityObligationReceipt {
+    let now = OffsetDateTime::now_utc();
+    AuthorityObligationReceipt {
+        schema_version: "splendor.authority_obligation_receipt.v1".to_string(),
+        receipt_id: AuthorityObligationReceiptId::new(),
+        issuer: PrincipalId::new(),
+        audience: "splendor.daemon.run:fixture".to_string(),
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::ApprovalRequired,
+        subject: PrincipalId::new(),
+        authority_decision_id: AuthorityDecisionId::new(),
+        canonical_request_digest: "blake3:canonical-request".to_string(),
+        evidence_digest: "blake3:evidence".to_string(),
+        evidence_ref: Some("evidence:approval/fixture".to_string()),
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        revocation: RevocationStatus::Active,
+        revocation_ref: "revocation:fixture".to_string(),
+        approval_id: None,
+        approval_trace_event_id: None,
+        validation: AuthorityObligationReceiptValidation {
+            validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+            algorithm: "local-signature-v1".to_string(),
+            key_id: "local-receipt-key-v1".to_string(),
+            digest: "blake3:receipt".to_string(),
+            signature: "synthetic-signature".to_string(),
+        },
+    }
 }
 
 fn read_only_action(name: &str) -> Action {
@@ -3946,7 +3978,7 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
         vec![DaemonActionCandidate {
             action_id: Some(ActionId::new()),
             action: Action {
-                params: json!({"nested": [{"API-KEY": CANARY}]}),
+                params: json!({"nested": [{"authKey": CANARY}]}),
                 ..action("allowed_action")
             },
             adapter: Some("daemon.local".to_string()),
@@ -4012,6 +4044,113 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
     assert!(!serde_json::to_string(&persisted)
         .expect("persisted traces serialize")
         .contains(CANARY));
+}
+
+#[tokio::test]
+async fn configured_receipt_strings_are_rejected_before_fingerprint_run_state_and_trace() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let app = router(DaemonState::with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+    ));
+    let fixed_run_id = RunId::new();
+    let mut request = create_request(
+        TenantId::new(),
+        AgentId::new(),
+        vec![DaemonActionCandidate {
+            action_id: Some(ActionId::new()),
+            action: action("allowed_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: Some(QuotaUsage::single_action()),
+            satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
+        }],
+        Vec::new(),
+    );
+    request.idempotency_key = "idem_c03_receipt_screening".to_string();
+    request.work_order.work_order.run_id = Some(fixed_run_id.clone());
+    resign_work_order(&mut request.work_order);
+
+    for field in [
+        "schema_version",
+        "audience",
+        "canonical_request_digest",
+        "evidence_digest",
+        "evidence_ref",
+        "revocation_reason",
+        "revocation_ref",
+        "algorithm",
+        "key_id",
+        "validation_digest",
+        "signature",
+    ] {
+        let canary = format!("Bearer C03_RECEIPT_{}_CANARY", field.to_ascii_uppercase());
+        let mut receipt = ordinary_unvalidated_obligation_receipt();
+        match field {
+            "schema_version" => receipt.schema_version = canary.clone(),
+            "audience" => receipt.audience = canary.clone(),
+            "canonical_request_digest" => receipt.canonical_request_digest = canary.clone(),
+            "evidence_digest" => receipt.evidence_digest = canary.clone(),
+            "evidence_ref" => receipt.evidence_ref = Some(canary.clone()),
+            "revocation_reason" => {
+                receipt.revocation = RevocationStatus::Revoked {
+                    reason: canary.clone(),
+                }
+            }
+            "revocation_ref" => receipt.revocation_ref = canary.clone(),
+            "algorithm" => receipt.validation.algorithm = canary.clone(),
+            "key_id" => receipt.validation.key_id = canary.clone(),
+            "validation_digest" => receipt.validation.digest = canary.clone(),
+            "signature" => receipt.validation.signature = canary.clone(),
+            _ => unreachable!("closed receipt field matrix"),
+        }
+        request.policy_actions[0].authority_obligation_receipts = vec![receipt];
+
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(request.clone()).expect("receipt-bearing create request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(error.code, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+        assert_eq!(error.message, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+        assert!(error.details.is_null());
+        assert!(!serde_json::to_string(&error)
+            .expect("error serializes")
+            .contains(&canary));
+
+        let (status, missing): (StatusCode, ApiErrorBody) =
+            call_empty(app.clone(), Method::GET, &format!("/runs/{fixed_run_id}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{field}");
+        assert_eq!(missing.code, "invalid_run", "{field}");
+        assert!(matches!(
+            trace_store.read(&fixed_run_id.to_string()),
+            Err(TraceStoreError::RunNotFound)
+        ));
+    }
+
+    request.policy_actions[0]
+        .authority_obligation_receipts
+        .clear();
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app,
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request).expect("credential-free create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created.run_id, fixed_run_id);
+    assert!(!created.duplicate);
+    let persisted = trace_store
+        .read(&fixed_run_id.to_string())
+        .expect("safe run traces");
+    assert!(!serde_json::to_string(&persisted)
+        .expect("persisted traces serialize")
+        .contains("C03_RECEIPT_"));
 }
 
 #[tokio::test]

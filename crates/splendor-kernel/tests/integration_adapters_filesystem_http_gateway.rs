@@ -1,8 +1,8 @@
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, ActionId, ActionRequest, ActionStatus, AdapterError,
-    AdapterResult, VerifiedActionGateway,
+    raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionRequest,
+    ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentId, AgentRuntimeConfig, LoopEngine, LoopError, Perceptor,
@@ -530,7 +530,7 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
 
     let write_action = action(
         "write_file",
-        serde_json::json!({"path": "hello.txt", "contents": "hi"}),
+        serde_json::json!({"path": "hello.txt", "bytes": [104, 105]}),
         SideEffectClass::Filesystem,
     );
     let read_action = action(
@@ -561,6 +561,81 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
         .expect("read output");
     assert_eq!(read_output["bytes_read"], 2);
     assert_eq!(read_output["bytes"], serde_json::json!([104, 105]));
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes() {
+    const FILE_CANARY: &str = "Bearer synthetic-filesystem";
+    const HTTP_CANARY: &str = "ghp_syntheticcredential";
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let write = action(
+        "write_file",
+        serde_json::json!({
+            "path": "credential.txt",
+            "bytes": FILE_CANARY.as_bytes().to_vec(),
+        }),
+        SideEffectClass::Filesystem,
+    );
+    let post = action(
+        "http_post",
+        serde_json::json!({
+            "url": "http://127.0.0.1:9/",
+            "bytes": HTTP_CANARY.as_bytes().to_vec(),
+        }),
+        SideEffectClass::Network,
+    );
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "numeric-byte-credential-denial",
+        vec![
+            HarnessRegistration::new("write_file", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("http_post", "http", http.clone()),
+        ],
+        vec![
+            action_candidate(write, "filesystem"),
+            action_candidate(post, "http"),
+        ],
+    ));
+
+    for outcome in &run.outcome.action_outcomes {
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert_eq!(
+            outcome.verification.reasons,
+            vec![RAW_CREDENTIAL_INPUT_DENIED.to_string()]
+        );
+    }
+    assert_eq!(filesystem.executions(), 0);
+    assert_eq!(http.executions(), 0);
+    assert!(!temp.path().join("credential.txt").exists());
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(FILE_CANARY));
+    assert!(!encoded_events.contains(HTTP_CANARY));
+    let proposed = run
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceEventKind::CandidatesProposed { actions } => Some(actions),
+            _ => None,
+        })
+        .expect("candidate event");
+    assert_eq!(
+        proposed,
+        &vec![
+            raw_credential_denied_action(),
+            raw_credential_denied_action()
+        ]
+    );
     assert_current_runtime_commits_state_after_action_results(&run);
 }
 

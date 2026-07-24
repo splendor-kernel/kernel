@@ -123,19 +123,36 @@ recording, or adapter execution. Kernel and daemon pre-persistence ingresses cal
 the same Gateway-owned implementation; they do not maintain independent key or
 content rules.
 
-The guard recursively checks action fields, params, requested adapter, and
-satisfied-precondition strings. Case/separator-normalized credential coordinates
-include authorization and proxy authorization, password/passwd, token/API key,
+The guard recursively checks action fields, param keys and values, requested
+adapter, satisfied-precondition strings, and free-form strings in raw authority
+obligation receipts. Receipt screening is content denial only: it neither
+validates a receipt nor turns one into authority. Case/separator-normalized
+credential coordinates include authorization/proxy authorization, common
+`authKey`/`apiToken`/`X-API-Key`/`authz` aliases, password/passwd, token/API key,
 client secret, private key, cookie/set-cookie, secret/credential,
-connection-string/DSN, common environment credential aliases, URL userinfo and
-credential query keys, and equivalent nested map/list content. Neutral-key
-strings are denied when they contain bounded known Basic/Bearer authorization,
-PEM private-key, repository-known provider-key-prefix, generic secret-reference,
-or unambiguous credential URL/DSN/assignment forms. Malformed percent encoding or
-other ambiguity in a credential-capable parsed coordinate fails closed. Object
-keys containing non-ASCII/confusable characters or residual percent escapes after
-one bounded decode also fail closed; ordinary ASCII keys and valid percent-encoded
-non-credential URLs retain their existing path.
+connection-string/DSN, provider environment-password aliases, URL userinfo and
+credential query keys, and equivalent nested map/list content. Credential
+material in an object key is screened as content as well as by normalized key
+name.
+
+Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
+authorization form, PEM private-key block, boundary-delimited provider token,
+embedded generic secret reference, or unambiguous credential URL/DSN/assignment
+form. Basic/Bearer and provider recognition requires a plausible complete token;
+ordinary prose such as `Basic monthly reporting` and resource paths such as
+`models/hf_transformer` remain accepted. Spaced or quoted assignment keys and
+boundary-delimited embedded `vault:`/secret-reference forms deny. Malformed
+percent encoding or other ambiguity in a credential-capable parsed coordinate
+fails closed. Object keys containing non-ASCII/confusable characters or residual
+percent escapes after one bounded decode also fail closed; ordinary ASCII keys
+and valid percent-encoded non-credential URLs retain their existing path.
+
+The executable `http_post` and `write_file` `params.bytes` coordinates are
+reconstructed from bounded integer arrays and scanned before traversal can ignore
+their numeric content. Non-array, non-integer, out-of-range, or over-budget shapes
+fail closed for those executable coordinates. Credential-free bounded byte
+bodies remain accepted, and unrelated actions do not acquire executable-byte
+semantics merely because they contain a numeric array.
 
 Traversal is bounded to depth 16, 2,048 inspected nodes, 16 KiB per string/key,
 and 64 KiB cumulative inspected UTF-8 bytes. A cap overflow returns the same

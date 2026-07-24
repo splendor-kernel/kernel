@@ -9,14 +9,19 @@
   `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run
   admission, direct/physical action handlers, and Gateway policy/trace-durability
   wrappers. Normalized credential coordinates, nested map/list content,
-  URL/userinfo/query, connection/environment assignments, Basic/Bearer, PEM,
-  common provider prefixes, generic secret refs, malformed parsed coordinates,
-  and depth/node/string/byte overflow all return only
+  URL/userinfo/query, quoted/spaced connection/environment assignments, complete
+  Basic/Bearer and boundary-delimited provider forms, PEM, embedded generic
+  secret refs, credential-bearing object keys, raw receipt metadata,
+  HTTP/filesystem executable numeric-byte bodies, and physical/operator envelope
+  strings are covered. Malformed parsed coordinates and
+  depth/node/string/byte overflow all return only
   `raw_credential_input_denied`. Denied traces retain action identity/order but
   use one constant action projection; raw input is excluded from constraints,
-  delegated authority, request fingerprints/idempotency, action traces,
-  feedback, adapters/simulators, and inspect-only replay. Existing wire schemas,
-  trace variants, `ActionStatus`, and credential-free behavior remain unchanged.
+  delegated authority, request fingerprints/idempotency, action traces, physical
+  safety evidence, operator records, feedback, adapters/simulators, and
+  inspect-only replay. Complete-token grammar preserves ordinary Basic prose and
+  provider-looking resource paths. Existing wire schemas, trace variants,
+  `ActionStatus`, and credential-free behavior remain unchanged.
   This is only a denial slice of `SECR-004`/`SECR-006`: it adds no typed secret
   delivery, broker/provider Gateway session, operation-specific
   `CredentialIngressProfile`, exhaustive entropy/encoded/split detection,

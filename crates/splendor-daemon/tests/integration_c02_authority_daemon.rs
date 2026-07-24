@@ -8,9 +8,9 @@ use splendor_daemon::caller_auth::{
 use splendor_daemon::{
     router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonActionCandidate, DaemonConfig,
     DaemonState, DevicePolicyCacheStatus, DeviceRuntimeProfile, DeviceTraceBufferStatus,
-    LifecycleRequest, RegisterDeviceProfileRequest, RegisteredAction, ReplayResponse,
-    RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest, SubmitPhysicalActionRequest,
-    TickResponse, TracePageResponse,
+    LifecycleRequest, OperatorInterventionEvidence, RegisterDeviceProfileRequest, RegisteredAction,
+    ReplayResponse, RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest,
+    SubmitPhysicalActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_gateway::{ActionOutcome, ActionStatus};
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
@@ -1569,26 +1569,109 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         .expect_err("raw credential denial must not contact simulator");
     assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
 
+    let mut denied_action_ids = vec![action_id.clone()];
+    for field in [
+        "allowed_zone_ref",
+        "zone_ref",
+        "cloud_helper_proposal_id",
+        "intervention_id",
+        "intervention_action_name",
+        "intervention_decision",
+        "intervention_expires_at",
+    ] {
+        let canary = format!("Bearer C03_PHYSICAL_{}_CANARY", field.to_ascii_uppercase());
+        let mut request = physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        );
+        let envelope_action_id = ActionId::new();
+        request.action_request.action_id = Some(envelope_action_id.clone());
+        match field {
+            "allowed_zone_ref" => request.safety_context.allowed_zone_refs = vec![canary.clone()],
+            "zone_ref" => request.safety_context.zone_ref = Some(canary.clone()),
+            "cloud_helper_proposal_id" => {
+                request.safety_context.cloud_helper_proposal_id = Some(canary.clone())
+            }
+            intervention_field => {
+                let mut evidence = OperatorInterventionEvidence {
+                    intervention_id: "intervention-fixture".to_string(),
+                    tenant_id: tenant_id.clone(),
+                    run_id: created.run_id.clone(),
+                    action_name: "move_to_waypoint".to_string(),
+                    decision: "granted".to_string(),
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                };
+                match intervention_field {
+                    "intervention_id" => evidence.intervention_id = canary.clone(),
+                    "intervention_action_name" => evidence.action_name = canary.clone(),
+                    "intervention_decision" => evidence.decision = canary.clone(),
+                    "intervention_expires_at" => evidence.expires_at = canary.clone(),
+                    _ => unreachable!("closed physical envelope matrix"),
+                }
+                request.operator_intervention_evidence = Some(evidence);
+            }
+        }
+
+        let (status, denied): (StatusCode, ActionOutcome) =
+            call_json(app.clone(), Method::POST, &uri, request).await;
+        assert_eq!(status, StatusCode::OK, "{field}");
+        assert_eq!(denied.action_id, envelope_action_id, "{field}");
+        assert_eq!(denied.status, ActionStatus::Denied, "{field}");
+        assert_eq!(
+            denied.verification.reasons,
+            vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED],
+            "{field}"
+        );
+        assert!(!serde_json::to_string(&denied)
+            .expect("denial serializes")
+            .contains(&canary));
+        denied_action_ids.push(envelope_action_id);
+        let simulator_error = listener
+            .accept()
+            .expect_err("physical envelope denial must not contact simulator");
+        assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-envelope-denial authority evaluation count"),
+        evaluations_before
+    );
+
     let raw_records = trace_store
         .read(&created.run_id.to_string())
         .expect("raw physical traces");
     let encoded = serde_json::to_string(&raw_records).expect("raw traces serialize");
     assert!(!encoded.contains(CANARY));
-    let action_events = raw_records
+    assert!(!encoded.contains("C03_PHYSICAL_"));
+    let raw_events = raw_records
         .iter()
         .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
-        .filter(|event| event.identity.action_id.as_ref() == Some(&action_id))
         .collect::<Vec<_>>();
-    assert_eq!(action_events.len(), 4);
-    assert!(action_events.iter().all(|event| match &event.kind {
-        TraceEventKind::ActionVerificationStarted { action }
-        | TraceEventKind::ActionVerificationCompleted { action, .. }
-        | TraceEventKind::ActionDenied { action, .. } => {
-            action == &splendor_gateway::raw_credential_denied_action()
-        }
-        TraceEventKind::OutcomeRecorded { .. } => true,
-        _ => false,
-    }));
+    for denied_action_id in &denied_action_ids {
+        let action_events = raw_events
+            .iter()
+            .filter(|event| event.identity.action_id.as_ref() == Some(denied_action_id))
+            .collect::<Vec<_>>();
+        assert_eq!(action_events.len(), 4);
+        assert!(action_events.iter().all(|event| match &event.kind {
+            TraceEventKind::ActionVerificationStarted { action }
+            | TraceEventKind::ActionVerificationCompleted { action, .. }
+            | TraceEventKind::ActionDenied { action, .. } => {
+                action == &splendor_gateway::raw_credential_denied_action()
+            }
+            TraceEventKind::OutcomeRecorded { .. } => true,
+            _ => false,
+        }));
+    }
 
     let replay_caller = replay_credential(tenant_id.clone());
     let executions_before_replay = inspect(app.clone(), &created.run_id)

@@ -18,7 +18,8 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, guard_action_request, guard_action_routing,
+    authority_pre_effect_evidence_recorded, guard_action_request,
+    guard_action_routing_and_receipts, guard_credential_capable_strings,
     raw_credential_denied_action, raw_credential_denied_outcome, ActionAdapter, ActionGateway,
     ActionId, ActionOutcome, ActionRequest, ActionStatus, AdapterError, AdapterResult,
     AuthorityObligationVerifier, CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary,
@@ -2035,20 +2036,49 @@ fn ensure_configured_actions_are_credential_free(
     request: &CreateRunRequest,
 ) -> Result<(), ApiError> {
     if request.policy_actions.iter().any(|candidate| {
-        guard_action_routing(
+        guard_action_routing_and_receipts(
             &candidate.action,
             candidate.adapter.as_deref(),
             &candidate.satisfied_preconditions,
+            &candidate.authority_obligation_receipts,
         )
         .is_err()
     }) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            RAW_CREDENTIAL_INPUT_DENIED,
-            RAW_CREDENTIAL_INPUT_DENIED,
-        ));
+        return Err(raw_credential_input_api_error());
     }
     Ok(())
+}
+
+fn raw_credential_input_api_error() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        RAW_CREDENTIAL_INPUT_DENIED,
+        RAW_CREDENTIAL_INPUT_DENIED,
+    )
+}
+
+fn guard_physical_envelope(
+    request: &SubmitPhysicalActionRequest,
+) -> Result<(), splendor_gateway::RawCredentialInputDenied> {
+    let safety_values = request
+        .safety_context
+        .allowed_zone_refs
+        .iter()
+        .map(String::as_str)
+        .chain(request.safety_context.zone_ref.as_deref())
+        .chain(request.safety_context.cloud_helper_proposal_id.as_deref());
+    let intervention_values = request
+        .operator_intervention_evidence
+        .iter()
+        .flat_map(|evidence| {
+            [
+                evidence.intervention_id.as_str(),
+                evidence.action_name.as_str(),
+                evidence.decision.as_str(),
+                evidence.expires_at.as_str(),
+            ]
+        });
+    guard_credential_capable_strings(safety_values.chain(intervention_values))
 }
 
 fn create_run_caller_scope(security: &DaemonSecurityDecision) -> serde_json::Value {
@@ -4035,7 +4065,9 @@ async fn submit_physical_action(
             None,
             request.action_request.audit_attribution.clone(),
         )?;
-        if guard_action_request(&action_request).is_err() {
+        if guard_action_request(&action_request).is_err()
+            || guard_physical_envelope(&request).is_err()
+        {
             record_daemon_audit(
                 &slot,
                 "splendor.devices.actions.submit",
@@ -4331,6 +4363,13 @@ async fn request_operator_intervention(
         None,
         request.audit_attribution.clone(),
     )?;
+    guard_credential_capable_strings([
+        request.intervention_id.as_str(),
+        request.action_name.as_str(),
+        request.reason.as_str(),
+        request.expires_at.as_str(),
+    ])
+    .map_err(|_| raw_credential_input_api_error())?;
     let trace_event_id = record_device_audit(
         &state,
         "operator.intervention.requested",
@@ -4402,6 +4441,11 @@ async fn decide_operator_intervention(
         None,
         request.audit_attribution.clone(),
     )?;
+    let credential_capable_strings = [intervention_id.as_str(), request.reason.as_str()]
+        .into_iter()
+        .chain(request.expires_at.as_deref());
+    guard_credential_capable_strings(credential_capable_strings)
+        .map_err(|_| raw_credential_input_api_error())?;
     let event = if status == "granted" {
         "operator.intervention.granted"
     } else {
@@ -8941,6 +8985,142 @@ mod tests {
         .expect_err("unregistered trace sync denied");
         assert_eq!(missing_sync.status, StatusCode::NOT_FOUND);
         assert_eq!(missing_sync.body.code, "device_not_registered");
+    }
+
+    #[tokio::test]
+    async fn operator_intervention_raw_metadata_denies_before_audit_and_persistence() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::minutes(15))
+            .format(&Rfc3339)
+            .expect("expiry");
+
+        for field in ["intervention_id", "action_name", "reason", "expires_at"] {
+            let canary = format!("Bearer C03_OPERATOR_{}_CANARY", field.to_ascii_uppercase());
+            let mut request = OperatorInterventionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                intervention_id: format!("intervention_{field}"),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                node_id: node_id.clone(),
+                action_name: "move_to_waypoint".to_string(),
+                reason: "operator review".to_string(),
+                expires_at: expires_at.clone(),
+            };
+            match field {
+                "intervention_id" => request.intervention_id = canary.clone(),
+                "action_name" => request.action_name = canary.clone(),
+                "reason" => request.reason = canary.clone(),
+                "expires_at" => request.expires_at = canary.clone(),
+                _ => unreachable!("closed operator request field matrix"),
+            }
+
+            let error = request_operator_intervention(State(state.clone()), Json(request))
+                .await
+                .expect_err("raw operator request metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            assert!(state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions")
+                .is_empty());
+            assert!(state
+                .inner
+                .device_audit
+                .lock()
+                .expect("device audit")
+                .is_empty());
+        }
+
+        let _ = request_operator_intervention(
+            State(state.clone()),
+            Json(OperatorInterventionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                intervention_id: "intervention_screened".to_string(),
+                tenant_id,
+                agent_id,
+                run_id,
+                node_id,
+                action_name: "move_to_waypoint".to_string(),
+                reason: "operator review".to_string(),
+                expires_at: expires_at.clone(),
+            }),
+        )
+        .await
+        .expect("safe intervention request");
+        assert_eq!(
+            state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions")
+                .len(),
+            1
+        );
+        assert_eq!(
+            state.inner.device_audit.lock().expect("device audit").len(),
+            1
+        );
+
+        for field in ["reason", "expires_at"] {
+            let canary = format!(
+                "Bearer C03_OPERATOR_DECISION_{}_CANARY",
+                field.to_ascii_uppercase()
+            );
+            let mut request = OperatorDecisionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                reason: "cleared".to_string(),
+                expires_at: Some(expires_at.clone()),
+            };
+            match field {
+                "reason" => request.reason = canary.clone(),
+                "expires_at" => request.expires_at = Some(canary.clone()),
+                _ => unreachable!("closed operator decision field matrix"),
+            }
+            let error = grant_operator_intervention(
+                Path("intervention_screened".to_string()),
+                State(state.clone()),
+                Json(request),
+            )
+            .await
+            .expect_err("raw operator decision metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            let interventions = state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions");
+            let record = interventions
+                .get("intervention_screened")
+                .expect("safe record retained");
+            assert_eq!(record.status, "requested");
+            assert_eq!(record.reason, "operator review");
+            drop(interventions);
+            assert_eq!(
+                state.inner.device_audit.lock().expect("device audit").len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

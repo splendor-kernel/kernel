@@ -19,8 +19,9 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 6. `PolicyCompleted` records successful policy return.
 7. The Gateway-owned raw credential guard screens every candidate before any
    candidate/action payload trace, constraint callback, delegated-authority
-   evaluation, or gateway submission. Each candidate receives its `ActionId` at
-   this boundary.
+   evaluation, or gateway submission. Screening includes raw obligation-receipt
+   strings without interpreting those receipts as authority. Each candidate
+   receives its `ActionId` at this boundary.
 8. `CandidatesProposed` records safe actions unchanged and raw-credential
    denials only as the constant suppression projection.
 9. The `ConstraintEngine` returns an aggregate `VerificationResult` over only

@@ -9,10 +9,18 @@ use splendor_kernel::{
     TenantRegistry, TraceEvent, TraceEventKind,
 };
 use splendor_store::{InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceStore};
-use splendor_types::{Action, Feedback, Percept, PerceptProvenance, VerificationResult};
+use splendor_types::{
+    Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
+    AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
+    AuthorityObligationReceiptValidationKind, Feedback, Percept, PerceptProvenance, PrincipalId,
+    RevocationStatus, VerificationResult,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
+
+const ACTION_CANARY: &str = "C03_RAW_CREDENTIAL_KERNEL_CANARY";
+const RECEIPT_CANARY: &str = "Bearer C03_RAW_RECEIPT_KERNEL_CANARY";
 
 struct StaticPerceptor;
 
@@ -81,6 +89,36 @@ impl ActionAdapter for StubAdapter {
 
 struct MixedCredentialPolicy;
 
+fn raw_receipt_canary() -> AuthorityObligationReceipt {
+    let now = OffsetDateTime::now_utc();
+    AuthorityObligationReceipt {
+        schema_version: "splendor.authority_obligation_receipt.v1".to_string(),
+        receipt_id: AuthorityObligationReceiptId::new(),
+        issuer: PrincipalId::new(),
+        audience: "splendor.kernel.fixture".to_string(),
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::ApprovalRequired,
+        subject: PrincipalId::new(),
+        authority_decision_id: AuthorityDecisionId::new(),
+        canonical_request_digest: "blake3:canonical-request".to_string(),
+        evidence_digest: "blake3:evidence".to_string(),
+        evidence_ref: Some(RECEIPT_CANARY.to_string()),
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        revocation: RevocationStatus::Active,
+        revocation_ref: "revocation:fixture".to_string(),
+        approval_id: None,
+        approval_trace_event_id: None,
+        validation: AuthorityObligationReceiptValidation {
+            validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+            algorithm: "local-signature-v1".to_string(),
+            key_id: "local-receipt-key-v1".to_string(),
+            digest: "blake3:receipt".to_string(),
+            signature: "synthetic-signature".to_string(),
+        },
+    }
+}
+
 impl Policy for MixedCredentialPolicy {
     fn name(&self) -> &str {
         "mixed-credential-policy"
@@ -94,7 +132,7 @@ impl Policy for MixedCredentialPolicy {
         let denied = ActionCandidate::new(Action {
             name: "unsafe-input".to_string(),
             params: serde_json::json!({
-                "nested": [{"client-secret": "C03_RAW_CREDENTIAL_KERNEL_CANARY"}]
+                "nested": [{"authKey": ACTION_CANARY}]
             }),
             side_effect_class: SideEffectClass::Network,
             cost_estimate: None,
@@ -103,6 +141,17 @@ impl Policy for MixedCredentialPolicy {
             postconditions: Vec::new(),
         })
         .with_adapter("stub");
+        let receipt_denied = ActionCandidate::new(Action {
+            name: "unsafe-input".to_string(),
+            params: serde_json::json!({"resource_ref": "fixture:receipt"}),
+            side_effect_class: SideEffectClass::Network,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        })
+        .with_adapter("stub")
+        .with_authority_obligation_receipts(vec![raw_receipt_canary()]);
         let allowed = ActionCandidate::new(Action {
             name: "safe-input".to_string(),
             params: serde_json::json!({"resource_ref": "fixture:report"}),
@@ -114,7 +163,7 @@ impl Policy for MixedCredentialPolicy {
         })
         .with_adapter("stub");
         Ok(PolicyDecision::new(
-            vec![denied, allowed],
+            vec![denied, receipt_denied, allowed],
             StateData {
                 bytes: b"credential-free-state".to_vec(),
                 content_type: Some("text/plain".to_string()),
@@ -312,8 +361,6 @@ fn loop_engine_persists_state_and_trace_records() {
 
 #[test]
 fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_replay() {
-    const CANARY: &str = "C03_RAW_CREDENTIAL_KERNEL_CANARY";
-
     let state_store = Arc::new(InMemoryStateStore::default());
     let trace_store = Arc::new(InMemoryTraceStore::default());
     let state_graph = StateGraph::new(
@@ -386,13 +433,18 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
 
     let outcome = engine.tick(1).expect("mixed tick");
 
-    assert_eq!(outcome.action_outcomes.len(), 2);
+    assert_eq!(outcome.action_outcomes.len(), 3);
     assert_eq!(outcome.action_outcomes[0].status, ActionStatus::Denied);
     assert_eq!(
         outcome.action_outcomes[0].verification,
         VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
     );
-    assert_eq!(outcome.action_outcomes[1].status, ActionStatus::Executed);
+    assert_eq!(outcome.action_outcomes[1].status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.action_outcomes[1].verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.action_outcomes[2].status, ActionStatus::Executed);
     assert_eq!(safe_adapter_calls.load(Ordering::SeqCst), 1);
     assert_eq!(raw_adapter_calls.load(Ordering::SeqCst), 0);
     assert_eq!(raw_provider_calls.load(Ordering::SeqCst), 0);
@@ -416,13 +468,15 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
                 .expect("snapshot id"),
         )
         .expect("snapshot");
-    assert!(!String::from_utf8_lossy(&snapshot.state.bytes).contains(CANARY));
+    assert!(!String::from_utf8_lossy(&snapshot.state.bytes).contains(ACTION_CANARY));
+    assert!(!String::from_utf8_lossy(&snapshot.state.bytes).contains(RECEIPT_CANARY));
 
     let records = trace_store
         .read(&run_id.to_string())
         .expect("trace records");
     let encoded_records = serde_json::to_string(&records).expect("records serialize");
-    assert!(!encoded_records.contains(CANARY));
+    assert!(!encoded_records.contains(ACTION_CANARY));
+    assert!(!encoded_records.contains(RECEIPT_CANARY));
     let events = records
         .iter()
         .map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).expect("event"))
@@ -435,7 +489,8 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
         })
         .expect("candidates");
     assert_eq!(candidates[0], raw_credential_denied_action());
-    assert_eq!(candidates[1].name, "safe-input");
+    assert_eq!(candidates[1], raw_credential_denied_action());
+    assert_eq!(candidates[2].name, "safe-input");
     assert!(events.iter().any(|event| matches!(
         &event.kind,
         TraceEventKind::ActionDenied { action, result }
@@ -453,5 +508,8 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
     assert_eq!(raw_provider_calls.load(Ordering::SeqCst), 0);
     assert!(!serde_json::to_string(&replayed)
         .expect("replay serializes")
-        .contains(CANARY));
+        .contains(ACTION_CANARY));
+    assert!(!serde_json::to_string(&replayed)
+        .expect("replay serializes")
+        .contains(RECEIPT_CANARY));
 }

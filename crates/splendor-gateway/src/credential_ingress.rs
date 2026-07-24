@@ -5,7 +5,9 @@
 //! credential material.
 
 use crate::{ActionOutcome, ActionRequest, ActionStatus};
-use splendor_types::{Action, SideEffectClass, VerificationResult};
+use splendor_types::{
+    Action, AuthorityObligationReceipt, RevocationStatus, SideEffectClass, VerificationResult,
+};
 use std::fmt;
 use time::OffsetDateTime;
 
@@ -44,7 +46,7 @@ impl std::error::Error for RawCredentialInputDenied {}
 
 /// Screens an action before any untrusted action payload is persisted.
 pub fn guard_action(action: &Action) -> Result<(), RawCredentialInputDenied> {
-    guard_action_routing(action, None, &[])
+    guard_action_routing_and_receipts(action, None, &[], &[])
 }
 
 /// Screens an action plus untrusted adapter/precondition routing metadata.
@@ -52,6 +54,17 @@ pub fn guard_action_routing(
     action: &Action,
     adapter: Option<&str>,
     satisfied_preconditions: &[String],
+) -> Result<(), RawCredentialInputDenied> {
+    guard_action_routing_and_receipts(action, adapter, satisfied_preconditions, &[])
+}
+
+/// Screens action routing plus raw authority-receipt metadata without treating
+/// a receipt as authority or duplicating Authority validation semantics.
+pub fn guard_action_routing_and_receipts(
+    action: &Action,
+    adapter: Option<&str>,
+    satisfied_preconditions: &[String],
+    authority_obligation_receipts: &[AuthorityObligationReceipt],
 ) -> Result<(), RawCredentialInputDenied> {
     let mut scanner = CredentialIngressScanner::default();
     scanner.scan_action(action)?;
@@ -61,18 +74,37 @@ pub fn guard_action_routing(
     for precondition in satisfied_preconditions {
         scanner.scan_string(precondition)?;
     }
+    scanner.scan_authority_obligation_receipts(authority_obligation_receipts)?;
+    Ok(())
+}
+
+/// Screens an owner-selected set of untrusted, credential-capable strings.
+///
+/// Callers select fields from their own closed envelope; all detection grammar
+/// and resource limits remain owned here by the Gateway. This check is
+/// denial-only and never validates or grants authority.
+pub fn guard_credential_capable_strings<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), RawCredentialInputDenied> {
+    let mut scanner = CredentialIngressScanner::default();
+    for value in values {
+        scanner.scan_string(value)?;
+    }
     Ok(())
 }
 
 /// Screens the untrusted action/routing portion of an action request.
 ///
-/// Typed caller authentication and authority evidence are intentionally not
-/// scanned as workload input. They remain governed by their owning validators.
+/// Typed caller authentication and authority decisions are intentionally not
+/// scanned as workload input. Raw receipt strings are content-screened before
+/// their owning Authority validator runs; screening does not make them valid or
+/// authorizing.
 pub fn guard_action_request(request: &ActionRequest) -> Result<(), RawCredentialInputDenied> {
-    guard_action_routing(
+    guard_action_routing_and_receipts(
         &request.action,
         request.adapter.as_deref(),
         &request.satisfied_preconditions,
+        &request.authority_obligation_receipts,
     )
 }
 
@@ -116,6 +148,9 @@ impl CredentialIngressScanner {
     fn scan_action(&mut self, action: &Action) -> Result<(), RawCredentialInputDenied> {
         self.charge_node()?;
         self.scan_string(&action.name)?;
+        if executable_numeric_bytes_coordinate(action) {
+            self.scan_executable_numeric_bytes(&action.params)?;
+        }
         self.scan_value(&action.params, 0)?;
 
         if let SideEffectClass::Custom(value) = &action.side_effect_class {
@@ -133,6 +168,52 @@ impl CredentialIngressScanner {
         }
         for value in &action.postconditions {
             self.scan_string(value)?;
+        }
+        Ok(())
+    }
+
+    fn scan_executable_numeric_bytes(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<(), RawCredentialInputDenied> {
+        let Some(bytes) = params.as_object().and_then(|params| params.get("bytes")) else {
+            return Ok(());
+        };
+        let bytes = bytes.as_array().ok_or(RawCredentialInputDenied)?;
+        if bytes.len() > CREDENTIAL_INGRESS_MAX_NODES {
+            return Err(RawCredentialInputDenied);
+        }
+        let mut reconstructed = Vec::with_capacity(bytes.len());
+        for value in bytes {
+            let value = value.as_u64().ok_or(RawCredentialInputDenied)?;
+            let byte = u8::try_from(value).map_err(|_| RawCredentialInputDenied)?;
+            reconstructed.push(byte);
+        }
+        let textual = String::from_utf8_lossy(&reconstructed);
+        self.scan_string(textual.as_ref())
+    }
+
+    fn scan_authority_obligation_receipts(
+        &mut self,
+        receipts: &[AuthorityObligationReceipt],
+    ) -> Result<(), RawCredentialInputDenied> {
+        for receipt in receipts {
+            self.charge_node()?;
+            self.scan_string(&receipt.schema_version)?;
+            self.scan_string(&receipt.audience)?;
+            self.scan_string(&receipt.canonical_request_digest)?;
+            self.scan_string(&receipt.evidence_digest)?;
+            if let Some(evidence_ref) = receipt.evidence_ref.as_deref() {
+                self.scan_string(evidence_ref)?;
+            }
+            if let RevocationStatus::Revoked { reason } = &receipt.revocation {
+                self.scan_string(reason)?;
+            }
+            self.scan_string(&receipt.revocation_ref)?;
+            self.scan_string(&receipt.validation.algorithm)?;
+            self.scan_string(&receipt.validation.key_id)?;
+            self.scan_string(&receipt.validation.digest)?;
+            self.scan_string(&receipt.validation.signature)?;
         }
         Ok(())
     }
@@ -167,7 +248,7 @@ impl CredentialIngressScanner {
 
     fn scan_key(&mut self, key: &str) -> Result<(), RawCredentialInputDenied> {
         self.charge_string_bytes(key)?;
-        if normalized_credential_key(key)? {
+        if normalized_credential_key(key)? || credential_content(key)? {
             return Err(RawCredentialInputDenied);
         }
         Ok(())
@@ -225,6 +306,13 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
         normalized.as_str(),
         "authorization"
             | "proxyauthorization"
+            | "auth"
+            | "authentication"
+            | "authkey"
+            | "authorizationkey"
+            | "xapikey"
+            | "apitoken"
+            | "authz"
             | "password"
             | "passwd"
             | "pwd"
@@ -270,8 +358,22 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
             | "cijobtoken"
             | "dockerauthconfig"
             | "pgpassword"
+            | "postgrespassword"
+            | "postgresqlpassword"
             | "pgpassfile"
             | "mysqlpwd"
+            | "mysqlpassword"
+            | "mysqlrootpassword"
+            | "mariadbpassword"
+            | "mariadbrootpassword"
+            | "mongopassword"
+            | "mongoinitdbrootpassword"
+            | "redispassword"
+            | "rabbitmqdefaultpass"
+            | "mssqlsapassword"
+            | "oraclepassword"
+            | "elasticpassword"
+            | "opensearchinitialadminpassword"
             | "mongodburi"
             | "rabbitmqurl"
             | "hftoken"
@@ -296,7 +398,7 @@ fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
             return Err(RawCredentialInputDenied);
         }
         let lowercase = decoded.to_ascii_lowercase();
-        if authorization_form(&lowercase)
+        if authorization_form(&decoded)
             || private_key_block(&lowercase)
             || provider_key_prefix(&decoded)
             || secret_reference_form(&lowercase)
@@ -309,7 +411,7 @@ fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
     }
     let lowercase = trimmed.to_ascii_lowercase();
 
-    if authorization_form(&lowercase)
+    if authorization_form(trimmed)
         || private_key_block(&lowercase)
         || provider_key_prefix(trimmed)
         || secret_reference_form(&lowercase)
@@ -322,17 +424,94 @@ fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
     Ok(false)
 }
 
-fn authorization_form(lowercase: &str) -> bool {
-    let value = lowercase.trim_start();
+fn authorization_form(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
     ["bearer", "basic"].iter().any(|scheme| {
-        value == *scheme
-            || value
-                .strip_prefix(scheme)
-                .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-            || value.contains(&format!("authorization: {scheme}"))
-            || value.contains(&format!("authorization={scheme}"))
-            || value.contains(&format!("proxy-authorization: {scheme}"))
+        lowercase.match_indices(scheme).any(|(index, _)| {
+            if index > 0 {
+                let before = lowercase.as_bytes()[index - 1];
+                if !authorization_scheme_boundary(before) {
+                    return false;
+                }
+            }
+            let after_scheme = &value[index + scheme.len()..];
+            if !after_scheme.chars().next().is_some_and(char::is_whitespace) {
+                return false;
+            }
+            let line = after_scheme
+                .split(['\r', '\n'])
+                .next()
+                .unwrap_or_default()
+                .trim_start();
+            let token_length = line
+                .bytes()
+                .take_while(|byte| authorization_token_byte(*byte, scheme))
+                .count();
+            if token_length == 0 {
+                return false;
+            }
+            let token = &line[..token_length];
+            let trailing = line[token_length..].trim();
+            trailing.bytes().all(is_authorization_closing_delimiter)
+                && if *scheme == "basic" {
+                    plausible_basic_token(token)
+                } else {
+                    plausible_bearer_token(token)
+                }
+        })
     })
+}
+
+fn authorization_scheme_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b'=' | b':' | b',' | b';' | b'(' | b'[' | b'{'
+        )
+}
+
+fn authorization_token_byte(byte: u8, scheme: &str) -> bool {
+    byte.is_ascii_alphanumeric()
+        || if scheme == "basic" {
+            matches!(byte, b'+' | b'/' | b'=')
+        } else {
+            matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        }
+}
+
+fn is_authorization_closing_delimiter(byte: u8) -> bool {
+    matches!(byte, b'"' | b'\'' | b'}' | b']' | b')' | b',' | b';')
+}
+
+fn plausible_basic_token(token: &str) -> bool {
+    const MINIMUM_BASIC_TOKEN_BYTES: usize = 8;
+    const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
+
+    if !(MINIMUM_BASIC_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len())
+        || token.len() % 4 != 0
+    {
+        return false;
+    }
+    let padding = token.bytes().rev().take_while(|byte| *byte == b'=').count();
+    padding <= 2
+        && token[..token.len() - padding]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+fn plausible_bearer_token(token: &str) -> bool {
+    const MINIMUM_BEARER_TOKEN_BYTES: usize = 8;
+    const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
+
+    if !(MINIMUM_BEARER_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len()) {
+        return false;
+    }
+    let padding = token.bytes().rev().take_while(|byte| *byte == b'=').count();
+    padding <= 2
+        && padding < token.len()
+        && token[..token.len() - padding].bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
 }
 
 fn private_key_block(lowercase: &str) -> bool {
@@ -347,47 +526,185 @@ fn private_key_block(lowercase: &str) -> bool {
         || (lowercase.contains("-----begin ") && lowercase.contains(" private key-----"))
 }
 
-fn provider_key_prefix(value: &str) -> bool {
-    let lowercase = value.to_ascii_lowercase();
-    let prefixed = [
-        ("gho_", 8_usize),
-        ("ghp_", 8),
-        ("github_pat_", 8),
-        ("xoxb-", 8),
-        ("xoxp-", 8),
-        ("glpat-", 8),
-        ("npm_", 8),
-        ("pypi-", 8),
-        ("hf_", 8),
-        ("dop_v1_", 8),
-        ("sg.", 8),
-        ("sk-", 8),
-        ("sk_", 8),
-        ("aiza", 16),
-    ]
-    .iter()
-    .any(|(prefix, minimum_suffix)| contains_prefixed_token(&lowercase, prefix, *minimum_suffix));
-    prefixed
-        || ["AKIA", "ASIA"]
-            .iter()
-            .any(|prefix| contains_prefixed_token(value, prefix, 12))
+#[derive(Clone, Copy)]
+enum ProviderTokenAlphabet {
+    Alphanumeric,
+    AlphanumericDashUnderscore,
+    AlphanumericDashUnderscoreDot,
+    UpperAlphanumeric,
 }
 
-fn contains_prefixed_token(value: &str, prefix: &str, minimum_suffix: usize) -> bool {
-    value.match_indices(prefix).any(|(index, _)| {
-        let boundary_before = index == 0
-            || !value.as_bytes()[index - 1].is_ascii_alphanumeric()
-                && value.as_bytes()[index - 1] != b'_';
-        if !boundary_before {
+#[derive(Clone, Copy)]
+struct ProviderTokenProfile {
+    prefix: &'static str,
+    minimum_suffix: usize,
+    maximum_suffix: usize,
+    case_sensitive: bool,
+    alphabet: ProviderTokenAlphabet,
+}
+
+const fn provider_token_profile(
+    prefix: &'static str,
+    minimum_suffix: usize,
+    maximum_suffix: usize,
+    case_sensitive: bool,
+    alphabet: ProviderTokenAlphabet,
+) -> ProviderTokenProfile {
+    ProviderTokenProfile {
+        prefix,
+        minimum_suffix,
+        maximum_suffix,
+        case_sensitive,
+        alphabet,
+    }
+}
+
+fn provider_key_prefix(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
+    [
+        provider_token_profile("gho_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile("ghp_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile(
+            "github_pat_",
+            8,
+            256,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "xoxb-",
+            8,
+            128,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "xoxp-",
+            8,
+            128,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "glpat-",
+            8,
+            128,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile("npm_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile(
+            "pypi-",
+            8,
+            256,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile("hf_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile(
+            "dop_v1_",
+            8,
+            128,
+            false,
+            ProviderTokenAlphabet::Alphanumeric,
+        ),
+        provider_token_profile(
+            "sg.",
+            8,
+            256,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscoreDot,
+        ),
+        provider_token_profile(
+            "sk-",
+            8,
+            256,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "sk_",
+            8,
+            256,
+            false,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "AIza",
+            16,
+            128,
+            true,
+            ProviderTokenAlphabet::AlphanumericDashUnderscore,
+        ),
+        provider_token_profile(
+            "AKIA",
+            12,
+            64,
+            true,
+            ProviderTokenAlphabet::UpperAlphanumeric,
+        ),
+        provider_token_profile(
+            "ASIA",
+            12,
+            64,
+            true,
+            ProviderTokenAlphabet::UpperAlphanumeric,
+        ),
+    ]
+    .into_iter()
+    .any(|profile| {
+        let candidate = if profile.case_sensitive {
+            value
+        } else {
+            &lowercase
+        };
+        contains_prefixed_token(candidate, profile)
+    })
+}
+
+fn contains_prefixed_token(value: &str, profile: ProviderTokenProfile) -> bool {
+    value.match_indices(profile.prefix).any(|(index, _)| {
+        if index > 0 && !provider_token_start_boundary(value.as_bytes()[index - 1]) {
             return false;
         }
-        let suffix = &value[index + prefix.len()..];
+        let suffix = &value[index + profile.prefix.len()..];
         let token_suffix_len = suffix
             .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+            .take_while(|byte| provider_suffix_byte(*byte, profile.alphabet))
             .count();
-        token_suffix_len >= minimum_suffix
+        if !(profile.minimum_suffix..=profile.maximum_suffix).contains(&token_suffix_len) {
+            return false;
+        }
+        let token_end = index + profile.prefix.len() + token_suffix_len;
+        token_end == value.len() || provider_token_end_boundary(value.as_bytes()[token_end])
     })
+}
+
+fn provider_suffix_byte(byte: u8, alphabet: ProviderTokenAlphabet) -> bool {
+    match alphabet {
+        ProviderTokenAlphabet::Alphanumeric => byte.is_ascii_alphanumeric(),
+        ProviderTokenAlphabet::AlphanumericDashUnderscore => {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+        }
+        ProviderTokenAlphabet::AlphanumericDashUnderscoreDot => {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        }
+        ProviderTokenAlphabet::UpperAlphanumeric => {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit()
+        }
+    }
+}
+
+fn provider_token_start_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b'=' | b':' | b',' | b';' | b'(' | b')' | b'[' | b']' | b'{' | b'}'
+        )
+}
+
+fn provider_token_end_boundary(byte: u8) -> bool {
+    provider_token_start_boundary(byte) || matches!(byte, b'/' | b'?' | b'#' | b'&')
 }
 
 fn secret_reference_form(lowercase: &str) -> bool {
@@ -403,10 +720,35 @@ fn secret_reference_form(lowercase: &str) -> bool {
     ]
     .iter()
     .any(|prefix| {
-        lowercase
-            .strip_prefix(prefix)
-            .is_some_and(|remainder| !remainder.trim().is_empty())
+        lowercase.match_indices(prefix).any(|(index, _)| {
+            if index > 0 {
+                let before = lowercase.as_bytes()[index - 1];
+                if before.is_ascii_alphanumeric() || matches!(before, b'_' | b'-') {
+                    return false;
+                }
+            }
+            let remainder = &lowercase[index + prefix.len()..];
+            let payload_length = remainder
+                .bytes()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(*byte, b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'~')
+                })
+                .count();
+            payload_length > 0
+                && payload_length <= 2_048
+                && (payload_length == remainder.len()
+                    || reference_boundary(remainder.as_bytes()[payload_length]))
+        })
     })
+}
+
+fn reference_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b',' | b';' | b')' | b']' | b'}' | b'&' | b'#'
+        )
 }
 
 fn credential_assignment(value: &str) -> Result<bool, RawCredentialInputDenied> {
@@ -416,25 +758,55 @@ fn credential_assignment(value: &str) -> Result<bool, RawCredentialInputDenied> 
             continue;
         }
 
-        let mut end = separator;
-        while end > 0
-            && (bytes[end - 1].is_ascii_whitespace() || matches!(bytes[end - 1], b'"' | b'\''))
-        {
-            end -= 1;
-        }
-        let mut start = end;
+        let mut start = separator;
         while start > 0
-            && (bytes[start - 1].is_ascii_alphanumeric()
-                || matches!(bytes[start - 1], b'_' | b'-' | b'.'))
+            && !matches!(
+                bytes[start - 1],
+                b'=' | b':' | b',' | b';' | b'{' | b'[' | b'(' | b'\r' | b'\n'
+            )
         {
             start -= 1;
         }
-        let key = &value[start..end];
-        if !key.is_empty() && normalized_credential_key(key)? {
-            return Ok(true);
+        let segment = value[start..separator].trim();
+        for candidate in assignment_key_suffixes(segment) {
+            if normalized_credential_key(candidate)? {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
+}
+
+fn assignment_key_suffixes(segment: &str) -> Vec<&str> {
+    let segment = segment.trim_matches(|character: char| {
+        character.is_ascii_whitespace() || matches!(character, '"' | '\'')
+    });
+    let mut candidates = Vec::new();
+    if plausible_assignment_key(segment) {
+        candidates.push(segment);
+    }
+    for (index, character) in segment.char_indices() {
+        if !character.is_ascii_whitespace() && !matches!(character, '"' | '\'') {
+            continue;
+        }
+        let candidate = segment[index + character.len_utf8()..].trim_matches(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '"' | '\'')
+        });
+        if plausible_assignment_key(candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn plausible_assignment_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/')
+        })
 }
 
 fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
@@ -489,7 +861,7 @@ fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
         }
         let decoded_value = percent_decode(raw_value)?;
         let lower_value = decoded_value.to_ascii_lowercase();
-        if authorization_form(&lower_value)
+        if authorization_form(&decoded_value)
             || private_key_block(&lower_value)
             || provider_key_prefix(&decoded_value)
             || secret_reference_form(&lower_value)
@@ -499,6 +871,10 @@ fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
         }
     }
     Ok(false)
+}
+
+fn executable_numeric_bytes_coordinate(action: &Action) -> bool {
+    matches!(action.name.as_str(), "http_post" | "write_file")
 }
 
 fn url_coordinate_candidate(value: &str) -> bool {
@@ -572,11 +948,20 @@ fn compact_ascii(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use splendor_types::{AgentId, CostEstimate, QuotaUsage, RunId, TenantId};
+    use splendor_types::{
+        AgentId, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
+        AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
+        AuthorityObligationReceiptValidationKind, CostEstimate, PrincipalId, QuotaUsage, RunId,
+        TenantId,
+    };
 
     fn action(params: serde_json::Value) -> Action {
+        action_named("inspect", params)
+    }
+
+    fn action_named(name: &str, params: serde_json::Value) -> Action {
         Action {
-            name: "inspect".to_string(),
+            name: name.to_string(),
             params,
             side_effect_class: SideEffectClass::ReadOnly,
             cost_estimate: None,
@@ -584,6 +969,43 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
         }
+    }
+
+    fn ordinary_receipt() -> AuthorityObligationReceipt {
+        let now = OffsetDateTime::now_utc();
+        AuthorityObligationReceipt {
+            schema_version: "splendor.authority_obligation_receipt.v1".to_string(),
+            receipt_id: AuthorityObligationReceiptId::new(),
+            issuer: PrincipalId::new(),
+            audience: "splendor.daemon.run:fixture".to_string(),
+            obligation_id: AuthorityObligationId::new(),
+            kind: AuthorityObligationKind::ApprovalRequired,
+            subject: PrincipalId::new(),
+            authority_decision_id: AuthorityDecisionId::new(),
+            canonical_request_digest: "blake3:canonical-request".to_string(),
+            evidence_digest: "blake3:evidence".to_string(),
+            evidence_ref: Some("evidence:approval/fixture".to_string()),
+            issued_at: now,
+            expires_at: now + time::Duration::minutes(5),
+            revocation: RevocationStatus::Active,
+            revocation_ref: "revocation:fixture".to_string(),
+            approval_id: None,
+            approval_trace_event_id: None,
+            validation: AuthorityObligationReceiptValidation {
+                validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+                algorithm: "local-signature-v1".to_string(),
+                key_id: "local-receipt-key-v1".to_string(),
+                digest: "blake3:receipt".to_string(),
+                signature: "synthetic-signature".to_string(),
+            },
+        }
+    }
+
+    fn synthetic_private_key_canary() -> String {
+        format!(
+            "-----BEGIN {}-----\nSYNTHETIC\n-----END {}-----",
+            "PRIVATE KEY", "PRIVATE KEY"
+        )
     }
 
     fn request(action: Action) -> ActionRequest {
@@ -615,6 +1037,10 @@ mod tests {
             "token",
             "api_key",
             "ApiKey",
+            "authKey",
+            "apiToken",
+            "X-API-Key",
+            "authz",
             "client secret",
             "private/key",
             "cookie",
@@ -633,7 +1059,21 @@ mod tests {
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "PGPASSWORD",
+            "POSTGRES_PASSWORD",
+            "POSTGRESQL_PASSWORD",
             "MYSQL_PWD",
+            "MYSQL_PASSWORD",
+            "MYSQL_ROOT_PASSWORD",
+            "MARIADB_PASSWORD",
+            "MARIADB_ROOT_PASSWORD",
+            "MONGO_PASSWORD",
+            "MONGO_INITDB_ROOT_PASSWORD",
+            "REDIS_PASSWORD",
+            "RABBITMQ_DEFAULT_PASS",
+            "MSSQL_SA_PASSWORD",
+            "ORACLE_PASSWORD",
+            "ELASTIC_PASSWORD",
+            "OPENSEARCH_INITIAL_ADMIN_PASSWORD",
             "DOCKER_AUTH_CONFIG",
             "HF_TOKEN",
             "secret_ref_id",
@@ -644,12 +1084,45 @@ mod tests {
     }
 
     #[test]
+    fn credential_content_in_object_keys_is_denied() {
+        for key in [
+            "Bearer synthetic-value",
+            "vault:team/service",
+            "ghp_syntheticcredential",
+            "authKey = synthetic",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({key: "ordinary-value"}))),
+                Err(RawCredentialInputDenied),
+                "credential-bearing object key must deny independently: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_assignments_and_embedded_refs_are_denied_independently() {
+        for value in [
+            r#""authKey" = "synthetic""#,
+            r#"prefix "X-API-Key" : "synthetic""#,
+            "export POSTGRES_PASSWORD = synthetic",
+            "read vault:team/service for deployment",
+            "reference=(secret_ref:team/service)",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Err(RawCredentialInputDenied),
+                "assignment/ref must deny independently: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn content_matrix_denies_auth_private_provider_ref_url_and_dsn_forms() {
         let mut values = vec![
             "Bearer synthetic-value".to_string(),
             "Bearer%20synthetic-value".to_string(),
             "Basic c3ludGhldGlj".to_string(),
-            "-----BEGIN PRIVATE KEY-----\nSYNTHETIC\n-----END PRIVATE KEY-----".to_string(),
+            synthetic_private_key_canary(),
             "secret_ref:synthetic-reference".to_string(),
             "https://user:synthetic@example.invalid/path".to_string(),
             "https%3A%2F%2Fuser%3Asynthetic%40example.invalid%2Fpath".to_string(),
@@ -682,6 +1155,155 @@ mod tests {
             assert_eq!(
                 guard_action(&action(serde_json::json!({"input": value}))),
                 Err(RawCredentialInputDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_and_provider_grammar_preserves_ordinary_prose_and_resources() {
+        for value in [
+            "Basic monthly reporting",
+            "Bearer monthly reporting",
+            "models/hf_transformer",
+            "models/Basic c3ludGhldGlj",
+            "models/sk-learn",
+            "prefixghp_syntheticcredential",
+            "Bearer ========",
+            "Basic reporting",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Ok(()),
+                "ordinary content must remain accepted: {value}"
+            );
+        }
+
+        for value in [
+            "Basic c3ludGhldGlj",
+            "Bearer synthetic-value",
+            "prefix Authorization: Bearer synthetic-value",
+            "hf_synthetic",
+            "ghp_syntheticcredential",
+            "ghp_syntheticcredential/metadata",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Err(RawCredentialInputDenied),
+                "complete credential form must deny: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_numeric_byte_coordinates_are_reconstructed_and_fail_closed() {
+        let credential_bodies = vec![
+            "Bearer synthetic-value".to_string(),
+            "Basic c3ludGhldGlj".to_string(),
+            synthetic_private_key_canary(),
+            "ghp_syntheticcredential".to_string(),
+            "PASSWORD=synthetic".to_string(),
+            "https://user:synthetic@example.invalid/path".to_string(),
+            "user:synthetic@example.invalid".to_string(),
+            "vault:team/service".to_string(),
+        ];
+        for action_name in ["http_post", "write_file"] {
+            for credential in &credential_bodies {
+                let bytes = credential.as_bytes().to_vec();
+                assert_eq!(
+                    guard_action(&action_named(
+                        action_name,
+                        serde_json::json!({"bytes": bytes})
+                    )),
+                    Err(RawCredentialInputDenied),
+                    "{action_name} numeric body must deny: {credential}"
+                );
+            }
+
+            assert_eq!(
+                guard_action(&action_named(
+                    action_name,
+                    serde_json::json!({"bytes": b"ordinary bounded body".to_vec()})
+                )),
+                Ok(())
+            );
+            for invalid in [
+                serde_json::json!("not-an-array"),
+                serde_json::json!([256]),
+                serde_json::json!([-1]),
+                serde_json::json!([1.5]),
+                serde_json::json!({"nested": true}),
+            ] {
+                assert_eq!(
+                    guard_action(&action_named(
+                        action_name,
+                        serde_json::json!({"bytes": invalid})
+                    )),
+                    Err(RawCredentialInputDenied),
+                    "ambiguous executable bytes must fail closed"
+                );
+            }
+            assert_eq!(
+                guard_action(&action_named(
+                    action_name,
+                    serde_json::json!({
+                        "bytes": vec![0_u8; CREDENTIAL_INGRESS_MAX_NODES + 1]
+                    })
+                )),
+                Err(RawCredentialInputDenied),
+                "oversized executable bytes must fail closed"
+            );
+        }
+
+        assert_eq!(
+            guard_action(&action(serde_json::json!({"bytes": [256]}))),
+            Ok(()),
+            "numeric byte semantics must not be inferred for unrelated actions"
+        );
+    }
+
+    #[test]
+    fn raw_receipt_strings_are_screened_without_validating_authority() {
+        let mut safe = request(action(serde_json::json!({"safe": true})));
+        safe.authority_obligation_receipts = vec![ordinary_receipt()];
+        assert_eq!(guard_action_request(&safe), Ok(()));
+
+        for field in [
+            "schema_version",
+            "audience",
+            "canonical_request_digest",
+            "evidence_digest",
+            "evidence_ref",
+            "revocation_reason",
+            "revocation_ref",
+            "algorithm",
+            "key_id",
+            "validation_digest",
+            "signature",
+        ] {
+            let mut receipt = ordinary_receipt();
+            let canary = "Bearer synthetic-value".to_string();
+            match field {
+                "schema_version" => receipt.schema_version = canary,
+                "audience" => receipt.audience = canary,
+                "canonical_request_digest" => receipt.canonical_request_digest = canary,
+                "evidence_digest" => receipt.evidence_digest = canary,
+                "evidence_ref" => receipt.evidence_ref = Some(canary),
+                "revocation_reason" => {
+                    receipt.revocation = RevocationStatus::Revoked { reason: canary }
+                }
+                "revocation_ref" => receipt.revocation_ref = canary,
+                "algorithm" => receipt.validation.algorithm = canary,
+                "key_id" => receipt.validation.key_id = canary,
+                "validation_digest" => receipt.validation.digest = canary,
+                "signature" => receipt.validation.signature = canary,
+                _ => unreachable!("closed receipt field matrix"),
+            }
+            let mut guarded = request(action(serde_json::json!({"safe": true})));
+            guarded.authority_obligation_receipts = vec![receipt];
+            assert_eq!(
+                guard_action_request(&guarded),
+                Err(RawCredentialInputDenied),
+                "receipt field must deny independently: {field}"
             );
         }
     }

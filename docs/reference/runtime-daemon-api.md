@@ -252,8 +252,11 @@ domain-separated BLAKE3. The earlier FNV representation is not emitted.
 After work-order and caller authentication, but before request fingerprinting,
 idempotency lookup/receipt creation, run-authority admission, run-slot insertion,
 state creation, or trace creation, the daemon screens every configured
-`policy_actions` candidate with the Gateway-owned raw credential guard. A match,
-ambiguity, or scanner-budget overflow returns HTTP `400` with only
+`policy_actions` candidate, including its raw authority-obligation receipt
+strings, with the Gateway-owned raw credential guard. Receipt screening occurs
+before the receipt bytes can enter the creation fingerprint, idempotency scope,
+static policy, run slot, state, or trace; Authority remains the sole receipt
+validator. A match, ambiguity, or scanner-budget overflow returns HTTP `400` with only
 `raw_credential_input_denied`. The error has null details and does not reflect a
 key, value, path, parser error, digest, or configured action. Exact retries remain
 clean rejections; no idempotency receipt or run ID has been reserved, so a later
@@ -334,6 +337,24 @@ authority/broker/provider, adapter, or device simulator, or change pending
 approval authority. Caller authentication credentials are validated by the
 daemon security boundary and are not treated as workload action data by this
 guard.
+
+The physical handler additionally screens every caller-controlled string in
+`SafetyContext` (`allowed_zone_refs`, `zone_ref`, and cloud-helper proposal ID)
+and attached operator-intervention evidence after authenticated tenant/run scope
+validation but before physical authority binding, safety snapshot/evidence,
+physical traces, Gateway construction, or simulator access. The operator
+intervention request/grant/deny handlers screen their free-form IDs, action,
+reason, decision-expiry metadata at the same authenticated boundary before
+device audit or intervention-record mutation. Operator endpoint rejection uses
+HTTP `400` with the same fixed, null-detail denial; physical action rejection
+uses the fixed suppressed `ActionOutcome` above.
+
+Residual incomplete behavior: direct and physical raw-input denials for an
+otherwise authenticated, run-scoped request still precede full lifecycle/quota
+admission so the raw payload cannot enter Authority. A waiting or closed run can
+therefore append a bounded fixed denial event group. No raw field is retained and
+no Gateway/adapter/simulator effect occurs, but denial-rate/lifecycle admission
+remains nonblocking follow-up rather than a completion claim for SECR-004/006.
 
 Raw approval evidence is admitted by the kernel before daemon audit, runtime
 trace, lifecycle, or gateway mutation. Active runs reject all raw grants and

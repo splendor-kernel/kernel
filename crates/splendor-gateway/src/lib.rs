@@ -41,10 +41,11 @@
 mod credential_ingress;
 
 pub use credential_ingress::{
-    guard_action, guard_action_request, guard_action_routing, raw_credential_denied_action,
-    raw_credential_denied_outcome, RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH,
-    CREDENTIAL_INGRESS_MAX_NODES, CREDENTIAL_INGRESS_MAX_STRING_BYTES,
-    CREDENTIAL_INGRESS_MAX_TOTAL_BYTES, RAW_CREDENTIAL_INPUT_DENIED,
+    guard_action, guard_action_request, guard_action_routing, guard_action_routing_and_receipts,
+    guard_credential_capable_strings, raw_credential_denied_action, raw_credential_denied_outcome,
+    RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH, CREDENTIAL_INGRESS_MAX_NODES,
+    CREDENTIAL_INGRESS_MAX_STRING_BYTES, CREDENTIAL_INGRESS_MAX_TOTAL_BYTES,
+    RAW_CREDENTIAL_INPUT_DENIED,
 };
 
 use serde::{Deserialize, Serialize};
