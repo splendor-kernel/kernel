@@ -1053,7 +1053,7 @@ fn issue_claim_and_exact_retry_are_bound_and_provider_free() {
         parsed_time("2026-07-24T12:05:00.000000Z")
     );
     assert_eq!(claim.revocation_generation(), 1);
-    assert_eq!(format!("{:?}", &*claim), "SecretDeliveryClaim(<opaque>)");
+    assert_eq!(format!("{:?}", *claim), "SecretDeliveryClaim(<opaque>)");
     assert_eq!(
         format!("{:?}", grant.handle()),
         "SecretDeliveryHandle(<opaque>)"
