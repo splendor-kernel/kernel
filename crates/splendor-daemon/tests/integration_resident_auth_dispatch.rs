@@ -1,3 +1,5 @@
+mod support;
+
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, State};
 use axum::http::{Method, Request, StatusCode};
@@ -53,6 +55,7 @@ const TENANT_ID: &str = "11111111-1111-4111-8111-111111111111";
 const AGENT_ID: &str = "22222222-2222-4222-8222-222222222222";
 const WORK_ORDER_KEY_ID: &str = "resident-dispatch-test-key";
 const MANAGER_WORK_ORDER_KEY: &[u8] = &[0x5a; 32];
+const RESIDENT_TEST_ADAPTER: &str = "resident.test";
 
 fn authority_receipt_config() -> LocalAuthorityObligationReceiptConfig {
     LocalAuthorityObligationReceiptConfig::trusted_local(
@@ -418,8 +421,10 @@ async fn spawn_resident_with_scopes_and_trace_store(
     let config = DaemonConfig::resident(instance_id, verifier, work_order_keyring, policy_keyring)
         .with_authority_obligation_receipt_config(authority_receipt_config());
     let state = match trace_store {
-        Some(trace_store) => DaemonState::with_trace_store(config, trace_store),
-        None => DaemonState::new(config),
+        Some(trace_store) => {
+            support::state_with_trace_store(config, trace_store, &[RESIDENT_TEST_ADAPTER])
+        }
+        None => support::state(config, &[RESIDENT_TEST_ADAPTER]),
     };
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["localhost".to_string()]).expect("test TLS certificate");
@@ -576,7 +581,7 @@ fn signed_work_order_expiring_at(
             run_id: Some(run_id),
             objective: "admit and start one resident run through the real daemon".to_string(),
             allowed_actions: vec!["daemon.record".to_string()],
-            allowed_adapters: vec!["daemon.recording".to_string()],
+            allowed_adapters: vec![RESIDENT_TEST_ADAPTER.to_string()],
             allowed_permissions: vec!["fixture.execute".to_string()],
             data_refs: Vec::new(),
             quotas: WorkOrderQuotaPolicy::default(),
@@ -606,7 +611,7 @@ fn resident_dispatch_approval_policy(work_order: &WorkOrderEnvelope) -> Approval
         tenant_id: work_order.work_order.tenant_id.clone(),
         agent_id: Some(work_order.work_order.agent_id.clone()),
         action_name: Some("daemon.record".to_string()),
-        adapter: Some("daemon.recording".to_string()),
+        adapter: Some(RESIDENT_TEST_ADAPTER.to_string()),
         required_permission: Some("fixture.execute".to_string()),
         side_effect_class: None,
         risk_level: Some("high".to_string()),
@@ -642,7 +647,7 @@ fn resident_create_request(
         credential: None,
         audit_attribution: None,
         allowed_actions: vec!["daemon.record".to_string()],
-        allowed_adapters: vec!["daemon.recording".to_string()],
+        allowed_adapters: vec![RESIDENT_TEST_ADAPTER.to_string()],
         allowed_permissions: vec!["fixture.execute".to_string()],
         policy_actions: Vec::new(),
         policy_bundle_required: false,
@@ -1938,7 +1943,7 @@ async fn manager_admitted_approval_policy_reaches_real_tls_resident_without_broa
             audit_attribution: None,
             causal_trace_id: Some(causal_trace_id.clone()),
             action: resident_record_action("daemon.delete"),
-            adapter: Some("daemon.recording".to_string()),
+            adapter: Some(RESIDENT_TEST_ADAPTER.to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
             requested_at: Some(OffsetDateTime::now_utc()),
@@ -1981,7 +1986,7 @@ async fn manager_admitted_approval_policy_reaches_real_tls_resident_without_broa
             audit_attribution: None,
             causal_trace_id: Some(causal_trace_id),
             action: resident_record_action("daemon.record"),
-            adapter: Some("daemon.recording".to_string()),
+            adapter: Some(RESIDENT_TEST_ADAPTER.to_string()),
             quota_usage: None,
             satisfied_preconditions: Vec::new(),
             requested_at: Some(requested_at),
@@ -2005,7 +2010,7 @@ async fn manager_admitted_approval_policy_reaches_real_tls_resident_without_broa
     assert_eq!(challenge.tenant_id, tenant_id);
     assert_eq!(challenge.agent_id, agent_id);
     assert_eq!(challenge.run_id, run_id);
-    assert_eq!(challenge.adapter, "daemon.recording");
+    assert_eq!(challenge.adapter, RESIDENT_TEST_ADAPTER);
     assert!(challenge
         .receipt_audience
         .contains(&instance_id.to_string()));
@@ -2145,7 +2150,7 @@ async fn granted_approval_revocation_requires_exact_resident_acknowledgement() {
         run_id: run_id.clone(),
         action_id: action_id.clone(),
         action_name: "daemon.record".to_string(),
-        adapter: "daemon.recording".to_string(),
+        adapter: RESIDENT_TEST_ADAPTER.to_string(),
         policy_id: "resident-approval-revocation".to_string(),
         risk_level: Some("high".to_string()),
         subject: PrincipalId::new(),

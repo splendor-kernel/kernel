@@ -18,6 +18,12 @@ from canonical_fleet_profiles import (  # noqa: E402
     VPC_INSTANCE_FEATURES,
     VPC_NODE_CAPABILITIES,
 )
+from acceptance_provider_evidence import (  # noqa: E402
+    provider_effect_state,
+    read_provider_evidence,
+)
+from acceptance_provider_output import project_private_v3_output  # noqa: E402
+from acceptance_scenario_expectations import expectation_for  # noqa: E402
 from resident_http import request_json_no_redirect  # noqa: E402
 
 FLEET_ID = "00000000-0000-4000-8000-000000000104"
@@ -86,6 +92,10 @@ def request_json(
         context,
         timeout=20,
     )
+
+
+def provider_counters(base_url: str) -> dict[str, Any]:
+    return read_provider_evidence(base_url)
 
 
 def splendorctl(root: Path) -> list[str]:
@@ -341,6 +351,11 @@ def quota() -> dict[str, int]:
 
 
 def action(name: str, permission: str, **params: Any) -> dict[str, Any]:
+    postcondition = {
+        "data.read_fixture": "data_read",
+        "artifact.create_internal": "artifact_created",
+        "artifact.publish_external": "artifact_published",
+    }[name]
     return {
         "name": name,
         "params": params,
@@ -348,7 +363,7 @@ def action(name: str, permission: str, **params: Any) -> dict[str, Any]:
         "cost_estimate": None,
         "required_permissions": [permission],
         "preconditions": [],
-        "postconditions": [],
+        "postconditions": [postcondition],
     }
 
 
@@ -548,8 +563,15 @@ def build_event_ids(
     return ids
 
 
-def action_evidence(outcome: dict[str, Any]) -> dict[str, Any]:
-    output = outcome.get("output") if isinstance(outcome.get("output"), dict) else {}
+def action_evidence(
+    outcome: dict[str, Any], expectation_id: str
+) -> dict[str, Any]:
+    expectation = expectation_for("UC-E2E-S7", expectation_id)
+    projection = project_private_v3_output(
+        outcome,
+        expectation=expectation,
+    )
+    output = projection["output"]
     verification = (
         outcome.get("verification")
         if isinstance(outcome.get("verification"), dict)
@@ -565,10 +587,11 @@ def action_evidence(outcome: dict[str, Any]) -> dict[str, Any]:
         "status": outcome.get("status"),
         "trace_event_id": outcome.get("trace_event_id")
         or artifacts.get("trace_event_id"),
-        "artifact_path": output.get("artifact_path") or output.get("publish_ref"),
-        "tenant_id": output.get("tenant_id"),
-        "integrity": output.get("integrity"),
+        "artifact_path": projection["resource_id"],
+        "tenant_id": projection["tenant_id"],
+        "integrity": projection["state_digest"],
         "output": output,
+        "private_v3_projection": projection,
     }
 
 
@@ -588,9 +611,13 @@ def action_execution_counts(records: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def resolve_action_trace_evidence(
-    records: list[dict[str, Any]], outcome: dict[str, Any], action_name: str
+    records: list[dict[str, Any]],
+    outcome: dict[str, Any],
+    expectation_id: str,
+    action_name: str,
 ) -> dict[str, Any]:
-    evidence = action_evidence(outcome)
+    expectation = expectation_for("UC-E2E-S7", expectation_id)
+    evidence = action_evidence(outcome, expectation_id)
     artifact_path = evidence.get("artifact_path")
     tenant_id = evidence.get("tenant_id")
     integrity = evidence.get("integrity")
@@ -600,15 +627,19 @@ def resolve_action_trace_evidence(
             continue
         payload = event_payload(record)
         candidate = payload.get("action", {})
-        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
-        trace_path = output.get("artifact_path") or candidate.get("params", {}).get("publish_ref")
         if candidate.get("name") != action_name:
             continue
+        output = payload.get("outcome", {}) if isinstance(payload.get("outcome"), dict) else {}
+        trace_projection = project_private_v3_output(
+            output,
+            expectation=expectation,
+        )
+        trace_path = trace_projection["resource_id"]
         if artifact_path and trace_path != artifact_path:
             continue
-        if tenant_id and output.get("tenant_id") != tenant_id:
+        if tenant_id and trace_projection["tenant_id"] != tenant_id:
             continue
-        if integrity and output.get("integrity") != integrity:
+        if integrity and trace_projection["state_digest"] != integrity:
             continue
         if not evidence.get("artifact_path") and trace_path:
             evidence["artifact_path"] = trace_path
@@ -622,8 +653,9 @@ def resolve_action_trace_evidence(
                 "trace_run_id": record.get("run_id"),
                 "trace_action_name": candidate.get("name"),
                 "trace_artifact_path": trace_path,
-                "trace_integrity": output.get("integrity"),
-                "trace_tenant_id": output.get("tenant_id"),
+                "trace_integrity": trace_projection["state_digest"],
+                "trace_tenant_id": trace_projection["tenant_id"],
+                "trace_private_v3_projection": trace_projection,
             }
         )
         break
@@ -640,18 +672,23 @@ def resolve_action_trace_evidence(
             if not isinstance(candidate, dict) or candidate.get("action_id") != action_id:
                 continue
             output = candidate.get("output") if isinstance(candidate.get("output"), dict) else {}
-            candidate_path = output.get("artifact_path") or output.get("publish_ref")
+            outcome_projection = project_private_v3_output(
+                output,
+                expectation=expectation,
+            )
+            candidate_path = outcome_projection["resource_id"]
             if artifact_path and candidate_path != artifact_path:
                 continue
-            if integrity and output.get("integrity") != integrity:
+            if integrity and outcome_projection["state_digest"] != integrity:
                 continue
             evidence.update(
                 {
                     "outcome_trace_event_id": trace_id(record),
                     "outcome_action_id": candidate.get("action_id"),
                     "outcome_artifact_path": candidate_path,
-                    "outcome_integrity": output.get("integrity"),
-                    "outcome_tenant_id": output.get("tenant_id"),
+                    "outcome_integrity": outcome_projection["state_digest"],
+                    "outcome_tenant_id": outcome_projection["tenant_id"],
+                    "outcome_private_v3_projection": outcome_projection,
                 }
             )
             return evidence
@@ -681,6 +718,7 @@ def main() -> int:
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--manager-url", default="http://central-manager:8081")
     parser.add_argument("--vpc-url", default="https://resident-vpc-node:8092")
+    parser.add_argument("--action-provider-url", default="http://acceptance-action-provider:8086")
     parser.add_argument(
         "--resident-auth-dir",
         default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"),
@@ -1181,12 +1219,14 @@ def main() -> int:
         or sent["body"].get("trace_event_id")
         or causal_anchor
     )
+    provider_before_data_read = provider_counters(args.action_provider_url)
     allowed_data_read = resident_call(
         "submitAction",
         "POST",
         "/actions",
         "actions_submit",
         {
+            "action_id": expectation_for("UC-E2E-S7", "specialist_data_read")["action_id"],
             "run_id": SPEC_RUN,
             "tenant_id": TENANT_A,
             "agent_id": SPEC,
@@ -1199,12 +1239,18 @@ def main() -> int:
             "satisfied_preconditions": [],
         },
     )
+    allowed_data_projection = project_private_v3_output(
+        allowed_data_read["body"],
+        expectation=expectation_for("UC-E2E-S7", "specialist_data_read"),
+    )
+    provider_after_data_read = provider_counters(args.action_provider_url)
     inspect_data_before_denials = resident_call(
         "inspectRunBeforeDeniedActions",
         "GET",
         f"/runs/{SPEC_RUN}",
         "runs_read",
     )
+    provider_before_data_denials = provider_counters(args.action_provider_url)
     tenant_b_denial = resident_call(
         "submitAction",
         "POST",
@@ -1262,6 +1308,7 @@ def main() -> int:
             "satisfied_preconditions": [],
         },
     )
+    provider_after_data_denials = provider_counters(args.action_provider_url)
     inspect_data_after_denials = resident_call(
         "inspectRunAfterDeniedActions",
         "GET",
@@ -1269,12 +1316,14 @@ def main() -> int:
         "runs_read",
     )
 
+    provider_before_internal_artifact = provider_counters(args.action_provider_url)
     internal_artifact = resident_call(
         "submitAction",
         "POST",
         "/actions",
         "actions_submit",
         {
+            "action_id": expectation_for("UC-E2E-S7", "internal_artifact")["action_id"],
             "run_id": ORCH_RUN,
             "tenant_id": TENANT_A,
             "agent_id": ORCH,
@@ -1289,12 +1338,14 @@ def main() -> int:
             "satisfied_preconditions": [],
         },
     )
+    provider_after_internal_artifact = provider_counters(args.action_provider_url)
     inspect_artifact_before_collision = resident_call(
         "inspectOrchestratorRunBeforeCollision",
         "GET",
         f"/runs/{ORCH_RUN}",
         "runs_read",
     )
+    provider_before_collision = provider_counters(args.action_provider_url)
     collision = resident_call(
         "submitAction",
         "POST",
@@ -1315,6 +1366,7 @@ def main() -> int:
             "satisfied_preconditions": [],
         },
     )
+    provider_after_collision = provider_counters(args.action_provider_url)
     inspect_artifact_after_collision = resident_call(
         "inspectOrchestratorRunAfterCollision",
         "GET",
@@ -1350,6 +1402,7 @@ def main() -> int:
     }
     if publish_create["status"] not in {200, 201} or publish_start["status"] != 200:
         raise SystemExit("manager dispatch did not create and start the publish run")
+    provider_before_publish = provider_counters(args.action_provider_url)
     publish_without_approval_response = resident_call(
         "submitUnapprovedPublish",
         "POST",
@@ -1369,6 +1422,7 @@ def main() -> int:
         },
     )
     require_status("submitUnapprovedPublish", publish_without_approval_response)
+    provider_after_unapproved_publish = provider_counters(args.action_provider_url)
     publish_no_approval = publish_without_approval_response["body"]
     approval_context = extract_approval_context(publish_no_approval)
     publish_waiting = resident_call(
@@ -1439,6 +1493,7 @@ def main() -> int:
     )
     require_status("submitApprovedExactAction", approved_publish_response)
     approved_publish = approved_publish_response["body"]
+    provider_after_approved_publish = provider_counters(args.action_provider_url)
     publish_after_approval = resident_call(
         "inspectPublishAfterExactAction",
         "GET",
@@ -1479,6 +1534,7 @@ def main() -> int:
     inspect_before_replay: dict[str, dict[str, Any]] = {}
     replay_responses: dict[str, dict[str, Any]] = {}
     inspect_after_replay: dict[str, dict[str, Any]] = {}
+    provider_before_replay = provider_counters(args.action_provider_url)
     for label, run_id in [
         ("orchestrator", ORCH_RUN),
         ("specialist", SPEC_RUN),
@@ -1497,6 +1553,7 @@ def main() -> int:
         inspect_after_replay[label] = resident_call(
             "inspectRunAfterReplay", "GET", f"/runs/{run_id}", "runs_read"
         )
+    provider_after_replay = provider_counters(args.action_provider_url)
     cross_tenant_replay = resident_call(
         "crossTenantReplay",
         "POST",
@@ -1584,6 +1641,58 @@ def main() -> int:
         label: response["body"].get("adapter_executions")
         for label, response in inspect_after_replay.items()
     }
+    data_provider_receipt = next(
+        (
+            receipt
+            for receipt in provider_after_data_read.get("receipts", [])
+            if receipt.get("action_id") == allowed_data_read["body"].get("action_id")
+        ),
+        {},
+    )
+    internal_provider_receipt = next(
+        (
+            receipt
+            for receipt in provider_after_internal_artifact.get("receipts", [])
+            if receipt.get("action_id") == internal_artifact["body"].get("action_id")
+        ),
+        {},
+    )
+    publish_provider_receipt = next(
+        (
+            receipt
+            for receipt in provider_after_approved_publish.get("receipts", [])
+            if receipt.get("action_id") == approved_publish.get("action_id")
+        ),
+        {},
+    )
+    provider_evidence = {
+        "schema_version": "splendor.uc_e2e_s7.action_provider_evidence.v1",
+        "data_read": {
+            "before": provider_before_data_read,
+            "after": provider_after_data_read,
+            "receipt": data_provider_receipt,
+        },
+        "denied_data_and_publish": {
+            "before": provider_before_data_denials,
+            "after": provider_after_data_denials,
+        },
+        "internal_artifact": {
+            "before": provider_before_internal_artifact,
+            "after": provider_after_internal_artifact,
+            "receipt": internal_provider_receipt,
+        },
+        "artifact_collision": {
+            "before": provider_before_collision,
+            "after": provider_after_collision,
+        },
+        "external_publish": {
+            "before": provider_before_publish,
+            "after_unapproved": provider_after_unapproved_publish,
+            "after_approved": provider_after_approved_publish,
+            "receipt": publish_provider_receipt,
+        },
+        "replay": {"before": provider_before_replay, "after": provider_after_replay},
+    }
 
     negatives = [
         {
@@ -1631,7 +1740,9 @@ def main() -> int:
         },
         {
             "case": "external_artifact_publish_without_approval_pauses",
-            "passed": publish_no_approval.get("status") == "NeedsApproval",
+            "passed": publish_no_approval.get("status") == "NeedsApproval"
+            and provider_effect_state(provider_before_publish)
+            == provider_effect_state(provider_after_unapproved_publish),
             "status": publish_no_approval.get("status"),
         },
         {
@@ -1653,27 +1764,41 @@ def main() -> int:
         },
         {
             "case": "denied_data_and_artifact_actions_did_not_reach_adapter",
-            "passed": adapter_before_denials == adapter_after_denials,
+            "passed": adapter_before_denials == adapter_after_denials
+            and provider_effect_state(provider_before_data_denials)
+            == provider_effect_state(provider_after_data_denials)
+            and provider_effect_state(provider_before_collision)
+            == provider_effect_state(provider_after_collision),
             "adapter_executions_before": adapter_before_denials,
             "adapter_executions_after": adapter_after_denials,
         },
         {
             "case": "replay_did_not_reread_republish_or_rewrite_artifacts",
             "passed": adapter_before_replay == adapter_after_replay
-            and action_counts_before_replay == action_counts_after_replay,
+            and action_counts_before_replay == action_counts_after_replay
+            and provider_effect_state(provider_before_replay)
+            == provider_effect_state(provider_after_replay),
             "adapter_executions_before_replay": adapter_before_replay,
             "adapter_executions_after_replay": adapter_after_replay,
             "action_execution_counts_before_replay": action_counts_before_replay,
             "action_execution_counts_after_replay": action_counts_after_replay,
+            "provider_calls_before_replay": provider_before_replay,
+            "provider_calls_after_replay": provider_after_replay,
             "published_artifact_path": PUBLISHED_ARTIFACT,
         },
     ]
 
     internal_artifact_evidence = resolve_action_trace_evidence(
-        records, internal_artifact["body"], "artifact.create_internal"
+        records,
+        internal_artifact["body"],
+        "internal_artifact",
+        "artifact.create_internal",
     )
     approved_publish_evidence = resolve_action_trace_evidence(
-        records, approved_publish, "artifact.publish_external"
+        records,
+        approved_publish,
+        "approved_publish",
+        "artifact.publish_external",
     )
     profile_summaries = {
         name: exact_profile_summary(envelope) for name, envelope in envelopes.items()
@@ -1837,17 +1962,42 @@ def main() -> int:
         "allowed_specialist_data_read_executed": allowed_data_read["body"].get(
             "status"
         )
-        == "Executed",
+        == "Executed"
+        and allowed_data_projection.get("resource_id") == DATA_REF_A
+        and data_provider_receipt.get("operation_id")
+        == "fixture-data-store/data.read_fixture"
+        and data_provider_receipt.get("action_id")
+        == allowed_data_read["body"].get("action_id")
+        and provider_after_data_read.get("by_action", {}).get("data.read_fixture", 0)
+        - provider_before_data_read.get("by_action", {}).get("data.read_fixture", 0)
+        == 1,
         "internal_artifact_recorded": internal_artifact["body"].get("status")
         == "Executed"
         and internal_artifact_evidence.get("artifact_path") == INTERNAL_ARTIFACT
         and internal_artifact_evidence.get("integrity")
         and internal_artifact_evidence.get("trace_event_id")
-        in event_ids.get("artifact.created", []),
+        in event_ids.get("artifact.created", [])
+        and internal_provider_receipt.get("operation_id")
+        == "artifact-store/artifact.create_internal"
+        and provider_after_internal_artifact.get("by_action", {}).get(
+            "artifact.create_internal", 0
+        )
+        - provider_before_internal_artifact.get("by_action", {}).get(
+            "artifact.create_internal", 0
+        )
+        == 1,
         "approved_publish_executed": approved_publish.get("status") == "Executed"
         and approved_publish_evidence.get("integrity")
         and approved_publish_evidence.get("trace_event_id")
-        in event_ids.get("artifact.publish.executed", []),
+        in event_ids.get("artifact.publish.executed", [])
+        and publish_provider_receipt.get("action_id") == approved_publish.get("action_id")
+        and provider_after_approved_publish.get("by_action", {}).get(
+            "artifact.publish_external", 0
+        )
+        - provider_before_publish.get("by_action", {}).get(
+            "artifact.publish_external", 0
+        )
+        == 1,
         "approval_action_trace_matched": approval_context.get("action_id")
         == PUBLISH_ACTION_ID
         == approved_publish.get("action_id"),
@@ -1876,7 +2026,9 @@ def main() -> int:
         "replay_inspect_only": all(
             response["body"].get("mode") == "inspect_only"
             for response in replay_responses.values()
-        ),
+        )
+        and provider_effect_state(provider_before_replay)
+        == provider_effect_state(provider_after_replay),
     }
     failures = [key for key, passed in positives.items() if not passed]
     failures.extend(
@@ -1916,6 +2068,8 @@ def main() -> int:
         "adapter_executions_after_replay": adapter_after_replay,
         "action_execution_counts_before_replay": action_counts_before_replay,
         "action_execution_counts_after_replay": action_counts_after_replay,
+        "provider_calls_before_replay": provider_before_replay,
+        "provider_calls_after_replay": provider_after_replay,
         "orchestrator_replay_id": replay_responses["orchestrator"]["body"].get(
             "replay_id"
         ),
@@ -1966,7 +2120,7 @@ def main() -> int:
             item["case"] for item in negatives if item.get("passed") is True
         ],
         "replay_evidence": [
-            "public replay APIs returned inspect_only explanations for all three exact-authority resident runs; raw protected fixture strings were absent; cross-tenant replay was rejected; adapter and trace-derived action execution counts were unchanged"
+            "public replay APIs returned inspect_only explanations for all three exact-authority resident runs; raw protected fixture strings were absent; cross-tenant replay was rejected; daemon, provider, and trace-derived action execution counts were unchanged"
         ],
         "replay_mode": "inspect_only",
         "replay_side_effect_suppression": replay_suppression,
@@ -2005,6 +2159,12 @@ def main() -> int:
         "required_trace_event_ids": event_ids,
         "negative_cases": negatives,
         "scenario_failures": failures,
+        "private_v3_outputs": [
+            allowed_data_projection,
+            internal_artifact_evidence["private_v3_projection"],
+            approved_publish_evidence["private_v3_projection"],
+        ],
+        "provider_evidence": [provider_before_replay, provider_after_replay],
         "resident_security": resident_security_report,
         "manager_approval_auth": manager_approval_auth_report,
         "artifact_paths": [],
@@ -2101,6 +2261,7 @@ def main() -> int:
                 "trace_event_id"
             ),
         },
+        "action-provider-evidence.json": provider_evidence,
         "audit-report.json": {
             "events": manager_events,
             "in_scope_data_refs": [DATA_REF_A],

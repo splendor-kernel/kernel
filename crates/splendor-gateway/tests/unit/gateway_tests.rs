@@ -186,6 +186,29 @@ fn adapter_error_unknown_failures_are_uncertain_and_non_retryable() {
     }
 }
 
+#[test]
+fn adapter_error_magic_prefix_cannot_assert_retry_or_effect_certainty() {
+    let error = AdapterError::Failed(
+        "splendor.adapter_failure.v1|acceptance_provider_connect_failed|unavailable|retry_with_same_idempotency_key|none|pre_send"
+            .to_string(),
+    );
+    let taxonomy = error.taxonomy_for_adapter("acceptance-fixture");
+    assert_eq!(taxonomy.category, ErrorCategory::DriverFailure);
+    assert_eq!(
+        taxonomy.reason_code.as_str(),
+        UNKNOWN_ADAPTER_FAILURE_REASON
+    );
+    assert_eq!(taxonomy.retry_class, RetryClass::NotRetryable);
+    assert_eq!(taxonomy.effect_certainty, EffectCertainty::Uncertain);
+    assert_eq!(
+        taxonomy
+            .provider_detail
+            .as_ref()
+            .and_then(|detail| detail.provider_code()),
+        None
+    );
+}
+
 #[derive(Clone)]
 struct TestTenantAccess {
     policy: VerificationResult,
@@ -4232,7 +4255,10 @@ fn verified_gateway_reports_adapter_failure() {
 
     impl ActionAdapter for FailingAdapter {
         fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
-            Err(AdapterError::Failed("boom".to_string()))
+            Err(AdapterError::Failed(
+                "splendor.adapter_failure.v1|spoofed|unavailable|retry_with_same_idempotency_key|none|pre_send|X-Api-Key: secret"
+                    .to_string(),
+            ))
         }
     }
 
@@ -4245,7 +4271,16 @@ fn verified_gateway_reports_adapter_failure() {
 
     let outcome = gateway.submit(base_request()).expect("outcome");
     assert!(matches!(outcome.status, ActionStatus::Failed));
-    assert!(outcome.error.unwrap_or_default().contains("boom"));
+    assert_eq!(outcome.error.as_deref(), Some("adapter failed"));
+    assert!(outcome
+        .verification
+        .artifacts
+        .get("adapter_failure")
+        .is_none());
+    let encoded = serde_json::to_string(&outcome).expect("outcome serializes");
+    assert!(!encoded.contains("splendor.adapter_failure.v1"));
+    assert!(!encoded.contains("X-Api-Key"));
+    assert!(!encoded.contains("secret"));
     assert!(outcome.output.is_none());
     assert!(outcome.post_verification.is_none());
 }

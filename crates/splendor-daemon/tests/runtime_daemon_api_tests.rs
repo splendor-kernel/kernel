@@ -1,3 +1,5 @@
+mod support;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
@@ -25,6 +27,10 @@ use splendor_types::{
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use tower::ServiceExt;
+
+fn action_test_state() -> DaemonState {
+    support::local_state(&["daemon.local"])
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PolicyTraceFailureTarget {
@@ -843,7 +849,7 @@ fn public_caller_credential_header_with_revocation(
 
 #[tokio::test]
 async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
-    let state = DaemonState::local_dev();
+    let state = action_test_state();
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1248,7 +1254,7 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
 
 #[tokio::test]
 async fn trace_read_and_export_redact_sensitive_payload_views() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
@@ -1418,8 +1424,8 @@ async fn trace_read_and_export_redact_sensitive_payload_views() {
 
 #[tokio::test]
 async fn experimental_local_dev_state_snapshot_import_preserves_compatibility() {
-    let source_app = router(DaemonState::local_dev());
-    let receiver_app = router(DaemonState::local_dev());
+    let source_app = router(action_test_state());
+    let receiver_app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let run_id = RunId::new();
@@ -1752,7 +1758,7 @@ async fn experimental_local_dev_state_snapshot_import_preserves_compatibility() 
 
 #[tokio::test]
 async fn replay_and_trace_export_reject_missing_null_and_mismatched_audit() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let create = create_request(tenant_id.clone(), agent_id, Vec::new(), Vec::new());
@@ -1842,7 +1848,7 @@ async fn replay_and_trace_export_reject_missing_null_and_mismatched_audit() {
 
 #[tokio::test]
 async fn approval_required_run_pauses_and_exact_receipt_retry_executes_once() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let policy_actions = vec![DaemonActionCandidate {
@@ -2093,7 +2099,7 @@ async fn approval_required_run_pauses_and_exact_receipt_retry_executes_once() {
 
 #[tokio::test]
 async fn policy_bundle_metadata_and_sync_failure_are_trace_visible() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(
@@ -2250,7 +2256,7 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
         "unrelated_revoked",
         "revoked",
     ] {
-        let app = router(DaemonState::local_dev());
+        let app = router(action_test_state());
         let tenant_id = TenantId::parse("10000000-0000-4000-8000-000000000001").expect("tenant id");
         let agent_id = AgentId::parse("20000000-0000-4000-8000-000000000002").expect("agent id");
         let now = OffsetDateTime::now_utc();
@@ -2528,7 +2534,7 @@ async fn policy_sync_unsupported_future_expired_and_revoked_matrix_fails_closed(
 
 #[tokio::test]
 async fn policy_sync_revocation_watermark_and_exact_retry_reconnect_attacks_fail_closed() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let now = OffsetDateTime::now_utc();
@@ -2746,9 +2752,10 @@ async fn policy_sync_revocation_watermark_and_exact_retry_reconnect_attacks_fail
 #[tokio::test]
 async fn policy_sync_trace_failures_do_not_commit_authority_or_reconnect() {
     let trace_store = Arc::new(FailingPolicyTraceStore::default());
-    let app = router(DaemonState::with_trace_store(
+    let app = router(support::state_with_trace_store(
         DaemonConfig::local_dev(),
         trace_store.clone(),
+        &["daemon.local"],
     ));
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -2885,9 +2892,10 @@ async fn revocation_trace_stage_failures_latch_pending_deny_and_reconcile_on_ret
         PolicyTraceFailureTarget::Revoked,
     ] {
         let trace_store = Arc::new(FailingPolicyTraceStore::default());
-        let app = router(DaemonState::with_trace_store(
+        let app = router(support::state_with_trace_store(
             DaemonConfig::local_dev(),
             trace_store.clone(),
+            &["daemon.local"],
         ));
         let tenant_id = TenantId::new();
         let agent_id = AgentId::new();
@@ -3028,7 +3036,7 @@ async fn revocation_trace_stage_failures_latch_pending_deny_and_reconcile_on_ret
 
 #[tokio::test]
 async fn circuit_breaker_sync_updates_live_gateway_and_preserves_action_id() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
@@ -3128,7 +3136,7 @@ async fn circuit_breaker_sync_updates_live_gateway_and_preserves_action_id() {
 
 #[tokio::test]
 async fn create_run_circuit_breaker_denies_runtime_admission_fail_closed() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
@@ -3218,7 +3226,7 @@ async fn create_run_circuit_breaker_denies_runtime_admission_fail_closed() {
 
 #[tokio::test]
 async fn invalid_policy_bundle_is_rejected_before_run_policy_invocation() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
@@ -3294,7 +3302,7 @@ async fn invalid_policy_bundle_is_rejected_before_run_policy_invocation() {
 
 #[tokio::test]
 async fn revoked_policy_bundle_blocks_existing_side_effects() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
@@ -3401,7 +3409,7 @@ async fn legacy_approval_variants_cannot_resume_tick_or_execute_adapter() {
         "unsupported_schema",
         "revoked",
     ] {
-        let app = router(DaemonState::local_dev());
+        let app = router(action_test_state());
         let tenant_id = TenantId::new();
         let agent_id = AgentId::new();
         let policy_actions = vec![DaemonActionCandidate {
@@ -3554,7 +3562,7 @@ async fn legacy_approval_variants_cannot_resume_tick_or_execute_adapter() {
 
 #[tokio::test]
 async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
 
@@ -3610,7 +3618,7 @@ async fn create_run_rejects_incompatible_and_duplicate_work_orders() {
 
 #[tokio::test]
 async fn create_run_idempotency_replays_same_scope_receipt_without_duplicate_work() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let run_id = RunId::new();
@@ -3684,7 +3692,7 @@ async fn create_run_idempotency_replays_same_scope_receipt_without_duplicate_wor
 
 #[tokio::test]
 async fn create_run_idempotency_scope_mismatch_and_missing_fields_fail_closed() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let first_run_id = RunId::new();
@@ -4088,7 +4096,7 @@ async fn create_run_rejects_invalid_work_orders_and_request_scope_widening() {
 
 #[tokio::test]
 async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
-    let state = DaemonState::local_dev();
+    let state = action_test_state();
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -4247,7 +4255,7 @@ async fn action_endpoint_uses_gateway_and_returns_structured_denial() {
 
 #[tokio::test]
 async fn active_run_raw_approval_evidence_is_rejected_before_trace_or_lifecycle_mutation() {
-    let state = DaemonState::local_dev();
+    let state = action_test_state();
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -4349,7 +4357,7 @@ async fn active_run_raw_approval_evidence_is_rejected_before_trace_or_lifecycle_
 
 #[tokio::test]
 async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(
@@ -4739,7 +4747,7 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
 
 #[tokio::test]
 async fn exact_waiting_action_accepts_raw_denial_and_records_replayable_terminal_evidence() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(
@@ -5154,7 +5162,7 @@ async fn action_transport_rejects_unknown_and_authority_looking_fields() {
 
 #[tokio::test]
 async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
-    let state = DaemonState::local_dev();
+    let state = action_test_state();
     let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -5291,7 +5299,7 @@ async fn daemon_error_paths_cover_state_trace_lifecycle_scope_and_percepts() {
 
 #[tokio::test]
 async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut planned = action("allowed_action");
@@ -5391,8 +5399,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(outcome.status, splendor_gateway::ActionStatus::Executed);
 
-    let mut failing = action("failing_action");
-    failing.params = json!({"fail_adapter": true});
+    let failing = action("failing_action");
     let failed_submit = SubmitActionRequest {
         action_id: None,
         run_id: submit.run_id,
@@ -5441,7 +5448,7 @@ async fn daemon_executes_allowed_actions_and_pages_trace_ranges() {
 
 #[tokio::test]
 async fn structured_errors_cover_invalid_run_malformed_percept_and_unavailable_runtime() {
-    let state = DaemonState::local_dev();
+    let state = action_test_state();
     let app = router(state.clone());
     let run_id = RunId::new();
 
@@ -5495,6 +5502,90 @@ async fn structured_errors_cover_invalid_run_malformed_percept_and_unavailable_r
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(unavailable.code, "runtime_unavailable");
+}
+
+#[tokio::test]
+async fn missing_direct_policy_and_physical_adapters_reject_before_run_or_idempotency_commit() {
+    for (kind, action_name, adapter_name, policy_action, registered_action) in [
+        ("direct", "allowed_action", "missing-direct", false, false),
+        ("policy", "policy_action", "missing-policy", true, false),
+        ("physical", "capture_image", "device-sim", false, true),
+    ] {
+        let app = router(DaemonState::local_dev());
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let run_id = RunId::new();
+        let mut create =
+            create_request(tenant_id.clone(), agent_id.clone(), Vec::new(), Vec::new());
+        create.allowed_actions = vec![action_name.to_string()];
+        create.allowed_adapters = vec![adapter_name.to_string()];
+        create.work_order.work_order.run_id = Some(run_id.clone());
+        create.work_order.work_order.allowed_actions = create.allowed_actions.clone();
+        create.work_order.work_order.allowed_adapters = create.allowed_adapters.clone();
+        if policy_action {
+            create.policy_actions = vec![DaemonActionCandidate {
+                action_id: None,
+                action: action(action_name),
+                adapter: Some(adapter_name.to_string()),
+                quota_usage: None,
+                satisfied_preconditions: Vec::new(),
+                requested_at: None,
+                authority_obligation_receipts: Vec::new(),
+            }];
+        }
+        if registered_action {
+            create.registered_actions = vec![RegisteredAction {
+                name: action_name.to_string(),
+                adapter: adapter_name.to_string(),
+                required_permissions: None,
+            }];
+        }
+        resign_work_order(&mut create.work_order);
+
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(&create).expect("create request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{kind}");
+        assert_eq!(error.code, "action_adapter_unavailable", "{kind}");
+        assert_eq!(error.details["tenant_id"], tenant_id.to_string(), "{kind}");
+        assert_eq!(error.details["agent_id"], agent_id.to_string(), "{kind}");
+        assert_eq!(error.details["run_id"], run_id.to_string(), "{kind}");
+        assert_eq!(error.details["action_name"], action_name, "{kind}");
+        assert_eq!(error.details["adapter"], adapter_name, "{kind}");
+        assert_eq!(error.details["effect_certainty"], "none", "{kind}");
+        assert_eq!(
+            error.details["admission_stage"], "before_run_and_idempotency_commit",
+            "{kind}"
+        );
+
+        let (status, not_found): (StatusCode, ApiErrorBody) =
+            call_empty(app.clone(), Method::GET, &format!("/runs/{run_id}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{kind}");
+        assert_eq!(not_found.code, "invalid_run", "{kind}");
+
+        if kind == "direct" {
+            let mut retry = create;
+            retry.work_order.work_order.allowed_actions = vec!["alternate_action".to_string()];
+            retry.work_order.work_order.allowed_adapters = vec!["missing-alternate".to_string()];
+            retry.allowed_actions = retry.work_order.work_order.allowed_actions.clone();
+            retry.allowed_adapters = retry.work_order.work_order.allowed_adapters.clone();
+            resign_work_order(&mut retry.work_order);
+            let (status, retry_error): (StatusCode, ApiErrorBody) = call_json(
+                app,
+                Method::POST,
+                "/runs",
+                serde_json::to_value(retry).expect("retry request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_error.code, "action_adapter_unavailable");
+            assert_eq!(retry_error.details["adapter"], "missing-alternate");
+        }
+    }
 }
 
 #[tokio::test]
@@ -5758,7 +5849,7 @@ async fn public_credential_header_rejections_cover_revocation_and_scope_branches
 
 #[tokio::test]
 async fn resume_without_signed_work_order_fails_before_tick_execution() {
-    let app = router(DaemonState::local_dev());
+    let app = router(action_test_state());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let request = create_request(

@@ -134,25 +134,59 @@ the policy file location, schema, exception owners, and rollout mode.
 
 ## Current FND-002 Baseline Guard
 
-The repository currently wires a bounded smoke guard at
-`scripts/architecture/check-dependency-policy.py` and CI runs it in the Rust job.
-This implemented guard is narrower than the proposed future architecture-policy
-check above:
+The repository currently wires one bounded Cargo metadata guard in the Rust CI
+job: `scripts/architecture/check-dependency-policy.py`. It invokes
+`cargo metadata --locked --format-version 1 --no-deps` and is narrower than the
+proposed future architecture-policy check above:
 
-- it reads Cargo metadata, checks direct non-dev Rust workspace dependency
-  allowlists for the current 0.1 crates/adapters only, and checks all direct
-  internal Rust workspace dependency edges for cycles;
+- it reads Cargo metadata, closes the exact current package-name and
+  repository-relative manifest identities for all 12 governed workspace
+  packages, rejects missing, duplicate, relocated, or unexpected members, and
+  rejects duplicate governed identities across all package records;
+- it treats every dependency path under the workspace root as repository-local,
+  requires its target to remain an exact governed workspace member, checks
+  direct non-dev Rust package allowlists, and keeps excluded local packages in
+  edge and cycle analysis when Cargo metadata still contains them. A dependency
+  using a governed canonical package name must resolve from `source = null` to
+  that package's exact canonical directory; registry, Git, outside, missing,
+  wrong-manifest, and symlink-escaped substitutions fail closed while Cargo
+  `rename` aliases retain their canonical name/path checks;
 - it rejects internal dependency cycles and obvious wrong-direction/provider
   non-dev edges, such as an adapter depending on `splendor-kernel` or
   `splendor-types` depending on `splendor-store`;
+- it confines the current capability-bearing HTTP client packages: `ureq` to
+  the HTTP adapter and unpublished acceptance host, and `reqwest` to the daemon;
+- daemon production lib/bin/example/build targets, its empty package feature
+  map, and direct normal/build dependencies are closed by package, rename, kind,
+  target predicate, optional/default-feature state, declared features, version
+  requirement, source, and repository-relative path. The `reqwest` declaration
+  remains only in the exact current RFC-0011 shape;
+- executable metadata fixtures compare complete expected violation multisets
+  and cover workspace identity/path exclusion, reverse adapter/core edges,
+  daemon adapter and acceptance-host edges, provider-client placement, normal
+  and dev-edge cycles, every closed dependency field, package-feature
+  forwarding, unapproved clients, unknown daemon lib/bin/example/build targets,
+  governed-name substitutions, duplicate-record and graph-order permutations,
+  and structured malformed/symlink path failures;
 - it preserves documented migration seams for `splendor-daemon`, `splendorctl`,
   and `splendor-bindings`;
-- it does not enforce `dependency_policy.proposed.json`, does not require
-  proposed v2 plane crates to exist, and does not prove full FND-002 completion.
+- it does not inspect Rust source, prove which Reqwest operations are called,
+  enforce `dependency_policy.proposed.json`, require proposed v2 plane crates to
+  exist, or prove full FND-002 completion.
 
 Treat failures from this script as current-baseline architecture regressions.
 Treat passing output as only lower-bound evidence that the existing Rust package
-graph has not drifted in the checked direction.
+and provider graph has not drifted in the checked direction. Production
+selection is separately evidenced by adapterless daemon startup, the generic
+non-authorizing `ConfiguredActionAdapters` injection port, missing-provider
+zero-I/O tests, and an unpublished outer acceptance host in a separate image
+target. Those tests and image-composition checks are not source-wide effect or
+duplicate-owner analysis.
+
+The source import/effect scan proposed by §10.2 and universal semantic
+duplicate-owner registry proposed by §10.3 remain future and unimplemented.
+Docker runtime scenarios and `G00` remain `not_exercised`; static Compose and
+native process evidence do not convert either status to passed.
 
 ## Duplicate Mutation-Owner Prohibition
 

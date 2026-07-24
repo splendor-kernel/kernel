@@ -10,10 +10,10 @@ use splendor_authority::{
     CompatibilityGrantContext, LegacyMultiScopeProfile, LegacyScopeProfile,
 };
 use splendor_daemon::{
-    router, ApiErrorBody, AppendPerceptRequest, CreateRunRequest, CreateRunResponse,
-    DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest, RegisteredAction,
-    ReplayResponse, RunInspectResponse, RunStatus as DaemonRunStatus, StateHeadResponse,
-    SubmitActionRequest, TickResponse, TracePageResponse,
+    router, ApiErrorBody, AppendPerceptRequest, ConfiguredActionAdapters, CreateRunRequest,
+    CreateRunResponse, DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest,
+    RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus as DaemonRunStatus,
+    StateHeadResponse, SubmitActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_gateway::{
     ActionAdapter, ActionRequest, ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway,
@@ -241,24 +241,46 @@ impl CountingAdapter {
 
 impl ActionAdapter for CountingAdapter {
     fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
-        self.calls
-            .lock()
-            .expect("adapter calls lock")
-            .push(action.action.name.clone());
-        if action
-            .action
-            .params
-            .get("fail_adapter")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let call_number = {
+            let mut calls = self.calls.lock().expect("adapter calls lock");
+            calls.push(action.action.name.clone());
+            calls
+                .iter()
+                .filter(|name| name.as_str() == action.action.name.as_str())
+                .count()
+        };
+        if action.action.name == "failing_action"
+            || (matches!(
+                action.action.name.as_str(),
+                "idempotent.fixture" | "non_idempotent.fixture"
+            ) && call_number == 1)
         {
             return Err(AdapterError::Failed("fixture_adapter_failure".to_string()));
         }
         Ok(AdapterResult {
-            output: json!({"adapter": "fixture", "action": action.action.name}),
+            output: json!({
+                "schema_version": "splendor.test.provider_receipt.v1",
+                "provider_receipt_id": format!("kernel-e2e-provider:{}", action.action_id),
+                "adapter_id": action.adapter,
+                "action_id": action.action_id,
+                "action_name": action.action.name,
+                "accepted": true,
+            }),
             satisfied_postconditions: action.action.postconditions.clone(),
         })
     }
+}
+
+fn daemon_action_state() -> DaemonState {
+    DaemonState::with_action_adapters(DaemonConfig::local_dev(), daemon_action_adapters())
+}
+
+fn daemon_action_adapters() -> ConfiguredActionAdapters {
+    let mut adapters = ConfiguredActionAdapters::new();
+    adapters
+        .insert("daemon.local", Arc::new(CountingAdapter::default()))
+        .expect("daemon E2E action adapter");
+    adapters
 }
 
 struct StaticPerceptor;
@@ -822,7 +844,7 @@ async fn call_empty<T: DeserializeOwned>(
 }
 
 async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
-    let state = DaemonState::local_dev();
+    let state = daemon_action_state();
     let app = router(state);
     let tenant_id = TenantId::parse("00000000-0000-0000-0000-000000000201")?;
     let agent_id = AgentId::parse("00000000-0000-0000-0000-000000000202")?;
@@ -967,8 +989,7 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(denied_outcome.status, ActionStatus::Denied);
 
-    let mut failing_action = daemon_action("failing_action");
-    failing_action.params = json!({"fail_adapter": true});
+    let failing_action = daemon_action("failing_action");
     let failing = SubmitActionRequest {
         action_id: None,
         run_id: created.run_id.clone(),
@@ -1050,16 +1071,19 @@ async fn run_daemon_boundary(artifacts: &Path) -> TestResult<DaemonEvidence> {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(malformed.code, "disallowed_percept");
 
-    let locked_app = router(DaemonState::new(DaemonConfig {
-        expected_audience: CredentialAudience::Daemon {
-            daemon_id: "daemon_local".to_string(),
+    let locked_app = router(DaemonState::with_action_adapters(
+        DaemonConfig {
+            expected_audience: CredentialAudience::Daemon {
+                daemon_id: "daemon_local".to_string(),
+            },
+            caller_token_verifier: None,
+            insecure_dev_mode: None,
+            policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
+            work_order_keyring: daemon_work_order_keyring(),
+            authority_obligation_receipt_config: None,
         },
-        caller_token_verifier: None,
-        insecure_dev_mode: None,
-        policy_bundle_keyring: splendor_types::PolicyBundleKeyring::new(),
-        work_order_keyring: daemon_work_order_keyring(),
-        authority_obligation_receipt_config: None,
-    }));
+        daemon_action_adapters(),
+    ));
     let locked_tenant = TenantId::parse("00000000-0000-0000-0000-000000000211")?;
     let locked_agent = AgentId::parse("00000000-0000-0000-0000-000000000212")?;
     let locked_create = CreateRunRequest {
@@ -2728,13 +2752,13 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         SideEffectClass::External,
         &["retry.safe"],
     );
-    idempotent.params = json!({"fail_adapter": true, "idempotent": true});
+    idempotent.params = json!({"idempotent": true});
     let mut non_idempotent = action(
         "non_idempotent.fixture",
         SideEffectClass::External,
         &["retry.safe"],
     );
-    non_idempotent.params = json!({"fail_adapter": true, "idempotent": false});
+    non_idempotent.params = json!({"idempotent": false});
     let state_store = Arc::new(InMemoryStateStore::default());
     let trace_store = Arc::new(InMemoryTraceStore::default());
     let mut engine = LoopEngine::with_trace_store(
@@ -3066,7 +3090,7 @@ async fn run_final_cross_primitive_journey(artifacts: &Path) -> TestResult<Final
     assert_eq!(placement.status, PlacementDecisionStatus::Selected);
     let selected_instance_id = "instance_journey_a";
 
-    let state = DaemonState::local_dev();
+    let state = daemon_action_state();
     let app = router(state);
     let create = CreateRunRequest {
         request_id: "req_final_cross_primitive_journey".to_string(),

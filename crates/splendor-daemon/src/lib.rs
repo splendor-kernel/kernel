@@ -7,6 +7,7 @@
 
 pub mod caller_auth;
 pub mod manager;
+pub mod process;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -18,12 +19,11 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
-    ActionRequest, ActionStatus, AdapterError, AdapterResult, AuthorityObligationVerifier,
-    CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary, PolicyApprovalVerifier,
-    PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier, SimulatedRiskLevel,
-    SimulatedSafetySnapshot, SimulatedSafetyVerifier, StaticCircuitBreakerEvaluator,
-    VerifiedActionGateway,
+    authority_pre_effect_evidence_recorded, ActionGateway, ActionId, ActionOutcome, ActionRequest,
+    ActionStatus, AuthorityObligationVerifier, CircuitBreakerEvaluator,
+    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway,
 };
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -58,14 +58,15 @@ use splendor_types::{
     RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use caller_auth::{CallerAuthError, CallerTokenVerifier};
+
+#[cfg(test)]
+use splendor_gateway::{ActionAdapter, AdapterError, AdapterResult};
 
 /// Local daemon state shared by the HTTP router.
 #[derive(Clone)]
@@ -84,11 +85,61 @@ struct DaemonInner {
     authority_obligation_receipt_config: Option<LocalAuthorityObligationReceiptConfig>,
     runtime_identity: RuntimeIdentityContext,
     trace_store_override: Option<Arc<dyn TraceStore>>,
+    action_adapters: ConfiguredActionAdapters,
     runtime_available: AtomicBool,
     device_profiles: Mutex<HashMap<NodeId, DeviceRuntimeProfile>>,
     operator_interventions: Mutex<HashMap<String, OperatorInterventionRecord>>,
     device_audit: Mutex<Vec<DeviceAuditEvent>>,
     resident_security_audit: Mutex<Vec<ResidentSecurityAuditEvent>>,
+}
+
+/// Immutable action adapters supplied by a trusted process composition root.
+///
+/// Adapter presence does not authorize an action. Signed work-order authority,
+/// trusted action profiles, gateway verifiers, and the final effect permit remain
+/// mandatory before an adapter can be invoked.
+#[derive(Clone, Default)]
+pub struct ConfiguredActionAdapters {
+    adapters: HashMap<String, Arc<dyn splendor_gateway::ActionAdapter>>,
+}
+
+impl ConfiguredActionAdapters {
+    /// Creates an empty, fail-closed adapter map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one process-configured adapter identity.
+    pub fn insert(
+        &mut self,
+        adapter_id: impl Into<String>,
+        adapter: Arc<dyn splendor_gateway::ActionAdapter>,
+    ) -> Result<(), String> {
+        let adapter_id = adapter_id.into();
+        if adapter_id.is_empty()
+            || adapter_id.trim() != adapter_id
+            || adapter_id.len() > 128
+            || !adapter_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("configured_action_adapter_id_invalid".to_string());
+        }
+        if self.adapters.contains_key(&adapter_id) {
+            return Err("configured_action_adapter_duplicate".to_string());
+        }
+        self.adapters.insert(adapter_id, adapter);
+        Ok(())
+    }
+
+    fn resolve(&self, adapter_id: &str) -> Option<Arc<dyn splendor_gateway::ActionAdapter>> {
+        self.adapters.get(adapter_id).cloned()
+    }
+
+    /// Returns whether no provider adapters were explicitly configured.
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
 }
 
 type SharedRunSlot = Arc<Mutex<RunSlot>>;
@@ -123,19 +174,41 @@ impl DaemonState {
 
     /// Builds daemon state from a config.
     pub fn new(config: DaemonConfig) -> Self {
-        Self::new_with_trace_store(config, None)
+        Self::compose(config, None, ConfiguredActionAdapters::default())
     }
 
     /// Builds daemon state with an explicit trace store used by newly created
     /// runs. This supports durable-store composition and deterministic fault
     /// injection without changing daemon wire contracts.
     pub fn with_trace_store(config: DaemonConfig, trace_store: Arc<dyn TraceStore>) -> Self {
-        Self::new_with_trace_store(config, Some(trace_store))
+        Self::compose(
+            config,
+            Some(trace_store),
+            ConfiguredActionAdapters::default(),
+        )
     }
 
-    fn new_with_trace_store(
+    /// Builds daemon state with only the explicitly supplied action adapters.
+    pub fn with_action_adapters(
+        config: DaemonConfig,
+        action_adapters: ConfiguredActionAdapters,
+    ) -> Self {
+        Self::compose(config, None, action_adapters)
+    }
+
+    /// Builds daemon state with explicit trace and action-adapter composition.
+    pub fn with_trace_store_and_action_adapters(
+        config: DaemonConfig,
+        trace_store: Arc<dyn TraceStore>,
+        action_adapters: ConfiguredActionAdapters,
+    ) -> Self {
+        Self::compose(config, Some(trace_store), action_adapters)
+    }
+
+    fn compose(
         config: DaemonConfig,
         trace_store_override: Option<Arc<dyn TraceStore>>,
+        action_adapters: ConfiguredActionAdapters,
     ) -> Self {
         let runtime_identity = match &config.expected_audience {
             CredentialAudience::Instance { instance_id } => RuntimeIdentityContext {
@@ -165,6 +238,7 @@ impl DaemonState {
                 authority_obligation_receipt_config,
                 runtime_identity,
                 trace_store_override,
+                action_adapters,
                 runtime_available: AtomicBool::new(true),
                 device_profiles: Mutex::new(HashMap::new()),
                 operator_interventions: Mutex::new(HashMap::new()),
@@ -941,87 +1015,6 @@ impl Policy for StaticDaemonPolicy {
     }
 }
 
-#[derive(Default)]
-struct RecordingAdapter {
-    executions: Arc<AtomicU64>,
-}
-
-impl ActionAdapter for RecordingAdapter {
-    fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
-        // Deterministic local recording-adapter failure hook for daemon tests and
-        // examples. Real adapters must implement their own failure semantics
-        // behind the same gateway-mediated boundary.
-        if action
-            .action
-            .params
-            .get("fail_adapter")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Err(AdapterError::Failed(
-                "requested adapter failure".to_string(),
-            ));
-        }
-        let execution = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
-        let simulator = submit_device_sim_action(action, execution)?;
-        let output = if action.action.name == "data.read_fixture" {
-            let data_ref = action
-                .action
-                .params
-                .get("data_ref")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            serde_json::json!({
-                "adapter": "fixture-data-store",
-                "execution": execution,
-                "action": action.action.name,
-                "data_ref": data_ref,
-                "raw_payload_included": false,
-                "analysis_summary": "trace-safe aggregate analysis for scoped data ref",
-                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-data-read.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "data_ref": data_ref, "fixture": "uc-e2e-s7"})),
-            })
-        } else if action.action.name == "artifact.create_internal" {
-            let path = action
-                .action
-                .params
-                .get("artifact_path")
-                .or_else(|| action.action.params.get("artifact_ref"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("artifact://unknown");
-            serde_json::json!({
-                "adapter": "artifact-store",
-                "execution": execution,
-                "action": action.action.name,
-                "artifact_path": path,
-                "tenant_id": action.tenant_id,
-                "raw_payload_included": false,
-                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-artifact-create.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "artifact_path": path, "kind": "internal"})),
-            })
-        } else if action.action.name == "artifact.publish_external" {
-            serde_json::json!({
-                "adapter": "artifact-store",
-                "execution": execution,
-                "action": action.action.name,
-                "published": true,
-                "external_store": "fake-artifact-store",
-                "raw_payload_included": false,
-                "integrity": stable_json_fingerprint(b"splendor.daemon.fixture-artifact-publish.v1\0", &serde_json::json!({"tenant_id": action.tenant_id, "action": action.action.name, "kind": "external_publish"})),
-            })
-        } else {
-            serde_json::json!({
-                "adapter": "daemon.recording",
-                "execution": execution,
-                "action": action.action.name,
-                "device_sim": simulator,
-            })
-        };
-        Ok(AdapterResult {
-            output,
-            satisfied_postconditions: action.action.postconditions.clone(),
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 struct DataArtifactBoundaryVerifier {
     tenant_id: TenantId,
@@ -1127,81 +1120,6 @@ impl ResourceBoundaryVerifier for DataArtifactBoundaryVerifier {
             }),
         }
     }
-}
-
-fn submit_device_sim_action(
-    action: &ActionRequest,
-    execution: u64,
-) -> Result<Option<serde_json::Value>, AdapterError> {
-    let Ok(base_url) = std::env::var("SPLENDOR_DEVICE_SIM_URL") else {
-        return Ok(None);
-    };
-    submit_device_sim_action_to(&base_url, action, execution)
-}
-
-fn submit_device_sim_action_to(
-    base_url: &str,
-    action: &ActionRequest,
-    execution: u64,
-) -> Result<Option<serde_json::Value>, AdapterError> {
-    let (host, port) = parse_http_host_port(base_url)?;
-    let body = serde_json::json!({
-        "action_id": action.action_id,
-        "action_name": action.action.name,
-        "tenant_id": action.tenant_id,
-        "agent_id": action.agent_id,
-        "run_id": action.run_id,
-        "adapter_execution": execution,
-        "params": action.action.params,
-    });
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|error| AdapterError::Failed(format!("device_sim_payload_error:{error}")))?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .map_err(|error| AdapterError::Failed(format!("device_sim_connect_error:{error}")))?;
-    let request = format!(
-        "POST /actions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body_bytes.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(&body_bytes))
-        .map_err(|error| AdapterError::Failed(format!("device_sim_write_error:{error}")))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| AdapterError::Failed(format!("device_sim_read_error:{error}")))?;
-    let status_line = response.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        return Err(AdapterError::Failed(format!(
-            "device_sim_status_error:{status_line}"
-        )));
-    }
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .ok_or_else(|| AdapterError::Failed("device_sim_missing_body".to_string()))?;
-    let parsed = serde_json::from_str(body)
-        .map_err(|error| AdapterError::Failed(format!("device_sim_response_error:{error}")))?;
-    Ok(Some(parsed))
-}
-
-fn parse_http_host_port(base_url: &str) -> Result<(String, u16), AdapterError> {
-    let rest = base_url
-        .strip_prefix("http://")
-        .ok_or_else(|| AdapterError::Failed("device_sim_url_must_be_http".to_string()))?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = authority
-        .rsplit_once(':')
-        .ok_or_else(|| AdapterError::Failed("device_sim_url_missing_port".to_string()))?;
-    if host.trim().is_empty() {
-        return Err(AdapterError::Failed(
-            "device_sim_url_missing_host".to_string(),
-        ));
-    }
-    let port = port
-        .parse::<u16>()
-        .map_err(|error| AdapterError::Failed(format!("device_sim_url_bad_port:{error}")))?;
-    Ok((host.to_string(), port))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2252,6 +2170,15 @@ async fn create_run(
         }
     }
 
+    let action_profiles = action_profiles_for_request(&request, &validated_work_order)?;
+    ensure_action_adapters_available(
+        &state,
+        &action_profiles,
+        &request.tenant_id,
+        &request.agent_id,
+        &run_id,
+    )?;
+
     let trace_store: Arc<dyn TraceStore> = state
         .inner
         .trace_store_override
@@ -2313,7 +2240,6 @@ async fn create_run(
     tenant_registry.insert(tenant_context);
 
     let adapter_executions = Arc::new(AtomicU64::new(0));
-    let action_profiles = action_profiles_for_request(&request, &validated_work_order)?;
     let mut gateway = VerifiedActionGateway::new(Arc::new(tenant_registry.clone()));
     gateway.set_action_authority_evaluator(Arc::new(run_authority.clone()));
     gateway.set_pre_effect_authority_recorder(Arc::clone(&authority_recorder));
@@ -2332,13 +2258,13 @@ async fn create_run(
     let circuit_breakers = SharedCircuitBreakerEvaluator::new(request.circuit_breakers.clone());
     gateway.set_circuit_breaker_evaluator(Arc::new(circuit_breakers.clone()));
     for profile in &action_profiles {
-        gateway.register_adapter(
-            profile.action_name.clone(),
-            profile.adapter.clone(),
-            Arc::new(RecordingAdapter {
-                executions: Arc::clone(&adapter_executions),
-            }),
-        );
+        if let Some(adapter) = state.inner.action_adapters.resolve(&profile.adapter) {
+            gateway.register_adapter(
+                profile.action_name.clone(),
+                profile.adapter.clone(),
+                adapter,
+            );
+        }
     }
 
     if request.policy_bundle_required && request.policy_bundle.is_none() {
@@ -3542,6 +3468,27 @@ async fn submit_action(
             )
             .map_err(run_action_admission_error)?;
         record_daemon_audit(&slot, "splendor.actions.submit", security.audit_attribution)?;
+        if let Some(profile) = slot
+            .action_profiles
+            .iter()
+            .find(|profile| profile.action_name == action_request.action.name)
+        {
+            if effective_adapter.as_deref() == Some(profile.adapter.as_str())
+                && state
+                    .inner
+                    .action_adapters
+                    .resolve(&profile.adapter)
+                    .is_none()
+            {
+                return Err(action_adapter_unavailable(
+                    &profile.action_name,
+                    &profile.adapter,
+                    &slot.tenant_id,
+                    &slot.agent_id,
+                    &slot.run_id,
+                ));
+            }
+        }
 
         record_run_action_event(
             &slot,
@@ -3565,6 +3512,7 @@ async fn submit_action(
         request.approval_evidence.as_ref(),
     )?;
     let mut slot = run.lock().map_err(|_| lock_error())?;
+    record_adapter_completion(&slot.adapter_executions, &outcome);
     if !authority_pre_effect_evidence_recorded(&outcome.verification) {
         record_run_action_event(
             &slot,
@@ -4041,6 +3989,28 @@ async fn submit_physical_action(
                 OffsetDateTime::now_utc(),
             )
             .map_err(run_action_admission_error)?;
+        let configured_adapter = slot
+            .action_profiles
+            .iter()
+            .find(|profile| profile.action_name == action_name)
+            .filter(|profile| effective_adapter.as_deref() == Some(profile.adapter.as_str()))
+            .map(|profile| {
+                state
+                    .inner
+                    .action_adapters
+                    .resolve(&profile.adapter)
+                    .ok_or_else(|| {
+                        action_adapter_unavailable(
+                            &profile.action_name,
+                            &profile.adapter,
+                            &slot.tenant_id,
+                            &slot.agent_id,
+                            &slot.run_id,
+                        )
+                    })
+                    .map(|adapter| (profile.adapter.clone(), adapter))
+            })
+            .transpose()?;
         record_daemon_audit(
             &slot,
             "splendor.devices.actions.submit",
@@ -4126,16 +4096,9 @@ async fn submit_physical_action(
         physical_gateway.set_safety_verifier(Arc::new(SimulatedSafetyVerifier::new(
             safety_snapshot.clone(),
         )));
-        physical_gateway.register_adapter(
-            action_name.clone(),
-            action_request
-                .adapter
-                .clone()
-                .unwrap_or_else(|| "device-sim".to_string()),
-            Arc::new(RecordingAdapter {
-                executions: Arc::clone(&slot.adapter_executions),
-            }),
-        );
+        if let Some((adapter_id, adapter)) = configured_adapter {
+            physical_gateway.register_adapter(action_name.clone(), adapter_id, adapter);
+        }
         (
             Arc::new(PolicyDistributionGateway::new(
                 Arc::new(physical_gateway),
@@ -4157,6 +4120,7 @@ async fn submit_physical_action(
         request.action_request.approval_evidence.as_ref(),
     )?;
     let mut slot = run.lock().map_err(|_| lock_error())?;
+    record_adapter_completion(&slot.adapter_executions, &outcome);
     if !authority_pre_effect_evidence_recorded(&outcome.verification) {
         record_run_action_event(
             &slot,
@@ -5592,6 +5556,9 @@ async fn run_lifecycle_tick(
             return Err(ApiError::from(error));
         }
     };
+    for outcome in &step.outcome.action_outcomes {
+        record_adapter_completion(&slot.adapter_executions, outcome);
+    }
     slot.state_head = Some(step.outcome.state_commit.node_id.clone());
     slot.tick_count = slot.tick_count.saturating_add(1);
     if let Some(outcome) = step
@@ -5724,6 +5691,38 @@ fn action_profiles_for_request(
     let mut profiles = profiles.into_values().collect::<Vec<_>>();
     profiles.sort_by(|left, right| left.action_name.cmp(&right.action_name));
     Ok(profiles)
+}
+
+fn ensure_action_adapters_available(
+    state: &DaemonState,
+    profiles: &[splendor_gateway::TrustedActionProfile],
+    tenant_id: &TenantId,
+    agent_id: &splendor_types::AgentId,
+    run_id: &RunId,
+) -> Result<(), ApiError> {
+    for profile in profiles {
+        if state
+            .inner
+            .action_adapters
+            .resolve(&profile.adapter)
+            .is_none()
+        {
+            return Err(action_adapter_unavailable(
+                &profile.action_name,
+                &profile.adapter,
+                tenant_id,
+                agent_id,
+                run_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn record_adapter_completion(executions: &AtomicU64, outcome: &ActionOutcome) {
+    if outcome.status == ActionStatus::Executed || outcome.post_verification.is_some() {
+        executions.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn normalized_permission_set(mut permissions: Vec<String>) -> Vec<String> {
@@ -6514,6 +6513,30 @@ fn lock_error() -> ApiError {
     )
 }
 
+fn action_adapter_unavailable(
+    action_name: &str,
+    adapter_id: &str,
+    tenant_id: &TenantId,
+    agent_id: &splendor_types::AgentId,
+    run_id: &RunId,
+) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "action_adapter_unavailable",
+        "no action adapter is configured for the trusted adapter identity",
+    )
+    .details(serde_json::json!({
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "action_name": action_name,
+        "adapter": adapter_id,
+        "effect_certainty": "none",
+        "retry_class": "retry_with_same_idempotency_key",
+        "admission_stage": "before_run_and_idempotency_commit",
+    }))
+}
+
 fn policy_bundle_error(error: PolicyBundleValidationError) -> ApiError {
     let status = match &error {
         PolicyBundleValidationError::Expired
@@ -6591,8 +6614,6 @@ mod tests {
     use axum::extract::Path;
     use base64::Engine as _;
     use splendor_store::{InMemoryTraceStore, TraceStore};
-    use std::net::TcpListener;
-    use std::thread;
     use std::time::Duration;
     use tower::ServiceExt as _;
 
@@ -6609,6 +6630,53 @@ mod tests {
             credential_id: Some("unit_credential".to_string()),
             requested_at: OffsetDateTime::now_utc(),
         }
+    }
+
+    struct UnitActionAdapter {
+        fail_next: Arc<AtomicBool>,
+    }
+
+    impl ActionAdapter for UnitActionAdapter {
+        fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(AdapterError::Failed("fixture_adapter_failure".to_string()));
+            }
+            Ok(AdapterResult {
+                output: serde_json::json!({
+                    "provider_receipt_id": format!("unit-provider:{}", action.action_id),
+                    "action_name": action.action.name,
+                }),
+                satisfied_postconditions: action.action.postconditions.clone(),
+            })
+        }
+    }
+
+    fn unit_action_state() -> DaemonState {
+        unit_action_state_with_failure_control().0
+    }
+
+    fn unit_action_state_with_failure_control() -> (DaemonState, Arc<AtomicBool>) {
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let adapters = unit_action_adapters(Arc::clone(&fail_next));
+        (
+            DaemonState::with_action_adapters(DaemonConfig::local_dev(), adapters),
+            fail_next,
+        )
+    }
+
+    fn unit_action_adapters(fail_next: Arc<AtomicBool>) -> ConfiguredActionAdapters {
+        let mut adapters = ConfiguredActionAdapters::new();
+        for adapter_id in ["daemon.local", "device-sim"] {
+            adapters
+                .insert(
+                    adapter_id,
+                    Arc::new(UnitActionAdapter {
+                        fail_next: Arc::clone(&fail_next),
+                    }),
+                )
+                .expect("unit action adapter");
+        }
+        adapters
     }
 
     fn unit_replay_credential(tenant_id: TenantId) -> CallerCredential {
@@ -6969,27 +7037,6 @@ mod tests {
             .load(Ordering::SeqCst)
     }
 
-    fn unit_action_request(action_name: &str) -> ActionRequest {
-        ActionRequest {
-            action_id: ActionId::new(),
-            tenant_id: TenantId::new(),
-            agent_id: splendor_types::AgentId::new(),
-            run_id: RunId::new(),
-            tick_id: None,
-            action: physical_action(action_name),
-            adapter: Some("device-sim".to_string()),
-            quota_usage: splendor_types::QuotaUsage::single_action(),
-            satisfied_preconditions: Vec::new(),
-            requested_at: OffsetDateTime::now_utc(),
-            physical_action_resource_coordinate: Some(
-                splendor_types::PhysicalActionResourceCoordinate::physical_node(NodeId::new()),
-            ),
-            approval_evidence: None,
-            authority_obligation_evidence: None,
-            authority_obligation_receipts: Vec::new(),
-        }
-    }
-
     #[test]
     fn resident_caller_projection_helpers_cover_fail_closed_profiles() {
         let credential = unit_replay_credential(TenantId::new());
@@ -7318,7 +7365,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_run_idempotency_returns_same_receipt_without_duplicate_state() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -7365,7 +7412,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_run_idempotency_scope_mismatch_fails_without_second_run() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let first = unit_create_run_request(
             TenantId::new(),
             splendor_types::AgentId::new(),
@@ -7408,7 +7455,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_run_rejects_blank_idempotency_fields_before_mutation() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let blank_request_id = unit_create_run_request(
             TenantId::new(),
             splendor_types::AgentId::new(),
@@ -7483,8 +7530,7 @@ mod tests {
     }
 
     #[test]
-    fn data_artifact_boundary_and_recording_adapter_cover_s7_paths() {
-        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
+    fn data_artifact_boundary_verifier_covers_s7_paths() {
         let tenant_id = TenantId::new();
         let allowed_ref = "dataset:tenant-a.finance.board_pack.v1".to_string();
         let verifier =
@@ -7525,52 +7571,6 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "artifact_path_tenant_mismatch"));
-
-        let executions = Arc::new(AtomicU64::new(0));
-        let adapter = RecordingAdapter {
-            executions: Arc::clone(&executions),
-        };
-        let data_output = adapter.execute(&data_action).expect("data output").output;
-        assert_eq!(data_output["adapter"], "fixture-data-store");
-        assert_eq!(data_output["raw_payload_included"], false);
-
-        let internal_artifact = unit_daemon_action_request(
-            tenant_id.clone(),
-            "artifact.create_internal",
-            serde_json::json!({"artifact_path": format!("artifact://{tenant_id}/board.md")}),
-        );
-        let output = adapter
-            .execute(&internal_artifact)
-            .expect("internal artifact output")
-            .output;
-        assert_eq!(output["adapter"], "artifact-store");
-        assert_eq!(output["tenant_id"], tenant_id.to_string());
-
-        let publish = unit_daemon_action_request(
-            tenant_id,
-            "artifact.publish_external",
-            serde_json::json!({"publish_ref": "artifact://tenant-a/board.md"}),
-        );
-        let output = adapter.execute(&publish).expect("publish output").output;
-        assert_eq!(output["published"], true);
-        assert_eq!(output["external_store"], "fake-artifact-store");
-
-        let generic = unit_daemon_action_request(
-            TenantId::new(),
-            "daemon.record",
-            serde_json::json!({"note": "generic"}),
-        );
-        let output = adapter.execute(&generic).expect("generic output").output;
-        assert_eq!(output["adapter"], "daemon.recording");
-        assert_eq!(output["device_sim"], serde_json::Value::Null);
-
-        let fail = unit_daemon_action_request(
-            TenantId::new(),
-            "artifact.create_internal",
-            serde_json::json!({"fail_adapter": true}),
-        );
-        assert!(adapter.execute(&fail).is_err());
-        assert_eq!(executions.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -7666,12 +7666,15 @@ mod tests {
         policy_bundle_keyring
             .insert_shared_secret("policy-local-key", b"splendor-local-policy-secret")
             .expect("policy key");
-        let state = DaemonState::new(DaemonConfig::resident(
-            instance_id.clone(),
-            verifier,
-            work_order_keyring,
-            policy_bundle_keyring,
-        ));
+        let state = DaemonState::with_action_adapters(
+            DaemonConfig::resident(
+                instance_id.clone(),
+                verifier,
+                work_order_keyring,
+                policy_bundle_keyring,
+            ),
+            unit_action_adapters(Arc::new(AtomicBool::new(false))),
+        );
         let app = router(state.clone());
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
@@ -7819,126 +7822,6 @@ mod tests {
         assert!(!trace_json.contains(&caller_time));
         assert!(!trace_json.contains(&first.encoded));
         assert!(!trace_json.contains(&raw_jti));
-    }
-
-    #[test]
-    fn device_sim_url_parser_and_disabled_env_path_are_explicit() {
-        assert_eq!(
-            parse_http_host_port("http://device-sim:8086/path").expect("valid url"),
-            ("device-sim".to_string(), 8086)
-        );
-        for invalid in [
-            "https://device-sim:8086",
-            "http://device-sim",
-            "http://:8086",
-            "http://device-sim:not-a-port",
-        ] {
-            assert!(parse_http_host_port(invalid).is_err());
-        }
-        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
-        assert!(
-            submit_device_sim_action(&unit_action_request("read_battery"), 7)
-                .expect("disabled simulator is allowed")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn device_sim_submit_posts_gateway_executed_action_payload() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
-        let addr = listener.local_addr().expect("simulator addr");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept simulator request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("set read timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 512];
-            loop {
-                let bytes = stream.read(&mut buffer).expect("read simulator request");
-                if bytes == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..bytes]);
-                let text = String::from_utf8_lossy(&request);
-                if text.contains("\"action_name\":\"inspect_zone\"")
-                    && text.contains("\"adapter_execution\":42")
-                {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /actions HTTP/1.1"));
-            assert!(request.contains("\"action_name\":\"inspect_zone\""));
-            assert!(request.contains("\"adapter_execution\":42"));
-            let body = serde_json::json!({"accepted": true, "counter": 1});
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.to_string().len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write simulator response");
-        });
-        let response = submit_device_sim_action_to(
-            &format!("http://{addr}"),
-            &unit_action_request("inspect_zone"),
-            42,
-        )
-        .expect("submit to simulator")
-        .expect("simulator response");
-        assert_eq!(response["accepted"], true);
-        assert_eq!(response["counter"], 1);
-        handle.join().expect("simulator thread joins");
-    }
-
-    #[test]
-    fn device_sim_submit_rejects_non_success_status() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
-        let addr = listener.local_addr().expect("simulator addr");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept simulator request");
-            let mut buffer = [0_u8; 512];
-            let _ = stream.read(&mut buffer).expect("read request bytes");
-            stream
-                .write_all(
-                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .expect("write failure response");
-        });
-        let error = submit_device_sim_action_to(
-            &format!("http://{addr}"),
-            &unit_action_request("read_battery"),
-            1,
-        )
-        .expect_err("non-200 simulator responses fail closed");
-        assert!(error.to_string().contains("device_sim_"));
-        handle.join().expect("simulator thread joins");
-    }
-
-    #[test]
-    fn device_sim_submit_rejects_malformed_success_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulator");
-        let addr = listener.local_addr().expect("simulator addr");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept simulator request");
-            let mut buffer = [0_u8; 512];
-            let _ = stream.read(&mut buffer).expect("read request bytes");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
-                )
-                .expect("write malformed success response");
-        });
-        let error = submit_device_sim_action_to(
-            &format!("http://{addr}"),
-            &unit_action_request("read_battery"),
-            1,
-        )
-        .expect_err("malformed simulator bodies fail closed");
-        assert!(error.to_string().contains("device_sim_"));
-        handle.join().expect("simulator thread joins");
     }
 
     #[test]
@@ -8527,7 +8410,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_profile_read_and_trace_sync_paths_are_covered() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let node_id = NodeId::new();
         let tenant_id = TenantId::new();
         let profile = unit_profile(node_id.clone(), tenant_id);
@@ -8837,7 +8720,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_intervention_lifecycle_and_evidence_fail_closed() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9104,7 +8987,7 @@ mod tests {
 
     #[tokio::test]
     async fn physical_action_paths_execute_and_deny_safely() {
-        let state = DaemonState::local_dev();
+        let (state, fail_next) = unit_action_state_with_failure_control();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9271,20 +9154,14 @@ mod tests {
         );
         assert_non_tick_action_trace(&state, &run_id, &denied_action_id);
 
-        let mut failed_request = physical_request(
+        let failed_request = physical_request(
             run_id.clone(),
             tenant_id.clone(),
             agent_id.clone(),
             "move_to_waypoint",
             safe_context(),
         );
-        failed_request
-            .action_request
-            .action
-            .params
-            .as_object_mut()
-            .expect("physical action params")
-            .insert("fail_adapter".to_string(), serde_json::Value::Bool(true));
+        fail_next.store(true, Ordering::SeqCst);
         let failed_action_id = failed_request
             .action_request
             .action_id
@@ -9459,7 +9336,7 @@ mod tests {
 
     #[tokio::test]
     async fn requester_safety_fields_cannot_override_unsafe_process_owned_device_state() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9601,7 +9478,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_action_completion_does_not_overwrite_concurrent_cancellation() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9664,7 +9541,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_approval_raw_denial_requires_and_uses_the_exact_pending_challenge() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9758,7 +9635,7 @@ mod tests {
 
     #[tokio::test]
     async fn physical_v1_challenge_allows_only_exact_raw_fail_closed_closure() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -9978,7 +9855,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_and_physical_effects_require_explicitly_capable_run_status() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -10113,7 +9990,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_zero_quota_is_normalized_for_direct_and_physical_actions() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -10181,7 +10058,7 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_and_zero_duration_estimates_use_server_floor_on_both_action_endpoints() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();
@@ -10271,7 +10148,7 @@ mod tests {
     async fn stop_and_cancel_close_admission_before_terminal_visibility_and_wait_without_run_lock()
     {
         for cancel in [false, true] {
-            let state = DaemonState::local_dev();
+            let state = unit_action_state();
             let tenant_id = TenantId::new();
             let agent_id = splendor_types::AgentId::new();
             let run_id = RunId::new();
@@ -10520,7 +10397,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_audit_records_details_and_registration_fails_when_runtime_unavailable() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let audit_id = record_device_audit(
             &state,
             "device.audit.unit",
@@ -10553,7 +10430,7 @@ mod tests {
 
     #[tokio::test]
     async fn physical_action_boundary_errors_are_explicit() {
-        let state = DaemonState::local_dev();
+        let state = unit_action_state();
         let tenant_id = TenantId::new();
         let agent_id = splendor_types::AgentId::new();
         let run_id = RunId::new();

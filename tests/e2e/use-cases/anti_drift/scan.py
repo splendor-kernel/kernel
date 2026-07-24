@@ -36,6 +36,7 @@ DOCUMENTED_PATH_PREFIXES = (
     "/runs",
     "/percepts",
     "/actions",
+    "/evidence",
     "/state-head",
     "/state-snapshots",
     "/traces",
