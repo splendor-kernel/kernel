@@ -2013,7 +2013,7 @@ impl ProcessLocalSecretBroker {
             .clock
             .now_utc()
             .ok_or(SecretBrokerError::ClockUnavailable)?;
-        if now.nanosecond() % 1_000 != 0 {
+        if !now.nanosecond().is_multiple_of(1_000) {
             return Err(SecretBrokerError::ClockUnavailable);
         }
         if state
@@ -2220,7 +2220,7 @@ fn parse_canonical(value: &CanonicalTimestampV1) -> Result<OffsetDateTime, Secre
 
 fn canonical_timestamp(value: OffsetDateTime) -> Result<CanonicalTimestampV1, SecretBrokerError> {
     let value = value.to_offset(time::UtcOffset::UTC);
-    if value.nanosecond() % 1_000 != 0 {
+    if !value.nanosecond().is_multiple_of(1_000) {
         return Err(SecretBrokerError::ClockUnavailable);
     }
     let text = format!(

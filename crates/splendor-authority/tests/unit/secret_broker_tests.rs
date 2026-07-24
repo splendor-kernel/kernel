@@ -768,7 +768,7 @@ fn broker_configuration_system_sources_and_fixed_errors_are_covered() {
     assert_eq!(broker.inspect_lease(&secret_id(99)).unwrap(), None);
 
     let system_now = SystemSecretBrokerClock.now_utc().unwrap();
-    assert_eq!(system_now.nanosecond() % 1_000, 0);
+    assert!(system_now.nanosecond().is_multiple_of(1_000));
     let system_ids = SystemSecretBrokerIdSource;
     for kind in [
         SecretBrokerIdKind::Lease,
