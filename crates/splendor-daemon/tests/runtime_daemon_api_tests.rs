@@ -4018,6 +4018,76 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             .contains(CANARY));
     }
 
+    for (label, params) in [
+        ("x_auth_token", json!({"X-Auth-Token": CANARY})),
+        ("private_token", json!({"Private-Token": CANARY})),
+        ("vault_token", json!({"VAULT_TOKEN": CANARY})),
+        ("consul_token", json!({"CONSUL_HTTP_TOKEN": CANARY})),
+        ("secret_key_ref", json!({"secretKeyRef": {"name": CANARY}})),
+        (
+            "presigned_query",
+            json!({"url": format!("https://example.invalid/?X-Amz-Signature={CANARY}")}),
+        ),
+        (
+            "encoded_path_ref",
+            json!({"url": "https://example.invalid/%76ault%3Ateam%2Fservice"}),
+        ),
+        (
+            "nested_query_url",
+            json!({"url": "https://example.invalid/redirect?target=https%3A%2F%2Fuser%3Apass%40nested.invalid"}),
+        ),
+        (
+            "short_basic_form",
+            json!({"url": "https://example.invalid/form?value=Basic+dTpw"}),
+        ),
+    ] {
+        request.policy_actions[0].action.params = params;
+        let (status, error): (StatusCode, ApiErrorBody) = call_json(
+            app.clone(),
+            Method::POST,
+            "/runs",
+            serde_json::to_value(request.clone()).expect("raw create request variant"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_eq!(
+            error.code,
+            splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED,
+            "{label}"
+        );
+        assert!(error.details.is_null(), "{label}");
+        assert!(!serde_json::to_string(&error)
+            .expect("error serializes")
+            .contains(CANARY));
+        assert!(matches!(
+            trace_store.read(&fixed_run_id.to_string()),
+            Err(TraceStoreError::RunNotFound)
+        ));
+    }
+
+    request.policy_actions[0].action.name = "alternate_http_post".to_string();
+    request.policy_actions[0].action.side_effect_class = SideEffectClass::ReadOnly;
+    request.policy_actions[0].adapter = Some("http".to_string());
+    request.policy_actions[0].action.params = json!({
+        "bytes": "Bearer x"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(request.clone()).expect("alternate routed byte request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+    assert!(matches!(
+        trace_store.read(&fixed_run_id.to_string()),
+        Err(TraceStoreError::RunNotFound)
+    ));
+
     let (status, missing): (StatusCode, ApiErrorBody) =
         call_empty(app.clone(), Method::GET, &format!("/runs/{fixed_run_id}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -4027,7 +4097,9 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
         Err(TraceStoreError::RunNotFound)
     ));
 
+    request.policy_actions[0].action = action("allowed_action");
     request.policy_actions[0].action.params = json!({"resource_ref": "fixture:report"});
+    request.policy_actions[0].adapter = Some("daemon.local".to_string());
     let (status, created): (StatusCode, CreateRunResponse) = call_json(
         app,
         Method::POST,
@@ -4085,24 +4157,28 @@ async fn configured_receipt_strings_are_rejected_before_fingerprint_run_state_an
         "validation_digest",
         "signature",
     ] {
-        let canary = format!("Bearer C03_RECEIPT_{}_CANARY", field.to_ascii_uppercase());
+        let canary = format!("C03_RECEIPT_{}_CANARY", field.to_ascii_uppercase());
+        let credential_value =
+            format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
         let mut receipt = ordinary_unvalidated_obligation_receipt();
         match field {
-            "schema_version" => receipt.schema_version = canary.clone(),
-            "audience" => receipt.audience = canary.clone(),
-            "canonical_request_digest" => receipt.canonical_request_digest = canary.clone(),
-            "evidence_digest" => receipt.evidence_digest = canary.clone(),
-            "evidence_ref" => receipt.evidence_ref = Some(canary.clone()),
+            "schema_version" => receipt.schema_version = credential_value.clone(),
+            "audience" => receipt.audience = credential_value.clone(),
+            "canonical_request_digest" => {
+                receipt.canonical_request_digest = credential_value.clone()
+            }
+            "evidence_digest" => receipt.evidence_digest = credential_value.clone(),
+            "evidence_ref" => receipt.evidence_ref = Some(credential_value.clone()),
             "revocation_reason" => {
                 receipt.revocation = RevocationStatus::Revoked {
-                    reason: canary.clone(),
+                    reason: credential_value.clone(),
                 }
             }
-            "revocation_ref" => receipt.revocation_ref = canary.clone(),
-            "algorithm" => receipt.validation.algorithm = canary.clone(),
-            "key_id" => receipt.validation.key_id = canary.clone(),
-            "validation_digest" => receipt.validation.digest = canary.clone(),
-            "signature" => receipt.validation.signature = canary.clone(),
+            "revocation_ref" => receipt.revocation_ref = credential_value.clone(),
+            "algorithm" => receipt.validation.algorithm = credential_value.clone(),
+            "key_id" => receipt.validation.key_id = credential_value.clone(),
+            "validation_digest" => receipt.validation.digest = credential_value.clone(),
+            "signature" => receipt.validation.signature = credential_value.clone(),
             _ => unreachable!("closed receipt field matrix"),
         }
         request.policy_actions[0].authority_obligation_receipts = vec![receipt];

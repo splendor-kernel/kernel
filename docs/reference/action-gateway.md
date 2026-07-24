@@ -128,31 +128,46 @@ adapter, satisfied-precondition strings, and free-form strings in raw authority
 obligation receipts. Receipt screening is content denial only: it neither
 validates a receipt nor turns one into authority. Case/separator-normalized
 credential coordinates include authorization/proxy authorization, common
-`authKey`/`apiToken`/`X-API-Key`/`authz` aliases, password/passwd, token/API key,
-client secret, private key, cookie/set-cookie, secret/credential,
-connection-string/DSN, provider environment-password aliases, URL userinfo and
-credential query keys, and equivalent nested map/list content. Credential
-material in an object key is screened as content as well as by normalized key
-name.
+`authKey`/`apiToken`/`X-API-Key`/`X-Auth-Token`/`Private-Token`/`authz` aliases,
+password/passwd, token/API key, Vault/Consul token environment coordinates,
+Kubernetes `secretKeyRef`, client secret, private key, cookie/set-cookie,
+secret/credential, connection-string/DSN, provider environment-password aliases,
+presigned signature coordinates such as `X-Amz-Signature`, URL userinfo, and
+equivalent nested map/list content. Credential material in an object key is
+screened as content as well as by normalized key name.
 
 Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
 authorization form, PEM private-key block, boundary-delimited provider token,
 embedded generic secret reference, or unambiguous credential URL/DSN/assignment
-form. Basic/Bearer and provider recognition requires a plausible complete token;
-ordinary prose such as `Basic monthly reporting` and resource paths such as
-`models/hf_transformer` remain accepted. Spaced or quoted assignment keys and
-boundary-delimited embedded `vault:`/secret-reference forms deny. Malformed
-percent encoding or other ambiguity in a credential-capable parsed coordinate
-fails closed. Object keys containing non-ASCII/confusable characters or residual
-percent escapes after one bounded decode also fail closed; ordinary ASCII keys
-and valid percent-encoded non-credential URLs retain their existing path.
+form. Basic tokens are locally base64-decoded within the scanner limit and deny
+only when the decoded credential has the required colon structure; short valid
+Basic/Bearer credentials still deny. Provider profiles use provider-specific
+realistic minimum/maximum lengths and alphabets, including after a path `/`.
+Ordinary prose such as `Basic planning`, standalone `hf_transformer`, and paths
+such as `models/hf_transformer` remain accepted.
 
-The executable `http_post` and `write_file` `params.bytes` coordinates are
-reconstructed from bounded integer arrays and scanned before traversal can ignore
-their numeric content. Non-array, non-integer, out-of-range, or over-budget shapes
-fail closed for those executable coordinates. Credential-free bounded byte
-bodies remain accepted, and unrelated actions do not acquire executable-byte
-semantics merely because they contain a numeric array.
+URL scanning extracts bounded candidates instead of treating surrounding prose as
+part of a scheme. It screens decoded path/fragment components, form/query keys and
+plus-as-space values, query-bearing secret refs, and nested credential URLs with a
+maximum nesting depth of four. Residual or ambiguous percent encodings fail
+closed. Thus `see https://example.invalid/docs` remains accepted while encoded
+refs, presigned signatures, provider tokens in paths, and nested credential URLs
+deny. Object keys containing non-ASCII/confusable characters or residual percent
+escapes after one bounded decode also fail closed.
+
+Top-level numeric `params.bytes` content is always a strict credential-capable
+coordinate, independent of action labels, declared side-effect class, optional
+adapter routing, or later registry lookup. It requires bounded integer bytes and
+unambiguous UTF-8;
+UTF-8 BOM, UTF-16LE/BE, invalid UTF-8, NUL/control data, non-array, non-integer,
+out-of-range, or over-budget shapes fail closed. Credential-free bounded UTF-8
+bodies remain accepted. Numeric arrays under other field names retain ordinary
+non-byte semantics.
+
+The Gateway also exposes the same recursive bounded value entry point for an
+owning service to screen a complete closed JSON envelope. The daemon uses it for
+`DeviceRuntimeProfile`; Gateway owns detection vocabulary while the daemon remains
+profile schema/mutation owner.
 
 Traversal is bounded to depth 16, 2,048 inspected nodes, 16 KiB per string/key,
 and 64 KiB cumulative inspected UTF-8 bytes. A cap overflow returns the same

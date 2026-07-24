@@ -51,20 +51,25 @@ before any earlier owner could persist or reflect an untrusted action.
 
 The bounded guard recognizes RFC 0012's normalized authorization/password/token/
 API-key/client-secret/private-key/cookie/secret/credential/connection/DSN and
-environment coordinates in nested action data and object keys, URL
-userinfo/query and quoted/spaced assignment forms, plus complete bounded
-Basic/Bearer, PEM, boundary-delimited provider, credential URL/DSN, and embedded
-generic ref-like content under neutral keys. It also screens raw receipt strings,
-physical/operator envelope strings selected by their daemon owner, and bounded
-numeric `bytes` bodies consumed by the HTTP/filesystem executable adapters. This
-screening never validates receipt authority. It denies malformed parsed
+structured cloud/device environment coordinates in nested action data and object
+keys, URL userinfo/path/query and quoted/spaced assignment forms, plus
+structurally decoded Basic, short Bearer, PEM, realistically bounded
+path-delimited provider, credential URL/DSN, and embedded/encoded generic
+ref-like content under neutral keys. URL/form handling has explicit nested/decode
+bounds and preserves ordinary embedded URLs and provider-like resource names. It
+also screens raw receipt strings, physical/operator envelope strings, complete
+device-profile values/keys, and every top-level numeric `params.bytes` body,
+independent of action labels or adapter routing. Such bytes must be unambiguous UTF-8;
+BOM, UTF-16, invalid/control encodings fail closed. This screening never
+validates receipt authority. It denies malformed parsed
 coordinates and depth/node/string/cumulative-byte overflow with the sole fixed
 reason `raw_credential_input_denied`. Its error type is fieldless,
 non-serializable, and non-reflecting. Denied action traces use one constant
 suppression projection; raw input never enters candidate/action traces, outcome
 feedback, daemon request fingerprints, create-run idempotency receipts, physical
-safety evidence, operator records, or adapters/simulators. Complete-token grammar
-preserves ordinary Basic prose and provider-looking resource paths.
+safety evidence, device profiles/status/audit, operator records, or
+adapters/simulators. Complete-token grammar preserves ordinary Basic prose and
+provider-looking resource paths.
 
 This barrier is intentionally not the complete RFC 0012
 `CredentialIngressProfile`: it has no operation-specific owner-schema registry,

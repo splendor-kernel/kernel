@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_request,
     guard_action_routing_and_receipts, guard_credential_capable_strings,
-    raw_credential_denied_action, raw_credential_denied_outcome, ActionAdapter, ActionGateway,
-    ActionId, ActionOutcome, ActionRequest, ActionStatus, AdapterError, AdapterResult,
-    AuthorityObligationVerifier, CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary,
-    PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier,
-    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    guard_credential_capable_value, raw_credential_denied_action, raw_credential_denied_outcome,
+    ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
+    AdapterError, AdapterResult, AuthorityObligationVerifier, CircuitBreakerEvaluator,
+    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
@@ -3891,7 +3891,6 @@ async fn register_device_profile(
     Json(request): Json<RegisterDeviceProfileRequest>,
 ) -> Result<Json<RegisterDeviceProfileResponse>, ApiError> {
     state.ensure_runtime_available()?;
-    validate_device_profile_payload(&request.profile)?;
     let security = state.validate_security(
         DaemonEndpoint::DeviceProfileRegister {
             tenant_id: request.profile.tenant_id.clone(),
@@ -3901,6 +3900,11 @@ async fn register_device_profile(
         None,
         request.audit_attribution.clone(),
     )?;
+    let profile_envelope =
+        serde_json::to_value(&request.profile).map_err(|_| raw_credential_input_api_error())?;
+    guard_credential_capable_value(&profile_envelope)
+        .map_err(|_| raw_credential_input_api_error())?;
+    validate_device_profile_payload(&request.profile)?;
     let mut profile = request.profile;
     profile.registered_at = now_rfc3339();
     state
@@ -6777,6 +6781,36 @@ mod tests {
         }
     }
 
+    fn locked_unit_state() -> DaemonState {
+        let mut config = DaemonConfig::local_dev();
+        config.insecure_dev_mode = None;
+        DaemonState::new(config)
+    }
+
+    fn unit_credential(tenant_id: TenantId, scopes: Vec<EndpointScope>) -> CallerCredential {
+        CallerCredential {
+            credential_id: "unit_credential".to_string(),
+            principal: unit_audit().principal,
+            scopes,
+            binding: CredentialBinding::Tenant { tenant_id },
+            audience: CredentialAudience::Daemon {
+                daemon_id: "daemon_local".to_string(),
+            },
+            expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            revocation: RevocationStatus::Active,
+        }
+    }
+
+    fn unit_credential_headers(credential: &CallerCredential) -> HeaderMap {
+        let encoded = serde_json::to_vec(credential).expect("credential serializes");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-splendor-caller-credential",
+            HeaderValue::from_bytes(&encoded).expect("credential header"),
+        );
+        headers
+    }
+
     fn unit_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile {
         DeviceRuntimeProfile {
             node_id,
@@ -8988,6 +9022,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_device_profile_ingress_denies_before_audit_or_mutation() {
+        let state = locked_unit_state();
+        let tenant_id = TenantId::new();
+        let register_credential =
+            unit_credential(tenant_id.clone(), vec![EndpointScope::DeviceRegister]);
+
+        let mut unauthenticated = unit_profile(NodeId::new(), tenant_id.clone());
+        unauthenticated.capabilities = vec!["Basic dTpw".to_string()];
+        let error = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unauthenticated,
+            }),
+        )
+        .await
+        .expect_err("authentication must precede profile screening");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.body.code, "anonymous_non_dev_call");
+
+        for field in [
+            "device_kind",
+            "capabilities",
+            "allowed_physical_actions",
+            "forbidden_action_classes",
+            "safety_constraints_value",
+            "safety_constraints_key",
+            "runtime_mode",
+            "safety_status_value",
+            "safety_status_key",
+            "policy_id",
+            "policy_expires_at",
+            "trace_integrity",
+            "registered_at",
+        ] {
+            let node_id = NodeId::new();
+            let canary = format!("C03_DEVICE_PROFILE_{}_CANARY", field.to_ascii_uppercase());
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+            let mut profile = unit_profile(node_id.clone(), tenant_id.clone());
+            match field {
+                "device_kind" => profile.device_kind = credential_value.clone(),
+                "capabilities" => profile.capabilities = vec![credential_value.clone()],
+                "allowed_physical_actions" => {
+                    profile.allowed_physical_actions = vec![credential_value.clone()]
+                }
+                "forbidden_action_classes" => {
+                    profile.forbidden_action_classes = vec![credential_value.clone()]
+                }
+                "safety_constraints_value" => {
+                    profile.safety_constraints = serde_json::json!({
+                        "allowed_zones": ["zone_a", {"nested": [credential_value.clone()]}]
+                    })
+                }
+                "safety_constraints_key" => {
+                    profile.safety_constraints = serde_json::Value::Object(
+                        [(credential_value.clone(), serde_json::json!("ordinary"))]
+                            .into_iter()
+                            .collect(),
+                    )
+                }
+                "runtime_mode" => profile.runtime_mode = credential_value.clone(),
+                "safety_status_value" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": {"nested": [credential_value.clone()]}
+                    })
+                }
+                "safety_status_key" => {
+                    profile.safety_status = serde_json::Value::Object(
+                        [(credential_value.clone(), serde_json::json!("ordinary"))]
+                            .into_iter()
+                            .collect(),
+                    )
+                }
+                "policy_id" => profile.policy_cache.policy_id = credential_value.clone(),
+                "policy_expires_at" => profile.policy_cache.expires_at = credential_value.clone(),
+                "trace_integrity" => profile.trace_buffer.integrity = credential_value.clone(),
+                "registered_at" => profile.registered_at = credential_value.clone(),
+                _ => unreachable!("closed device profile field matrix"),
+            }
+
+            let error = register_device_profile(
+                State(state.clone()),
+                Json(RegisterDeviceProfileRequest {
+                    credential: Some(register_credential.clone()),
+                    audit_attribution: Some(unit_audit()),
+                    profile,
+                }),
+            )
+            .await
+            .expect_err("raw device profile metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            assert!(!state
+                .inner
+                .device_profiles
+                .lock()
+                .expect("profiles")
+                .contains_key(&node_id));
+            assert!(state
+                .inner
+                .device_audit
+                .lock()
+                .expect("device audit")
+                .is_empty());
+        }
+
+        let node_id = NodeId::new();
+        let registered = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: Some(register_credential),
+                audit_attribution: Some(unit_audit()),
+                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+            }),
+        )
+        .await
+        .expect("ordinary authenticated device profile remains accepted")
+        .0;
+        assert_eq!(registered.profile.node_id, node_id);
+
+        let anonymous = get_device_status(
+            Path(node_id.clone()),
+            State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("device read remains authenticated");
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.body.code, "anonymous_non_dev_call");
+
+        let read_credential = unit_credential(tenant_id, vec![EndpointScope::DeviceRead]);
+        let read = get_device_status(
+            Path(node_id),
+            State(state.clone()),
+            unit_credential_headers(&read_credential),
+        )
+        .await
+        .expect("authenticated ordinary device profile read")
+        .0;
+        assert_eq!(read.device_kind, "drone_sim");
+        assert!(!serde_json::to_string(&read)
+            .expect("profile serializes")
+            .contains("C03_DEVICE_PROFILE_"));
+        assert_eq!(
+            state.inner.device_audit.lock().expect("device audit").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn operator_intervention_raw_metadata_denies_before_audit_and_persistence() {
         let state = DaemonState::local_dev();
         let tenant_id = TenantId::new();
@@ -8999,7 +9190,9 @@ mod tests {
             .expect("expiry");
 
         for field in ["intervention_id", "action_name", "reason", "expires_at"] {
-            let canary = format!("Bearer C03_OPERATOR_{}_CANARY", field.to_ascii_uppercase());
+            let canary = format!("C03_OPERATOR_{}_CANARY", field.to_ascii_uppercase());
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
             let mut request = OperatorInterventionRequest {
                 credential: None,
                 audit_attribution: Some(unit_audit()),
@@ -9013,10 +9206,10 @@ mod tests {
                 expires_at: expires_at.clone(),
             };
             match field {
-                "intervention_id" => request.intervention_id = canary.clone(),
-                "action_name" => request.action_name = canary.clone(),
-                "reason" => request.reason = canary.clone(),
-                "expires_at" => request.expires_at = canary.clone(),
+                "intervention_id" => request.intervention_id = credential_value.clone(),
+                "action_name" => request.action_name = credential_value.clone(),
+                "reason" => request.reason = credential_value.clone(),
+                "expires_at" => request.expires_at = credential_value.clone(),
                 _ => unreachable!("closed operator request field matrix"),
             }
 
@@ -9077,9 +9270,11 @@ mod tests {
 
         for field in ["reason", "expires_at"] {
             let canary = format!(
-                "Bearer C03_OPERATOR_DECISION_{}_CANARY",
+                "C03_OPERATOR_DECISION_{}_CANARY",
                 field.to_ascii_uppercase()
             );
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
             let mut request = OperatorDecisionRequest {
                 credential: None,
                 audit_attribution: Some(unit_audit()),
@@ -9087,8 +9282,8 @@ mod tests {
                 expires_at: Some(expires_at.clone()),
             };
             match field {
-                "reason" => request.reason = canary.clone(),
-                "expires_at" => request.expires_at = Some(canary.clone()),
+                "reason" => request.reason = credential_value.clone(),
+                "expires_at" => request.expires_at = Some(credential_value.clone()),
                 _ => unreachable!("closed operator decision field matrix"),
             }
             let error = grant_operator_intervention(

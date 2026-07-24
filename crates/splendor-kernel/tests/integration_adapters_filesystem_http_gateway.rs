@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 const TICK_ID: u64 = 1;
@@ -73,8 +74,37 @@ impl TestServer {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set request read timeout");
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
-                let _ = stream.read(&mut buffer);
+                loop {
+                    let bytes_read = stream.read(&mut buffer).expect("read request");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes_read]);
+
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers are UTF-8")
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
                     body.len(),
@@ -566,9 +596,6 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
 
 #[test]
 fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes() {
-    const FILE_CANARY: &str = "Bearer synthetic-filesystem";
-    const HTTP_CANARY: &str = "ghp_syntheticcredential";
-
     let temp = tempfile::TempDir::new().expect("temp dir");
     let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
         FilesystemAdapterConfig {
@@ -580,32 +607,85 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
         allowed_domains: vec!["127.0.0.1".to_string()],
         ..HttpAdapterConfig::default()
     })));
-    let write = action(
-        "write_file",
-        serde_json::json!({
-            "path": "credential.txt",
-            "bytes": FILE_CANARY.as_bytes().to_vec(),
-        }),
-        SideEffectClass::Filesystem,
-    );
-    let post = action(
-        "http_post",
-        serde_json::json!({
-            "url": "http://127.0.0.1:9/",
-            "bytes": HTTP_CANARY.as_bytes().to_vec(),
-        }),
-        SideEffectClass::Network,
-    );
+    let provider_canary = format!("ghp_{}", "A".repeat(36));
+    let utf16le = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let utf16be = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+    utf8_bom.extend_from_slice(b"ordinary body");
+    let bodies = [
+        b"Basic dTpw".to_vec(),
+        provider_canary.as_bytes().to_vec(),
+        utf16le,
+        utf16be,
+        utf8_bom,
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+    ];
+    let mut candidates = Vec::new();
+    let mut serialized_bodies = Vec::new();
+    for (index, body) in bodies.iter().enumerate() {
+        serialized_bodies.push(serde_json::to_string(body).expect("numeric body serializes"));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-{index}.txt"),
+                    "bytes": body,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "bytes": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "custom_write",
+            serde_json::json!({
+                "path": "credential-alias.txt",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "custom_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "http",
+    ));
+    let expected_denials = candidates.len();
     let run = run_adapter_case(AdapterHarnessCase::new(
         "numeric-byte-credential-denial",
         vec![
             HarnessRegistration::new("write_file", "filesystem", filesystem.clone()),
             HarnessRegistration::new("http_post", "http", http.clone()),
+            HarnessRegistration::new("custom_write", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("custom_post", "http", http.clone()),
         ],
-        vec![
-            action_candidate(write, "filesystem"),
-            action_candidate(post, "http"),
-        ],
+        candidates,
     ));
 
     for outcome in &run.outcome.action_outcomes {
@@ -617,10 +697,18 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
     }
     assert_eq!(filesystem.executions(), 0);
     assert_eq!(http.executions(), 0);
-    assert!(!temp.path().join("credential.txt").exists());
+    for index in 0..bodies.len() {
+        assert!(!temp.path().join(format!("credential-{index}.txt")).exists());
+    }
+    assert!(!temp.path().join("credential-alias.txt").exists());
     let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
-    assert!(!encoded_events.contains(FILE_CANARY));
-    assert!(!encoded_events.contains(HTTP_CANARY));
+    assert!(!encoded_events.contains(&provider_canary));
+    for body in serialized_bodies {
+        assert!(
+            !encoded_events.contains(&body),
+            "raw numeric body must not enter trace"
+        );
+    }
     let proposed = run
         .events
         .iter()
@@ -631,10 +719,7 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_numeric_bytes(
         .expect("candidate event");
     assert_eq!(
         proposed,
-        &vec![
-            raw_credential_denied_action(),
-            raw_credential_denied_action()
-        ]
+        &vec![raw_credential_denied_action(); expected_denials]
     );
     assert_current_runtime_commits_state_after_action_results(&run);
 }
@@ -706,6 +791,41 @@ fn http_adapter_harness_allows_allowlisted_local_domain() {
         .expect("output");
     assert_eq!(output["status"], 200);
     assert_eq!(output["body"], "ok");
+    assert_current_runtime_commits_state_after_action_results(&run);
+    server.join();
+}
+
+#[test]
+fn http_adapter_harness_allows_ordinary_utf8_numeric_body() {
+    let server = TestServer::start("posted");
+    let adapter = HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(adapter));
+    let body = "ordinary UTF-8 café\n".as_bytes().to_vec();
+    let action = action(
+        "http_post",
+        serde_json::json!({"url": server.url, "bytes": body}),
+        SideEffectClass::Network,
+    );
+    let usage = QuotaUsage {
+        http_requests: 1,
+        ..QuotaUsage::default()
+    };
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "http-ordinary-utf8-bytes",
+        vec![HarnessRegistration::new(
+            "http_post",
+            "http",
+            counting.clone(),
+        )],
+        vec![action_candidate(action, "http").with_usage(usage)],
+    ));
+
+    assert_action_status(&run, 0, ActionStatus::Executed);
+    assert_eq!(counting.executions(), 1);
+    assert_action_executed_trace(&run, 0, "http_post");
     assert_current_runtime_commits_state_after_action_results(&run);
     server.join();
 }

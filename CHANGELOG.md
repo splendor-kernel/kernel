@@ -9,19 +9,27 @@
   `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run
   admission, direct/physical action handlers, and Gateway policy/trace-durability
   wrappers. Normalized credential coordinates, nested map/list content,
-  URL/userinfo/query, quoted/spaced connection/environment assignments, complete
-  Basic/Bearer and boundary-delimited provider forms, PEM, embedded generic
-  secret refs, credential-bearing object keys, raw receipt metadata,
-  HTTP/filesystem executable numeric-byte bodies, and physical/operator envelope
-  strings are covered. Malformed parsed coordinates and
+  URL/userinfo/path/query, quoted/spaced connection/environment assignments,
+  structured cloud/device aliases, decoded colon-bearing Basic, short Bearer,
+  realistically bounded provider forms, PEM, embedded/encoded generic secret
+  refs, credential-bearing object keys, raw receipt metadata, physical/operator
+  envelope strings, and complete device-profile envelopes are covered. URL/form
+  parsing handles bounded nested URLs and plus-as-space values while preserving
+  ordinary embedded URLs and provider-like resource names. Every top-level
+  numeric `params.bytes` body requires unambiguous UTF-8 regardless of action
+  label or adapter routing; UTF BOM, UTF-16, invalid UTF-8, NUL/control,
+  malformed parsed coordinates, and
   depth/node/string/byte overflow all return only
   `raw_credential_input_denied`. Denied traces retain action identity/order but
   use one constant action projection; raw input is excluded from constraints,
   delegated authority, request fingerprints/idempotency, action traces, physical
-  safety evidence, operator records, feedback, adapters/simulators, and
+  safety evidence, device profile/status/audit records, operator records,
+  feedback, adapters/simulators, and
   inspect-only replay. Complete-token grammar preserves ordinary Basic prose and
-  provider-looking resource paths. Existing wire schemas, trace variants,
-  `ActionStatus`, and credential-free behavior remain unchanged.
+  provider-looking resource paths. Existing wire schemas, trace variants, and
+  `ActionStatus` remain unchanged. Ordinary non-byte and bounded UTF-8 byte
+  actions remain compatible; generic top-level binary/ambiguous `params.bytes`
+  now fail closed until an owner-versioned ingress profile exists.
   This is only a denial slice of `SECR-004`/`SECR-006`: it adds no typed secret
   delivery, broker/provider Gateway session, operation-specific
   `CredentialIngressProfile`, exhaustive entropy/encoded/split detection,

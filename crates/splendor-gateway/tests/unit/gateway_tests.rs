@@ -463,11 +463,27 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"authKey": "synthetic"}),
         serde_json::json!({"apiToken": "synthetic"}),
         serde_json::json!({"X-API-Key": "synthetic"}),
+        serde_json::json!({"X-Auth-Token": "synthetic"}),
+        serde_json::json!({"Private-Token": "synthetic"}),
+        serde_json::json!({"VAULT_TOKEN": "synthetic"}),
+        serde_json::json!({"CONSUL_HTTP_TOKEN": "synthetic"}),
+        serde_json::json!({"secretKeyRef": {"name": "fixture"}}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Credential=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Security-Token=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Signature=synthetic"}),
         serde_json::json!({"authz": "synthetic"}),
         serde_json::json!({"POSTGRES_PASSWORD": "synthetic"}),
         serde_json::json!({"Bearer synthetic-value": "ordinary"}),
         serde_json::json!({"input": r#"export "POSTGRES_PASSWORD" = synthetic"#}),
         serde_json::json!({"input": "read vault:team/service now"}),
+        serde_json::json!({"input": "https://example.invalid/%76ault%3Ateam%2Fservice"}),
+        serde_json::json!({"input": "vault://team/service?version=1"}),
+        serde_json::json!({"input": "https://example.invalid/redirect?target=https%3A%2F%2Fuser%3Apass%40nested.invalid"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Bearer+short"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Basic+dTpw"}),
+        serde_json::json!({"input": "Basic dTpw"}),
+        serde_json::json!({"input": "Basic YTpi"}),
+        serde_json::json!({"input": "Bearer x"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -480,6 +496,61 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
     numeric_bytes.action.name = "http_post".to_string();
     numeric_bytes.action.params = serde_json::json!({"bytes": b"Bearer synthetic-value".to_vec()});
     vectors.push(numeric_bytes);
+
+    let mut utf16_bytes = base_request();
+    utf16_bytes.adapter = Some("adapter".to_string());
+    utf16_bytes.action.name = "write_file".to_string();
+    utf16_bytes.action.params = serde_json::json!({
+        "bytes": "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(utf16_bytes);
+
+    for bytes in [
+        "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>(),
+        vec![0xef, 0xbb, 0xbf, b'o', b'k'],
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+    ] {
+        let mut ambiguous_bytes = base_request();
+        ambiguous_bytes.adapter = Some("http".to_string());
+        ambiguous_bytes.action.name = "custom_http_post".to_string();
+        ambiguous_bytes.action.params = serde_json::json!({"bytes": bytes});
+        vectors.push(ambiguous_bytes);
+    }
+
+    let mut alternate_route = base_request();
+    alternate_route.adapter = Some("filesystem".to_string());
+    alternate_route.action.name = "custom_write".to_string();
+    alternate_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    alternate_route.action.params = serde_json::json!({"bytes": b"Basic dTpw".to_vec()});
+    vectors.push(alternate_route);
+
+    let mut implicit_route = base_request();
+    implicit_route.action.name = "custom_registered_write".to_string();
+    implicit_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    implicit_route.action.params = serde_json::json!({
+        "bytes": "Bearer x"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(implicit_route);
+
+    let mut provider_path = base_request();
+    provider_path.adapter = Some("adapter".to_string());
+    provider_path.action.params = serde_json::json!({
+        "url": format!(
+            "https://example.invalid/models/ghp_{}/metadata",
+            "A".repeat(36)
+        )
+    });
+    vectors.push(provider_path);
 
     let mut receipt_request = base_request();
     receipt_request.adapter = Some("adapter".to_string());
@@ -502,7 +573,13 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
 
 #[test]
 fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
-    for value in ["Basic monthly reporting", "models/hf_transformer"] {
+    for value in [
+        "Basic monthly reporting",
+        "Basic planning",
+        "hf_transformer",
+        "models/hf_transformer",
+        "see https://example.invalid/docs",
+    ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
         request.action.params = serde_json::json!({"input": value});

@@ -338,6 +338,17 @@ approval authority. Caller authentication credentials are validated by the
 daemon security boundary and are not treated as workload action data by this
 guard.
 
+Authenticated `POST /devices/profiles` applies tenant/node scope validation first,
+then serializes and recursively screens the complete caller-supplied
+`DeviceRuntimeProfile` through the Gateway-owned bounded value guard before device
+profile validation, audit, or profile-map mutation. This includes capabilities,
+allowed/forbidden action strings, every nested constraint/status string and object
+key, policy-cache strings, trace-buffer strings, zone refs, and caller-supplied
+registration metadata. Rejection is HTTP `400` with fixed null-detail
+`raw_credential_input_denied`; the profile cannot subsequently be read or copied
+into safety evidence. Credential-free profiles preserve registration/read and
+physical execution behavior.
+
 The physical handler additionally screens every caller-controlled string in
 `SafetyContext` (`allowed_zone_refs`, `zone_ref`, and cloud-helper proposal ID)
 and attached operator-intervention evidence after authenticated tenant/run scope

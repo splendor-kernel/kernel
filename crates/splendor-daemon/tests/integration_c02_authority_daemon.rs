@@ -1505,6 +1505,81 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
     let (status, created): (StatusCode, CreateRunResponse) =
         call_json(app.clone(), Method::POST, "/runs", create).await;
     assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("physical causal trace");
+    let profile_canary = "C03_DEVICE_PROFILE_SAFETY_EVIDENCE_CANARY";
+    let mut rejected_profile = device_profile(node_id.clone(), tenant_id.clone());
+    rejected_profile.safety_constraints["allowed_zones"] = json!([
+        "zone_a",
+        format!("https://example.invalid/form?value=Basic+dTpw&label={profile_canary}")
+    ]);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: rejected_profile,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+    assert!(error.details.is_null());
+    assert!(!serde_json::to_string(&error)
+        .expect("profile denial serializes")
+        .contains(profile_canary));
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::GET,
+        &format!("/devices/{node_id}/status"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+
+    let profile_denial_trace_count = traces(app.clone(), &created.run_id).await.records.len();
+    let profile_denial_evaluations = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-profile-denial authority evaluation count");
+    let uri = format!("/devices/{node_id}/actions");
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &uri,
+        physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+    assert_eq!(
+        traces(app.clone(), &created.run_id).await.records.len(),
+        profile_denial_trace_count
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-profile-denial authority evaluation count"),
+        profile_denial_evaluations
+    );
+    let simulator_error = listener
+        .accept()
+        .expect_err("rejected profile must not reach simulator");
+    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+
     let (status, _registered): (StatusCode, Value) = call_json(
         app.clone(),
         Method::POST,
@@ -1517,14 +1592,6 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let causal_trace_id = traces(app.clone(), &created.run_id)
-        .await
-        .records
-        .into_iter()
-        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
-        .map(|event| event.trace_event_id)
-        .next()
-        .expect("physical causal trace");
     let mut raw = physical_submit_request(
         &created,
         tenant_id.clone(),
@@ -1535,13 +1602,11 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
     raw.action_request.action_id = Some(action_id.clone());
     raw.action_request.action.params = json!({
         "zone_ref": "zone_a",
-        "headers": {"Proxy-Authorization": format!("Bearer {CANARY}")}
+        "headers": {"X-Auth-Token": CANARY}
     });
     let evaluations_before = state
         .run_authority_evaluation_count(&created.run_id)
         .expect("authority evaluation count");
-    let uri = format!("/devices/{node_id}/actions");
-
     let (status, denied): (StatusCode, ActionOutcome) =
         call_json(app.clone(), Method::POST, &uri, raw).await;
 
@@ -1579,7 +1644,9 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         "intervention_decision",
         "intervention_expires_at",
     ] {
-        let canary = format!("Bearer C03_PHYSICAL_{}_CANARY", field.to_ascii_uppercase());
+        let canary = format!("C03_PHYSICAL_{}_CANARY", field.to_ascii_uppercase());
+        let credential_value =
+            format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
         let mut request = physical_submit_request(
             &created,
             tenant_id.clone(),
@@ -1589,10 +1656,12 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         let envelope_action_id = ActionId::new();
         request.action_request.action_id = Some(envelope_action_id.clone());
         match field {
-            "allowed_zone_ref" => request.safety_context.allowed_zone_refs = vec![canary.clone()],
-            "zone_ref" => request.safety_context.zone_ref = Some(canary.clone()),
+            "allowed_zone_ref" => {
+                request.safety_context.allowed_zone_refs = vec![credential_value.clone()]
+            }
+            "zone_ref" => request.safety_context.zone_ref = Some(credential_value.clone()),
             "cloud_helper_proposal_id" => {
-                request.safety_context.cloud_helper_proposal_id = Some(canary.clone())
+                request.safety_context.cloud_helper_proposal_id = Some(credential_value.clone())
             }
             intervention_field => {
                 let mut evidence = OperatorInterventionEvidence {
@@ -1604,10 +1673,10 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
                     expires_at: "2030-01-01T00:00:00Z".to_string(),
                 };
                 match intervention_field {
-                    "intervention_id" => evidence.intervention_id = canary.clone(),
-                    "intervention_action_name" => evidence.action_name = canary.clone(),
-                    "intervention_decision" => evidence.decision = canary.clone(),
-                    "intervention_expires_at" => evidence.expires_at = canary.clone(),
+                    "intervention_id" => evidence.intervention_id = credential_value.clone(),
+                    "intervention_action_name" => evidence.action_name = credential_value.clone(),
+                    "intervention_decision" => evidence.decision = credential_value.clone(),
+                    "intervention_expires_at" => evidence.expires_at = credential_value.clone(),
                     _ => unreachable!("closed physical envelope matrix"),
                 }
                 request.operator_intervention_evidence = Some(evidence);
@@ -1651,6 +1720,7 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         .expect("raw physical traces");
     let encoded = serde_json::to_string(&raw_records).expect("raw traces serialize");
     assert!(!encoded.contains(CANARY));
+    assert!(!encoded.contains(profile_canary));
     assert!(!encoded.contains("C03_PHYSICAL_"));
     let raw_events = raw_records
         .iter()

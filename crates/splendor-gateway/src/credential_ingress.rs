@@ -8,7 +8,7 @@ use crate::{ActionOutcome, ActionRequest, ActionStatus};
 use splendor_types::{
     Action, AuthorityObligationReceipt, RevocationStatus, SideEffectClass, VerificationResult,
 };
-use std::fmt;
+use std::{fmt, str};
 use time::OffsetDateTime;
 
 /// Stable, non-reflecting reason returned for every raw credential denial.
@@ -22,6 +22,8 @@ pub const CREDENTIAL_INGRESS_MAX_NODES: usize = 2_048;
 pub const CREDENTIAL_INGRESS_MAX_STRING_BYTES: usize = 16 * 1024;
 /// Maximum cumulative UTF-8 bytes inspected across strings and object keys.
 pub const CREDENTIAL_INGRESS_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
+const CREDENTIAL_INGRESS_MAX_URL_NESTING: usize = 4;
 
 /// Opaque denial from the raw credential ingress guard.
 ///
@@ -93,6 +95,17 @@ pub fn guard_credential_capable_strings<'a>(
     Ok(())
 }
 
+/// Recursively screens every string and object key in one caller-owned JSON
+/// envelope using the same bounds and grammar as action ingress.
+///
+/// The caller remains the schema and mutation owner. This function only returns
+/// clear or the fixed denial and cannot validate or authorize the envelope.
+pub fn guard_credential_capable_value(
+    value: &serde_json::Value,
+) -> Result<(), RawCredentialInputDenied> {
+    CredentialIngressScanner::default().scan_value(value, 0)
+}
+
 /// Screens the untrusted action/routing portion of an action request.
 ///
 /// Typed caller authentication and authority decisions are intentionally not
@@ -148,9 +161,7 @@ impl CredentialIngressScanner {
     fn scan_action(&mut self, action: &Action) -> Result<(), RawCredentialInputDenied> {
         self.charge_node()?;
         self.scan_string(&action.name)?;
-        if executable_numeric_bytes_coordinate(action) {
-            self.scan_executable_numeric_bytes(&action.params)?;
-        }
+        self.scan_top_level_numeric_bytes(&action.params)?;
         self.scan_value(&action.params, 0)?;
 
         if let SideEffectClass::Custom(value) = &action.side_effect_class {
@@ -172,7 +183,7 @@ impl CredentialIngressScanner {
         Ok(())
     }
 
-    fn scan_executable_numeric_bytes(
+    fn scan_top_level_numeric_bytes(
         &mut self,
         params: &serde_json::Value,
     ) -> Result<(), RawCredentialInputDenied> {
@@ -189,8 +200,8 @@ impl CredentialIngressScanner {
             let byte = u8::try_from(value).map_err(|_| RawCredentialInputDenied)?;
             reconstructed.push(byte);
         }
-        let textual = String::from_utf8_lossy(&reconstructed);
-        self.scan_string(textual.as_ref())
+        let textual = unambiguous_utf8_body(&reconstructed).ok_or(RawCredentialInputDenied)?;
+        self.scan_string(textual)
     }
 
     fn scan_authority_obligation_receipts(
@@ -311,6 +322,8 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
             | "authkey"
             | "authorizationkey"
             | "xapikey"
+            | "xauthtoken"
+            | "privatetoken"
             | "apitoken"
             | "authz"
             | "password"
@@ -333,6 +346,7 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
             | "secret"
             | "secretref"
             | "secretrefid"
+            | "secretkeyref"
             | "credential"
             | "credentials"
             | "connectionstring"
@@ -343,6 +357,9 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
             | "awsaccesskeyid"
             | "awssecretaccesskey"
             | "awssessiontoken"
+            | "xamzcredential"
+            | "xamzsecuritytoken"
+            | "xamzsignature"
             | "secretaccesskey"
             | "azureclientsecret"
             | "azureopenaiapikey"
@@ -358,6 +375,8 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
             | "cijobtoken"
             | "dockerauthconfig"
             | "pgpassword"
+            | "vaulttoken"
+            | "consulhttptoken"
             | "postgrespassword"
             | "postgresqlpassword"
             | "pgpassfile"
@@ -388,6 +407,16 @@ fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied
 }
 
 fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
+    credential_content_bounded(value, 0)
+}
+
+fn credential_content_bounded(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    if url_nesting > CREDENTIAL_INGRESS_MAX_URL_NESTING {
+        return Err(RawCredentialInputDenied);
+    }
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(false);
@@ -397,15 +426,7 @@ fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
         if contains_percent_escape(&decoded) {
             return Err(RawCredentialInputDenied);
         }
-        let lowercase = decoded.to_ascii_lowercase();
-        if authorization_form(&decoded)
-            || private_key_block(&lowercase)
-            || provider_key_prefix(&decoded)
-            || secret_reference_form(&lowercase)
-            || credential_assignment(&decoded)?
-            || credential_url(&decoded)?
-            || credential_dsn_without_scheme(&decoded)
-        {
+        if credential_content_bounded(&decoded, url_nesting.saturating_add(1))? {
             return Ok(true);
         }
     }
@@ -416,7 +437,7 @@ fn credential_content(value: &str) -> Result<bool, RawCredentialInputDenied> {
         || provider_key_prefix(trimmed)
         || secret_reference_form(&lowercase)
         || credential_assignment(trimmed)?
-        || credential_url(trimmed)?
+        || credential_url(trimmed, url_nesting)?
         || credential_dsn_without_scheme(trimmed)
     {
         return Ok(true);
@@ -484,23 +505,19 @@ fn is_authorization_closing_delimiter(byte: u8) -> bool {
 }
 
 fn plausible_basic_token(token: &str) -> bool {
-    const MINIMUM_BASIC_TOKEN_BYTES: usize = 8;
+    const MINIMUM_BASIC_TOKEN_BYTES: usize = 4;
     const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
 
     if !(MINIMUM_BASIC_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len())
-        || token.len() % 4 != 0
+        || !token.len().is_multiple_of(4)
     {
         return false;
     }
-    let padding = token.bytes().rev().take_while(|byte| *byte == b'=').count();
-    padding <= 2
-        && token[..token.len() - padding]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    basic_base64_decodes_with_colon(token.as_bytes())
 }
 
 fn plausible_bearer_token(token: &str) -> bool {
-    const MINIMUM_BEARER_TOKEN_BYTES: usize = 8;
+    const MINIMUM_BEARER_TOKEN_BYTES: usize = 1;
     const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
 
     if !(MINIMUM_BEARER_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len()) {
@@ -512,6 +529,55 @@ fn plausible_bearer_token(token: &str) -> bool {
         && token[..token.len() - padding].bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
         })
+}
+
+fn basic_base64_decodes_with_colon(token: &[u8]) -> bool {
+    let mut contains_colon = false;
+    let chunk_count = token.len() / 4;
+    for (index, chunk) in token.chunks_exact(4).enumerate() {
+        let last = index + 1 == chunk_count;
+        let Some(first) = base64_value(chunk[0]) else {
+            return false;
+        };
+        let Some(second) = base64_value(chunk[1]) else {
+            return false;
+        };
+        contains_colon |= (first << 2 | second >> 4) == b':';
+
+        if chunk[2] == b'=' {
+            if !last || chunk[3] != b'=' || second & 0x0f != 0 {
+                return false;
+            }
+            continue;
+        }
+        let Some(third) = base64_value(chunk[2]) else {
+            return false;
+        };
+        contains_colon |= ((second & 0x0f) << 4 | third >> 2) == b':';
+
+        if chunk[3] == b'=' {
+            if !last || third & 0x03 != 0 {
+                return false;
+            }
+            continue;
+        }
+        let Some(fourth) = base64_value(chunk[3]) else {
+            return false;
+        };
+        contains_colon |= ((third & 0x03) << 6 | fourth) == b':';
+    }
+    contains_colon
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 fn private_key_block(lowercase: &str) -> bool {
@@ -562,91 +628,91 @@ const fn provider_token_profile(
 fn provider_key_prefix(value: &str) -> bool {
     let lowercase = value.to_ascii_lowercase();
     [
-        provider_token_profile("gho_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
-        provider_token_profile("ghp_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile("gho_", 36, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile("ghp_", 36, 128, false, ProviderTokenAlphabet::Alphanumeric),
         provider_token_profile(
             "github_pat_",
-            8,
+            40,
             256,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "xoxb-",
-            8,
+            24,
             128,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "xoxp-",
-            8,
+            24,
             128,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "glpat-",
-            8,
+            20,
             128,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
-        provider_token_profile("npm_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile("npm_", 36, 36, false, ProviderTokenAlphabet::Alphanumeric),
         provider_token_profile(
             "pypi-",
-            8,
+            32,
             256,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
-        provider_token_profile("hf_", 8, 128, false, ProviderTokenAlphabet::Alphanumeric),
+        provider_token_profile("hf_", 34, 34, false, ProviderTokenAlphabet::Alphanumeric),
         provider_token_profile(
             "dop_v1_",
-            8,
-            128,
+            64,
+            64,
             false,
             ProviderTokenAlphabet::Alphanumeric,
         ),
         provider_token_profile(
             "sg.",
-            8,
+            32,
             256,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscoreDot,
         ),
         provider_token_profile(
             "sk-",
-            8,
+            20,
             256,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "sk_",
-            8,
+            20,
             256,
             false,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "AIza",
-            16,
-            128,
+            35,
+            35,
             true,
             ProviderTokenAlphabet::AlphanumericDashUnderscore,
         ),
         provider_token_profile(
             "AKIA",
-            12,
-            64,
+            16,
+            16,
             true,
             ProviderTokenAlphabet::UpperAlphanumeric,
         ),
         provider_token_profile(
             "ASIA",
-            12,
-            64,
+            16,
+            16,
             true,
             ProviderTokenAlphabet::UpperAlphanumeric,
         ),
@@ -699,7 +765,18 @@ fn provider_token_start_boundary(byte: u8) -> bool {
     byte.is_ascii_whitespace()
         || matches!(
             byte,
-            b'"' | b'\'' | b'=' | b':' | b',' | b';' | b'(' | b')' | b'[' | b']' | b'{' | b'}'
+            b'"' | b'\''
+                | b'='
+                | b':'
+                | b','
+                | b';'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'/'
         )
 }
 
@@ -747,7 +824,7 @@ fn reference_boundary(byte: u8) -> bool {
     byte.is_ascii_whitespace()
         || matches!(
             byte,
-            b'"' | b'\'' | b',' | b';' | b')' | b']' | b'}' | b'&' | b'#'
+            b'"' | b'\'' | b',' | b';' | b')' | b']' | b'}' | b'&' | b'#' | b'?'
         )
 }
 
@@ -809,16 +886,58 @@ fn plausible_assignment_key(value: &str) -> bool {
         })
 }
 
-fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
+fn credential_url(value: &str, url_nesting: usize) -> Result<bool, RawCredentialInputDenied> {
+    if url_nesting > CREDENTIAL_INGRESS_MAX_URL_NESTING {
+        return Err(RawCredentialInputDenied);
+    }
+
+    let mut cursor = 0;
+    let mut found_absolute = false;
+    while let Some(relative_separator) = value[cursor..].find("://") {
+        let separator = cursor + relative_separator;
+        let mut start = separator;
+        while start > 0 && url_scheme_byte(value.as_bytes()[start - 1]) {
+            start -= 1;
+        }
+        let scheme = &value[start..separator];
+        if !valid_url_scheme(scheme) {
+            return Err(RawCredentialInputDenied);
+        }
+        let end = value[separator + 3..]
+            .char_indices()
+            .find_map(|(index, character)| {
+                url_candidate_terminator(character).then_some(separator + 3 + index)
+            })
+            .unwrap_or(value.len());
+        if credential_url_candidate(&value[start..end], url_nesting)? {
+            return Ok(true);
+        }
+        found_absolute = true;
+        cursor = end.max(separator + 3);
+        if cursor >= value.len() {
+            break;
+        }
+    }
+
+    if !found_absolute && (value.starts_with("//") || value.starts_with('/') && value.contains('?'))
+    {
+        return credential_url_candidate(value, url_nesting);
+    }
+    Ok(false)
+}
+
+fn credential_url_candidate(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
     let scheme_separator = value.find("://");
     let relative_authority = value.starts_with("//");
-    let query_only = value.starts_with('/') && value.contains('?');
+    let query_only = value.starts_with('/') && value.contains('?') && !relative_authority;
     if scheme_separator.is_none() && !relative_authority && !query_only {
         return Ok(false);
     }
     if let Some(separator) = scheme_separator {
-        let scheme = &value[..separator];
-        if !valid_url_scheme(scheme) {
+        if !valid_url_scheme(&value[..separator]) {
             return Err(RawCredentialInputDenied);
         }
     }
@@ -830,6 +949,7 @@ fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
     }
 
     let authority_start = scheme_separator.map_or(2, |index| index + 3);
+    let mut path_start = 0;
     if !query_only {
         let remainder = &value[authority_start..];
         let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
@@ -841,40 +961,98 @@ fn credential_url(value: &str) -> Result<bool, RawCredentialInputDenied> {
         if authority.contains('@') || decoded_authority.contains('@') {
             return Ok(true);
         }
+        path_start = authority_start + authority_end;
     }
 
-    let Some(query_start) = value.find('?') else {
-        return Ok(false);
-    };
-    let query = value[query_start + 1..]
-        .split('#')
-        .next()
-        .unwrap_or_default();
-    for field in query.split(['&', ';']) {
-        if field.is_empty() {
-            continue;
+    let fragment_start = value.find('#');
+    let query_start = value
+        .find('?')
+        .filter(|query| fragment_start.is_none_or(|fragment| query < &fragment));
+    let path_end = query_start.or(fragment_start).unwrap_or(value.len());
+    if path_start < path_end
+        && credential_url_component(
+            &value[path_start..path_end],
+            false,
+            url_nesting.saturating_add(1),
+        )?
+    {
+        return Ok(true);
+    }
+
+    if let Some(query_start) = query_start {
+        let query_end = fragment_start.unwrap_or(value.len());
+        let query = &value[query_start + 1..query_end];
+        for field in query.split(['&', ';']) {
+            if field.is_empty() {
+                continue;
+            }
+            let (raw_key, raw_value) = field.split_once('=').unwrap_or((field, ""));
+            let key = percent_decode_form(raw_key)?;
+            if contains_percent_escape(&key) || normalized_credential_key(&key)? {
+                return if contains_percent_escape(&key) {
+                    Err(RawCredentialInputDenied)
+                } else {
+                    Ok(true)
+                };
+            }
+            if credential_url_component(raw_value, true, url_nesting.saturating_add(1))? {
+                return Ok(true);
+            }
         }
-        let (raw_key, raw_value) = field.split_once('=').unwrap_or((field, ""));
-        let key = percent_decode(raw_key)?;
-        if normalized_credential_key(&key)? {
-            return Ok(true);
-        }
-        let decoded_value = percent_decode(raw_value)?;
-        let lower_value = decoded_value.to_ascii_lowercase();
-        if authorization_form(&decoded_value)
-            || private_key_block(&lower_value)
-            || provider_key_prefix(&decoded_value)
-            || secret_reference_form(&lower_value)
-            || credential_assignment(&decoded_value)?
-        {
+    }
+
+    if let Some(fragment_start) = fragment_start {
+        if credential_url_component(
+            &value[fragment_start + 1..],
+            false,
+            url_nesting.saturating_add(1),
+        )? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn executable_numeric_bytes_coordinate(action: &Action) -> bool {
-    matches!(action.name.as_str(), "http_post" | "write_file")
+fn credential_url_component(
+    value: &str,
+    plus_as_space: bool,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    if url_nesting > CREDENTIAL_INGRESS_MAX_URL_NESTING {
+        return Err(RawCredentialInputDenied);
+    }
+    let decoded = if plus_as_space {
+        percent_decode_form(value)?
+    } else {
+        percent_decode(value)?
+    };
+    if contains_percent_escape(&decoded) {
+        return Err(RawCredentialInputDenied);
+    }
+    credential_content_bounded(&decoded, url_nesting)
+}
+
+fn unambiguous_utf8_body(bytes: &[u8]) -> Option<&str> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return None;
+    }
+    let text = str::from_utf8(bytes).ok()?;
+    if text.chars().any(|character| {
+        character == '\u{feff}'
+            || character.is_control() && !matches!(character, '\t' | '\n' | '\r')
+    }) {
+        return None;
+    }
+    Some(text)
+}
+
+fn url_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+fn url_candidate_terminator(character: char) -> bool {
+    character.is_ascii_whitespace()
+        || matches!(character, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',')
 }
 
 fn url_coordinate_candidate(value: &str) -> bool {
@@ -908,10 +1086,26 @@ fn contains_percent_escape(value: &str) -> bool {
 }
 
 fn percent_decode(value: &str) -> Result<String, RawCredentialInputDenied> {
+    percent_decode_component(value, false)
+}
+
+fn percent_decode_form(value: &str) -> Result<String, RawCredentialInputDenied> {
+    percent_decode_component(value, true)
+}
+
+fn percent_decode_component(
+    value: &str,
+    plus_as_space: bool,
+) -> Result<String, RawCredentialInputDenied> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
+        if plus_as_space && bytes[index] == b'+' {
+            decoded.push(b' ');
+            index += 1;
+            continue;
+        }
         if bytes[index] != b'%' {
             decoded.push(bytes[index]);
             index += 1;
@@ -1008,6 +1202,10 @@ mod tests {
         )
     }
 
+    fn synthetic_provider_token(prefix: &str, suffix_bytes: usize) -> String {
+        format!("{prefix}{}", "A".repeat(suffix_bytes))
+    }
+
     fn request(action: Action) -> ActionRequest {
         ActionRequest {
             action_id: crate::ActionId::new(),
@@ -1040,6 +1238,8 @@ mod tests {
             "authKey",
             "apiToken",
             "X-API-Key",
+            "X-Auth-Token",
+            "Private-Token",
             "authz",
             "client secret",
             "private/key",
@@ -1053,12 +1253,15 @@ mod tests {
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
+            "X-Amz-Signature",
             "AZURE_CLIENT_SECRET",
             "GOOGLE_APPLICATION_CREDENTIALS",
             "GITHUB_TOKEN",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "PGPASSWORD",
+            "VAULT_TOKEN",
+            "CONSUL_HTTP_TOKEN",
             "POSTGRES_PASSWORD",
             "POSTGRESQL_PASSWORD",
             "MYSQL_PWD",
@@ -1077,6 +1280,7 @@ mod tests {
             "DOCKER_AUTH_CONFIG",
             "HF_TOKEN",
             "secret_ref_id",
+            "secretKeyRef",
         ] {
             let params = serde_json::json!({"outer": [{key: "synthetic-value"}]});
             assert_eq!(guard_action(&action(params)), Err(RawCredentialInputDenied));
@@ -1086,13 +1290,13 @@ mod tests {
     #[test]
     fn credential_content_in_object_keys_is_denied() {
         for key in [
-            "Bearer synthetic-value",
-            "vault:team/service",
-            "ghp_syntheticcredential",
-            "authKey = synthetic",
+            "Bearer synthetic-value".to_string(),
+            "vault:team/service".to_string(),
+            synthetic_provider_token("ghp_", 36),
+            "authKey = synthetic".to_string(),
         ] {
             assert_eq!(
-                guard_action(&action(serde_json::json!({key: "ordinary-value"}))),
+                guard_action(&action(serde_json::json!({&key: "ordinary-value"}))),
                 Err(RawCredentialInputDenied),
                 "credential-bearing object key must deny independently: {key}"
             );
@@ -1121,7 +1325,7 @@ mod tests {
         let mut values = vec![
             "Bearer synthetic-value".to_string(),
             "Bearer%20synthetic-value".to_string(),
-            "Basic c3ludGhldGlj".to_string(),
+            "Basic dTpw".to_string(),
             synthetic_private_key_canary(),
             "secret_ref:synthetic-reference".to_string(),
             "https://user:synthetic@example.invalid/path".to_string(),
@@ -1134,22 +1338,25 @@ mod tests {
             r#"{"token":"synthetic"}"#.to_string(),
             "user:synthetic@example.invalid".to_string(),
         ];
-        for (prefix, suffix) in [
-            ("gho_", "syntheticcredential"),
-            ("ghp_", "syntheticcredential"),
-            ("github_pat_", "syntheticcredential"),
-            ("xoxb-", "syntheticcredential"),
-            ("xoxp-", "syntheticcredential"),
-            ("glpat-", "synthetic"),
-            ("npm_", "synthetic"),
-            ("pypi-", "synthetic"),
-            ("hf_", "synthetic"),
-            ("dop_v1_", "synthetic"),
-            ("SG.", "synthetic"),
-            ("sk_", "syntheticcredential"),
-            ("AKIA", "SYNTHETICVALUE"),
+        for (prefix, suffix_bytes) in [
+            ("gho_", 36),
+            ("ghp_", 36),
+            ("github_pat_", 40),
+            ("xoxb-", 24),
+            ("xoxp-", 24),
+            ("glpat-", 20),
+            ("npm_", 36),
+            ("pypi-", 32),
+            ("hf_", 34),
+            ("dop_v1_", 64),
+            ("SG.", 32),
+            ("sk-", 20),
+            ("sk_", 20),
+            ("AIza", 35),
+            ("AKIA", 16),
+            ("ASIA", 16),
         ] {
-            values.push(format!("{prefix}{suffix}"));
+            values.push(synthetic_provider_token(prefix, suffix_bytes));
         }
         for value in values {
             assert_eq!(
@@ -1163,9 +1370,11 @@ mod tests {
     fn authorization_and_provider_grammar_preserves_ordinary_prose_and_resources() {
         for value in [
             "Basic monthly reporting",
+            "Basic planning",
             "Bearer monthly reporting",
+            "hf_transformer",
             "models/hf_transformer",
-            "models/Basic c3ludGhldGlj",
+            "models/Basic dTpw",
             "models/sk-learn",
             "prefixghp_syntheticcredential",
             "Bearer ========",
@@ -1179,12 +1388,11 @@ mod tests {
         }
 
         for value in [
-            "Basic c3ludGhldGlj",
+            "Basic dTpw",
+            "Basic YTpi",
+            "Bearer x",
             "Bearer synthetic-value",
             "prefix Authorization: Bearer synthetic-value",
-            "hf_synthetic",
-            "ghp_syntheticcredential",
-            "ghp_syntheticcredential/metadata",
         ] {
             assert_eq!(
                 guard_action(&action(serde_json::json!({"input": value}))),
@@ -1192,15 +1400,77 @@ mod tests {
                 "complete credential form must deny: {value}"
             );
         }
+
+        for value in [
+            synthetic_provider_token("hf_", 34),
+            synthetic_provider_token("ghp_", 36),
+            format!(
+                "https://example.invalid/models/{}/metadata",
+                synthetic_provider_token("ghp_", 36)
+            ),
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Err(RawCredentialInputDenied),
+                "realistic complete provider token must deny"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_url_path_query_and_nested_values_deny_without_rejecting_url_prose() {
+        let provider_path = format!(
+            "https://example.invalid/models/{}/metadata",
+            synthetic_provider_token("ghp_", 36)
+        );
+        let nested_url =
+            "https://example.invalid/redirect?target=https%3A%2F%2Fuser%3Apass%40nested.invalid";
+        for value in [
+            provider_path.as_str(),
+            "https://example.invalid/%76ault%3Ateam%2Fservice",
+            "vault://team/service?version=1",
+            nested_url,
+            "https://example.invalid/form?value=Bearer+short",
+            "https://example.invalid/sign?X-Amz-Signature=synthetic",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Err(RawCredentialInputDenied),
+                "URL/ref credential vector must deny: {value}"
+            );
+        }
+
+        for value in [
+            "see https://example.invalid/docs",
+            "read https://example.invalid/models/hf_transformer for details",
+            "https://example.invalid/docs?topic=Basic+planning",
+            "https://example.invalid/#section?topic=Basic+planning",
+        ] {
+            assert_eq!(
+                guard_action(&action(serde_json::json!({"input": value}))),
+                Ok(()),
+                "ordinary embedded URL/prose must remain accepted: {value}"
+            );
+        }
+
+        let mut over_nested = "https://leaf.invalid/docs".to_string();
+        for level in 0..=CREDENTIAL_INGRESS_MAX_URL_NESTING {
+            over_nested = format!("https://level-{level}.invalid/?next={over_nested}");
+        }
+        assert_eq!(
+            guard_action(&action(serde_json::json!({"input": over_nested}))),
+            Err(RawCredentialInputDenied),
+            "URL nesting beyond the explicit cap must fail closed"
+        );
     }
 
     #[test]
     fn executable_numeric_byte_coordinates_are_reconstructed_and_fail_closed() {
         let credential_bodies = vec![
             "Bearer synthetic-value".to_string(),
-            "Basic c3ludGhldGlj".to_string(),
+            "Basic dTpw".to_string(),
             synthetic_private_key_canary(),
-            "ghp_syntheticcredential".to_string(),
+            synthetic_provider_token("ghp_", 36),
             "PASSWORD=synthetic".to_string(),
             "https://user:synthetic@example.invalid/path".to_string(),
             "user:synthetic@example.invalid".to_string(),
@@ -1252,12 +1522,69 @@ mod tests {
                 Err(RawCredentialInputDenied),
                 "oversized executable bytes must fail closed"
             );
+
+            for ambiguous in [
+                vec![0xff, b'a'],
+                vec![0xef, 0xbb, 0xbf, b'o', b'k'],
+                vec![b'B', 0, b'e', 0, b'a', 0, b'r', 0, b'e', 0, b'r', 0],
+                vec![0, b'B', 0, b'e', 0, b'a', 0, b'r', 0, b'e', 0, b'r'],
+                vec![b'o', b'k', 0, b'x'],
+            ] {
+                assert_eq!(
+                    guard_action(&action_named(
+                        action_name,
+                        serde_json::json!({"bytes": ambiguous})
+                    )),
+                    Err(RawCredentialInputDenied),
+                    "ambiguous executable encoding must fail closed"
+                );
+            }
         }
 
         assert_eq!(
-            guard_action(&action(serde_json::json!({"bytes": [256]}))),
+            guard_action(&action(serde_json::json!({"vector": [256]}))),
             Ok(()),
-            "numeric byte semantics must not be inferred for unrelated actions"
+            "unrelated numeric arrays retain their non-byte semantics"
+        );
+        assert_eq!(
+            guard_action(&action(serde_json::json!({"vector": [255, 0]}))),
+            Ok(()),
+            "unrelated numeric arrays retain their non-byte semantics"
+        );
+        assert_eq!(
+            guard_action(&action(
+                serde_json::json!({"vector": b"Basic dTpw".to_vec()})
+            )),
+            Ok(()),
+            "unrelated textual numeric arrays retain their non-byte semantics"
+        );
+
+        let mut alternate = request(action_named(
+            "custom_upload",
+            serde_json::json!({"bytes": b"Basic dTpw".to_vec()}),
+        ));
+        alternate.adapter = Some("http".to_string());
+        assert_eq!(
+            guard_action_request(&alternate),
+            Err(RawCredentialInputDenied),
+            "adapter routing cannot evade executable byte screening"
+        );
+    }
+
+    #[test]
+    fn generic_envelope_guard_recursively_screens_strings_and_keys() {
+        assert_eq!(
+            guard_credential_capable_value(&serde_json::json!({
+                "nested": [{"secretKeyRef": "fixture"}]
+            })),
+            Err(RawCredentialInputDenied)
+        );
+        assert_eq!(
+            guard_credential_capable_value(&serde_json::json!({
+                "nested": [{"zone_ref": "zone_a"}],
+                "status": "ready"
+            })),
+            Ok(())
         );
     }
 
