@@ -244,11 +244,11 @@ def is_adapter_package(package: dict[str, Any]) -> bool:
 
 def is_secret_provider_package(package: dict[str, Any]) -> bool:
     manifest_path = package.get("manifest_path") or ""
-    parts = Path(manifest_path).parts
+    manifest_dir = Path(manifest_path).parent
     return (
         package["name"].startswith("splendor-adapter-secrets-")
-        and "adapters" in parts
-        and any(part.startswith("secrets-") for part in parts)
+        and manifest_dir.parent.name == "adapters"
+        and manifest_dir.name.startswith("secrets-")
     )
 
 
@@ -485,6 +485,29 @@ def run_self_test() -> int:
                 f"splendor-adapter-secrets-memory -> {dependency}",
             )
         )
+
+    nested_secret_provider = metadata_fixture(
+        {
+            "splendor-types": [],
+            "splendor-authority": ["splendor-types"],
+            "splendor-adapter-secrets-memory": [
+                "splendor-types",
+                "splendor-authority",
+            ],
+        }
+    )
+    next(
+        package
+        for package in nested_secret_provider["packages"]
+        if package["name"] == "splendor-adapter-secrets-memory"
+    )["manifest_path"] = "/adapters/experimental/secrets-memory/Cargo.toml"
+    cases.append(
+        (
+            "nested_secret_provider_does_not_receive_exception",
+            nested_secret_provider,
+            "splendor-adapter-secrets-memory -> splendor-authority",
+        )
+    )
 
     failures = 0
     for name, metadata, expected in cases:
