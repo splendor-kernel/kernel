@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fixtures"))
-from acceptance_provider_evidence import read_provider_evidence  # noqa: E402
+from acceptance_provider_evidence import (  # noqa: E402
+    provider_effect_state,
+    read_provider_evidence,
+)
 from resident_http import request_json_no_redirect  # noqa: E402
 
 FLEET_ID = "00000000-0000-4000-8000-000000000104"
@@ -135,6 +138,11 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
 
 def provider_counters(base_url: str) -> dict[str, Any]:
     return read_provider_evidence(base_url)
+
+
+def replay_provider_effect_state(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Compare provider effects without per-read signed-envelope freshness."""
+    return provider_effect_state(evidence)
 
 
 def contains_retired_adapter_authority_schema(value: object) -> bool:
@@ -1140,8 +1148,8 @@ def main() -> int:
     missing_events = sorted(event for event in REQUIRED_TRACE_EVENTS if not event_ids.get(event))
     failures.extend(f"missing_required_trace_event:{event}" for event in missing_events)
 
-    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "provider_calls": provider_before_replay, "manager_audit_events": len(replay_audit_before["body"]), "message_delivery_status": message_before["body"].get("delivery_status"), "message_duplicate": message_before["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": {"adapter": "GET /runs/{run_id}", "provider": "GET /evidence", "message": "POST /messages/{message_id}/read", "audit": "POST /fleet/audit/read", "artifact": "not_used_by_s9"}}
-    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "provider_calls": provider_after_replay, "manager_audit_events": len(replay_audit_after["body"]), "message_delivery_status": message_after["body"].get("delivery_status"), "message_duplicate": message_after["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": before_counts["counter_sources"]}
+    before_counts = {"adapter_executions": replay_before["body"].get("adapter_executions"), "provider_calls": replay_provider_effect_state(provider_before_replay), "manager_audit_events": len(replay_audit_before["body"]), "message_delivery_status": message_before["body"].get("delivery_status"), "message_duplicate": message_before["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": {"adapter": "GET /runs/{run_id}", "provider": "GET /evidence projected through provider_effect_state", "message": "POST /messages/{message_id}/read", "audit": "POST /fleet/audit/read", "artifact": "not_used_by_s9"}}
+    after_counts = {"adapter_executions": replay_after["body"].get("adapter_executions"), "provider_calls": replay_provider_effect_state(provider_after_replay), "manager_audit_events": len(replay_audit_after["body"]), "message_delivery_status": message_after["body"].get("delivery_status"), "message_duplicate": message_after["body"].get("duplicate"), "artifact_external_publishes": 0, "counter_sources": before_counts["counter_sources"]}
     replay_report = {
         **replay["body"],
         "mode": "inspect_only",

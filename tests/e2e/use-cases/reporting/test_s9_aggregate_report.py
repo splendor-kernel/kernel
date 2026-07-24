@@ -338,5 +338,41 @@ class S9ScenarioFailurePredicateTests(unittest.TestCase):
                 )
 
 
+class S9ReplayProviderStateTests(unittest.TestCase):
+    def test_ignores_read_freshness_and_detects_effect_changes(self) -> None:
+        before = {
+            "by_action": {"s9.idempotent_read": 1},
+            "actions": [{"action_id": ACTION_ID, "result": "executed"}],
+            "snapshot_at_unix_ms": 1,
+            "expires_at_unix_ms": 2,
+            "snapshot_sequence": 7,
+            "request_binding": {"nonce": "before"},
+            "_evidence_verification": {"envelope": {"signature_b64": "before"}},
+        }
+        after = copy.deepcopy(before)
+        after.update(
+            {
+                "snapshot_at_unix_ms": 3,
+                "expires_at_unix_ms": 4,
+                "snapshot_sequence": 8,
+                "request_binding": {"nonce": "after"},
+                "_evidence_verification": {
+                    "envelope": {"signature_b64": "after"}
+                },
+            }
+        )
+
+        self.assertEqual(
+            S9_SCENARIO.replay_provider_effect_state(before),
+            S9_SCENARIO.replay_provider_effect_state(after),
+        )
+
+        after["by_action"]["s9.idempotent_read"] = 2
+        self.assertNotEqual(
+            S9_SCENARIO.replay_provider_effect_state(before),
+            S9_SCENARIO.replay_provider_effect_state(after),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2926,8 +2926,8 @@ def validate_s6_physical_approval_binding(
             != closed.get("unknown_authority_field", {}).get("body")
             or reserved_node.get("status") != 200
             or reserved_node.get("body", {}).get("status") != "Failed"
-            or "acceptance_operation_reserved_field"
-            not in str(reserved_node.get("body", {}).get("error", ""))
+            or reserved_node.get("body", {}).get("error") != "adapter failed"
+            or "acceptance_operation_reserved_field" in str(reserved_node.get("body", {}))
             or closed.get("simulator_unchanged") is not True
         ):
             failures.append("s6_physical_action_transport_schema_not_closed")

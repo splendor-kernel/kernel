@@ -160,7 +160,10 @@
   exact scenario expectations, the exact reader scope, one signing key/provider
   epoch, unique nonces, and increasing in-report sequences. Live verifier replay
   state is bounded and process-local, not durable. One canonical output projection
-  verifies S5/S6/S7/S10 and aggregate evidence. The fixture semantic retry now
+  verifies S5/S6/S7/S10 and aggregate evidence. S6 negative evidence now requires
+  the bounded gateway error and rejects private provider failure text; S9 replay
+  counters compare the stable provider effect-state projection while retaining
+  complete signed evidence reads as audit artifacts. The fixture semantic retry now
   declares a required `retry_attempt` transition, four optional companion-varying
   fields, and a separate external idempotency identity.
   Signer execution pins material identity and bounds process lifetime/output.

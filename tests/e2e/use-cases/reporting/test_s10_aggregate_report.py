@@ -1716,7 +1716,7 @@ def valid_s6_physical_approval_fixture() -> tuple[dict, dict, list[dict]]:
                 "status": 200,
                 "body": {
                     "status": "Failed",
-                    "error": "acceptance_operation_reserved_field",
+                    "error": "adapter failed",
                 },
             },
             "simulator_unchanged": True,
@@ -1855,6 +1855,16 @@ class S6PhysicalApprovalBindingReportTests(unittest.TestCase):
         artifact, manager_auth, rows = valid_s6_physical_approval_fixture()
         self.assertEqual(
             [], ar.validate_s6_physical_approval_binding(artifact, manager_auth, rows)
+        )
+
+    def test_rejects_provider_private_reserved_field_error(self) -> None:
+        artifact, manager_auth, rows = valid_s6_physical_approval_fixture()
+        artifact["closed_schema"]["reserved_node_action_param"]["body"]["error"] = (
+            "acceptance_operation_reserved_field"
+        )
+        self.assertIn(
+            "s6_physical_action_transport_schema_not_closed",
+            ar.validate_s6_physical_approval_binding(artifact, manager_auth, rows),
         )
 
     def test_rejects_wrong_node_and_manager_order_mutations(self) -> None:

@@ -4,7 +4,7 @@
 
 **Scope:** `FR-0.2-01`, `V2-FND-0`, bounded `FND-002` provider-ownership correction
 
-**Status:** Architecture direction accepted; reviewable but not merge-ready because two deterministic acceptance-harness defects remain
+**Status:** Bounded architecture correction accepted; merge readiness remains subject to full validation and required CI
 
 ## Verdict
 
@@ -14,12 +14,11 @@ production daemon explicitly adapterless, keeps adapter execution behind the
 gateway, and adds a fail-closed lower-bound guard for the current Rust package
 graph.
 
-It is suitable for a draft review but is not merge-ready. Final code review
-found two deterministic contradictions in the migrated acceptance harness: S6
-expects provider-private error text that the gateway intentionally redacts, and
-S9 compares changing signed evidence envelopes rather than stable provider
-effect state around replay. These are introduced defects, not environment-only
-limitations.
+Final code review found and the follow-up correction resolved two deterministic
+contradictions in the migrated acceptance harness. S6 now verifies the bounded
+gateway error instead of provider-private text. S9 now compares the stable
+provider effect-state projection around replay while retaining the complete
+signed evidence envelopes as audit artifacts.
 
 The repository is **not yet fully organized around one semantic owner per
 responsibility**. Important pre-existing ownership and client-boundary defects
@@ -142,7 +141,7 @@ require their own checks; this script does not pretend to prove them.
 | Medium packaging | `splendor-bindings` imports `splendor.runtime` but does not declare the `splendor` distribution as a runtime dependency. | Add the packaging edge and clean-wheel installation evidence separately; the production image is not currently selecting this optional facade. |
 | Blocked design | Durable caller-attributed denial before run creation lacks accepted Event/Audit owner and durability contracts. | RFC 0025 remains Draft/blocked and grants no implementation authority. It is not part of this change. |
 
-## Merge-blocking acceptance defects
+## Corrected acceptance defects
 
 ### S6 requires text that the gateway deliberately removes
 
@@ -152,24 +151,20 @@ This is intentional: provider text must not become trusted public outcome
 evidence.
 
 `tests/e2e/use-cases/scenarios/uc_e2e_s6_physical_edge/run.py` and the S6 checks
-in `tests/e2e/use-cases/reporting/aggregate_report.py` nevertheless require the
-public error to contain the private fixture reason
-`acceptance_operation_reserved_field`. That assertion cannot pass through the
-real gateway path. The corresponding reporting unit fixture supplies the
-unredacted value and therefore does not expose the production mismatch.
+in `tests/e2e/use-cases/reporting/aggregate_report.py` now require exactly that
+bounded public error and reject retained provider-private reason text. The
+reporting fixture follows the real gateway contract, and a regression mutation
+test proves that an unredacted private reason fails validation.
 
 ### S9 compares evidence reads instead of effect state
 
-`tests/e2e/use-cases/scenarios/uc_e2e_s9_failure_injection/run.py` stores complete
-provider-evidence responses in its before/after replay counters. Every evidence
-read intentionally receives a fresh request nonce and a new signed snapshot
-sequence, so the complete envelopes differ even when no provider effect changed.
-The scenario consequently reports `replay_executed_side_effects` for a safe
-inspect-only replay.
-
-Other migrated scenarios already compare the stable provider effect-state
-projection. S9 must use that same semantic comparison before this change is
-merge-ready.
+Every provider-evidence read intentionally receives a fresh request nonce and a
+new signed snapshot sequence. S9 now applies the same stable provider
+effect-state projection used by the other migrated scenarios when constructing
+its replay before/after counters. The complete signed reads remain in
+`action-provider-evidence.json`; only the no-side-effect comparison excludes
+per-read freshness fields. Regression coverage proves that freshness changes
+compare equal while an effect-counter change does not.
 
 ## Validation boundary
 
@@ -187,10 +182,9 @@ container isolation, and `G00` are therefore `not_exercised`, not passed. Native
 S2 evidence is `functional_only` and must not be used as role-isolation proof.
 Inherited workspace dependency advisories also remain a disclosed limitation.
 
-Static final review established that S6 and S9 would fail for the deterministic
-reasons above even in an otherwise healthy Docker environment. Docker
-unavailability explains why those failures were not executed; it does not make
-them non-blocking.
+The focused S6/S9 reporting regression suite passes after the corrections. Full
+container-backed scenario claims remain limited to the validation actually run
+and the required CI result.
 
 ## PR claim boundary
 
@@ -203,9 +197,9 @@ This correction **may claim**:
 - conservative gateway handling of provider failures; and
 - lower-bound enforcement of the current Cargo package graph.
 
-These are architecture-diff claims only. Until the S6/S9 contradictions are
-corrected, the PR must remain draft/blocked and must not claim passing end-to-end
-acceptance.
+These remain bounded architecture claims. The S6/S9 contradictions are
+corrected, but unavailable checks must still be reported as `not_exercised`
+rather than inferred from focused tests.
 
 It **must not claim**:
 
@@ -223,8 +217,8 @@ The changed provider path now has a defensible owner and dependency direction:
 production composition is adapterless, concrete provider behavior is outside
 the daemon, verification remains in the gateway, and acceptance evidence is
 isolated from public runtime claims. That slice is materially better organized
-and can be reviewed independently, but the current branch must not merge while
-its S6 and S9 acceptance assertions contradict the implemented boundaries.
+and can be reviewed independently. Its acceptance assertions now match the
+implemented gateway redaction and replay-effect boundaries.
 
 The repository as a whole still has significant ownership debt. The next
 highest-value corrections are the public Python bearer boundary and the split
