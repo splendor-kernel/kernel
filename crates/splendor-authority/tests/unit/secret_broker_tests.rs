@@ -1411,6 +1411,268 @@ fn idempotency_conflicts_are_hidden_and_unauthorized_probes_do_not_poison_comman
 }
 
 #[test]
+fn stable_command_and_request_partitions_exclude_valid_placement_coordinates() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let request = initial_request(410, 3);
+    let grant = applied(fixture.broker.issue_lease(
+        request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    let baseline_context = active_context(&active, &binding, &current);
+    let baseline_command_key = trusted_command_key(
+        SecretCommandKind::Issue,
+        request.secret_lease_request_id().to_string(),
+        &baseline_context,
+    );
+    let baseline_request_key = scoped_lease_request_id(&request, &baseline_context);
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+    let (leases, handles, commands) = {
+        let state = fixture.broker.lock_state().unwrap();
+        (
+            state.leases.len(),
+            state.handles.len(),
+            state.commands.len(),
+        )
+    };
+
+    for change in [
+        BindingChange::Node,
+        BindingChange::Instance,
+        BindingChange::Audience,
+    ] {
+        let changed_binding = use_binding(Some(change));
+        let changed_declaration = declaration(&changed_binding);
+        let changed_authority = authority_fixture_for(&changed_binding, AuthorityState::Active);
+        let changed_context =
+            active_context(&changed_authority, &changed_binding, &changed_declaration);
+        let changed_request = lease_request(
+            410,
+            changed_binding.clone(),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            3,
+        );
+        assert_eq!(
+            trusted_command_key(
+                SecretCommandKind::Issue,
+                changed_request.secret_lease_request_id().to_string(),
+                &changed_context,
+            ),
+            baseline_command_key
+        );
+        assert_eq!(
+            scoped_lease_request_id(&changed_request, &changed_context),
+            baseline_request_key
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .issue_lease(changed_request, &changed_context)
+                .unwrap_err(),
+            SecretBrokerError::SecretNotAvailable,
+            "same nominal command under {change:?} placement must conflict"
+        );
+    }
+
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+    let state = fixture.broker.lock_state().unwrap();
+    assert_eq!(state.leases.len(), leases);
+    assert_eq!(state.handles.len(), handles);
+    assert_eq!(state.commands.len(), commands);
+    assert!(state
+        .leases
+        .contains_key(grant.snapshot().secret_lease_id()));
+    assert_eq!(fixture.provider.calls(), 0);
+}
+
+#[test]
+fn requested_at_is_nonsemantic_for_historical_issue_success_and_denial() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let original = initial_request(420, 3);
+    let grant = applied(
+        fixture
+            .broker
+            .issue_lease(original, &active_context(&active, &binding, &current)),
+    );
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+    let receipt = historical(fixture.broker.issue_lease(
+        lease_request(
+            420,
+            binding.clone(),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T11:59:59.000000Z",
+            3,
+        ),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        receipt.evidence().secret_lease_id(),
+        Some(grant.snapshot().secret_lease_id())
+    );
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+
+    let denied = custom_request(
+        421,
+        binding.clone(),
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T12:00:00.000000Z",
+        1,
+        vec![SecretDeliveryMethod::EnvironmentVariable],
+    );
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(denied, &active_context(&active, &binding, &current))
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    let denied_ids = fixture.ids.count();
+    let denied_events = all_events(&fixture.broker).len();
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                custom_request(
+                    421,
+                    binding.clone(),
+                    "2026-07-24T12:00:00.000000Z",
+                    "2026-07-24T12:05:00.000000Z",
+                    "2026-07-24T11:59:59.000000Z",
+                    1,
+                    vec![SecretDeliveryMethod::EnvironmentVariable],
+                ),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::SecretNotAvailable
+    );
+    assert_eq!(fixture.ids.count(), denied_ids);
+    assert_eq!(all_events(&fixture.broker).len(), denied_events);
+}
+
+#[test]
+fn renewal_semantics_bind_handle_and_request_but_exclude_requested_at() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let old = applied(fixture.broker.issue_lease(
+        initial_request(430, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    fixture
+        .clock
+        .set(parsed_time("2026-07-24T12:01:00.000000Z"));
+    let command: SecretRenewalCommandId = secret_id(431);
+    let renewed = applied(fixture.broker.renew_lease(
+        command.clone(),
+        old.handle(),
+        lease_request(
+            432,
+            binding.clone(),
+            "2026-07-24T12:00:30.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:30.000000Z",
+            3,
+        ),
+        &active_context(&active, &binding, &current),
+    ));
+    let ids = fixture.ids.count();
+    let events = all_events(&fixture.broker).len();
+    let receipt = historical(fixture.broker.renew_lease(
+        command,
+        old.handle(),
+        lease_request(
+            432,
+            binding.clone(),
+            "2026-07-24T12:00:30.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            3,
+        ),
+        &active_context(&active, &binding, &current),
+    ));
+    assert_eq!(
+        receipt.evidence().secret_lease_id(),
+        Some(renewed.snapshot().secret_lease_id())
+    );
+    assert_eq!(fixture.ids.count(), ids);
+    assert_eq!(all_events(&fixture.broker).len(), events);
+}
+
+#[test]
+fn current_authority_is_type_gated_before_ref_and_driver_visibility() {
+    let fixture = broker_fixture(default_policy(2, true));
+    let existing_binding = use_binding(None);
+    let absent_binding = use_binding(Some(BindingChange::Ref));
+
+    for (index, binding) in [existing_binding, absent_binding].into_iter().enumerate() {
+        let current = declaration(&binding);
+        let unavailable = authority_fixture_for(&binding, AuthorityState::Missing);
+        let context = active_context(&unavailable, &binding, &current);
+        assert!(validated_current_secret_broker_authority(
+            &context,
+            &binding,
+            parsed_time("2026-07-24T12:00:00.000000Z"),
+            parsed_time("2026-07-24T12:00:00.000001Z"),
+        )
+        .is_none());
+        assert_eq!(
+            fixture
+                .broker
+                .issue_lease(
+                    lease_request(
+                        440 + index as u128,
+                        binding.clone(),
+                        "2026-07-24T12:00:00.000000Z",
+                        "2026-07-24T12:05:00.000000Z",
+                        "2026-07-24T12:00:00.000000Z",
+                        1,
+                    ),
+                    &context,
+                )
+                .unwrap_err(),
+            SecretBrokerError::SecretNotAvailable
+        );
+    }
+    assert!(all_events(&fixture.broker).is_empty());
+    assert_eq!(fixture.ids.count(), 0);
+
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let context = active_context(&active, &binding, &current);
+    let current_authority = validated_current_secret_broker_authority(
+        &context,
+        &binding,
+        parsed_time("2026-07-24T12:00:00.000000Z"),
+        parsed_time("2026-07-24T12:00:00.000001Z"),
+    )
+    .expect("current Authority must produce the prerequisite proof");
+    assert!(validated_secret_ref_and_driver_permit(
+        &SecretBrokerState::default(),
+        &context,
+        &binding,
+        parsed_time("2026-07-24T12:00:00.000000Z"),
+        &current_authority,
+    )
+    .is_none());
+}
+
+#[test]
 fn successful_issue_duplicate_is_historical_only_after_current_visibility() {
     let fixture = broker_fixture(default_policy(3, true));
     let binding = use_binding(None);
@@ -3970,6 +4232,286 @@ fn short_authority_window_cannot_authorize_full_lease_lifecycle_window() {
 }
 
 #[test]
+fn explicit_lease_request_projection_excludes_only_requested_at() {
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let context = active_context(&active, &binding, &current);
+    let command_id =
+        ProcessLocalSecretBrokerCommandId::LeaseRequest(secret_id::<SecretLeaseRequestId>(2_100));
+    let baseline = initial_request(2_100, 3);
+    let baseline_digest = issue_command_digest(&command_id, &baseline, &context).unwrap();
+    let different_requested_at = lease_request(
+        2_100,
+        binding.clone(),
+        "2026-07-24T12:00:00.000000Z",
+        "2026-07-24T12:05:00.000000Z",
+        "2026-07-24T11:59:59.000000Z",
+        3,
+    );
+    assert_eq!(
+        issue_command_digest(&command_id, &different_requested_at, &context).unwrap(),
+        baseline_digest
+    );
+
+    let expanded_requirement = SecretUseRequirement::try_new(
+        binding.secret_ref_id().clone(),
+        binding.credential_slot_id(),
+        binding.intent(),
+        binding.purpose(),
+        vec![SecretDeliveryMethod::InheritedFd],
+        301,
+        3,
+        true,
+    )
+    .unwrap();
+    let variants = [
+        initial_request(2_101, 3),
+        initial_request(2_100, 2),
+        custom_request(
+            2_100,
+            binding.clone(),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            3,
+            vec![
+                SecretDeliveryMethod::TmpfsFile,
+                SecretDeliveryMethod::InheritedFd,
+            ],
+        ),
+        SecretLeaseRequest::try_new(
+            secret_id(2_100),
+            binding.clone(),
+            expanded_requirement,
+            canonical("2026-07-24T12:00:00.000000Z"),
+            canonical("2026-07-24T12:05:00.000000Z"),
+            canonical("2026-07-24T12:00:00.000000Z"),
+        )
+        .unwrap(),
+        SecretLeaseRequest::try_new(
+            secret_id(2_100),
+            binding.clone(),
+            baseline.bound_use_requirement().clone(),
+            canonical("2026-07-24T12:00:01.000000Z"),
+            canonical("2026-07-24T12:05:00.000000Z"),
+            canonical("2026-07-24T12:00:00.000000Z"),
+        )
+        .unwrap(),
+        SecretLeaseRequest::try_new(
+            secret_id(2_100),
+            binding.clone(),
+            baseline.bound_use_requirement().clone(),
+            canonical("2026-07-24T12:00:00.000000Z"),
+            canonical("2026-07-24T12:04:59.000000Z"),
+            canonical("2026-07-24T12:00:00.000000Z"),
+        )
+        .unwrap(),
+    ];
+    for variant in variants {
+        assert_ne!(
+            issue_command_digest(&command_id, &variant, &context).unwrap(),
+            baseline_digest
+        );
+    }
+    for change in [
+        BindingChange::Tenant,
+        BindingChange::Principal,
+        BindingChange::Workload,
+        BindingChange::Operation,
+        BindingChange::DeclarationRevision,
+        BindingChange::Slot,
+        BindingChange::DestinationSchema,
+        BindingChange::DestinationDigest,
+        BindingChange::Exposure,
+        BindingChange::TrustedSend,
+        BindingChange::Node,
+        BindingChange::Instance,
+        BindingChange::Audience,
+        BindingChange::Ref,
+        BindingChange::RefRevision,
+        BindingChange::Provider,
+        BindingChange::ProviderVersion,
+        BindingChange::Intent,
+        BindingChange::Purpose,
+    ] {
+        let variant = lease_request(
+            2_100,
+            use_binding(Some(change)),
+            "2026-07-24T12:00:00.000000Z",
+            "2026-07-24T12:05:00.000000Z",
+            "2026-07-24T12:00:00.000000Z",
+            3,
+        );
+        assert_ne!(
+            issue_command_digest(&command_id, &variant, &context).unwrap(),
+            baseline_digest,
+            "binding axis {change:?} must remain semantic"
+        );
+    }
+    assert_ne!(
+        issue_command_digest(
+            &ProcessLocalSecretBrokerCommandId::LeaseRequest(secret_id(2_102)),
+            &baseline,
+            &context,
+        )
+        .unwrap(),
+        baseline_digest
+    );
+
+    let other_principal = principal(2_103);
+    let other_scope = SecretBrokerAuthorityContext::new(
+        &active.cache,
+        active.revocations.as_ref(),
+        &active.policy,
+        binding.tenant_id(),
+        &other_principal,
+        binding.workload_id(),
+        binding.node_id(),
+        binding.instance_id(),
+        binding.audience_id(),
+        binding.intent(),
+        binding.purpose(),
+        &current,
+    );
+    assert_ne!(
+        issue_command_digest(&command_id, &baseline, &other_scope).unwrap(),
+        baseline_digest
+    );
+}
+
+#[test]
+fn historical_receipts_validate_every_pointer_field_and_event_binding() {
+    let fixture = broker_fixture(default_policy(3, true));
+    let binding = use_binding(None);
+    let current = declaration(&binding);
+    let active = authority_fixture(AuthorityState::Active);
+    let first_request = initial_request(2_200, 3);
+    applied(fixture.broker.issue_lease(
+        first_request.clone(),
+        &active_context(&active, &binding, &current),
+    ));
+    applied(fixture.broker.issue_lease(
+        initial_request(2_201, 3),
+        &active_context(&active, &binding, &current),
+    ));
+    let key = trusted_command_key(
+        SecretCommandKind::Issue,
+        first_request.secret_lease_request_id().to_string(),
+        &active_context(&active, &binding, &current),
+    );
+    let (original_record, original_event, unrelated_event) = {
+        let state = fixture.broker.lock_state().unwrap();
+        let record = match &state.commands.get(&key).unwrap().terminal {
+            SecretCommandTerminal::Issue(Ok(record)) => record.clone(),
+            _ => panic!("expected successful issue history"),
+        };
+        (record, state.events[0].clone(), state.events[1].clone())
+    };
+
+    for field in 0..6 {
+        let mut tampered = original_record.clone();
+        match field {
+            0 => tampered.event_index = 1,
+            1 => tampered.event_id = secret_id(2_202),
+            2 => {
+                tampered.expected_command_id =
+                    ProcessLocalSecretBrokerCommandId::LeaseRequest(secret_id(2_203));
+            }
+            3 => tampered.expected_kind = SecretAccessEvidenceKind::LeaseDenied,
+            4 => tampered.expected_outcome = SecretAccessEvidenceOutcome::Denied,
+            5 => tampered.event_integrity_digest = ContentHash::blake3(b"tampered-history"),
+            _ => unreachable!(),
+        }
+        let mut state = fixture.broker.lock_state().unwrap();
+        match &mut state.commands.get_mut(&key).unwrap().terminal {
+            SecretCommandTerminal::Issue(Ok(record)) => *record = tampered,
+            _ => panic!("expected successful issue history"),
+        }
+        drop(state);
+        assert_eq!(
+            fixture
+                .broker
+                .issue_lease(
+                    first_request.clone(),
+                    &active_context(&active, &binding, &current),
+                )
+                .unwrap_err(),
+            SecretBrokerError::StateUnavailable,
+            "tampered historical pointer field {field} must fail closed"
+        );
+    }
+
+    let mut unrelated_pointer = original_record.clone();
+    unrelated_pointer.event_index = 1;
+    unrelated_pointer.event_id = unrelated_event.secret_access_event_id().clone();
+    {
+        let mut state = fixture.broker.lock_state().unwrap();
+        match &mut state.commands.get_mut(&key).unwrap().terminal {
+            SecretCommandTerminal::Issue(Ok(record)) => *record = unrelated_pointer,
+            _ => panic!("expected successful issue history"),
+        }
+    }
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                first_request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::StateUnavailable
+    );
+
+    let swapped_binding = use_binding(Some(BindingChange::Node));
+    let swapped_event = SecretAccessEvidence::try_new(
+        original_event.secret_access_event_id().clone(),
+        original_event.command_id().clone(),
+        original_event.kind(),
+        original_event.outcome(),
+        swapped_binding,
+        original_event.secret_lease_id().cloned(),
+        original_event.delivery_handle_id().cloned(),
+        original_event.secret_use_claim_id().cloned(),
+        original_event.uses_claimed(),
+        original_event.max_uses(),
+        original_event.revocation_generation(),
+        original_event.denial_code(),
+        original_event.occurred_at().clone(),
+    )
+    .unwrap();
+    {
+        let mut state = fixture.broker.lock_state().unwrap();
+        state.events[0] = swapped_event;
+        match &mut state.commands.get_mut(&key).unwrap().terminal {
+            SecretCommandTerminal::Issue(Ok(record)) => *record = original_record.clone(),
+            _ => panic!("expected successful issue history"),
+        }
+    }
+    assert_eq!(
+        fixture
+            .broker
+            .issue_lease(
+                first_request.clone(),
+                &active_context(&active, &binding, &current),
+            )
+            .unwrap_err(),
+        SecretBrokerError::StateUnavailable
+    );
+
+    {
+        let mut state = fixture.broker.lock_state().unwrap();
+        state.events[0] = original_event;
+    }
+    assert!(matches!(
+        fixture
+            .broker
+            .issue_lease(first_request, &active_context(&active, &binding, &current),),
+        Ok(SecretBrokerCommandOutcome::Historical(_))
+    ));
+}
+
+#[test]
 fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() {
     let fixture = broker_fixture(default_policy(2, true));
     assert_eq!(
@@ -4084,6 +4626,12 @@ fn private_helpers_fail_closed_for_invalid_pages_time_ids_and_terminal_shapes() 
             terminal: SecretCommandTerminal::Issue(Ok(HistoricalSecretBrokerRecord {
                 event_index: state.events.len(),
                 event_id: secret_id(2_001),
+                expected_command_id: ProcessLocalSecretBrokerCommandId::LeaseRequest(secret_id(
+                    2_002,
+                )),
+                expected_kind: SecretAccessEvidenceKind::LeaseIssued,
+                expected_outcome: SecretAccessEvidenceOutcome::Succeeded,
+                event_integrity_digest: ContentHash::blake3(b"missing-event"),
             })),
         },
     );
@@ -4312,9 +4860,10 @@ fn direct_validation_covers_consumed_request_time_and_current_declaration_denial
     let request = initial_request(1_900, 2);
     {
         let mut state = fixture.broker.lock_state().unwrap();
-        state
-            .used_request_ids
-            .insert(scoped_lease_request_id(&request));
+        state.used_request_ids.insert(scoped_lease_request_id(
+            &request,
+            &active_context(&active, &binding, &current),
+        ));
         assert_eq!(
             fixture
                 .broker

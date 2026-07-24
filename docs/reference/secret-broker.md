@@ -96,20 +96,29 @@ The owner supports:
   exposed before a trusted visibility policy exists.
 
 Issue, internal claim, renewal, and revocation command keys are derived from the
-crate-owned trusted context and scoped by command kind plus
-tenant/principal/workload/node/instance/audience. Caller request bytes cannot
-select a ledger partition. Current trusted scope, ref/Driver visibility, and
-Authority/revocation checks occur before command or handle disclosure. The
-broker stores a semantic request digest and first terminal success or denial,
-but a successful terminal record contains only a small pointer to already
-committed historical non-authorizing evidence: it stores no handle, snapshot,
-or claim capability nonce. The
-first success alone returns a newly minted live opaque capability. An exact
-currently-visible retry returns the historical receipt and creates no ID,
-evidence, lease/use counter, or result timestamp. It still samples trusted time
-for current Authority evaluation, and that valid observation obeys the
-monotonic high-water fence. Changed reuse, hidden hit/miss, unauthorized scope,
-and conflict all return the same `secret_not_available` outward code.
+crate-owned trusted context and scoped only by command kind, nominal command ID,
+and trusted tenant/principal/workload. Lease-request reuse uses the same trusted
+scope. Node, instance, audience, and every other placement/binding field remain
+in semantic equality, so the same nominal ID under another valid placement
+conflicts instead of selecting a new partition. Caller request bytes cannot
+select a ledger partition. Current authenticated Authority/capability/revocation
+evaluation occurs before SecretRef/current-Driver, command, or handle lookup.
+
+The broker stores an explicit
+`splendor.secret.semantic_idempotency_projection.v1` digest containing command
+kind/ID, trusted ledger scope, and the complete lease request except
+`requested_at`; renewal additionally binds the old opaque handle metadata. A
+successful terminal record contains only a small integrity-bound pointer to
+already committed historical non-authorizing evidence. The pointer binds the
+expected command, event kind/outcome, and complete safe event integrity without
+retaining a handle, snapshot, claim, or capability nonce. The first success
+alone returns a newly minted live opaque capability. An exact currently-visible
+retry, including one with only a different `requested_at`, returns the original
+historical receipt or denial and creates no ID, evidence, lease/use counter, or
+result timestamp. It still samples trusted time for current Authority
+evaluation, and that valid observation obeys the monotonic high-water fence.
+Changed reuse, hidden hit/miss, unauthorized scope, and conflict all return the
+same `secret_not_available` outward code.
 
 Default finite ceilings cover refs, providers, active and retained leases,
 command records, local evidence, generated identities, and replay page size.
@@ -137,6 +146,9 @@ non-cloneable/non-serializable, redacted,
 `!Send`, `!Sync`, and backed by `zeroize::Zeroizing<Vec<u8>>`. The result exposes
 only material length and safe audit evidence; no byte or `into_parts` escape is
 available. Zeroization reduces exposure but is not a perfect-erasure claim.
+Provider audit evidence, provider health evidence, and the memory provider use
+fixed redacted `Debug` output with no tenant, ref, provider, version, digest, or
+timestamp coordinates.
 All reduced provider request/result/evidence/error symbols and schema constants
 are exported under `ProcessLocal*` / `PROCESS_LOCAL_*` names.
 

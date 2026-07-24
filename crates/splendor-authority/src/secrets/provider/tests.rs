@@ -90,6 +90,18 @@ fn fetch_request_audit_and_material_result_are_exactly_bound() {
         audit.request_binding_digest().algorithm,
         HashAlgorithm::Blake3
     );
+    let audit_debug = format!("{audit:?}");
+    assert_eq!(audit_debug, "SecretProviderAuditEvidence(<redacted>)");
+    for sensitive_coordinate in [
+        uuid(1).to_string(),
+        uuid(2).to_string(),
+        uuid(3).to_string(),
+        uuid(4).to_string(),
+        "version-1".to_string(),
+        timestamp().as_str().to_owned(),
+    ] {
+        assert!(!audit_debug.contains(&sensitive_coordinate));
+    }
     let encoded = serde_json::to_value(&audit).unwrap();
     assert_eq!(
         encoded["schema_version"],
@@ -266,6 +278,10 @@ fn health_and_closed_error_vocabulary_are_serializable_and_redacted() {
     assert_eq!(health.secret_provider_id(), &provider_id);
     assert!(!health.available());
     assert_eq!(health.observed_at(), &timestamp());
+    let health_debug = format!("{health:?}");
+    assert_eq!(health_debug, "SecretProviderHealthEvidence(<redacted>)");
+    assert!(!health_debug.contains(&uuid(80).to_string()));
+    assert!(!health_debug.contains(timestamp().as_str()));
     let encoded = serde_json::to_value(&health).unwrap();
     assert_eq!(
         encoded["schema_version"],

@@ -37,8 +37,8 @@ use splendor_types::{
     SecretAudienceId, SecretCredentialDeclarationComparisonV2, SecretDeliveryHandleId,
     SecretDeliveryMethod, SecretLeaseId, SecretLeaseRequestId, SecretProviderId, SecretPurpose,
     SecretRefId, SecretRefV2, SecretRenewalCommandId, SecretRevocationCommandId,
-    SecretUseAttemptId, SecretUseClaimId, SecretUseIntent, TenantId, WorkloadId,
-    AUTHORITY_OPERATION_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
+    SecretUseAttemptId, SecretUseClaimId, SecretUseIntent, SecretUseRequirement, TenantId,
+    WorkloadId, AUTHORITY_OPERATION_SCHEMA_VERSION, CAPABILITY_REQUEST_SCHEMA_VERSION,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -190,6 +190,12 @@ impl<'a> SecretBrokerAuthorityContext<'a> {
 /// Private proof that Authority, placement, current Driver declaration, current
 /// SecretRef authorization, expiry, and revocation all matched one request.
 struct ValidatedSecretBrokerPermit {
+    _private: (),
+}
+
+/// Private proof that current authenticated Authority, capability, placement,
+/// expiry, and revocation matched before any object-state lookup.
+struct ValidatedCurrentSecretBrokerAuthority {
     _private: (),
 }
 
@@ -505,9 +511,6 @@ struct ScopedSecretLeaseRequestId {
     tenant_id: TenantId,
     principal_id: PrincipalId,
     workload_id: WorkloadId,
-    node_id: NodeId,
-    instance_id: InstanceId,
-    audience_id: SecretAudienceId,
 }
 
 #[derive(Clone)]
@@ -545,6 +548,17 @@ enum SecretCommandKind {
     Revoke,
 }
 
+impl SecretCommandKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::Claim => "claim",
+            Self::Renew => "renew",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SecretCommandKey {
     kind: SecretCommandKind,
@@ -552,9 +566,6 @@ struct SecretCommandKey {
     tenant_id: TenantId,
     principal_id: PrincipalId,
     workload_id: WorkloadId,
-    node_id: NodeId,
-    instance_id: InstanceId,
-    audience_id: SecretAudienceId,
 }
 
 #[derive(Clone)]
@@ -579,6 +590,10 @@ enum SecretCommandTerminal {
 struct HistoricalSecretBrokerRecord {
     event_index: usize,
     event_id: SecretAccessEventId,
+    expected_command_id: ProcessLocalSecretBrokerCommandId,
+    expected_kind: SecretAccessEvidenceKind,
+    expected_outcome: SecretAccessEvidenceOutcome,
+    event_integrity_digest: ContentHash,
 }
 
 /// Historical, non-authorizing result returned for an exact duplicate. It is
@@ -782,7 +797,7 @@ impl ProcessLocalSecretBroker {
             request.secret_lease_request_id().to_string(),
             authority,
         );
-        let semantic_digest = issue_command_digest(&request)?;
+        let semantic_digest = issue_command_digest(&command_id, &request, authority)?;
         let lookup_now = self.observe_time(&mut mutation_guard)?;
         {
             let state = self.lock_state()?;
@@ -893,10 +908,7 @@ impl ProcessLocalSecretBroker {
                 capability_nonce,
             },
         };
-        let historical = HistoricalSecretBrokerRecord {
-            event_index: state.events.len(),
-            event_id: event_id.clone(),
-        };
+        let historical = historical_record(state.events.len(), &event)?;
         let mut next = state.clone();
         self.reserve_generated_ids(
             &mut next,
@@ -920,7 +932,7 @@ impl ProcessLocalSecretBroker {
         );
         next.leases.insert(secret_lease_id, record);
         next.used_request_ids
-            .insert(scoped_lease_request_id(&request));
+            .insert(scoped_lease_request_id(&request, authority));
         next.commands.insert(
             command_key,
             SecretCommandRecord {
@@ -953,7 +965,13 @@ impl ProcessLocalSecretBroker {
             secret_use_attempt_id.to_string(),
             authority,
         );
-        let semantic_digest = handle_command_digest("claim", handle, use_binding, None)?;
+        let semantic_digest = handle_command_digest(
+            SecretCommandKind::Claim,
+            &command_id,
+            handle,
+            use_binding,
+            authority,
+        )?;
         let lookup_now = self.observe_time(&mut mutation_guard)?;
         {
             let state = self.lock_state()?;
@@ -1138,10 +1156,7 @@ impl ProcessLocalSecretBroker {
         if next_uses == updated.max_uses {
             updated.status = SecretLeaseStatus::Exhausted;
         }
-        let historical = HistoricalSecretBrokerRecord {
-            event_index: state.events.len(),
-            event_id: event_id.clone(),
-        };
+        let historical = historical_record(state.events.len(), &event)?;
         self.append_event(&mut next, event)?;
         next.max_observed_time = Some(now);
         next.leases.insert(lease_id, updated);
@@ -1175,7 +1190,7 @@ impl ProcessLocalSecretBroker {
             renewal_command_id.to_string(),
             authority,
         );
-        let semantic_digest = renew_command_digest(old_handle, &request)?;
+        let semantic_digest = renew_command_digest(&command_id, old_handle, &request, authority)?;
         let lookup_now = self.observe_time(&mut mutation_guard)?;
         {
             let state = self.lock_state()?;
@@ -1338,10 +1353,7 @@ impl ProcessLocalSecretBroker {
                 capability_nonce,
             },
         };
-        let historical = HistoricalSecretBrokerRecord {
-            event_index: state.events.len(),
-            event_id: event_id.clone(),
-        };
+        let historical = historical_record(state.events.len(), &event)?;
         let mut next = state.clone();
         self.reserve_generated_ids(
             &mut next,
@@ -1373,7 +1385,7 @@ impl ProcessLocalSecretBroker {
         );
         next.leases.insert(new_lease_id, record);
         next.used_request_ids
-            .insert(scoped_lease_request_id(&request));
+            .insert(scoped_lease_request_id(&request, authority));
         next.commands.insert(
             command_key,
             SecretCommandRecord {
@@ -1406,7 +1418,13 @@ impl ProcessLocalSecretBroker {
             revocation_command_id.to_string(),
             authority,
         );
-        let semantic_digest = handle_command_digest("revoke", handle, use_binding, None)?;
+        let semantic_digest = handle_command_digest(
+            SecretCommandKind::Revoke,
+            &command_id,
+            handle,
+            use_binding,
+            authority,
+        )?;
         let lookup_now = self.observe_time(&mut mutation_guard)?;
         {
             let state = self.lock_state()?;
@@ -1540,10 +1558,7 @@ impl ProcessLocalSecretBroker {
         updated.status = SecretLeaseStatus::Revoked;
         updated.revocation_generation = next_generation;
         let terminal_snapshot = snapshot(&updated)?;
-        let historical = HistoricalSecretBrokerRecord {
-            event_index: state.events.len(),
-            event_id: event_id.clone(),
-        };
+        let historical = historical_record(state.events.len(), &event)?;
         let mut next = state.clone();
         self.reserve_generated_ids(
             &mut next,
@@ -1665,7 +1680,7 @@ impl ProcessLocalSecretBroker {
     ) -> Result<IssuePlan, (SecretBrokerError, SecretAccessDenialCode)> {
         if state
             .used_request_ids
-            .contains(&scoped_lease_request_id(request))
+            .contains(&scoped_lease_request_id(request, authority))
         {
             return Err((
                 SecretBrokerError::RequestAlreadyUsed,
@@ -1787,7 +1802,7 @@ impl ProcessLocalSecretBroker {
     ) -> Result<(), SecretAccessDenialCode> {
         if state
             .used_request_ids
-            .contains(&scoped_lease_request_id(request))
+            .contains(&scoped_lease_request_id(request, authority))
         {
             return Err(SecretAccessDenialCode::RequestAlreadyUsed);
         }
@@ -2170,39 +2185,80 @@ fn trusted_command_key(
         tenant_id: authority.tenant_id.clone(),
         principal_id: authority.principal_id.clone(),
         workload_id: authority.workload_id.clone(),
-        node_id: authority.node_id.clone(),
-        instance_id: authority.instance_id.clone(),
-        audience_id: authority.audience_id.clone(),
     }
 }
 
-fn scoped_lease_request_id(request: &SecretLeaseRequest) -> ScopedSecretLeaseRequestId {
-    let binding = request.use_binding();
+fn scoped_lease_request_id(
+    request: &SecretLeaseRequest,
+    authority: &SecretBrokerAuthorityContext<'_>,
+) -> ScopedSecretLeaseRequestId {
     ScopedSecretLeaseRequestId {
         secret_lease_request_id: request.secret_lease_request_id().clone(),
-        tenant_id: binding.tenant_id().clone(),
-        principal_id: binding.principal_id().clone(),
-        workload_id: binding.workload_id().clone(),
-        node_id: binding.node_id().clone(),
-        instance_id: binding.instance_id().clone(),
-        audience_id: binding.audience_id().clone(),
+        tenant_id: authority.tenant_id.clone(),
+        principal_id: authority.principal_id.clone(),
+        workload_id: authority.workload_id.clone(),
     }
 }
+
+const SECRET_SEMANTIC_IDEMPOTENCY_PROJECTION_SCHEMA_V1: &str =
+    "splendor.secret.semantic_idempotency_projection.v1";
+const HISTORICAL_SECRET_BROKER_EVENT_INTEGRITY_SCHEMA_LOCAL_V1: &str =
+    "splendor.secret.historical_broker_event_integrity.local.v1";
 
 #[derive(Serialize)]
 struct IssueCommandDigestMaterial<'a> {
-    operation: &'static str,
-    request: &'a SecretLeaseRequest,
+    schema_version: &'static str,
+    command_kind: &'static str,
+    trusted_ledger_scope: TrustedSecretLedgerScope<'a>,
+    command_id: &'a ProcessLocalSecretBrokerCommandId,
+    request: SecretLeaseRequestSemanticProjection<'a>,
 }
 
 #[derive(Serialize)]
 struct HandleCommandDigestMaterial<'a> {
-    operation: &'static str,
+    schema_version: &'static str,
+    command_kind: &'static str,
+    trusted_ledger_scope: TrustedSecretLedgerScope<'a>,
+    command_id: &'a ProcessLocalSecretBrokerCommandId,
     delivery_handle_id: &'a SecretDeliveryHandleId,
     secret_lease_id: &'a SecretLeaseId,
     capability_nonce: Uuid,
     binding: &'a SecretLeaseUseBinding,
-    request: Option<&'a SecretLeaseRequest>,
+}
+
+#[derive(Serialize)]
+struct RenewCommandDigestMaterial<'a> {
+    schema_version: &'static str,
+    command_kind: &'static str,
+    trusted_ledger_scope: TrustedSecretLedgerScope<'a>,
+    command_id: &'a ProcessLocalSecretBrokerCommandId,
+    delivery_handle_id: &'a SecretDeliveryHandleId,
+    secret_lease_id: &'a SecretLeaseId,
+    capability_nonce: Uuid,
+    request: SecretLeaseRequestSemanticProjection<'a>,
+}
+
+#[derive(Serialize)]
+struct TrustedSecretLedgerScope<'a> {
+    tenant_id: &'a TenantId,
+    principal_id: &'a PrincipalId,
+    workload_id: &'a WorkloadId,
+}
+
+#[derive(Serialize)]
+struct SecretLeaseRequestSemanticProjection<'a> {
+    schema_version: &'static str,
+    secret_lease_request_id: &'a SecretLeaseRequestId,
+    use_binding: &'a SecretLeaseUseBinding,
+    bound_use_requirement: &'a SecretUseRequirement,
+    starts_at: &'a CanonicalTimestampV1,
+    expires_at: &'a CanonicalTimestampV1,
+}
+
+#[derive(Serialize)]
+struct HistoricalSecretBrokerEventIntegrity<'a> {
+    schema_version: &'static str,
+    event: &'a SecretAccessEvidence,
 }
 
 fn command_digest<T: Serialize>(value: &T) -> Result<ContentHash, SecretBrokerError> {
@@ -2211,33 +2267,100 @@ fn command_digest<T: Serialize>(value: &T) -> Result<ContentHash, SecretBrokerEr
         .map_err(|_| SecretBrokerError::StateUnavailable)
 }
 
-fn issue_command_digest(request: &SecretLeaseRequest) -> Result<ContentHash, SecretBrokerError> {
+fn trusted_ledger_scope<'a>(
+    authority: &SecretBrokerAuthorityContext<'a>,
+) -> TrustedSecretLedgerScope<'a> {
+    TrustedSecretLedgerScope {
+        tenant_id: authority.tenant_id,
+        principal_id: authority.principal_id,
+        workload_id: authority.workload_id,
+    }
+}
+
+fn lease_request_semantic_projection(
+    request: &SecretLeaseRequest,
+) -> SecretLeaseRequestSemanticProjection<'_> {
+    SecretLeaseRequestSemanticProjection {
+        schema_version: request.schema_version(),
+        secret_lease_request_id: request.secret_lease_request_id(),
+        use_binding: request.use_binding(),
+        bound_use_requirement: request.bound_use_requirement(),
+        starts_at: request.starts_at(),
+        expires_at: request.expires_at(),
+    }
+}
+
+fn issue_command_digest(
+    command_id: &ProcessLocalSecretBrokerCommandId,
+    request: &SecretLeaseRequest,
+    authority: &SecretBrokerAuthorityContext<'_>,
+) -> Result<ContentHash, SecretBrokerError> {
     command_digest(&IssueCommandDigestMaterial {
-        operation: "issue",
-        request,
+        schema_version: SECRET_SEMANTIC_IDEMPOTENCY_PROJECTION_SCHEMA_V1,
+        command_kind: SecretCommandKind::Issue.as_str(),
+        trusted_ledger_scope: trusted_ledger_scope(authority),
+        command_id,
+        request: lease_request_semantic_projection(request),
     })
 }
 
 fn renew_command_digest(
+    command_id: &ProcessLocalSecretBrokerCommandId,
     handle: &SecretDeliveryHandle,
     request: &SecretLeaseRequest,
+    authority: &SecretBrokerAuthorityContext<'_>,
 ) -> Result<ContentHash, SecretBrokerError> {
-    handle_command_digest("renew", handle, request.use_binding(), Some(request))
+    command_digest(&RenewCommandDigestMaterial {
+        schema_version: SECRET_SEMANTIC_IDEMPOTENCY_PROJECTION_SCHEMA_V1,
+        command_kind: SecretCommandKind::Renew.as_str(),
+        trusted_ledger_scope: trusted_ledger_scope(authority),
+        command_id,
+        delivery_handle_id: &handle.delivery_handle_id,
+        secret_lease_id: &handle.secret_lease_id,
+        capability_nonce: handle.capability_nonce,
+        request: lease_request_semantic_projection(request),
+    })
 }
 
 fn handle_command_digest(
-    operation: &'static str,
+    command_kind: SecretCommandKind,
+    command_id: &ProcessLocalSecretBrokerCommandId,
     handle: &SecretDeliveryHandle,
     binding: &SecretLeaseUseBinding,
-    request: Option<&SecretLeaseRequest>,
+    authority: &SecretBrokerAuthorityContext<'_>,
 ) -> Result<ContentHash, SecretBrokerError> {
     command_digest(&HandleCommandDigestMaterial {
-        operation,
+        schema_version: SECRET_SEMANTIC_IDEMPOTENCY_PROJECTION_SCHEMA_V1,
+        command_kind: command_kind.as_str(),
+        trusted_ledger_scope: trusted_ledger_scope(authority),
+        command_id,
         delivery_handle_id: &handle.delivery_handle_id,
         secret_lease_id: &handle.secret_lease_id,
         capability_nonce: handle.capability_nonce,
         binding,
-        request,
+    })
+}
+
+fn historical_event_integrity_digest(
+    event: &SecretAccessEvidence,
+) -> Result<ContentHash, SecretBrokerError> {
+    command_digest(&HistoricalSecretBrokerEventIntegrity {
+        schema_version: HISTORICAL_SECRET_BROKER_EVENT_INTEGRITY_SCHEMA_LOCAL_V1,
+        event,
+    })
+}
+
+fn historical_record(
+    event_index: usize,
+    event: &SecretAccessEvidence,
+) -> Result<HistoricalSecretBrokerRecord, SecretBrokerError> {
+    Ok(HistoricalSecretBrokerRecord {
+        event_index,
+        event_id: event.secret_access_event_id().clone(),
+        expected_command_id: event.command_id().clone(),
+        expected_kind: event.kind(),
+        expected_outcome: event.outcome(),
+        event_integrity_digest: historical_event_integrity_digest(event)?,
     })
 }
 
@@ -2310,11 +2433,19 @@ fn historical_outcome<T>(
     let evidence = state
         .events
         .get(record.event_index)
-        .filter(|event| event.secret_access_event_id() == &record.event_id)
-        .cloned()
         .ok_or(SecretBrokerError::StateUnavailable)?;
+    if evidence.secret_access_event_id() != &record.event_id
+        || evidence.command_id() != &record.expected_command_id
+        || evidence.kind() != record.expected_kind
+        || evidence.outcome() != record.expected_outcome
+        || historical_event_integrity_digest(evidence)? != record.event_integrity_digest
+    {
+        return Err(SecretBrokerError::StateUnavailable);
+    }
     Ok(SecretBrokerCommandOutcome::Historical(Box::new(
-        HistoricalSecretBrokerReceipt { evidence },
+        HistoricalSecretBrokerReceipt {
+            evidence: evidence.clone(),
+        },
     )))
 }
 
@@ -2385,6 +2516,17 @@ fn validated_authority_permit(
     now: OffsetDateTime,
     expires_at: OffsetDateTime,
 ) -> Option<ValidatedSecretBrokerPermit> {
+    let current_authority =
+        validated_current_secret_broker_authority(authority, binding, now, expires_at)?;
+    validated_secret_ref_and_driver_permit(state, authority, binding, now, &current_authority)
+}
+
+fn validated_current_secret_broker_authority(
+    authority: &SecretBrokerAuthorityContext<'_>,
+    binding: &SecretLeaseUseBinding,
+    now: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> Option<ValidatedCurrentSecretBrokerAuthority> {
     if authority.tenant_id != binding.tenant_id()
         || authority.principal_id != binding.principal_id()
         || authority.workload_id != binding.workload_id()
@@ -2395,17 +2537,6 @@ fn validated_authority_permit(
         || authority.purpose != binding.purpose()
         || now >= expires_at
     {
-        return None;
-    }
-    let secret_ref = state
-        .refs
-        .get(&(binding.tenant_id().clone(), binding.secret_ref_id().clone()))?;
-    if !secret_ref_allows_binding(
-        secret_ref,
-        binding,
-        authority.current_driver_declaration,
-        now,
-    ) {
         return None;
     }
     let request = CapabilityRequest {
@@ -2434,7 +2565,26 @@ fn validated_authority_permit(
         now,
     );
     (decision.status == AuthorityDecisionStatus::Allowed)
-        .then_some(ValidatedSecretBrokerPermit { _private: () })
+        .then_some(ValidatedCurrentSecretBrokerAuthority { _private: () })
+}
+
+fn validated_secret_ref_and_driver_permit(
+    state: &SecretBrokerState,
+    authority: &SecretBrokerAuthorityContext<'_>,
+    binding: &SecretLeaseUseBinding,
+    now: OffsetDateTime,
+    _current_authority: &ValidatedCurrentSecretBrokerAuthority,
+) -> Option<ValidatedSecretBrokerPermit> {
+    let secret_ref = state
+        .refs
+        .get(&(binding.tenant_id().clone(), binding.secret_ref_id().clone()))?;
+    secret_ref_allows_binding(
+        secret_ref,
+        binding,
+        authority.current_driver_declaration,
+        now,
+    )
+    .then_some(ValidatedSecretBrokerPermit { _private: () })
 }
 
 #[allow(clippy::too_many_arguments)]

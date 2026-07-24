@@ -341,7 +341,8 @@ fn debug_and_errors_are_redacted_and_trait_object_is_real() {
             .unwrap(),
     );
     let rendered = format!("{provider:?}");
-    assert!(rendered.contains("<redacted>"));
+    assert_eq!(rendered, "MemorySecretProvider(<redacted>)");
+    assert!(!rendered.contains(&provider_id().to_string()));
     assert!(!rendered.contains("material"));
     let port: Arc<dyn SecretProvider> = provider;
     assert_eq!(port.provider_id(), &provider_id());

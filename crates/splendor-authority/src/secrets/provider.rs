@@ -81,7 +81,7 @@ pub enum SecretProviderOutcome {
 
 /// Safe provider audit evidence. It contains no endpoint, request, response,
 /// provider error text, material digest, locator, or credential.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecretProviderAuditEvidence {
     provider_audit_id: SecretProviderAuditId,
     secret_provider_id: SecretProviderId,
@@ -94,6 +94,12 @@ pub struct SecretProviderAuditEvidence {
     outcome: SecretProviderOutcome,
     effect_certainty: EffectCertainty,
     observed_at: CanonicalTimestampV1,
+}
+
+impl fmt::Debug for SecretProviderAuditEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretProviderAuditEvidence(<redacted>)")
+    }
 }
 
 impl SecretProviderAuditEvidence {
@@ -495,11 +501,17 @@ impl fmt::Debug for SecretProviderFetchResult<'_> {
 }
 
 /// Safe passive health projection for one configured provider.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecretProviderHealthEvidence {
     secret_provider_id: SecretProviderId,
     available: bool,
     observed_at: CanonicalTimestampV1,
+}
+
+impl fmt::Debug for SecretProviderHealthEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretProviderHealthEvidence(<redacted>)")
+    }
 }
 
 impl SecretProviderHealthEvidence {

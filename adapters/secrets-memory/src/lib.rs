@@ -372,11 +372,7 @@ impl MemorySecretProvider {
 
 impl fmt::Debug for MemorySecretProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemorySecretProvider")
-            .field("provider_id", &self.provider_id)
-            .field("state", &"<redacted>")
-            .finish()
+        formatter.write_str("MemorySecretProvider(<redacted>)")
     }
 }
 

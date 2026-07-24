@@ -13,10 +13,16 @@
   lifecycle, constructors, handles/claims, clocks/IDs, limits, mutation errors,
   inspection, and replay are crate-private; there is no callable production
   lease API or complete live permit. The internal one-tenant prototype performs
-  exact current Authority/ref/Driver/revocation checks before command disclosure,
-  derives command partitions from trusted context, returns historical
-  non-authorizing receipts without retaining/recreating capability nonces, and
-  gives a live opaque capability only to the first successful application.
+  current authenticated Authority/capability/revocation checks before
+  SecretRef/current-Driver, command, or handle lookup; derives command and
+  request partitions only from trusted tenant/principal/workload plus command
+  kind/nominal ID; and keeps placement/binding coordinates in explicit semantic
+  equality while excluding only lease-request `requested_at`. Historical
+  non-authorizing receipts are integrity-bound to their exact command/event and
+  retain/recreate no capability nonce. Fixed provider audit/health and memory
+  provider `Debug` output exposes no provider/ref/tenant/version/digest/time
+  coordinates. A live opaque capability is available only to the first
+  successful application.
   Hidden hit/miss/conflict/cross-scope cases share `secret_not_available`.
   `environment_variable` is never selected, renewal uses broker-observed current
   time as its immediate cutover, and every valid clock observation latches a
