@@ -5486,7 +5486,13 @@ async fn action_endpoint_traces_approval_lifecycles_without_adapter_bypass() {
 
 #[tokio::test]
 async fn exact_waiting_action_accepts_raw_denial_and_records_replayable_terminal_evidence() {
-    let app = router(action_test_state());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state = support::state_with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+        &["daemon.local"],
+    );
+    let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let mut create = create_request(
@@ -5736,6 +5742,145 @@ async fn exact_waiting_action_accepts_raw_denial_and_records_replayable_terminal
             })
             .unwrap_or(false)
     }));
+
+    const CREDENTIAL_CANARY: &str = "C03_APPROVAL_DENIAL_REASON_CREDENTIAL_CANARY";
+    let authority_evaluations_before_credential_denial = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("authority evaluations before credential denial");
+    let raw_trace_count_before_credential_denial = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw traces before credential denial")
+        .len();
+    let mut credential_denial = exact_denial.clone();
+    credential_denial.reason = Some(format!("Bearer {CREDENTIAL_CANARY}"));
+    let mut credential_denied_request = request.clone();
+    credential_denied_request.approval_evidence = Some(credential_denial);
+    let (status, credential_denied): (StatusCode, splendor_gateway::ActionOutcome) = call_json(
+        app.clone(),
+        Method::POST,
+        "/actions",
+        serde_json::to_value(credential_denied_request)
+            .expect("credential-bearing approval denial"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        credential_denied.status,
+        splendor_gateway::ActionStatus::Denied
+    );
+    assert_eq!(
+        credential_denied.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+    assert_eq!(
+        credential_denied.error.as_deref(),
+        Some(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert!(credential_denied.output.is_none());
+    assert!(credential_denied.post_verification.is_none());
+    assert!(credential_denied.approval_challenge.is_none());
+    assert!(!serde_json::to_string(&credential_denied)
+        .expect("credential denial outcome")
+        .contains(CREDENTIAL_CANARY));
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw traces after credential denial");
+    assert_eq!(
+        raw_records.len(),
+        raw_trace_count_before_credential_denial + 5,
+        "the known audit plus four fixed denial events remain bounded"
+    );
+    assert!(!serde_json::to_string(&raw_records)
+        .expect("raw trace records")
+        .contains(CREDENTIAL_CANARY));
+    let denial_events = raw_records[raw_trace_count_before_credential_denial..]
+        .iter()
+        .map(|record| {
+            serde_json::from_value::<TraceEvent>(record.payload.clone())
+                .expect("credential denial trace event")
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        &denial_events[0].kind,
+        TraceEventKind::DaemonAudit { endpoint, .. }
+            if endpoint == "splendor.actions.submit"
+    ));
+    assert!(matches!(
+        &denial_events[1].kind,
+        TraceEventKind::ActionVerificationStarted { action }
+            if action == &splendor_gateway::raw_credential_denied_action()
+    ));
+    assert!(matches!(
+        &denial_events[2].kind,
+        TraceEventKind::ActionVerificationCompleted { action, result }
+            if action == &splendor_gateway::raw_credential_denied_action()
+                && result.reasons == vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    ));
+    assert!(matches!(
+        &denial_events[3].kind,
+        TraceEventKind::ActionDenied { action, result }
+            if action == &splendor_gateway::raw_credential_denied_action()
+                && result.reasons == vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    ));
+    assert!(matches!(
+        &denial_events[4].kind,
+        TraceEventKind::OutcomeRecorded { outcome, .. }
+            if outcome
+                .pointer("/action_outcome/error")
+                .and_then(Value::as_str)
+                == Some(splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED)
+    ));
+
+    let (status, trace_read): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!serde_json::to_string(&trace_read)
+        .expect("trace read response")
+        .contains(CREDENTIAL_CANARY));
+
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::ReplayCreate]);
+    let replay_audit = matching_attribution(&replay_credential);
+    let (status, credential_denial_replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({
+            "credential": replay_credential,
+            "audit_attribution": replay_audit,
+            "mode": "inspect_only",
+            "side_effects_allowed": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!serde_json::to_string(&credential_denial_replay)
+        .expect("credential denial replay")
+        .contains(CREDENTIAL_CANARY));
+    assert!(!credential_denial_replay
+        .approval_events
+        .iter()
+        .any(|event| event.lifecycle == "denied"));
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("authority evaluations after credential denial and replay"),
+        authority_evaluations_before_credential_denial
+    );
+    let (status, inspected): (StatusCode, RunInspectResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.status, RunStatus::WaitingForApproval);
+    assert_eq!(inspected.adapter_executions, 0);
 
     denial.approval_id = challenge.approval_id.clone();
     let mut denied_request = request;

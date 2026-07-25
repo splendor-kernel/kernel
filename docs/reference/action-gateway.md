@@ -124,9 +124,10 @@ the same Gateway-owned implementation; they do not maintain independent key or
 content rules.
 
 The guard recursively checks action fields, param keys and values, requested
-adapter, satisfied-precondition strings, and free-form strings in raw authority
-obligation receipts. Receipt screening is content denial only: it neither
-validates a receipt nor turns one into authority. Case/separator-normalized
+adapter, satisfied-precondition strings, free-form raw approval-evidence fields,
+and free-form strings in raw authority obligation receipts. Approval-evidence and
+receipt screening is content denial only: it neither validates the object nor
+turns it into authority. Case/separator-normalized
 credential coordinates include authorization/proxy authorization, common
 `authKey`/`apiToken`/`X-API-Key`/`X-Auth-Token`/`Private-Token`/`authz` aliases,
 password/passwd, token/API key, Vault/Consul token environment coordinates,

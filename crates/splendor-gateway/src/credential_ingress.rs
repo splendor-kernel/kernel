@@ -6,7 +6,8 @@
 
 use crate::{ActionOutcome, ActionRequest, ActionStatus};
 use splendor_types::{
-    Action, AuthorityObligationReceipt, RevocationStatus, SideEffectClass, VerificationResult,
+    Action, ApprovalEvidence, AuthorityObligationReceipt, RevocationStatus, SideEffectClass,
+    VerificationResult,
 };
 use std::{fmt, net::Ipv6Addr, str};
 use time::OffsetDateTime;
@@ -71,6 +72,22 @@ pub fn guard_action_routing_and_receipts(
     authority_obligation_receipts: &[AuthorityObligationReceipt],
 ) -> Result<(), RawCredentialInputDenied> {
     let mut scanner = CredentialIngressScanner::default();
+    scan_action_routing_and_receipts(
+        &mut scanner,
+        action,
+        adapter,
+        satisfied_preconditions,
+        authority_obligation_receipts,
+    )
+}
+
+fn scan_action_routing_and_receipts(
+    scanner: &mut CredentialIngressScanner,
+    action: &Action,
+    adapter: Option<&str>,
+    satisfied_preconditions: &[String],
+    authority_obligation_receipts: &[AuthorityObligationReceipt],
+) -> Result<(), RawCredentialInputDenied> {
     scanner.scan_action(action)?;
     if let Some(adapter) = adapter {
         scanner.scan_string(adapter)?;
@@ -108,19 +125,25 @@ pub fn guard_credential_capable_value(
     CredentialIngressScanner::default().scan_value(value, 0)
 }
 
-/// Screens the untrusted action/routing portion of an action request.
+/// Screens all credential-capable strings in an untrusted action request.
 ///
 /// Typed caller authentication and authority decisions are intentionally not
-/// scanned as workload input. Raw receipt strings are content-screened before
-/// their owning Authority validator runs; screening does not make them valid or
-/// authorizing.
+/// scanned as workload input. Raw approval-evidence and receipt strings are
+/// content-screened before their owning validators run; screening does not make
+/// them valid or authorizing.
 pub fn guard_action_request(request: &ActionRequest) -> Result<(), RawCredentialInputDenied> {
-    guard_action_routing_and_receipts(
+    let mut scanner = CredentialIngressScanner::default();
+    scan_action_routing_and_receipts(
+        &mut scanner,
         &request.action,
         request.adapter.as_deref(),
         &request.satisfied_preconditions,
         &request.authority_obligation_receipts,
-    )
+    )?;
+    if let Some(evidence) = request.approval_evidence.as_ref() {
+        scanner.scan_approval_evidence(evidence)?;
+    }
+    Ok(())
 }
 
 /// Returns the constant action projection used for all credential denials.
@@ -227,6 +250,25 @@ impl CredentialIngressScanner {
             self.scan_string(&receipt.validation.key_id)?;
             self.scan_string(&receipt.validation.digest)?;
             self.scan_string(&receipt.validation.signature)?;
+        }
+        Ok(())
+    }
+
+    fn scan_approval_evidence(
+        &mut self,
+        evidence: &ApprovalEvidence,
+    ) -> Result<(), RawCredentialInputDenied> {
+        self.charge_node()?;
+        self.scan_string(&evidence.schema_version)?;
+        for value in [
+            evidence.action_name.as_deref(),
+            evidence.adapter.as_deref(),
+            evidence.reason.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.scan_string(value)?;
         }
         Ok(())
     }
@@ -1737,10 +1779,10 @@ fn compact_ascii(value: &str) -> String {
 mod tests {
     use super::*;
     use splendor_types::{
-        AgentId, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
-        AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
-        AuthorityObligationReceiptValidationKind, CostEstimate, PrincipalId, QuotaUsage, RunId,
-        TenantId,
+        AgentId, ApprovalDecision, ApprovalId, AuthorityDecisionId, AuthorityObligationId,
+        AuthorityObligationKind, AuthorityObligationReceiptId,
+        AuthorityObligationReceiptValidation, AuthorityObligationReceiptValidationKind,
+        CostEstimate, PrincipalId, QuotaUsage, RunId, TenantId,
     };
 
     fn action(params: serde_json::Value) -> Action {
@@ -1817,6 +1859,22 @@ mod tests {
             authority_obligation_evidence: None,
             authority_obligation_receipts: Vec::new(),
         }
+    }
+
+    fn ordinary_approval_evidence(request: &ActionRequest) -> ApprovalEvidence {
+        let mut evidence = ApprovalEvidence::new(
+            ApprovalId::new(),
+            request.tenant_id.clone(),
+            request.agent_id.clone(),
+            request.run_id.clone(),
+            ApprovalDecision::Denied,
+            OffsetDateTime::now_utc() + time::Duration::minutes(5),
+        );
+        evidence.action_id = Some(request.action_id.clone());
+        evidence.action_name = Some(request.action.name.clone());
+        evidence.adapter = request.adapter.clone();
+        evidence.reason = Some("operator denied exact action".to_string());
+        evidence
     }
 
     #[test]
@@ -2360,6 +2418,70 @@ mod tests {
                 "receipt field must deny independently: {field}"
             );
         }
+    }
+
+    #[test]
+    fn raw_approval_evidence_strings_are_screened_without_granting_authority() {
+        let mut safe = request(action(serde_json::json!({"safe": true})));
+        safe.adapter = Some("fixture".to_string());
+        safe.approval_evidence = Some(ordinary_approval_evidence(&safe));
+        assert_eq!(guard_action_request(&safe), Ok(()));
+
+        for field in ["schema_version", "action_name", "adapter", "reason"] {
+            let mut guarded = safe.clone();
+            let evidence = guarded
+                .approval_evidence
+                .as_mut()
+                .expect("approval evidence");
+            let canary = "Bearer synthetic-value".to_string();
+            match field {
+                "schema_version" => evidence.schema_version = canary,
+                "action_name" => evidence.action_name = Some(canary),
+                "adapter" => evidence.adapter = Some(canary),
+                "reason" => evidence.reason = Some(canary),
+                _ => unreachable!("closed approval evidence field matrix"),
+            }
+            assert_eq!(
+                guard_action_request(&guarded),
+                Err(RawCredentialInputDenied),
+                "approval evidence field must deny independently: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_evidence_shares_the_action_request_cumulative_byte_budget() {
+        let mut guarded = request(action(serde_json::json!({"safe": true})));
+        let evidence = ordinary_approval_evidence(&guarded);
+        let evidence_bytes = evidence.schema_version.len()
+            + evidence.action_name.as_deref().map_or(0, str::len)
+            + evidence.adapter.as_deref().map_or(0, str::len)
+            + evidence.reason.as_deref().map_or(0, str::len);
+        let mut remaining = CREDENTIAL_INGRESS_MAX_TOTAL_BYTES
+            .checked_sub(evidence_bytes + guarded.action.name.len())
+            .expect("evidence fixture fits request budget");
+        let mut values = Vec::new();
+        while remaining > 0 {
+            let len = remaining.min(CREDENTIAL_INGRESS_MAX_STRING_BYTES);
+            values.push(serde_json::Value::String("x".repeat(len)));
+            remaining -= len;
+        }
+        guarded.action.params = serde_json::Value::Array(values);
+        guarded.approval_evidence = Some(evidence);
+        assert_eq!(guard_action_request(&guarded), Ok(()));
+
+        guarded
+            .approval_evidence
+            .as_mut()
+            .expect("approval evidence")
+            .reason
+            .as_mut()
+            .expect("approval reason")
+            .push('x');
+        assert_eq!(
+            guard_action_request(&guarded),
+            Err(RawCredentialInputDenied)
+        );
     }
 
     #[test]

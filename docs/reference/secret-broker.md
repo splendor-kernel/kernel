@@ -70,8 +70,9 @@ IPv6/zone or IPvFuture literals, and raw-colon `u16` ports; percent decoding nev
 creates a structural port separator. Malformed or ambiguously encoded authorities
 fail closed while preserving
 literal-percent forms, ordinary embedded URLs, and provider-like resource names.
-It also screens raw receipt strings, physical/operator envelope strings, complete
-device-profile values/keys, and every top-level numeric `params.bytes` body,
+It also screens free-form raw approval-evidence and receipt strings,
+physical/operator envelope strings, complete device-profile values/keys, and
+every top-level numeric `params.bytes` body,
 independent of action labels or adapter routing. Every inspected raw or decoded
 string rejects BOM and NUL/control ambiguity; numeric bytes additionally require
 unambiguous UTF-8, so UTF-16 and invalid encodings fail closed. This screening

@@ -400,7 +400,8 @@ completion records cannot overwrite a terminal lifecycle status published while
 the effect was in flight.
 
 After run/tenant/agent scope and caller authentication, direct and physical
-handlers apply the same Gateway-owned raw credential guard before run-authority
+handlers apply the same Gateway-owned raw credential guard to action/routing,
+raw approval-evidence, and raw receipt strings before run-authority
 admission/binding, approval-state mutation, safety/simulator work, or an action
 payload trace. A denied submission returns HTTP `200` with a fixed
 `ActionOutcome.status = Denied` and reason/error
@@ -445,9 +446,12 @@ therefore append a bounded fixed denial event group. No raw field is retained an
 no Gateway/adapter/simulator effect occurs, but denial-rate/lifecycle admission
 remains nonblocking follow-up rather than a completion claim for SECR-004/006.
 
-Raw approval evidence is admitted by the kernel before daemon audit, runtime
-trace, lifecycle, or gateway mutation. Active runs reject all raw grants and
-denials at that boundary. The only raw-evidence exception is the exact pending
+Credential-free raw approval evidence is admitted by the kernel before daemon
+audit, runtime trace, lifecycle, or gateway mutation. Its schema, optional
+action/adapter, and reason strings first pass the same bounded Gateway-owned
+credential screen; a match returns only the fixed suppressed denial above.
+Active runs reject all raw grants and denials at the kernel boundary. The only
+raw-evidence exception is the exact pending
 `waiting_for_approval` retry carrying a fail-closed `Denied`, expired, or revoked
 decision with no obligation receipts; it can record a terminal denial but cannot
 reach adapter execution.

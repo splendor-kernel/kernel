@@ -14,8 +14,9 @@
   objects for credential aliases (while preserving generic/non-ASCII labels),
   decoded colon-bearing Basic, short Bearer, provider-specific realistically
   bounded token forms, PEM, embedded/encoded generic secret refs,
-  credential-bearing object keys, raw receipt metadata, physical/operator
-  envelope strings, and complete device-profile envelopes are covered. URL/form
+  credential-bearing object keys, raw approval-evidence and receipt metadata,
+  physical/operator envelope strings, and complete device-profile envelopes are
+  covered. URL/form
   parsing handles once-decoded URL authorities, paths, bare query names and
   values, bounded nested URLs, standalone form bodies, encoded non-URL spans
   adjacent to URLs, valid token prefixes before alphabet-overlapping punctuation,
