@@ -17,18 +17,18 @@ use splendor_store::{
 };
 use splendor_types::{
     select_placement, AgentId, ApprovalChallenge, ApprovalDecision, ApprovalEvidence, ApprovalId,
-    ApprovalPolicy, AuditAttribution, AuthorityObligationReceipt, CallerCredential, CircuitBreaker,
-    CircuitBreakerId, CircuitBreakerScope, ContentHash, CredentialAudience, CredentialBinding,
-    DataLocality, EndpointScope, FleetId, FleetTelemetrySnapshot, HealthStatus, InstanceHeartbeat,
-    InstanceId, InstanceRegistration, InstanceTelemetry, Message, MessageEnvelope, MessageId,
-    NodeHeartbeat, NodeId, NodeRegistration, PlacementCandidate, PlacementDecision,
-    PlacementDecisionStatus, PlacementExecutionMode, PlacementRequest, PlacementTarget,
-    PolicyBundle, PolicyBundleEnvelope, ResidentApprovalReceiptRevocationAck,
-    ResidentApprovalReceiptRevocationRequest, ResidentApprovalReceiptRevocationStatus,
-    RevocationStatus, RunId, RunStatus, RunTelemetry, RuntimeMode, TaskRequest,
-    TelemetryRuntimeMode, TenantId, TraceEventId, TraceSyncTelemetry, WorkOrderEnvelope,
-    WorkOrderKeyring, WorkOrderValidationContext, APPROVAL_POLICY_SCHEMA_VERSION,
-    RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
+    ApprovalPolicy, AuditAttribution, AuthorityObligationReceipt, AuthorityObligationReceiptId,
+    CallerCredential, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope, ContentHash,
+    CredentialAudience, CredentialBinding, DataLocality, EndpointScope, FleetId,
+    FleetTelemetrySnapshot, HealthStatus, InstanceHeartbeat, InstanceId, InstanceRegistration,
+    InstanceTelemetry, Message, MessageEnvelope, MessageId, NodeHeartbeat, NodeId,
+    NodeRegistration, PlacementCandidate, PlacementDecision, PlacementDecisionStatus,
+    PlacementExecutionMode, PlacementRequest, PlacementTarget, PolicyBundle, PolicyBundleEnvelope,
+    ResidentApprovalReceiptRevocationAck, ResidentApprovalReceiptRevocationRequest,
+    ResidentApprovalReceiptRevocationStatus, RevocationStatus, RunId, RunStatus, RunTelemetry,
+    RuntimeMode, TaskRequest, TelemetryRuntimeMode, TenantId, TraceEventId, TraceSyncTelemetry,
+    WorkOrderEnvelope, WorkOrderKeyring, WorkOrderValidationContext,
+    APPROVAL_POLICY_SCHEMA_VERSION, RESIDENT_APPROVAL_RECEIPT_REVOCATION_ACK_SCHEMA_VERSION,
     RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION, TASK_REQUEST_SCHEMA,
 };
 use std::collections::{HashMap, HashSet};
@@ -172,6 +172,63 @@ struct ResidentTickResponse {
     _state_node_id: String,
     #[serde(rename = "action_outcomes")]
     _action_outcomes: Vec<ActionOutcome>,
+}
+
+enum ResidentDispatchOperation<'a> {
+    CreateRun,
+    StartRun {
+        run_id: &'a RunId,
+    },
+    RevokeApprovalReceipt {
+        run_id: &'a RunId,
+        receipt_id: &'a AuthorityObligationReceiptId,
+    },
+    CancelRun {
+        run_id: &'a RunId,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ResidentCallerOperation {
+    CreateRun,
+    StartRun,
+    RevokeApprovalReceipt,
+    CancelRun,
+}
+
+impl ResidentCallerOperation {
+    fn endpoint_scope(self) -> EndpointScope {
+        match self {
+            Self::CreateRun => EndpointScope::RunsCreate,
+            Self::StartRun => EndpointScope::RunsStart,
+            Self::RevokeApprovalReceipt => EndpointScope::ApprovalReceiptsRevoke,
+            Self::CancelRun => EndpointScope::RunsStop,
+        }
+    }
+}
+
+impl ResidentDispatchOperation<'_> {
+    fn path(&self) -> String {
+        match self {
+            Self::CreateRun => "/runs".to_string(),
+            Self::StartRun { run_id } => format!("/runs/{run_id}/start"),
+            Self::RevokeApprovalReceipt { run_id, receipt_id } => {
+                format!("/runs/{run_id}/approval-receipts/{receipt_id}/revoke")
+            }
+            Self::CancelRun { run_id } => format!("/runs/{run_id}/cancel"),
+        }
+    }
+
+    fn timeout(&self, client: &ResidentDispatchClient) -> StdDuration {
+        match self {
+            Self::CreateRun | Self::CancelRun { .. } => client.create_timeout,
+            Self::StartRun { .. } | Self::RevokeApprovalReceipt { .. } => client.start_timeout,
+        }
+    }
+
+    fn expected_status(&self) -> reqwest::StatusCode {
+        reqwest::StatusCode::OK
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2168,11 +2225,10 @@ async fn dispatch_work_order(
         .validate_base_url(&dispatch_binding.resident_daemon_url)?;
     let instance_id = dispatch_binding.instance_id.clone();
     let daemon_url = dispatch_binding.resident_daemon_url.clone();
-    let create_auth = resident_credential(
-        &state.inner.resident_dispatch,
-        &instance_id,
-        &work_order.envelope.work_order.tenant_id,
-    )?;
+    let create_auth = state
+        .inner
+        .resident_dispatch
+        .create_run_caller(&work_order.envelope.work_order.tenant_id, &instance_id)?;
     let create_audit = resident_audit(&create_auth.credential);
     let create = resident_create_run_payload(
         &work_order.envelope,
@@ -2190,14 +2246,7 @@ async fn dispatch_work_order(
     let create_response: ResidentHttpResponse<ResidentCreateRunResponse> = state
         .inner
         .resident_dispatch
-        .post_json(
-            &daemon_url,
-            "/runs",
-            &create_auth.encoded,
-            &create,
-            state.inner.resident_dispatch.create_timeout,
-            reqwest::StatusCode::OK,
-        )
+        .create_run(&daemon_url, &create_auth.encoded, &create)
         .await
         .map_err(|error| {
             let _ = state.audit(
@@ -2227,11 +2276,10 @@ async fn dispatch_work_order(
         ));
     }
 
-    let start_auth = state.inner.resident_dispatch.signed_caller(
-        &work_order.envelope.work_order.tenant_id,
-        &instance_id,
-        EndpointScope::RunsStart,
-    )?;
+    let start_auth = state
+        .inner
+        .resident_dispatch
+        .start_run_caller(&work_order.envelope.work_order.tenant_id, &instance_id)?;
     let start_audit = resident_audit(&start_auth.credential);
     let start = serde_json::json!({
         "credential": &start_auth.credential,
@@ -2243,14 +2291,7 @@ async fn dispatch_work_order(
     let start_result: Result<ResidentHttpResponse<ResidentTickResponse>, ResidentHttpError> = state
         .inner
         .resident_dispatch
-        .post_json(
-            &daemon_url,
-            &format!("/runs/{run_id}/start"),
-            &start_auth.encoded,
-            &start,
-            state.inner.resident_dispatch.start_timeout,
-            reqwest::StatusCode::OK,
-        )
+        .start_run(&daemon_url, &run_id, &start_auth.encoded, &start)
         .await;
     let start_response = match start_result {
         Ok(response) => response,
@@ -4098,11 +4139,10 @@ async fn revoke_approval(
             "retained resident origin did not match its immutable grant target",
         ));
     }
-    let caller = state.inner.resident_dispatch.signed_caller(
-        &record.tenant_id,
-        &target.instance_id,
-        EndpointScope::ApprovalReceiptsRevoke,
-    )?;
+    let caller = state
+        .inner
+        .resident_dispatch
+        .approval_receipt_revocation_caller(&record.tenant_id, &target.instance_id)?;
     let revocation = ResidentApprovalReceiptRevocationRequest {
         schema_version: RESIDENT_APPROVAL_RECEIPT_REVOCATION_SCHEMA_VERSION.to_string(),
         authority_obligation_receipt: receipt.clone(),
@@ -4114,20 +4154,15 @@ async fn revoke_approval(
             "resident revocation request could not be serialized",
         )
     })?;
-    let path = format!(
-        "/runs/{}/approval-receipts/{}/revoke",
-        record.run_id, receipt.receipt_id
-    );
     let response: ResidentHttpResponse<ResidentApprovalReceiptRevocationAck> = match state
         .inner
         .resident_dispatch
-        .post_json(
+        .revoke_approval_receipt(
             &target.resident_daemon_url,
-            &path,
+            &record.run_id,
+            &receipt.receipt_id,
             &caller.encoded,
             &body,
-            state.inner.resident_dispatch.start_timeout,
-            reqwest::StatusCode::OK,
         )
         .await
     {
@@ -4522,11 +4557,10 @@ async fn activate_kill_switch(
             .inner
             .resident_dispatch
             .validate_base_url(&target.daemon_url)?;
-        let caller = state.inner.resident_dispatch.signed_caller(
-            tenant_id,
-            &target.instance_id,
-            EndpointScope::RunsStop,
-        )?;
+        let caller = state
+            .inner
+            .resident_dispatch
+            .cancel_run_caller(tenant_id, &target.instance_id)?;
         let audit = resident_audit(&caller.credential);
         let payload = serde_json::json!({
             "credential": caller.credential,
@@ -4537,14 +4571,7 @@ async fn activate_kill_switch(
         let response: ResidentHttpResponse<crate::RunInspectResponse> = state
             .inner
             .resident_dispatch
-            .post_json(
-                &target.daemon_url,
-                &format!("/runs/{run_id}/cancel"),
-                &caller.encoded,
-                &payload,
-                state.inner.resident_dispatch.create_timeout,
-                reqwest::StatusCode::OK,
-            )
+            .cancel_run(&target.daemon_url, run_id, &caller.encoded, &payload)
             .await
             .map_err(|error| resident_http_error("cancel", error, false))?;
         cancel_status = Some(response.status);
@@ -5397,6 +5424,12 @@ struct ResidentHttpResponse<T> {
     value: T,
 }
 
+#[derive(Debug)]
+struct ResidentRawHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
 struct DispatchReservation {
     inner: Arc<ManagerInner>,
     work_order_id: String,
@@ -5569,22 +5602,123 @@ impl ResidentDispatchClient {
         })
     }
 
-    async fn post_json<T: for<'de> Deserialize<'de> + Serialize>(
+    fn create_run_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signed_caller(tenant_id, instance_id, ResidentCallerOperation::CreateRun)
+    }
+
+    fn start_run_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signed_caller(tenant_id, instance_id, ResidentCallerOperation::StartRun)
+    }
+
+    fn approval_receipt_revocation_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signed_caller(
+            tenant_id,
+            instance_id,
+            ResidentCallerOperation::RevokeApprovalReceipt,
+        )
+    }
+
+    fn cancel_run_caller(
+        &self,
+        tenant_id: &TenantId,
+        instance_id: &InstanceId,
+    ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
+        self.signed_caller(tenant_id, instance_id, ResidentCallerOperation::CancelRun)
+    }
+
+    async fn create_run(
         &self,
         base_url: &str,
-        path: &str,
         token: &str,
         body: &serde_json::Value,
-        timeout: StdDuration,
-        expected_status: reqwest::StatusCode,
-    ) -> Result<ResidentHttpResponse<T>, ResidentHttpError> {
+    ) -> Result<ResidentHttpResponse<ResidentCreateRunResponse>, ResidentHttpError> {
+        decode_resident_response(
+            self.execute_operation(base_url, token, body, ResidentDispatchOperation::CreateRun)
+                .await?,
+        )
+    }
+
+    async fn start_run(
+        &self,
+        base_url: &str,
+        run_id: &RunId,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<ResidentHttpResponse<ResidentTickResponse>, ResidentHttpError> {
+        decode_resident_response(
+            self.execute_operation(
+                base_url,
+                token,
+                body,
+                ResidentDispatchOperation::StartRun { run_id },
+            )
+            .await?,
+        )
+    }
+
+    async fn revoke_approval_receipt(
+        &self,
+        base_url: &str,
+        run_id: &RunId,
+        receipt_id: &AuthorityObligationReceiptId,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<ResidentHttpResponse<ResidentApprovalReceiptRevocationAck>, ResidentHttpError> {
+        decode_resident_response(
+            self.execute_operation(
+                base_url,
+                token,
+                body,
+                ResidentDispatchOperation::RevokeApprovalReceipt { run_id, receipt_id },
+            )
+            .await?,
+        )
+    }
+
+    async fn cancel_run(
+        &self,
+        base_url: &str,
+        run_id: &RunId,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<ResidentHttpResponse<crate::RunInspectResponse>, ResidentHttpError> {
+        decode_resident_response(
+            self.execute_operation(
+                base_url,
+                token,
+                body,
+                ResidentDispatchOperation::CancelRun { run_id },
+            )
+            .await?,
+        )
+    }
+
+    async fn execute_operation(
+        &self,
+        base_url: &str,
+        token: &str,
+        body: &serde_json::Value,
+        operation: ResidentDispatchOperation<'_>,
+    ) -> Result<ResidentRawHttpResponse, ResidentHttpError> {
         let mut url = reqwest::Url::parse(base_url).map_err(|_| ResidentHttpError::InvalidUrl)?;
         validate_resident_url(&url, self.allow_loopback_http, &self.allowed_origins)?;
         let base_path = url.path().trim_end_matches('/');
-        url.set_path(&format!("{base_path}{path}"));
+        url.set_path(&format!("{base_path}{}", operation.path()));
         url.set_query(None);
         url.set_fragment(None);
-        tokio::time::timeout(timeout, async {
+        tokio::time::timeout(operation.timeout(self), async {
             let response = self
                 .http
                 .post(url)
@@ -5600,7 +5734,7 @@ impl ResidentDispatchClient {
                 })?;
             let status = response.status();
             let bytes = read_bounded_response(response, self.maximum_response_bytes).await?;
-            if status != expected_status {
+            if status != operation.expected_status() {
                 let upstream_code = serde_json::from_slice::<ApiErrorBody>(&bytes)
                     .ok()
                     .and_then(|error| bounded_upstream_code(error.code));
@@ -5609,14 +5743,9 @@ impl ResidentDispatchClient {
                     upstream_code,
                 });
             }
-            let value =
-                serde_json::from_slice(&bytes).map_err(|_| ResidentHttpError::InvalidResponse)?;
-            let body =
-                serde_json::to_string(&value).map_err(|_| ResidentHttpError::InvalidResponse)?;
-            Ok(ResidentHttpResponse {
+            Ok(ResidentRawHttpResponse {
                 status: status.as_u16(),
-                body,
-                value,
+                body: bytes,
             })
         })
         .await
@@ -5630,13 +5759,13 @@ impl ResidentDispatchClient {
         &self,
         tenant_id: &TenantId,
         instance_id: &InstanceId,
-        scope: EndpointScope,
+        operation: ResidentCallerOperation,
     ) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
         self.signer
             .sign(
                 tenant_id,
                 instance_id,
-                vec![scope],
+                vec![operation.endpoint_scope()],
                 OffsetDateTime::now_utc(),
                 Duration::seconds(60),
             )
@@ -5647,6 +5776,19 @@ impl ResidentDispatchClient {
                 )
             })
     }
+}
+
+fn decode_resident_response<T: for<'de> Deserialize<'de> + Serialize>(
+    response: ResidentRawHttpResponse,
+) -> Result<ResidentHttpResponse<T>, ResidentHttpError> {
+    let value =
+        serde_json::from_slice(&response.body).map_err(|_| ResidentHttpError::InvalidResponse)?;
+    let body = serde_json::to_string(&value).map_err(|_| ResidentHttpError::InvalidResponse)?;
+    Ok(ResidentHttpResponse {
+        status: response.status,
+        body,
+        value,
+    })
 }
 
 async fn read_bounded_response(
@@ -5828,14 +5970,6 @@ fn telemetry_run_status(status: &crate::RunStatus) -> RunStatus {
         crate::RunStatus::Denied => RunStatus::Denied,
         crate::RunStatus::Expired => RunStatus::Expired,
     }
-}
-
-fn resident_credential(
-    signer: &ResidentDispatchClient,
-    instance_id: &InstanceId,
-    tenant_id: &TenantId,
-) -> Result<crate::caller_auth::SignedCallerToken, ManagerApiError> {
-    signer.signed_caller(tenant_id, instance_id, EndpointScope::RunsCreate)
 }
 
 fn resident_audit(credential: &CallerCredential) -> serde_json::Value {
@@ -6069,7 +6203,7 @@ mod tests {
                 run_id: Some(RunId::parse("44444444-4444-4444-8444-444444444445").expect("run")),
                 objective: "admit a resident run without synthesizing policy actions".to_string(),
                 allowed_actions: vec!["daemon.record".to_string()],
-                allowed_adapters: vec!["daemon.recording".to_string()],
+                allowed_adapters: vec!["resident.test".to_string()],
                 allowed_permissions: vec!["fixture.execute".to_string()],
                 data_refs: Vec::new(),
                 quotas: WorkOrderQuotaPolicy::default(),
@@ -6099,7 +6233,7 @@ mod tests {
             tenant_id: work_order.work_order.tenant_id.clone(),
             agent_id: Some(work_order.work_order.agent_id.clone()),
             action_name: Some("daemon.record".to_string()),
-            adapter: Some("daemon.recording".to_string()),
+            adapter: Some("resident.test".to_string()),
             required_permission: Some("fixture.execute".to_string()),
             side_effect_class: None,
             risk_level: Some("high".to_string()),
@@ -9766,7 +9900,7 @@ mod tests {
             .first()
             .expect("profile");
         assert_eq!(profile["name"], "daemon.record");
-        assert_eq!(profile["adapter"], "daemon.recording");
+        assert_eq!(profile["adapter"], "resident.test");
         assert_eq!(
             profile["required_permissions"],
             serde_json::json!(["fixture.execute"])
@@ -12425,29 +12559,19 @@ mod tests {
         );
         assert!(bounded_upstream_code("x".repeat(129)).is_none());
         assert!(bounded_upstream_code("unsafe code\n".to_string()).is_none());
-        let app = Router::new()
-            .route(
-                "/redirect",
-                post(|| async {
-                    (
+        let app = Router::new().route(
+            "/runs",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                match body.get("case").and_then(serde_json::Value::as_str) {
+                    Some("redirect") => (
                         StatusCode::TEMPORARY_REDIRECT,
                         [(axum::http::header::LOCATION, "http://127.0.0.1:1/never")],
                         Json(serde_json::json!({"redirect": true})),
                     )
-                }),
-            )
-            .route(
-                "/large",
-                post(|| async { (StatusCode::OK, "x".repeat(1024)) }),
-            )
-            .route(
-                "/malformed",
-                post(|| async { (StatusCode::OK, "not-json") }),
-            )
-            .route(
-                "/extra",
-                post(|| async {
-                    Json(serde_json::json!({
+                        .into_response(),
+                    Some("large") => (StatusCode::OK, "x".repeat(1024)).into_response(),
+                    Some("malformed") => (StatusCode::OK, "not-json").into_response(),
+                    Some("extra") => Json(serde_json::json!({
                         "request_id": "request",
                         "idempotency_key": "idempotency",
                         "idempotency_receipt_id": "receipt",
@@ -12456,8 +12580,11 @@ mod tests {
                         "status": "pending",
                         "reflected_authorization": "must-not-be-retained"
                     }))
-                }),
-            );
+                    .into_response(),
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("transport listener");
@@ -12490,18 +12617,15 @@ mod tests {
         let caller = state
             .inner
             .resident_dispatch
-            .signed_caller(&tenant_id, &instance_id, EndpointScope::RunsCreate)
+            .create_run_caller(&tenant_id, &instance_id)
             .expect("transport caller");
         let redirected = state
             .inner
             .resident_dispatch
-            .post_json::<serde_json::Value>(
+            .create_run(
                 &base_url,
-                "/redirect",
                 &caller.encoded,
-                &serde_json::json!({}),
-                StdDuration::from_secs(1),
-                reqwest::StatusCode::OK,
+                &serde_json::json!({"case": "redirect"}),
             )
             .await
             .expect_err("redirect is returned, never followed");
@@ -12513,13 +12637,10 @@ mod tests {
         let oversized = state
             .inner
             .resident_dispatch
-            .post_json::<serde_json::Value>(
+            .create_run(
                 &base_url,
-                "/large",
                 &caller.encoded,
-                &serde_json::json!({}),
-                StdDuration::from_secs(1),
-                reqwest::StatusCode::OK,
+                &serde_json::json!({"case": "large"}),
             )
             .await
             .expect_err("large response rejected before decoding");
@@ -12527,13 +12648,10 @@ mod tests {
         let malformed = state
             .inner
             .resident_dispatch
-            .post_json::<serde_json::Value>(
+            .create_run(
                 &base_url,
-                "/malformed",
                 &caller.encoded,
-                &serde_json::json!({}),
-                StdDuration::from_secs(1),
-                reqwest::StatusCode::OK,
+                &serde_json::json!({"case": "malformed"}),
             )
             .await
             .expect_err("malformed success is never accepted");
@@ -12541,13 +12659,10 @@ mod tests {
         let unknown_field = state
             .inner
             .resident_dispatch
-            .post_json::<ResidentCreateRunResponse>(
+            .create_run(
                 &base_url,
-                "/extra",
                 &caller.encoded,
-                &serde_json::json!({}),
-                StdDuration::from_secs(1),
-                reqwest::StatusCode::OK,
+                &serde_json::json!({"case": "extra"}),
             )
             .await
             .expect_err("unknown success fields are never accepted or retained");

@@ -183,10 +183,7 @@ fn adapter_failure_returns_traceable_failed_outcome() {
     let outcome = gateway.submit(request("dock")).expect("outcome");
     assert_eq!(outcome.status, ActionStatus::Failed);
     assert_eq!(adapter.call_count(), 1);
-    assert!(outcome
-        .error
-        .unwrap()
-        .contains("simulated robotics middleware failure"));
+    assert_eq!(outcome.error.as_deref(), Some("adapter failed"));
     assert!(outcome.verification.artifacts["safety"].is_object());
 }
 

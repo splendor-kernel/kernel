@@ -1,3 +1,5 @@
+mod support;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
@@ -6,13 +8,16 @@ use splendor_daemon::caller_auth::{
     CallerTokenSigner, CallerTokenTrustSnapshot, CallerTokenVerifier,
 };
 use splendor_daemon::{
-    router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonActionCandidate, DaemonConfig,
-    DaemonState, DevicePolicyCacheStatus, DeviceRuntimeProfile, DeviceTraceBufferStatus,
-    LifecycleRequest, OperatorInterventionEvidence, RegisterDeviceProfileRequest, RegisteredAction,
-    ReplayResponse, RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest,
-    SubmitPhysicalActionRequest, TickResponse, TracePageResponse,
+    router, ApiErrorBody, ConfiguredActionAdapters, CreateRunRequest, CreateRunResponse,
+    DaemonActionCandidate, DaemonConfig, DaemonState, DevicePolicyCacheStatus,
+    DeviceRuntimeProfile, DeviceTraceBufferStatus, LifecycleRequest, OperatorInterventionEvidence,
+    RegisterDeviceProfileRequest, RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus,
+    SafetyContext, SubmitActionRequest, SubmitPhysicalActionRequest, TickResponse,
+    TracePageResponse,
 };
-use splendor_gateway::{ActionOutcome, ActionStatus};
+use splendor_gateway::{
+    ActionAdapter, ActionOutcome, ActionRequest, ActionStatus, AdapterError, AdapterResult,
+};
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{
@@ -24,10 +29,8 @@ use splendor_types::{
     WorkOrderPlacement, WorkOrderQuotaPolicy, FORBIDDEN_PHYSICAL_ACTION_PATTERNS,
     WORK_ORDER_SCHEMA_VERSION,
 };
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
@@ -35,85 +38,61 @@ const ACTION: &str = "fixture.write";
 const ADAPTER: &str = "fixture.local";
 const PERMISSION: &str = "fixture.write";
 
-static DEVICE_SIM_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct DeviceSimEnvGuard {
-    _lock: MutexGuard<'static, ()>,
+struct BlockingActionAdapter {
+    adapter_id: String,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
 }
 
-impl DeviceSimEnvGuard {
-    fn disabled() -> Self {
-        let lock = DEVICE_SIM_ENV_LOCK
+impl ActionAdapter for BlockingActionAdapter {
+    fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+        self.entered
             .lock()
-            .expect("device simulator env lock");
-        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
-        Self { _lock: lock }
-    }
-
-    fn enabled(url: &str) -> Self {
-        let lock = DEVICE_SIM_ENV_LOCK
+            .map_err(|_| AdapterError::Failed("blocking_adapter_poisoned".to_string()))?
+            .take()
+            .ok_or_else(|| AdapterError::Failed("blocking_adapter_reentered".to_string()))?
+            .send(())
+            .map_err(|_| AdapterError::Failed("blocking_adapter_signal_failed".to_string()))?;
+        self.release
             .lock()
-            .expect("device simulator env lock");
-        std::env::set_var("SPLENDOR_DEVICE_SIM_URL", url);
-        Self { _lock: lock }
+            .map_err(|_| AdapterError::Failed("blocking_adapter_poisoned".to_string()))?
+            .recv()
+            .map_err(|_| AdapterError::Failed("blocking_adapter_release_failed".to_string()))?;
+        Ok(AdapterResult {
+            output: json!({
+                "schema_version": "splendor.test.provider_receipt.v1",
+                "provider_receipt_id": format!("blocking-provider:{}", action.action_id),
+                "adapter_id": self.adapter_id,
+                "action_id": action.action_id,
+                "action_name": action.action.name,
+                "accepted": true,
+            }),
+            satisfied_postconditions: action.action.postconditions.clone(),
+        })
     }
 }
 
-impl Drop for DeviceSimEnvGuard {
-    fn drop(&mut self) {
-        std::env::remove_var("SPLENDOR_DEVICE_SIM_URL");
-    }
-}
-
-fn spawn_blocking_device_sim() -> (
-    String,
+fn blocking_action_adapters(
+    adapter_id: &str,
+) -> (
+    ConfiguredActionAdapters,
     mpsc::Receiver<()>,
     mpsc::Sender<()>,
-    std::thread::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind blocking device simulator");
-    let address = listener.local_addr().expect("device simulator address");
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept adapter request");
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .expect("set adapter request timeout");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 512];
-        loop {
-            let read = stream.read(&mut buffer).expect("read adapter request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-            else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            if request.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-        entered_tx.send(()).expect("adapter entered signal");
-        release_rx.recv().expect("adapter release signal");
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-            )
-            .expect("write simulator response");
-    });
-    (format!("http://{address}"), entered_rx, release_tx, server)
+    let mut adapters = ConfiguredActionAdapters::new();
+    adapters
+        .insert(
+            adapter_id,
+            Arc::new(BlockingActionAdapter {
+                adapter_id: adapter_id.to_string(),
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .expect("blocking action adapter");
+    (adapters, entered_rx, release_tx)
 }
 
 #[derive(Default)]
@@ -696,8 +675,7 @@ async fn assert_direct_action_trace(
 
 #[tokio::test]
 async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
-    let _device_sim_env = DeviceSimEnvGuard::disabled();
-    let state = DaemonState::local_dev();
+    let state = support::local_state(&[ADAPTER]);
     let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1011,9 +989,10 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
     assert_eq!(inspect(app, &expiring.run_id).await.adapter_executions, 0);
 
     let failing_store = Arc::new(FailingAuthorityEvidenceStore::default());
-    let failing_state = DaemonState::with_trace_store(
+    let failing_state = support::state_with_trace_store(
         DaemonConfig::local_dev(),
         failing_store.clone() as Arc<dyn TraceStore>,
+        &[ADAPTER],
     );
     let failing_app = router(failing_state);
     let failing_tenant = TenantId::new();
@@ -1057,7 +1036,6 @@ async fn public_daemon_paths_enforce_live_c02_authority_evidence_and_replay() {
 
 #[tokio::test]
 async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
-    let _device_sim_env = DeviceSimEnvGuard::disabled();
     let app = router(DaemonState::local_dev());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1127,7 +1105,6 @@ async fn run_admission_rejects_ambiguous_or_narrowed_compatibility_profiles() {
 
 #[tokio::test]
 async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
-    let _device_sim_env = DeviceSimEnvGuard::disabled();
     let instance_id = InstanceId::new();
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1156,12 +1133,15 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
     );
     let verifier = CallerTokenVerifier::new(trust, instance_id.clone()).expect("verifier");
     let local = DaemonConfig::local_dev();
-    let state = DaemonState::new(DaemonConfig::resident(
-        instance_id.clone(),
-        verifier,
-        local.work_order_keyring,
-        local.policy_bundle_keyring,
-    ));
+    let state = support::state(
+        DaemonConfig::resident(
+            instance_id.clone(),
+            verifier,
+            local.work_order_keyring,
+            local.policy_bundle_keyring,
+        ),
+        &[ADAPTER],
+    );
     let app = router(state.clone());
     let signed = signer
         .sign(
@@ -1482,17 +1462,13 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
 async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator() {
     const CANARY: &str = "C03_PHYSICAL_RAW_CREDENTIAL_CANARY";
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind credential guard simulator");
-    listener
-        .set_nonblocking(true)
-        .expect("set simulator nonblocking");
-    let simulator_url = format!(
-        "http://{}",
-        listener.local_addr().expect("simulator address")
-    );
-    let device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
     let trace_store = Arc::new(InMemoryTraceStore::default());
-    let state = DaemonState::with_trace_store(DaemonConfig::local_dev(), trace_store.clone());
+    let (adapters, provider_entered, provider_release) = blocking_action_adapters("device-sim");
+    let state = DaemonState::with_trace_store_and_action_adapters(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+        adapters,
+    );
     let app = router(state.clone());
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1573,10 +1549,10 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
             .expect("post-profile-denial authority evaluation count"),
         profile_denial_evaluations
     );
-    let simulator_error = listener
-        .accept()
-        .expect_err("rejected profile must not reach simulator");
-    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
 
     let (status, _registered): (StatusCode, Value) = call_json(
         app.clone(),
@@ -1627,10 +1603,10 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
             .expect("post-denial authority evaluation count"),
         evaluations_before
     );
-    let simulator_error = listener
-        .accept()
-        .expect_err("raw credential denial must not contact simulator");
-    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
 
     let mut denied_action_ids = vec![action_id.clone()];
     for field in [
@@ -1695,10 +1671,10 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
             .expect("denial serializes")
             .contains(&canary));
         denied_action_ids.push(envelope_action_id);
-        let simulator_error = listener
-            .accept()
-            .expect_err("physical envelope denial must not contact simulator");
-        assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            provider_entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
     assert_eq!(
         inspect(app.clone(), &created.run_id)
@@ -1775,21 +1751,27 @@ async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator()
         evaluations_before_replay
     );
 
-    drop(device_sim_env);
-    drop(listener);
-    let _device_sim_disabled = DeviceSimEnvGuard::disabled();
+    provider_release
+        .send(())
+        .expect("release credential-free provider call");
     let safe = physical_submit_request(&created, tenant_id, agent_id, causal_trace_id);
     let (status, executed): (StatusCode, ActionOutcome) =
         call_json(app.clone(), Method::POST, &uri, safe).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(executed.status, ActionStatus::Executed);
+    provider_entered
+        .try_recv()
+        .expect("credential-free action reaches configured provider");
+    assert!(matches!(
+        provider_entered.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
     assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
 }
 
 #[tokio::test]
 async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
-    let _device_sim_env = DeviceSimEnvGuard::disabled();
-    let app = router(DaemonState::local_dev());
+    let app = router(support::local_state(&["device-sim"]));
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
     let node_id = NodeId::new();
@@ -1934,9 +1916,9 @@ async fn physical_approval_uses_exact_one_use_receipt_and_never_legacy_grant() {
 }
 
 async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: bool) {
-    let (simulator_url, entered, release, simulator) = spawn_blocking_device_sim();
-    let _device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
-    let state = DaemonState::local_dev();
+    let adapter_id = if physical { "device-sim" } else { ADAPTER };
+    let (adapters, entered, release) = blocking_action_adapters(adapter_id);
+    let state = DaemonState::with_action_adapters(DaemonConfig::local_dev(), adapters);
     let app = router(state);
     let tenant_id = TenantId::new();
     let agent_id = AgentId::new();
@@ -1958,17 +1940,17 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
             false,
         )
     };
-    let other_create = create_request(
-        if physical {
-            "wo_c02_physical_other_run"
-        } else {
-            "wo_c02_direct_other_run"
-        },
-        other_tenant_id,
-        other_agent_id,
-        OffsetDateTime::now_utc() + Duration::minutes(5),
-        false,
-    );
+    let other_create = if physical {
+        physical_create_request("wo_c02_physical_other_run", other_tenant_id, other_agent_id)
+    } else {
+        create_request(
+            "wo_c02_direct_other_run",
+            other_tenant_id,
+            other_agent_id,
+            OffsetDateTime::now_utc() + Duration::minutes(5),
+            false,
+        )
+    };
     let (status, primary): (StatusCode, CreateRunResponse) =
         call_json(app.clone(), Method::POST, "/runs", primary_create).await;
     assert_eq!(status, StatusCode::OK);
@@ -2093,7 +2075,6 @@ async fn assert_blocked_handler_lifecycle_linearization(physical: bool, cancel: 
     assert_eq!(error.code, "run_not_effect_capable");
 
     release.send(()).expect("release blocking adapter");
-    simulator.join().expect("blocking simulator");
     let (status, outcome) = action_task.await.expect("action task");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(outcome.status, ActionStatus::Executed, "{outcome:?}");

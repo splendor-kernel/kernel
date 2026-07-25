@@ -18,6 +18,12 @@ from canonical_fleet_profiles import (  # noqa: E402
     CLOUD_INSTANCE_FEATURES,
     CLOUD_NODE_CAPABILITIES,
 )
+from acceptance_provider_evidence import (  # noqa: E402
+    provider_effect_state,
+    read_provider_evidence,
+)
+from acceptance_provider_output import project_private_v3_output  # noqa: E402
+from acceptance_scenario_expectations import expectation_for  # noqa: E402
 from resident_http import request_json_no_redirect  # noqa: E402
 
 FLEET_ID = "00000000-0000-4000-8000-000000000104"
@@ -39,6 +45,7 @@ SECRET = "splendor-local-work-order-secret"
 CLOUD_WORK_ORDER_KEY_ID = "work-order-acceptance-cloud"
 RUNTIME_IMAGE_IDENTITY = "splendor-kernel-runtime:acceptance-target-runtime"
 ARTIFACT_SECRET_KEYS = {"authorization", "bearer", "signature", "token"}
+ARTIFACT_REF = f"artifact://{TENANT_ID}/governance/uc-e2e-s5.md"
 
 
 def utc(offset_minutes: int = 0) -> str:
@@ -79,6 +86,10 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
         context,
         timeout=20,
     )
+
+
+def provider_counters(base_url: str) -> dict[str, Any]:
+    return read_provider_evidence(base_url)
 
 
 def splendorctl(root: Path) -> list[str]:
@@ -247,14 +258,15 @@ def sign_resident_work_order(root: Path, artifact_dir: Path, commands: Path, aut
 
 
 def action(name: str) -> dict[str, Any]:
+    create = name == "artifact.create_internal"
     return {
         "name": name,
-        "params": {"artifact": "uc-e2e-s5", "external": name.endswith("external")},
+        "params": {"artifact_path" if create else "publish_ref": ARTIFACT_REF},
         "side_effect_class": "External",
         "cost_estimate": None,
         "required_permissions": [name],
         "preconditions": [],
-        "postconditions": [],
+        "postconditions": ["artifact_created" if create else "artifact_published"],
     }
 
 
@@ -387,6 +399,7 @@ def main() -> int:
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--base-url", default="http://splendor-daemon-local:8080")
     parser.add_argument("--manager-url", default="http://central-manager:8081")
+    parser.add_argument("--action-provider-url", default="http://acceptance-action-provider:8086")
     parser.add_argument("--cloud-url", default="https://resident-cloud-node:8091")
     parser.add_argument("--resident-auth-dir", default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"))
     parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-root-ca.pem"))
@@ -526,6 +539,10 @@ def main() -> int:
     internal_cred = daemon_credential(INTERNAL_RUN_ID)
     internal_start = call("startRun", "POST", args.base_url, f"/runs/{INTERNAL_RUN_ID}/start", {"credential": internal_cred, "audit_attribution": audit(internal_cred), "reason": "uc_e2e_s5_internal_artifact"})
     internal = require_action_outcome("internal startRun", internal_start)
+    internal_projection = project_private_v3_output(
+        internal,
+        expectation=expectation_for("UC-E2E-S5", "internal_artifact"),
+    )
     internal_state_head = call("getStateHead", "GET", args.base_url, f"/runs/{INTERNAL_RUN_ID}/state-head", headers=credential_header(internal_cred))
 
     envelope = sign_work_order(root, artifact_dir, commands, work_order(RUN_ID))
@@ -538,6 +555,7 @@ def main() -> int:
     pending_traces = call("getRunTraces", "GET", args.base_url, f"/runs/{RUN_ID}/traces?redaction_policy=uc-e2e-s5-redacted", headers=credential_header(daemon_cred))
     require_status("getRunTraces", pending_traces, 200)
     pending_causal_trace_id = first_trace_event_id(pending_traces["body"].get("records", []))
+    provider_before_publish = provider_counters(args.action_provider_url)
     forged_legacy = {
         "schema_version": "splendor.approval_evidence.v1",
         "approval_id": approval_context["approval_id"],
@@ -556,6 +574,7 @@ def main() -> int:
     }
     forged_legacy_retry = call("submitAction", "POST", args.base_url, "/actions", {"action_id": approval_context["action_id"], "run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": daemon_cred, "audit_attribution": audit(daemon_cred), "causal_trace_id": pending_causal_trace_id, "action": action("artifact.publish_external"), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": [], "requested_at": approval_context["requested_at"], "approval_evidence": forged_legacy})
     after_forged_legacy = call("inspectRun", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(daemon_cred))
+    provider_after_forged_legacy = provider_counters(args.action_provider_url)
     approval_request = manager_approval_call("requestApproval", "/approvals", approval_request_payload(sec(manager_cred), approval_context, "external publication requested"))
     approval_grant = manager_approval_call("grantApproval", f"/approvals/{approval_context['approval_id']}/grant", {"reason": "approved_for_uc_e2e_s5"})
     evidence = approval_grant["body"].get("evidence")
@@ -564,6 +583,23 @@ def main() -> int:
         raise SystemExit("manager grant did not issue a trusted approval obligation receipt")
     receipt_resume_rejected = call("resumeRun", "POST", args.base_url, f"/runs/{RUN_ID}/resume", {"credential": daemon_cred, "work_order": envelope, "audit_attribution": audit(daemon_cred), "reason": "receipt must retry exact action", "authority_obligation_receipts": [authority_receipt]})
     approved_retry = call("submitAction", "POST", args.base_url, "/actions", {"action_id": approval_context["action_id"], "run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "credential": daemon_cred, "audit_attribution": audit(daemon_cred), "causal_trace_id": approval_grant["body"].get("trace_event_id"), "action": action("artifact.publish_external"), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": [], "requested_at": approval_context["requested_at"], "authority_obligation_receipts": [authority_receipt]})
+    publish_projection = project_private_v3_output(
+        approved_retry["body"],
+        expectation=expectation_for("UC-E2E-S5", "approved_publish"),
+    )
+    provider_after_publish = provider_counters(args.action_provider_url)
+    publish_provider_delta = (
+        provider_after_publish.get("by_action", {}).get("artifact.publish_external", 0)
+        - provider_before_publish.get("by_action", {}).get("artifact.publish_external", 0)
+    )
+    publish_provider_receipt = next(
+        (
+            receipt
+            for receipt in provider_after_publish.get("receipts", [])
+            if receipt.get("action_id") == approval_context["action_id"]
+        ),
+        {},
+    )
     state_head = call("getStateHead", "GET", args.base_url, f"/runs/{RUN_ID}/state-head", headers=credential_header(daemon_cred))
 
     before_expired_raw = call("inspectRunBeforeExpiredRaw", "GET", args.base_url, f"/runs/{RUN_ID}", headers=credential_header(daemon_cred))
@@ -794,14 +830,16 @@ def main() -> int:
     kill_traces = call("exportTraces", "POST", args.cloud_url, f"/runs/{KILL_RUN_ID}/traces/export", {"credential": kill_trace_cred, "audit_attribution": audit(kill_trace_cred), "redaction_policy": "uc-e2e-s5-redacted", "start": None, "end": None}, resident_credential_header(kill_trace_auth))
     ttl_traces = call("exportTraces", "POST", args.base_url, f"/runs/{ttl_run_id}/traces/export", {"credential": ttl_cred, "audit_attribution": audit(ttl_cred), "redaction_policy": "uc-e2e-s5-redacted", "start": None, "end": None})
     uncertainty_traces = call("exportTraces", "POST", args.base_url, "/runs/44444444-4444-4444-8444-444444445045/traces/export", {"credential": uncertain_cred, "audit_attribution": audit(uncertain_cred), "redaction_policy": "uc-e2e-s5-redacted", "start": None, "end": None})
+    provider_before_replay = provider_counters(args.action_provider_url)
     replay = call("replayRun", "POST", args.base_url, f"/runs/{RUN_ID}/replay", {"credential": daemon_cred, "audit_attribution": audit(daemon_cred), "mode": "inspect_only", "side_effects_allowed": False})
+    provider_after_replay = provider_counters(args.action_provider_url)
     audit_export = call("exportGovernanceAudit", "POST", args.manager_url, "/governance/audit/export", {**sec(manager_cred), "run_id": RUN_ID})
     revoke_audit_export = call("exportRevocableGovernanceAudit", "POST", args.manager_url, "/governance/audit/export", {**sec(manager_cred), "run_id": REVOKE_RUN_ID})
 
     records = internal_traces["body"].get("records", []) + traces["body"].get("records", []) + expire_traces["body"].get("records", []) + revoke_traces["body"].get("records", []) + deny_traces["body"].get("records", []) + cb_traces["body"].get("records", []) + kill_traces["body"].get("records", []) + ttl_traces["body"].get("records", []) + uncertainty_traces["body"].get("records", [])
     manager_events = audit_export["body"].get("events", [])
     event_ids = trace_event_id_map(records, manager_events)
-    external_executions = [approved_retry["body"]] if approved_retry["body"].get("status") == "Executed" and approved_retry["body"].get("output", {}).get("action") == "artifact.publish_external" else []
+    external_executions = [approved_retry["body"]] if approved_retry["body"].get("status") == "Executed" and publish_projection.get("operation_id") == "artifact-store/artifact.publish_external" else []
     cb_denied_breaker = cb_submit["body"].get("verification", {}).get("artifacts", {}).get("circuit_breaker", {})
     cb_denied_breaker_id = cb_denied_breaker.get("breaker_id") or cb_denied_breaker.get("circuit_breaker", {}).get("breaker_id")
     ttl_trace_ids = trace_event_id_map(ttl_traces["body"].get("records", []), {})
@@ -874,7 +912,7 @@ def main() -> int:
         {"case": "approval_denial_blocks_pending_action", "passed": denial["body"].get("status") == "denied" and deny_resume["status"] == 200 and deny_resume["body"].get("status") == "Denied" and deny_resume["body"].get("error") == "approval_denied" and deny_resume["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "denied" and deny_resume["body"].get("output") is None, "reason_code": "operator_denied_publication"},
         {"case": "expired_approval_cannot_authorize_execution", "passed": expired_raw_rejection["status"] == 409 and expired_raw_rejection["body"].get("code") == "legacy_approval_evidence_non_authorizing" and before_expired_raw["body"].get("status") == "running" and expired_raw_lifecycle_unchanged and before_expired_trace_ids == after_expired_trace_ids and not expired_raw_approval_trace_records and active_expired_raw_evidence["adapter_effect_delta"] == 0 and expired["body"].get("status") == "Denied" and expired["body"].get("verification", {}).get("artifacts", {}).get("approval_status") == "expired" and expired["body"].get("output") is None and expire_after["body"].get("status") == "expired" and expire_after["body"].get("adapter_executions") == 0, "boundary": "active_rejection_and_exact_waiting_fail_closed", "reason_code": "approval_expired"},
         {"case": "revoked_approval_cannot_authorize_execution", "passed": revoked["status"] == 200 and revoked_denial.get("status") == "Denied" and "authority_obligation_receipt_revoked" in revoked_denial.get("verification", {}).get("reasons", []) and revoked_denial.get("output") is None and resident_revocation_exact and resident_revocation_security_valid and revoke_lifecycle_unchanged and revoke_state_unchanged and set(revoke_adapter_effects.values()) == {0} and not revoke_execution_traces, "reason_code": "authority_obligation_receipt_revoked", "resident_ack_status": resident_revocation_ack.get("status")},
-        {"case": "forged_legacy_grant_has_zero_effect", "passed": forged_legacy_retry["status"] == 409 and forged_legacy_retry["body"].get("code") == "legacy_approval_evidence_non_authorizing" and after_forged_legacy["body"].get("adapter_executions") == 0 and after_forged_legacy["body"].get("status") == "waiting_for_approval"},
+        {"case": "forged_legacy_grant_has_zero_effect", "passed": forged_legacy_retry["status"] == 409 and forged_legacy_retry["body"].get("code") == "legacy_approval_evidence_non_authorizing" and after_forged_legacy["body"].get("adapter_executions") == 0 and after_forged_legacy["body"].get("status") == "waiting_for_approval" and provider_effect_state(provider_before_publish) == provider_effect_state(provider_after_forged_legacy)},
         {"case": "receipt_resume_does_not_tick", "passed": receipt_resume_rejected["status"] == 409 and receipt_resume_rejected["body"].get("code") == "approval_receipt_resume_not_supported"},
         {"case": "missing_policy_bundle_fails_closed", "passed": missing_policy["status"] == 400 and missing_policy["body"].get("code") == "missing_policy_bundle"},
         {"case": "expired_policy_bundle_fails_closed", "passed": expired_policy_create["status"] == 403 and expired_policy_create["body"].get("code") == "expired_policy_bundle" and ttl_create["status"] == 200 and ttl_start["status"] == 200 and ttl_policy_artifacts.get("policy_bundle_id") == "policy_uc_e2e_s5_runtime_expiry" and ttl_policy_artifacts.get("action") == "artifact.publish_external" and bool(ttl_trace_ids.get("policy.expired"))},
@@ -891,15 +929,15 @@ def main() -> int:
         "policy_status_publicly_read": policy_status["status"] == 200,
         "internal_artifact_run_created": internal_create["status"] == 200,
         "run_created": create["status"] == 200,
-        "internal_artifact_executed": internal.get("status") == "Executed" and internal.get("output", {}).get("action") == "artifact.create_internal",
+        "internal_artifact_executed": internal.get("status") == "Executed" and internal_projection.get("operation_id") == "artifact-store/artifact.create_internal" and internal_projection.get("resource_id") == ARTIFACT_REF,
         "external_needs_approval": needs_approval.get("status") == "NeedsApproval",
         "adapter_not_called_before_approval": start["body"].get("status") == "waiting_for_approval" and start["body"].get("action_outcomes", [{}])[0].get("output") is None,
         "approval_granted": approval_request["status"] == 200 and approval_grant["body"].get("status") == "granted" and evidence.get("action_id") == approval_context["action_id"],
-        "approved_action_executed_once": len(external_executions) == 1 and approved_retry["status"] == 200,
+        "approved_action_executed_once": len(external_executions) == 1 and approved_retry["status"] == 200 and publish_provider_delta == 1 and publish_provider_receipt.get("action_id") == approval_context["action_id"] and publish_provider_receipt.get("operation_id") == "artifact-store/artifact.publish_external",
         "resident_receipt_revocation_acknowledged": revoke_validation["body"].get("accepted") is True and revoke_dispatch["body"].get("selected_instance_id") == CLOUD_INSTANCE_ID and resident_revocation_exact,
         "state_committed": bool(state_head["body"].get("state_node_id")),
         "audit_exported": audit_export["body"].get("exported") is True,
-        "replay_inspect_only": replay["body"].get("mode") == "inspect_only",
+        "replay_inspect_only": replay["body"].get("mode") == "inspect_only" and provider_effect_state(provider_before_replay) == provider_effect_state(provider_after_replay),
     }
     failures = [name for name, ok in required_positive.items() if not ok]
     failures.extend(f"negative_failed:{item['case']}" for item in negatives if item.get("passed") is not True)
@@ -910,7 +948,7 @@ def main() -> int:
         "components": ["daemon", "central-manager", "governance", "approval", "policy-bundle", "circuit-breaker", "kill-switch", "gateway", "trace", "replay/audit", "artifact-adapter"],
         "positive_evidence": [key for key, ok in required_positive.items() if ok],
         "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True],
-        "replay_evidence": ["replayRun public API returned inspect_only approval explanation and did not execute external publish"],
+        "replay_evidence": ["replayRun public API returned inspect_only approval explanation and provider counters were unchanged"],
         "replay_mode": "inspect_only",
         "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "external_publish_replayed": False},
         "replay_artifacts": [str(artifact_dir / "replay-report.json")],
@@ -928,6 +966,8 @@ def main() -> int:
         "negative_cases": negatives,
         "positive_checks": required_positive,
         "scenario_failures": failures,
+        "private_v3_outputs": [internal_projection, publish_projection],
+        "provider_evidence": [provider_before_replay, provider_after_replay],
         "artifact_paths": [],
     }
     artifacts = {
@@ -985,6 +1025,7 @@ def main() -> int:
         "internal-artifact-report.json": {"work_order_id": internal_envelope["work_order_id"], "run_id": INTERNAL_RUN_ID, "create": internal_create["body"], "start": internal_start["body"], "outcome": internal, "state_head": internal_state_head["body"]},
         "state-export.json": state_head["body"],
         "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "external_publish_replayed": False, "approval_lifecycles": [event.get("lifecycle") for event in replay["body"].get("approval_events", [])]},
+        "action-provider-evidence.json": {"before_publish": provider_before_publish, "after_forged_legacy": provider_after_forged_legacy, "after_publish": provider_after_publish, "publish_call_delta": publish_provider_delta, "provider_receipt": publish_provider_receipt, "before_replay": provider_before_replay, "after_replay": provider_after_replay},
         "audit-report.json": {"manager": audit_export["body"], "resident_revocation_manager": revoke_audit_export["body"], "negative_cases": negatives, "event_ids": event_ids},
         "anti-drift-results.json": {"status": "passed" if not failures else "failed", "private_helper_only_e2e": False, "gateway_bypass": False, "governance_plane_direct_runtime_mutation": False, "broad_action_authority": False, "replay_side_effects_allowed_default": False},
         "stdout.log": "UC-E2E-S5 governance scenario completed through public daemon and manager HTTP APIs\n",

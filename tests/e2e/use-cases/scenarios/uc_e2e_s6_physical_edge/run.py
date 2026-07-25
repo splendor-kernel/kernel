@@ -20,6 +20,12 @@ from canonical_fleet_profiles import (  # noqa: E402
     EDGE_INSTANCE_FEATURES,
     EDGE_NODE_CAPABILITIES,
 )
+from acceptance_provider_evidence import (  # noqa: E402
+    provider_effect_state,
+    read_provider_evidence,
+)
+from acceptance_provider_output import project_private_v3_output  # noqa: E402
+from acceptance_scenario_expectations import expectation_for  # noqa: E402
 from resident_http import request_json_no_redirect  # noqa: E402
 
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
@@ -99,6 +105,8 @@ def request_json(method: str, base_url: str, path: str, body: dict[str, Any] | N
 
 
 def sim_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    if method == "GET" and path == "/evidence" and body is None:
+        return read_provider_evidence(base_url)
     status, data = request_json(method, base_url, path, body)
     if status != 200:
         raise SystemExit(f"device-sim request failed: {method} {path} status={status} body={data}")
@@ -106,7 +114,7 @@ def sim_json(method: str, base_url: str, path: str, body: dict[str, Any] | None 
 
 
 def sim_total(counters: dict[str, Any]) -> int:
-    return int(counters.get("total", 0))
+    return int(counters.get("requests_total", counters.get("total", 0)))
 
 
 def sim_action_count(counters: dict[str, Any], action_name: str) -> int:
@@ -294,7 +302,8 @@ def sign_work_order(root: Path, artifact_dir: Path, commands: Path, auth_dir: Pa
 
 
 def action(name: str, **params: Any) -> dict[str, Any]:
-    return {"name": name, "params": params or {"physical_action": True}, "side_effect_class": {"Custom": "physical.high_level"}, "cost_estimate": None, "required_permissions": [PHYSICAL_PERMISSION], "preconditions": [], "postconditions": []}
+    postcondition = "sensor_read" if name in {"read_battery", "read_sensor_summary"} else "device_state_updated"
+    return {"name": name, "params": params or {"physical_action": True}, "side_effect_class": {"Custom": "physical.high_level"}, "cost_estimate": None, "required_permissions": [PHYSICAL_PERMISSION], "preconditions": [], "postconditions": [postcondition]}
 
 
 def quota() -> dict[str, int]:
@@ -346,12 +355,17 @@ def safety(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def physical_payload(name: str, **safety_overrides: Any) -> dict[str, Any]:
+def physical_payload(
+    name: str, *, action_id: str | None = None, **safety_overrides: Any
+) -> dict[str, Any]:
     action_params = {"physical_action": True}
     for key in ["cloud_helper_proposal_id", "cloud_helper_message_id"]:
         if safety_overrides.get(key):
             action_params[key] = safety_overrides[key]
-    return {"run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "causal_trace_id": CLOUD_CAUSAL_TRACE_ID, "action": action(name, **action_params), "adapter": "device-sim", "quota_usage": quota(), "satisfied_preconditions": [], "safety_context": safety(**safety_overrides)}
+    payload = {"run_id": RUN_ID, "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "causal_trace_id": CLOUD_CAUSAL_TRACE_ID, "action": action(name, **action_params), "adapter": "device-sim", "quota_usage": quota(), "satisfied_preconditions": [], "safety_context": safety(**safety_overrides)}
+    if action_id is not None:
+        payload["action_id"] = action_id
+    return payload
 
 
 def approval_physical_payload(causal_trace_id: str, requested_at: str) -> dict[str, Any]:
@@ -361,7 +375,7 @@ def approval_physical_payload(causal_trace_id: str, requested_at: str) -> dict[s
         "tenant_id": TENANT_ID,
         "agent_id": AGENT_ID,
         "causal_trace_id": causal_trace_id,
-        "action": action("capture_image", physical_action=True, node_id=OTHER_EDGE_NODE_ID),
+        "action": action("capture_image", physical_action=True),
         "adapter": "device-sim",
         "quota_usage": quota(),
         "satisfied_preconditions": [],
@@ -432,7 +446,12 @@ def main() -> int:
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--edge-url", default="https://resident-edge-node:8093")
     parser.add_argument("--manager-url", default="http://central-manager:8081")
-    parser.add_argument("--device-sim-url", default="http://device-sim:8086")
+    parser.add_argument(
+        "--action-provider-url",
+        dest="device_sim_url",
+        metavar="ACTION_PROVIDER_URL",
+        default="http://acceptance-action-provider:8086",
+    )
     parser.add_argument("--resident-auth-dir", default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"))
     parser.add_argument("--resident-ca-file", default=os.environ.get("SPLENDOR_RESIDENT_CA_FILE", "/run/splendor-auth/resident-root-ca.pem"))
     args = parser.parse_args()
@@ -589,24 +608,40 @@ def main() -> int:
     approval_requested_at = utc(0)
     approval_action_request = approval_physical_payload(approval_causal_trace_id, approval_requested_at)
 
-    sim_before_coordinate_injection = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_coordinate_injection = sim_json("GET", args.device_sim_url, "/evidence")
     coordinate_injection_payload = json.loads(json.dumps(approval_action_request))
     coordinate_injection_payload["physical_action_resource_coordinate"] = {"resource_kind": "physical_node", "node_id": OTHER_EDGE_NODE_ID}
     coordinate_injection = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", coordinate_injection_payload)
-    sim_after_coordinate_injection = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_coordinate_injection = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "physical_coordinate_field_injection_rejected", "action_name": "capture_image", "status": coordinate_injection.get("status"), "counter_before": sim_before_coordinate_injection, "counter_after": sim_after_coordinate_injection, "total_delta": sim_total(sim_after_coordinate_injection) - sim_total(sim_before_coordinate_injection), "action_delta": sim_action_count(sim_after_coordinate_injection, "capture_image") - sim_action_count(sim_before_coordinate_injection, "capture_image"), "expected_sim_delta": 0})
 
-    sim_before_unknown_authority = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_unknown_authority = sim_json("GET", args.device_sim_url, "/evidence")
     unknown_authority_payload = json.loads(json.dumps(approval_action_request))
     unknown_authority_payload["authority_override"] = {"node_id": OTHER_EDGE_NODE_ID, "allowed": True}
     unknown_authority = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", unknown_authority_payload)
-    sim_after_unknown_authority = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_unknown_authority = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "physical_unknown_authority_field_rejected", "action_name": "capture_image", "status": unknown_authority.get("status"), "counter_before": sim_before_unknown_authority, "counter_after": sim_after_unknown_authority, "total_delta": sim_total(sim_after_unknown_authority) - sim_total(sim_before_unknown_authority), "action_delta": sim_action_count(sim_after_unknown_authority, "capture_image") - sim_action_count(sim_before_unknown_authority, "capture_image"), "expected_sim_delta": 0})
 
-    sim_before_challenge = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_reserved_node = sim_json("GET", args.device_sim_url, "/evidence")
+    reserved_node_payload = physical_payload(
+        "capture_image",
+        action_id="55555555-5555-4555-8555-555555556699",
+    )
+    reserved_node_payload["action"]["params"]["node_id"] = OTHER_EDGE_NODE_ID
+    reserved_node_injection = resident_call(
+        "submitPhysicalActionReservedNodeParam",
+        "POST",
+        f"/devices/{EDGE_NODE_ID}/actions",
+        "actions_submit",
+        reserved_node_payload,
+    )
+    sim_after_reserved_node = sim_json("GET", args.device_sim_url, "/evidence")
+    simulator_evidence.append({"label": "physical_reserved_node_param_rejected", "action_name": "capture_image", "status": reserved_node_injection.get("body", {}).get("status"), "counter_before": sim_before_reserved_node, "counter_after": sim_after_reserved_node, "total_delta": sim_total(sim_after_reserved_node) - sim_total(sim_before_reserved_node), "action_delta": sim_action_count(sim_after_reserved_node, "capture_image") - sim_action_count(sim_before_reserved_node, "capture_image"), "expected_sim_delta": 0})
+
+    sim_before_challenge = sim_json("GET", args.device_sim_url, "/evidence")
     approval_required = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", approval_action_request)
     require_status("submitPhysicalActionNeedsApproval", approval_required)
-    sim_after_challenge = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_challenge = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "physical_approval_challenge_no_effect", "action_name": "capture_image", "status": approval_required.get("body", {}).get("status"), "counter_before": sim_before_challenge, "counter_after": sim_after_challenge, "total_delta": sim_total(sim_after_challenge) - sim_total(sim_before_challenge), "action_delta": sim_action_count(sim_after_challenge, "capture_image") - sim_action_count(sim_before_challenge, "capture_image"), "expected_sim_delta": 0})
     approval_challenge = approval_required["body"].get("approval_challenge")
     if not isinstance(approval_challenge, dict):
@@ -626,74 +661,96 @@ def main() -> int:
     receipt_retry_request["authority_obligation_receipts"] = [authority_receipt]
     receipt_retry_request["causal_trace_id"] = approval_grant["body"].get("trace_event_id") or approval_causal_trace_id
 
-    sim_before_wrong_node = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_wrong_node = sim_json("GET", args.device_sim_url, "/evidence")
     wrong_node_receipt_retry = resident_call("submitPhysicalAction", "POST", f"/devices/{OTHER_EDGE_NODE_ID}/actions", "actions_submit", receipt_retry_request)
-    sim_after_wrong_node = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_wrong_node = sim_json("GET", args.device_sim_url, "/evidence")
     approval_waiting_after_wrong_node = resident_call("inspectRun", "GET", f"/runs/{APPROVAL_RUN_ID}", "runs_read")
     approval_traces_after_wrong_node = resident_call("exportTraces", "POST", f"/runs/{APPROVAL_RUN_ID}/traces/export", "traces_read", {"redaction_policy": "uc-e2e-s6-redacted", "start": None, "end": None})
     simulator_evidence.append({"label": "physical_approval_wrong_node_preclaim_rejected", "action_name": "capture_image", "status": wrong_node_receipt_retry.get("status"), "reason_code": wrong_node_receipt_retry.get("body", {}).get("code"), "counter_before": sim_before_wrong_node, "counter_after": sim_after_wrong_node, "total_delta": sim_total(sim_after_wrong_node) - sim_total(sim_before_wrong_node), "action_delta": sim_action_count(sim_after_wrong_node, "capture_image") - sim_action_count(sim_before_wrong_node, "capture_image"), "expected_sim_delta": 0})
 
-    sim_before_exact_node = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_exact_node = sim_json("GET", args.device_sim_url, "/evidence")
     exact_node_receipt_retry = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", receipt_retry_request)
     require_status("submitPhysicalApprovalReceiptExactNode", exact_node_receipt_retry)
-    sim_after_exact_node = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_exact_node = sim_json("GET", args.device_sim_url, "/evidence")
     approval_after_exact_node = resident_call("inspectRun", "GET", f"/runs/{APPROVAL_RUN_ID}", "runs_read")
     simulator_evidence.append({"label": "physical_approval_exact_node_executed", "action_name": "capture_image", "status": exact_node_receipt_retry.get("body", {}).get("status"), "counter_before": sim_before_exact_node, "counter_after": sim_after_exact_node, "total_delta": sim_total(sim_after_exact_node) - sim_total(sim_before_exact_node), "action_delta": sim_action_count(sim_after_exact_node, "capture_image") - sim_action_count(sim_before_exact_node, "capture_image"), "expected_sim_delta": 1})
 
-    sim_before_receipt_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_receipt_replay = sim_json("GET", args.device_sim_url, "/evidence")
     receipt_replay = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", receipt_retry_request)
     require_status("replayPhysicalApprovalReceipt", receipt_replay)
-    sim_after_receipt_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_receipt_replay = sim_json("GET", args.device_sim_url, "/evidence")
     approval_after_receipt_replay = resident_call("inspectRun", "GET", f"/runs/{APPROVAL_RUN_ID}", "runs_read")
     simulator_evidence.append({"label": "physical_approval_receipt_replay_denied", "action_name": "capture_image", "status": receipt_replay.get("body", {}).get("status"), "reason_codes": receipt_replay.get("body", {}).get("verification", {}).get("reasons", []), "counter_before": sim_before_receipt_replay, "counter_after": sim_after_receipt_replay, "total_delta": sim_total(sim_after_receipt_replay) - sim_total(sim_before_receipt_replay), "action_delta": sim_action_count(sim_after_receipt_replay, "capture_image") - sim_action_count(sim_before_receipt_replay, "capture_image"), "expected_sim_delta": 0})
     approval_final_traces = resident_call("exportTraces", "POST", f"/runs/{APPROVAL_RUN_ID}/traces/export", "traces_read", {"redaction_policy": "uc-e2e-s6-redacted", "start": None, "end": None})
-    sim_before_approval_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_approval_replay = sim_json("GET", args.device_sim_url, "/evidence")
     approval_replay = resident_call("replayRun", "POST", f"/runs/{APPROVAL_RUN_ID}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": False})
-    sim_after_approval_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_approval_replay = sim_json("GET", args.device_sim_url, "/evidence")
 
-    def physical_call_with_counters(label: str, name: str, expected_sim_delta: int, **safety_overrides: Any) -> dict[str, Any]:
-        before = sim_json("GET", args.device_sim_url, "/counters")
-        response = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", physical_payload(name, **safety_overrides))
-        after = sim_json("GET", args.device_sim_url, "/counters")
+    def physical_call_with_counters(label: str, name: str, expected_sim_delta: int, *, expectation_id: str | None = None, **safety_overrides: Any) -> dict[str, Any]:
+        before = sim_json("GET", args.device_sim_url, "/evidence")
+        expected_action_id = (
+            expectation_for("UC-E2E-S6", expectation_id)["action_id"]
+            if expectation_id is not None
+            else None
+        )
+        response = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", physical_payload(name, action_id=expected_action_id, **safety_overrides))
+        after = sim_json("GET", args.device_sim_url, "/evidence")
         simulator_evidence.append({"label": label, "action_name": name, "status": response.get("body", {}).get("status"), "reason_codes": response.get("body", {}).get("verification", {}).get("reasons", []), "counter_before": before, "counter_after": after, "total_delta": sim_total(after) - sim_total(before), "action_delta": sim_action_count(after, name) - sim_action_count(before, name), "expected_sim_delta": expected_sim_delta})
         return response
 
-    before_warmup = sim_json("GET", args.device_sim_url, "/counters")
-    read_battery = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", physical_payload("read_battery"))
-    after_warmup = sim_json("GET", args.device_sim_url, "/counters")
+    before_warmup = sim_json("GET", args.device_sim_url, "/evidence")
+    read_battery = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", physical_payload("read_battery", action_id=expectation_for("UC-E2E-S6", "read_battery")["action_id"]))
+    after_warmup = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "read_battery_policy_warmup", "action_name": "read_battery", "status": read_battery.get("body", {}).get("status"), "counter_before": before_warmup, "counter_after": after_warmup, "total_delta": sim_total(after_warmup) - sim_total(before_warmup), "action_delta": sim_action_count(after_warmup, "read_battery") - sim_action_count(before_warmup, "read_battery"), "expected_sim_delta": 1})
-    inspect_zone = physical_call_with_counters("inspect_zone_from_typed_cloud_proposal", "inspect_zone", 1, cloud_helper_proposal_id=cloud_message["payload"]["proposal_id"], cloud_helper_message_id=CLOUD_MESSAGE_ID)
-    waypoint = physical_call_with_counters("move_to_waypoint_from_typed_cloud_proposal", "move_to_waypoint", 1, cloud_helper_proposal_id=cloud_message["payload"]["proposal_id"], cloud_helper_message_id=CLOUD_MESSAGE_ID)
-    capture = physical_call_with_counters("capture_image", "capture_image", 1)
-    offline_sensor = physical_call_with_counters("read_sensor_summary_offline", "read_sensor_summary", 1, offline=True)
-    offline_rtb = physical_call_with_counters("return_to_base_low_battery_safe", "return_to_base", 1, offline=True, battery_percent=0.18)
-    upload_summary = physical_call_with_counters("upload_trace_summary", "upload_trace_summary", 1)
+    inspect_zone = physical_call_with_counters("inspect_zone_from_typed_cloud_proposal", "inspect_zone", 1, expectation_id="inspect_zone", cloud_helper_proposal_id=cloud_message["payload"]["proposal_id"], cloud_helper_message_id=CLOUD_MESSAGE_ID)
+    waypoint = physical_call_with_counters("move_to_waypoint_from_typed_cloud_proposal", "move_to_waypoint", 1, expectation_id="move_to_waypoint", cloud_helper_proposal_id=cloud_message["payload"]["proposal_id"], cloud_helper_message_id=CLOUD_MESSAGE_ID)
+    capture = physical_call_with_counters("capture_image", "capture_image", 1, expectation_id="capture_image")
+    offline_sensor = physical_call_with_counters("read_sensor_summary_offline", "read_sensor_summary", 1, expectation_id="read_sensor_summary", offline=True)
+    offline_rtb = physical_call_with_counters("return_to_base_low_battery_safe", "return_to_base", 1, expectation_id="return_to_base", offline=True, battery_percent=0.18)
+    upload_summary = physical_call_with_counters("upload_trace_summary", "upload_trace_summary", 1, expectation_id="upload_trace_summary")
 
     ambiguous = physical_call_with_counters("ambiguous_privacy_denied_until_operator", "capture_image", 0, offline=True, high_risk=True, privacy_clear=False)
     intervention_expires_at = utc(30)
     intervention_request = resident_call("requestOperatorIntervention", "POST", "/operator/interventions", "operator_intervene", {"intervention_id": "intervention_uc_e2e_s6_capture", "tenant_id": TENANT_ID, "agent_id": AGENT_ID, "run_id": RUN_ID, "node_id": EDGE_NODE_ID, "action_name": "capture_image", "reason": "ambiguous privacy state while offline", "expires_at": intervention_expires_at})
     intervention_grant = resident_call("grantOperatorIntervention", "POST", "/operator/interventions/intervention_uc_e2e_s6_capture/grant", "operator_intervene", {"reason": "local operator verified privacy clear", "expires_at": intervention_expires_at})
-    granted_payload = physical_payload("capture_image", offline=True, high_risk=True)
+    granted_payload = physical_payload("capture_image", action_id=expectation_for("UC-E2E-S6", "operator_capture")["action_id"], offline=True, high_risk=True)
     granted_payload["operator_intervention_evidence"] = intervention_grant["body"].get("evidence")
-    before_granted = sim_json("GET", args.device_sim_url, "/counters")
+    before_granted = sim_json("GET", args.device_sim_url, "/evidence")
     intervention_capture = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", granted_payload)
-    after_granted = sim_json("GET", args.device_sim_url, "/counters")
+    after_granted = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_granted_capture", "action_name": "capture_image", "status": intervention_capture.get("body", {}).get("status"), "counter_before": before_granted, "counter_after": after_granted, "total_delta": sim_total(after_granted) - sim_total(before_granted), "action_delta": sim_action_count(after_granted, "capture_image") - sim_action_count(before_granted, "capture_image"), "expected_sim_delta": 1})
+    private_v3_outputs = [
+        project_private_v3_output(
+            response["body"],
+            expectation=expectation_for("UC-E2E-S6", expectation_id),
+        )
+        for expectation_id, response in (
+            ("approved_capture", exact_node_receipt_retry),
+            ("read_battery", read_battery),
+            ("inspect_zone", inspect_zone),
+            ("move_to_waypoint", waypoint),
+            ("capture_image", capture),
+            ("read_sensor_summary", offline_sensor),
+            ("return_to_base", offline_rtb),
+            ("upload_trace_summary", upload_summary),
+            ("operator_capture", intervention_capture),
+        )
+    ]
 
     extended_evidence = dict(intervention_grant["body"].get("evidence", {}))
     extended_evidence["expires_at"] = utc(60)
     extended_payload = physical_payload("capture_image")
     extended_payload["operator_intervention_evidence"] = extended_evidence
-    before_extended = sim_json("GET", args.device_sim_url, "/counters")
+    before_extended = sim_json("GET", args.device_sim_url, "/evidence")
     extended_intervention = resident_call("submitPhysicalActionExtendedIntervention", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", extended_payload)
-    after_extended = sim_json("GET", args.device_sim_url, "/counters")
+    after_extended = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_extended_expiry_denied", "action_name": "capture_image", "status": extended_intervention.get("status"), "counter_before": before_extended, "counter_after": after_extended, "total_delta": sim_total(after_extended) - sim_total(before_extended), "expected_sim_delta": 0})
 
     reused_payload = physical_payload("capture_image")
     reused_payload["operator_intervention_evidence"] = intervention_grant["body"].get("evidence")
-    before_reuse = sim_json("GET", args.device_sim_url, "/counters")
+    before_reuse = sim_json("GET", args.device_sim_url, "/evidence")
     reused_intervention = resident_call("submitPhysicalActionReusedIntervention", "POST", f"/devices/{OTHER_EDGE_NODE_ID}/actions", "actions_submit", reused_payload)
-    after_reuse = sim_json("GET", args.device_sim_url, "/counters")
+    after_reuse = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_cross_device_reuse_denied", "action_name": "capture_image", "status": reused_intervention.get("status"), "counter_before": before_reuse, "counter_after": after_reuse, "total_delta": sim_total(after_reuse) - sim_total(before_reuse), "expected_sim_delta": 0})
     intervention_deny = resident_call("denyOperatorIntervention", "POST", "/operator/interventions/intervention_uc_e2e_s6_capture/deny", "operator_intervene", {"reason": "negative denial branch", "expires_at": utc(30)})
 
@@ -706,17 +763,17 @@ def main() -> int:
     wrong_scope_evidence["action_name"] = "move_to_waypoint"
     wrong_scope_payload = physical_payload("capture_image")
     wrong_scope_payload["operator_intervention_evidence"] = wrong_scope_evidence
-    before_wrong_scope = sim_json("GET", args.device_sim_url, "/counters")
+    before_wrong_scope = sim_json("GET", args.device_sim_url, "/evidence")
     wrong_scope = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", wrong_scope_payload)
-    after_wrong_scope = sim_json("GET", args.device_sim_url, "/counters")
+    after_wrong_scope = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_wrong_scope_denied", "action_name": "capture_image", "status": wrong_scope.get("status"), "counter_before": before_wrong_scope, "counter_after": after_wrong_scope, "total_delta": sim_total(after_wrong_scope) - sim_total(before_wrong_scope), "expected_sim_delta": 0})
     expired_evidence = dict(intervention_grant["body"].get("evidence", {}))
     expired_evidence["expires_at"] = utc(-1)
     expired_evidence_payload = physical_payload("capture_image")
     expired_evidence_payload["operator_intervention_evidence"] = expired_evidence
-    before_expired_approval = sim_json("GET", args.device_sim_url, "/counters")
+    before_expired_approval = sim_json("GET", args.device_sim_url, "/evidence")
     expired_approval = resident_call("submitPhysicalAction", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", expired_evidence_payload)
-    after_expired_approval = sim_json("GET", args.device_sim_url, "/counters")
+    after_expired_approval = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_expired_evidence_denied", "action_name": "capture_image", "status": expired_approval.get("status"), "counter_before": before_expired_approval, "counter_after": after_expired_approval, "total_delta": sim_total(after_expired_approval) - sim_total(before_expired_approval), "expected_sim_delta": 0})
     missing_credential_action = call("submitPhysicalActionMissingCredential", "POST", f"/devices/{EDGE_NODE_ID}/actions", {**physical_payload("inspect_zone"), "credential": None, "audit_attribution": None})
     wrong_bearer_audience_action = resident_call("submitPhysicalActionWrongBearerAudience", "POST", f"/devices/{EDGE_NODE_ID}/actions", "actions_submit", physical_payload("inspect_zone"), auth=resident_auth(root, auth_dir, CLOUD_INSTANCE_ID, ["actions_submit"]))
@@ -749,9 +806,9 @@ def main() -> int:
     if reordered_records:
         reordered_records[0]["sequence"] = 1
     reordered = resident_call("syncDeviceTraceBuffer", "POST", f"/devices/{EDGE_NODE_ID}/trace-buffer/sync", "device_trace_sync", {"run_id": RUN_ID, "records": reordered_records, "simulate_tamper": False})
-    sim_before_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_replay = sim_json("GET", args.device_sim_url, "/evidence")
     replay = resident_call("replayRun", "POST", f"/runs/{RUN_ID}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": False})
-    sim_after_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_replay = sim_json("GET", args.device_sim_url, "/evidence")
 
     approval_final_records = approval_final_traces["body"].get("records", [])
     extra_events = {"device.profile.registered": [register["body"].get("trace_event_id", ""), other_device_register["body"].get("trace_event_id", "")], "policy.cache.loaded": [register["body"].get("trace_event_id", ""), other_device_register["body"].get("trace_event_id", "")], "cloud_helper.proposal.received": [cloud_message_received["body"].get("read_trace_event_id", "")], "approval.requested": [approval_manager_request["body"].get("trace_event_id", "")], "approval.granted": [approval_grant["body"].get("trace_event_id", "")], "operator.intervention.requested": [intervention_request["body"].get("trace_event_id", "")], "operator.intervention.granted": [intervention_grant["body"].get("trace_event_id", "")], "operator.intervention.denied": [intervention_deny["body"].get("trace_event_id", "")], "trace.sync.completed": [sync["body"].get("trace_event_id", ""), duplicate_sync["body"].get("trace_event_id", "")], "trace.sync.failed": [tamper["body"].get("trace_event_id", ""), payload_tamper["body"].get("trace_event_id", ""), cross_run_sync["body"].get("trace_event_id", ""), reordered["body"].get("trace_event_id", "")]}
@@ -797,7 +854,8 @@ def main() -> int:
     wrong_node_preclaim_valid = (
         wrong_node_receipt_retry["status"] == 409
         and wrong_node_receipt_retry["body"].get("code") == "approval_challenge_retry_mismatch"
-        and sim_before_wrong_node == sim_after_wrong_node
+        and provider_effect_state(sim_before_wrong_node)
+        == provider_effect_state(sim_after_wrong_node)
         and approval_waiting_before_wrong_node["body"].get("status") == "waiting_for_approval"
         and approval_waiting_after_wrong_node["body"].get("status") == "waiting_for_approval"
         and approval_waiting_before_wrong_node["body"].get("adapter_executions") == 0
@@ -814,18 +872,22 @@ def main() -> int:
     receipt_replay_denied = (
         receipt_replay["body"].get("status") == "Denied"
         and "authority_obligation_receipt_replayed" in receipt_replay["body"].get("verification", {}).get("reasons", [])
-        and sim_before_receipt_replay == sim_after_receipt_replay
+        and provider_effect_state(sim_before_receipt_replay)
+        == provider_effect_state(sim_after_receipt_replay)
         and approval_after_receipt_replay["body"].get("adapter_executions") == 1
     )
-    approval_replay_unchanged = sim_before_approval_replay == sim_after_approval_replay
+    approval_replay_unchanged = provider_effect_state(
+        sim_before_approval_replay
+    ) == provider_effect_state(sim_after_approval_replay)
 
     def from_safety_verifier(response: dict[str, Any]) -> bool:
         return response.get("body", {}).get("verification", {}).get("artifacts", {}).get("source") == "safety_verifier"
 
     negatives = [
         {"case": "forbidden_low_level_actions_rejected", "passed": all(item["status"] == 400 and item["body"].get("code") == "low_level_physical_action_rejected" for item in forbidden)},
-        {"case": "physical_action_resource_coordinate_injection_rejected", "passed": coordinate_injection["status"] == 422 and sim_before_coordinate_injection == sim_after_coordinate_injection},
-        {"case": "physical_unknown_authority_field_rejected", "passed": unknown_authority["status"] == 422 and sim_before_unknown_authority == sim_after_unknown_authority},
+        {"case": "physical_action_resource_coordinate_injection_rejected", "passed": coordinate_injection["status"] == 422 and provider_effect_state(sim_before_coordinate_injection) == provider_effect_state(sim_after_coordinate_injection)},
+        {"case": "physical_unknown_authority_field_rejected", "passed": unknown_authority["status"] == 422 and provider_effect_state(sim_before_unknown_authority) == provider_effect_state(sim_after_unknown_authority)},
+        {"case": "physical_reserved_node_param_rejected", "passed": reserved_node_injection["status"] == 200 and reserved_node_injection["body"].get("status") == "Failed" and reserved_node_injection["body"].get("error") == "adapter failed" and "acceptance_operation_reserved_field" not in str(reserved_node_injection["body"]) and provider_effect_state(sim_before_reserved_node) == provider_effect_state(sim_after_reserved_node)},
         {"case": "physical_approval_wrong_node_rejected_before_claim", "passed": wrong_node_preclaim_valid},
         {"case": "physical_approval_receipt_replay_denied", "passed": receipt_replay_denied},
         {"case": "geofence_breach_denied_before_adapter", "passed": geofence["body"].get("status") == "Denied" and "geofence_violation" in geofence["body"].get("verification", {}).get("reasons", []) and from_safety_verifier(geofence)},
@@ -843,12 +905,14 @@ def main() -> int:
         {"case": "device_endpoint_wrong_tenant_rejected", "passed": wrong_tenant_status["status"] == 403 and wrong_tenant_status["body"].get("code") == "wrong_credential_binding" and wrong_tenant_action["status"] == 403 and wrong_tenant_action["body"].get("code") == "wrong_credential_binding"},
     ]
     simulator_counters_valid = all(item.get("total_delta") == item.get("expected_sim_delta") for item in simulator_evidence)
-    replay_unchanged = sim_before_replay == sim_after_replay
+    replay_unchanged = provider_effect_state(sim_before_replay) == provider_effect_state(
+        sim_after_replay
+    )
     cloud_message_valid = all(cloud_message.get(field) for field in ["message_id", "source_agent_id", "target_agent_id", "run_id", "schema", "causal_parent", "created_at"]) and cloud_message["payload"].get("direct_actuator_authority") is False and helper_work_order_submit["body"].get("accepted") is True and cloud_message_delivery["body"].get("message_id") == CLOUD_MESSAGE_ID and cloud_message_delivery["body"].get("delivery_status") == "delivered" and cloud_message_delivery["body"].get("receive_side_validated") is True and cloud_message_delivery["body"].get("remote_state_mutated") is False and cloud_message_received["body"].get("message_id") == CLOUD_MESSAGE_ID and CLOUD_MESSAGE_ID in manager_audit_payload and proposal_trace_linked
     positives = {"device_registered": register["status"] == 200 and register["body"].get("profile", {}).get("device_kind") == "drone_sim", "equivalent_same_tenant_device_nodes_registered": other_device_register["status"] == 200 and register["body"].get("profile", {}).get("node_id") == EDGE_NODE_ID and other_device_register["body"].get("profile", {}).get("node_id") == OTHER_EDGE_NODE_ID and register["body"].get("profile", {}).get("tenant_id") == other_device_register["body"].get("profile", {}).get("tenant_id") == TENANT_ID and profile_a_governed == profile_b_governed, "policy_cache_loaded": cache["body"].get("loaded") is True and cache["body"].get("expired") is False, "run_created_started": create["status"] == 200 and start["status"] == 200, "physical_approval_v2_node_and_resident_target_bound": physical_approval_binding_valid, "physical_approval_exact_node_executes_once": exact_node_execution_valid, "physical_approval_inspect_replay_suppressed": approval_replay["body"].get("mode") == "inspect_only" and approval_replay_unchanged, "cloud_helper_typed_proposal_local_only": waypoint["body"].get("status") == "Executed" and inspect_zone["body"].get("status") == "Executed" and cloud_message_valid, "inspect_zone_executed": inspect_zone["body"].get("status") == "Executed", "safe_actions_executed": all(resp["body"].get("status") == "Executed" for resp in [read_battery, inspect_zone, waypoint, capture, offline_sensor, offline_rtb, upload_summary, intervention_capture]), "ambiguous_action_denied_by_safety_verifier": ambiguous["body"].get("status") == "Denied" and from_safety_verifier(ambiguous), "simulator_counters_valid": simulator_counters_valid, "trace_sync_completed": len(sync_records) > 0 and sync["body"].get("accepted") is True and duplicate_sync["body"].get("accepted") is True and duplicate_sync["body"].get("accepted_records") == sync["body"].get("accepted_records"), "replay_inspect_only": replay["body"].get("mode") == "inspect_only" and replay_unchanged}
     failures = [key for key, ok in positives.items() if not ok]
     failures.extend(f"negative_failed:{item['case']}" for item in negatives if item.get("passed") is not True)
-    scenario = {"id": "UC-E2E-S6", "status": "passed" if not failures else "failed", "fr_coverage": [f"FR-0.05-{i:02d}" for i in range(1, 11)], "components": ["resident-edge-node", "central-manager-message-api", "device-profile", "physical-capability", "device-sim-adapter", "safety-verifier", "offline-policy-cache", "trace-buffer", "operator-intervention", "typed-cloud-helper-proposal", "gateway", "trace", "replay/audit"], "positive_evidence": [key for key, ok in positives.items() if ok], "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True], "replay_evidence": ["replayRun public API returned inspect_only and device-sim counters were unchanged"], "replay_mode": "inspect_only", "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "simulator_counter_before": sim_before_replay, "simulator_counter_after": sim_after_replay}, "replay_artifacts": [str(artifact_dir / "replay-report.json")], "anti_drift_checks": ["public_device_daemon_verified_https_bearer_used", "public_manager_message_api_used", "gateway_required_before_device_sim_adapter", "cloud_helper_proposal_only", "no_low_level_physical_action_accepted", "replay_no_simulator_control"], "run_ids": [RUN_ID], "trace_event_ids": sorted({tid for ids in event_ids.values() for tid in ids if tid and not str(tid).startswith("operator_")}), "state_node_ids": [state_head["body"].get("state_node_id", "")], "state_hashes": [state_head["body"].get("data_hash", "")], "message_ids": [CLOUD_MESSAGE_ID], "work_order_ids": [WORK_ORDER_ID, HELPER_WORK_ORDER_ID], "approval_ids": ["intervention_uc_e2e_s6_capture"], "node_ids": [EDGE_NODE_ID, CLOUD_NODE_ID], "api_operations": sorted({row["operation_id"] for row in api_rows}), "required_trace_event_ids": event_ids, "negative_cases": negatives, "positive_checks": positives, "scenario_failures": failures, "artifact_paths": []}
+    scenario = {"id": "UC-E2E-S6", "status": "passed" if not failures else "failed", "fr_coverage": [f"FR-0.05-{i:02d}" for i in range(1, 11)], "components": ["resident-edge-node", "central-manager-message-api", "device-profile", "physical-capability", "device-sim-adapter", "safety-verifier", "offline-policy-cache", "trace-buffer", "operator-intervention", "typed-cloud-helper-proposal", "gateway", "trace", "replay/audit"], "positive_evidence": [key for key, ok in positives.items() if ok], "negative_evidence": [item["case"] for item in negatives if item.get("passed") is True], "replay_evidence": ["replayRun public API returned inspect_only and device-sim counters were unchanged"], "replay_mode": "inspect_only", "replay_side_effect_suppression": {"required": True, "evidence_present": True, "side_effects_allowed_default": False, "simulator_counter_before": sim_before_replay, "simulator_counter_after": sim_after_replay}, "replay_artifacts": [str(artifact_dir / "replay-report.json")], "anti_drift_checks": ["public_device_daemon_verified_https_bearer_used", "public_manager_message_api_used", "gateway_required_before_device_sim_adapter", "cloud_helper_proposal_only", "no_low_level_physical_action_accepted", "replay_no_simulator_control"], "run_ids": [RUN_ID], "trace_event_ids": sorted({tid for ids in event_ids.values() for tid in ids if tid and not str(tid).startswith("operator_")}), "state_node_ids": [state_head["body"].get("state_node_id", "")], "state_hashes": [state_head["body"].get("data_hash", "")], "message_ids": [CLOUD_MESSAGE_ID], "work_order_ids": [WORK_ORDER_ID, HELPER_WORK_ORDER_ID], "approval_ids": ["intervention_uc_e2e_s6_capture"], "node_ids": [EDGE_NODE_ID, CLOUD_NODE_ID], "api_operations": sorted({row["operation_id"] for row in api_rows}), "required_trace_event_ids": event_ids, "negative_cases": negatives, "positive_checks": positives, "scenario_failures": failures, "private_v3_outputs": private_v3_outputs, "provider_evidence": [sim_before_replay, sim_after_replay], "artifact_paths": []}
     artifacts = {"scenario-report.json": scenario, "device-profile.json": register["body"], "device-status.json": status["body"], "policy-cache-status.json": cache["body"], "cloud-helper-message.json": {"work_order_submit": helper_work_order_submit["body"], "delivery": cloud_message_delivery["body"], "received": cloud_message_received["body"], "manager_audit_contains_message_id": CLOUD_MESSAGE_ID in manager_audit_payload, "trace_payload_contains_message_id": CLOUD_MESSAGE_ID in trace_payload, "trace_payload_contains_proposal_id": cloud_message["payload"]["proposal_id"] in trace_payload}, "cloud-helper-proposal.json": {"message": cloud_message, "proposal": cloud_message["payload"], "local_validation_inputs": {"inspect_zone": {"cloud_helper_proposal_id": cloud_message["payload"]["proposal_id"], "cloud_helper_message_id": CLOUD_MESSAGE_ID}, "move_to_waypoint": {"cloud_helper_proposal_id": cloud_message["payload"]["proposal_id"], "cloud_helper_message_id": CLOUD_MESSAGE_ID}}, "local_validation_outcomes": {"inspect_zone": inspect_zone["body"], "move_to_waypoint": waypoint["body"]}, "direct_attempt": cloud_direct["body"]}, "device-sim-counters.json": {"evidence": simulator_evidence, "before_replay": sim_before_replay, "after_replay": sim_after_replay}, "device-safety-evidence.json": {"positive": positives, "safe_actions": {"read_battery": read_battery["body"], "inspect_zone": inspect_zone["body"], "move_to_waypoint": waypoint["body"], "capture_image": capture["body"], "offline_sensor": offline_sensor["body"], "return_to_base": offline_rtb["body"], "upload_trace_summary": upload_summary["body"]}, "denials": {"geofence": geofence["body"], "low_battery": low_battery["body"], "expired_policy": expired_policy["body"], "cloud_direct": cloud_direct["body"]}}, "operator-intervention.json": {"ambiguous": ambiguous["body"], "request": intervention_request["body"], "grant": intervention_grant["body"], "granted_capture": intervention_capture["body"], "deny": intervention_deny["body"], "wrong_scope": wrong_scope, "expired": expired_approval}, "security-negatives.json": {"missing_credential_status": missing_credential_status, "wrong_bearer_audience_status": wrong_bearer_audience_status, "wrong_audience_status": wrong_audience_status, "wrong_tenant_status": wrong_tenant_status, "missing_credential_action": missing_credential_action, "wrong_bearer_audience_action": wrong_bearer_audience_action, "wrong_audience_action": wrong_audience_action, "wrong_tenant_action": wrong_tenant_action}, "trace-sync-report.json": {"completed": sync["body"], "tamper": tamper["body"], "reordered": reordered["body"], "tampered_record_mutation": "prev_event_hash", "reordered_records": True}, "state-export.json": state_head["body"], "replay-report.json": {**replay["body"], "side_effects_allowed_default": False, "simulator_counter_before": sim_before_replay, "simulator_counter_after": sim_after_replay, "simulator_actuator_calls_replayed": not replay_unchanged, "physical_decisions_explained": [item["case"] for item in negatives if item.get("passed") is True]}, "audit-report.json": {"cloud_helper_authority": "proposal_only", "cloud_helper_direct_action_authorized": False, "operator_intervention_ids": ["intervention_uc_e2e_s6_capture"], "event_ids": event_ids}, "anti-drift-results.json": {"status": "passed" if not failures else "failed", "private_helper_only_e2e": False, "gateway_bypass": False, "raw_physical_action_accepted": False, "cloud_helper_direct_actuator_authority": False, "replay_side_effects_allowed_default": False}, "stdout.log": "UC-E2E-S6 physical/edge scenario completed through public resident-edge daemon and central-manager message HTTP endpoints\n", "stderr.log": ""}
     scenario.update({
         "components": scenario["components"] + ["manager-approval-api", "physical-v2-node-binding", "authority-receipt-ledger"],
@@ -896,13 +960,14 @@ def main() -> int:
         },
         "challenge": {
             "status": approval_required["body"].get("status"),
+            "request": redact_sensitive(approval_action_request),
             "canonical_request_digest": approval_challenge.get("canonical_request_digest"),
             "gateway_action_request_digest": approval_challenge.get("gateway_action_request_digest"),
             "authority_decision_digest": approval_challenge.get("authority_decision_digest"),
             "physical_action_resource_coordinate": challenge_coordinate,
             "receipt_audience": approval_challenge.get("receipt_audience"),
             "caller_action_param_node_id": approval_action_request["action"]["params"].get("node_id"),
-            "caller_param_did_not_override_server_coordinate": approval_action_request["action"]["params"].get("node_id") == OTHER_EDGE_NODE_ID and challenge_coordinate.get("node_id") == EDGE_NODE_ID,
+            "caller_param_did_not_override_server_coordinate": "node_id" not in approval_action_request["action"]["params"] and challenge_coordinate.get("node_id") == EDGE_NODE_ID,
             "simulator_counter_before": sim_before_challenge,
             "simulator_counter_after": sim_after_challenge,
         },
@@ -916,7 +981,8 @@ def main() -> int:
         "closed_schema": {
             "physical_action_resource_coordinate": coordinate_injection,
             "unknown_authority_field": unknown_authority,
-            "simulator_unchanged": sim_before_coordinate_injection == sim_after_coordinate_injection and sim_before_unknown_authority == sim_after_unknown_authority,
+            "reserved_node_action_param": reserved_node_injection,
+            "simulator_unchanged": provider_effect_state(sim_before_coordinate_injection) == provider_effect_state(sim_after_coordinate_injection) and provider_effect_state(sim_before_unknown_authority) == provider_effect_state(sim_after_unknown_authority) and provider_effect_state(sim_before_reserved_node) == provider_effect_state(sim_after_reserved_node),
         },
         "wrong_node_preclaim": {
             "response": wrong_node_receipt_retry,
@@ -930,6 +996,7 @@ def main() -> int:
             "receipt_unclaimed": wrong_node_preclaim_valid,
         },
         "exact_node_execution": {
+            "request": redact_sensitive(receipt_retry_request),
             "response": redact_sensitive(exact_node_receipt_retry["body"]),
             "run_after": approval_after_exact_node["body"],
             "simulator_counter_before": sim_before_exact_node,

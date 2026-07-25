@@ -25,6 +25,9 @@ from canonical_fleet_profiles import (  # noqa: E402
     VPC_INSTANCE_FEATURES,
     VPC_NODE_CAPABILITIES,
 )
+from acceptance_provider_evidence import read_provider_evidence  # noqa: E402
+from acceptance_provider_output import project_private_v3_output  # noqa: E402
+from acceptance_scenario_expectations import expectation_for  # noqa: E402
 from resident_http import (  # noqa: E402
     REDIRECT_POLICY,
     project_retained_approval_evidence,
@@ -332,6 +335,8 @@ def derive_resident_security_summary(events: list[dict[str, Any]]) -> dict[str, 
 
 
 def sim_json(method: str, base_url: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    if method == "GET" and path == "/evidence" and body is None:
+        return read_provider_evidence(base_url)
     status, data = request_json(method, base_url, path, body)
     if status != 200:
         raise SystemExit(f"device simulator request failed: {method} {path} status={status} body={data}")
@@ -339,7 +344,7 @@ def sim_json(method: str, base_url: str, path: str, body: dict[str, Any] | None 
 
 
 def sim_total(counters: dict[str, Any]) -> int:
-    return int(counters.get("total", 0))
+    return int(counters.get("requests_total", counters.get("total", 0)))
 
 
 def sim_action_count(counters: dict[str, Any], action_name: str) -> int:
@@ -716,6 +721,18 @@ def quota(actions: int = 1) -> dict[str, int]:
     return {"actions": actions, "action_duration_ms": 1, "filesystem_read_bytes": 0, "filesystem_write_bytes": 0, "network_read_bytes": 0, "network_write_bytes": 0, "http_requests": 0}
 
 
+def postcondition_for_action(name: str) -> str:
+    if name in {"read_battery", "read_sensor_summary"}:
+        return "sensor_read"
+    if name in set(ALLOWED_PHYSICAL_ACTIONS) - {"read_battery", "read_sensor_summary"}:
+        return "device_state_updated"
+    return {
+        "data.read_fixture": "data_read",
+        "artifact.create_internal": "artifact_created",
+        "artifact.publish_external": "artifact_published",
+    }.get(name, "marker_recorded")
+
+
 def action(name: str, permission: str | None = None, side_effect_class: str = "External", **params: Any) -> dict[str, Any]:
     return {
         "name": name,
@@ -724,7 +741,7 @@ def action(name: str, permission: str | None = None, side_effect_class: str = "E
         "cost_estimate": None,
         "required_permissions": [permission or name],
         "preconditions": [],
-        "postconditions": [],
+        "postconditions": [postcondition_for_action(name)],
     }
 
 
@@ -752,12 +769,14 @@ def safety_context(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def physical_payload(name: str, **safety_overrides: Any) -> dict[str, Any]:
+def physical_payload(
+    name: str, *, action_id: str | None = None, **safety_overrides: Any
+) -> dict[str, Any]:
     params = {"physical_action": True}
     for key in ["cloud_helper_proposal_id", "cloud_helper_message_id"]:
         if safety_overrides.get(key):
             params[key] = safety_overrides[key]
-    return {
+    payload = {
         "run_id": EDGE_RUN,
         "tenant_id": TENANT_ID,
         "agent_id": EDGE_AGENT,
@@ -768,6 +787,9 @@ def physical_payload(name: str, **safety_overrides: Any) -> dict[str, Any]:
         "satisfied_preconditions": [],
         "safety_context": safety_context(**safety_overrides),
     }
+    if action_id is not None:
+        payload["action_id"] = action_id
+    return payload
 
 
 def create_run_payload(
@@ -786,7 +808,7 @@ def create_run_payload(
     registered_actions = [
         {
             "name": name,
-            "adapter": allowed_adapters[0] if allowed_adapters else "daemon.recording",
+            "adapter": allowed_adapters[0] if allowed_adapters else "acceptance-fixture",
             "required_permissions": list(envelope.get("allowed_permissions", [])),
         }
         for name in allowed_actions
@@ -1207,23 +1229,38 @@ def collect_action_ids(records: list[dict[str, Any]], responses: list[dict[str, 
     return sorted(ids)
 
 
-def resolve_action_trace_evidence(records: list[dict[str, Any]], outcome: dict[str, Any], action_name: str) -> dict[str, Any]:
-    output = outcome.get("output") if isinstance(outcome.get("output"), dict) else {}
+def resolve_action_trace_evidence(
+    records: list[dict[str, Any]],
+    outcome: dict[str, Any],
+    expectation_id: str,
+    action_name: str,
+) -> dict[str, Any]:
+    expectation = expectation_for("UC-E2E-S10", expectation_id)
+    projection = project_private_v3_output(
+        outcome,
+        expectation=expectation,
+    )
+    output = projection["output"]
     evidence = {
         "action_id": outcome.get("action_id"),
         "status": outcome.get("status"),
-        "artifact_path": output.get("artifact_path") or output.get("publish_ref"),
-        "tenant_id": output.get("tenant_id"),
-        "integrity": output.get("integrity"),
+        "artifact_path": projection["resource_id"],
+        "tenant_id": projection["tenant_id"],
+        "integrity": projection["state_digest"],
         "trace_event_id": outcome.get("trace_event_id"),
         "output": output,
+        "private_v3_projection": projection,
     }
     for record in records:
         if trace_kind(record) != "action.executed" or trace_action_name(record) != action_name:
             continue
         body = trace_body(record)
         trace_output = body.get("outcome") if isinstance(body.get("outcome"), dict) else {}
-        trace_path = trace_output.get("artifact_path") or trace_output.get("publish_ref") or body.get("action", {}).get("params", {}).get("publish_ref")
+        trace_projection = project_private_v3_output(
+            trace_output,
+            expectation=expectation,
+        )
+        trace_path = trace_projection["resource_id"]
         if evidence.get("artifact_path") and trace_path != evidence.get("artifact_path"):
             continue
         evidence.update(
@@ -1232,16 +1269,17 @@ def resolve_action_trace_evidence(records: list[dict[str, Any]], outcome: dict[s
                 "trace_run_id": record.get("run_id") or trace_identity(record).get("run_id"),
                 "trace_action_name": action_name,
                 "trace_artifact_path": trace_path,
-                "trace_integrity": trace_output.get("integrity"),
-                "trace_tenant_id": trace_output.get("tenant_id"),
+                "trace_integrity": trace_projection["state_digest"],
+                "trace_tenant_id": trace_projection["tenant_id"],
+                "trace_private_v3_projection": trace_projection,
             }
         )
         if not evidence.get("artifact_path") and trace_path:
             evidence["artifact_path"] = trace_path
         if not evidence.get("tenant_id") and isinstance(trace_path, str) and trace_path.startswith("artifact://"):
             evidence["tenant_id"] = trace_path.removeprefix("artifact://").split("/", 1)[0]
-        if not evidence.get("integrity") and trace_output.get("integrity"):
-            evidence["integrity"] = trace_output.get("integrity")
+        if not evidence.get("integrity"):
+            evidence["integrity"] = trace_projection["state_digest"]
         break
     return evidence
 
@@ -1254,7 +1292,12 @@ def main() -> int:
     parser.add_argument("--vpc-url", default="https://resident-vpc-node:8092")
     parser.add_argument("--cloud-url", default="https://resident-cloud-node:8091")
     parser.add_argument("--edge-url", default="https://resident-edge-node:8093")
-    parser.add_argument("--device-sim-url", default="http://device-sim:8086")
+    parser.add_argument(
+        "--action-provider-url",
+        dest="device_sim_url",
+        metavar="ACTION_PROVIDER_URL",
+        default="http://acceptance-action-provider:8086",
+    )
     parser.add_argument(
         "--resident-auth-dir",
         default=os.environ.get("SPLENDOR_RESIDENT_AUTH_DIR", "/run/splendor-auth"),
@@ -1631,8 +1674,16 @@ def main() -> int:
     invalid_work_order = orchestrator_work_order() | {"work_order_id": "wo_uc_e2e_s10_invalid_unsigned", "run_id": "44444444-4444-4444-8444-444444448899"}
     invalid_submit = call("submitWorkOrder", "POST", args.manager_url, "/work-orders", {**sec(manager), "work_order": invalid_work_order, "expected_audience": "central-manager"})
 
-    data_analysis = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"run_id": ORCH_DATA_RUN, "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "causal_trace_id": dispatch_data["body"].get("trace_event_id"), "action": action("data.read_fixture", "data.read_fixture", "ReadOnly", data_ref=DATA_REF), "adapter": "fixture-data-store", "quota_usage": quota(), "satisfied_preconditions": []})
-    specialist_data = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"run_id": SPECIALIST_RUN, "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "causal_trace_id": dispatch_spec["body"].get("trace_event_id"), "action": action("data.read_fixture", "data.read_fixture", "ReadOnly", data_ref=DATA_REF), "adapter": "fixture-data-store", "quota_usage": quota(), "satisfied_preconditions": []})
+    data_analysis = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"action_id": expectation_for("UC-E2E-S10", "orchestrator_data_read")["action_id"], "run_id": ORCH_DATA_RUN, "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "causal_trace_id": dispatch_data["body"].get("trace_event_id"), "action": action("data.read_fixture", "data.read_fixture", "ReadOnly", data_ref=DATA_REF), "adapter": "fixture-data-store", "quota_usage": quota(), "satisfied_preconditions": []})
+    specialist_data = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"action_id": expectation_for("UC-E2E-S10", "specialist_data_read")["action_id"], "run_id": SPECIALIST_RUN, "tenant_id": TENANT_ID, "agent_id": SPECIALIST_AGENT, "causal_trace_id": dispatch_spec["body"].get("trace_event_id"), "action": action("data.read_fixture", "data.read_fixture", "ReadOnly", data_ref=DATA_REF), "adapter": "fixture-data-store", "quota_usage": quota(), "satisfied_preconditions": []})
+    data_analysis_projection = project_private_v3_output(
+        data_analysis["body"],
+        expectation=expectation_for("UC-E2E-S10", "orchestrator_data_read"),
+    )
+    specialist_data_projection = project_private_v3_output(
+        specialist_data["body"],
+        expectation=expectation_for("UC-E2E-S10", "specialist_data_read"),
+    )
 
     task_request = typed_message(TASK_REQUEST_ID, ORCH_AGENT, SPECIALIST_AGENT, ORCH_RUN, "splendor.message.task_request.v2", {"parent_run_id": ORCH_RUN, "child_run_id": SPECIALIST_RUN, "target_agent_id": SPECIALIST_AGENT, "objective": "analyze scoped field-intelligence package under separately signed data authority", "capability_grant_id": CAPABILITY_GRANT_ID, "data_refs": [DATA_REF], "permissions": [], "delegated_authority": {"allowed_actions": [], "allowed_adapters": [], "allowed_permissions": []}}, dispatch_spec["body"].get("trace_event_id") or dispatch_data["body"].get("trace_event_id"), True)
     task_sent = call("sendMessage", "POST", args.manager_url, "/messages", {**sec(manager), "work_order_id": WORK_ORDER_ORCH_MESSAGE, "message_envelope": task_request, "source_instance_id": VPC_INSTANCE, "target_instance_id": VPC_INSTANCE, "idempotency_key": "s10-task-request", "simulate_failure": None})
@@ -1676,37 +1727,55 @@ def main() -> int:
 
     simulator_evidence: list[dict[str, Any]] = []
 
-    def physical_call(label: str, name: str, expected_delta: int, **safety_overrides: Any) -> dict[str, Any]:
-        before = sim_json("GET", args.device_sim_url, "/counters")
-        response = resident_call("submitPhysicalAction", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{EDGE_NODE}/actions", "actions_submit", physical_payload(name, **safety_overrides))
-        after = sim_json("GET", args.device_sim_url, "/counters")
+    def physical_call(label: str, name: str, expected_delta: int, *, expectation_id: str | None = None, **safety_overrides: Any) -> dict[str, Any]:
+        before = sim_json("GET", args.device_sim_url, "/evidence")
+        expected_action_id = (
+            expectation_for("UC-E2E-S10", expectation_id)["action_id"]
+            if expectation_id is not None
+            else None
+        )
+        response = resident_call("submitPhysicalAction", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{EDGE_NODE}/actions", "actions_submit", physical_payload(name, action_id=expected_action_id, **safety_overrides))
+        after = sim_json("GET", args.device_sim_url, "/evidence")
         simulator_evidence.append({"label": label, "action_name": name, "status": response["body"].get("status"), "counter_before": before, "counter_after": after, "total_delta": sim_total(after) - sim_total(before), "action_delta": sim_action_count(after, name) - sim_action_count(before, name), "expected_sim_delta": expected_delta, "reason_codes": response["body"].get("verification", {}).get("reasons", [])})
         return response
 
-    inspect_zone = physical_call("inspect_zone_from_cloud_proposal", "inspect_zone", 1, cloud_helper_proposal_id=ROUTE_PROPOSAL_ID, cloud_helper_message_id=CLOUD_MESSAGE_ID)
-    waypoint = physical_call("move_to_waypoint_from_cloud_proposal", "move_to_waypoint", 1, cloud_helper_proposal_id=ROUTE_PROPOSAL_ID, cloud_helper_message_id=CLOUD_MESSAGE_ID)
-    offline_sensor = physical_call("offline_sensor_summary_buffered", "read_sensor_summary", 1, offline=True)
-    upload_summary = physical_call("upload_trace_summary_after_reconnect", "upload_trace_summary", 1)
+    inspect_zone = physical_call("inspect_zone_from_cloud_proposal", "inspect_zone", 1, expectation_id="inspect_zone", cloud_helper_proposal_id=ROUTE_PROPOSAL_ID, cloud_helper_message_id=CLOUD_MESSAGE_ID)
+    waypoint = physical_call("move_to_waypoint_from_cloud_proposal", "move_to_waypoint", 1, expectation_id="move_to_waypoint", cloud_helper_proposal_id=ROUTE_PROPOSAL_ID, cloud_helper_message_id=CLOUD_MESSAGE_ID)
+    offline_sensor = physical_call("offline_sensor_summary_buffered", "read_sensor_summary", 1, expectation_id="read_sensor_summary", offline=True)
+    upload_summary = physical_call("upload_trace_summary_after_reconnect", "upload_trace_summary", 1, expectation_id="upload_trace_summary")
     cloud_direct_denial = physical_call("cloud_helper_direct_authority_denied", "move_to_waypoint", 0, cloud_helper_proposal_id="bad-direct", cloud_helper_message_id=CLOUD_MESSAGE_ID, cloud_helper_direct_authority=True)
     raw_physical = [resident_call("submitPhysicalAction", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{EDGE_NODE}/actions", "actions_submit", physical_payload(name), expected_statuses=(400,), expected_result="error") for name in FORBIDDEN_PHYSICAL_ACTIONS]
 
     intervention_expires_at = utc(30)
     intervention_request = resident_call("requestOperatorIntervention", "POST", args.edge_url, EDGE_INSTANCE, "/operator/interventions", "operator_intervene", {"intervention_id": "intervention_uc_e2e_s10_capture", "tenant_id": TENANT_ID, "agent_id": EDGE_AGENT, "run_id": EDGE_RUN, "node_id": EDGE_NODE, "action_name": "capture_image", "reason": "S10 local operator review", "expires_at": intervention_expires_at})
     intervention_grant = resident_call("grantOperatorIntervention", "POST", args.edge_url, EDGE_INSTANCE, "/operator/interventions/intervention_uc_e2e_s10_capture/grant", "operator_intervene", {"reason": "S10 local operator cleared capture", "expires_at": intervention_expires_at})
-    intervention_payload = physical_payload("capture_image")
+    intervention_payload = physical_payload("capture_image", action_id=expectation_for("UC-E2E-S10", "operator_capture")["action_id"])
     intervention_payload["operator_intervention_evidence"] = intervention_grant["body"].get("evidence")
-    before_intervention_capture = sim_json("GET", args.device_sim_url, "/counters")
+    before_intervention_capture = sim_json("GET", args.device_sim_url, "/evidence")
     intervention_capture = resident_call("submitPhysicalActionWithIntervention", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{EDGE_NODE}/actions", "actions_submit", intervention_payload)
-    after_intervention_capture = sim_json("GET", args.device_sim_url, "/counters")
+    after_intervention_capture = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_intervention_capture", "action_name": "capture_image", "status": intervention_capture["body"].get("status"), "http_status": intervention_capture["status"], "counter_before": before_intervention_capture, "counter_after": after_intervention_capture, "total_delta": sim_total(after_intervention_capture) - sim_total(before_intervention_capture), "action_delta": sim_action_count(after_intervention_capture, "capture_image") - sim_action_count(before_intervention_capture, "capture_image"), "expected_sim_delta": 1, "reason_codes": intervention_capture["body"].get("verification", {}).get("reasons", [])})
+    physical_projections = [
+        project_private_v3_output(
+            response["body"],
+            expectation=expectation_for("UC-E2E-S10", expectation_id),
+        )
+        for expectation_id, response in (
+            ("inspect_zone", inspect_zone),
+            ("move_to_waypoint", waypoint),
+            ("read_sensor_summary", offline_sensor),
+            ("upload_trace_summary", upload_summary),
+            ("operator_capture", intervention_capture),
+        )
+    ]
 
     extended_intervention_payload = physical_payload("capture_image")
     extended_intervention_evidence = copy.deepcopy(intervention_grant["body"].get("evidence", {}))
     extended_intervention_evidence["expires_at"] = utc(60)
     extended_intervention_payload["operator_intervention_evidence"] = extended_intervention_evidence
-    before_extended_intervention = sim_json("GET", args.device_sim_url, "/counters")
+    before_extended_intervention = sim_json("GET", args.device_sim_url, "/evidence")
     extended_intervention = resident_call("submitPhysicalActionExtendedIntervention", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{EDGE_NODE}/actions", "actions_submit", extended_intervention_payload, expected_statuses=(403,), expected_result="error")
-    after_extended_intervention = sim_json("GET", args.device_sim_url, "/counters")
+    after_extended_intervention = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_intervention_extended_expiry", "action_name": "capture_image", "status": extended_intervention["body"].get("status"), "http_status": extended_intervention["status"], "counter_before": before_extended_intervention, "counter_after": after_extended_intervention, "total_delta": sim_total(after_extended_intervention) - sim_total(before_extended_intervention), "action_delta": sim_action_count(after_extended_intervention, "capture_image") - sim_action_count(before_extended_intervention, "capture_image"), "expected_sim_delta": 0, "reason_codes": extended_intervention["body"].get("verification", {}).get("reasons", [])})
 
     other_device_profile = copy.deepcopy(device_profile)
@@ -1714,12 +1783,12 @@ def main() -> int:
     other_device_register = resident_call("registerOtherDeviceProfile", "POST", args.edge_url, EDGE_INSTANCE, "/devices/profiles", "device_register", {"profile": other_device_profile})
     reused_intervention_payload = physical_payload("capture_image")
     reused_intervention_payload["operator_intervention_evidence"] = intervention_grant["body"].get("evidence")
-    before_intervention_reuse = sim_json("GET", args.device_sim_url, "/counters")
+    before_intervention_reuse = sim_json("GET", args.device_sim_url, "/evidence")
     reused_intervention = resident_call("submitPhysicalActionReusedIntervention", "POST", args.edge_url, EDGE_INSTANCE, f"/devices/{OTHER_EDGE_NODE}/actions", "actions_submit", reused_intervention_payload, expected_statuses=(403,), expected_result="error")
-    after_intervention_reuse = sim_json("GET", args.device_sim_url, "/counters")
+    after_intervention_reuse = sim_json("GET", args.device_sim_url, "/evidence")
     simulator_evidence.append({"label": "operator_intervention_cross_device_reuse", "action_name": "capture_image", "status": reused_intervention["body"].get("status"), "http_status": reused_intervention["status"], "counter_before": before_intervention_reuse, "counter_after": after_intervention_reuse, "total_delta": sim_total(after_intervention_reuse) - sim_total(before_intervention_reuse), "action_delta": sim_action_count(after_intervention_reuse, "capture_image") - sim_action_count(before_intervention_reuse, "capture_image"), "expected_sim_delta": 0, "reason_codes": reused_intervention["body"].get("verification", {}).get("reasons", [])})
 
-    internal_artifact = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"run_id": ORCH_RUN, "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "causal_trace_id": response_sent["body"].get("trace_event_id") or task_sent["body"].get("trace_event_id") or data_analysis["body"].get("trace_event_id"), "action": action("artifact.create_internal", "artifact.create_internal", "External", artifact_path=INTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
+    internal_artifact = resident_call("submitAction", "POST", args.vpc_url, VPC_INSTANCE, "/actions", "actions_submit", {"action_id": expectation_for("UC-E2E-S10", "internal_artifact")["action_id"], "run_id": ORCH_RUN, "tenant_id": TENANT_ID, "agent_id": ORCH_AGENT, "causal_trace_id": response_sent["body"].get("trace_event_id") or task_sent["body"].get("trace_event_id") or data_analysis["body"].get("trace_event_id"), "action": action("artifact.create_internal", "artifact.create_internal", "External", artifact_path=INTERNAL_ARTIFACT), "adapter": "artifact-store", "quota_usage": quota(), "satisfied_preconditions": []})
     publish_create = dispatch_create_body(dispatch_publish)
     publish_start = dispatch_start_body(dispatch_publish)
     publish_after_dispatch = resident_call("inspectPublishAfterDispatch", "GET", args.vpc_url, VPC_INSTANCE, f"/runs/{PUBLISH_RUN}", "runs_read")
@@ -1906,12 +1975,12 @@ def main() -> int:
     inspect_before_replay = resident_call("inspectRunBeforeReplay", "GET", args.vpc_url, VPC_INSTANCE, f"/runs/{ORCH_RUN}", "runs_read")
     publish_before_replay = resident_call("inspectPublishBeforeReplay", "GET", args.vpc_url, VPC_INSTANCE, f"/runs/{PUBLISH_RUN}", "runs_read")
     helper_before_replay = resident_call("inspectHelperBeforeReplay", "GET", args.cloud_url, CLOUD_INSTANCE, f"/runs/{CLOUD_HELPER_RUN}", "runs_read")
-    sim_before_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_before_replay = sim_json("GET", args.device_sim_url, "/evidence")
     replay_orch = resident_call("replayRun", "POST", args.vpc_url, VPC_INSTANCE, f"/runs/{ORCH_RUN}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": False})
     replay_publish = resident_call("replayPublishRun", "POST", args.vpc_url, VPC_INSTANCE, f"/runs/{PUBLISH_RUN}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": False})
     replay_edge = resident_call("replayEdgeRun", "POST", args.edge_url, EDGE_INSTANCE, f"/runs/{EDGE_RUN}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": False})
     unsafe_replay = resident_call("replaySideEffectMode", "POST", args.vpc_url, VPC_INSTANCE, f"/runs/{PUBLISH_RUN}/replay", "replay_create", {"mode": "inspect_only", "side_effects_allowed": True}, expected_statuses=(400, 403), expected_result="error")
-    sim_after_replay = sim_json("GET", args.device_sim_url, "/counters")
+    sim_after_replay = sim_json("GET", args.device_sim_url, "/evidence")
     inspect_after_replay = resident_call("inspectRunAfterReplay", "GET", args.vpc_url, VPC_INSTANCE, f"/runs/{ORCH_RUN}", "runs_read")
     publish_after_replay = resident_call("inspectPublishAfterReplay", "GET", args.vpc_url, VPC_INSTANCE, f"/runs/{PUBLISH_RUN}", "runs_read")
     helper_after_replay = resident_call("inspectHelperAfterReplay", "GET", args.cloud_url, CLOUD_INSTANCE, f"/runs/{CLOUD_HELPER_RUN}", "runs_read")
@@ -1993,8 +2062,18 @@ def main() -> int:
     action_counts = action_execution_counts(records)
     orch_publish_executions = [record for record in records if (record.get("run_id") or trace_identity(record).get("run_id")) == PUBLISH_RUN and trace_kind(record) == "action.executed" and trace_action_name(record) == "artifact.publish_external"]
     revoke_publish_executions = [record for record in records if (record.get("run_id") or trace_identity(record).get("run_id")) == REVOKE_RUN and trace_kind(record) == "action.executed" and trace_action_name(record) == "artifact.publish_external"]
-    internal_evidence = resolve_action_trace_evidence(records, internal_artifact["body"], "artifact.create_internal")
-    publish_evidence = resolve_action_trace_evidence(records, approved_publish["body"], "artifact.publish_external")
+    internal_evidence = resolve_action_trace_evidence(
+        records,
+        internal_artifact["body"],
+        "internal_artifact",
+        "artifact.create_internal",
+    )
+    publish_evidence = resolve_action_trace_evidence(
+        records,
+        approved_publish["body"],
+        "approved_publish",
+        "artifact.publish_external",
+    )
     expired_raw_trace_records_before = publish_traces_before_expired_raw["body"].get("records", [])
     expired_raw_trace_records_after = publish_traces_after_expired_raw["body"].get("records", [])
     def approval_action_outcome_trace_ids(trace_records: list[dict[str, Any]]) -> list[str]:
@@ -2353,7 +2432,7 @@ def main() -> int:
         "nodes_and_instances_registered": node_list["status"] == 200 and all(item["status"] == 200 for item in node_registrations + instance_registrations + instance_heartbeats),
         "policy_bundle_published_with_ttl": policy["body"].get("status") == "published" and policy_status["body"].get("status") == "published" and bool(policy["body"].get("envelope", {}).get("expires_at")),
         "signed_work_order_accepted_and_placed_on_vpc": placement["body"].get("status") == "selected" and placement["body"].get("candidate_id") == VPC_NODE and placement_data["body"].get("status") == "selected" and placement_data["body"].get("candidate_id") == VPC_NODE and placement_spec["body"].get("status") == "selected" and placement_spec["body"].get("candidate_id") == VPC_NODE and placement_publish["body"].get("status") == "selected" and placement_publish["body"].get("candidate_id") == VPC_NODE and placement_revoke["body"].get("status") == "selected" and placement_revoke["body"].get("candidate_id") == VPC_NODE and orch_create["status"] in {200, 201} and orch_start["status"] == 200 and dispatch_data["body"].get("create_run_status") in {200, 201} and dispatch_spec["body"].get("create_run_status") in {200, 201} and dispatch_publish["body"].get("selected_instance_id") == VPC_INSTANCE and dispatch_revoke["body"].get("selected_instance_id") == VPC_INSTANCE and resident_security["status"] == "passed" and resident_security["all_work_orders_signed_for_target_instance"] is True,
-        "data_local_analysis_executed": data_analysis["body"].get("status") == "Executed" and data_analysis["body"].get("output", {}).get("data_ref") == DATA_REF,
+        "data_local_analysis_executed": data_analysis["body"].get("status") == "Executed" and data_analysis_projection.get("resource_id") == DATA_REF and specialist_data_projection.get("resource_id") == DATA_REF,
         "shared_specialist_typed_response_delivered": specialist_data["body"].get("status") == "Executed" and task_sent["body"].get("delivery_status") == "delivered" and task_read["body"].get("receive_side_validated") is True and response_sent["body"].get("delivery_status") == "delivered" and response_read["body"].get("receive_side_validated") is True,
         "message_public_api_surface_exercised": {row["operation_id"] for row in api_rows} >= message_api_operations and schema_validation["body"].get("valid") is True and message_schemas["body"].get("delivery_authority_granted") is False and orchestrator_outbox["body"].get("messages") and specialist_inbox["body"].get("messages") and specialist_outbox["body"].get("messages") and edge_inbox["body"].get("messages") and len(causal_graph["body"].get("nodes", [])) >= 2 and ack_task["body"].get("delivery_status") == "consumed" and ack_response["body"].get("delivery_status") == "consumed" and nack_duplicate["body"].get("payload_preserved") is True,
         "cloud_helper_proposal_only": cloud_delivery["body"].get("delivery_status") == "delivered" and cloud_read["body"].get("receive_side_validated") is True and cloud_proposal["message"]["payload"].get("direct_actuator_authority") is False and cloud_proposal["message"]["payload"].get("publication_authority") is False and helper_publish_denial["body"].get("status") == "Denied" and cloud_direct_denial["body"].get("status") == "Denied",
@@ -2372,7 +2451,7 @@ def main() -> int:
 
     contract_report = read_json(report_dir / "contract-status.json")
     topology_path = root / "tests" / "e2e" / "use-cases" / "docker-compose.acceptance.yml"
-    topology = {"compose_file": str(topology_path), "topology_hash": digest_file(topology_path), "services": ["central-manager", "resident-vpc-node", "resident-cloud-node", "resident-edge-node", "device-sim", "e2e-runner"]}
+    topology = {"compose_file": str(topology_path), "topology_hash": digest_file(topology_path), "services": ["central-manager", "resident-vpc-node", "resident-cloud-node", "resident-edge-node", "acceptance-action-provider", "e2e-runner"]}
     trace_event_ids = sorted({tid for values in event_ids.values() for tid in values if tid} | {trace_id(record) for record in records if trace_id(record)})
     state_node_ids = sorted({state_before["body"].get("state_node_id", ""), handoff_export["body"].get("state_node_id", ""), cloud_state_before_import["body"].get("state_node_id", ""), cloud_state_after_import_denial["body"].get("state_node_id", ""), state_after["body"].get("state_node_id", ""), cloud_resume["body"].get("state_node_id", "")})
     state_hashes = sorted({state_before["body"].get("data_hash", ""), state_after["body"].get("data_hash", ""), handoff_export["body"].get("handoff", {}).get("snapshot", {}).get("state_hash", {}).get("value", "")})
@@ -2585,6 +2664,14 @@ def main() -> int:
         "positive_checks": positives,
         "negative_cases": negatives,
         "scenario_failures": failures,
+        "private_v3_outputs": [
+            data_analysis_projection,
+            specialist_data_projection,
+            internal_evidence["private_v3_projection"],
+            publish_evidence["private_v3_projection"],
+            *physical_projections,
+        ],
+        "provider_evidence": [sim_before_replay, sim_after_replay],
         "artifact_paths": [],
     }
     anti = {
@@ -2613,7 +2700,7 @@ def main() -> int:
         "api-contract-report.json": {"source": str(report_dir / "contract-status.json"), "digest": digest_file(report_dir / "contract-status.json"), "contract": contract_report},
         "topology.json": topology,
         "registry-report.json": {"node_registrations": node_registrations, "instance_registrations": instance_registrations, "instance_heartbeats": instance_heartbeats, "list_nodes": node_list, "canonical_s4_registration_reused": True, "all_registration_requests_accepted": all(item["status"] == 200 for item in node_registrations + instance_registrations + instance_heartbeats), "duplicate_registration_rejections_treated_as_success": False},
-        "journey-report.json": {"positive_checks": positives, "run_dispatch": {"orchestrator": {"mode": "direct_exact_profile", "create": orch_create["body"], "start": orch_start["body"]}, "orchestrator_data": dispatch_data["body"], "specialist": dispatch_spec["body"], "cloud_helper": dispatch_helper["body"], "publish": dispatch_publish["body"], "publish_revoke": dispatch_revoke["body"]}, "publish_run": {"manager_submission": publish_submit["body"], "manager_dispatch": dispatch_publish["body"], "create": publish_create, "start": publish_start, "approval_policies": publish_approval_policies, "exact_action_retry": publish_retry["body"], "forged_legacy_grant": forged_legacy_publish, "expired_raw_pre_gateway": expired_raw_pre_gateway_unchanged}, "data_analysis": data_analysis["body"], "device": {"register": device_register["body"], "status": device_status["body"], "policy_cache": policy_cache["body"], "simulator_evidence": simulator_evidence}, "state_before": state_before["body"], "state_after": state_after["body"]},
+        "journey-report.json": {"positive_checks": positives, "run_dispatch": {"orchestrator": {"mode": "direct_exact_profile", "create": orch_create["body"], "start": orch_start["body"]}, "orchestrator_data": dispatch_data["body"], "specialist": dispatch_spec["body"], "cloud_helper": dispatch_helper["body"], "publish": dispatch_publish["body"], "publish_revoke": dispatch_revoke["body"]}, "publish_run": {"manager_submission": publish_submit["body"], "manager_dispatch": dispatch_publish["body"], "create": publish_create, "start": publish_start, "approval_policies": publish_approval_policies, "exact_action_retry": publish_retry["body"], "forged_legacy_grant": forged_legacy_publish, "expired_raw_pre_gateway": expired_raw_pre_gateway_unchanged}, "data_analysis": data_analysis["body"], "specialist_data": specialist_data["body"], "device": {"register": device_register["body"], "status": device_status["body"], "policy_cache": policy_cache["body"], "simulator_evidence": simulator_evidence}, "state_before": state_before["body"], "state_after": state_after["body"]},
         "message-flow.json": {"task_request": task_sent["body"], "task_request_read": task_read["body"], "task_response": response_sent["body"], "task_response_read": response_read["body"], "cloud_proposal": cloud_delivery["body"], "cloud_proposal_read": cloud_read["body"], "duplicate": duplicate_delivery["body"]},
         "message-api-report.json": message_api_report,
         "artifact-publication-report.json": {"internal_run_id": ORCH_RUN, "publish_run_id": PUBLISH_RUN, "internal_work_order_id": WORK_ORDER_ORCH, "publish_work_order_id": WORK_ORDER_ORCH_PUBLISH, "profiles_split": True, "internal_create": orch_create["body"], "internal_start": orch_start["body"], "publish_manager_submission": publish_submit["body"], "publish_manager_dispatch": dispatch_publish["body"], "publish_approval_policies": publish_approval_policies, "publish_create": publish_create, "publish_start": publish_start, "publish_after_dispatch": publish_after_dispatch["body"], "publish_state_after_dispatch": publish_state_after_dispatch["body"], "publish_exact_action_request": publish_exact_action_request, "publish_exact_action_retry": publish_retry["body"], "publish_before_exact_retry": publish_before_retry["body"], "publish_after_exact_retry": publish_after_retry["body"], "publish_state_before_exact_retry": publish_state_before_retry["body"], "publish_state_after_exact_retry": publish_state_after_retry["body"], "exact_retry_preserved_tick_and_state": publish_retry_preserved_tick_and_state, "exact_retry_executed_once_without_lifecycle_advance": publish_retry_executed_once_without_lifecycle_advance, "forged_legacy_grant": forged_legacy_publish, "forged_legacy_adapter_executions": publish_after_forged_legacy["body"].get("adapter_executions"), "internal_artifact": internal_artifact["body"], "internal_artifact_evidence": internal_evidence, "publish_needs_approval": publish_needs_approval["body"], "approval_request": approval_request["body"], "approval_grant": approval_grant["body"], "approved_publish": approved_publish["body"], "approved_publish_evidence": publish_evidence, "expired_approval": expired_approval, "expired_raw_active_run": {"pre_gateway_rejected_unchanged": expired_raw_pre_gateway_unchanged, "run_before": publish_before_expired_raw["body"], "run_after": publish_after_expired_raw["body"], "state_before": publish_state_before_expired_raw["body"], "state_after": publish_state_after_expired_raw["body"], "lifecycle_unchanged": expired_raw_lifecycle_unchanged, "state_unchanged": expired_raw_state_unchanged, "no_new_approval_action_outcome_trace": expired_raw_no_new_decision_trace, "decision_trace_ids_before": expired_raw_decision_traces_before, "decision_trace_ids_after": expired_raw_decision_traces_after}, "claim_first_revoke": claim_first_revoke, "publish_execution_count_for_positive_run": len(orch_publish_executions)},

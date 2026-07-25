@@ -1,0 +1,24 @@
+[package]
+name = "splendor-acceptance-action-host"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+ring = "0.17"
+serde = { workspace = true }
+serde_json = { workspace = true }
+splendor-daemon = { path = "../../../../crates/splendor-daemon" }
+splendor-gateway = { path = "../../../../crates/splendor-gateway" }
+splendor-types = { path = "../../../../crates/splendor-types" }
+time = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+ureq = { version = "2", features = ["tls"] }
+url = "2.5"
+uuid = { workspace = true }
+
+[[bin]]
+name = "splendor-acceptance-action-host"
+path = "src/main.rs"

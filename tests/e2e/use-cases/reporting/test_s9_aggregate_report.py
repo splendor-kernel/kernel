@@ -2,9 +2,31 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 
 import aggregate_report as ar
+
+
+def load_s9_scenario_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scenarios"
+        / "uc_e2e_s9_failure_injection"
+        / "run.py"
+    )
+    spec = importlib.util.spec_from_file_location("uc_e2e_s9_failure_injection_run", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load S9 scenario helper module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+S9_SCENARIO = load_s9_scenario_module()
 
 
 RUN_ID = "44444444-4444-4444-8444-444444449903"
@@ -224,6 +246,132 @@ class S9AggregateEvidenceTests(unittest.TestCase):
             source_trace_records=source_records,
         )
         self.assertIn("s9_trace_write_failure_after_effect_evidence_missing", failures)
+
+
+class S9ScenarioFailurePredicateTests(unittest.TestCase):
+    def fixture(self) -> tuple[dict, dict, dict, dict, dict, int]:
+        action_id = "55555555-5555-4555-8555-555555559902"
+        outcome = {
+            "action_id": action_id,
+            "status": "Failed",
+            "error": "adapter failed",
+            "output": None,
+            "post_verification": None,
+            "verification": {"artifacts": {}},
+        }
+        before = {"adapter_executions": 0}
+        after = {"adapter_executions": 0}
+        provider_before = {"by_action": {"s9.adapter_failure": 0}, "actions": []}
+        provider_after = {
+            "by_action": {"s9.adapter_failure": 1},
+            "actions": [
+                {
+                    "action_id": action_id,
+                    "result": "failed",
+                    "provider_receipt_id": None,
+                }
+            ],
+        }
+        return outcome, before, after, provider_before, provider_after, 1
+
+    def test_accepts_bounded_failure_without_self_asserted_certainty(self) -> None:
+        self.assertTrue(S9_SCENARIO.conservative_adapter_failure_evidence(*self.fixture()))
+
+    def test_rejects_magic_prefix_or_structured_adapter_claim(self) -> None:
+        fixture = list(self.fixture())
+        fixture[0] = copy.deepcopy(fixture[0])
+        fixture[0]["error"] = (
+            "splendor.adapter_failure.v1|spoofed|unavailable|"
+            "retry_with_same_idempotency_key|none|pre_send"
+        )
+        self.assertFalse(S9_SCENARIO.conservative_adapter_failure_evidence(*fixture))
+
+        fixture = list(self.fixture())
+        fixture[0] = copy.deepcopy(fixture[0])
+        fixture[0]["verification"]["artifacts"]["adapter_failure"] = {
+            "effect_certainty": "none",
+            "retry_class": "retry_with_same_idempotency_key",
+        }
+        self.assertFalse(S9_SCENARIO.conservative_adapter_failure_evidence(*fixture))
+
+    def test_rejects_retry_or_success_counter_drift(self) -> None:
+        fixture = list(self.fixture())
+        fixture[-1] = 2
+        self.assertFalse(S9_SCENARIO.conservative_adapter_failure_evidence(*fixture))
+
+        fixture = list(self.fixture())
+        fixture[2] = {"adapter_executions": 1}
+        self.assertFalse(S9_SCENARIO.conservative_adapter_failure_evidence(*fixture))
+
+    def test_rejects_missing_or_non_exact_execution_counters(self) -> None:
+        cases = [
+            ("both_missing", {}, {}),
+            ("before_missing", {}, {"adapter_executions": 0}),
+            ("after_missing", {"adapter_executions": 0}, {}),
+            ("none", {"adapter_executions": None}, {"adapter_executions": None}),
+            ("bool", {"adapter_executions": False}, {"adapter_executions": False}),
+            ("float", {"adapter_executions": 0.0}, {"adapter_executions": 0.0}),
+            ("string", {"adapter_executions": "0"}, {"adapter_executions": "0"}),
+        ]
+        for name, before, after in cases:
+            with self.subTest(name=name):
+                fixture = list(self.fixture())
+                fixture[1] = before
+                fixture[2] = after
+                self.assertFalse(
+                    S9_SCENARIO.conservative_adapter_failure_evidence(*fixture)
+                )
+
+    def test_rejects_retired_authority_schemas_under_any_artifact_nesting(self) -> None:
+        cases = [
+            {"alternate": {"schema": "splendor.adapter_failure_evidence.v1"}},
+            {"nested": [{"schema": "splendor.adapter_failure.v1"}]},
+            {"splendor.adapter_failure_evidence.v1": {"claim": "none"}},
+        ]
+        for artifacts in cases:
+            with self.subTest(artifacts=artifacts):
+                fixture = list(self.fixture())
+                fixture[0] = copy.deepcopy(fixture[0])
+                fixture[0]["verification"]["artifacts"] = artifacts
+                self.assertFalse(
+                    S9_SCENARIO.conservative_adapter_failure_evidence(*fixture)
+                )
+
+
+class S9ReplayProviderStateTests(unittest.TestCase):
+    def test_ignores_read_freshness_and_detects_effect_changes(self) -> None:
+        before = {
+            "by_action": {"s9.idempotent_read": 1},
+            "actions": [{"action_id": ACTION_ID, "result": "executed"}],
+            "snapshot_at_unix_ms": 1,
+            "expires_at_unix_ms": 2,
+            "snapshot_sequence": 7,
+            "request_binding": {"nonce": "before"},
+            "_evidence_verification": {"envelope": {"signature_b64": "before"}},
+        }
+        after = copy.deepcopy(before)
+        after.update(
+            {
+                "snapshot_at_unix_ms": 3,
+                "expires_at_unix_ms": 4,
+                "snapshot_sequence": 8,
+                "request_binding": {"nonce": "after"},
+                "_evidence_verification": {
+                    "envelope": {"signature_b64": "after"}
+                },
+            }
+        )
+
+        self.assertEqual(
+            S9_SCENARIO.replay_provider_effect_state(before),
+            S9_SCENARIO.replay_provider_effect_state(after),
+        )
+
+        after["by_action"]["s9.idempotent_read"] = 2
+        self.assertNotEqual(
+            S9_SCENARIO.replay_provider_effect_state(before),
+            S9_SCENARIO.replay_provider_effect_state(after),
+        )
 
 
 if __name__ == "__main__":

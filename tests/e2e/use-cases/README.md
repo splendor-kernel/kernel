@@ -64,10 +64,24 @@ trace/state/replay/audit evidence.
 
 `docker-compose.acceptance.yml` provides active S0 service roles: runner, local
 daemon, acceptance manager, TLS resident nodes, an ephemeral resident-auth
-fixture initializer, device sim, fake external services, telemetry sink, and
-toxiproxy. The initializer generates test-only caller/work-order/policy keys and
-a TLS certificate in an untracked Docker volume; no generated private material
-is written to source or evidence artifacts. The local daemon remains
+fixture initializer, a controlled receipt-bearing action provider, fake external
+services, telemetry sink, and toxiproxy. Local and resident roles use the
+dedicated `acceptance-action-host` image target, not the production daemon image.
+That unpublished host composes a closed fixture adapter set with a local provider;
+the production `splendor-daemon` remains adapterless. One checked-in private-v3
+manifest owns all 18 operation profiles. The initializer generates distinct
+owner-only HMAC request credentials for local, cloud, VPC, and edge hosts, plus
+a provider-only Ed25519 receipt key. Request credentials additionally bind exact
+fixture artifact/data references or the provisioned physical node where those
+resources apply. Each host mounts only its scoped request credential and the raw
+receipt public key. The root runner receives root-owned runner-only evidence
+material and performs a signed read/verification smoke before scenarios start.
+Its short-lived HMAC request binds method, path, query, view, reader, audience,
+provider epoch, timestamp, and nonce; the signed response repeats that binding
+and a monotonic snapshot sequence. The runner cannot authenticate `/actions` or
+forge a receipt. It also generates test-only
+caller/work-order/policy keys and a TLS certificate in role-specific volumes; no
+generated private material is written to source or evidence artifacts. The local daemon remains
 loopback-only; compose makes the runner share the daemon container network
 namespace so it can call documented `/health` and `/capabilities` on
 `127.0.0.1` without publishing daemon ports or binding all interfaces. The S0
@@ -120,7 +134,37 @@ backed by exported runtime traces, manager audit rows, or public API response
 artifacts and is correlated to S10 run/work-order/message/node/instance or
 governance IDs. The journey keeps cloud helpers proposal-only, telemetry
 observational, replay side-effect-free by default, and physical actions
-high-level only.
+high-level only. S2, S5, S6, S7, S9, and S10 retain provider-returned fixture
+records and authenticated signed observations, including the envelope, public
+key fingerprint/material, exact request binding, and decoded snapshot. Only
+S5/S6/S7/S10 route those observations through the canonical externally anchored
+aggregate verifier. On that path, retained key material is compare-only:
+aggregation requires the setup-owned provider public-key path and checked-in
+scenario expectations, and fails closed when either trust input is absent or
+does not match. It also requires the exact reader scope, one signing
+key/provider epoch, unique nonces, and increasing sequences within the retained
+report chain. S2/S9 retain signed observations for scenario diagnostics, but
+their aggregate loaders do not currently apply that canonical external trust
+path; an S9 report alone is not cryptographic proof of retry behavior. Live
+sequence replay detection is bounded process-local state; it is not durable
+across verifier process restart and makes no durable anti-replay claim.
+S5/S6/S7/S10 use one canonical private-v3 projection for marker, artifact,
+data/SQL, sensor, and physical output families.
+The acceptance host verifies provider-origin receipts before parsing their payloads,
+then enforces manifest-selected status, output-family, digest, coordinate, and
+postcondition predicates. These fixture receipts remain adapter outcomes rather
+than kernel authority. Deduplication is bounded to one provider process epoch;
+a provider restart requires host restart/rebinding and makes no restart-durable
+exactly-once claim. There is no private-v2 negotiation or fallback. Static
+Compose validation is not a runtime pass; Docker scenarios are `not_exercised`
+when the Docker daemon is unavailable.
+
+`run-native-acceptance-host-s2.sh` is a functional fallback only. It removes its
+entire dedicated runtime tree before generating only the local request role, and
+retained reports label native execution `functional_only` and Docker isolation
+`not_exercised`. Because provider and host share the invoking Unix identity, the
+native run is never evidence of provider-private-key or compromised-host
+isolation.
 
 Independent aggregation re-derives the migrated approval contracts from retained
 API traffic rather than scenario summary booleans. S5 proves active raw-evidence

@@ -124,7 +124,8 @@ case "${MODE}" in
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s2_management_api/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
-        --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}"
+        --base-url "${SPLENDOR_DAEMON_URL:-http://127.0.0.1:8077}" \
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
     fi
     if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S3" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S10" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s3_multi_agent_delegation/run.py" \
@@ -144,20 +145,23 @@ case "${MODE}" in
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
         --base-url "${SPLENDOR_DAEMON_URL:-http://splendor-daemon-local:8080}" \
-        --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}"
+        --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
     fi
     if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S6" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S10" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s6_physical_edge/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
-        --edge-url "${SPLENDOR_EDGE_NODE_URL:-https://resident-edge-node:8093}"
+        --edge-url "${SPLENDOR_EDGE_NODE_URL:-https://resident-edge-node:8093}" \
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
     fi
     if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S7" || "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S10" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s7_data_isolation_artifacts/run.py" \
         --root "${ROOT_DIR}" \
         --report-dir "${REPORT_DIR}" \
         --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
-        --vpc-url "${SPLENDOR_VPC_NODE_URL:-https://resident-vpc-node:8092}"
+        --vpc-url "${SPLENDOR_VPC_NODE_URL:-https://resident-vpc-node:8092}" \
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
     fi
     if [[ ( "${MODE}" == "scenario" && ( "${SCENARIO}" == "UC-E2E-S8" || "${SCENARIO}" == "UC-E2E-S10" ) ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s8_replay_audit_compat/run.py" \
@@ -174,7 +178,8 @@ case "${MODE}" in
         --base-url "${SPLENDOR_DAEMON_URL:-http://splendor-daemon-local:8080}" \
         --manager-url "${SPLENDOR_MANAGER_URL:-http://central-manager:8081}" \
         --vpc-url "${SPLENDOR_VPC_NODE_URL:-https://resident-vpc-node:8092}" \
-        --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-https://resident-cloud-node:8091}"
+        --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-https://resident-cloud-node:8091}" \
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
     fi
     if [[ ( "${MODE}" == "scenario" && "${SCENARIO}" == "UC-E2E-S10" ) || "${MODE}" == "all" ]]; then
       python3 "${ROOT_DIR}/tests/e2e/use-cases/scenarios/uc_e2e_s10_final_journey/run.py" \
@@ -184,14 +189,20 @@ case "${MODE}" in
         --vpc-url "${SPLENDOR_VPC_NODE_URL:-https://resident-vpc-node:8092}" \
         --cloud-url "${SPLENDOR_CLOUD_NODE_URL:-https://resident-cloud-node:8091}" \
         --edge-url "${SPLENDOR_EDGE_NODE_URL:-https://resident-edge-node:8093}" \
-        --device-sim-url "${SPLENDOR_DEVICE_SIM_URL:-http://device-sim:8086}"
+        --action-provider-url "${SPLENDOR_ACTION_PROVIDER_URL:-http://acceptance-action-provider:8086}"
+    fi
+    TRUSTED_PROVIDER_PUBLIC_KEY="${SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE:-}"
+    if [[ -z "${TRUSTED_PROVIDER_PUBLIC_KEY}" ]]; then
+      echo "SPLENDOR_ACCEPTANCE_RECEIPT_PUBLIC_KEY_FILE is required for retained private-v3 verification." >&2
+      exit 2
     fi
     python3 "${ROOT_DIR}/tests/e2e/use-cases/reporting/aggregate_report.py" \
       --root "${ROOT_DIR}" \
       --report-dir "${REPORT_DIR}" \
       --scenario "${SCENARIO:-UC-E2E-S0}" \
       --mode "${MODE}" \
-      --compose-file "${COMPOSE_FILE}"
+      --compose-file "${COMPOSE_FILE}" \
+      --trusted-provider-public-key "${TRUSTED_PROVIDER_PUBLIC_KEY}"
     ;;
 esac
 

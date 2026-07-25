@@ -157,6 +157,81 @@ does not inherit local-development caller, work-order, or policy trust. Missing,
 empty, malformed, stale, or unsafe inputs abort/fail closed. `local_dev` is
 explicit, warning-logged, and loopback-only; unknown mode values fail startup.
 
+## Action adapter composition
+
+The production `splendor-daemon` binary is deliberately adapterless in both
+`local_dev` and `resident` modes. It does not read provider endpoints or construct
+concrete adapters. A run whose immutable registered, work-order, or policy action
+profile names an unavailable adapter is rejected with HTTP `503` and
+`action_adapter_unavailable` before the run or create-idempotency receipt is
+committed. Error details identify the tenant, agent, run, action, adapter,
+`effect_certainty: none`, and the pre-commit admission stage.
+
+The daemon library accepts a narrow `ConfiguredActionAdapters` map of already
+constructed `Arc<dyn ActionAdapter>` values for tests and explicit outer process
+owners. The map grants no authority and requests cannot add endpoints or widen
+profiles. Signed work orders, exact action profiles, live run authority, gateway
+verifiers, and final effect permits remain required before adapter invocation.
+
+The repository's Cargo-only architecture guard closes the current daemon package
+feature map, production dependencies and targets, provider-client package owners,
+and inward adapter/package direction. The exact current `reqwest` declaration is
+retained for RFC-0011 resident dispatch. The guard does not inspect Rust source or
+prove which provider/effect operations are called. Source-wide effect scanning
+and universal semantic duplicate-owner detection remain future and unimplemented;
+the current lower bound is package closure plus production-selection, zero-I/O,
+gateway, replay, and image-composition tests.
+
+Repository use-case acceptance uses the unpublished
+`splendor-acceptance-action-host`, a separate non-production binary and Docker
+target. It composes the daemon with a closed set of fixture operations and an
+authenticated local provider. The private-v3 fixture protocol has no negotiation
+or fallback. One embedded manifest owns all 18 operation profiles and is digest-
+bound into requests and receipts. Local, cloud, VPC, and edge hosts receive
+different owner-only 256-bit HMAC request credentials scoped to exact instance,
+tenant, audience, lifetime, TTL, operation IDs, and applicable fixture resource
+references. Edge authority binds the provisioned physical node; data and artifact
+authority binds explicit accepted references. Each host receives only the
+provider's raw Ed25519 public key; provider-only private material signs receipts.
+None of these inputs is supported by the production daemon binary or image.
+
+The acceptance host verifies the detached Ed25519 signature over exact receipt
+payload bytes before parsing, pins the provider startup epoch, and enforces the
+manifest-selected status, operation-specific output proof, bounds, digests,
+coordinates, and postconditions. A separate runner-only HMAC credential protects
+`/evidence` reads. The signed snapshot binds the exact reader key/principal,
+audience, method, path/query/view, timestamp, nonce, provider epoch, and monotonic
+snapshot sequence. Retained reports include the signed envelope, decoded snapshot,
+and compare-only public verification material for independent aggregation. The
+aggregate verifier requires a setup-owned provider public-key path and checked-in
+scenario expectations; report-embedded key material and expected values never
+select trust or authority. It also requires the exact reader scope, one signing
+key/provider epoch, unique nonces, and increasing sequences within the retained
+report chain. Live verifier sequence tracking is bounded process-local memory,
+not durable cross-process anti-replay state. Request and receipt freshness, global
+and per-principal provider ledgers/concurrency, host
+anti-equivocation state, evidence nonces, worker admission, signer output/time,
+and payload sizes are bounded. Deduplication is explicitly process-epoch-only,
+not restart durable, and is not a production exactly-once claim.
+
+The fixture's one semantic-retry profile requires
+`action.params.retry_attempt` to move from `1` to `2`. Its action ID, request ID,
+issued time, and deadline are optional companion-varying fields; no companion can
+reconcile without that marker transition. `action.params.idempotency_key` is the
+external idempotency identity, not a retry-varying field, so changing it starts a
+separate initial identity or fails as a reconciliation without an existing effect.
+
+`AdapterError::Failed(String)` remains the stable adapter contract. The gateway
+does not parse that human string for category, retry, phase, provider code, or
+effect certainty. Every such failure maps conservatively to the existing unknown
+adapter taxonomy (`not_retryable`, `uncertain`), while the public action-outcome
+message is the bounded text `adapter failed`. Inspect-only replay does not invoke
+an injected adapter. Static Compose validation is not a container pass; container
+runtime scenarios and `G00` remain `not_exercised` whenever the Docker daemon is
+unavailable. The native S2 fallback cleans a dedicated tree and creates only its
+local request role, but remains `functional_only`: its shared Unix identity is not
+provider-key, role-isolation, or compromised-host evidence.
+
 Resident requests use `Authorization: Bearer` with the accepted closed Ed25519
 profile from [RFC 0011](../rfc/0011-resident-caller-auth-and-dispatch.md). The
 body/header `CallerCredential` and `AuditAttribution` objects are compatibility

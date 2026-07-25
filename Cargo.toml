@@ -11,6 +11,7 @@ members = [
     "adapters/http",
     "adapters/robotics",
     "adapters/secrets-memory",
+    "tests/e2e/use-cases/acceptance-host",
     "python/bindings",
 ]
 resolver = "2"
