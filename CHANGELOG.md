@@ -19,8 +19,8 @@
   parsing handles once-decoded URL authorities, paths, bare query names and
   values, bounded nested URLs, standalone form bodies, encoded non-URL spans
   adjacent to URLs, valid token prefixes before alphabet-overlapping punctuation,
-  structurally separated numeric host ports, and plus-as-space values with one
-  decode per layer;
+  structurally validated reg-name/IP-literal authorities and `u16` ports, and
+  plus-as-space values with one decode per layer;
   ordinary literal-percent forms, embedded URLs, generic schema descriptors, and
   provider-like resource names remain accepted. Every inspected raw or decoded
   string rejects BOM and ambiguous NUL/control encodings. Every top-level numeric

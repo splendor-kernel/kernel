@@ -678,6 +678,16 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         "http://example.invalid%27token:8443/path".to_string(),
         "http://example.invalid%29token:8443/path".to_string(),
         "http://example.invalid%5Dtoken:8443/path".to_string(),
+        "http://[vault]:8200/path".to_string(),
+        "http://[password]:1234/path".to_string(),
+        "http://[gggg]:8443/path".to_string(),
+        "http://[v1.]:8443/path".to_string(),
+        "http://[é]:8443/path".to_string(),
+        "http://:8443/path".to_string(),
+        "http://2001:db8::1/path".to_string(),
+        "http://example.invalid:99999/path".to_string(),
+        "http://example.invalid$password:1234/path".to_string(),
+        "http://example.invalid&vault:8200/path".to_string(),
     ];
     let mut candidates = Vec::new();
     let mut serialized_bodies = Vec::new();

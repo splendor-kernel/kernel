@@ -534,6 +534,16 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"url": "https://example.invalid%29token:8443/path"}),
         serde_json::json!({"body": "https://example.invalid]token:8443"}),
         serde_json::json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
+        serde_json::json!({"url": "https://[vault]:8200/path"}),
+        serde_json::json!({"url": "https://[password]:1234/path"}),
+        serde_json::json!({"url": "https://[gggg]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.]:8443/path"}),
+        serde_json::json!({"url": "https://[é]:8443/path"}),
+        serde_json::json!({"url": "https://:8443/path"}),
+        serde_json::json!({"url": "https://2001:db8::1/path"}),
+        serde_json::json!({"url": "https://example.invalid:99999/path"}),
+        serde_json::json!({"url": "https://example.invalid$password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid&vault:8200/path"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -680,6 +690,20 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         serde_json::json!({"url": "https://[::1]:8443/path"}),
         serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
         serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid:65535/path"}),
+        serde_json::json!({"url": "https://example.invalid.:8443/path"}),
+        serde_json::json!({"url": "https://[v1.a!b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a'b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a)b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a,b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%21b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%27b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%29b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%2Cb]:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a!b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a'b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a)b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a,b%5D:443/"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());

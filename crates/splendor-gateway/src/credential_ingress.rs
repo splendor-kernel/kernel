@@ -8,7 +8,7 @@ use crate::{ActionOutcome, ActionRequest, ActionStatus};
 use splendor_types::{
     Action, AuthorityObligationReceipt, RevocationStatus, SideEffectClass, VerificationResult,
 };
-use std::{fmt, str};
+use std::{fmt, net::Ipv6Addr, str};
 use time::OffsetDateTime;
 
 /// Stable, non-reflecting reason returned for every raw credential denial.
@@ -575,12 +575,7 @@ fn credential_percent_encoded_tokens(
         if start >= cursor && credential_percent_encoded_span(&value[cursor..start], url_nesting)? {
             return Ok(true);
         }
-        let end = value[separator + 3..]
-            .char_indices()
-            .find_map(|(index, character)| {
-                url_candidate_terminator(character).then_some(separator + 3 + index)
-            })
-            .unwrap_or(value.len());
+        let end = absolute_url_candidate_end(value, separator + 3);
         cursor = end;
         search = end.max(separator + 3);
         if search >= value.len() {
@@ -1282,12 +1277,7 @@ fn credential_url(value: &str, url_nesting: usize) -> Result<bool, RawCredential
         if !valid_url_scheme(scheme) {
             return Err(RawCredentialInputDenied);
         }
-        let end = value[separator + 3..]
-            .char_indices()
-            .find_map(|(index, character)| {
-                url_candidate_terminator(character).then_some(separator + 3 + index)
-            })
-            .unwrap_or(value.len());
+        let end = absolute_url_candidate_end(value, separator + 3);
         if credential_url_candidate(&value[start..end], url_nesting)? {
             return Ok(true);
         }
@@ -1431,13 +1421,10 @@ fn authority_host_without_numeric_port(authority: &str) -> Result<&str, RawCrede
         let host = &authority[..=close];
         let address = &authority[1..close];
         let remainder = &authority[close + 1..];
-        if address.is_empty()
-            || !address.chars().all(bracketed_authority_character)
+        if !valid_ip_literal(address)
             || remainder.contains(['[', ']'])
             || !(remainder.is_empty()
-                || remainder.strip_prefix(':').is_some_and(|port| {
-                    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
-                }))
+                || remainder.strip_prefix(':').is_some_and(valid_numeric_port))
         {
             return Err(RawCredentialInputDenied);
         }
@@ -1446,37 +1433,81 @@ fn authority_host_without_numeric_port(authority: &str) -> Result<&str, RawCrede
     if authority.contains(['[', ']']) {
         return Err(RawCredentialInputDenied);
     }
-    if !authority.chars().all(authority_character) {
-        return Err(RawCredentialInputDenied);
-    }
     let Some((host, port)) = authority.rsplit_once(':') else {
-        return Ok(authority);
+        return valid_reg_name_host(authority)
+            .then_some(authority)
+            .ok_or(RawCredentialInputDenied);
     };
-    let unbracketed_host = !host.contains(':');
-    if !host.is_empty()
-        && !port.is_empty()
-        && port.bytes().all(|byte| byte.is_ascii_digit())
-        && unbracketed_host
-    {
+    if !host.contains(':') && valid_reg_name_host(host) && valid_numeric_port(port) {
         Ok(host)
     } else {
-        Ok(authority)
+        Err(RawCredentialInputDenied)
     }
 }
 
-fn authority_character(character: char) -> bool {
-    character.is_alphanumeric()
-        || matches!(
-            character,
-            '-' | '.' | '_' | '~' | '%' | ':' | '@' | '$' | '&' | '(' | '*' | '+' | ';' | '='
-        )
+fn valid_numeric_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
-fn bracketed_authority_character(character: char) -> bool {
-    character.is_ascii_hexdigit()
-        || character.is_alphabetic()
-        || character.is_ascii_digit()
-        || matches!(character, ':' | '.' | '%' | '-' | '_' | '~')
+fn valid_reg_name_host(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && !host.split('.').any(str::is_empty)
+        && host.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
+        })
+}
+
+fn valid_ip_literal(address: &str) -> bool {
+    if let Some(ipv_future) = address
+        .strip_prefix('v')
+        .or_else(|| address.strip_prefix('V'))
+    {
+        return valid_ipv_future(ipv_future);
+    }
+    let (address, zone) = address
+        .split_once('%')
+        .map_or((address, None), |(address, zone)| (address, Some(zone)));
+    address.parse::<Ipv6Addr>().is_ok()
+        && zone.is_none_or(|zone| {
+            !zone.is_empty()
+                && !zone.contains('%')
+                && zone.chars().all(|character| {
+                    character.is_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
+                })
+        })
+}
+
+fn valid_ipv_future(value: &str) -> bool {
+    let Some((version, address)) = value.split_once('.') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !address.is_empty()
+        && address.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '-' | '.'
+                        | '_'
+                        | '~'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
+                        | ':'
+                )
+        })
 }
 
 fn unambiguous_utf8_body(bytes: &[u8]) -> Option<&str> {
@@ -1507,6 +1538,54 @@ fn url_candidate_terminator(character: char) -> bool {
             character,
             '"' | '\'' | '`' | '<' | '>' | ')' | '}' | ',' | '|' | '!' | '\\'
         )
+}
+
+fn absolute_url_candidate_end(value: &str, authority_start: usize) -> usize {
+    let candidate = &value[authority_start..];
+    let bracket_search_start = if candidate.starts_with('[') {
+        Some(1)
+    } else if percent_encoded_byte_at(candidate, 0, b'[') {
+        Some(3)
+    } else {
+        None
+    };
+    let bracket_close_end =
+        bracket_search_start.and_then(|search_start| closing_bracket_end(candidate, search_start));
+    if bracket_search_start.is_some() && bracket_close_end.is_none() {
+        return value.len();
+    }
+    candidate
+        .char_indices()
+        .find_map(|(index, character)| {
+            if bracket_close_end.is_some_and(|close_end| index < close_end) {
+                None
+            } else {
+                url_candidate_terminator(character).then_some(authority_start + index)
+            }
+        })
+        .unwrap_or(value.len())
+}
+
+fn closing_bracket_end(value: &str, mut index: usize) -> Option<usize> {
+    while index < value.len() {
+        if value.as_bytes()[index] == b']' {
+            return Some(index + 1);
+        }
+        if percent_encoded_byte_at(value, index, b']') {
+            return Some(index + 3);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn percent_encoded_byte_at(value: &str, index: usize, expected: u8) -> bool {
+    let bytes = value.as_bytes();
+    index + 2 < bytes.len()
+        && bytes[index] == b'%'
+        && hex_value(bytes[index + 1])
+            .zip(hex_value(bytes[index + 2]))
+            .is_some_and(|(high, low)| (high << 4 | low) == expected)
 }
 
 fn url_coordinate_candidate(value: &str) -> bool {
@@ -2000,6 +2079,16 @@ mod tests {
             serde_json::json!({"url": "https://[::1]:8443/path"}),
             serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
             serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+            serde_json::json!({"url": "https://example.invalid:65535/path"}),
+            serde_json::json!({"url": "https://example.invalid.:8443/path"}),
+            serde_json::json!({"url": "https://[v1.a!b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a'b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a)b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a,b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a%21b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a%27b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a%29b]:443/"}),
+            serde_json::json!({"url": "https://[v1.a%2Cb]:443/"}),
         ]
         .into_iter()
         .enumerate()
@@ -2230,11 +2319,73 @@ mod tests {
             "https://first@second@example.invalid/",
             "https:///missing-authority",
             "1https://example.invalid/",
+            "https://[vault]:8200/path",
+            "https://[password]:1234/path",
+            "https://[gggg]:8443/path",
+            "https://[v1.]:8443/path",
+            "https://[é]:8443/path",
+            "https://:8443/path",
+            "https://2001:db8::1/path",
+            "https://example.invalid:99999/path",
+            "https://example.invalid$password:1234/path",
+            "https://example.invalid&vault:8200/path",
+            "https://[v1.a!b:443/",
         ] {
             assert_eq!(
                 guard_action(&action(serde_json::json!({"input": ambiguous}))),
                 Err(RawCredentialInputDenied)
             );
+        }
+    }
+
+    #[test]
+    fn valid_authority_hosts_and_ports_are_not_assignments_or_references() {
+        assert_eq!(
+            authority_host_without_numeric_port("example.invalid:65535"),
+            Ok("example.invalid")
+        );
+        assert_eq!(credential_url_component("/path", false, 1), Ok(false));
+        for value in [
+            "https://auth:8443/path",
+            "https://vault:8200/v1/sys/health",
+            "https://example.invalid:65535/path",
+            "https://example.invalid.:8443/path",
+            "https://[::1]:8443/path",
+            "https://[v1.fe80]:8443/path",
+            "https://[fe80::1%25eth0]:8443/path",
+        ] {
+            assert_eq!(
+                credential_assignment(value),
+                Ok(false),
+                "authority port must not become an assignment: {value}"
+            );
+            assert!(
+                !secret_reference_form(&value.to_ascii_lowercase()),
+                "authority host must not become a secret reference: {value}"
+            );
+            assert_eq!(
+                credential_url(value, 0),
+                Ok(false),
+                "valid credential-free authority must remain clear: {value}"
+            );
+        }
+
+        for opening in ["[", "%5B"] {
+            for closing in ["]", "%5D"] {
+                for delimiter in "!$&'()*+,;=:".chars() {
+                    for rendered_delimiter in
+                        [delimiter.to_string(), format!("%{:02X}", delimiter as u8)]
+                    {
+                        let value =
+                            format!("https://{opening}v1.a{rendered_delimiter}b{closing}:443/");
+                        assert_eq!(
+                            guard_action(&action(serde_json::json!({"url": value}))),
+                            Ok(()),
+                            "raw/encoded IPvFuture forms must be equivalent"
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -65,7 +65,9 @@ punctuation also belongs to the surrounding credential alphabet.
 URL/form handling covers standalone fields and encoded non-URL spans adjacent to
 URLs, including decoded host content after structural numeric-port separation and
 bare query-name content, with explicit nested/decode bounds and one decode per
-layer, while preserving
+layer. Authority validation accepts bounded reg-name/IPv4-style hosts, parsed
+IPv6/zone or IPvFuture literals, and `u16` ports; malformed or ambiguously encoded
+authorities fail closed while preserving
 literal-percent forms, ordinary embedded URLs, and provider-like resource names.
 It also screens raw receipt strings, physical/operator envelope strings, complete
 device-profile values/keys, and every top-level numeric `params.bytes` body,

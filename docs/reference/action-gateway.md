@@ -160,8 +160,11 @@ broad `sk-` family. Ordinary prose such as `Basic planning`, standalone
 
 URL scanning extracts bounded candidates instead of treating surrounding prose as
 part of a scheme. It separates a structurally valid numeric authority port before
-screening the once-decoded host, including matched bracketed IPv6 hosts, and does
-not let a preceding URL suppress a later assignment/reference. It also screens
+screening the once-decoded host. Hosts must be nonempty bounded reg-name/IPv4-style
+names, parsed IPv6 literals with optional zone IDs, or valid IPvFuture literals;
+ports must fit `u16`. Raw and once-encoded IP-literal brackets receive equivalent
+candidate parsing. A preceding URL cannot suppress a later assignment/reference.
+The guard also screens
 decoded path/fragment components, standalone and URL form/query names and values,
 plus-as-space values, encoded non-URL spans beside even
 comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs

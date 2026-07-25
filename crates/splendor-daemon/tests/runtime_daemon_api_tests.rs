@@ -4123,6 +4123,18 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             "encoded_closing_delimiter_before_numeric_credential_assignment",
             json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
         ),
+        (
+            "credential_named_invalid_ip_literal",
+            json!({"url": "https://[password]:1234/path"}),
+        ),
+        (
+            "out_of_range_authority_port",
+            json!({"url": "https://example.invalid:99999/path"}),
+        ),
+        (
+            "authority_subdelimiter_before_credential_assignment",
+            json!({"url": "https://example.invalid$password:1234/path"}),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(
