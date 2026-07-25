@@ -4103,6 +4103,26 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
                 )
             }),
         ),
+        (
+            "basic_prefix_before_path_separator",
+            json!({"url": "https://example.invalid/Basic%20dTpw/next"}),
+        ),
+        (
+            "maximum_provider_prefix_before_alphabet_punctuation",
+            json!({"body": format!("github_pat_{}-tail", "A".repeat(256))}),
+        ),
+        (
+            "url_followed_by_numeric_credential_assignment",
+            json!({"body": "https://example.invalid password:1234"}),
+        ),
+        (
+            "encoded_authority_separator_before_numeric_credential_assignment",
+            json!({"url": "https://example.invalid%20password:1234/path"}),
+        ),
+        (
+            "encoded_closing_delimiter_before_numeric_credential_assignment",
+            json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(

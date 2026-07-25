@@ -512,6 +512,28 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"url": "https://example.invalid/?%42earer%20x"}),
         serde_json::json!({"url": "https://example.invalid/?safe%60%42earer%20x%60"}),
         serde_json::json!({"url": "https://example.invalid/?%76ault%3Aprod%2Fdb"}),
+        serde_json::json!({"body": "Basic dTpw/next"}),
+        serde_json::json!({"body": "Basic dTpw+next"}),
+        serde_json::json!({"body": "Basic dTpw=next"}),
+        serde_json::json!({"body": "Basic ICA+OnA=/next"}),
+        serde_json::json!({"body": "Basic ICA/OnA=+next"}),
+        serde_json::json!({"url": "https://example.invalid/Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/#Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/?q=Basic+dTpw%2Fnext"}),
+        serde_json::json!({"body": "https://example.invalid password:1234"}),
+        serde_json::json!({"body": "https://example.invalid vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid,token:8443"}),
+        serde_json::json!({"body": "https://example.invalid|password:1234"}),
+        serde_json::json!({"body": "https://example.invalid—auth:8443"}),
+        serde_json::json!({"url": "https://example.invalid%20password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid%2Ctoken:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid%20vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid'token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%27token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid)token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%29token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid]token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -525,6 +547,11 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         format!("https://example.invalid/?%67hp%5F{}", "A".repeat(36)),
         format!("https://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
         format!("https://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+        format!("github_pat_{}-tail", "A".repeat(256)),
+        format!("xoxb-{}-tail", "A".repeat(128)),
+        format!("SG.{}.tail", "A".repeat(256)),
+        format!("AIza{}-tail", "A".repeat(35)),
+        format!("vault:{}/next", "A".repeat(2_048)),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -646,6 +673,13 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         serde_json::json!({"json": {"name": "café", "value": "ordinary"}}),
         serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
         serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
+        serde_json::json!({"url": "https://auth:8443/path"}),
+        serde_json::json!({"url": "https://token:8443/path"}),
+        serde_json::json!({"url": "https://password:8443/path"}),
+        serde_json::json!({"url": "https://vault:8200/v1/sys/health"}),
+        serde_json::json!({"url": "https://[::1]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());

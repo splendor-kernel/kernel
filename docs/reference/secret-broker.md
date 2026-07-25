@@ -60,9 +60,12 @@ coordinate objects for credential aliases are normalized by the same owner gramm
 without treating the generic `token` selector or non-ASCII schema labels as credentials.
 Unicode alphanumeric characters continue words; all punctuation/separator
 characters delimit credential syntax without a finite ASCII delimiter allowlist.
+A valid bounded token/reference prefix is denied at punctuation even when that
+punctuation also belongs to the surrounding credential alphabet.
 URL/form handling covers standalone fields and encoded non-URL spans adjacent to
-URLs, including decoded authority and bare query-name content, with explicit
-nested/decode bounds and one decode per layer, while preserving
+URLs, including decoded host content after structural numeric-port separation and
+bare query-name content, with explicit nested/decode bounds and one decode per
+layer, while preserving
 literal-percent forms, ordinary embedded URLs, and provider-like resource names.
 It also screens raw receipt strings, physical/operator envelope strings, complete
 device-profile values/keys, and every top-level numeric `params.bytes` body,

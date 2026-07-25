@@ -24,6 +24,8 @@ pub const CREDENTIAL_INGRESS_MAX_STRING_BYTES: usize = 16 * 1024;
 pub const CREDENTIAL_INGRESS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 
 const CREDENTIAL_INGRESS_MAX_URL_NESTING: usize = 4;
+const CREDENTIAL_INGRESS_MAX_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
+const CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES: usize = 2_048;
 
 /// Opaque denial from the raw credential ingress guard.
 ///
@@ -719,27 +721,50 @@ fn authorization_form(value: &str) -> bool {
                 .next()
                 .unwrap_or_default()
                 .trim_start();
-            let token_length = line
-                .bytes()
-                .take_while(|byte| authorization_token_byte(*byte, scheme))
-                .count();
-            if token_length == 0 {
-                return false;
-            }
-            let token = &line[..token_length];
-            let trailing = line[token_length..].trim();
-            (trailing.is_empty()
-                || trailing
-                    .chars()
-                    .next()
-                    .is_some_and(authorization_token_boundary))
-                && if *scheme == "basic" {
-                    plausible_basic_token(token)
-                } else {
-                    plausible_bearer_token(token)
-                }
+            contains_plausible_authorization_token(line, scheme)
         })
     })
+}
+
+fn contains_plausible_authorization_token(line: &str, scheme: &str) -> bool {
+    for (index, character) in line.char_indices() {
+        if index > CREDENTIAL_INGRESS_MAX_AUTHORIZATION_TOKEN_BYTES {
+            return false;
+        }
+        if index > 0
+            && authorization_candidate_boundary(&line[index..], character)
+            && plausible_authorization_token(&line[..index], scheme)
+        {
+            return true;
+        }
+        if !character.is_ascii()
+            || !authorization_token_byte(character as u8, scheme)
+            || index == CREDENTIAL_INGRESS_MAX_AUTHORIZATION_TOKEN_BYTES
+        {
+            return false;
+        }
+    }
+    plausible_authorization_token(line, scheme)
+}
+
+fn authorization_candidate_boundary(remainder: &str, character: char) -> bool {
+    if !character.is_whitespace() {
+        return authorization_token_boundary(character);
+    }
+    let trailing = remainder.trim_start();
+    trailing.is_empty()
+        || trailing
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_whitespace() && authorization_token_boundary(next))
+}
+
+fn plausible_authorization_token(token: &str, scheme: &str) -> bool {
+    if scheme == "basic" {
+        plausible_basic_token(token)
+    } else {
+        plausible_bearer_token(token)
+    }
 }
 
 fn authorization_scheme_boundary(character: char) -> bool {
@@ -765,9 +790,9 @@ fn credential_token_boundary(character: char) -> bool {
 
 fn plausible_basic_token(token: &str) -> bool {
     const MINIMUM_BASIC_TOKEN_BYTES: usize = 4;
-    const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
 
-    if !(MINIMUM_BASIC_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len())
+    if !(MINIMUM_BASIC_TOKEN_BYTES..=CREDENTIAL_INGRESS_MAX_AUTHORIZATION_TOKEN_BYTES)
+        .contains(&token.len())
         || !token.len().is_multiple_of(4)
     {
         return false;
@@ -777,9 +802,10 @@ fn plausible_basic_token(token: &str) -> bool {
 
 fn plausible_bearer_token(token: &str) -> bool {
     const MINIMUM_BEARER_TOKEN_BYTES: usize = 1;
-    const MAXIMUM_AUTHORIZATION_TOKEN_BYTES: usize = 4 * 1024;
 
-    if !(MINIMUM_BEARER_TOKEN_BYTES..=MAXIMUM_AUTHORIZATION_TOKEN_BYTES).contains(&token.len()) {
+    if !(MINIMUM_BEARER_TOKEN_BYTES..=CREDENTIAL_INGRESS_MAX_AUTHORIZATION_TOKEN_BYTES)
+        .contains(&token.len())
+    {
         return false;
     }
     let padding = token.bytes().rev().take_while(|byte| *byte == b'=').count();
@@ -1013,20 +1039,28 @@ fn contains_prefixed_token(value: &str, profile: ProviderTokenProfile) -> bool {
             }
         }
         let suffix = &value[index + profile.prefix.len()..];
-        let token_suffix_len = suffix
-            .bytes()
-            .take_while(|byte| provider_suffix_byte(*byte, profile.alphabet))
-            .count();
-        if !(profile.minimum_suffix..=profile.maximum_suffix).contains(&token_suffix_len) {
+        contains_provider_token_suffix(suffix, profile)
+    })
+}
+
+fn contains_provider_token_suffix(suffix: &str, profile: ProviderTokenProfile) -> bool {
+    for (index, character) in suffix.char_indices() {
+        if index > profile.maximum_suffix {
             return false;
         }
-        let token_end = index + profile.prefix.len() + token_suffix_len;
-        token_end == value.len()
-            || value[token_end..]
-                .chars()
-                .next()
-                .is_some_and(provider_token_end_boundary)
-    })
+        if (profile.minimum_suffix..=profile.maximum_suffix).contains(&index)
+            && provider_token_end_boundary(character)
+        {
+            return true;
+        }
+        if !character.is_ascii()
+            || !provider_suffix_byte(character as u8, profile.alphabet)
+            || index == profile.maximum_suffix
+        {
+            return false;
+        }
+    }
+    (profile.minimum_suffix..=profile.maximum_suffix).contains(&suffix.len())
 }
 
 fn provider_suffix_byte(byte: u8, alphabet: ProviderTokenAlphabet) -> bool {
@@ -1074,23 +1108,42 @@ fn secret_reference_form(lowercase: &str) -> bool {
                     return false;
                 }
             }
+            if prefix.ends_with(':')
+                && url_authority_numeric_port_separator(
+                    lowercase,
+                    index + prefix.len().saturating_sub(1),
+                )
+            {
+                return false;
+            }
             let remainder = &lowercase[index + prefix.len()..];
-            let payload_length = remainder
-                .bytes()
-                .take_while(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || matches!(*byte, b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'~')
-                })
-                .count();
-            payload_length > 0
-                && payload_length <= 2_048
-                && (payload_length == remainder.len()
-                    || remainder[payload_length..]
-                        .chars()
-                        .next()
-                        .is_some_and(reference_end_boundary))
+            contains_secret_reference_payload(remainder)
         })
     })
+}
+
+fn contains_secret_reference_payload(remainder: &str) -> bool {
+    for (index, character) in remainder.char_indices() {
+        if index > CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES {
+            return false;
+        }
+        if (1..=CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES).contains(&index)
+            && reference_end_boundary(character)
+        {
+            return true;
+        }
+        if !reference_payload_character(character)
+            || index == CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES
+        {
+            return false;
+        }
+    }
+    (1..=CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES).contains(&remainder.len())
+}
+
+fn reference_payload_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-' | '.' | '/' | ':' | '@' | '~')
 }
 
 fn reference_start_boundary(character: char) -> bool {
@@ -1105,6 +1158,12 @@ fn credential_assignment(value: &str) -> Result<bool, RawCredentialInputDenied> 
     let bytes = value.as_bytes();
     for (separator, byte) in bytes.iter().copied().enumerate() {
         if !matches!(byte, b'=' | b':') {
+            continue;
+        }
+        if byte == b':'
+            && (value[separator + 1..].starts_with("//")
+                || url_authority_numeric_port_separator(value, separator))
+        {
             continue;
         }
 
@@ -1126,6 +1185,48 @@ fn credential_assignment(value: &str) -> Result<bool, RawCredentialInputDenied> 
         }
     }
     Ok(false)
+}
+
+fn url_authority_numeric_port_separator(value: &str, separator: usize) -> bool {
+    let Some(scheme_separator) = value[..separator].rfind("://") else {
+        return false;
+    };
+    let authority_start = scheme_separator + 3;
+    if authority_start >= separator {
+        return false;
+    }
+    let mut scheme_start = scheme_separator;
+    while scheme_start > 0 && url_scheme_byte(value.as_bytes()[scheme_start - 1]) {
+        scheme_start -= 1;
+    }
+    if !valid_url_scheme(&value[scheme_start..scheme_separator]) {
+        return false;
+    }
+    let after_port_separator = &value[separator + 1..];
+    let port_length = after_port_separator
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if port_length == 0 {
+        return false;
+    }
+    let remainder = &after_port_separator[port_length..];
+    if !(remainder.is_empty()
+        || remainder.chars().next().is_some_and(|character| {
+            matches!(character, '/' | '?' | '#') || url_candidate_terminator(character)
+        }))
+    {
+        return false;
+    }
+    let raw_authority = &value[authority_start..separator + 1 + port_length];
+    let Ok(decoded_authority) = percent_decode(raw_authority) else {
+        return false;
+    };
+    if contains_percent_escape(&decoded_authority) || !unambiguous_text(&decoded_authority) {
+        return false;
+    }
+    authority_host_without_numeric_port(&decoded_authority)
+        .is_ok_and(|host| host.len() < decoded_authority.len())
 }
 
 fn assignment_key_suffixes(segment: &str) -> Vec<&str> {
@@ -1241,7 +1342,8 @@ fn credential_url_candidate(
         if authority.contains('@') || decoded_authority.contains('@') {
             return Ok(true);
         }
-        if credential_content_decoded(&decoded_authority, url_nesting.saturating_add(1))? {
+        let decoded_host = authority_host_without_numeric_port(&decoded_authority)?;
+        if credential_content_decoded(decoded_host, url_nesting.saturating_add(1))? {
             return Ok(true);
         }
         path_start = authority_start + authority_end;
@@ -1323,6 +1425,60 @@ fn credential_url_component(
     credential_content_decoded(&decoded, url_nesting)
 }
 
+fn authority_host_without_numeric_port(authority: &str) -> Result<&str, RawCredentialInputDenied> {
+    if authority.starts_with('[') {
+        let close = authority.find(']').ok_or(RawCredentialInputDenied)?;
+        let host = &authority[..=close];
+        let address = &authority[1..close];
+        let remainder = &authority[close + 1..];
+        if address.is_empty()
+            || !address.chars().all(bracketed_authority_character)
+            || remainder.contains(['[', ']'])
+            || !(remainder.is_empty()
+                || remainder.strip_prefix(':').is_some_and(|port| {
+                    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+                }))
+        {
+            return Err(RawCredentialInputDenied);
+        }
+        return Ok(host);
+    }
+    if authority.contains(['[', ']']) {
+        return Err(RawCredentialInputDenied);
+    }
+    if !authority.chars().all(authority_character) {
+        return Err(RawCredentialInputDenied);
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok(authority);
+    };
+    let unbracketed_host = !host.contains(':');
+    if !host.is_empty()
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && unbracketed_host
+    {
+        Ok(host)
+    } else {
+        Ok(authority)
+    }
+}
+
+fn authority_character(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            '-' | '.' | '_' | '~' | '%' | ':' | '@' | '$' | '&' | '(' | '*' | '+' | ';' | '='
+        )
+}
+
+fn bracketed_authority_character(character: char) -> bool {
+    character.is_ascii_hexdigit()
+        || character.is_alphabetic()
+        || character.is_ascii_digit()
+        || matches!(character, ':' | '.' | '%' | '-' | '_' | '~')
+}
+
 fn unambiguous_utf8_body(bytes: &[u8]) -> Option<&str> {
     let text = str::from_utf8(bytes).ok()?;
     unambiguous_text(text).then_some(text)
@@ -1346,10 +1502,10 @@ fn url_scheme_byte(byte: u8) -> bool {
 }
 
 fn url_candidate_terminator(character: char) -> bool {
-    character.is_ascii_whitespace()
+    character.is_whitespace()
         || matches!(
             character,
-            '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | '|' | '!' | '\\'
+            '"' | '\'' | '`' | '<' | '>' | ')' | '}' | ',' | '|' | '!' | '\\'
         )
 }
 
@@ -1795,6 +1951,28 @@ mod tests {
             serde_json::json!({"url": "https://example.invalid/Bearer%20x"}),
             serde_json::json!({"url": "https://example.invalid/?%42earer%20x"}),
             serde_json::json!({"url": "https://example.invalid/?%76ault%3Aprod%2Fdb"}),
+            serde_json::json!({"body": "Basic dTpw/next"}),
+            serde_json::json!({"body": "Basic dTpw+next"}),
+            serde_json::json!({"body": "Basic dTpw=next"}),
+            serde_json::json!({"body": "Basic ICA+OnA=/next"}),
+            serde_json::json!({"body": "Basic ICA/OnA=+next"}),
+            serde_json::json!({"url": "https://example.invalid/Basic%20dTpw/next"}),
+            serde_json::json!({"url": "https://example.invalid/#Basic%20dTpw/next"}),
+            serde_json::json!({"url": "https://example.invalid/?q=Basic+dTpw%2Fnext"}),
+            serde_json::json!({"body": "https://example.invalid password:1234"}),
+            serde_json::json!({"body": "https://example.invalid vault:8200/path"}),
+            serde_json::json!({"body": "https://example.invalid,token:8443"}),
+            serde_json::json!({"body": "https://example.invalid|password:1234"}),
+            serde_json::json!({"body": "https://example.invalid—auth:8443"}),
+            serde_json::json!({"url": "https://example.invalid%20password:1234/path"}),
+            serde_json::json!({"url": "https://example.invalid%2Ctoken:8443/path"}),
+            serde_json::json!({"url": "https://example.invalid%20vault:8200/path"}),
+            serde_json::json!({"body": "https://example.invalid'token:8443"}),
+            serde_json::json!({"url": "https://example.invalid%27token:8443/path"}),
+            serde_json::json!({"body": "https://example.invalid)token:8443"}),
+            serde_json::json!({"url": "https://example.invalid%29token:8443/path"}),
+            serde_json::json!({"body": "https://example.invalid]token:8443"}),
+            serde_json::json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
         ] {
             assert_eq!(
                 guard_action(&action(params)),
@@ -1803,7 +1981,7 @@ mod tests {
             );
         }
 
-        for params in [
+        for (index, params) in [
             serde_json::json!({"body": "topic=Basic+planning&mode=monthly"}),
             serde_json::json!({"json": {"name": "model_name", "value": "hf_transformer"}}),
             serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
@@ -1815,11 +1993,21 @@ mod tests {
             serde_json::json!({"body": "name=CPU%25&value=ordinary"}),
             serde_json::json!({"body": "safe=1&label=50%25"}),
             serde_json::json!({"contents": "ordinary UTF-8 café\n"}),
-        ] {
+            serde_json::json!({"url": "https://auth:8443/path"}),
+            serde_json::json!({"url": "https://token:8443/path"}),
+            serde_json::json!({"url": "https://password:8443/path"}),
+            serde_json::json!({"url": "https://vault:8200/v1/sys/health"}),
+            serde_json::json!({"url": "https://[::1]:8443/path"}),
+            serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
+            serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(
                 guard_action(&action(params)),
                 Ok(()),
-                "ordinary form, coordinate, and text controls must remain accepted"
+                "ordinary form, coordinate, and text control {index} must remain accepted"
             );
         }
 
@@ -1829,6 +2017,14 @@ mod tests {
             format!("https://example.invalid/?%67hp%5F{}", "A".repeat(36)),
             format!("https://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
             format!("https://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+            format!("github_pat_{}-tail", "A".repeat(256)),
+            format!("xoxb-{}-tail", "A".repeat(128)),
+            format!("SG.{}.tail", "A".repeat(256)),
+            format!("AIza{}-tail", "A".repeat(35)),
+            format!(
+                "vault:{}/next",
+                "A".repeat(CREDENTIAL_INGRESS_MAX_REFERENCE_PAYLOAD_BYTES)
+            ),
         ] {
             assert_eq!(
                 guard_action(&action(serde_json::json!({"input": value}))),
@@ -2048,6 +2244,7 @@ mod tests {
         for delimiter in ('!'..='~').filter(|character| character.is_ascii_punctuation()) {
             for value in [
                 format!("safe{delimiter}Bearer x{delimiter}"),
+                format!("safe{delimiter}Basic dTpw{delimiter}next"),
                 format!("safe{delimiter}token=synthetic"),
                 format!("safe{delimiter}{provider}{delimiter}"),
             ] {
@@ -2076,6 +2273,7 @@ mod tests {
         ] {
             for value in [
                 format!("safe{delimiter}Bearer x{delimiter}"),
+                format!("safe{delimiter}Basic dTpw{delimiter}next"),
                 format!("safe{delimiter}token=synthetic"),
                 format!("safe{delimiter}{provider}{delimiter}"),
             ] {

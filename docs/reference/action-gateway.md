@@ -149,15 +149,19 @@ alphanumeric characters continue a surrounding word, while ASCII or Unicode
 punctuation/separators delimit authorization, provider-token, reference, and
 assignment syntax. Basic tokens are locally base64-decoded within the scanner
 limit and deny only when the decoded credential has the required colon structure;
-short valid Basic/Bearer credentials still deny. Provider profiles use
-provider-specific prefixes, realistic minimum/maximum lengths, and
+short valid Basic/Bearer credentials still deny. A valid bounded credential
+prefix ending at punctuation is denied even when that punctuation is also legal
+inside the broader Basic, Bearer, provider, or reference alphabet. Provider
+profiles use provider-specific prefixes, realistic minimum/maximum lengths, and
 alphabets—including exact legacy `sk-` and named modern variants rather than one
 broad `sk-` family. Ordinary prose such as `Basic planning`, standalone
 `hf_transformer`, and resource paths such as `models/hf_transformer` or
 `models/sk-learn-sentiment-classifier-v2` remain accepted.
 
 URL scanning extracts bounded candidates instead of treating surrounding prose as
-part of a scheme. It screens the once-decoded authority/hostname as well as
+part of a scheme. It separates a structurally valid numeric authority port before
+screening the once-decoded host, including matched bracketed IPv6 hosts, and does
+not let a preceding URL suppress a later assignment/reference. It also screens
 decoded path/fragment components, standalone and URL form/query names and values,
 plus-as-space values, encoded non-URL spans beside even
 comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs
