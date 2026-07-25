@@ -5,7 +5,10 @@
 //! action gateway wrapper denies unsafe side effects without introducing any
 //! alternate adapter execution path.
 
-use splendor_gateway::{ActionGateway, ActionOutcome, ActionRequest, ActionStatus, GatewayError};
+use splendor_gateway::{
+    guard_action_request, raw_credential_denied_outcome, ActionGateway, ActionOutcome,
+    ActionRequest, ActionStatus, GatewayError,
+};
 use splendor_types::{
     AgentId, OfflineHighRiskBehavior, PolicyBundle, PolicyBundleTraceContext, RevocationStatus,
     SideEffectClass, TenantId, TraceEventKind, ValidatedPolicyBundle, VerificationResult,
@@ -968,6 +971,9 @@ impl PolicyDistributionGateway {
 
 impl ActionGateway for PolicyDistributionGateway {
     fn submit(&self, request: ActionRequest) -> Result<ActionOutcome, GatewayError> {
+        if guard_action_request(&request).is_err() {
+            return Ok(raw_credential_denied_outcome(request.action_id));
+        }
         let verification = self
             .status
             .verify_policy_action(&request, OffsetDateTime::now_utc());

@@ -16,12 +16,14 @@ clocks/ID sources, limits, mutation errors, inspection, and replay are all
 crate-private. There is no callable production lease API or complete live secret
 permit in this slice.
 
-This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`. It does not
+This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`, plus a
+denial-only pre-persistence slice of `SECR-004`/`SECR-006`. It does not
 implement RFC 0012's complete durable lease, exposure-lineage, delivery,
 provider-control, node-control, outer-submission, or terminal publication
 records. It adds no provider invocation from the broker, material-returning
 broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
-surface, scanner, production provider, issue closure, or gold pass. The reduced
+secret surface, complete profile/repository/leak scanner, production provider,
+issue closure, or gold pass. The reduced
 wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
 the complete RFC 0012 wire schemas. `G07` and `G08` remain `not_exercised`.
 
@@ -38,6 +40,58 @@ placement, audience, ref revision/provider version, intent, and purpose binding.
 The Authority context constructor is crate-private and there is no production
 composition path in this slice; external callers cannot manufacture one from
 arbitrary coordinates.
+
+## Implemented denial-only legacy credential ingress barrier
+
+The existing stable generic action path now has an always-on, Gateway-owned,
+pre-persistence barrier. `VerifiedActionGateway` applies it first, and the kernel
+tick, daemon configured-run admission, direct action, physical action, policy
+distribution, and trace-durability wrappers call the same pure implementation
+before any earlier owner could persist or reflect an untrusted action.
+
+The bounded guard recognizes RFC 0012's normalized authorization/password/token/
+API-key/client-secret/private-key/cookie/secret/credential/connection/DSN and
+structured cloud/device environment coordinates in nested action data and object
+keys, URL userinfo/authority/path/query and quoted/spaced assignment forms, plus
+structurally decoded Basic, short Bearer, PEM, provider-specific realistically
+bounded punctuation-delimited tokens, credential URL/DSN, and embedded/encoded
+generic ref-like content under neutral keys. Closed selector-plus-material
+coordinate objects for credential aliases are normalized by the same owner grammar
+without treating the generic `token` selector or non-ASCII schema labels as credentials.
+Unicode alphanumeric characters continue words; all punctuation/separator
+characters delimit credential syntax without a finite ASCII delimiter allowlist.
+A valid bounded token/reference prefix is denied at punctuation even when that
+punctuation also belongs to the surrounding credential alphabet.
+URL/form handling covers standalone fields and encoded non-URL spans adjacent to
+URLs, including decoded host content after structural numeric-port separation and
+bare query-name content, with explicit nested/decode bounds and one decode per
+layer. Authority validation accepts bounded reg-name/IPv4-style hosts, parsed
+IPv6/zone or IPvFuture literals, and raw-colon `u16` ports; percent decoding never
+creates a structural port separator. Malformed or ambiguously encoded authorities
+fail closed while preserving
+literal-percent forms, ordinary embedded URLs, and provider-like resource names.
+It also screens raw receipt strings, physical/operator envelope strings, complete
+device-profile values/keys, and every top-level numeric `params.bytes` body,
+independent of action labels or adapter routing. Every inspected raw or decoded
+string rejects BOM and NUL/control ambiguity; numeric bytes additionally require
+unambiguous UTF-8, so UTF-16 and invalid encodings fail closed. This screening
+never validates receipt authority. It denies malformed parsed
+coordinates and depth/node/string/cumulative-byte overflow with the sole fixed
+reason `raw_credential_input_denied`. Its error type is fieldless,
+non-serializable, and non-reflecting. Denied action traces use one constant
+suppression projection; raw input never enters candidate/action traces, outcome
+feedback, daemon request fingerprints, create-run idempotency receipts, physical
+safety evidence, device profiles/status/audit, operator records, or
+adapters/simulators. Complete-token grammar preserves ordinary Basic prose and
+provider-looking resource paths.
+
+This barrier is intentionally not the complete RFC 0012
+`CredentialIngressProfile`: it has no operation-specific owner-schema registry,
+positive typed-wrapper recognition, non-secret exception registry, exhaustive
+entropy/encoded/split detector, post-execution leak detector, repository CI
+scanner, quarantine/incident workflow, or live broker/provider/material path.
+Generic `SecretRef`-looking data is denied rather than upgraded into authority.
+Typed secret delivery remains unavailable.
 
 ## Implemented process-local owner slice
 
@@ -531,6 +585,14 @@ provider duplicates material into one zeroizing request-lifetime allocation only
 when its private provider request path is invoked; this owner slice never invokes
 that path.
 
+Raw action credential guard failures expose only
+`raw_credential_input_denied`; cap overflow, normalized coordinate, candidate
+content, URL/DSN parser ambiguity, source path, and any candidate-derived digest
+are deliberately indistinguishable. Direct and physical denials make zero
+run-authority, provider, pre-effect, adapter, or simulator calls. Inspect-only
+replay reads only the fixed sanitized denial and never reruns the guard as a
+positive secret path or resolves material.
+
 ## Compatibility and versioning
 
 The symbols are additive experimental 0.2/v2 Rust exports. The closed enum
@@ -545,6 +607,13 @@ credential-sink fixture bytes are also unchanged. RFC 0014's authorization/ref
 v2 schemas are additive experimental successors; revision-less v1 remains
 historical read/deny only and there is no dual live-reader fallback. Persisted
 records and bytes remain unchanged.
+
+The ingress barrier changes acceptance of credential-bearing values within the
+unchanged stable `Action` / `ActionRequest` wire shape; it adds no field, trace
+variant, `ActionStatus`, daemon wire object, or generated SDK type. Existing
+credential-free actions retain their prior path. The fixed safe projection is
+used only for newly denied runtime traces; historical trace bytes are not
+rewritten.
 
 The `ProcessLocalSecretLease*` and `ProcessLocalSecretAccess*` exports are
 explicitly local v1 profiles. They do not claim compatibility with RFC 0012's

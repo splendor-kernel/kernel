@@ -1,8 +1,8 @@
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig};
 use splendor_gateway::{
-    ActionAdapter, ActionGateway, ActionId, ActionRequest, ActionStatus, AdapterError,
-    AdapterResult, VerifiedActionGateway,
+    raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionRequest,
+    ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentId, AgentRuntimeConfig, LoopEngine, LoopError, Perceptor,
@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 const TICK_ID: u64 = 1;
@@ -73,8 +74,37 @@ impl TestServer {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set request read timeout");
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
-                let _ = stream.read(&mut buffer);
+                loop {
+                    let bytes_read = stream.read(&mut buffer).expect("read request");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes_read]);
+
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers are UTF-8")
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
                     body.len(),
@@ -530,7 +560,7 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
 
     let write_action = action(
         "write_file",
-        serde_json::json!({"path": "hello.txt", "contents": "hi"}),
+        serde_json::json!({"path": "hello.txt", "bytes": [104, 105]}),
         SideEffectClass::Filesystem,
     );
     let read_action = action(
@@ -561,6 +591,307 @@ fn filesystem_adapter_harness_allows_sandboxed_write_and_read() {
         .expect("read output");
     assert_eq!(read_output["bytes_read"], 2);
     assert_eq!(read_output["bytes"], serde_json::json!([104, 105]));
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let provider_canary = format!("ghp_{}", "A".repeat(36));
+    let utf16le = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let utf16be = "Bearer x"
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect::<Vec<_>>();
+    let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+    utf8_bom.extend_from_slice(b"ordinary body");
+    let bodies = [
+        b"Basic dTpw".to_vec(),
+        provider_canary.as_bytes().to_vec(),
+        utf16le,
+        utf16be,
+        utf8_bom,
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+        b"safe=1&value=Basic+dTpw".to_vec(),
+    ];
+    let encoded_string_bodies = vec![
+        "name=VAULT_TOKEN&value=C03_FORM_CANARY".to_string(),
+        "header=X-Auth-Token&value=C03_HEADER_CANARY".to_string(),
+        "Bearer%20x,https://example.invalid/docs".to_string(),
+        "vault%3Ateam%2Fservice,https://example.invalid/docs".to_string(),
+        "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs".to_string(),
+        "value=%EF%BB%BFBasic%20dTpw".to_string(),
+        "value=B%00e%00a%00r%00e%00r%00%20x".to_string(),
+        "safe/Bearer x".to_string(),
+        "safe|Bearer x".to_string(),
+        "safe`Bearer x`".to_string(),
+        "safe—Bearer x—".to_string(),
+        "safe|token=synthetic".to_string(),
+        "safe`token=synthetic".to_string(),
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        "https://example.invalid/Bearer%20x".to_string(),
+        "https://example.invalid/safe.Bearer%20x".to_string(),
+        "https://example.invalid/?%42earer%20x".to_string(),
+        "https://example.invalid/?safe%60%42earer%20x%60".to_string(),
+        "https://example.invalid/?%76ault%3Aprod%2Fdb".to_string(),
+        "Basic dTpw/next".to_string(),
+        "Basic dTpw+next".to_string(),
+        "Basic dTpw=next".to_string(),
+        "https://example.invalid password:1234".to_string(),
+        "https://example.invalid vault:8200/path".to_string(),
+        "https://example.invalid,token:8443".to_string(),
+        "https://example.invalid|password:1234".to_string(),
+        "https://example.invalid—auth:8443".to_string(),
+        "https://example.invalid'token:8443".to_string(),
+        "https://example.invalid)token:8443".to_string(),
+        "https://example.invalid]token:8443".to_string(),
+        format!("github_pat_{}-tail", "A".repeat(256)),
+        format!("xoxb-{}-tail", "A".repeat(128)),
+        format!("SG.{}.tail", "A".repeat(256)),
+        format!("AIza{}-tail", "A".repeat(35)),
+        format!("vault:{}/next", "A".repeat(2_048)),
+    ];
+    let encoded_authority_urls = vec![
+        format!("http://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("http://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+        "http://example.invalid/Basic%20dTpw/next".to_string(),
+        "http://example.invalid/#Basic%20dTpw/next".to_string(),
+        "http://example.invalid/?q=Basic+dTpw%2Fnext".to_string(),
+        "http://example.invalid%20password:1234/path".to_string(),
+        "http://example.invalid%2Ctoken:8443/path".to_string(),
+        "http://example.invalid%20vault:8200/path".to_string(),
+        "http://example.invalid%27token:8443/path".to_string(),
+        "http://example.invalid%29token:8443/path".to_string(),
+        "http://example.invalid%5Dtoken:8443/path".to_string(),
+        "http://[vault]:8200/path".to_string(),
+        "http://[password]:1234/path".to_string(),
+        "http://[gggg]:8443/path".to_string(),
+        "http://[v1.]:8443/path".to_string(),
+        "http://[é]:8443/path".to_string(),
+        "http://:8443/path".to_string(),
+        "http://2001:db8::1/path".to_string(),
+        "http://example.invalid:99999/path".to_string(),
+        "http://example.invalid$password:1234/path".to_string(),
+        "http://example.invalid&vault:8200/path".to_string(),
+        "http://password%3A1234/path".to_string(),
+        "http://vault%3A8200/path".to_string(),
+        "http://%70assword%3A1234/path".to_string(),
+        "http://[::1]%3A8443/path".to_string(),
+        "http://%5B::1%5D%3A8443/path".to_string(),
+    ];
+    let mut candidates = Vec::new();
+    let mut serialized_bodies = Vec::new();
+    for (index, body) in bodies.iter().enumerate() {
+        serialized_bodies.push(serde_json::to_string(body).expect("numeric body serializes"));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-{index}.txt"),
+                    "bytes": body,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "bytes": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "custom_write",
+            serde_json::json!({
+                "path": "credential-alias.txt",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "custom_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "bytes": b"Basic dTpw".to_vec(),
+            }),
+            SideEffectClass::ReadOnly,
+        ),
+        "http",
+    ));
+    for body in &encoded_string_bodies {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "body": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    for (index, url) in encoded_authority_urls.iter().enumerate() {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": url,
+                    "body": "ordinary body",
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-url-{index}.txt"),
+                    "contents": url,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "write_file",
+            serde_json::json!({
+                "path": "credential-contents.txt",
+                "contents": "B\0e\0a\0r\0e\0r\0 \0x\0",
+            }),
+            SideEffectClass::Filesystem,
+        ),
+        "filesystem",
+    ));
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "body": "safe=1&value=Basic+dTpw",
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
+    for json_body in [
+        serde_json::json!({"key": "password", "value": "C03_PASSWORD_CANARY"}),
+        serde_json::json!({"header": "Authorization", "value": "C03_HEADER_VALUE_CANARY"}),
+    ] {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "json": json_body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    candidates.push(action_candidate(
+        action(
+            "http_post",
+            serde_json::json!({
+                "url": "http://127.0.0.1:9/",
+                "json": {"name": "VAULT_TOKEN", "value": "C03_STRUCTURED_CANARY"},
+            }),
+            SideEffectClass::Network,
+        ),
+        "http",
+    ));
+    let expected_denials = candidates.len();
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "credential-encoding-denial",
+        vec![
+            HarnessRegistration::new("write_file", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("http_post", "http", http.clone()),
+            HarnessRegistration::new("custom_write", "filesystem", filesystem.clone()),
+            HarnessRegistration::new("custom_post", "http", http.clone()),
+        ],
+        candidates,
+    ));
+
+    for outcome in &run.outcome.action_outcomes {
+        assert_eq!(outcome.status, ActionStatus::Denied);
+        assert_eq!(
+            outcome.verification.reasons,
+            vec![RAW_CREDENTIAL_INPUT_DENIED.to_string()]
+        );
+    }
+    assert_eq!(filesystem.executions(), 0);
+    assert_eq!(http.executions(), 0);
+    for index in 0..bodies.len() {
+        assert!(!temp.path().join(format!("credential-{index}.txt")).exists());
+    }
+    for index in 0..encoded_authority_urls.len() {
+        assert!(!temp
+            .path()
+            .join(format!("credential-url-{index}.txt"))
+            .exists());
+    }
+    assert!(!temp.path().join("credential-alias.txt").exists());
+    assert!(!temp.path().join("credential-contents.txt").exists());
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(&provider_canary));
+    assert!(!encoded_events.contains("safe=1&value=Basic+dTpw"));
+    assert!(!encoded_events.contains("VAULT_TOKEN"));
+    assert!(!encoded_events.contains("C03_STRUCTURED_CANARY"));
+    assert!(!encoded_events.contains("C03_PASSWORD_CANARY"));
+    assert!(!encoded_events.contains("C03_HEADER_VALUE_CANARY"));
+    for body in &encoded_string_bodies {
+        assert!(!encoded_events.contains(body));
+    }
+    for url in &encoded_authority_urls {
+        assert!(!encoded_events.contains(url));
+    }
+    for body in serialized_bodies {
+        assert!(
+            !encoded_events.contains(&body),
+            "raw numeric body must not enter trace"
+        );
+    }
+    let proposed = run
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceEventKind::CandidatesProposed { actions } => Some(actions),
+            _ => None,
+        })
+        .expect("candidate event");
+    assert_eq!(
+        proposed,
+        &vec![raw_credential_denied_action(); expected_denials]
+    );
     assert_current_runtime_commits_state_after_action_results(&run);
 }
 
@@ -631,6 +962,43 @@ fn http_adapter_harness_allows_allowlisted_local_domain() {
         .expect("output");
     assert_eq!(output["status"], 200);
     assert_eq!(output["body"], "ok");
+    assert_current_runtime_commits_state_after_action_results(&run);
+    server.join();
+}
+
+#[test]
+fn http_adapter_harness_allows_ordinary_utf8_numeric_body() {
+    let server = TestServer::start("posted");
+    let adapter = HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    });
+    let counting = Arc::new(CountingAdapter::new(adapter));
+    let body = "safe=1&label=50%25&topic=Basic+planning&text=café\n"
+        .as_bytes()
+        .to_vec();
+    let action = action(
+        "http_post",
+        serde_json::json!({"url": server.url, "bytes": body}),
+        SideEffectClass::Network,
+    );
+    let usage = QuotaUsage {
+        http_requests: 1,
+        ..QuotaUsage::default()
+    };
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "http-ordinary-utf8-bytes",
+        vec![HarnessRegistration::new(
+            "http_post",
+            "http",
+            counting.clone(),
+        )],
+        vec![action_candidate(action, "http").with_usage(usage)],
+    ));
+
+    assert_action_status(&run, 0, ActionStatus::Executed);
+    assert_eq!(counting.executions(), 1);
+    assert_action_executed_trace(&run, 0, "http_post");
     assert_current_runtime_commits_state_after_action_results(&run);
     server.join();
 }

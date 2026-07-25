@@ -249,6 +249,19 @@ without changing the durable idempotency scope.
 Create-run request fingerprints and idempotency receipt hashes use
 domain-separated BLAKE3. The earlier FNV representation is not emitted.
 
+After work-order and caller authentication, but before request fingerprinting,
+idempotency lookup/receipt creation, run-authority admission, run-slot insertion,
+state creation, or trace creation, the daemon screens every configured
+`policy_actions` candidate, including its raw authority-obligation receipt
+strings, with the Gateway-owned raw credential guard. Receipt screening occurs
+before the receipt bytes can enter the creation fingerprint, idempotency scope,
+static policy, run slot, state, or trace; Authority remains the sole receipt
+validator. A match, ambiguity, or scanner-budget overflow returns HTTP `400` with only
+`raw_credential_input_denied`. The error has null details and does not reflect a
+key, value, path, parser error, digest, or configured action. Exact retries remain
+clean rejections; no idempotency receipt or run ID has been reserved, so a later
+credential-free request may use the same idempotency key normally.
+
 `CreateRunRequest.approval_policies` installs local approval policies for the run.
 `LifecycleRequest.approval_evidence` and `SubmitActionRequest.approval_evidence`
 remain decodable for compatibility and fail-closed trace/replay handling, but a
@@ -310,6 +323,52 @@ per-run state before waiting for those earlier permits to quiesce. Unrelated run
 remain inspectable while an earlier effect or lifecycle wait is blocked. Action
 completion records cannot overwrite a terminal lifecycle status published while
 the effect was in flight.
+
+After run/tenant/agent scope and caller authentication, direct and physical
+handlers apply the same Gateway-owned raw credential guard before run-authority
+admission/binding, approval-state mutation, safety/simulator work, or an action
+payload trace. A denied submission returns HTTP `200` with a fixed
+`ActionOutcome.status = Denied` and reason/error
+`raw_credential_input_denied`. The daemon records caller audit attribution and
+the normal verification-started, verification-completed, denied, and outcome
+sequence, but every action-bearing event uses the constant suppression
+projection. It does not persist the original action, call the Gateway wrapper,
+authority/broker/provider, adapter, or device simulator, or change pending
+approval authority. Caller authentication credentials are validated by the
+daemon security boundary and are not treated as workload action data by this
+guard.
+
+Authenticated `POST /devices/profiles` applies tenant/node scope validation first,
+then serializes and recursively screens the complete caller-supplied
+`DeviceRuntimeProfile` through the Gateway-owned bounded value guard before device
+profile validation, audit, or profile-map mutation. This includes capabilities,
+allowed/forbidden action strings, every nested constraint/status string and object
+key, policy-cache strings, trace-buffer strings, zone refs, and caller-supplied
+registration metadata. Rejection is HTTP `400` with fixed null-detail
+`raw_credential_input_denied`; the profile cannot subsequently be read or copied
+into safety evidence. Closed selector-plus-material coordinates for specific
+provider/header/environment aliases, standalone form representations, and raw or
+decoded BOM/NUL/control ambiguity receive the same denial as direct credential
+forms. Generic schema labels such as `name=token` remain ordinary metadata.
+Credential-free profiles preserve registration/read and physical execution behavior.
+
+The physical handler additionally screens every caller-controlled string in
+`SafetyContext` (`allowed_zone_refs`, `zone_ref`, and cloud-helper proposal ID)
+and attached operator-intervention evidence after authenticated tenant/run scope
+validation but before physical authority binding, safety snapshot/evidence,
+physical traces, Gateway construction, or simulator access. The operator
+intervention request/grant/deny handlers screen their free-form IDs, action,
+reason, decision-expiry metadata at the same authenticated boundary before
+device audit or intervention-record mutation. Operator endpoint rejection uses
+HTTP `400` with the same fixed, null-detail denial; physical action rejection
+uses the fixed suppressed `ActionOutcome` above.
+
+Residual incomplete behavior: direct and physical raw-input denials for an
+otherwise authenticated, run-scoped request still precede full lifecycle/quota
+admission so the raw payload cannot enter Authority. A waiting or closed run can
+therefore append a bounded fixed denial event group. No raw field is retained and
+no Gateway/adapter/simulator effect occurs, but denial-rate/lifecycle admission
+remains nonblocking follow-up rather than a completion claim for SECR-004/006.
 
 Raw approval evidence is admitted by the kernel before daemon audit, runtime
 trace, lifecycle, or gateway mutation. Active runs reject all raw grants and
@@ -474,6 +533,9 @@ remain outside a scheduler tick and do not fabricate a tick ID. Direct and
 run-bound physical requests allocate the effective action ID before verification;
 their started, single completed, terminal, and outcome records share the exact
 run/tenant/agent/action identity through the run's common trace cursor.
+Raw credential denials preserve that identity/order while replacing every
+request-controlled action field with the constant safe projection before the
+first action trace.
 Their caller-supplied quota estimate is untrusted: the daemon normalizes it to at
 least one action and one millisecond before quota verification. See
 [`quotas.md`](quotas.md) for the current reconciliation limitation.
@@ -522,6 +584,9 @@ and redacted decision digests; they omit concrete operation names and grant
 payloads. Replay does not invoke perceptors, policies, authority evaluators,
 receipt issuers/validators, gateways, verifiers, or adapters, and cannot repeat filesystem, network,
 database, webhook, shell, or external-service side effects.
+Raw credential denials therefore replay only the already-sanitized projection
+and fixed outcome; replay cannot recover the denied input or invoke a provider or
+adapter.
 
 Replay request bodies must include non-null `credential` and
 `audit_attribution`; both principal identity and `credential_id` are validated
@@ -562,6 +627,8 @@ Required 0.02-S5 failures include:
 | Non-exact `/actions` retry while waiting for approval | `409` | `approval_exact_action_retry_required` or `approval_challenge_retry_mismatch` |
 | Pending challenge unavailable while retrying | `503` | `approval_challenge_unavailable` |
 | Direct/physical effect from another non-capable lifecycle state | `409` | `run_not_effect_capable` |
+| Configured create-run action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `400` | `raw_credential_input_denied`; no run/idempotency/state/trace mutation |
+| Authenticated direct/physical action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `200` | fixed `ActionOutcome.status = Denied`, reason `raw_credential_input_denied`, safe traces only |
 | Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
 | Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
 | Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |

@@ -8,9 +8,9 @@ use splendor_daemon::caller_auth::{
 use splendor_daemon::{
     router, ApiErrorBody, CreateRunRequest, CreateRunResponse, DaemonActionCandidate, DaemonConfig,
     DaemonState, DevicePolicyCacheStatus, DeviceRuntimeProfile, DeviceTraceBufferStatus,
-    LifecycleRequest, RegisterDeviceProfileRequest, RegisteredAction, ReplayResponse,
-    RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest, SubmitPhysicalActionRequest,
-    TickResponse, TracePageResponse,
+    LifecycleRequest, OperatorInterventionEvidence, RegisterDeviceProfileRequest, RegisteredAction,
+    ReplayResponse, RunInspectResponse, RunStatus, SafetyContext, SubmitActionRequest,
+    SubmitPhysicalActionRequest, TickResponse, TracePageResponse,
 };
 use splendor_gateway::{ActionOutcome, ActionStatus};
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
@@ -1476,6 +1476,314 @@ async fn resident_daemon_verified_caller_preserves_c02_effect_authority() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{label}");
         assert_eq!(error.code, "caller_credential_mirror_mismatch", "{label}");
     }
+}
+
+#[tokio::test]
+async fn physical_raw_credential_denial_precedes_authority_trace_and_simulator() {
+    const CANARY: &str = "C03_PHYSICAL_RAW_CREDENTIAL_CANARY";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind credential guard simulator");
+    listener
+        .set_nonblocking(true)
+        .expect("set simulator nonblocking");
+    let simulator_url = format!(
+        "http://{}",
+        listener.local_addr().expect("simulator address")
+    );
+    let device_sim_env = DeviceSimEnvGuard::enabled(&simulator_url);
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state = DaemonState::with_trace_store(DaemonConfig::local_dev(), trace_store.clone());
+    let app = router(state.clone());
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let node_id = NodeId::new();
+    let create = physical_create_request(
+        "wo_c02_physical_raw_credential",
+        tenant_id.clone(),
+        agent_id.clone(),
+    );
+    let (status, created): (StatusCode, CreateRunResponse) =
+        call_json(app.clone(), Method::POST, "/runs", create).await;
+    assert_eq!(status, StatusCode::OK);
+    let causal_trace_id = traces(app.clone(), &created.run_id)
+        .await
+        .records
+        .into_iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload).ok())
+        .map(|event| event.trace_event_id)
+        .next()
+        .expect("physical causal trace");
+    let profile_canary = "C03_DEVICE_PROFILE_SAFETY_EVIDENCE_CANARY";
+    let mut rejected_profile = device_profile(node_id.clone(), tenant_id.clone());
+    rejected_profile.safety_constraints["allowed_zones"] =
+        json!(["zone_a", format!("\u{feff}Basic dTpw {profile_canary}")]);
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: rejected_profile,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED);
+    assert!(error.details.is_null());
+    assert!(!serde_json::to_string(&error)
+        .expect("profile denial serializes")
+        .contains(profile_canary));
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::GET,
+        &format!("/devices/{node_id}/status"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+
+    let profile_denial_trace_count = traces(app.clone(), &created.run_id).await.records.len();
+    let profile_denial_evaluations = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-profile-denial authority evaluation count");
+    let uri = format!("/devices/{node_id}/actions");
+    let (status, missing): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &uri,
+        physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code, "device_not_registered");
+    assert_eq!(
+        traces(app.clone(), &created.run_id).await.records.len(),
+        profile_denial_trace_count
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-profile-denial authority evaluation count"),
+        profile_denial_evaluations
+    );
+    let simulator_error = listener
+        .accept()
+        .expect_err("rejected profile must not reach simulator");
+    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+
+    let (status, _registered): (StatusCode, Value) = call_json(
+        app.clone(),
+        Method::POST,
+        "/devices/profiles",
+        RegisterDeviceProfileRequest {
+            credential: None,
+            audit_attribution: Some(audit()),
+            profile: device_profile(node_id.clone(), tenant_id.clone()),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw = physical_submit_request(
+        &created,
+        tenant_id.clone(),
+        agent_id.clone(),
+        causal_trace_id.clone(),
+    );
+    let action_id = ActionId::new();
+    raw.action_request.action_id = Some(action_id.clone());
+    raw.action_request.action.params = json!({
+        "zone_ref": "zone_a",
+        "headers": {"X-Auth-Token": CANARY}
+    });
+    let evaluations_before = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("authority evaluation count");
+    let (status, denied): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, raw).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied.action_id, action_id);
+    assert_eq!(denied.status, ActionStatus::Denied);
+    assert_eq!(
+        denied.verification.reasons,
+        vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED]
+    );
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-denial authority evaluation count"),
+        evaluations_before
+    );
+    let simulator_error = listener
+        .accept()
+        .expect_err("raw credential denial must not contact simulator");
+    assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+
+    let mut denied_action_ids = vec![action_id.clone()];
+    for field in [
+        "allowed_zone_ref",
+        "zone_ref",
+        "cloud_helper_proposal_id",
+        "intervention_id",
+        "intervention_action_name",
+        "intervention_decision",
+        "intervention_expires_at",
+    ] {
+        let canary = format!("C03_PHYSICAL_{}_CANARY", field.to_ascii_uppercase());
+        let credential_value =
+            format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+        let mut request = physical_submit_request(
+            &created,
+            tenant_id.clone(),
+            agent_id.clone(),
+            causal_trace_id.clone(),
+        );
+        let envelope_action_id = ActionId::new();
+        request.action_request.action_id = Some(envelope_action_id.clone());
+        match field {
+            "allowed_zone_ref" => {
+                request.safety_context.allowed_zone_refs = vec![credential_value.clone()]
+            }
+            "zone_ref" => request.safety_context.zone_ref = Some(credential_value.clone()),
+            "cloud_helper_proposal_id" => {
+                request.safety_context.cloud_helper_proposal_id = Some(credential_value.clone())
+            }
+            intervention_field => {
+                let mut evidence = OperatorInterventionEvidence {
+                    intervention_id: "intervention-fixture".to_string(),
+                    tenant_id: tenant_id.clone(),
+                    run_id: created.run_id.clone(),
+                    action_name: "move_to_waypoint".to_string(),
+                    decision: "granted".to_string(),
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                };
+                match intervention_field {
+                    "intervention_id" => evidence.intervention_id = credential_value.clone(),
+                    "intervention_action_name" => evidence.action_name = credential_value.clone(),
+                    "intervention_decision" => evidence.decision = credential_value.clone(),
+                    "intervention_expires_at" => evidence.expires_at = credential_value.clone(),
+                    _ => unreachable!("closed physical envelope matrix"),
+                }
+                request.operator_intervention_evidence = Some(evidence);
+            }
+        }
+
+        let (status, denied): (StatusCode, ActionOutcome) =
+            call_json(app.clone(), Method::POST, &uri, request).await;
+        assert_eq!(status, StatusCode::OK, "{field}");
+        assert_eq!(denied.action_id, envelope_action_id, "{field}");
+        assert_eq!(denied.status, ActionStatus::Denied, "{field}");
+        assert_eq!(
+            denied.verification.reasons,
+            vec![splendor_gateway::RAW_CREDENTIAL_INPUT_DENIED],
+            "{field}"
+        );
+        assert!(!serde_json::to_string(&denied)
+            .expect("denial serializes")
+            .contains(&canary));
+        denied_action_ids.push(envelope_action_id);
+        let simulator_error = listener
+            .accept()
+            .expect_err("physical envelope denial must not contact simulator");
+        assert_eq!(simulator_error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        0
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-envelope-denial authority evaluation count"),
+        evaluations_before
+    );
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw physical traces");
+    let encoded = serde_json::to_string(&raw_records).expect("raw traces serialize");
+    assert!(!encoded.contains(CANARY));
+    assert!(!encoded.contains(profile_canary));
+    assert!(!encoded.contains("C03_PHYSICAL_"));
+    let raw_events = raw_records
+        .iter()
+        .filter_map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).ok())
+        .collect::<Vec<_>>();
+    for denied_action_id in &denied_action_ids {
+        let action_events = raw_events
+            .iter()
+            .filter(|event| event.identity.action_id.as_ref() == Some(denied_action_id))
+            .collect::<Vec<_>>();
+        assert_eq!(action_events.len(), 4);
+        assert!(action_events.iter().all(|event| match &event.kind {
+            TraceEventKind::ActionVerificationStarted { action }
+            | TraceEventKind::ActionVerificationCompleted { action, .. }
+            | TraceEventKind::ActionDenied { action, .. } => {
+                action == &splendor_gateway::raw_credential_denied_action()
+            }
+            TraceEventKind::OutcomeRecorded { .. } => true,
+            _ => false,
+        }));
+    }
+
+    let replay_caller = replay_credential(tenant_id.clone());
+    let executions_before_replay = inspect(app.clone(), &created.run_id)
+        .await
+        .adapter_executions;
+    let evaluations_before_replay = state
+        .run_authority_evaluation_count(&created.run_id)
+        .expect("pre-replay authority evaluations");
+    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({
+            "mode": "inspect_only",
+            "side_effects_allowed": false,
+            "audit_attribution": credential_audit(&replay_caller),
+            "credential": replay_caller,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay.mode, "inspect_only");
+    assert_eq!(
+        inspect(app.clone(), &created.run_id)
+            .await
+            .adapter_executions,
+        executions_before_replay
+    );
+    assert_eq!(
+        state
+            .run_authority_evaluation_count(&created.run_id)
+            .expect("post-replay authority evaluations"),
+        evaluations_before_replay
+    );
+
+    drop(device_sim_env);
+    drop(listener);
+    let _device_sim_disabled = DeviceSimEnvGuard::disabled();
+    let safe = physical_submit_request(&created, tenant_id, agent_id, causal_trace_id);
+    let (status, executed): (StatusCode, ActionOutcome) =
+        call_json(app.clone(), Method::POST, &uri, safe).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(executed.status, ActionStatus::Executed);
+    assert_eq!(inspect(app, &created.run_id).await.adapter_executions, 1);
 }
 
 #[tokio::test]

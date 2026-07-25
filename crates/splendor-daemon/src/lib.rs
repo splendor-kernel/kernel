@@ -18,12 +18,14 @@ use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use splendor_gateway::{
-    authority_pre_effect_evidence_recorded, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
-    ActionRequest, ActionStatus, AdapterError, AdapterResult, AuthorityObligationVerifier,
-    CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary, PolicyApprovalVerifier,
-    PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier, SimulatedRiskLevel,
-    SimulatedSafetySnapshot, SimulatedSafetyVerifier, StaticCircuitBreakerEvaluator,
-    VerifiedActionGateway,
+    authority_pre_effect_evidence_recorded, guard_action_request,
+    guard_action_routing_and_receipts, guard_credential_capable_strings,
+    guard_credential_capable_value, raw_credential_denied_action, raw_credential_denied_outcome,
+    ActionAdapter, ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
+    AdapterError, AdapterResult, AuthorityObligationVerifier, CircuitBreakerEvaluator,
+    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    StaticCircuitBreakerEvaluator, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
     Action, ActionCandidate, AgentContext, AgentIsolationPolicy, AgentRuntimeConfig,
@@ -2030,6 +2032,55 @@ fn require_create_run_token(value: &str, field: &'static str) -> Result<String, 
     Ok(trimmed.to_string())
 }
 
+fn ensure_configured_actions_are_credential_free(
+    request: &CreateRunRequest,
+) -> Result<(), ApiError> {
+    if request.policy_actions.iter().any(|candidate| {
+        guard_action_routing_and_receipts(
+            &candidate.action,
+            candidate.adapter.as_deref(),
+            &candidate.satisfied_preconditions,
+            &candidate.authority_obligation_receipts,
+        )
+        .is_err()
+    }) {
+        return Err(raw_credential_input_api_error());
+    }
+    Ok(())
+}
+
+fn raw_credential_input_api_error() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        RAW_CREDENTIAL_INPUT_DENIED,
+        RAW_CREDENTIAL_INPUT_DENIED,
+    )
+}
+
+fn guard_physical_envelope(
+    request: &SubmitPhysicalActionRequest,
+) -> Result<(), splendor_gateway::RawCredentialInputDenied> {
+    let safety_values = request
+        .safety_context
+        .allowed_zone_refs
+        .iter()
+        .map(String::as_str)
+        .chain(request.safety_context.zone_ref.as_deref())
+        .chain(request.safety_context.cloud_helper_proposal_id.as_deref());
+    let intervention_values = request
+        .operator_intervention_evidence
+        .iter()
+        .flat_map(|evidence| {
+            [
+                evidence.intervention_id.as_str(),
+                evidence.action_name.as_str(),
+                evidence.decision.as_str(),
+                evidence.expires_at.as_str(),
+            ]
+        });
+    guard_credential_capable_strings(safety_values.chain(intervention_values))
+}
+
 fn create_run_caller_scope(security: &DaemonSecurityDecision) -> serde_json::Value {
     let principal = security.principal.as_ref().or_else(|| {
         security
@@ -2162,7 +2213,6 @@ async fn create_run(
         None,
     )?;
     let validated_work_order = validated_authority_work_order.work_order().clone();
-    ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
     let work_order_authorization = work_order_authorization_for_endpoint(
         &request.work_order,
         vec![splendor_types::EndpointScope::RunsCreate],
@@ -2175,6 +2225,8 @@ async fn create_run(
         Some(work_order_authorization),
         request.audit_attribution.clone(),
     )?;
+    ensure_configured_actions_are_credential_free(&request)?;
+    ensure_request_does_not_widen_work_order(&request, &validated_work_order)?;
 
     let existing_run_id_for_scope = {
         let idempotency = state
@@ -3506,7 +3558,7 @@ async fn submit_action(
         authority_obligation_receipts: request.authority_obligation_receipts.clone(),
     };
     let (gateway, pending_approval_retry) = {
-        let slot = run.lock().map_err(|_| lock_error())?;
+        let mut slot = run.lock().map_err(|_| lock_error())?;
         if request.tenant_id != slot.tenant_id || request.agent_id != slot.agent_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -3525,6 +3577,18 @@ async fn submit_action(
             None,
             request.audit_attribution,
         )?;
+        if guard_action_request(&action_request).is_err() {
+            record_daemon_audit(&slot, "splendor.actions.submit", security.audit_attribution)?;
+            let outcome = record_raw_credential_action_denial(
+                &slot,
+                &effective_action_id,
+                RawCredentialIngressSource::Direct {
+                    causal_trace_id: request.causal_trace_id.clone(),
+                },
+            )?;
+            slot.updated_at = OffsetDateTime::now_utc();
+            return Ok(Json(outcome));
+        }
         let effective_adapter = action_request.adapter.clone().or_else(|| {
             slot.action_profiles
                 .iter()
@@ -3827,7 +3891,6 @@ async fn register_device_profile(
     Json(request): Json<RegisterDeviceProfileRequest>,
 ) -> Result<Json<RegisterDeviceProfileResponse>, ApiError> {
     state.ensure_runtime_available()?;
-    validate_device_profile_payload(&request.profile)?;
     let security = state.validate_security(
         DaemonEndpoint::DeviceProfileRegister {
             tenant_id: request.profile.tenant_id.clone(),
@@ -3837,6 +3900,11 @@ async fn register_device_profile(
         None,
         request.audit_attribution.clone(),
     )?;
+    let profile_envelope =
+        serde_json::to_value(&request.profile).map_err(|_| raw_credential_input_api_error())?;
+    guard_credential_capable_value(&profile_envelope)
+        .map_err(|_| raw_credential_input_api_error())?;
+    validate_device_profile_payload(&request.profile)?;
     let mut profile = request.profile;
     profile.registered_at = now_rfc3339();
     state
@@ -3950,26 +4018,6 @@ async fn submit_physical_action(
         ));
     }
     let action_name = request.action_request.action.name.clone();
-    if matches_forbidden_physical_action(&action_name) || !is_allowed_physical_action(&action_name)
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "low_level_physical_action_rejected",
-            "physical endpoint accepts only bounded high-level actions",
-        ));
-    }
-    if !profile
-        .allowed_physical_actions
-        .iter()
-        .any(|allowed| allowed == &action_name)
-    {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "physical_action_not_profile_allowed",
-            "device profile does not allow action",
-        ));
-    }
-
     let effective_action_id = request
         .action_request
         .action_id
@@ -3994,14 +4042,13 @@ async fn submit_physical_action(
         authority_obligation_evidence: None,
         authority_obligation_receipts: request.action_request.authority_obligation_receipts.clone(),
     };
-    let safety_snapshot = simulated_safety_snapshot(&request, &profile, &action_name);
-    let offline = effective_device_offline(&request.safety_context, &profile);
     let run = state.run_slot(&request.action_request.run_id)?;
-    let (physical_gateway, pending_approval_retry): (
+    let (physical_gateway, pending_approval_retry, offline): (
         Arc<dyn ActionGateway>,
         Option<ApprovalChallenge>,
+        bool,
     ) = {
-        let slot = run.lock().map_err(|_| lock_error())?;
+        let mut slot = run.lock().map_err(|_| lock_error())?;
         if request.action_request.tenant_id != slot.tenant_id
             || request.action_request.agent_id != slot.agent_id
         {
@@ -4022,6 +4069,44 @@ async fn submit_physical_action(
             None,
             request.action_request.audit_attribution.clone(),
         )?;
+        if guard_action_request(&action_request).is_err()
+            || guard_physical_envelope(&request).is_err()
+        {
+            record_daemon_audit(
+                &slot,
+                "splendor.devices.actions.submit",
+                security.audit_attribution,
+            )?;
+            let outcome = record_raw_credential_action_denial(
+                &slot,
+                &effective_action_id,
+                RawCredentialIngressSource::Physical,
+            )?;
+            slot.updated_at = OffsetDateTime::now_utc();
+            return Ok(Json(outcome));
+        }
+        if matches_forbidden_physical_action(&action_name)
+            || !is_allowed_physical_action(&action_name)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "low_level_physical_action_rejected",
+                "physical endpoint accepts only bounded high-level actions",
+            ));
+        }
+        if !profile
+            .allowed_physical_actions
+            .iter()
+            .any(|allowed| allowed == &action_name)
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "physical_action_not_profile_allowed",
+                "device profile does not allow action",
+            ));
+        }
+        let safety_snapshot = simulated_safety_snapshot(&request, &profile, &action_name);
+        let offline = effective_device_offline(&request.safety_context, &profile);
         slot.run_authority
             .bind_physical_action_resource(&mut action_request, node_id.clone())
             .map_err(run_action_admission_error)?;
@@ -4142,6 +4227,7 @@ async fn submit_physical_action(
                 Arc::new(slot.policy_cache.clone()),
             )),
             pending_approval_retry,
+            offline,
         )
     };
     let mut outcome = physical_gateway.submit(action_request).map_err(|error| {
@@ -4281,6 +4367,13 @@ async fn request_operator_intervention(
         None,
         request.audit_attribution.clone(),
     )?;
+    guard_credential_capable_strings([
+        request.intervention_id.as_str(),
+        request.action_name.as_str(),
+        request.reason.as_str(),
+        request.expires_at.as_str(),
+    ])
+    .map_err(|_| raw_credential_input_api_error())?;
     let trace_event_id = record_device_audit(
         &state,
         "operator.intervention.requested",
@@ -4352,6 +4445,11 @@ async fn decide_operator_intervention(
         None,
         request.audit_attribution.clone(),
     )?;
+    let credential_capable_strings = [intervention_id.as_str(), request.reason.as_str()]
+        .into_iter()
+        .chain(request.expires_at.as_deref());
+    guard_credential_capable_strings(credential_capable_strings)
+        .map_err(|_| raw_credential_input_api_error())?;
     let event = if status == "granted" {
         "operator.intervention.granted"
     } else {
@@ -5803,6 +5901,64 @@ fn record_run_action_event(
         })
 }
 
+enum RawCredentialIngressSource {
+    Direct { causal_trace_id: Option<TraceId> },
+    Physical,
+}
+
+fn record_raw_credential_action_denial(
+    slot: &RunSlot,
+    action_id: &ActionId,
+    source: RawCredentialIngressSource,
+) -> Result<ActionOutcome, ApiError> {
+    let action = raw_credential_denied_action();
+    let outcome = raw_credential_denied_outcome(action_id.clone());
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionVerificationStarted {
+            action: action.clone(),
+        },
+    )?;
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionVerificationCompleted {
+            action: action.clone(),
+            result: outcome.verification.clone(),
+        },
+    )?;
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::ActionDenied {
+            action,
+            result: outcome.verification.clone(),
+        },
+    )?;
+    let recorded_outcome = match source {
+        RawCredentialIngressSource::Direct { causal_trace_id } => serde_json::json!({
+            "source": "daemon.action",
+            "causal_trace_id": causal_trace_id,
+            "action_outcome": &outcome,
+        }),
+        RawCredentialIngressSource::Physical => serde_json::json!({
+            "source": "daemon.physical_action",
+            "action_outcome": &outcome,
+        }),
+    };
+    record_run_action_event(
+        slot,
+        action_id,
+        TraceEventKind::OutcomeRecorded {
+            outcome: recorded_outcome,
+            feedback: None,
+            reward: None,
+        },
+    )?;
+    Ok(outcome)
+}
+
 fn record_run_event_returning_id(
     slot: &RunSlot,
     kind: TraceEventKind,
@@ -6623,6 +6779,36 @@ mod tests {
             expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(5),
             revocation: splendor_types::RevocationStatus::Active,
         }
+    }
+
+    fn locked_unit_state() -> DaemonState {
+        let mut config = DaemonConfig::local_dev();
+        config.insecure_dev_mode = None;
+        DaemonState::new(config)
+    }
+
+    fn unit_credential(tenant_id: TenantId, scopes: Vec<EndpointScope>) -> CallerCredential {
+        CallerCredential {
+            credential_id: "unit_credential".to_string(),
+            principal: unit_audit().principal,
+            scopes,
+            binding: CredentialBinding::Tenant { tenant_id },
+            audience: CredentialAudience::Daemon {
+                daemon_id: "daemon_local".to_string(),
+            },
+            expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(5),
+            revocation: RevocationStatus::Active,
+        }
+    }
+
+    fn unit_credential_headers(credential: &CallerCredential) -> HeaderMap {
+        let encoded = serde_json::to_vec(credential).expect("credential serializes");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-splendor-caller-credential",
+            HeaderValue::from_bytes(&encoded).expect("credential header"),
+        );
+        headers
     }
 
     fn unit_profile(node_id: NodeId, tenant_id: TenantId) -> DeviceRuntimeProfile {
@@ -8833,6 +9019,341 @@ mod tests {
         .expect_err("unregistered trace sync denied");
         assert_eq!(missing_sync.status, StatusCode::NOT_FOUND);
         assert_eq!(missing_sync.body.code, "device_not_registered");
+    }
+
+    #[tokio::test]
+    async fn authenticated_device_profile_ingress_denies_before_audit_or_mutation() {
+        let state = locked_unit_state();
+        let tenant_id = TenantId::new();
+        let register_credential =
+            unit_credential(tenant_id.clone(), vec![EndpointScope::DeviceRegister]);
+
+        let mut unauthenticated = unit_profile(NodeId::new(), tenant_id.clone());
+        unauthenticated.capabilities = vec!["Basic dTpw".to_string()];
+        let error = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                profile: unauthenticated,
+            }),
+        )
+        .await
+        .expect_err("authentication must precede profile screening");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.body.code, "anonymous_non_dev_call");
+
+        for field in [
+            "device_kind",
+            "capabilities",
+            "allowed_physical_actions",
+            "forbidden_action_classes",
+            "safety_constraints_value",
+            "safety_constraints_key",
+            "runtime_mode",
+            "safety_status_value",
+            "safety_status_key",
+            "policy_id",
+            "policy_expires_at",
+            "trace_integrity",
+            "registered_at",
+            "safety_constraints_structured_coordinate",
+            "safety_status_bom",
+            "policy_id_nul",
+            "trace_integrity_form",
+            "safety_status_percent_bom",
+            "trace_integrity_percent_nul",
+        ] {
+            let node_id = NodeId::new();
+            let canary = format!("C03_DEVICE_PROFILE_{}_CANARY", field.to_ascii_uppercase());
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+            let mut profile = unit_profile(node_id.clone(), tenant_id.clone());
+            match field {
+                "device_kind" => profile.device_kind = credential_value.clone(),
+                "capabilities" => profile.capabilities = vec![credential_value.clone()],
+                "allowed_physical_actions" => {
+                    profile.allowed_physical_actions = vec![credential_value.clone()]
+                }
+                "forbidden_action_classes" => {
+                    profile.forbidden_action_classes = vec![credential_value.clone()]
+                }
+                "safety_constraints_value" => {
+                    profile.safety_constraints = serde_json::json!({
+                        "allowed_zones": ["zone_a", {"nested": [credential_value.clone()]}]
+                    })
+                }
+                "safety_constraints_key" => {
+                    profile.safety_constraints = serde_json::Value::Object(
+                        [(credential_value.clone(), serde_json::json!("ordinary"))]
+                            .into_iter()
+                            .collect(),
+                    )
+                }
+                "runtime_mode" => profile.runtime_mode = credential_value.clone(),
+                "safety_status_value" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": {"nested": [credential_value.clone()]}
+                    })
+                }
+                "safety_status_key" => {
+                    profile.safety_status = serde_json::Value::Object(
+                        [(credential_value.clone(), serde_json::json!("ordinary"))]
+                            .into_iter()
+                            .collect(),
+                    )
+                }
+                "policy_id" => profile.policy_cache.policy_id = credential_value.clone(),
+                "policy_expires_at" => profile.policy_cache.expires_at = credential_value.clone(),
+                "trace_integrity" => profile.trace_buffer.integrity = credential_value.clone(),
+                "registered_at" => profile.registered_at = credential_value.clone(),
+                "safety_constraints_structured_coordinate" => {
+                    profile.safety_constraints = serde_json::json!({
+                        "allowed_zones": [{"name": "VAULT_TOKEN", "value": canary.clone()}]
+                    })
+                }
+                "safety_status_bom" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": format!("\u{feff}Basic dTpw {canary}")
+                    })
+                }
+                "policy_id_nul" => {
+                    profile.policy_cache.policy_id = format!("B\0e\0a\0r\0e\0r\0 \0x\0 {canary}")
+                }
+                "trace_integrity_form" => {
+                    profile.trace_buffer.integrity =
+                        format!("safe=1&value=Basic+dTpw&label={canary}")
+                }
+                "safety_status_percent_bom" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": format!("value=%EF%BB%BFBasic%20dTpw&label={canary}")
+                    })
+                }
+                "trace_integrity_percent_nul" => {
+                    profile.trace_buffer.integrity =
+                        format!("value=B%00e%00a%00r%00e%00r%00%20x&label={canary}")
+                }
+                _ => unreachable!("closed device profile field matrix"),
+            }
+
+            let error = register_device_profile(
+                State(state.clone()),
+                Json(RegisterDeviceProfileRequest {
+                    credential: Some(register_credential.clone()),
+                    audit_attribution: Some(unit_audit()),
+                    profile,
+                }),
+            )
+            .await
+            .expect_err("raw device profile metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            assert!(!state
+                .inner
+                .device_profiles
+                .lock()
+                .expect("profiles")
+                .contains_key(&node_id));
+            assert!(state
+                .inner
+                .device_audit
+                .lock()
+                .expect("device audit")
+                .is_empty());
+        }
+
+        let node_id = NodeId::new();
+        let mut ordinary_profile = unit_profile(node_id.clone(), tenant_id.clone());
+        ordinary_profile.safety_status["descriptor"] = serde_json::json!({
+            "name": "token",
+            "type": "string"
+        });
+        let registered = register_device_profile(
+            State(state.clone()),
+            Json(RegisterDeviceProfileRequest {
+                credential: Some(register_credential),
+                audit_attribution: Some(unit_audit()),
+                profile: ordinary_profile,
+            }),
+        )
+        .await
+        .expect("ordinary authenticated device profile remains accepted")
+        .0;
+        assert_eq!(registered.profile.node_id, node_id);
+
+        let anonymous = get_device_status(
+            Path(node_id.clone()),
+            State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("device read remains authenticated");
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.body.code, "anonymous_non_dev_call");
+
+        let read_credential = unit_credential(tenant_id, vec![EndpointScope::DeviceRead]);
+        let read = get_device_status(
+            Path(node_id),
+            State(state.clone()),
+            unit_credential_headers(&read_credential),
+        )
+        .await
+        .expect("authenticated ordinary device profile read")
+        .0;
+        assert_eq!(read.device_kind, "drone_sim");
+        assert_eq!(read.safety_status["descriptor"]["name"], "token");
+        assert!(!serde_json::to_string(&read)
+            .expect("profile serializes")
+            .contains("C03_DEVICE_PROFILE_"));
+        assert_eq!(
+            state.inner.device_audit.lock().expect("device audit").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_intervention_raw_metadata_denies_before_audit_and_persistence() {
+        let state = DaemonState::local_dev();
+        let tenant_id = TenantId::new();
+        let agent_id = splendor_types::AgentId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::minutes(15))
+            .format(&Rfc3339)
+            .expect("expiry");
+
+        for field in ["intervention_id", "action_name", "reason", "expires_at"] {
+            let canary = format!("C03_OPERATOR_{}_CANARY", field.to_ascii_uppercase());
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+            let mut request = OperatorInterventionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                intervention_id: format!("intervention_{field}"),
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                node_id: node_id.clone(),
+                action_name: "move_to_waypoint".to_string(),
+                reason: "operator review".to_string(),
+                expires_at: expires_at.clone(),
+            };
+            match field {
+                "intervention_id" => request.intervention_id = credential_value.clone(),
+                "action_name" => request.action_name = credential_value.clone(),
+                "reason" => request.reason = credential_value.clone(),
+                "expires_at" => request.expires_at = credential_value.clone(),
+                _ => unreachable!("closed operator request field matrix"),
+            }
+
+            let error = request_operator_intervention(State(state.clone()), Json(request))
+                .await
+                .expect_err("raw operator request metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            assert!(state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions")
+                .is_empty());
+            assert!(state
+                .inner
+                .device_audit
+                .lock()
+                .expect("device audit")
+                .is_empty());
+        }
+
+        let _ = request_operator_intervention(
+            State(state.clone()),
+            Json(OperatorInterventionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                intervention_id: "intervention_screened".to_string(),
+                tenant_id,
+                agent_id,
+                run_id,
+                node_id,
+                action_name: "move_to_waypoint".to_string(),
+                reason: "operator review".to_string(),
+                expires_at: expires_at.clone(),
+            }),
+        )
+        .await
+        .expect("safe intervention request");
+        assert_eq!(
+            state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions")
+                .len(),
+            1
+        );
+        assert_eq!(
+            state.inner.device_audit.lock().expect("device audit").len(),
+            1
+        );
+
+        for field in ["reason", "expires_at"] {
+            let canary = format!(
+                "C03_OPERATOR_DECISION_{}_CANARY",
+                field.to_ascii_uppercase()
+            );
+            let credential_value =
+                format!("https://example.invalid/form?value=Basic+dTpw&label={canary}");
+            let mut request = OperatorDecisionRequest {
+                credential: None,
+                audit_attribution: Some(unit_audit()),
+                reason: "cleared".to_string(),
+                expires_at: Some(expires_at.clone()),
+            };
+            match field {
+                "reason" => request.reason = credential_value.clone(),
+                "expires_at" => request.expires_at = Some(credential_value.clone()),
+                _ => unreachable!("closed operator decision field matrix"),
+            }
+            let error = grant_operator_intervention(
+                Path("intervention_screened".to_string()),
+                State(state.clone()),
+                Json(request),
+            )
+            .await
+            .expect_err("raw operator decision metadata must deny");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(error.body.code, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert_eq!(error.body.message, RAW_CREDENTIAL_INPUT_DENIED, "{field}");
+            assert!(error.body.details.is_null(), "{field}");
+            assert!(!serde_json::to_string(&error.body)
+                .expect("error serializes")
+                .contains(&canary));
+            let interventions = state
+                .inner
+                .operator_interventions
+                .lock()
+                .expect("interventions");
+            let record = interventions
+                .get("intervention_screened")
+                .expect("safe record retained");
+            assert_eq!(record.status, "requested");
+            assert_eq!(record.reason, "operator review");
+            drop(interventions);
+            assert_eq!(
+                state.inner.device_audit.lock().expect("device audit").len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

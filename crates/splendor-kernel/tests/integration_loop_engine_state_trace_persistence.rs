@@ -1,13 +1,26 @@
-use splendor_gateway::{ActionAdapter, AdapterError, AdapterResult, VerifiedActionGateway};
+use splendor_gateway::{
+    raw_credential_denied_action, ActionAdapter, ActionOutcome, ActionStatus, AdapterError,
+    AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
+};
 use splendor_kernel::{
-    ActionCandidate, AgentContext, AgentRuntimeConfig, LoopEngine, Perceptor, Policy,
-    PolicyDecision, QuotaPolicy, RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext,
-    TenantPolicy, TenantRegistry, TraceEvent, TraceEventKind,
+    ActionCandidate, AgentContext, AgentRuntimeConfig, ConstraintEngine, ConstraintEvaluation,
+    LoopEngine, OutcomeEvaluator, OutcomeSignal, Perceptor, Policy, PolicyDecision, QuotaPolicy,
+    RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
+    TenantRegistry, TraceEvent, TraceEventKind,
 };
 use splendor_store::{InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceStore};
-use splendor_types::{Action, Percept, PerceptProvenance};
-use std::sync::Arc;
+use splendor_types::{
+    Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
+    AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
+    AuthorityObligationReceiptValidationKind, Feedback, Percept, PerceptProvenance, PrincipalId,
+    RevocationStatus, VerificationResult,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
+
+const ACTION_CANARY: &str = "C03_RAW_CREDENTIAL_KERNEL_CANARY";
+const RECEIPT_CANARY: &str = "Bearer C03_RAW_RECEIPT_KERNEL_CANARY";
 
 struct StaticPerceptor;
 
@@ -69,6 +82,172 @@ impl ActionAdapter for StubAdapter {
     ) -> Result<AdapterResult, AdapterError> {
         Ok(AdapterResult {
             output: serde_json::json!({"ok": true}),
+            satisfied_postconditions: Vec::new(),
+        })
+    }
+}
+
+struct MixedCredentialPolicy;
+
+fn raw_receipt_canary() -> AuthorityObligationReceipt {
+    let now = OffsetDateTime::now_utc();
+    AuthorityObligationReceipt {
+        schema_version: "splendor.authority_obligation_receipt.v1".to_string(),
+        receipt_id: AuthorityObligationReceiptId::new(),
+        issuer: PrincipalId::new(),
+        audience: "splendor.kernel.fixture".to_string(),
+        obligation_id: AuthorityObligationId::new(),
+        kind: AuthorityObligationKind::ApprovalRequired,
+        subject: PrincipalId::new(),
+        authority_decision_id: AuthorityDecisionId::new(),
+        canonical_request_digest: "blake3:canonical-request".to_string(),
+        evidence_digest: "blake3:evidence".to_string(),
+        evidence_ref: Some(RECEIPT_CANARY.to_string()),
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        revocation: RevocationStatus::Active,
+        revocation_ref: "revocation:fixture".to_string(),
+        approval_id: None,
+        approval_trace_event_id: None,
+        validation: AuthorityObligationReceiptValidation {
+            validation_kind: AuthorityObligationReceiptValidationKind::LocalSignature,
+            algorithm: "local-signature-v1".to_string(),
+            key_id: "local-receipt-key-v1".to_string(),
+            digest: "blake3:receipt".to_string(),
+            signature: "synthetic-signature".to_string(),
+        },
+    }
+}
+
+impl Policy for MixedCredentialPolicy {
+    fn name(&self) -> &str {
+        "mixed-credential-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, splendor_kernel::LoopError> {
+        let denied = ActionCandidate::new(Action {
+            name: "unsafe-input".to_string(),
+            params: serde_json::json!({
+                "nested": [{"authKey": ACTION_CANARY}]
+            }),
+            side_effect_class: SideEffectClass::Network,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        })
+        .with_adapter("stub");
+        let receipt_denied = ActionCandidate::new(Action {
+            name: "unsafe-input".to_string(),
+            params: serde_json::json!({"resource_ref": "fixture:receipt"}),
+            side_effect_class: SideEffectClass::Network,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        })
+        .with_adapter("stub")
+        .with_authority_obligation_receipts(vec![raw_receipt_canary()]);
+        let allowed = ActionCandidate::new(Action {
+            name: "safe-input".to_string(),
+            params: serde_json::json!({"resource_ref": "fixture:report"}),
+            side_effect_class: SideEffectClass::ReadOnly,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        })
+        .with_adapter("stub");
+        Ok(PolicyDecision::new(
+            vec![denied, receipt_denied, allowed],
+            StateData {
+                bytes: b"credential-free-state".to_vec(),
+                content_type: Some("text/plain".to_string()),
+            },
+            Some("mixed-screened".to_string()),
+        ))
+    }
+}
+
+struct RecordingConstraintEngine {
+    names: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConstraintEngine for RecordingConstraintEngine {
+    fn evaluate(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+        actions: &[ActionCandidate],
+    ) -> ConstraintEvaluation {
+        *self.names.lock().expect("constraint names") = actions
+            .iter()
+            .map(|candidate| candidate.action.name.clone())
+            .collect();
+        ConstraintEvaluation::allow()
+    }
+}
+
+struct RecordingOutcomeEvaluator {
+    names: Arc<Mutex<Vec<String>>>,
+}
+
+impl OutcomeEvaluator for RecordingOutcomeEvaluator {
+    fn evaluate(&self, action: &Action, _outcome: &ActionOutcome) -> OutcomeSignal {
+        self.names
+            .lock()
+            .expect("outcome names")
+            .push(action.name.clone());
+        OutcomeSignal {
+            feedback: Some(Feedback {
+                kind: "integration".to_string(),
+                payload: action.params.clone(),
+                recorded_at: OffsetDateTime::now_utc(),
+            }),
+            reward: None,
+        }
+    }
+}
+
+struct CountingAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for CountingAdapter {
+    fn execute(
+        &self,
+        action: &splendor_gateway::ActionRequest,
+    ) -> Result<AdapterResult, AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AdapterResult {
+            output: serde_json::json!({"executed": action.action.name}),
+            satisfied_postconditions: Vec::new(),
+        })
+    }
+}
+
+struct ForbiddenRawEffectAdapter {
+    adapter_calls: Arc<AtomicUsize>,
+    provider_calls: Arc<AtomicUsize>,
+    network_calls: Arc<AtomicUsize>,
+    filesystem_calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for ForbiddenRawEffectAdapter {
+    fn execute(
+        &self,
+        _action: &splendor_gateway::ActionRequest,
+    ) -> Result<AdapterResult, AdapterError> {
+        self.adapter_calls.fetch_add(1, Ordering::SeqCst);
+        self.provider_calls.fetch_add(1, Ordering::SeqCst);
+        self.network_calls.fetch_add(1, Ordering::SeqCst);
+        self.filesystem_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AdapterResult {
+            output: serde_json::json!({"unexpected": true}),
             satisfied_postconditions: Vec::new(),
         })
     }
@@ -178,4 +357,159 @@ fn loop_engine_persists_state_and_trace_records() {
             outcome.state_commit.snapshot_id.as_ref()
         );
     }
+}
+
+#[test]
+fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_replay() {
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_graph = StateGraph::new(
+        state_store.clone(),
+        SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        },
+    );
+    let tenant_id = splendor_kernel::TenantId::new();
+    let agent_id = splendor_kernel::AgentId::new();
+    let agent = AgentContext::new(agent_id, tenant_id.clone(), AgentRuntimeConfig::default());
+    let registry = TenantRegistry::new();
+    registry.insert(TenantContext::new(
+        tenant_id,
+        TenantPolicy {
+            allowed_actions: vec!["unsafe-input".to_string(), "safe-input".to_string()],
+            allowed_adapters: vec!["stub".to_string()],
+            allowed_permissions: Vec::new(),
+        },
+        QuotaPolicy::default(),
+    ));
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+
+    let safe_adapter_calls = Arc::new(AtomicUsize::new(0));
+    let raw_adapter_calls = Arc::new(AtomicUsize::new(0));
+    let raw_provider_calls = Arc::new(AtomicUsize::new(0));
+    let raw_network_calls = Arc::new(AtomicUsize::new(0));
+    let raw_filesystem_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry));
+    gateway.register_adapter(
+        "unsafe-input",
+        "stub",
+        Arc::new(ForbiddenRawEffectAdapter {
+            adapter_calls: Arc::clone(&raw_adapter_calls),
+            provider_calls: Arc::clone(&raw_provider_calls),
+            network_calls: Arc::clone(&raw_network_calls),
+            filesystem_calls: Arc::clone(&raw_filesystem_calls),
+        }),
+    );
+    gateway.register_adapter(
+        "safe-input",
+        "stub",
+        Arc::new(CountingAdapter {
+            calls: Arc::clone(&safe_adapter_calls),
+        }),
+    );
+    let constraint_names = Arc::new(Mutex::new(Vec::new()));
+    let outcome_names = Arc::new(Mutex::new(Vec::new()));
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        agent,
+        state_graph,
+        StateData {
+            bytes: b"initial".to_vec(),
+            content_type: None,
+        },
+        Box::new(MixedCredentialPolicy),
+        Arc::new(gateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.set_constraint_engine(RecordingConstraintEngine {
+        names: Arc::clone(&constraint_names),
+    });
+    engine.set_outcome_evaluator(RecordingOutcomeEvaluator {
+        names: Arc::clone(&outcome_names),
+    });
+
+    let outcome = engine.tick(1).expect("mixed tick");
+
+    assert_eq!(outcome.action_outcomes.len(), 3);
+    assert_eq!(outcome.action_outcomes[0].status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.action_outcomes[0].verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.action_outcomes[1].status, ActionStatus::Denied);
+    assert_eq!(
+        outcome.action_outcomes[1].verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.action_outcomes[2].status, ActionStatus::Executed);
+    assert_eq!(safe_adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(raw_adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(raw_provider_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(raw_network_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(raw_filesystem_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *constraint_names.lock().expect("constraint names"),
+        vec!["safe-input".to_string()]
+    );
+    assert_eq!(
+        *outcome_names.lock().expect("outcome names"),
+        vec!["safe-input".to_string()]
+    );
+
+    let snapshot = state_store
+        .load_snapshot(
+            outcome
+                .state_commit
+                .snapshot_id
+                .as_ref()
+                .expect("snapshot id"),
+        )
+        .expect("snapshot");
+    assert!(!String::from_utf8_lossy(&snapshot.state.bytes).contains(ACTION_CANARY));
+    assert!(!String::from_utf8_lossy(&snapshot.state.bytes).contains(RECEIPT_CANARY));
+
+    let records = trace_store
+        .read(&run_id.to_string())
+        .expect("trace records");
+    let encoded_records = serde_json::to_string(&records).expect("records serialize");
+    assert!(!encoded_records.contains(ACTION_CANARY));
+    assert!(!encoded_records.contains(RECEIPT_CANARY));
+    let events = records
+        .iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload.clone()).expect("event"))
+        .collect::<Vec<_>>();
+    let candidates = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceEventKind::CandidatesProposed { actions } => Some(actions),
+            _ => None,
+        })
+        .expect("candidates");
+    assert_eq!(candidates[0], raw_credential_denied_action());
+    assert_eq!(candidates[1], raw_credential_denied_action());
+    assert_eq!(candidates[2].name, "safe-input");
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        TraceEventKind::ActionDenied { action, result }
+            if action == &raw_credential_denied_action()
+                && result == &VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    )));
+
+    // Inspect-only reconstruction reads the sanitized records and cannot call an adapter.
+    let replayed = trace_store
+        .read(&run_id.to_string())
+        .expect("inspect replay");
+    assert_eq!(replayed, records);
+    assert_eq!(safe_adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(raw_adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(raw_provider_calls.load(Ordering::SeqCst), 0);
+    assert!(!serde_json::to_string(&replayed)
+        .expect("replay serializes")
+        .contains(ACTION_CANARY));
+    assert!(!serde_json::to_string(&replayed)
+        .expect("replay serializes")
+        .contains(RECEIPT_CANARY));
 }

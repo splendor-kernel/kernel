@@ -103,8 +103,9 @@ conditions.
 
 `VerifiedActionGateway` runs identity, live authority, approval obligation,
 permission, quota, safety, and invariant checks before executing adapters and
-evaluates postconditions after execution. It
-first validates `action_id`, `tenant_id`, `agent_id`, and `run_id`; missing or nil
+evaluates postconditions after execution. Its first operation is the bounded raw
+credential ingress guard described below. It then validates `action_id`,
+`tenant_id`, `agent_id`, and `run_id`; missing or nil
 identity returns a denied `ActionOutcome` with reason `identity_invalid` and does
 not call adapters. Approval-required, denied, expired, revoked, wrong-scope,
 unsupported-schema, forged, replayed, or exact-binding-mismatched approval
@@ -112,6 +113,110 @@ decisions/receipts also stop before adapter execution. Receipt validation is not
 enough by itself: the gateway re-evaluates the current conditional authority
 decision and atomically claims a one-use receipt immediately before durable
 pre-effect evidence and adapter invocation.
+
+### Raw credential ingress guard
+
+`splendor-gateway` owns one pure, always-on denial guard for the existing
+`Action` / `ActionRequest` path. The guard runs before identity validation,
+adapter lookup, authority/broker/provider evaluation, verifier calls, pre-effect
+recording, or adapter execution. Kernel and daemon pre-persistence ingresses call
+the same Gateway-owned implementation; they do not maintain independent key or
+content rules.
+
+The guard recursively checks action fields, param keys and values, requested
+adapter, satisfied-precondition strings, and free-form strings in raw authority
+obligation receipts. Receipt screening is content denial only: it neither
+validates a receipt nor turns one into authority. Case/separator-normalized
+credential coordinates include authorization/proxy authorization, common
+`authKey`/`apiToken`/`X-API-Key`/`X-Auth-Token`/`Private-Token`/`authz` aliases,
+password/passwd, token/API key, Vault/Consul token environment coordinates,
+Kubernetes `secretKeyRef`, client secret, private key, cookie/set-cookie,
+secret/credential, connection-string/DSN, provider environment-password aliases,
+presigned signature coordinates such as `X-Amz-Signature`, URL userinfo, and
+equivalent nested map/list content. Credential material in an object key is
+screened as content as well as by normalized key name.
+
+Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
+authorization form, PEM private-key block, boundary-delimited provider token,
+embedded generic secret reference, or unambiguous credential URL/DSN/assignment
+form. Closed selector-plus-material objects such as `{ "name": "VAULT_TOKEN",
+"value": "..." }` are screened against the same Gateway-owned credential-key
+grammar, excluding the intentionally ambiguous generic `token` selector and
+non-ASCII labels. Generic schema descriptions such as `{ "name": "token",
+"type": "string" }` are not treated as credential material merely from their
+label. Lexical boundaries are complement-based and Unicode-safe: Unicode
+alphanumeric characters continue a surrounding word, while ASCII or Unicode
+punctuation/separators delimit authorization, provider-token, reference, and
+assignment syntax. Basic tokens are locally base64-decoded within the scanner
+limit and deny only when the decoded credential has the required colon structure;
+short valid Basic/Bearer credentials still deny. A valid bounded credential
+prefix ending at punctuation is denied even when that punctuation is also legal
+inside the broader Basic, Bearer, provider, or reference alphabet. Provider
+profiles use provider-specific prefixes, realistic minimum/maximum lengths, and
+alphabets—including exact legacy `sk-` and named modern variants rather than one
+broad `sk-` family. Ordinary prose such as `Basic planning`, standalone
+`hf_transformer`, and resource paths such as `models/hf_transformer` or
+`models/sk-learn-sentiment-classifier-v2` remain accepted.
+
+URL scanning extracts bounded candidates instead of treating surrounding prose as
+part of a scheme. It separates a structurally valid numeric authority port before
+screening the once-decoded host. Hosts must be nonempty bounded reg-name/IPv4-style
+names, parsed IPv6 literals with optional zone IDs, or valid IPvFuture literals;
+ports must use a raw structural colon and fit `u16`; an encoded colon is never
+promoted into a port separator. Raw and once-encoded IP-literal brackets receive
+equivalent candidate parsing, and scoped IPv6 `%25` zone delimiters accept bounded
+unreserved zone IDs. A preceding URL cannot suppress a later assignment/reference.
+The guard also screens
+decoded path/fragment components, standalone and URL form/query names and values,
+plus-as-space values, encoded non-URL spans beside even
+comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs
+with a maximum nesting depth of four. Each form/percent layer is decoded once;
+residual valid escapes or ambiguous encodings fail closed while an intentional
+literal percent encoded as `%25` remains ordinary content. Thus `see
+https://example.invalid/docs` remains accepted while encoded refs, presigned
+signatures, provider tokens in authorities or paths, and nested credential URLs
+deny. Object keys containing non-ASCII/confusable characters or residual percent
+escapes after one bounded decode also fail closed.
+
+Top-level numeric `params.bytes` content is always a strict credential-capable
+coordinate, independent of action labels, declared side-effect class, optional
+adapter routing, or later registry lookup. It requires bounded integer bytes and
+unambiguous UTF-8;
+UTF-8 BOM, UTF-16LE/BE, invalid UTF-8, NUL/control data, non-array, non-integer,
+out-of-range, or over-budget shapes fail closed. Credential-free bounded UTF-8
+bodies remain accepted. Numeric arrays under other field names retain ordinary
+non-byte semantics.
+
+All inspected raw and decoded string and object-key coordinates must also be
+unambiguous text. UTF BOM markers and non-whitespace control/NUL characters fail
+closed before a string can enter traces, persistence, safety evidence, or an
+adapter. Tabs and ordinary line endings remain valid credential-free text.
+
+The Gateway also exposes the same recursive bounded value entry point for an
+owning service to screen a complete closed JSON envelope. The daemon uses it for
+`DeviceRuntimeProfile`; Gateway owns detection vocabulary while the daemon remains
+profile schema/mutation owner.
+
+Traversal is bounded to depth 16, 2,048 inspected nodes, 16 KiB per string/key,
+and 64 KiB cumulative inspected UTF-8 bytes. A cap overflow returns the same
+fieldless, non-serializable `RawCredentialInputDenied`; its `Display` and `Debug`
+are exactly `raw_credential_input_denied` and retain no key, value, path, parser
+detail, or derived digest. The matching `ActionOutcome` is `Denied`, has no
+output/artifacts, and uses only that fixed reason/error.
+
+Persisting callers must use `raw_credential_denied_action()` for every action
+trace associated with this denial. The projection is constant: it retains action
+identity only in the enclosing trace identity/outcome and replaces all
+requester-controlled action fields with `credential_input_suppressed` plus the
+fixed suppression marker. The original denied action must never be traced.
+
+This is a bounded denial-only compatibility barrier. It does not claim exhaustive
+high-entropy, arbitrary encoded, encrypted/compressed, or split-secret detection;
+does not implement RFC 0012's operation-specific `CredentialIngressProfile` or
+the future repository scanner; and does not create a typed secret requirement,
+broker permit, provider invocation, material delivery, or exception registry.
+Generic `secret_ref_id` fields and ref-like strings are denied because the stable
+generic action schema is not a typed C03 requirement path.
 
 For physical actions, the gateway rejects forbidden low-level action names such
 as motor PWM, raw actuator writes, firmware safety bypass, flight-controller

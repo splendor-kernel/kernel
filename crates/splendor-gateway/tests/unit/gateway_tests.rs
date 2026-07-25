@@ -285,6 +285,10 @@ struct CountingAdapter {
 
 struct DenyResourceVerifier;
 
+struct CountingResourceVerifier {
+    calls: Arc<AtomicUsize>,
+}
+
 struct DefaultPostSafetyVerifier;
 
 impl SafetyVerifier for DefaultPostSafetyVerifier {
@@ -323,6 +327,17 @@ impl ResourceBoundaryVerifier for DenyResourceVerifier {
                 "adapter_execution": "not_attempted",
             }),
         }
+    }
+}
+
+impl ResourceBoundaryVerifier for CountingResourceVerifier {
+    fn verify_resource_boundary(
+        &self,
+        _action: &ActionRequest,
+        _adapter: Option<&str>,
+    ) -> VerificationResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        VerificationResult::allow()
     }
 }
 
@@ -383,6 +398,334 @@ fn resource_boundary_denial_prevents_adapter_execution() {
         .reasons
         .contains(&"resource_scope_denied".to_string()));
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 0);
+}
+
+#[test]
+fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
+    let mut request = base_request();
+    request.adapter = Some("adapter".to_string());
+    request.action.params = serde_json::json!({
+        "nested": [{"Pass-Word": "RAW_CREDENTIAL_GATEWAY_CANARY"}]
+    });
+
+    assert_raw_credential_guard_is_first(request, "baseline");
+}
+
+fn assert_raw_credential_guard_is_first(request: ActionRequest, case: &str) {
+    let action_name = request.action.name.clone();
+
+    let now = OffsetDateTime::now_utc();
+    let mut decision = authority_decision_for(&request, "adapter", PrincipalId::new(), now);
+    decision.status = AuthorityDecisionStatus::Allowed;
+    decision.reasons = vec!["capability_allowed".to_string()];
+    decision.obligations.clear();
+    bind_gateway_authority_decision_digest(&mut decision);
+
+    let authority_calls = Arc::new(AtomicUsize::new(0));
+    let resource_verifier_calls = Arc::new(AtomicUsize::new(0));
+    let recorder_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(CountingAdapter::default());
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.set_action_authority_evaluator(Arc::new(FixedLiveAuthorityEvaluator {
+        decisions: vec![decision],
+        calls: Arc::clone(&authority_calls),
+    }));
+    gateway.set_resource_boundary_verifier(Arc::new(CountingResourceVerifier {
+        calls: Arc::clone(&resource_verifier_calls),
+    }));
+    gateway.set_pre_effect_authority_recorder(Arc::new(OrderingAuthorityRecorder {
+        calls: Arc::clone(&recorder_calls),
+        adapter: Arc::clone(&adapter),
+    }));
+    gateway.register_adapter(action_name, "adapter", adapter.clone());
+
+    let outcome = gateway.submit(request).expect("fixed credential denial");
+
+    assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
+    assert_eq!(
+        outcome.verification,
+        VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
+    );
+    assert_eq!(outcome.error.as_deref(), Some(RAW_CREDENTIAL_INPUT_DENIED));
+    assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resource_verifier_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(*adapter.calls.lock().expect("adapter calls"), 0);
+}
+
+#[test]
+fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_seam() {
+    let mut vectors = Vec::new();
+    for params in [
+        serde_json::json!({"authKey": "synthetic"}),
+        serde_json::json!({"apiToken": "synthetic"}),
+        serde_json::json!({"X-API-Key": "synthetic"}),
+        serde_json::json!({"X-Auth-Token": "synthetic"}),
+        serde_json::json!({"Private-Token": "synthetic"}),
+        serde_json::json!({"VAULT_TOKEN": "synthetic"}),
+        serde_json::json!({"CONSUL_HTTP_TOKEN": "synthetic"}),
+        serde_json::json!({"secretKeyRef": {"name": "fixture"}}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Credential=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Security-Token=synthetic"}),
+        serde_json::json!({"url": "https://example.invalid/?X-Amz-Signature=synthetic"}),
+        serde_json::json!({"authz": "synthetic"}),
+        serde_json::json!({"POSTGRES_PASSWORD": "synthetic"}),
+        serde_json::json!({"Bearer synthetic-value": "ordinary"}),
+        serde_json::json!({"input": r#"export "POSTGRES_PASSWORD" = synthetic"#}),
+        serde_json::json!({"input": "read vault:team/service now"}),
+        serde_json::json!({"input": "https://example.invalid/%76ault%3Ateam%2Fservice"}),
+        serde_json::json!({"input": "vault://team/service?version=1"}),
+        serde_json::json!({"input": "https://example.invalid/redirect?target=https%3A%2F%2Fuser%3Apass%40nested.invalid"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Bearer+short"}),
+        serde_json::json!({"input": "https://example.invalid/form?value=Basic+dTpw"}),
+        serde_json::json!({"input": "Basic dTpw"}),
+        serde_json::json!({"input": "Basic YTpi"}),
+        serde_json::json!({"input": "Bearer x"}),
+        serde_json::json!({"body": "safe=1&value=Basic+dTpw"}),
+        serde_json::json!({"body": "safe=1&X-Auth-Token=synthetic"}),
+        serde_json::json!({"json": {"name": "VAULT_TOKEN", "value": "synthetic"}}),
+        serde_json::json!({"body": "\u{feff}Basic dTpw"}),
+        serde_json::json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
+        serde_json::json!({"input": "Bearer%20x see https://example.invalid/docs"}),
+        serde_json::json!({"body": "name=VAULT_TOKEN&value=synthetic"}),
+        serde_json::json!({"body": "header=X-Auth-Token&value=synthetic"}),
+        serde_json::json!({"body": "Bearer%20x,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3Ateam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
+        serde_json::json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
+        serde_json::json!({"body": "safe/Bearer x"}),
+        serde_json::json!({"body": "safe|Bearer x"}),
+        serde_json::json!({"body": "safe`Bearer x`"}),
+        serde_json::json!({"body": "safe—Bearer x—"}),
+        serde_json::json!({"body": "safe|token=synthetic"}),
+        serde_json::json!({"body": "safe`token=synthetic"}),
+        serde_json::json!({"json": {"key": "password", "value": "hunter2"}}),
+        serde_json::json!({"json": {"header": "Authorization", "value": "opaque"}}),
+        serde_json::json!({"body": "key=password&value=hunter2"}),
+        serde_json::json!({"body": "env=API_KEY&value=opaque"}),
+        serde_json::json!({"url": "https://example.invalid/Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/safe.Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?%42earer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?safe%60%42earer%20x%60"}),
+        serde_json::json!({"url": "https://example.invalid/?%76ault%3Aprod%2Fdb"}),
+        serde_json::json!({"body": "Basic dTpw/next"}),
+        serde_json::json!({"body": "Basic dTpw+next"}),
+        serde_json::json!({"body": "Basic dTpw=next"}),
+        serde_json::json!({"body": "Basic ICA+OnA=/next"}),
+        serde_json::json!({"body": "Basic ICA/OnA=+next"}),
+        serde_json::json!({"url": "https://example.invalid/Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/#Basic%20dTpw/next"}),
+        serde_json::json!({"url": "https://example.invalid/?q=Basic+dTpw%2Fnext"}),
+        serde_json::json!({"body": "https://example.invalid password:1234"}),
+        serde_json::json!({"body": "https://example.invalid vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid,token:8443"}),
+        serde_json::json!({"body": "https://example.invalid|password:1234"}),
+        serde_json::json!({"body": "https://example.invalid—auth:8443"}),
+        serde_json::json!({"url": "https://example.invalid%20password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid%2Ctoken:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid%20vault:8200/path"}),
+        serde_json::json!({"body": "https://example.invalid'token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%27token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid)token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%29token:8443/path"}),
+        serde_json::json!({"body": "https://example.invalid]token:8443"}),
+        serde_json::json!({"url": "https://example.invalid%5Dtoken:8443/path"}),
+        serde_json::json!({"url": "https://[vault]:8200/path"}),
+        serde_json::json!({"url": "https://[password]:1234/path"}),
+        serde_json::json!({"url": "https://[gggg]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.]:8443/path"}),
+        serde_json::json!({"url": "https://[é]:8443/path"}),
+        serde_json::json!({"url": "https://:8443/path"}),
+        serde_json::json!({"url": "https://2001:db8::1/path"}),
+        serde_json::json!({"url": "https://example.invalid:99999/path"}),
+        serde_json::json!({"url": "https://example.invalid$password:1234/path"}),
+        serde_json::json!({"url": "https://example.invalid&vault:8200/path"}),
+        serde_json::json!({"url": "https://password%3A1234/path"}),
+        serde_json::json!({"url": "https://vault%3A8200/path"}),
+        serde_json::json!({"url": "https://%70assword%3A1234/path"}),
+        serde_json::json!({"url": "https://[::1]%3A8443/path"}),
+        serde_json::json!({"url": "https://%5B::1%5D%3A8443/path"}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        vectors.push(request);
+    }
+
+    for input in [
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        format!("https://example.invalid/?%67hp%5F{}", "A".repeat(36)),
+        format!("https://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("https://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+        format!("github_pat_{}-tail", "A".repeat(256)),
+        format!("xoxb-{}-tail", "A".repeat(128)),
+        format!("SG.{}.tail", "A".repeat(256)),
+        format!("AIza{}-tail", "A".repeat(35)),
+        format!("vault:{}/next", "A".repeat(2_048)),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": input});
+        vectors.push(request);
+    }
+
+    let mut numeric_bytes = base_request();
+    numeric_bytes.adapter = Some("adapter".to_string());
+    numeric_bytes.action.name = "http_post".to_string();
+    numeric_bytes.action.params = serde_json::json!({"bytes": b"Bearer synthetic-value".to_vec()});
+    vectors.push(numeric_bytes);
+
+    let mut utf16_bytes = base_request();
+    utf16_bytes.adapter = Some("adapter".to_string());
+    utf16_bytes.action.name = "write_file".to_string();
+    utf16_bytes.action.params = serde_json::json!({
+        "bytes": "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(utf16_bytes);
+
+    for bytes in [
+        "Bearer short"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>(),
+        vec![0xef, 0xbb, 0xbf, b'o', b'k'],
+        vec![0xff, 0xfe, b'x'],
+        vec![b'o', b'k', 0, b'x'],
+    ] {
+        let mut ambiguous_bytes = base_request();
+        ambiguous_bytes.adapter = Some("http".to_string());
+        ambiguous_bytes.action.name = "custom_http_post".to_string();
+        ambiguous_bytes.action.params = serde_json::json!({"bytes": bytes});
+        vectors.push(ambiguous_bytes);
+    }
+
+    let mut alternate_route = base_request();
+    alternate_route.adapter = Some("filesystem".to_string());
+    alternate_route.action.name = "custom_write".to_string();
+    alternate_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    alternate_route.action.params = serde_json::json!({"bytes": b"Basic dTpw".to_vec()});
+    vectors.push(alternate_route);
+
+    let mut implicit_route = base_request();
+    implicit_route.action.name = "custom_registered_write".to_string();
+    implicit_route.action.side_effect_class = SideEffectClass::ReadOnly;
+    implicit_route.action.params = serde_json::json!({
+        "bytes": "Bearer x"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    });
+    vectors.push(implicit_route);
+
+    let mut provider_path = base_request();
+    provider_path.adapter = Some("adapter".to_string());
+    provider_path.action.params = serde_json::json!({
+        "url": format!(
+            "https://example.invalid/models/ghp_{}/metadata",
+            "A".repeat(36)
+        )
+    });
+    vectors.push(provider_path);
+
+    let mut receipt_request = base_request();
+    receipt_request.adapter = Some("adapter".to_string());
+    let decision = authority_decision_for(
+        &receipt_request,
+        "adapter",
+        PrincipalId::new(),
+        OffsetDateTime::now_utc(),
+    );
+    let mut receipt =
+        unsigned_obligation_receipt(&decision, PrincipalId::new(), OffsetDateTime::now_utc());
+    receipt.evidence_ref = Some("Bearer synthetic-value".to_string());
+    receipt_request.authority_obligation_receipts = vec![receipt];
+    vectors.push(receipt_request);
+
+    for (index, request) in vectors.into_iter().enumerate() {
+        assert_raw_credential_guard_is_first(request, &format!("credential vector {index}"));
+    }
+}
+
+#[test]
+fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
+    for value in [
+        "Basic monthly reporting",
+        "Basic planning",
+        "hf_transformer",
+        "models/hf_transformer",
+        "see https://example.invalid/docs",
+        "models/sk-learn-sentiment-classifier-v2",
+        "topic=Basic+planning&mode=monthly",
+        "safe=1&label=50%25",
+        "name=token&value=linguistic+unit",
+        "name=CPU%25&value=ordinary",
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": value});
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed, "{value}");
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1, "{value}");
+    }
+
+    for params in [
+        serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
+        serde_json::json!({"json": {"name": "token", "value": "linguistic unit"}}),
+        serde_json::json!({"json": {"name": "café", "value": "ordinary"}}),
+        serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
+        serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
+        serde_json::json!({"url": "https://auth:8443/path"}),
+        serde_json::json!({"url": "https://token:8443/path"}),
+        serde_json::json!({"url": "https://password:8443/path"}),
+        serde_json::json!({"url": "https://vault:8200/v1/sys/health"}),
+        serde_json::json!({"url": "https://[::1]:8443/path"}),
+        serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%2512]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25ab0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25%31%32]:8443/path"}),
+        serde_json::json!({"url": "https://example.invalid:65535/path"}),
+        serde_json::json!({"url": "https://example.invalid.:8443/path"}),
+        serde_json::json!({"url": "https://[v1.a!b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a'b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a)b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a,b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%21b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%27b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%29b]:443/"}),
+        serde_json::json!({"url": "https://[v1.a%2Cb]:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a!b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a'b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a)b%5D:443/"}),
+        serde_json::json!({"url": "https://%5Bv1.a,b%5D:443/"}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed);
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
+    }
 }
 
 #[test]
