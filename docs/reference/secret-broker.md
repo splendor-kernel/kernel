@@ -108,8 +108,11 @@ explicit process-local names:
 | `ProcessLocalSecretLeaseSnapshot` | `splendor.secret.lease_snapshot.local.v1` | Read-only safe lease state, counters, renewal lineage times, selected delivery method, and event/handle IDs. |
 | `ProcessLocalSecretAccessEvidence` | `splendor.secret.access_evidence.local.v1` | Ref-only issuance, internal claim, denial, renewal, and revocation evidence. |
 
-All fields are private and construction is checked. These values implement
-`Serialize`, not generic `Deserialize`, and contain no material, provider
+All fields are private and construction is checked. Access evidence admits only
+the closed lease-request, use-attempt, renewal, or revocation event family that
+matches its typed command ID; a cross-family pair fails with the fixed
+`invalid_evidence_shape` code. These values implement `Serialize`, not generic
+`Deserialize`, and contain no material, provider
 locator/request/response, delivery endpoint, bearer capability, arbitrary JSON,
 or raw error. They are non-authorizing process-local projections, not the full
 RFC 0012 durable contracts. Their crate-root schema constants likewise use the

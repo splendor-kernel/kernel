@@ -664,6 +664,27 @@ impl SecretAccessEvidence {
         {
             return Err(SecretLeaseContractError::InvalidUseCounter);
         }
+        let command_matches_kind = match &command_id {
+            ProcessLocalSecretBrokerCommandId::LeaseRequest(_) => matches!(
+                kind,
+                SecretAccessEvidenceKind::LeaseIssued | SecretAccessEvidenceKind::LeaseDenied
+            ),
+            ProcessLocalSecretBrokerCommandId::UseAttempt(_) => matches!(
+                kind,
+                SecretAccessEvidenceKind::UseClaimed | SecretAccessEvidenceKind::UseDenied
+            ),
+            ProcessLocalSecretBrokerCommandId::Renewal(_) => matches!(
+                kind,
+                SecretAccessEvidenceKind::LeaseRenewed | SecretAccessEvidenceKind::RenewalDenied
+            ),
+            ProcessLocalSecretBrokerCommandId::Revocation(_) => matches!(
+                kind,
+                SecretAccessEvidenceKind::LeaseRevoked | SecretAccessEvidenceKind::RevocationDenied
+            ),
+        };
+        if !command_matches_kind {
+            return Err(SecretLeaseContractError::InvalidEvidenceShape);
+        }
         if matches!(outcome, SecretAccessEvidenceOutcome::Denied) != denial_code.is_some() {
             return Err(SecretLeaseContractError::InvalidEvidenceShape);
         }

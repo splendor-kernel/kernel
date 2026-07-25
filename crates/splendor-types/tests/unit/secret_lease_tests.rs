@@ -1,7 +1,12 @@
 use super::*;
 use crate::{
-    DriverOperationRef, DriverTrustedSendProfileV1, SecretDeliveryControlKind,
-    SecretDeliveryMethod, SecretPurpose, SecretUseIntent, SECRET_USE_REQUIREMENT_SCHEMA_V1,
+    DriverOperationRef, DriverTrustedSendProfileV1,
+    ProcessLocalSecretAccessDenialCode as EvidenceDenialCode, ProcessLocalSecretAccessEvidence,
+    ProcessLocalSecretAccessEvidenceKind as EvidenceKind,
+    ProcessLocalSecretAccessEvidenceOutcome as EvidenceOutcome,
+    ProcessLocalSecretBrokerCommandId as BrokerCommandId, ProcessLocalSecretLeaseContractError,
+    SecretDeliveryControlKind, SecretDeliveryMethod, SecretPurpose, SecretUseIntent,
+    SECRET_USE_REQUIREMENT_SCHEMA_V1,
 };
 
 const TENANT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4001";
@@ -19,8 +24,17 @@ const EVENT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4012";
 const CLAIM_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4013";
 const ATTEMPT_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4014";
 const PROVIDER_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4015";
+const RENEWAL_COMMAND_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4016";
+const REVOCATION_COMMAND_ID: &str = "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4017";
 const DESTINATION_DIGEST: &str =
     "blake3:1111111111111111111111111111111111111111111111111111111111111111";
+
+const EVIDENCE_KINDS_BY_COMMAND_FAMILY: [[EvidenceKind; 2]; 4] = [
+    [EvidenceKind::LeaseIssued, EvidenceKind::LeaseDenied],
+    [EvidenceKind::UseClaimed, EvidenceKind::UseDenied],
+    [EvidenceKind::LeaseRenewed, EvidenceKind::RenewalDenied],
+    [EvidenceKind::LeaseRevoked, EvidenceKind::RevocationDenied],
+];
 
 fn binding() -> SecretLeaseUseBinding {
     SecretLeaseUseBinding::try_new(
@@ -79,6 +93,51 @@ fn request() -> SecretLeaseRequest {
         "2026-07-24T12:00:00.000000Z".parse().unwrap(),
     )
     .unwrap()
+}
+
+fn command_id(family: usize) -> BrokerCommandId {
+    match family {
+        0 => BrokerCommandId::LeaseRequest(REQUEST_ID.parse().unwrap()),
+        1 => BrokerCommandId::UseAttempt(ATTEMPT_ID.parse().unwrap()),
+        2 => BrokerCommandId::Renewal(RENEWAL_COMMAND_ID.parse().unwrap()),
+        3 => BrokerCommandId::Revocation(REVOCATION_COMMAND_ID.parse().unwrap()),
+        _ => unreachable!("test matrix has exactly four command families"),
+    }
+}
+
+fn public_access_evidence(
+    command_id: BrokerCommandId,
+    kind: EvidenceKind,
+) -> Result<ProcessLocalSecretAccessEvidence, ProcessLocalSecretLeaseContractError> {
+    let denied = matches!(
+        kind,
+        EvidenceKind::LeaseDenied
+            | EvidenceKind::UseDenied
+            | EvidenceKind::RenewalDenied
+            | EvidenceKind::RevocationDenied
+    );
+    let outcome = if denied {
+        EvidenceOutcome::Denied
+    } else {
+        EvidenceOutcome::Succeeded
+    };
+    let claim_id = (kind == EvidenceKind::UseClaimed).then(|| CLAIM_ID.parse().unwrap());
+
+    ProcessLocalSecretAccessEvidence::try_new(
+        EVENT_ID.parse().unwrap(),
+        command_id,
+        kind,
+        outcome,
+        binding(),
+        Some(LEASE_ID.parse().unwrap()),
+        Some(HANDLE_ID.parse().unwrap()),
+        claim_id,
+        1,
+        2,
+        1,
+        denied.then_some(EvidenceDenialCode::AuthorityDenied),
+        "2026-07-24T12:01:00.000000Z".parse().unwrap(),
+    )
 }
 
 #[test]
@@ -211,6 +270,48 @@ fn snapshot_and_access_evidence_serialize_only_safe_coordinates() {
     assert!(!encoded.contains("PRIVATE_SECRET_CANARY"));
     assert!(!encoded.contains("material"));
     assert!(!encoded.contains("locator"));
+}
+
+#[test]
+fn public_evidence_constructor_accepts_every_legal_command_event_pair() {
+    let mut accepted = 0;
+    for (command_family, kinds) in EVIDENCE_KINDS_BY_COMMAND_FAMILY.into_iter().enumerate() {
+        for kind in kinds {
+            let command_id = command_id(command_family);
+            let expected_command_id = command_id.clone();
+            let evidence = public_access_evidence(command_id, kind).unwrap();
+
+            assert_eq!(evidence.command_id(), &expected_command_id);
+            assert_eq!(evidence.kind(), kind);
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 8);
+}
+
+#[test]
+fn public_evidence_constructor_rejects_every_cross_family_pair_with_fixed_error() {
+    let mut rejected = 0;
+    for command_family in 0..EVIDENCE_KINDS_BY_COMMAND_FAMILY.len() {
+        for (event_family, kinds) in EVIDENCE_KINDS_BY_COMMAND_FAMILY.into_iter().enumerate() {
+            if command_family == event_family {
+                continue;
+            }
+
+            for kind in kinds {
+                let error = public_access_evidence(command_id(command_family), kind).unwrap_err();
+                assert_eq!(
+                    error,
+                    ProcessLocalSecretLeaseContractError::InvalidEvidenceShape
+                );
+                assert_eq!(error.code(), "invalid_evidence_shape");
+                assert_eq!(error.to_string(), "invalid_evidence_shape");
+                assert_eq!(format!("{error:?}"), "InvalidEvidenceShape");
+                rejected += 1;
+            }
+        }
+    }
+    assert_eq!(rejected, 24);
 }
 
 #[test]

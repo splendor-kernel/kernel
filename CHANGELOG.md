@@ -79,7 +79,9 @@
   and non-restart-durable; it does not invoke a provider from the broker, return
   material, add Gateway/node delivery, persistence, daemon/API/SDK/generated
   surfaces, production providers, issue closure, or gold evidence. Its reduced
-  records use explicit `*.local.v1` schemas rather than claiming RFC 0012's
+  access-evidence construction rejects every cross-family command/event pairing
+  with the existing fixed shape error. Reduced records use explicit `*.local.v1`
+  schemas rather than claiming RFC 0012's
   complete durable wire records; `G07` and `G08` remain `not_exercised`.
 - **status/incomplete:** added RFC 0018 Slice 1A's additive experimental,
   behavior-free C03 foundation lexical Rust primitives and the sole accepted
