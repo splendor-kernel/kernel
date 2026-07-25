@@ -162,8 +162,10 @@ URL scanning extracts bounded candidates instead of treating surrounding prose a
 part of a scheme. It separates a structurally valid numeric authority port before
 screening the once-decoded host. Hosts must be nonempty bounded reg-name/IPv4-style
 names, parsed IPv6 literals with optional zone IDs, or valid IPvFuture literals;
-ports must fit `u16`. Raw and once-encoded IP-literal brackets receive equivalent
-candidate parsing. A preceding URL cannot suppress a later assignment/reference.
+ports must use a raw structural colon and fit `u16`; an encoded colon is never
+promoted into a port separator. Raw and once-encoded IP-literal brackets receive
+equivalent candidate parsing, and scoped IPv6 `%25` zone delimiters accept bounded
+unreserved zone IDs. A preceding URL cannot suppress a later assignment/reference.
 The guard also screens
 decoded path/fragment components, standalone and URL form/query names and values,
 plus-as-space values, encoded non-URL spans beside even

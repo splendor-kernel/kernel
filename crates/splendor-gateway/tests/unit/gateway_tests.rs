@@ -544,6 +544,11 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"url": "https://example.invalid:99999/path"}),
         serde_json::json!({"url": "https://example.invalid$password:1234/path"}),
         serde_json::json!({"url": "https://example.invalid&vault:8200/path"}),
+        serde_json::json!({"url": "https://password%3A1234/path"}),
+        serde_json::json!({"url": "https://vault%3A8200/path"}),
+        serde_json::json!({"url": "https://%70assword%3A1234/path"}),
+        serde_json::json!({"url": "https://[::1]%3A8443/path"}),
+        serde_json::json!({"url": "https://%5B::1%5D%3A8443/path"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -690,6 +695,9 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         serde_json::json!({"url": "https://[::1]:8443/path"}),
         serde_json::json!({"url": "https://[v1.fe80]:8443/path"}),
         serde_json::json!({"url": "https://[fe80::1%25eth0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%2512]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25ab0]:8443/path"}),
+        serde_json::json!({"url": "https://[fe80::1%25%31%32]:8443/path"}),
         serde_json::json!({"url": "https://example.invalid:65535/path"}),
         serde_json::json!({"url": "https://example.invalid.:8443/path"}),
         serde_json::json!({"url": "https://[v1.a!b]:443/"}),

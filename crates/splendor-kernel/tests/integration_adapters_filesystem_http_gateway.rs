@@ -688,6 +688,11 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         "http://example.invalid:99999/path".to_string(),
         "http://example.invalid$password:1234/path".to_string(),
         "http://example.invalid&vault:8200/path".to_string(),
+        "http://password%3A1234/path".to_string(),
+        "http://vault%3A8200/path".to_string(),
+        "http://%70assword%3A1234/path".to_string(),
+        "http://[::1]%3A8443/path".to_string(),
+        "http://%5B::1%5D%3A8443/path".to_string(),
     ];
     let mut candidates = Vec::new();
     let mut serialized_bodies = Vec::new();
@@ -751,7 +756,7 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
             "http",
         ));
     }
-    for url in &encoded_authority_urls {
+    for (index, url) in encoded_authority_urls.iter().enumerate() {
         candidates.push(action_candidate(
             action(
                 "http_post",
@@ -762,6 +767,17 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
                 SideEffectClass::Network,
             ),
             "http",
+        ));
+        candidates.push(action_candidate(
+            action(
+                "write_file",
+                serde_json::json!({
+                    "path": format!("credential-url-{index}.txt"),
+                    "contents": url,
+                }),
+                SideEffectClass::Filesystem,
+            ),
+            "filesystem",
         ));
     }
     candidates.push(action_candidate(
@@ -836,6 +852,12 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
     assert_eq!(http.executions(), 0);
     for index in 0..bodies.len() {
         assert!(!temp.path().join(format!("credential-{index}.txt")).exists());
+    }
+    for index in 0..encoded_authority_urls.len() {
+        assert!(!temp
+            .path()
+            .join(format!("credential-url-{index}.txt"))
+            .exists());
     }
     assert!(!temp.path().join("credential-alias.txt").exists());
     assert!(!temp.path().join("credential-contents.txt").exists());

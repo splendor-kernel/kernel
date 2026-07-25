@@ -4135,6 +4135,22 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             "authority_subdelimiter_before_credential_assignment",
             json!({"url": "https://example.invalid$password:1234/path"}),
         ),
+        (
+            "encoded_authority_colon_before_password_assignment",
+            json!({"url": "https://password%3A1234/path"}),
+        ),
+        (
+            "encoded_authority_colon_before_secret_reference",
+            json!({"url": "https://vault%3A8200/path"}),
+        ),
+        (
+            "encoded_host_and_authority_colon_before_password_assignment",
+            json!({"url": "https://%70assword%3A1234/path"}),
+        ),
+        (
+            "encoded_ip_literal_port_separator",
+            json!({"url": "https://[::1]%3A8443/path"}),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(
