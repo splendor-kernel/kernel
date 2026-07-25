@@ -628,6 +628,15 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         vec![b'o', b'k', 0, b'x'],
         b"safe=1&value=Basic+dTpw".to_vec(),
     ];
+    let encoded_string_bodies = [
+        "name=VAULT_TOKEN&value=C03_FORM_CANARY",
+        "header=X-Auth-Token&value=C03_HEADER_CANARY",
+        "Bearer%20x,https://example.invalid/docs",
+        "vault%3Ateam%2Fservice,https://example.invalid/docs",
+        "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs",
+        "value=%EF%BB%BFBasic%20dTpw",
+        "value=B%00e%00a%00r%00e%00r%00%20x",
+    ];
     let mut candidates = Vec::new();
     let mut serialized_bodies = Vec::new();
     for (index, body) in bodies.iter().enumerate() {
@@ -677,6 +686,19 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         ),
         "http",
     ));
+    for body in encoded_string_bodies {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "body": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
     candidates.push(action_candidate(
         action(
             "write_file",
@@ -741,6 +763,9 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
     assert!(!encoded_events.contains("safe=1&value=Basic+dTpw"));
     assert!(!encoded_events.contains("VAULT_TOKEN"));
     assert!(!encoded_events.contains("C03_STRUCTURED_CANARY"));
+    for body in encoded_string_bodies {
+        assert!(!encoded_events.contains(body));
+    }
     for body in serialized_bodies {
         assert!(
             !encoded_events.contains(&body),
@@ -841,7 +866,9 @@ fn http_adapter_harness_allows_ordinary_utf8_numeric_body() {
         ..HttpAdapterConfig::default()
     });
     let counting = Arc::new(CountingAdapter::new(adapter));
-    let body = "ordinary UTF-8 café\n".as_bytes().to_vec();
+    let body = "safe=1&label=50%25&topic=Basic+planning&text=café\n"
+        .as_bytes()
+        .to_vec();
     let action = action(
         "http_post",
         serde_json::json!({"url": server.url, "bytes": body}),

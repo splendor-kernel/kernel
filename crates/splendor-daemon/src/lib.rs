@@ -9061,6 +9061,8 @@ mod tests {
             "safety_status_bom",
             "policy_id_nul",
             "trace_integrity_form",
+            "safety_status_percent_bom",
+            "trace_integrity_percent_nul",
         ] {
             let node_id = NodeId::new();
             let canary = format!("C03_DEVICE_PROFILE_{}_CANARY", field.to_ascii_uppercase());
@@ -9122,6 +9124,15 @@ mod tests {
                     profile.trace_buffer.integrity =
                         format!("safe=1&value=Basic+dTpw&label={canary}")
                 }
+                "safety_status_percent_bom" => {
+                    profile.safety_status = serde_json::json!({
+                        "current_zone": format!("value=%EF%BB%BFBasic%20dTpw&label={canary}")
+                    })
+                }
+                "trace_integrity_percent_nul" => {
+                    profile.trace_buffer.integrity =
+                        format!("value=B%00e%00a%00r%00e%00r%00%20x&label={canary}")
+                }
                 _ => unreachable!("closed device profile field matrix"),
             }
 
@@ -9157,12 +9168,17 @@ mod tests {
         }
 
         let node_id = NodeId::new();
+        let mut ordinary_profile = unit_profile(node_id.clone(), tenant_id.clone());
+        ordinary_profile.safety_status["descriptor"] = serde_json::json!({
+            "name": "token",
+            "type": "string"
+        });
         let registered = register_device_profile(
             State(state.clone()),
             Json(RegisterDeviceProfileRequest {
                 credential: Some(register_credential),
                 audit_attribution: Some(unit_audit()),
-                profile: unit_profile(node_id.clone(), tenant_id.clone()),
+                profile: ordinary_profile,
             }),
         )
         .await
@@ -9190,6 +9206,7 @@ mod tests {
         .expect("authenticated ordinary device profile read")
         .0;
         assert_eq!(read.device_kind, "drone_sim");
+        assert_eq!(read.safety_status["descriptor"]["name"], "token");
         assert!(!serde_json::to_string(&read)
             .expect("profile serializes")
             .contains("C03_DEVICE_PROFILE_"));

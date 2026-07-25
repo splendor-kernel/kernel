@@ -4057,6 +4057,22 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             "encoded_credential_before_url",
             json!({"input": "Bearer%20x see https://example.invalid/docs"}),
         ),
+        (
+            "structured_form_coordinate",
+            json!({"body": "name=VAULT_TOKEN&value=synthetic"}),
+        ),
+        (
+            "encoded_credential_adjacent_url",
+            json!({"body": "Bearer%20x,https://example.invalid/docs"}),
+        ),
+        (
+            "percent_encoded_bom_form",
+            json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
+        ),
+        (
+            "percent_encoded_nul_form",
+            json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(

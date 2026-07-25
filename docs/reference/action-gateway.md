@@ -139,11 +139,13 @@ screened as content as well as by normalized key name.
 Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
 authorization form, PEM private-key block, boundary-delimited provider token,
 embedded generic secret reference, or unambiguous credential URL/DSN/assignment
-form. Closed coordinate objects such as `{ "name": "VAULT_TOKEN", "value":
-"..." }` are screened by the same normalized Gateway vocabulary. Basic tokens
-are locally base64-decoded within the scanner limit and deny only when the
-decoded credential has the required colon structure; short valid Basic/Bearer
-credentials still deny. Provider profiles use provider-specific prefixes,
+form. Closed selector-plus-material objects such as `{ "name": "VAULT_TOKEN",
+"value": "..." }` are screened against a specific Gateway-owned provider,
+header, and environment alias set. Generic schema descriptions such as `{ "name":
+"token", "type": "string" }` are not treated as credential material merely from
+their label. Basic tokens are locally base64-decoded within the scanner limit and
+deny only when the decoded credential has the required colon structure; short
+valid Basic/Bearer credentials still deny. Provider profiles use provider-specific prefixes,
 realistic minimum/maximum lengths, and alphabets—including exact legacy `sk-`
 and named modern variants rather than one broad `sk-` family. Ordinary prose
 such as `Basic planning`, standalone `hf_transformer`, and resource paths such
@@ -152,9 +154,11 @@ accepted.
 
 URL scanning extracts bounded candidates instead of treating surrounding prose as
 part of a scheme. It screens decoded path/fragment components, standalone and URL
-form/query fields, plus-as-space values, encoded non-URL spans beside benign URLs,
-query-bearing secret refs, and nested credential URLs with a maximum nesting depth
-of four. Residual or ambiguous percent encodings fail closed. Thus `see
+form/query fields, plus-as-space values, encoded non-URL spans beside even
+comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs
+with a maximum nesting depth of four. Each form/percent layer is decoded once;
+residual valid escapes or ambiguous encodings fail closed while an intentional
+literal percent encoded as `%25` remains ordinary content. Thus `see
 https://example.invalid/docs` remains accepted while encoded refs, presigned
 signatures, provider tokens in paths, and nested credential URLs deny. Object keys
 containing non-ASCII/confusable characters or residual percent escapes after one
@@ -169,10 +173,10 @@ out-of-range, or over-budget shapes fail closed. Credential-free bounded UTF-8
 bodies remain accepted. Numeric arrays under other field names retain ordinary
 non-byte semantics.
 
-All inspected string and object-key coordinates must also be unambiguous text.
-UTF BOM markers and non-whitespace control/NUL characters fail closed before a
-string can enter traces, persistence, safety evidence, or an adapter. Tabs and
-ordinary line endings remain valid credential-free text.
+All inspected raw and decoded string and object-key coordinates must also be
+unambiguous text. UTF BOM markers and non-whitespace control/NUL characters fail
+closed before a string can enter traces, persistence, safety evidence, or an
+adapter. Tabs and ordinary line endings remain valid credential-free text.
 
 The Gateway also exposes the same recursive bounded value entry point for an
 owning service to screen a complete closed JSON envelope. The daemon uses it for

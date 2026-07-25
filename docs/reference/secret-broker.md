@@ -55,14 +55,16 @@ structured cloud/device environment coordinates in nested action data and object
 keys, URL userinfo/path/query and quoted/spaced assignment forms, plus
 structurally decoded Basic, short Bearer, PEM, provider-specific realistically
 bounded path-delimited tokens, credential URL/DSN, and embedded/encoded generic
-ref-like content under neutral keys. Closed name/key/value credential coordinate
-objects are normalized by the same owner grammar. URL/form handling covers
-standalone fields and encoded non-URL spans with explicit nested/decode bounds,
-while preserving ordinary embedded URLs and provider-like resource names. It
+ref-like content under neutral keys. Closed selector-plus-material coordinate
+objects for specific provider/header/environment aliases are normalized by the
+same owner grammar without treating generic schema labels as credentials.
+URL/form handling covers standalone fields and encoded non-URL spans adjacent to
+URLs with explicit nested/decode bounds and one decode per layer, while preserving
+literal-percent forms, ordinary embedded URLs, and provider-like resource names. It
 also screens raw receipt strings, physical/operator envelope strings, complete
 device-profile values/keys, and every top-level numeric `params.bytes` body,
-independent of action labels or adapter routing. Every inspected string rejects
-BOM and NUL/control ambiguity; numeric bytes additionally require unambiguous
+independent of action labels or adapter routing. Every inspected raw or decoded
+string rejects BOM and NUL/control ambiguity; numeric bytes additionally require unambiguous
 UTF-8, so UTF-16 and invalid encodings fail closed. This screening never
 validates receipt authority. It denies malformed parsed
 coordinates and depth/node/string/cumulative-byte overflow with the sole fixed

@@ -490,6 +490,13 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"body": "\u{feff}Basic dTpw"}),
         serde_json::json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
         serde_json::json!({"input": "Bearer%20x see https://example.invalid/docs"}),
+        serde_json::json!({"body": "name=VAULT_TOKEN&value=synthetic"}),
+        serde_json::json!({"body": "header=X-Auth-Token&value=synthetic"}),
+        serde_json::json!({"body": "Bearer%20x,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3Ateam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs"}),
+        serde_json::json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
+        serde_json::json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -587,6 +594,8 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         "see https://example.invalid/docs",
         "models/sk-learn-sentiment-classifier-v2",
         "topic=Basic+planning&mode=monthly",
+        "safe=1&label=50%25",
+        "name=token&value=linguistic+unit",
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -600,6 +609,26 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         let outcome = gateway.submit(request).expect("ordinary action outcome");
         assert_eq!(outcome.status, ActionStatus::Executed, "{value}");
         assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1, "{value}");
+    }
+
+    for params in [
+        serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
+        serde_json::json!({"json": {"name": "token", "value": "linguistic unit"}}),
+        serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
+        serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = params;
+        let now = OffsetDateTime::now_utc();
+        let (_issuer, context, evidence) = authority_evidence_for(&request, "adapter", now);
+        request.authority_obligation_evidence = Some(evidence);
+        let adapter = Arc::new(CountingAdapter::default());
+        let gateway = authority_gateway(context, adapter.clone());
+
+        let outcome = gateway.submit(request).expect("ordinary action outcome");
+        assert_eq!(outcome.status, ActionStatus::Executed);
+        assert_eq!(*adapter.calls.lock().expect("adapter calls"), 1);
     }
 }
 

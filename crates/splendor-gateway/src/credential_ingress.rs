@@ -248,9 +248,9 @@ impl CredentialIngressScanner {
                 for (key, value) in values {
                     self.scan_key(key)?;
                     self.scan_value(value, depth.saturating_add(1))?;
-                    if structured_credential_coordinate(key, value)? {
-                        return Err(RawCredentialInputDenied);
-                    }
+                }
+                if structured_credential_object(values)? {
+                    return Err(RawCredentialInputDenied);
                 }
             }
             serde_json::Value::String(value) => self.scan_string_without_node(value)?,
@@ -321,32 +321,116 @@ fn structured_credential_coordinate_key(key: &str) -> bool {
     )
 }
 
-fn structured_credential_coordinate(
-    key: &str,
-    value: &serde_json::Value,
+fn structured_credential_material_key(key: &str) -> bool {
+    matches!(
+        compact_ascii(key).as_str(),
+        "value"
+            | "values"
+            | "data"
+            | "contents"
+            | "body"
+            | "valuefrom"
+            | "secretvalue"
+            | "material"
+    )
+}
+
+fn structured_credential_object(
+    values: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<bool, RawCredentialInputDenied> {
-    if !structured_credential_coordinate_key(key) {
+    if !values
+        .keys()
+        .any(|key| structured_credential_material_key(key))
+    {
         return Ok(false);
     }
-    value
-        .as_str()
-        .map(normalized_credential_key)
-        .transpose()
-        .map(Option::unwrap_or_default)
+    for (key, value) in values {
+        if structured_credential_coordinate_key(key)
+            && value
+                .as_str()
+                .map(structured_credential_alias)
+                .transpose()?
+                .unwrap_or_default()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn structured_credential_alias(value: &str) -> Result<bool, RawCredentialInputDenied> {
+    let normalized = normalized_credential_coordinate(value)?;
+    Ok(matches!(
+        normalized.as_str(),
+        "xapikey"
+            | "xauthtoken"
+            | "privatetoken"
+            | "secretkeyref"
+            | "awsaccesskeyid"
+            | "awssecretaccesskey"
+            | "awssessiontoken"
+            | "xamzcredential"
+            | "xamzsecuritytoken"
+            | "xamzsignature"
+            | "azureclientsecret"
+            | "azureopenaiapikey"
+            | "googleapplicationcredentials"
+            | "googleapikey"
+            | "geminiapikey"
+            | "githubtoken"
+            | "gitlabtoken"
+            | "openaiapikey"
+            | "anthropicapikey"
+            | "slackbottoken"
+            | "slackapptoken"
+            | "cijobtoken"
+            | "dockerauthconfig"
+            | "pgpassword"
+            | "vaulttoken"
+            | "consulhttptoken"
+            | "postgrespassword"
+            | "postgresqlpassword"
+            | "pgpassfile"
+            | "mysqlpwd"
+            | "mysqlpassword"
+            | "mysqlrootpassword"
+            | "mariadbpassword"
+            | "mariadbrootpassword"
+            | "mongopassword"
+            | "mongoinitdbrootpassword"
+            | "redispassword"
+            | "rabbitmqdefaultpass"
+            | "mssqlsapassword"
+            | "oraclepassword"
+            | "elasticpassword"
+            | "opensearchinitialadminpassword"
+            | "hftoken"
+            | "huggingfacehubtoken"
+            | "cargoregistrytoken"
+            | "stripesecretkey"
+            | "sendgridapikey"
+            | "sshprivatekey"
+            | "npmtoken"
+            | "pypitoken"
+    ))
+}
+
+fn normalized_credential_coordinate(value: &str) -> Result<String, RawCredentialInputDenied> {
+    let decoded;
+    let value = if value.as_bytes().contains(&b'%') {
+        decoded = percent_decode(value)?;
+        decoded.as_str()
+    } else {
+        value
+    };
+    if !value.is_ascii() || value.as_bytes().contains(&b'%') {
+        return Err(RawCredentialInputDenied);
+    }
+    Ok(compact_ascii(value))
 }
 
 fn normalized_credential_key(key: &str) -> Result<bool, RawCredentialInputDenied> {
-    let decoded;
-    let key = if key.as_bytes().contains(&b'%') {
-        decoded = percent_decode(key)?;
-        decoded.as_str()
-    } else {
-        key
-    };
-    if !key.is_ascii() || key.as_bytes().contains(&b'%') {
-        return Err(RawCredentialInputDenied);
-    }
-    let normalized = compact_ascii(key);
+    let normalized = normalized_credential_coordinate(key)?;
     Ok(matches!(
         normalized.as_str(),
         "authorization"
@@ -458,16 +542,45 @@ fn credential_content_bounded(
     if credential_percent_encoded_tokens(trimmed, url_nesting)? {
         return Ok(true);
     }
-    let lowercase = trimmed.to_ascii_lowercase();
+    if credential_form(trimmed, url_nesting)? {
+        return Ok(true);
+    }
+    credential_content_plain(trimmed, url_nesting)
+}
 
-    if authorization_form(trimmed)
+fn credential_content_decoded(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    if url_nesting > CREDENTIAL_INGRESS_MAX_URL_NESTING {
+        return Err(RawCredentialInputDenied);
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    ensure_unambiguous_text(trimmed)?;
+    if contains_percent_escape(trimmed) {
+        return Err(RawCredentialInputDenied);
+    }
+    if credential_form_decoded(trimmed, url_nesting)? {
+        return Ok(true);
+    }
+    credential_content_plain(trimmed, url_nesting)
+}
+
+fn credential_content_plain(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    let lowercase = value.to_ascii_lowercase();
+    if authorization_form(value)
         || private_key_block(&lowercase)
-        || provider_key_prefix(trimmed)
+        || provider_key_prefix(value)
         || secret_reference_form(&lowercase)
-        || credential_form(trimmed, url_nesting)?
-        || credential_assignment(trimmed)?
-        || credential_url(trimmed, url_nesting)?
-        || credential_dsn_without_scheme(trimmed)
+        || credential_assignment(value)?
+        || credential_url(value, url_nesting)?
+        || credential_dsn_without_scheme(value)
     {
         return Ok(true);
     }
@@ -481,16 +594,55 @@ fn credential_percent_encoded_tokens(
     if !contains_percent_escape(value) {
         return Ok(false);
     }
-    for token in value.split_ascii_whitespace() {
-        let token = token.trim_matches(url_candidate_terminator);
-        if !contains_percent_escape(token) || url_coordinate_candidate(token) {
+    let mut cursor = 0;
+    let mut search = 0;
+    while let Some(relative_separator) = value[search..].find("://") {
+        let separator = search + relative_separator;
+        let mut start = separator;
+        while start > 0 && url_scheme_byte(value.as_bytes()[start - 1]) {
+            start -= 1;
+        }
+        if !valid_url_scheme(&value[start..separator]) {
+            return Err(RawCredentialInputDenied);
+        }
+        if start >= cursor && credential_percent_encoded_span(&value[cursor..start], url_nesting)? {
+            return Ok(true);
+        }
+        let end = value[separator + 3..]
+            .char_indices()
+            .find_map(|(index, character)| {
+                url_candidate_terminator(character).then_some(separator + 3 + index)
+            })
+            .unwrap_or(value.len());
+        cursor = end;
+        search = end.max(separator + 3);
+        if search >= value.len() {
+            break;
+        }
+    }
+    credential_percent_encoded_span(&value[cursor..], url_nesting)
+}
+
+fn credential_percent_encoded_span(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    for token in value.split(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(
+                character,
+                '&' | ';' | '=' | ',' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    }) {
+        if !contains_percent_escape(token) {
             continue;
         }
         let decoded = percent_decode(token)?;
         if contains_percent_escape(&decoded) {
             return Err(RawCredentialInputDenied);
         }
-        if credential_content_bounded(&decoded, url_nesting.saturating_add(1))? {
+        ensure_unambiguous_text(&decoded)?;
+        if credential_content_decoded(&decoded, url_nesting.saturating_add(1))? {
             return Ok(true);
         }
     }
@@ -501,6 +653,8 @@ fn credential_form(value: &str, url_nesting: usize) -> Result<bool, RawCredentia
     if !value.contains('=') {
         return Ok(false);
     }
+    let mut structured_alias = false;
+    let mut structured_material = false;
     for field in value.split(['&', ';']) {
         let Some((raw_key, raw_value)) = field.split_once('=') else {
             continue;
@@ -510,6 +664,7 @@ fn credential_form(value: &str, url_nesting: usize) -> Result<bool, RawCredentia
         }
         let url_prefixed_key = url_coordinate_candidate(raw_key.trim());
         let key = percent_decode_form(raw_key.trim())?;
+        ensure_unambiguous_text(&key)?;
         if contains_percent_escape(&key) {
             return Err(RawCredentialInputDenied);
         }
@@ -518,14 +673,70 @@ fn credential_form(value: &str, url_nesting: usize) -> Result<bool, RawCredentia
         }
 
         let decoded_value = percent_decode_form(raw_value.trim())?;
+        ensure_unambiguous_text(&decoded_value)?;
         if contains_percent_escape(&decoded_value) {
             return Err(RawCredentialInputDenied);
         }
-        if credential_content_bounded(&decoded_value, url_nesting.saturating_add(1))? {
+        update_structured_form_coordinates(
+            &key,
+            &decoded_value,
+            &mut structured_alias,
+            &mut structured_material,
+        )?;
+        if credential_content_decoded(&decoded_value, url_nesting.saturating_add(1))? {
             return Ok(true);
         }
     }
-    Ok(false)
+    Ok(structured_alias && structured_material)
+}
+
+fn credential_form_decoded(
+    value: &str,
+    url_nesting: usize,
+) -> Result<bool, RawCredentialInputDenied> {
+    if !value.contains('=') {
+        return Ok(false);
+    }
+    let mut structured_alias = false;
+    let mut structured_material = false;
+    for field in value.split(['&', ';']) {
+        let Some((key, decoded_value)) = field.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let decoded_value = decoded_value.trim();
+        ensure_unambiguous_text(key)?;
+        ensure_unambiguous_text(decoded_value)?;
+        if !url_coordinate_candidate(key) && normalized_credential_key(key)? {
+            return Ok(true);
+        }
+        update_structured_form_coordinates(
+            key,
+            decoded_value,
+            &mut structured_alias,
+            &mut structured_material,
+        )?;
+        if credential_content_decoded(decoded_value, url_nesting.saturating_add(1))? {
+            return Ok(true);
+        }
+    }
+    Ok(structured_alias && structured_material)
+}
+
+fn update_structured_form_coordinates(
+    key: &str,
+    value: &str,
+    structured_alias: &mut bool,
+    structured_material: &mut bool,
+) -> Result<(), RawCredentialInputDenied> {
+    *structured_material |= structured_credential_material_key(key);
+    if structured_credential_coordinate_key(key) && structured_credential_alias(value)? {
+        *structured_alias = true;
+    }
+    Ok(())
 }
 
 fn authorization_form(value: &str) -> bool {
@@ -1041,6 +1252,7 @@ fn credential_url_candidate(
     }
     if value.as_bytes().contains(&b'%') {
         let decoded = percent_decode(value)?;
+        ensure_unambiguous_text(&decoded)?;
         if contains_percent_escape(&decoded) {
             return Err(RawCredentialInputDenied);
         }
@@ -1056,6 +1268,7 @@ fn credential_url_candidate(
             return Err(RawCredentialInputDenied);
         }
         let decoded_authority = percent_decode(authority)?;
+        ensure_unambiguous_text(&decoded_authority)?;
         if authority.contains('@') || decoded_authority.contains('@') {
             return Ok(true);
         }
@@ -1080,12 +1293,16 @@ fn credential_url_candidate(
     if let Some(query_start) = query_start {
         let query_end = fragment_start.unwrap_or(value.len());
         let query = &value[query_start + 1..query_end];
+        if credential_form(query, url_nesting.saturating_add(1))? {
+            return Ok(true);
+        }
         for field in query.split(['&', ';']) {
             if field.is_empty() {
                 continue;
             }
             let (raw_key, raw_value) = field.split_once('=').unwrap_or((field, ""));
             let key = percent_decode_form(raw_key)?;
+            ensure_unambiguous_text(&key)?;
             if contains_percent_escape(&key) || normalized_credential_key(&key)? {
                 return if contains_percent_escape(&key) {
                     Err(RawCredentialInputDenied)
@@ -1127,7 +1344,8 @@ fn credential_url_component(
     if contains_percent_escape(&decoded) {
         return Err(RawCredentialInputDenied);
     }
-    credential_content_bounded(&decoded, url_nesting)
+    ensure_unambiguous_text(&decoded)?;
+    credential_content_decoded(&decoded, url_nesting)
 }
 
 fn unambiguous_utf8_body(bytes: &[u8]) -> Option<&str> {
@@ -1539,6 +1757,7 @@ mod tests {
             "Bearer%20x see https://example.invalid/docs",
             "vault%3A%2F%2Fteam%2Fservice see https://example.invalid/docs",
             "https://example.invalid/form?value=Bearer+short",
+            "https://example.invalid/form?name=VAULT_TOKEN&value=synthetic",
             "https://example.invalid/sign?X-Amz-Signature=synthetic",
         ] {
             assert_eq!(
@@ -1580,6 +1799,13 @@ mod tests {
             serde_json::json!({"json": {"name": "VAULT_TOKEN", "value": "synthetic"}}),
             serde_json::json!({"body": "\u{feff}Basic dTpw"}),
             serde_json::json!({"contents": "B\0e\0a\0r\0e\0r\0 \0x\0"}),
+            serde_json::json!({"body": "name=VAULT_TOKEN&value=synthetic"}),
+            serde_json::json!({"body": "header=X-Auth-Token&value=synthetic"}),
+            serde_json::json!({"body": "Bearer%20x,https://example.invalid/docs"}),
+            serde_json::json!({"body": "vault%3Ateam%2Fservice,https://example.invalid/docs"}),
+            serde_json::json!({"body": "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs"}),
+            serde_json::json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
+            serde_json::json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
         ] {
             assert_eq!(
                 guard_action(&action(params)),
@@ -1591,6 +1817,12 @@ mod tests {
         for params in [
             serde_json::json!({"body": "topic=Basic+planning&mode=monthly"}),
             serde_json::json!({"json": {"name": "model_name", "value": "hf_transformer"}}),
+            serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
+            serde_json::json!({"json": {"name": "token", "value": "linguistic unit"}}),
+            serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
+            serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
+            serde_json::json!({"body": "name=token&value=linguistic+unit"}),
+            serde_json::json!({"body": "safe=1&label=50%25"}),
             serde_json::json!({"contents": "ordinary UTF-8 café\n"}),
         ] {
             assert_eq!(
