@@ -11,13 +11,15 @@
   wrappers. Normalized credential coordinates, nested map/list content,
   URL/userinfo/path/query, quoted/spaced connection/environment assignments,
   structured cloud/device aliases, closed selector-plus-material coordinate
-  objects for specific provider/header/environment aliases,
+  objects for credential aliases (while preserving generic/non-ASCII labels),
   decoded colon-bearing Basic, short Bearer, provider-specific realistically
   bounded token forms, PEM, embedded/encoded generic secret refs,
   credential-bearing object keys, raw receipt metadata, physical/operator
   envelope strings, and complete device-profile envelopes are covered. URL/form
-  parsing handles bounded nested URLs, standalone form bodies, encoded non-URL
-  spans adjacent to URLs, and plus-as-space values with one decode per layer;
+  parsing handles once-decoded URL authorities, paths, bare query names and
+  values, bounded nested URLs, standalone form bodies, encoded non-URL spans
+  adjacent to URLs, punctuation-delimited token forms, and plus-as-space values
+  with one decode per layer;
   ordinary literal-percent forms, embedded URLs, generic schema descriptors, and
   provider-like resource names remain accepted. Every inspected raw or decoded
   string rejects BOM and ambiguous NUL/control encodings. Every top-level numeric

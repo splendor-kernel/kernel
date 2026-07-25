@@ -140,29 +140,34 @@ Neutral-key strings are denied when they contain a complete bounded Basic/Bearer
 authorization form, PEM private-key block, boundary-delimited provider token,
 embedded generic secret reference, or unambiguous credential URL/DSN/assignment
 form. Closed selector-plus-material objects such as `{ "name": "VAULT_TOKEN",
-"value": "..." }` are screened against a specific Gateway-owned provider,
-header, and environment alias set. Generic schema descriptions such as `{ "name":
-"token", "type": "string" }` are not treated as credential material merely from
-their label. Basic tokens are locally base64-decoded within the scanner limit and
-deny only when the decoded credential has the required colon structure; short
-valid Basic/Bearer credentials still deny. Provider profiles use provider-specific prefixes,
-realistic minimum/maximum lengths, and alphabets—including exact legacy `sk-`
-and named modern variants rather than one broad `sk-` family. Ordinary prose
-such as `Basic planning`, standalone `hf_transformer`, and resource paths such
-as `models/hf_transformer` or `models/sk-learn-sentiment-classifier-v2` remain
-accepted.
+"value": "..." }` are screened against the same Gateway-owned credential-key
+grammar, excluding the intentionally ambiguous generic `token` selector and
+non-ASCII labels. Generic schema descriptions such as `{ "name": "token",
+"type": "string" }` are not treated as credential material merely from their
+label. Lexical boundaries are complement-based and Unicode-safe: Unicode
+alphanumeric characters continue a surrounding word, while ASCII or Unicode
+punctuation/separators delimit authorization, provider-token, reference, and
+assignment syntax. Basic tokens are locally base64-decoded within the scanner
+limit and deny only when the decoded credential has the required colon structure;
+short valid Basic/Bearer credentials still deny. Provider profiles use
+provider-specific prefixes, realistic minimum/maximum lengths, and
+alphabets—including exact legacy `sk-` and named modern variants rather than one
+broad `sk-` family. Ordinary prose such as `Basic planning`, standalone
+`hf_transformer`, and resource paths such as `models/hf_transformer` or
+`models/sk-learn-sentiment-classifier-v2` remain accepted.
 
 URL scanning extracts bounded candidates instead of treating surrounding prose as
-part of a scheme. It screens decoded path/fragment components, standalone and URL
-form/query fields, plus-as-space values, encoded non-URL spans beside even
+part of a scheme. It screens the once-decoded authority/hostname as well as
+decoded path/fragment components, standalone and URL form/query names and values,
+plus-as-space values, encoded non-URL spans beside even
 comma-adjacent benign URLs, query-bearing secret refs, and nested credential URLs
 with a maximum nesting depth of four. Each form/percent layer is decoded once;
 residual valid escapes or ambiguous encodings fail closed while an intentional
 literal percent encoded as `%25` remains ordinary content. Thus `see
 https://example.invalid/docs` remains accepted while encoded refs, presigned
-signatures, provider tokens in paths, and nested credential URLs deny. Object keys
-containing non-ASCII/confusable characters or residual percent escapes after one
-bounded decode also fail closed.
+signatures, provider tokens in authorities or paths, and nested credential URLs
+deny. Object keys containing non-ASCII/confusable characters or residual percent
+escapes after one bounded decode also fail closed.
 
 Top-level numeric `params.bytes` content is always a strict credential-capable
 coordinate, independent of action labels, declared side-effect class, optional

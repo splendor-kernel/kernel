@@ -408,10 +408,10 @@ fn raw_credential_guard_is_first_and_bypasses_every_downstream_seam() {
         "nested": [{"Pass-Word": "RAW_CREDENTIAL_GATEWAY_CANARY"}]
     });
 
-    assert_raw_credential_guard_is_first(request);
+    assert_raw_credential_guard_is_first(request, "baseline");
 }
 
-fn assert_raw_credential_guard_is_first(request: ActionRequest) {
+fn assert_raw_credential_guard_is_first(request: ActionRequest, case: &str) {
     let action_name = request.action.name.clone();
 
     let now = OffsetDateTime::now_utc();
@@ -444,7 +444,7 @@ fn assert_raw_credential_guard_is_first(request: ActionRequest) {
 
     let outcome = gateway.submit(request).expect("fixed credential denial");
 
-    assert_eq!(outcome.status, ActionStatus::Denied);
+    assert_eq!(outcome.status, ActionStatus::Denied, "{case}");
     assert_eq!(
         outcome.verification,
         VerificationResult::deny(RAW_CREDENTIAL_INPUT_DENIED)
@@ -497,10 +497,38 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
         serde_json::json!({"body": "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs"}),
         serde_json::json!({"body": "value=%EF%BB%BFBasic%20dTpw"}),
         serde_json::json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
+        serde_json::json!({"body": "safe/Bearer x"}),
+        serde_json::json!({"body": "safe|Bearer x"}),
+        serde_json::json!({"body": "safe`Bearer x`"}),
+        serde_json::json!({"body": "safe—Bearer x—"}),
+        serde_json::json!({"body": "safe|token=synthetic"}),
+        serde_json::json!({"body": "safe`token=synthetic"}),
+        serde_json::json!({"json": {"key": "password", "value": "hunter2"}}),
+        serde_json::json!({"json": {"header": "Authorization", "value": "opaque"}}),
+        serde_json::json!({"body": "key=password&value=hunter2"}),
+        serde_json::json!({"body": "env=API_KEY&value=opaque"}),
+        serde_json::json!({"url": "https://example.invalid/Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/safe.Bearer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?%42earer%20x"}),
+        serde_json::json!({"url": "https://example.invalid/?safe%60%42earer%20x%60"}),
+        serde_json::json!({"url": "https://example.invalid/?%76ault%3Aprod%2Fdb"}),
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
         request.action.params = params;
+        vectors.push(request);
+    }
+
+    for input in [
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        format!("https://example.invalid/?%67hp%5F{}", "A".repeat(36)),
+        format!("https://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("https://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
+    ] {
+        let mut request = base_request();
+        request.adapter = Some("adapter".to_string());
+        request.action.params = serde_json::json!({"input": input});
         vectors.push(request);
     }
 
@@ -579,8 +607,8 @@ fn raw_credential_alias_byte_and_receipt_vectors_each_bypass_every_downstream_se
     receipt_request.authority_obligation_receipts = vec![receipt];
     vectors.push(receipt_request);
 
-    for request in vectors {
-        assert_raw_credential_guard_is_first(request);
+    for (index, request) in vectors.into_iter().enumerate() {
+        assert_raw_credential_guard_is_first(request, &format!("credential vector {index}"));
     }
 }
 
@@ -596,6 +624,7 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
         "topic=Basic+planning&mode=monthly",
         "safe=1&label=50%25",
         "name=token&value=linguistic+unit",
+        "name=CPU%25&value=ordinary",
     ] {
         let mut request = base_request();
         request.adapter = Some("adapter".to_string());
@@ -614,6 +643,7 @@ fn ordinary_basic_prose_and_hugging_face_resource_execute_through_gateway() {
     for params in [
         serde_json::json!({"descriptor": {"name": "token", "type": "string"}}),
         serde_json::json!({"json": {"name": "token", "value": "linguistic unit"}}),
+        serde_json::json!({"json": {"name": "café", "value": "ordinary"}}),
         serde_json::json!({"descriptor": {"key": "password", "description": "field label only"}}),
         serde_json::json!({"example": {"header": "Authorization", "description": "header name only"}}),
     ] {

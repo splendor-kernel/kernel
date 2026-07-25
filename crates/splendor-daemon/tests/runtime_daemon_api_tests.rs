@@ -4073,6 +4073,36 @@ async fn create_run_raw_credential_rejection_precedes_idempotency_run_state_and_
             "percent_encoded_nul_form",
             json!({"body": "value=B%00e%00a%00r%00e%00r%00%20x"}),
         ),
+        ("pipe_delimited_bearer", json!({"body": "safe|Bearer x"})),
+        (
+            "backtick_delimited_bearer",
+            json!({"body": "safe`Bearer x`"}),
+        ),
+        (
+            "unicode_delimited_bearer",
+            json!({"body": "safe—Bearer x—"}),
+        ),
+        (
+            "common_structured_password",
+            json!({"json": {"key": "password", "value": CANARY}}),
+        ),
+        (
+            "bare_encoded_query_content",
+            json!({"url": "https://example.invalid/?%42earer%20x"}),
+        ),
+        (
+            "punctuated_encoded_url_path",
+            json!({"url": "https://example.invalid/safe.Bearer%20x"}),
+        ),
+        (
+            "encoded_provider_in_url_authority",
+            json!({
+                "url": format!(
+                    "https://sink-%41KIA{}.attacker.invalid/",
+                    "1".repeat(16)
+                )
+            }),
+        ),
     ] {
         request.policy_actions[0].action.params = params;
         let (status, error): (StatusCode, ApiErrorBody) = call_json(

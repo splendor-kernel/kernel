@@ -52,21 +52,24 @@ before any earlier owner could persist or reflect an untrusted action.
 The bounded guard recognizes RFC 0012's normalized authorization/password/token/
 API-key/client-secret/private-key/cookie/secret/credential/connection/DSN and
 structured cloud/device environment coordinates in nested action data and object
-keys, URL userinfo/path/query and quoted/spaced assignment forms, plus
+keys, URL userinfo/authority/path/query and quoted/spaced assignment forms, plus
 structurally decoded Basic, short Bearer, PEM, provider-specific realistically
-bounded path-delimited tokens, credential URL/DSN, and embedded/encoded generic
-ref-like content under neutral keys. Closed selector-plus-material coordinate
-objects for specific provider/header/environment aliases are normalized by the
-same owner grammar without treating generic schema labels as credentials.
+bounded punctuation-delimited tokens, credential URL/DSN, and embedded/encoded
+generic ref-like content under neutral keys. Closed selector-plus-material
+coordinate objects for credential aliases are normalized by the same owner grammar
+without treating the generic `token` selector or non-ASCII schema labels as credentials.
+Unicode alphanumeric characters continue words; all punctuation/separator
+characters delimit credential syntax without a finite ASCII delimiter allowlist.
 URL/form handling covers standalone fields and encoded non-URL spans adjacent to
-URLs with explicit nested/decode bounds and one decode per layer, while preserving
-literal-percent forms, ordinary embedded URLs, and provider-like resource names. It
-also screens raw receipt strings, physical/operator envelope strings, complete
+URLs, including decoded authority and bare query-name content, with explicit
+nested/decode bounds and one decode per layer, while preserving
+literal-percent forms, ordinary embedded URLs, and provider-like resource names.
+It also screens raw receipt strings, physical/operator envelope strings, complete
 device-profile values/keys, and every top-level numeric `params.bytes` body,
 independent of action labels or adapter routing. Every inspected raw or decoded
-string rejects BOM and NUL/control ambiguity; numeric bytes additionally require unambiguous
-UTF-8, so UTF-16 and invalid encodings fail closed. This screening never
-validates receipt authority. It denies malformed parsed
+string rejects BOM and NUL/control ambiguity; numeric bytes additionally require
+unambiguous UTF-8, so UTF-16 and invalid encodings fail closed. This screening
+never validates receipt authority. It denies malformed parsed
 coordinates and depth/node/string/cumulative-byte overflow with the sole fixed
 reason `raw_credential_input_denied`. Its error type is fieldless,
 non-serializable, and non-reflecting. Denied action traces use one constant
