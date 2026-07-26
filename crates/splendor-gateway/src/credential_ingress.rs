@@ -149,10 +149,14 @@ pub fn guard_persisted_percept(percept: &Percept) -> Result<(), RawCredentialInp
 pub fn guard_persisted_state(
     bytes: &[u8],
     content_type: Option<&str>,
+    label: Option<&str>,
 ) -> Result<(), RawCredentialInputDenied> {
     let mut scanner = CredentialIngressScanner::default();
     if let Some(content_type) = content_type {
         scanner.scan_string(content_type)?;
+    }
+    if let Some(label) = label {
+        scanner.scan_string(label)?;
     }
     scanner.scan_persisted_bytes(bytes, content_type)
 }
@@ -2665,7 +2669,7 @@ mod tests {
             (b"{not-json}".as_slice(), Some("application/json")),
         ] {
             assert_eq!(
-                guard_persisted_state(bytes, content_type),
+                guard_persisted_state(bytes, content_type, None),
                 Err(RawCredentialInputDenied)
             );
         }
@@ -2675,29 +2679,40 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
         assert_eq!(
-            guard_persisted_state(&utf16, Some("application/octet-stream")),
+            guard_persisted_state(&utf16, Some("application/octet-stream"), None),
             Err(RawCredentialInputDenied)
         );
         assert_eq!(
             guard_persisted_state(
                 "x".repeat(CREDENTIAL_INGRESS_MAX_STRING_BYTES + 1)
                     .as_bytes(),
-                Some("text/plain")
+                Some("text/plain"),
+                None
             ),
             Err(RawCredentialInputDenied)
         );
 
         assert_eq!(
-            guard_persisted_state(&[0, 1, 0xff], Some("application/octet-stream")),
+            guard_persisted_state(&[0, 1, 0xff], Some("application/octet-stream"), None),
             Ok(())
         );
-        assert_eq!(guard_persisted_state(&[1], None), Ok(()));
+        assert_eq!(guard_persisted_state(&[1], None, None), Ok(()));
         assert_eq!(
             guard_persisted_state(
                 br#"{"status":"ready","values":[1,2,3]}"#,
-                Some("application/json; charset=utf-8")
+                Some("application/json; charset=utf-8"),
+                Some("ordinary snapshot")
             ),
             Ok(())
+        );
+        assert_eq!(
+            guard_persisted_state(
+                b"ordinary state",
+                Some("text/plain"),
+                Some("password=C03_STATE_LABEL_CANARY")
+            ),
+            Err(RawCredentialInputDenied),
+            "policy-selected state metadata must share the pre-persistence guard"
         );
     }
 

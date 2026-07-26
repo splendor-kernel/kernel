@@ -19,9 +19,10 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 5. `PolicyInvoked` records policy entry.
 6. The `Policy` callback receives current state and percepts and returns action
    candidates plus next state.
-7. The policy-selected next state is screened before any action, outcome, or
-   state persistence. Declared JSON/text ambiguity, a match, or scanner failure
-   fails the tick; genuinely opaque binary remains compatible without an
+7. The policy-selected next-state bytes, content type, and optional state label
+   are screened under one budget before any action, outcome, or state
+   persistence. Declared JSON/text ambiguity, a match, or scanner failure fails
+   the tick; genuinely opaque binary remains compatible without an
    encrypted/compressed absence claim.
 8. `PolicyCompleted` records successful policy return.
 9. The Gateway-owned raw credential guard screens every candidate before any

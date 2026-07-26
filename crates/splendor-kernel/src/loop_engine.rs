@@ -806,6 +806,7 @@ impl LoopEngine {
         if guard_persisted_state(
             &decision.next_state.bytes,
             decision.next_state.content_type.as_deref(),
+            decision.metadata.label.as_deref(),
         )
         .is_err()
         {

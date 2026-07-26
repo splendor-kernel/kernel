@@ -94,11 +94,12 @@ and adapter-result envelopes:
 - every collected percept shares one bounded scan across `schema`, `payload`,
   provenance source, and provenance detail before `PerceptsReceived`, policy
   invocation, or daemon queue retention;
-- policy-selected next-state bytes are screened immediately after policy return
-  and before `PolicyCompleted`, action processing, `OutcomeRecorded`, or a state
-  write. Declared JSON must parse and declared text must be unambiguous UTF-8;
-  malformed JSON, ambiguous textual encodings, detected content, and scanner
-  overflow fail the tick with only `raw_credential_input_denied`;
+- policy-selected next-state bytes, content type, and optional state label share
+  one screen immediately after policy return and before `PolicyCompleted`,
+  action processing, `OutcomeRecorded`, or a state write. Declared JSON must
+  parse and declared text must be unambiguous UTF-8; malformed JSON, ambiguous
+  textual encodings, detected content, and scanner overflow fail the tick with
+  only `raw_credential_input_denied`;
 - `AdapterResult.output` and satisfied-postcondition strings are screened
   immediately after one adapter return and before invariant/safety
   post-verifiers, `ActionOutcome`, action/outcome traces, daemon responses, or
