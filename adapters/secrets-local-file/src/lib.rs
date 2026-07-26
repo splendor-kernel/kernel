@@ -265,10 +265,12 @@ impl LocalFileSecretProvider {
         let expected_uid = effective_uid();
         let trusted_root = open_trusted_root(&trusted_root, expected_uid)?;
         let mut entries = HashMap::with_capacity(validated_entries.len());
+        let mut unique_backing_sources = HashSet::with_capacity(validated_entries.len());
         for (key, relative_path) in validated_entries {
             let (_file, fingerprint) =
                 open_relative_secret_file(&trusted_root, &relative_path, expected_uid)
                     .map_err(config_error_from_open_failure)?;
+            register_unique_backing_source(&mut unique_backing_sources, &fingerprint)?;
             entries.insert(
                 key,
                 RegisteredFile {
@@ -586,6 +588,17 @@ fn validate_coordinates(
         Err(LocalFileSecretProviderConfigError::InvalidCoordinates)
     } else {
         Ok(())
+    }
+}
+
+fn register_unique_backing_source(
+    sources: &mut HashSet<(u64, u64)>,
+    fingerprint: &FileFingerprint,
+) -> Result<(), LocalFileSecretProviderConfigError> {
+    if sources.insert((fingerprint.device, fingerprint.inode)) {
+        Ok(())
+    } else {
+        Err(LocalFileSecretProviderConfigError::AmbiguousPath)
     }
 }
 

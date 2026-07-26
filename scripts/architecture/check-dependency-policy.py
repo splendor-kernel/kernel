@@ -1016,11 +1016,41 @@ def development_secret_provider_surface_violations(
                 )
 
     for package in packages:
-        if package.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE:
-            continue
+        authority_dependency_aliases = {
+            str(dependency.get("rename") or dependency.get("name"))
+            for dependency in package.get("dependencies", [])
+            if dependency.get("name") == "splendor-authority"
+        }
+        for feature_name, activations in (package.get("features") or {}).items():
+            for alias in authority_dependency_aliases:
+                forbidden_activations = {
+                    f"{alias}/{SECRET_PROVIDER_TEST_SUPPORT_FEATURE}",
+                    f"{alias}?/{SECRET_PROVIDER_TEST_SUPPORT_FEATURE}",
+                }
+                if forbidden_activations.intersection(activations):
+                    violations.append(
+                        Violation(
+                            f"{package.get('name')} feature {feature_name!r} may not forward "
+                            "splendor-authority secret-provider-test-support; provider test support is dev-only."
+                        )
+                    )
         for dependency in package.get("dependencies", []):
             if (
-                dependency.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+                dependency.get("name") == "splendor-authority"
+                and dependency.get("kind") != "dev"
+                and SECRET_PROVIDER_TEST_SUPPORT_FEATURE
+                in (dependency.get("features") or [])
+            ):
+                violations.append(
+                    Violation(
+                        f"{package.get('name')} -> splendor-authority "
+                        f"({dependency_kind_label(dependency)} dependency) may not enable "
+                        "secret-provider-test-support; provider test support is dev-only."
+                    )
+            )
+            if (
+                package.get("name") != LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+                and dependency.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE
                 and dependency.get("kind") != "dev"
             ):
                 violations.append(
@@ -1265,7 +1295,40 @@ def run_self_test() -> int:
             get_policy_packages(local_provider_normal_test_support)
         ),
         [
-            "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only."
+            "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only.",
+            "splendor-adapter-secrets-local-file -> splendor-authority (normal dependency) may not enable secret-provider-test-support; provider test support is dev-only."
+        ],
+    )
+
+    authority_test_support_release_consumer = accepted_metadata_fixture()
+    dependency_named(
+        package_named(authority_test_support_release_consumer, "splendor-gateway"),
+        "splendor-authority",
+    )["features"] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "authority_provider_test_support_release_consumer_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_release_consumer)
+        ),
+        [
+            "splendor-gateway -> splendor-authority (normal dependency) may not enable secret-provider-test-support; provider test support is dev-only."
+        ],
+    )
+
+    authority_test_support_forwarding = accepted_metadata_fixture()
+    package_named(authority_test_support_forwarding, "splendor-gateway")["features"] = {
+        "default": [],
+        "unsafe-test-support": [
+            "splendor-authority/secret-provider-test-support"
+        ],
+    }
+    failures += report_exact_self_test(
+        "authority_provider_test_support_forwarding_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_forwarding)
+        ),
+        [
+            "splendor-gateway feature 'unsafe-test-support' may not forward splendor-authority secret-provider-test-support; provider test support is dev-only."
         ],
     )
 

@@ -602,6 +602,30 @@ fn root_intermediate_owner_and_hard_link_policies_are_enforced() {
         validate_secret_file_metadata(&metadata, effective_uid().wrapping_add(1)),
         Err(OpenFailure::PolicyDenied)
     ));
+
+    let file = File::open(root.join("alias")).unwrap();
+    assert!(matches!(
+        fingerprint_for_open_file(&file, effective_uid()),
+        Err(OpenFailure::PolicyDenied)
+    ));
+
+    let (_source_directory, source_root) = secure_root();
+    write_secure(&source_root, Path::new("source"), b"synthetic");
+    let source_file = File::open(source_root.join("source")).unwrap();
+    let source_fingerprint = match fingerprint_for_open_file(&source_file, effective_uid()) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => panic!("secure source fingerprint must be available"),
+    };
+    let mut backing_sources = HashSet::new();
+    assert_eq!(
+        register_unique_backing_source(&mut backing_sources, &source_fingerprint),
+        Ok(())
+    );
+    assert_eq!(
+        register_unique_backing_source(&mut backing_sources, &source_fingerprint),
+        Err(LocalFileSecretProviderConfigError::AmbiguousPath),
+        "distinct configured paths may not alias one device/inode backing source"
+    );
 }
 
 #[test]
