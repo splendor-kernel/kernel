@@ -17,12 +17,13 @@ crate-private. There is no callable production lease API or complete live secret
 permit in this slice.
 
 This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`, plus a
-denial-only pre-persistence slice of `SECR-004`/`SECR-006`. It does not
+denial-only pre-persistence slice of `SECR-004`/`SECR-006` and the repository
+contract/fixture scanner required by QA-089. It does not
 implement RFC 0012's complete durable lease, exposure-lineage, delivery,
 provider-control, node-control, outer-submission, or terminal publication
 records. It adds no provider invocation from the broker, material-returning
 broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
-secret surface, complete profile/repository/leak scanner, production provider,
+secret surface, complete live profile/output-leak scanner, production provider,
 issue closure, or gold pass. The reduced
 wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
 the complete RFC 0012 wire schemas. `G07` and `G08` remain `not_exercised`.
@@ -93,6 +94,31 @@ entropy/encoded/split detector, post-execution leak detector, repository CI
 scanner, quarantine/incident workflow, or live broker/provider/material path.
 Generic `SecretRef`-looking data is denied rather than upgraded into authority.
 Typed secret delivery remains unavailable.
+
+## Implemented repository contract and fixture scanner
+
+`scripts/security/check-secret-contracts.py` is a standard-library-only,
+network-independent CI guard with an internal negative self-test. Its strict
+`splendor.secret_field_scan.v1` policy binds exact governed roots, closed C03
+safe-record validators, caller-auth/bootstrap field exceptions, symbolic fixture
+validators, resource caps, and digest/count-bound content exceptions.
+
+The guard structurally parses JSON, the current closed OpenAPI/example YAML
+subset, and JSON/YAML Markdown fences. It rejects normalized secret/value field
+families, fake schema wrappers, malformed/duplicate documents, path/symlink or
+format ambiguity, stale/expired exceptions, and budget overflow. A separate
+bounded content pass checks tracked and non-ignored candidate source, fixtures,
+generated text, docs, manifests, and supported archives for known private-key,
+provider-token, authorization, credential-URL, encoded-key, and high-entropy
+forms. Diagnostics never print candidate material.
+
+The exact developer policy, rule families, allowlist process, commands, and
+nonclaims are documented in
+[`docs/development/c03-secret-contract-scanner.md`](../development/c03-secret-contract-scanner.md).
+This scanner is static QA-089/partial `SECR-006` evidence only. It is not the
+runtime pre-persistence output barrier, an encrypted/arbitrary-binary absence
+proof, external API/SDK C03 parity, QA-090 release-provider exclusion, or Gold
+execution evidence.
 
 ## Implemented process-local owner slice
 

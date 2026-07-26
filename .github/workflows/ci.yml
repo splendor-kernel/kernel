@@ -23,6 +23,10 @@ jobs:
         run: |
           python3 scripts/architecture/check-dependency-policy.py --self-test
           python3 scripts/architecture/check-dependency-policy.py
+      - name: C03 secret contract and fixture guard
+        run: |
+          python3 scripts/security/check-secret-contracts.py --self-test
+          python3 scripts/security/check-secret-contracts.py
       - name: Rust fmt
         run: cargo fmt --all -- --check
       - name: Rust clippy
