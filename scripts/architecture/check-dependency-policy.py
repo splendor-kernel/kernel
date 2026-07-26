@@ -40,6 +40,9 @@ EXPECTED_WORKSPACE_PACKAGE_MANIFESTS: dict[str, str] = {
     "splendor-adapter-filesystem": "adapters/filesystem/Cargo.toml",
     "splendor-adapter-http": "adapters/http/Cargo.toml",
     "splendor-adapter-robotics": "adapters/robotics/Cargo.toml",
+    "splendor-adapter-secrets-local-file": (
+        "adapters/secrets-local-file/Cargo.toml"
+    ),
     "splendor-adapter-secrets-memory": "adapters/secrets-memory/Cargo.toml",
     "splendor-acceptance-action-host": (
         "tests/e2e/use-cases/acceptance-host/Cargo.toml"
@@ -90,6 +93,19 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
 
 ADAPTER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-gateway"}
 SECRET_PROVIDER_ALLOWED_INTERNAL_DEPS = {"splendor-types", "splendor-authority"}
+LOCAL_FILE_SECRET_PROVIDER_PACKAGE = "splendor-adapter-secrets-local-file"
+LOCAL_FILE_SECRET_PROVIDER_FEATURE = "local-file-secret-provider"
+SECRET_PROVIDER_TEST_SUPPORT_FEATURE = "secret-provider-test-support"
+LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES = {
+    "default": [],
+    LOCAL_FILE_SECRET_PROVIDER_FEATURE: [],
+}
+LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS = {
+    "libc",
+    "splendor-authority",
+    "splendor-types",
+    "zeroize",
+}
 CHECKED_DEP_KINDS = {None, "build"}
 CARGO_METADATA_COMMAND = (
     "cargo",
@@ -330,6 +346,9 @@ def check_metadata(metadata: dict[str, Any]) -> tuple[list[Violation], dict[str,
 
     violations = workspace_identity_violations(metadata, workspace_packages)
     violations.extend(governed_package_record_violations(metadata))
+    violations.extend(
+        development_secret_provider_surface_violations(policy_packages)
+    )
     checked_edges: dict[str, list[tuple[str, str]]] = {
         name: [] for name in known_internal_names
     }
@@ -918,6 +937,102 @@ def daemon_closure_violations(
     return violations
 
 
+def development_secret_provider_surface_violations(
+    packages: list[dict[str, Any]],
+) -> list[Violation]:
+    """Keep test/dev provider capabilities out of normal release graphs."""
+
+    violations: list[Violation] = []
+    packages_by_name = {str(package.get("name")): package for package in packages}
+
+    authority = packages_by_name.get("splendor-authority")
+    if authority is not None:
+        authority_features = authority.get("features")
+        if not isinstance(authority_features, dict):
+            violations.append(
+                Violation(
+                    "splendor-authority package feature map is unavailable; the default-off secret provider test-support boundary cannot be verified."
+                )
+            )
+        else:
+            if authority_features.get("default") != []:
+                violations.append(
+                    Violation(
+                        "splendor-authority default features must remain empty; secret provider test support may never be enabled by default."
+                    )
+                )
+            if authority_features.get(SECRET_PROVIDER_TEST_SUPPORT_FEATURE) != []:
+                violations.append(
+                    Violation(
+                        "splendor-authority secret-provider-test-support must remain an empty, explicit feature with no feature forwarding."
+                    )
+                )
+
+    provider = packages_by_name.get(LOCAL_FILE_SECRET_PROVIDER_PACKAGE)
+    if provider is not None:
+        if provider.get("publish") != []:
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file must remain publish=false (Cargo metadata publish=[])."
+                )
+            )
+        actual_features = provider.get("features")
+        if actual_features != LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES:
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file feature map changed; expected only empty default and explicit local-file-secret-provider features: "
+                    f"expected={LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES!r} actual={actual_features!r}."
+                )
+            )
+
+        production_dependencies = [
+            dependency
+            for dependency in provider.get("dependencies", [])
+            if dependency.get("kind") != "dev"
+        ]
+        production_names = [
+            str(dependency.get("name")) for dependency in production_dependencies
+        ]
+        actual_name_set = set(production_names)
+        if (
+            actual_name_set != LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS
+            or len(production_names) != len(actual_name_set)
+        ):
+            violations.append(
+                Violation(
+                    "splendor-adapter-secrets-local-file production dependency closure changed; "
+                    f"expected={sorted(LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS)!r} "
+                    f"actual={sorted(production_names)!r}."
+                )
+            )
+        for dependency in production_dependencies:
+            if dependency.get("name") == "splendor-authority" and (
+                dependency.get("features") or []
+            ):
+                violations.append(
+                    Violation(
+                        "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only."
+                    )
+                )
+
+    for package in packages:
+        if package.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE:
+            continue
+        for dependency in package.get("dependencies", []):
+            if (
+                dependency.get("name") == LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+                and dependency.get("kind") != "dev"
+            ):
+                violations.append(
+                    Violation(
+                        f"{package.get('name')} -> {LOCAL_FILE_SECRET_PROVIDER_PACKAGE} "
+                        f"({dependency_kind_label(dependency)} dependency) is forbidden: the local-file Secret Provider is development-only and absent from normal release graphs."
+                    )
+                )
+
+    return violations
+
+
 def count_names(names: Iterable[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for name in names:
@@ -1091,6 +1206,100 @@ def run_self_test() -> int:
     current_violations, _stats = check_metadata(current_fixture)
     failures += report_exact_self_test(
         "governed_workspace_current_shape", current_violations, []
+    )
+
+    local_provider_default = accepted_metadata_fixture()
+    package_named(local_provider_default, LOCAL_FILE_SECRET_PROVIDER_PACKAGE)[
+        "features"
+    ]["default"] = [LOCAL_FILE_SECRET_PROVIDER_FEATURE]
+    failures += report_exact_self_test(
+        "local_file_secret_provider_default_feature_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_default)
+        ),
+        [
+            "splendor-adapter-secrets-local-file feature map changed; expected only empty default and explicit "
+            "local-file-secret-provider features: expected={'default': [], 'local-file-secret-provider': []} "
+            "actual={'default': ['local-file-secret-provider'], 'local-file-secret-provider': []}."
+        ],
+    )
+
+    local_provider_publish = accepted_metadata_fixture()
+    package_named(local_provider_publish, LOCAL_FILE_SECRET_PROVIDER_PACKAGE)[
+        "publish"
+    ] = None
+    failures += report_exact_self_test(
+        "local_file_secret_provider_publish_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_publish)
+        ),
+        [
+            "splendor-adapter-secrets-local-file must remain publish=false (Cargo metadata publish=[])."
+        ],
+    )
+
+    authority_test_support_default = accepted_metadata_fixture()
+    package_named(authority_test_support_default, "splendor-authority")["features"][
+        "default"
+    ] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "authority_provider_test_support_default_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(authority_test_support_default)
+        ),
+        [
+            "splendor-authority default features must remain empty; secret provider test support may never be enabled by default."
+        ],
+    )
+
+    local_provider_normal_test_support = accepted_metadata_fixture()
+    dependency_named(
+        package_named(
+            local_provider_normal_test_support, LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+        ),
+        "splendor-authority",
+    )["features"] = [SECRET_PROVIDER_TEST_SUPPORT_FEATURE]
+    failures += report_exact_self_test(
+        "local_file_normal_authority_test_support_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_normal_test_support)
+        ),
+        [
+            "splendor-adapter-secrets-local-file normal splendor-authority dependency must enable no features; secret provider test support is dev-only."
+        ],
+    )
+
+    local_provider_dependency_widening = accepted_metadata_fixture()
+    package_named(
+        local_provider_dependency_widening, LOCAL_FILE_SECRET_PROVIDER_PACKAGE
+    )["dependencies"].append(
+        dependency_fixture("reqwest", repository_local=False)
+    )
+    failures += report_exact_self_test(
+        "local_file_secret_provider_dependency_widening_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_dependency_widening)
+        ),
+        [
+            "splendor-adapter-secrets-local-file production dependency closure changed; expected=['libc', "
+            "'splendor-authority', 'splendor-types', 'zeroize'] actual=['libc', 'reqwest', "
+            "'splendor-authority', 'splendor-types', 'zeroize']."
+        ],
+    )
+
+    local_provider_release_consumer = accepted_metadata_fixture()
+    package_named(local_provider_release_consumer, "splendor-daemon")[
+        "dependencies"
+    ].append(dependency_fixture(LOCAL_FILE_SECRET_PROVIDER_PACKAGE))
+    failures += report_exact_self_test(
+        "local_file_secret_provider_release_consumer_rejected",
+        development_secret_provider_surface_violations(
+            get_policy_packages(local_provider_release_consumer)
+        ),
+        [
+            "splendor-daemon -> splendor-adapter-secrets-local-file (normal dependency) is forbidden: the "
+            "local-file Secret Provider is development-only and absent from normal release graphs."
+        ],
     )
 
     missing_outer_host = accepted_metadata_fixture()
@@ -2037,6 +2246,10 @@ def accepted_metadata_fixture() -> dict[str, Any]:
             ("splendor-gateway", None),
             ("splendor-types", None),
         ],
+        "splendor-adapter-secrets-local-file": [
+            ("splendor-authority", None),
+            ("splendor-types", None),
+        ],
         "splendor-adapter-secrets-memory": [
             ("splendor-authority", None),
             ("splendor-types", None),
@@ -2060,6 +2273,28 @@ def accepted_metadata_fixture() -> dict[str, Any]:
             dependency_fixture(dependency, kind)
             for dependency, kind in internal_dependencies[name]
         )
+        if name == "splendor-authority":
+            package["features"] = {
+                "default": [],
+                SECRET_PROVIDER_TEST_SUPPORT_FEATURE: [],
+            }
+        if name == LOCAL_FILE_SECRET_PROVIDER_PACKAGE:
+            package["publish"] = []
+            package["features"] = copy.deepcopy(
+                LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES
+            )
+            package["dependencies"].extend(
+                [
+                    dependency_fixture("libc", repository_local=False),
+                    dependency_fixture("zeroize", repository_local=False),
+                    {
+                        **dependency_fixture("splendor-authority", "dev"),
+                        "features": [SECRET_PROVIDER_TEST_SUPPORT_FEATURE],
+                    },
+                    dependency_fixture("tempfile", "dev", repository_local=False),
+                    dependency_fixture("uuid", "dev", repository_local=False),
+                ]
+            )
         if name in {"splendor-adapter-http", "splendor-acceptance-action-host"}:
             package["dependencies"].append(
                 dependency_fixture("ureq", repository_local=False)

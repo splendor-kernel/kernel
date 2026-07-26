@@ -4,6 +4,27 @@
 
 ### Added
 
+- **status/incomplete:** added `splendor-adapter-secrets-local-file`, an
+  unpublished, empty-default-feature Unix provider restricted by construction
+  to explicit test/local-development modes. It accepts only a canonical absolute
+  trusted root and finite exact coordinate-to-relative-file map, retains the
+  root descriptor, uses descriptor-relative no-follow/nonblocking opens, and
+  enforces effective-user ownership, owner-only root/intermediate/file access,
+  regular single-link files, a 1..65,536-byte bound, and pinned descriptor
+  identity/change metadata before and after reads. Traversal, absolute or
+  noncanonical children, path aliases, symlinks, hard links, non-regular files,
+  insecure ownership/modes, missing/replaced/empty/oversized files, outage, and
+  poisoned state fail with fixed non-reflecting errors. Fetch uses only the
+  existing private-construction Authority provider port; audit/health expose
+  safe evidence, while renew/revoke return `unsupported_operation` and never
+  delete files. A default-off Authority test-support feature enables realistic
+  provider-port tests while returning only material length and safe evidence,
+  never request objects or bytes. Dependency-policy self-tests pin the adapter's
+  `publish = false`, empty default feature, narrow dependencies, dev-only test
+  support, and absence from normal release consumers. There is no environment,
+  home/current-directory/default-chain fallback, enumeration, listener, daemon
+  or Gateway composition, production provider, routing/failover/HA, issue
+  closure, or Gold claim; `G07` and `G08` remain `not_exercised`.
 - **status/incomplete:** added a Gateway-owned, always-on, bounded
   pre-persistence raw-credential ingress denial across direct
   `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run
