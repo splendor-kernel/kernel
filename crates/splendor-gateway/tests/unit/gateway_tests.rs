@@ -3653,6 +3653,308 @@ fn verified_gateway_executes_when_checks_pass() {
 }
 
 #[test]
+fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
+    struct FixedOutputAdapter {
+        calls: Arc<AtomicUsize>,
+        output: serde_json::Value,
+        satisfied_postconditions: Vec<String>,
+    }
+
+    impl ActionAdapter for FixedOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterResult {
+                output: self.output.clone(),
+                satisfied_postconditions: self.satisfied_postconditions.clone(),
+            })
+        }
+    }
+
+    struct CountingPostInvariant {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl InvariantEvaluator for CountingPostInvariant {
+        fn verify_pre(
+            &self,
+            _action: &Action,
+            _satisfied_preconditions: &[String],
+        ) -> VerificationResult {
+            VerificationResult::allow()
+        }
+
+        fn verify_post(
+            &self,
+            _action: &Action,
+            _satisfied_postconditions: &[String],
+        ) -> VerificationResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            VerificationResult::allow()
+        }
+    }
+
+    const CANARY: &str = "C03_ADAPTER_OUTPUT_CANARY";
+    let oversized = "x".repeat(CREDENTIAL_INGRESS_MAX_STRING_BYTES + 1);
+    let vectors = [
+        (
+            "plain",
+            serde_json::json!({"message": format!("password={CANARY}")}),
+        ),
+        (
+            "structured",
+            serde_json::json!({"api_key": CANARY, "status": "complete"}),
+        ),
+        (
+            "encoded",
+            serde_json::json!({"body": "value=Basic+dTpw", "marker": CANARY}),
+        ),
+        (
+            "numeric_root",
+            serde_json::json!(format!("password={CANARY}").into_bytes()),
+        ),
+        (
+            "numeric_body",
+            serde_json::json!({
+                "body": format!("password={CANARY}").into_bytes()
+            }),
+        ),
+        (
+            "malformed_json_body",
+            serde_json::json!({
+                "content_type": "application/json",
+                "body": "{not-json}"
+            }),
+        ),
+        (
+            "malformed_content_type",
+            serde_json::json!({
+                "content_type": "application/json/extra",
+                "body": "{}"
+            }),
+        ),
+        (
+            "ambiguous_utf16_body",
+            serde_json::json!({
+                "content_type": "application/octet-stream",
+                "body": "Bearer x"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            }),
+        ),
+        ("oversized_text", serde_json::json!({"body": oversized})),
+    ];
+
+    for (case, output) in vectors {
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let post_calls = Arc::new(AtomicUsize::new(0));
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter(
+            "noop",
+            "adapter",
+            Arc::new(FixedOutputAdapter {
+                calls: Arc::clone(&adapter_calls),
+                output,
+                satisfied_postconditions: Vec::new(),
+            }),
+        );
+        gateway.set_invariant_evaluator(Arc::new(CountingPostInvariant {
+            calls: Arc::clone(&post_calls),
+        }));
+
+        let outcome = gateway.submit(base_request()).expect("suppressed outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Failed, "{case}");
+        assert!(outcome.verification.allowed, "{case}");
+        assert_eq!(
+            outcome.post_verification,
+            Some(VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)),
+            "{case}"
+        );
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED),
+            "{case}"
+        );
+        assert!(outcome.output.is_none(), "{case}");
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(post_calls.load(Ordering::SeqCst), 0, "{case}");
+        let encoded = serde_json::to_string(&outcome).expect("outcome serializes");
+        assert!(!encoded.contains(CANARY), "{case}: {encoded}");
+        assert!(!encoded.contains("not-json"), "{case}: {encoded}");
+    }
+
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter(
+        "noop",
+        "adapter",
+        Arc::new(FixedOutputAdapter {
+            calls: Arc::clone(&adapter_calls),
+            output: serde_json::json!({"status": "ready"}),
+            satisfied_postconditions: vec![format!("password={CANARY}")],
+        }),
+    );
+    gateway.set_invariant_evaluator(Arc::new(CountingPostInvariant {
+        calls: Arc::clone(&post_calls),
+    }));
+
+    let outcome = gateway
+        .submit(base_request())
+        .expect("unsafe postcondition is suppressed");
+
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert!(outcome.output.is_none());
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 0);
+    assert!(!serde_json::to_string(&outcome)
+        .expect("outcome serializes")
+        .contains(CANARY));
+}
+
+#[test]
+fn benign_json_text_and_opaque_binary_adapter_outputs_remain_compatible() {
+    struct FixedOutputAdapter(serde_json::Value);
+
+    impl ActionAdapter for FixedOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            Ok(AdapterResult {
+                output: self.0.clone(),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    for (case, output) in [
+        (
+            "ordinary_json",
+            serde_json::json!({"status": "ready", "values": [1, 2, 3]}),
+        ),
+        (
+            "json_body",
+            serde_json::json!({
+                "content_type": "application/json; charset=utf-8",
+                "body": "{\"status\":\"ready\"}"
+            }),
+        ),
+        (
+            "filesystem_binary",
+            serde_json::json!({"bytes": [0, 1, 255], "bytes_read": 3}),
+        ),
+        (
+            "http_binary",
+            serde_json::json!({"content_type": null, "body": [0, 1, 255]}),
+        ),
+        (
+            "ordinary_named_collections",
+            serde_json::json!({
+                "body": [1, 2, 300],
+                "contents": ["section one", "section two"]
+            }),
+        ),
+    ] {
+        let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+            policy: VerificationResult::allow(),
+            quota: VerificationResult::allow(),
+        }));
+        gateway.register_adapter(
+            "noop",
+            "adapter",
+            Arc::new(FixedOutputAdapter(output.clone())),
+        );
+
+        let outcome = gateway.submit(base_request()).expect("benign outcome");
+
+        assert_eq!(outcome.status, ActionStatus::Executed, "{case}");
+        assert_eq!(outcome.output, Some(output), "{case}");
+    }
+}
+
+#[test]
+fn unsafe_physical_output_never_reaches_the_post_safety_verifier() {
+    struct UnsafeOutputAdapter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionAdapter for UnsafeOutputAdapter {
+        fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterResult {
+                output: serde_json::json!({
+                    "body": "password=C03_PHYSICAL_OUTPUT_CANARY"
+                }),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    struct CountingPostSafetyVerifier {
+        post_calls: Arc<AtomicUsize>,
+    }
+
+    impl SafetyVerifier for CountingPostSafetyVerifier {
+        fn verify_pre(
+            &self,
+            _action: &ActionRequest,
+            _adapter: Option<&str>,
+        ) -> SafetyVerification {
+            SafetyVerification::Allowed(VerificationResult::allow())
+        }
+
+        fn verify_post(
+            &self,
+            _action: &ActionRequest,
+            _adapter: Option<&str>,
+            _result: &AdapterResult,
+        ) -> SafetyVerification {
+            self.post_calls.fetch_add(1, Ordering::SeqCst);
+            SafetyVerification::Allowed(VerificationResult::allow())
+        }
+    }
+
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(TestTenantAccess {
+        policy: VerificationResult::allow(),
+        quota: VerificationResult::allow(),
+    }));
+    gateway.register_adapter(
+        "move_to_waypoint",
+        "robotics",
+        Arc::new(UnsafeOutputAdapter {
+            calls: Arc::clone(&adapter_calls),
+        }),
+    );
+    gateway.set_safety_verifier(Arc::new(CountingPostSafetyVerifier {
+        post_calls: Arc::clone(&post_calls),
+    }));
+
+    let outcome = gateway
+        .submit(physical_request())
+        .expect("suppressed outcome");
+
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(post_calls.load(Ordering::SeqCst), 0);
+    assert!(outcome.output.is_none());
+}
+
+#[test]
 fn approval_required_action_pauses_without_adapter_execution() {
     let request = base_request();
     let adapter = Arc::new(CountingAdapter::default());

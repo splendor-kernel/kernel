@@ -12,8 +12,9 @@ use crate::{
 };
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_routing_and_receipts,
-    raw_credential_denied_action, raw_credential_denied_outcome, ActionGateway, ActionId,
-    ActionOutcome, ActionRequest, ActionStatus, GatewayError,
+    guard_persisted_percept, guard_persisted_state, raw_credential_denied_action,
+    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
+    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
@@ -802,6 +803,15 @@ impl LoopEngine {
             },
         )?;
         let decision = self.policy.decide(&self.state, &percepts)?;
+        if guard_persisted_state(
+            &decision.next_state.bytes,
+            decision.next_state.content_type.as_deref(),
+            decision.metadata.label.as_deref(),
+        )
+        .is_err()
+        {
+            return Err(LoopError::Policy(RAW_CREDENTIAL_INPUT_DENIED.to_string()));
+        }
         self.record_tick_event(
             tick_id,
             TraceEventKind::PolicyCompleted {
@@ -1174,6 +1184,14 @@ impl LoopEngine {
         let mut percepts = Vec::new();
         for perceptor in &self.perceptors {
             let mut batch = perceptor.collect(&self.agent)?;
+            if batch
+                .iter()
+                .any(|percept| guard_persisted_percept(percept).is_err())
+            {
+                return Err(LoopError::Perceptor(
+                    RAW_CREDENTIAL_INPUT_DENIED.to_string(),
+                ));
+            }
             percepts.append(&mut batch);
         }
         Ok(percepts)

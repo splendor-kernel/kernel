@@ -414,6 +414,18 @@ approval authority. Caller authentication credentials are validated by the
 daemon security boundary and are not treated as workload action data by this
 guard.
 
+Configured adapter results are screened inside `VerifiedActionGateway`
+immediately after adapter return, before daemon reacquisition of the run slot or
+any action/outcome trace. A detected, malformed, ambiguous, or over-budget
+output returns HTTP `200` with `ActionOutcome.status = Failed`, absent `output`,
+`post_verification` denied only for `raw_credential_output_suppressed`, and
+`error` set to that same fixed code.
+Direct-action traces, raw backing trace records, read/export/replay views, and
+the response contain only that fixed projection. Because the adapter was entered,
+this outcome does not claim no effect, rollback, or safe retry. This is a bounded
+generic compatibility barrier, not a live per-lease detector or incident/
+quarantine workflow.
+
 Authenticated `POST /devices/profiles` applies tenant/node scope validation first,
 then serializes and recursively screens the complete caller-supplied
 `DeviceRuntimeProfile` through the Gateway-owned bounded value guard before device
@@ -475,6 +487,15 @@ This endpoint does not claim restart-durable revocation storage.
 provenance source match the run's allowlist. Accepted percepts are consumed by
 the run's queued perceptor on the next tick and appear in the normal
 `PerceptsReceived` trace event, matching SDK/CLI perceptor ingestion semantics.
+
+After authenticated allowlist validation and before queue insertion or percept
+trace data, the daemon applies the Gateway-owned persisted-percept guard to the
+schema, payload, provenance source, and provenance detail under one bounded
+scan. A match, text/JSON ambiguity, or scanner overflow returns HTTP `400` with
+only `raw_credential_input_denied` and null details. A safe caller-attribution
+audit may be recorded, but the percept is not retained and no candidate bytes or
+paths are reflected. The loop applies the same guard to non-daemon perceptors
+before `PerceptsReceived` and policy invocation.
 
 The daemon also records a `PerceptsAppended` trace event through the run's trace
 runtime, preserving trace sequence continuity before the next tick.
@@ -697,6 +718,7 @@ Required 0.02-S5 failures include:
 | Verified bearer has wrong endpoint scope/tenant or mismatched metadata mirror | `403` | daemon security or mirror mismatch code |
 | Invalid run | `404` | `invalid_run` |
 | Malformed percept body | `400` | `malformed_percept` |
+| Credential-bearing/ambiguous/over-budget percept envelope | `400` | `raw_credential_input_denied`; no queue retention or percept trace |
 | Invalid policy bundle | `400` or `403` | policy validation reason code |
 | Unauthorized or missing scope/action trace link | `403` | daemon security error code |
 | Runtime unavailable | `503` | `runtime_unavailable` |
@@ -708,6 +730,7 @@ Required 0.02-S5 failures include:
 | Direct/physical effect from another non-capable lifecycle state | `409` | `run_not_effect_capable` |
 | Configured create-run action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `400` | `raw_credential_input_denied`; no run/idempotency/state/trace mutation |
 | Authenticated direct/physical action contains/ambiguously resembles raw credentials or exceeds scanner bounds | `200` | fixed `ActionOutcome.status = Denied`, reason `raw_credential_input_denied`, safe traces only |
+| Entered adapter returns credential-bearing, malformed textual/JSON, or over-budget output | `200` | fixed `ActionOutcome.status = Failed`, absent output, `raw_credential_output_suppressed`; effect not claimed absent |
 | Start/resume from an incompatible lifecycle state | `409` | `invalid_run_state` |
 | Resume with a different original work-order ID | `403` | `resume_work_order_identity_mismatch` |
 | Resume with changed canonical work-order payload | `403` | `resume_work_order_payload_mismatch` |

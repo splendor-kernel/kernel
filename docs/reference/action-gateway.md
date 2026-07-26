@@ -219,6 +219,35 @@ broker permit, provider invocation, material delivery, or exception registry.
 Generic `secret_ref_id` fields and ref-like strings are denied because the stable
 generic action schema is not a typed C03 requirement path.
 
+### Adapter-result persistence barrier
+
+Immediately after `ActionAdapter::execute` returns successfully,
+`VerifiedActionGateway` submits the complete `AdapterResult.output` plus its
+satisfied-postcondition strings to the same Gateway-owned bounded scanner. The
+scan occurs before invariant or safety post-verification and before any output
+can enter `ActionOutcome`, traces, daemon responses, state, export, or replay.
+Persisted JSON screening includes strings and keys, root numeric byte arrays, and
+selected `bytes`, `body`, and `contents` numeric-byte envelopes, including the
+current filesystem and HTTP result shapes. Declared JSON bodies must parse,
+textual bodies must be unambiguous UTF-8, and scanner/parser/resource uncertainty
+fails closed.
+
+A match or uncertainty after adapter entry is not a pre-effect denial. The
+Gateway returns `ActionStatus::Failed`, keeps the already-safe pre-verification
+result, sets `post_verification` to a denial whose only reason is
+`raw_credential_output_suppressed`, sets `error` to that same code, and omits
+output. This does not claim that the adapter effect was rolled back or never
+happened and does not authorize blind retry. Adapter errors continue to use
+their existing fixed `adapter failed` projection and never expose
+provider-controlled text.
+
+The companion pure percept/state guards share this scanner owner. Percepts are
+screened before trace/policy/queue retention. Policy-selected state declared as
+JSON or text is strictly parsed/decoded before commit; genuinely opaque binary
+state remains compatible and carries no encrypted/compressed absence claim.
+This bounded compatibility barrier is not RFC 0012's per-lease streaming leak
+detector, output-drain, incident, or quarantine owner.
+
 For physical actions, the gateway rejects forbidden low-level action names such
 as motor PWM, raw actuator writes, firmware safety bypass, flight-controller
 internals, collision-avoidance bypass, or emergency-stop bypass before adapter
