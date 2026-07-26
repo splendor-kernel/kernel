@@ -3,6 +3,10 @@ name = "splendor-authority"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+secret-provider-test-support = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

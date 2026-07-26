@@ -13,6 +13,11 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "secret-provider-test-support")]
+#[doc(hidden)]
+#[path = "provider/test_support.rs"]
+pub mod test_support;
+
 const MAX_SECRET_MATERIAL_BYTES: usize = 65_536;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 

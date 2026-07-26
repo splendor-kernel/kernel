@@ -10,7 +10,9 @@ pre-placement grammar, revision-bound `SecretRefV2`, and historical-v1 read/deny
 views described below. It also provides additive `ProcessLocal*` lease, binding,
 and access-evidence exports, an internal Authority-owned broker prototype, an
 outbound Rust `ProcessLocalSecretProvider` port with request-bound session-local
-results, and an explicitly feature-gated test/local-development memory provider.
+results, an explicitly feature-gated test/local-development memory provider, and
+an explicitly feature-gated Unix local-file provider for tests and local
+development.
 The broker lifecycle, constructors, authority context, handles, grants, claims,
 clocks/ID sources, limits, mutation errors, inspection, and replay are all
 crate-private. There is no callable production lease API or complete live secret
@@ -224,9 +226,56 @@ fixed redacted errors. Rotation and provider-port revocation remove the old
 entry so its zeroizing storage is dropped. The adapter opens no listener, reads
 no environment fallback, and exposes no public independent resolve method.
 
+`splendor-adapter-secrets-local-file` is also `publish = false`, has empty
+default features, and compiles for consumers only with the explicit
+`local-file-secret-provider` feature (its own unit tests use `cfg(test)`). Its
+constructor accepts only explicit `Test` or `LocalDevelopment`, one canonical
+absolute trusted root, and one finite exact provider/tenant/ref/revision/version
+to relative-file map. Resident, remote, fleet, production, and unknown modes;
+empty or over-capacity maps; duplicate coordinates; path aliases; absolute,
+noncanonical, or traversing children; and implicit current/home/environment
+configuration all fail closed. Root and relative paths are capped at 4,096 Unix
+bytes, components at 255 bytes, root depth at 128 components, and relative depth
+at 64 components.
+
+The Unix implementation opens the trusted root one component at a time and
+retains its descriptor. Every configured fetch is descriptor-relative with
+`O_NOFOLLOW`, `O_CLOEXEC`, and nonblocking final-file open. The root and mapped
+intermediate directories must belong to the effective user and expose no
+group/other access. Final descriptors must be effective-user-owned regular
+single-link files with no group/other access and a size from 1 through 65,536
+bytes. Device, inode, size, mode, owner, link count, modification time, and
+change time are pinned at construction and rechecked before and after a bounded
+read. Missing, replaced, relinked, permission-changed, empty, oversized,
+non-regular, symlinked, or poisoned state returns only fixed provider/config
+codes. OS diagnostics, roots, relative paths, coordinates, and material are not
+rendered by adapter `Debug` or errors. Transient failed-read buffers are
+zeroized; this reduces exposure and is not a perfect-erasure claim.
+
+Fetch is available only through the existing private-construction Authority
+provider port and returns the existing request-borrowed result with only length
+and audit access. Sanitized `audit` validates the exact registered descriptor
+identity without reading bytes. `active_probe` reports a passive boolean for the
+exact mapping; provider-side `renew` and `revoke` return
+`unsupported_operation` and never modify or delete the file. A separate
+default-off Authority test-support feature constructs legitimate requests only
+inside Authority and returns safe length/audit/health observations, never a
+request object or material bytes. The dependency guard pins that feature to
+dev-only use, pins the adapter's empty default feature and narrow dependency
+closure, and rejects every normal release-graph consumer. The normal daemon
+dependency graph contains no development secret provider.
+
+This development adapter is not daemon- or Gateway-composed and does not claim
+the durable bootstrap-backing-source registry, route enrollment, provider
+control ledger, production keychain/network provider, timeout, circuit breaker,
+routing, failover, HA, issue completion, or Gold behavior required by full
+`SECR-005`. `G07` and `G08` remain `not_exercised`.
+
 The dependency guard recognizes `adapters/secrets-*` before the ordinary adapter
-rule and permits exactly `splendor-authority` plus `splendor-types`. It rejects
-direct dependencies on Gateway, kernel, store, daemon, node, or another adapter.
+rule and permits only `splendor-authority` plus `splendor-types` as direct
+internal dependencies. It rejects direct dependencies on Gateway, kernel, store,
+daemon, node, or another adapter; the local-file provider additionally has a
+closed `libc`/`zeroize` external production dependency set.
 
 ## Canonical identity contract
 

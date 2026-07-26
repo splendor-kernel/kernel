@@ -8,6 +8,9 @@
 
 mod provider;
 
+#[cfg(feature = "secret-provider-test-support")]
+#[doc(hidden)]
+pub use provider::test_support as secret_provider_test_support;
 pub use provider::{
     SecretProvider, SecretProviderAuditEvidence, SecretProviderControlRequest, SecretProviderError,
     SecretProviderErrorCode, SecretProviderFetchRequest, SecretProviderFetchResult,
