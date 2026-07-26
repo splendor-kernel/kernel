@@ -1417,6 +1417,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "splendor-adapter-secrets-local-file"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "splendor-authority",
+ "splendor-types",
+ "tempfile",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "splendor-adapter-secrets-memory"
 version = "0.1.0"
 dependencies = [

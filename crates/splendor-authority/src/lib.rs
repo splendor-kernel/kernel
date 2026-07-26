@@ -120,6 +120,9 @@ pub use run_authority::{
     LocalRunAuthorityAdmissionError, LocalRunAuthorityEffectPermit,
     LocalRunAuthorityPermitEvaluation, LocalSignedWorkOrderRunAuthority,
 };
+#[cfg(feature = "secret-provider-test-support")]
+#[doc(hidden)]
+pub use secrets::secret_provider_test_support;
 pub use secrets::{
     SecretProvider as ProcessLocalSecretProvider,
     SecretProviderAuditEvidence as ProcessLocalSecretProviderAuditEvidence,

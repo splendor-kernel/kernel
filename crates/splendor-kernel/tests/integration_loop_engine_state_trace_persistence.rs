@@ -1,6 +1,7 @@
 use splendor_gateway::{
     raw_credential_denied_action, ActionAdapter, ActionOutcome, ActionStatus, AdapterError,
     AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
+    RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentRuntimeConfig, ConstraintEngine, ConstraintEvaluation,
@@ -8,12 +9,15 @@ use splendor_kernel::{
     RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
     TenantRegistry, TraceEvent, TraceEventKind,
 };
-use splendor_store::{InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceStore};
+use splendor_store::{
+    InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
+    StateSnapshot, StateStore, StateStoreError, TraceStore,
+};
 use splendor_types::{
     Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
     AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
     AuthorityObligationReceiptValidationKind, Feedback, Percept, PerceptProvenance, PrincipalId,
-    RevocationStatus, VerificationResult,
+    RevocationStatus, SnapshotId, StateNodeId, VerificationResult,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,8 @@ use time::OffsetDateTime;
 
 const ACTION_CANARY: &str = "C03_RAW_CREDENTIAL_KERNEL_CANARY";
 const RECEIPT_CANARY: &str = "Bearer C03_RAW_RECEIPT_KERNEL_CANARY";
+const PERCEPT_CANARY: &str = "C03_RAW_PERCEPT_KERNEL_CANARY";
+const STATE_CANARY: &str = "C03_RAW_STATE_KERNEL_CANARY";
 
 struct StaticPerceptor;
 
@@ -68,6 +74,89 @@ impl Policy for StaticPolicy {
             vec![candidate],
             next_state,
             Some("snapshot".to_string()),
+        ))
+    }
+}
+
+struct CredentialPerceptor;
+
+impl Perceptor for CredentialPerceptor {
+    fn collect(&self, _agent: &AgentContext) -> Result<Vec<Percept>, splendor_kernel::LoopError> {
+        Ok(vec![Percept {
+            schema: "splendor.percept.fixture.v1".to_string(),
+            payload: serde_json::json!({
+                "body": format!("password={PERCEPT_CANARY}")
+            }),
+            provenance: PerceptProvenance {
+                source: "integration".to_string(),
+                detail: None,
+            },
+            timestamp: OffsetDateTime::now_utc(),
+        }])
+    }
+}
+
+struct CountingNoopPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for CountingNoopPolicy {
+    fn name(&self) -> &str {
+        "counting-noop-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, splendor_kernel::LoopError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::new(
+            Vec::new(),
+            StateData {
+                bytes: vec![1],
+                content_type: None,
+            },
+            None,
+        ))
+    }
+}
+
+struct CredentialStatePolicy {
+    observed_states: Arc<Mutex<Vec<StateData>>>,
+}
+
+impl Policy for CredentialStatePolicy {
+    fn name(&self) -> &str {
+        "credential-state-policy"
+    }
+
+    fn decide(
+        &self,
+        state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, splendor_kernel::LoopError> {
+        self.observed_states
+            .lock()
+            .expect("observed state lock")
+            .push(state.clone());
+        let candidate = ActionCandidate::new(Action {
+            name: "noop".to_string(),
+            params: serde_json::json!({"ok": true}),
+            side_effect_class: SideEffectClass::ReadOnly,
+            cost_estimate: None,
+            required_permissions: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        })
+        .with_adapter("stub");
+        Ok(PolicyDecision::new(
+            vec![candidate],
+            StateData {
+                bytes: format!("password={STATE_CANARY}").into_bytes(),
+                content_type: Some("text/plain".to_string()),
+            },
+            Some("unsafe-state".to_string()),
         ))
     }
 }
@@ -237,6 +326,42 @@ struct ForbiddenRawEffectAdapter {
     filesystem_calls: Arc<AtomicUsize>,
 }
 
+struct FailIfWrittenStateStore {
+    writes: Arc<AtomicUsize>,
+}
+
+impl StateStore for FailIfWrittenStateStore {
+    fn put_state(&self, _state: StateData) -> Result<StateDataRef, StateStoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Err(StateStoreError::Poisoned)
+    }
+
+    fn get_state(&self, _data_ref: &StateDataRef) -> Result<StateData, StateStoreError> {
+        Err(StateStoreError::MissingState)
+    }
+
+    fn commit_node(
+        &self,
+        _parent_ids: Vec<StateNodeId>,
+        _data_ref: StateDataRef,
+        _metadata: StateMetadata,
+    ) -> Result<StateNodeId, StateStoreError> {
+        Err(StateStoreError::Poisoned)
+    }
+
+    fn get_node(&self, _node_id: &StateNodeId) -> Result<StateNode, StateStoreError> {
+        Err(StateStoreError::MissingNode)
+    }
+
+    fn snapshot(&self, _node_id: &StateNodeId) -> Result<SnapshotId, StateStoreError> {
+        Err(StateStoreError::MissingSnapshot)
+    }
+
+    fn load_snapshot(&self, _snapshot_id: &SnapshotId) -> Result<StateSnapshot, StateStoreError> {
+        Err(StateStoreError::MissingSnapshot)
+    }
+}
+
 impl ActionAdapter for ForbiddenRawEffectAdapter {
     fn execute(
         &self,
@@ -356,6 +481,354 @@ fn loop_engine_persists_state_and_trace_records() {
             snapshot_id.as_ref(),
             outcome.state_commit.snapshot_id.as_ref()
         );
+    }
+}
+
+#[test]
+fn credential_percept_never_reaches_trace_policy_or_state_store() {
+    let state_writes = Arc::new(AtomicUsize::new(0));
+    let state_store = Arc::new(FailIfWrittenStateStore {
+        writes: Arc::clone(&state_writes),
+    });
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let graph = StateGraph::new(state_store, SnapshotPolicy::default());
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            splendor_kernel::TenantId::new(),
+            AgentRuntimeConfig::default(),
+        ),
+        graph,
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CountingNoopPolicy {
+            calls: Arc::clone(&policy_calls),
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.add_perceptor(CredentialPerceptor);
+
+    let error = engine.tick(1).expect_err("credential percept must deny");
+
+    assert!(matches!(
+        error,
+        splendor_kernel::LoopError::Perceptor(ref reason)
+            if reason == RAW_CREDENTIAL_INPUT_DENIED
+    ));
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state_writes.load(Ordering::SeqCst), 0);
+    let records = trace_store.read(&run_id.to_string()).expect("safe traces");
+    let encoded = serde_json::to_string(&records).expect("traces serialize");
+    assert!(!encoded.contains(PERCEPT_CANARY));
+    let events = records
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+        .collect::<Vec<_>>();
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::PerceptsReceived { .. }
+            | TraceEventKind::PolicyInvoked { .. }
+            | TraceEventKind::StateCommitted { .. }
+            | TraceEventKind::LoopTickCompleted { .. }
+    )));
+}
+
+#[test]
+fn credential_policy_state_stops_before_actions_outcome_and_state_commit() {
+    let state_writes = Arc::new(AtomicUsize::new(0));
+    let state_store = Arc::new(FailIfWrittenStateStore {
+        writes: Arc::clone(&state_writes),
+    });
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let graph = StateGraph::new(state_store, SnapshotPolicy::default());
+    let tenant_id = splendor_kernel::TenantId::new();
+    let registry = TenantRegistry::new();
+    registry.insert(TenantContext::new(
+        tenant_id.clone(),
+        TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["stub".to_string()],
+            allowed_permissions: Vec::new(),
+        },
+        QuotaPolicy::default(),
+    ));
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let observed_states = Arc::new(Mutex::new(Vec::new()));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry));
+    gateway.register_adapter(
+        "noop",
+        "stub",
+        Arc::new(CountingAdapter {
+            calls: Arc::clone(&adapter_calls),
+        }),
+    );
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        graph,
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CredentialStatePolicy {
+            observed_states: Arc::clone(&observed_states),
+        }),
+        Arc::new(gateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.add_perceptor(StaticPerceptor);
+
+    let error = engine.tick(1).expect_err("credential state must deny");
+
+    assert!(matches!(
+        error,
+        splendor_kernel::LoopError::Policy(ref reason)
+            if reason == RAW_CREDENTIAL_INPUT_DENIED
+    ));
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state_writes.load(Ordering::SeqCst), 0);
+    let retry_error = engine
+        .tick(2)
+        .expect_err("a later tick cannot advance the rejected state");
+    assert!(matches!(
+        retry_error,
+        splendor_kernel::LoopError::Policy(ref reason)
+            if reason == RAW_CREDENTIAL_INPUT_DENIED
+    ));
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *observed_states.lock().expect("observed states"),
+        vec![
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+        ]
+    );
+    let records = trace_store.read(&run_id.to_string()).expect("safe traces");
+    let encoded = serde_json::to_string(&records).expect("traces serialize");
+    assert!(!encoded.contains(STATE_CANARY));
+    let events = records
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::PolicyInvoked { .. })));
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::PolicyCompleted { .. }
+            | TraceEventKind::CandidatesProposed { .. }
+            | TraceEventKind::OutcomeRecorded { .. }
+            | TraceEventKind::StateCommitted { .. }
+            | TraceEventKind::LoopTickCompleted { .. }
+    )));
+}
+
+#[test]
+fn credential_adapter_output_is_absent_from_outcome_trace_and_committed_state() {
+    const OUTPUT_CANARY: &str = "C03_RAW_OUTPUT_KERNEL_CANARY";
+
+    struct CredentialOutputAdapter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionAdapter for CredentialOutputAdapter {
+        fn execute(
+            &self,
+            _action: &splendor_gateway::ActionRequest,
+        ) -> Result<AdapterResult, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AdapterResult {
+                output: serde_json::json!({
+                    "body": format!("password={OUTPUT_CANARY}")
+                }),
+                satisfied_postconditions: Vec::new(),
+            })
+        }
+    }
+
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let graph = StateGraph::new(
+        state_store.clone(),
+        SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        },
+    );
+    let tenant_id = splendor_kernel::TenantId::new();
+    let registry = TenantRegistry::new();
+    registry.insert(TenantContext::new(
+        tenant_id.clone(),
+        TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["stub".to_string()],
+            allowed_permissions: Vec::new(),
+        },
+        QuotaPolicy::default(),
+    ));
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry));
+    gateway.register_adapter(
+        "noop",
+        "stub",
+        Arc::new(CredentialOutputAdapter {
+            calls: Arc::clone(&adapter_calls),
+        }),
+    );
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        graph,
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(gateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.add_perceptor(StaticPerceptor);
+
+    let tick = engine
+        .tick(1)
+        .expect("output suppression is a recorded failure");
+
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tick.action_outcomes.len(), 1);
+    let outcome = &tick.action_outcomes[0];
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert_eq!(
+        outcome.post_verification,
+        Some(VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED))
+    );
+    assert!(outcome.output.is_none());
+
+    let records = trace_store.read(&run_id.to_string()).expect("raw traces");
+    let encoded = serde_json::to_string(&records).expect("traces serialize");
+    assert!(!encoded.contains(OUTPUT_CANARY));
+    let events = records
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::ActionExecuted { .. })));
+
+    let snapshot = state_store
+        .load_snapshot(tick.state_commit.snapshot_id.as_ref().expect("snapshot id"))
+        .expect("safe state snapshot");
+    let encoded_state = serde_json::to_string(&snapshot).expect("state serializes");
+    assert!(!encoded_state.contains(OUTPUT_CANARY));
+    assert_eq!(snapshot.state.bytes, vec![9]);
+}
+
+#[test]
+fn benign_json_and_opaque_binary_policy_state_remain_compatible() {
+    struct FixedStatePolicy(StateData);
+
+    impl Policy for FixedStatePolicy {
+        fn name(&self) -> &str {
+            "fixed-state-policy"
+        }
+
+        fn decide(
+            &self,
+            _state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, splendor_kernel::LoopError> {
+            Ok(PolicyDecision::new(Vec::new(), self.0.clone(), None))
+        }
+    }
+
+    let cases = [
+        (
+            "benign-json",
+            StateData {
+                bytes: br#"{"status":"ready","values":[1,2,3]}"#.to_vec(),
+                content_type: Some("application/json; charset=utf-8".to_string()),
+            },
+        ),
+        (
+            "opaque-binary",
+            StateData {
+                bytes: vec![0, 1, 255],
+                content_type: Some("application/octet-stream".to_string()),
+            },
+        ),
+    ];
+
+    for (case, next_state) in cases {
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let graph = StateGraph::new(
+            state_store.clone(),
+            SnapshotPolicy {
+                interval: Some(1),
+                important_labels: Vec::new(),
+            },
+        );
+        let mut engine = LoopEngine::with_trace_store(
+            AgentContext::new(
+                splendor_kernel::AgentId::new(),
+                splendor_kernel::TenantId::new(),
+                AgentRuntimeConfig::default(),
+            ),
+            graph,
+            StateData {
+                bytes: b"initial".to_vec(),
+                content_type: Some("text/plain".to_string()),
+            },
+            Box::new(FixedStatePolicy(next_state.clone())),
+            Arc::new(splendor_gateway::UnimplementedGateway),
+            Arc::new(InMemoryTraceStore::default()),
+            Some(RunId::new()),
+        )
+        .expect("engine");
+        engine.add_perceptor(StaticPerceptor);
+
+        let tick = engine
+            .tick(1)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert!(tick.action_outcomes.is_empty(), "{case}");
+        let snapshot = state_store
+            .load_snapshot(tick.state_commit.snapshot_id.as_ref().expect("snapshot id"))
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(snapshot.state, next_state, "{case}");
     }
 }
 

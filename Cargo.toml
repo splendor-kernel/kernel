@@ -10,6 +10,7 @@ members = [
     "adapters/filesystem",
     "adapters/http",
     "adapters/robotics",
+    "adapters/secrets-local-file",
     "adapters/secrets-memory",
     "tests/e2e/use-cases/acceptance-host",
     "python/bindings",

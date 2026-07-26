@@ -11,35 +11,48 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 
 0. `RunStarted` starts a new persisted run trace stream.
 1. `LoopTickStarted` starts the tick.
-2. Registered `Perceptor` implementations collect `Percept` values.
-3. `StateLoaded` records the state hash available to policy.
-4. `PolicyInvoked` records policy entry.
-5. The `Policy` callback receives current state and percepts and returns action
+2. Registered `Perceptor` implementations collect `Percept` values. The
+   Gateway-owned persisted-percept guard screens schema, payload, and provenance
+   under one budget before any percept trace or policy invocation.
+3. `PerceptsReceived` records only the screened percept batch.
+4. `StateLoaded` records the state hash available to policy.
+5. `PolicyInvoked` records policy entry.
+6. The `Policy` callback receives current state and percepts and returns action
    candidates plus next state.
-6. `PolicyCompleted` records successful policy return.
-7. The Gateway-owned raw credential guard screens every candidate before any
+7. The policy-selected next-state bytes, content type, and optional state label
+   are screened under one budget before any action, outcome, or state
+   persistence. Declared JSON/text ambiguity, a match, or scanner failure fails
+   the tick; genuinely opaque binary remains compatible without an
+   encrypted/compressed absence claim.
+8. `PolicyCompleted` records successful policy return.
+9. The Gateway-owned raw credential guard screens every candidate before any
    candidate/action payload trace, constraint callback, delegated-authority
    evaluation, or gateway submission. Screening includes raw obligation-receipt
    strings without interpreting those receipts as authority. Each candidate
    receives its `ActionId` at this boundary.
-8. `CandidatesProposed` records safe actions unchanged and raw-credential
+10. `CandidatesProposed` records safe actions unchanged and raw-credential
    denials only as the constant suppression projection.
-9. The `ConstraintEngine` returns an aggregate `VerificationResult` over only
+11. The `ConstraintEngine` returns an aggregate `VerificationResult` over only
    credential-free candidates.
-10. Each projected/safe action records verification start in original policy
+12. Each projected/safe action records verification start in original policy
     order.
-11. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
-   adapter allowlists, permissions, quotas, invariants, and action preconditions.
-12. Only verified credential-free actions reach registered adapters.
-13. If an optional 0.04-S3 escalation policy is configured, explicit
+13. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
+    adapter allowlists, permissions, quotas, invariants, and action preconditions.
+14. Only verified credential-free actions reach registered adapters.
+15. Immediately after adapter return, output and satisfied-postcondition strings
+    pass the Gateway-owned persistence barrier before post-verifiers. Unsafe or
+    ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
+    with no output; adapter entry means no rollback or no-effect claim is made.
+16. If an optional 0.04-S3 escalation policy is configured, explicit
     verifier/runtime facts can produce `EscalationTriggered` and
     `ActionNeedsIntervention` trace events before final outcome recording.
-14. Adapter output, denial, failure, or intervention need is recorded as an
+17. Safe adapter output, denial, failure, or intervention need is recorded as an
     action outcome.
-15. The outcome evaluator can attach feedback/reward for credential-free
+18. The outcome evaluator can attach feedback/reward for credential-free
     candidates; it is not invoked with a denied raw action.
-16. The state graph commits the next state node and optional snapshot.
-17. Trace records are appended in order.
+19. The state graph commits the already-screened next state node and optional
+    snapshot.
+20. Trace records are appended in order.
 
 ## Identity scope
 
@@ -58,6 +71,10 @@ documented in [`identity.md`](identity.md).
 ## Failure behavior
 
 - Perceptor/policy errors return a loop error and do not execute actions.
+- Credential-bearing percepts return fixed `raw_credential_input_denied` before
+  `PerceptsReceived`; credential-bearing/ambiguous policy state returns the same
+  fixed error before `PolicyCompleted`, action execution, outcome recording, or
+  state commit.
 - Raw credential-bearing candidates return the fixed
   `raw_credential_input_denied` outcome. They skip constraints, delegated
   authority, gateway/adapters, escalation, and outcome evaluation. Their
@@ -73,6 +90,9 @@ documented in [`identity.md`](identity.md).
   escalation does not execute adapters, contact ticket systems, or install
   circuit breakers.
 - Adapter failure records a failed/denied outcome.
+- Credential-bearing or ambiguous adapter output records a fixed failed outcome
+  with no output. It does not imply that the already-entered adapter had no
+  effect and must not be blindly retried.
 - State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
   being emitted for that tick.
 - Trace store failure fails the tick before side-effectful work can proceed when

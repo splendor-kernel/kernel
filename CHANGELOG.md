@@ -18,6 +18,45 @@
   the current-tree scan before Rust build/test. This is not runtime output-leak
   scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
   parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
+- **status/incomplete:** extended the single Gateway-owned bounded credential
+  scanner with a generic pre-persistence barrier for adapter results, percepts,
+  and policy-selected state. Adapter output and satisfied-postcondition strings
+  are screened immediately after one adapter return and before post-verifiers,
+  outcomes, traces, daemon responses, state, export, or replay; unsafe or
+  ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
+  with no output and no rollback/no-effect claim. Daemon and kernel percepts are
+  screened before queue retention, `PerceptsReceived`, or policy invocation, and
+  next-state bytes, content type, and optional label are screened before
+  `PolicyCompleted`, actions, outcomes, or state writes. Persisted JSON
+  screening covers strings/keys, root numeric byte arrays, and selected
+  `bytes`, `body`, and `contents` byte envelopes, including existing
+  filesystem/HTTP result shapes. Ordinary bounded JSON/text and genuinely
+  opaque binary remain compatible; encrypted/compressed/custom opaque content
+  is not claimed inspected. This bounded `SECR-004`/`SECR-006` slice adds no
+  live per-lease detector, positive secret delivery, incident/quarantine owner,
+  provider path, repository scanner, issue closure, or Gold evidence; `G07`,
+  `G08`, and `G82` remain `not_exercised`.
+- **status/incomplete:** added `splendor-adapter-secrets-local-file`, an
+  unpublished, empty-default-feature Unix provider restricted by construction
+  to explicit test/local-development modes. It accepts only a canonical absolute
+  trusted root and finite exact coordinate-to-relative-file map, retains the
+  root descriptor, uses descriptor-relative no-follow/nonblocking opens, and
+  enforces effective-user ownership, owner-only root/intermediate/file access,
+  regular single-link files, a 1..65,536-byte bound, and pinned descriptor
+  identity/change metadata before and after reads. Traversal, absolute or
+  noncanonical children, path aliases, symlinks, hard links, non-regular files,
+  insecure ownership/modes, missing/replaced/empty/oversized files, outage, and
+  poisoned state fail with fixed non-reflecting errors. Fetch uses only the
+  existing private-construction Authority provider port; audit/health expose
+  safe evidence, while renew/revoke return `unsupported_operation` and never
+  delete files. A default-off Authority test-support feature enables realistic
+  provider-port tests while returning only material length and safe evidence,
+  never request objects or bytes. Dependency-policy self-tests pin the adapter's
+  `publish = false`, empty default feature, narrow dependencies, dev-only test
+  support, and absence from normal release consumers. There is no environment,
+  home/current-directory/default-chain fallback, enumeration, listener, daemon
+  or Gateway composition, production provider, routing/failover/HA, issue
+  closure, or Gold claim; `G07` and `G08` remain `not_exercised`.
 - **status/incomplete:** added a Gateway-owned, always-on, bounded
   pre-persistence raw-credential ingress denial across direct
   `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run

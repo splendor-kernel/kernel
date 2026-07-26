@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_request,
     guard_action_routing_and_receipts, guard_credential_capable_strings,
-    guard_credential_capable_value, raw_credential_denied_action, raw_credential_denied_outcome,
-    ActionGateway, ActionId, ActionOutcome, ActionRequest, ActionStatus,
-    AuthorityObligationVerifier, CircuitBreakerEvaluator, GatewayAuthorityDecisionSummary,
-    PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder, ResourceBoundaryVerifier,
-    SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
+    guard_credential_capable_value, guard_persisted_percept, raw_credential_denied_action,
+    raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
+    ActionStatus, AuthorityObligationVerifier, CircuitBreakerEvaluator,
+    GatewayAuthorityDecisionSummary, PolicyApprovalVerifier, PreEffectAuthorityDecisionRecorder,
+    ResourceBoundaryVerifier, SimulatedRiskLevel, SimulatedSafetySnapshot, SimulatedSafetyVerifier,
     StaticCircuitBreakerEvaluator, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_kernel::{
@@ -2749,6 +2749,14 @@ async fn append_percept(
         None,
         request.audit_attribution,
     )?;
+    if guard_persisted_percept(&percept).is_err() {
+        record_daemon_audit(
+            &slot,
+            "splendor.percepts.append",
+            security.audit_attribution,
+        )?;
+        return Err(raw_credential_input_api_error());
+    }
     record_daemon_audit(
         &slot,
         "splendor.percepts.append",

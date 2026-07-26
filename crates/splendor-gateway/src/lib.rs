@@ -42,11 +42,13 @@ mod credential_ingress;
 
 pub use credential_ingress::{
     guard_action, guard_action_request, guard_action_routing, guard_action_routing_and_receipts,
-    guard_credential_capable_strings, guard_credential_capable_value, raw_credential_denied_action,
-    raw_credential_denied_outcome, RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH,
-    CREDENTIAL_INGRESS_MAX_NODES, CREDENTIAL_INGRESS_MAX_STRING_BYTES,
-    CREDENTIAL_INGRESS_MAX_TOTAL_BYTES, RAW_CREDENTIAL_INPUT_DENIED,
+    guard_credential_capable_strings, guard_credential_capable_value, guard_persisted_percept,
+    guard_persisted_state, raw_credential_denied_action, raw_credential_denied_outcome,
+    RawCredentialInputDenied, CREDENTIAL_INGRESS_MAX_DEPTH, CREDENTIAL_INGRESS_MAX_NODES,
+    CREDENTIAL_INGRESS_MAX_STRING_BYTES, CREDENTIAL_INGRESS_MAX_TOTAL_BYTES,
+    RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
+use credential_ingress::{guard_adapter_result, raw_credential_output_suppressed_outcome};
 
 use serde::{Deserialize, Serialize};
 use splendor_authority::{
@@ -2218,6 +2220,12 @@ impl ActionGateway for VerifiedActionGateway {
                 });
             }
         };
+        if guard_adapter_result(&adapter_result).is_err() {
+            return Ok(raw_credential_output_suppressed_outcome(
+                action.action_id,
+                verification,
+            ));
+        }
         drop((effect_permit, obligation_effect_permit));
 
         let post_verification = self
