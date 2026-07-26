@@ -66,7 +66,10 @@ Repository content scanning covers bounded UTF-8 source, fixtures, generated
 text, docs, manifests, and supported ZIP/TAR/TAR.GZ archives. Archive traversal,
 links, encryption, malformed members, excessive expansion, or resource overflow
 fails closed. Nested archives are rejected instead of being silently skipped.
-Structured JSON/YAML/Markdown members are also structurally checked.
+Every archive member that decodes as unambiguous UTF-8 is content-scanned
+regardless of filename suffix. UTF-8 BOM/NUL ambiguity fails closed; opaque
+non-UTF-8 members remain outside the absence claim. Structured JSON/YAML/Markdown
+members are also structurally checked.
 
 ## Safe records and exceptions
 

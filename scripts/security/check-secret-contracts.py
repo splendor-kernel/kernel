@@ -2304,12 +2304,20 @@ def apply_content_allowlist(
 
 
 def scan_one_content_blob(
-    path: str, data: bytes, maximum: int
+    path: str,
+    data: bytes,
+    maximum: int,
+    *,
+    allow_opaque_non_text: bool = False,
 ) -> tuple[list[ContentHit], list[Finding]]:
     try:
-        text = decode_text(data)
-    except ScanDataError as exc:
-        return [], [Finding(path, exc.line, exc.code)]
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        if allow_opaque_non_text:
+            return [], []
+        return [], [Finding(path, 0, "SCN003_PATH_AMBIGUOUS")]
+    if text.startswith("\ufeff") or "\x00" in text:
+        return [], [Finding(path, 0, "SCN003_PATH_AMBIGUOUS")]
     return scan_content(text, maximum + 1), []
 
 
@@ -2393,10 +2401,11 @@ def scan_repository(
                         member_suffix = suffix_for(member_name)
                         if member_suffix in ARCHIVE_SUFFIXES:
                             raise ScanDataError("SCA001_ARCHIVE_INVALID")
-                        if member_suffix not in TEXT_EXTENSIONS:
-                            continue
                         hits, blob_findings = scan_one_content_blob(
-                            display, member_data, limits["max_findings"]
+                            display,
+                            member_data,
+                            limits["max_findings"],
+                            allow_opaque_non_text=member_suffix not in TEXT_EXTENSIONS,
                         )
                         findings.extend(blob_findings)
                         hits, allowed, allow_findings = apply_content_allowlist(
@@ -3125,6 +3134,50 @@ def run_self_test() -> int:
             archive_stats.archive_members == 1
             and any(item.code == "SCC003_AUTH_VALUE" for item in archived)
             and not any(item.code == "SCN004_UNSUPPORTED_FORMAT" for item in archived),
+        )
+
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("neutral-name.bin", auth_fixture.encode("utf-8"))
+        neutral_archive, _ = scan_repository(
+            root,
+            minimal_test_policy("fixture.zip"),
+            explicit_paths=["fixture.zip"],
+        )
+        check(
+            "archive utf8 content cannot hide behind a binary suffix",
+            any(item.code == "SCC003_AUTH_VALUE" for item in neutral_archive),
+        )
+
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("ordinary.bin", b"bounded fixture metadata")
+        ordinary_archive, _ = scan_repository(
+            root,
+            minimal_test_policy("fixture.zip"),
+            explicit_paths=["fixture.zip"],
+        )
+        check("benign utf8 binary suffix remains accepted", not ordinary_archive)
+
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("opaque.bin", b"\xff\x00\xfe")
+        opaque_archive, _ = scan_repository(
+            root,
+            minimal_test_policy("fixture.zip"),
+            explicit_paths=["fixture.zip"],
+        )
+        check("opaque archive content remains a nonclaim", not opaque_archive)
+
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr(
+                "ambiguous.bin", b"\xef\xbb\xbf" + auth_fixture.encode("utf-8")
+            )
+        ambiguous_archive, _ = scan_repository(
+            root,
+            minimal_test_policy("fixture.zip"),
+            explicit_paths=["fixture.zip"],
+        )
+        check(
+            "ambiguous utf8 archive content fails closed",
+            any(item.code == "SCN003_PATH_AMBIGUOUS" for item in ambiguous_archive),
         )
 
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
