@@ -2625,6 +2625,7 @@ def run_self_test() -> int:
     limits = minimal_test_policy()["limits"]
     slot_id_fixture = "018f0a1b-2c3d-4e5f-" + "8a9b-0c1d2e3f4101"
     ref_id_fixture = "018f0a1b-2c3d-4e5f-" + "8a9b-0c1d2e3f4001"
+    provider_id_fixture = "018f0a1b-2c3d-4e5f-" + "8a9b-0c1d2e3f4201"
     safe_requirement = {
         "credential_slot_id": slot_id_fixture,
         "delivery_methods": ["inherited_fd"],
@@ -2674,7 +2675,7 @@ def run_self_test() -> int:
         "provider_namespace": "synthetic",
         "provider_version_ref": "version-1",
         "schema_version": "splendor.secret.ref.v2",
-        "secret_provider_id": "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4201",
+        "secret_provider_id": provider_id_fixture,
         "secret_ref_id": ref_id_fixture,
         "secret_ref_revision": 1,
         "tenant_id": "018f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4301",
