@@ -4,6 +4,24 @@
 
 ### Added
 
+- **status/incomplete:** extended the single Gateway-owned bounded credential
+  scanner with a generic pre-persistence barrier for adapter results, percepts,
+  and policy-selected state. Adapter output and satisfied-postcondition strings
+  are screened immediately after one adapter return and before post-verifiers,
+  outcomes, traces, daemon responses, state, export, or replay; unsafe or
+  ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
+  with no output and no rollback/no-effect claim. Daemon and kernel percepts are
+  screened before queue retention, `PerceptsReceived`, or policy invocation, and
+  declared text/JSON next-state is screened before `PolicyCompleted`, actions,
+  outcomes, or state writes. Persisted JSON screening covers strings/keys, root
+  numeric byte arrays, and selected `bytes`, `body`, and `contents` byte
+  envelopes, including existing filesystem/HTTP result shapes. Ordinary bounded
+  JSON/text and genuinely opaque binary
+  remain compatible; encrypted/compressed/custom opaque content is not claimed
+  inspected. This bounded `SECR-004`/`SECR-006` slice adds no live per-lease
+  detector, positive secret delivery, incident/quarantine owner, provider path,
+  repository scanner, issue closure, or Gold evidence; `G07`, `G08`, and `G82`
+  remain `not_exercised`.
 - **status/incomplete:** added a Gateway-owned, always-on, bounded
   pre-persistence raw-credential ingress denial across direct
   `VerifiedActionGateway` calls, kernel policy candidates, daemon configured-run

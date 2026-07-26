@@ -5,12 +5,17 @@ use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use splendor_daemon::{
-    router, ApiErrorBody, AppendPerceptRequest, CircuitBreakerSyncResponse, CreateRunRequest,
-    CreateRunResponse, DaemonActionCandidate, DaemonConfig, DaemonState, LifecycleRequest,
-    PolicySyncRequest, PolicySyncResponse, RegisteredAction, ReplayResponse, RunInspectResponse,
-    RunStatus, StateHeadResponse, StateSnapshotExportRequest, StateSnapshotExportResponse,
-    StateSnapshotImportRequest, StateSnapshotImportResponse, SubmitActionRequest, TickResponse,
-    TraceExportResponse, TracePageResponse,
+    router, ApiErrorBody, AppendPerceptRequest, CircuitBreakerSyncResponse,
+    ConfiguredActionAdapters, CreateRunRequest, CreateRunResponse, DaemonActionCandidate,
+    DaemonConfig, DaemonState, LifecycleRequest, PolicySyncRequest, PolicySyncResponse,
+    RegisteredAction, ReplayResponse, RunInspectResponse, RunStatus, StateHeadResponse,
+    StateSnapshotExportRequest, StateSnapshotExportResponse, StateSnapshotImportRequest,
+    StateSnapshotImportResponse, SubmitActionRequest, TickResponse, TraceExportResponse,
+    TracePageResponse,
+};
+use splendor_gateway::{
+    ActionAdapter, ActionRequest, AdapterError, AdapterResult, RAW_CREDENTIAL_INPUT_DENIED,
+    RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
 use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
@@ -26,12 +31,32 @@ use splendor_types::{
     WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION,
     POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use tower::ServiceExt;
 
 fn action_test_state() -> DaemonState {
     support::local_state(&["daemon.local"])
+}
+
+struct CredentialOutputAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for CredentialOutputAdapter {
+    fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let output = if action.action.name == "allowed_action" {
+            json!({"body": "password=C03_DAEMON_OUTPUT_CANARY"})
+        } else {
+            json!({"status": "ready"})
+        };
+        Ok(AdapterResult {
+            output,
+            satisfied_postconditions: Vec::new(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1331,6 +1356,265 @@ async fn daemon_run_lifecycle_state_trace_and_replay_are_local_and_ordered() {
         inspected_after_replay.adapter_executions, before_replay_executions,
         "replay must not call adapters again"
     );
+}
+
+#[tokio::test]
+async fn daemon_direct_adapter_output_is_suppressed_before_raw_store_api_export_and_replay() {
+    const CANARY: &str = "C03_DAEMON_OUTPUT_CANARY";
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let mut adapters = ConfiguredActionAdapters::new();
+    adapters
+        .insert(
+            "daemon.local",
+            Arc::new(CredentialOutputAdapter {
+                calls: Arc::clone(&adapter_calls),
+            }),
+        )
+        .expect("configured adapter");
+    let state = DaemonState::with_trace_store_and_action_adapters(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+        adapters,
+    );
+    let app = router(state);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let mut create = create_request(
+        tenant_id.clone(),
+        agent_id.clone(),
+        vec![DaemonActionCandidate {
+            action_id: None,
+            action: action("safe_action"),
+            adapter: Some("daemon.local".to_string()),
+            quota_usage: None,
+            satisfied_preconditions: Vec::new(),
+            requested_at: None,
+            authority_obligation_receipts: Vec::new(),
+        }],
+        vec![
+            RegisteredAction {
+                name: "allowed_action".to_string(),
+                adapter: "daemon.local".to_string(),
+                required_permissions: None,
+            },
+            RegisteredAction {
+                name: "safe_action".to_string(),
+                adapter: "daemon.local".to_string(),
+                required_permissions: None,
+            },
+        ],
+    );
+    create.allowed_actions = vec!["allowed_action".to_string(), "safe_action".to_string()];
+    create
+        .work_order
+        .work_order
+        .allowed_actions
+        .push("safe_action".to_string());
+    resign_work_order(&mut create.work_order);
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("start-safe-state".to_string()),
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("lifecycle request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tick.status, RunStatus::Running);
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    let state_node_before = tick.state_node_id;
+
+    let outcome = submit_allowed_action(
+        app.clone(),
+        created.run_id.clone(),
+        tenant_id.clone(),
+        agent_id,
+    )
+    .await;
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.status, splendor_gateway::ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert!(outcome.output.is_none());
+    let encoded_outcome = serde_json::to_string(&outcome).expect("outcome serializes");
+    assert!(!encoded_outcome.contains(CANARY));
+
+    let raw_records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw trace records");
+    let encoded_raw = serde_json::to_string(&raw_records).expect("raw traces serialize");
+    assert!(!encoded_raw.contains(CANARY));
+
+    let (status, head): (StatusCode, StateHeadResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/state-head", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(head.state_node_id, state_node_before);
+
+    let (status, traces): (StatusCode, TracePageResponse) = call_empty(
+        app.clone(),
+        Method::GET,
+        &format!("/runs/{}/traces?redaction_policy=none", created.run_id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!serde_json::to_string(&traces)
+        .expect("trace response serializes")
+        .contains(CANARY));
+
+    let trace_credential =
+        caller_credential_for_tenant(tenant_id.clone(), vec![EndpointScope::TracesRead]);
+    let trace_audit = matching_attribution(&trace_credential);
+    let (status, exported): (StatusCode, TraceExportResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/traces/export", created.run_id),
+        json!({
+            "credential": trace_credential,
+            "audit_attribution": trace_audit,
+            "redaction_policy": "none",
+            "start": null,
+            "end": null
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!serde_json::to_string(&exported)
+        .expect("trace export serializes")
+        .contains(CANARY));
+
+    let replay_credential =
+        caller_credential_for_tenant(tenant_id, vec![EndpointScope::ReplayCreate]);
+    let replay_audit = matching_attribution(&replay_credential);
+    let (status, replay): (StatusCode, ReplayResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/replay", created.run_id),
+        json!({"credential": replay_credential, "audit_attribution": replay_audit}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay.mode, "inspect_only");
+    assert!(!serde_json::to_string(&replay)
+        .expect("replay serializes")
+        .contains(CANARY));
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 2);
+
+    let (status, inspected): (StatusCode, RunInspectResponse) =
+        call_empty(app, Method::GET, &format!("/runs/{}", created.run_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected.status, RunStatus::Failed);
+    assert_eq!(inspected.adapter_executions, 2);
+    assert_eq!(
+        inspected.state_head.as_deref(),
+        Some(state_node_before.as_str())
+    );
+}
+
+#[tokio::test]
+async fn daemon_rejects_credential_percept_before_queue_trace_and_policy_state() {
+    const CANARY: &str = "C03_DAEMON_PERCEPT_CANARY";
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let app = router(support::state_with_trace_store(
+        DaemonConfig::local_dev(),
+        trace_store.clone(),
+        &["daemon.local"],
+    ));
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let create = create_request(tenant_id, agent_id, Vec::new(), Vec::new());
+    let (status, created): (StatusCode, CreateRunResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        "/runs",
+        serde_json::to_value(create).expect("create request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut unsafe_percept = percept("splendor.percept.test.v1");
+    unsafe_percept.payload = json!({"body": format!("password={CANARY}")});
+    let (status, error): (StatusCode, ApiErrorBody) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/percepts", created.run_id),
+        serde_json::to_value(AppendPerceptRequest {
+            credential: None,
+            audit_attribution: Some(attribution()),
+            percept: Some(unsafe_percept),
+        })
+        .expect("percept request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, RAW_CREDENTIAL_INPUT_DENIED);
+    assert_eq!(error.message, RAW_CREDENTIAL_INPUT_DENIED);
+    assert!(error.details.is_null());
+    assert!(!serde_json::to_string(&error)
+        .expect("error serializes")
+        .contains(CANARY));
+    let records_after_denial = trace_store
+        .read(&created.run_id.to_string())
+        .expect("safe audit traces");
+    assert!(!serde_json::to_string(&records_after_denial)
+        .expect("raw traces serialize")
+        .contains(CANARY));
+
+    let lifecycle = LifecycleRequest {
+        credential: None,
+        work_order: None,
+        audit_attribution: Some(attribution()),
+        reason: Some("verify-empty-percept-queue".to_string()),
+        approval_evidence: None,
+        authority_obligation_receipts: Vec::new(),
+    };
+    let (status, tick): (StatusCode, TickResponse) = call_json(
+        app.clone(),
+        Method::POST,
+        &format!("/runs/{}/start", created.run_id),
+        serde_json::to_value(lifecycle).expect("lifecycle request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(tick.action_outcomes.is_empty());
+
+    let records = trace_store
+        .read(&created.run_id.to_string())
+        .expect("raw trace records");
+    let encoded = serde_json::to_string(&records).expect("traces serialize");
+    assert!(!encoded.contains(CANARY));
+    assert!(records.iter().any(|record| {
+        serde_json::from_value::<TraceEvent>(record.payload.clone()).is_ok_and(|event| {
+            matches!(
+                event.kind,
+                TraceEventKind::PerceptsReceived { ref percepts } if percepts.is_empty()
+            )
+        })
+    }));
 }
 
 #[tokio::test]

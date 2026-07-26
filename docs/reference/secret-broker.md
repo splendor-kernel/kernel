@@ -2,8 +2,9 @@
 
 ## Status
 
-**status/incomplete — first process-local Secret Broker owner slice, with no
-material delivery or production durability.**
+**status/incomplete — first process-local Secret Broker owner slice plus a
+bounded generic pre-persistence barrier, with no material delivery or production
+durability.**
 
 The current implementation retains the behavior-free C03 identities,
 pre-placement grammar, revision-bound `SecretRefV2`, and historical-v1 read/deny
@@ -17,7 +18,7 @@ crate-private. There is no callable production lease API or complete live secret
 permit in this slice.
 
 This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`, plus a
-denial-only pre-persistence slice of `SECR-004`/`SECR-006`. It does not
+denial/failure-only pre-persistence slice of `SECR-004`/`SECR-006`. It does not
 implement RFC 0012's complete durable lease, exposure-lineage, delivery,
 provider-control, node-control, outer-submission, or terminal publication
 records. It adds no provider invocation from the broker, material-returning
@@ -25,7 +26,8 @@ broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
 secret surface, complete profile/repository/leak scanner, production provider,
 issue closure, or gold pass. The reduced
 wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
-the complete RFC 0012 wire schemas. `G07` and `G08` remain `not_exercised`.
+the complete RFC 0012 wire schemas. `G07`, `G08`, and `G82` remain
+`not_exercised`.
 
 ## Purpose and boundary
 
@@ -41,7 +43,7 @@ The Authority context constructor is crate-private and there is no production
 composition path in this slice; external callers cannot manufacture one from
 arbitrary coordinates.
 
-## Implemented denial-only legacy credential ingress barrier
+## Implemented generic credential ingress and persistence barrier
 
 The existing stable generic action path now has an always-on, Gateway-owned,
 pre-persistence barrier. `VerifiedActionGateway` applies it first, and the kernel
@@ -86,11 +88,38 @@ safety evidence, device profiles/status/audit, operator records, or
 adapters/simulators. Complete-token grammar preserves ordinary Basic prose and
 provider-looking resource paths.
 
+The same scanner owner now exposes pure barriers for persisted percept, state,
+and adapter-result envelopes:
+
+- every collected percept shares one bounded scan across `schema`, `payload`,
+  provenance source, and provenance detail before `PerceptsReceived`, policy
+  invocation, or daemon queue retention;
+- policy-selected next-state bytes are screened immediately after policy return
+  and before `PolicyCompleted`, action processing, `OutcomeRecorded`, or a state
+  write. Declared JSON must parse and declared text must be unambiguous UTF-8;
+  malformed JSON, ambiguous textual encodings, detected content, and scanner
+  overflow fail the tick with only `raw_credential_input_denied`;
+- `AdapterResult.output` and satisfied-postcondition strings are screened
+  immediately after one adapter return and before invariant/safety
+  post-verifiers, `ActionOutcome`, action/outcome traces, daemon responses, or
+  state. A detection returns stable `ActionStatus::Failed`, absent output, and
+  a post-verification denial plus error containing only
+  `raw_credential_output_suppressed`. This means the adapter was entered and
+  does not claim rollback, no effect, or safe retry.
+
+Persisted JSON scanning covers strings/object keys plus root numeric byte arrays
+and selected `bytes`, `body`, and `contents` byte-envelope coordinates, including
+current filesystem/HTTP result shapes. Bounded benign JSON, text,
+filesystem/HTTP results, and genuinely opaque binary state remain compatible.
+Explicit text/JSON ambiguity fails closed. Invalid non-text binary bytes may
+remain opaque; the barrier does not claim visibility inside encrypted,
+compressed, custom-encoded, or otherwise opaque state.
+
 This barrier is intentionally not the complete RFC 0012
 `CredentialIngressProfile`: it has no operation-specific owner-schema registry,
 positive typed-wrapper recognition, non-secret exception registry, exhaustive
-entropy/encoded/split detector, post-execution leak detector, repository CI
-scanner, quarantine/incident workflow, or live broker/provider/material path.
+entropy/encoded/split or per-lease live detector, repository CI scanner,
+quarantine/incident workflow, or live broker/provider/material path.
 Generic `SecretRef`-looking data is denied rather than upgraded into authority.
 Typed secret delivery remains unavailable.
 
