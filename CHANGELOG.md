@@ -14,8 +14,8 @@
   path/symlink ambiguity, unsupported governed formats, stale policy entries,
   and resource overflow. A separate bounded content pass covers candidate source,
   fixtures, generated text, docs, manifests, and supported archives with
-  digest/count-bound synthetic/public-vector exceptions. CI runs self-tests and
-  the current-tree scan before Rust build/test. This is not runtime output-leak
+  digest/count-bound synthetic/public-vector exceptions. Every CI build/test job
+  depends on the self-test and current-tree scan. This is not runtime output-leak
   scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
   parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
 - **status/incomplete:** extended the single Gateway-owned bounded credential

@@ -29,7 +29,8 @@ python3 scripts/security/check-secret-contracts.py
 
 The self-test uses only temporary synthetic fragments. Normal mode enumerates
 tracked plus non-ignored candidate files with local `git ls-files`; it performs
-no network access.
+no network access. CI runs these commands in a dedicated prerequisite job; Rust,
+Python, TypeScript, and Docker jobs do not start unless both pass.
 
 To check one new repository-relative fixture before placing it under a governed
 root:

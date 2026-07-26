@@ -5,7 +5,23 @@ on:
   pull_request:
 
 jobs:
+  secret-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository without default token
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
+          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+      - name: C03 secret contract and fixture guard
+        run: |
+          python3 scripts/security/check-secret-contracts.py --self-test
+          python3 scripts/security/check-secret-contracts.py
+
   rust:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
@@ -23,10 +39,6 @@ jobs:
         run: |
           python3 scripts/architecture/check-dependency-policy.py --self-test
           python3 scripts/architecture/check-dependency-policy.py
-      - name: C03 secret contract and fixture guard
-        run: |
-          python3 scripts/security/check-secret-contracts.py --self-test
-          python3 scripts/security/check-secret-contracts.py
       - name: Rust fmt
         run: cargo fmt --all -- --check
       - name: Rust clippy
@@ -41,6 +53,7 @@ jobs:
         run: cargo llvm-cov --workspace --all-targets --fail-under-lines 95
 
   python:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
@@ -61,6 +74,7 @@ jobs:
         run: pytest python/tests --cov=splendor --cov-fail-under=95
 
   typescript:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
@@ -83,6 +97,7 @@ jobs:
         run: npm run coverage
 
   docker:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token

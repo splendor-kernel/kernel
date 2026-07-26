@@ -142,7 +142,8 @@ format ambiguity, stale/expired exceptions, and budget overflow. A separate
 bounded content pass checks tracked and non-ignored candidate source, fixtures,
 generated text, docs, manifests, and supported archives for known private-key,
 provider-token, authorization, credential-URL, encoded-key, and high-entropy
-forms. Diagnostics never print candidate material.
+forms. Diagnostics never print candidate material. Every CI build/test job
+depends on this guard succeeding.
 
 The exact developer policy, rule families, allowlist process, commands, and
 nonclaims are documented in
