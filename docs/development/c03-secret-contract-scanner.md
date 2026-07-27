@@ -29,14 +29,17 @@ python3 scripts/security/check-secret-contracts.py
 
 The self-test uses only temporary synthetic fragments. Normal mode enumerates
 tracked plus non-ignored files with local `git ls-files`; every regular file is
-read under the cumulative budget and every unambiguous UTF-8 file is
+read relative to one no-follow, descriptor-pinned repository root under the
+cumulative budget and every unambiguous UTF-8 file is
 content-scanned regardless of suffix. The scanner performs no network access. CI
 and the Docker image workflow run these commands in a dedicated prerequisite
 job; build, test, image, and publication jobs do not start unless both pass.
+Every job fetches, detaches, and verifies the same immutable `GITHUB_SHA`; there
+is no mutable-ref or `FETCH_HEAD` fallback.
 Recognized JSON, YAML, and Markdown files are additionally decoded so escaped,
-folded, keyed, and scalar content is scanned recursively. Recognized Python,
-JavaScript, and TypeScript suffixes receive bounded declaration checks in normal
-repository mode, not only when explicitly selected.
+folded, keyed, and scalar content is scanned recursively. Registered governed
+Python, JavaScript, and TypeScript roots, sniffed archive members, and explicitly
+selected source files receive bounded declaration checks.
 
 To check one new repository-relative fixture before placing it under a governed
 root:
@@ -48,6 +51,8 @@ python3 scripts/security/check-secret-contracts.py --path path/to/fixture.json
 Missing paths, symlinks, traversal, malformed or duplicate JSON/YAML keys,
 unsupported governed formats, invalid UTF-8, resource exhaustion, stale policy
 entries, and unavailable repository enumeration all fail the command.
+Ancestor and final-file identities are checked before and after reads. FIFOs and
+other non-regular objects are opened nonblocking and rejected.
 
 ## Governed roots and formats
 
@@ -78,11 +83,16 @@ all recognized repository text.
 Repository content scanning covers bounded UTF-8 source, fixtures, generated
 text, docs, manifests, and ZIP/TAR/GZIP containers recognized by magic rather
 than filename. Standalone gzip text and gzip-wrapped TAR are supported; every
-other nested archive is rejected. Archive traversal, links, encryption,
-malformed members, excessive expansion, or cumulative file/member/unpacked/work
-budget overflow fails closed. Every archive member that decodes as unambiguous
-UTF-8 is content-scanned regardless of filename suffix. UTF-8 BOM/NUL ambiguity
-fails closed; opaque non-UTF-8 members remain outside the absence claim.
+other nested archive is rejected. ZIP members use stored, Deflate, or BZIP2
+streams with exact end-of-stream, size, CRC, and metadata validation; other ZIP
+compression methods fail closed. Archive traversal, links, encryption,
+prefixes/polyglots, trailing data, ZIP comments, credential-capable
+member/metadata names, concatenated GZIP streams, malformed members, excessive
+expansion, or cumulative file/member/unpacked/work budget overflow fail closed.
+Global member capacity is checked before archive-library enumeration. Every
+archive member that decodes as unambiguous UTF-8 is content-scanned regardless
+of filename suffix. UTF-8 BOM/NUL/control/format ambiguity fails closed; opaque
+non-UTF-8 members remain outside the absence claim.
 JSON/YAML-looking members are structurally sniffed before scanning; Markdown
 members are parsed when their member name identifies Markdown.
 
@@ -102,7 +112,10 @@ make the object safe.
 The only structural exceptions are exact path + document schema + field path
 entries. Current entries cover:
 
-- four exact daemon Python/TypeScript caller-auth transport declarations;
+- exact daemon Python/TypeScript caller-auth transport declarations and object
+  projections;
+- exact digest-bound TypeScript owner declarations/references for current
+  non-material caller-credential metadata;
 - two exact process-local synthetic HMAC-key declarations in the containerized
   acceptance provider (declarations only; no committed value);
 - the deprecated daemon caller-credential header name and closed OpenAPI
@@ -131,7 +144,8 @@ structural findings.
 
 Diagnostics contain only a safe repository location, optional line, and a fixed
 rule message. Credential-capable path/archive-member segments are
-digest-redacted, including percent-encoded and opaque mixed-token segments;
+replaced by the single fixed `<redacted>` marker, including normalized plural,
+percent-encoded, and opaque mixed-token segments;
 candidate material and matched substrings are never printed.
 Malformed Unicode, non-finite values, archives, and filesystem objects map to
 fixed rule codes.
@@ -166,6 +180,10 @@ The policy caps cumulative files/work bytes/structure nodes/archive members and
 unpacked bytes, plus per-document depth/members/strings/fences. Raising a cap
 beyond the scanner's hard ceiling is invalid. Both CI workflows impose a
 five-minute scanner-job timeout as an outer resource bound.
+
+The mandatory self-test pins exactly 141 unique test identities and their
+manifest digest. Zero discovery, a missing test, governed-root inventory drift,
+or owner/symbolic fixture digest drift fails closed.
 
 The repository has no configured root Python typing policy or scanner-specific
 type-check CI job. Correction validation therefore runs the explicit default-tool

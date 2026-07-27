@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import math
 import re
+import unicodedata
+import urllib.parse
 from collections import Counter
 
 from .model import ContentHit
 
 
 def normalize_field_name(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
     value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
     value = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
@@ -21,6 +24,8 @@ _BENIGN_EXACT_FIELDS = {
     "auth_method",
     "auth_mode",
     "auth_scheme",
+    "authorization_endpoint",
+    "authorization_url",
     "authentication_method",
     "authentication_mode",
     "credential_count",
@@ -30,13 +35,20 @@ _BENIGN_EXACT_FIELDS = {
     "credential_ref",
     "credential_refs",
     "credential_scope",
+    "credential_algorithm",
+    "jwks_uri",
     "max_tokens",
+    "oauth_authorization_endpoint",
+    "oauth_token_endpoint",
+    "public_metadata",
     "public_key",
     "public_keys",
     "secret_count",
     "secret_ref",
     "secret_ref_id",
     "secret_ref_ids",
+    "signature_algorithm",
+    "token_algorithm",
     "token_count",
     "token_counts",
     "token_index",
@@ -44,25 +56,41 @@ _BENIGN_EXACT_FIELDS = {
     "token_type",
     "token_types",
     "token_usage",
+    "token_endpoint",
+    "token_endpoint_auth_method",
+    "token_url",
     "tokenizer",
     "tokenizers",
     "tokens_used",
 }
 _BENIGN_SUFFIXES = (
+    "_algorithm",
     "_count",
     "_digest",
+    "_dir",
+    "_directory",
+    "_endpoint",
+    "_file",
+    "_filename",
     "_hash",
     "_id",
     "_ids",
+    "_identities",
+    "_identity",
     "_index",
     "_kind",
     "_length",
+    "_non_disclosure",
+    "_path",
+    "_provider",
     "_ref",
     "_refs",
     "_revision",
+    "_secret_broker",
     "_status",
     "_type",
     "_version",
+    "_url",
 )
 _SECRET_EXACT_FIELDS = {
     "access_key",
@@ -141,6 +169,8 @@ def is_secret_field_name(key: str) -> bool:
         return False
     tokens = {token for token in normalized.split("_") if token}
     if not tokens:
+        return False
+    if "oauth" in tokens and tokens & {"endpoint", "url", "uri"}:
         return False
     if "key" in tokens and tokens & _KEY_QUALIFIERS:
         return "public" not in tokens
@@ -257,6 +287,21 @@ AUTH_COORDINATE_PREFIX = re.compile(
 CREDENTIAL_URL_PATTERN = re.compile(
     r"(?i)\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp(?:s)?|ftp)://[^\s/@:]+:[^\s/@]+@"
 )
+URL_PATTERN = re.compile(
+    r"(?i)\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp(?:s)?|ftp)://[^\s\"'<>]{1,4096}"
+)
+BARE_QUERY_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?:^|[?&;])(?P<name>[A-Za-z0-9_.%+-]{1,128})=(?P<value>[^&#;\s]{1,1024})"
+)
+CONFIG_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)^[ \t]*(?:(?:(?:export|readonly|local|typeset)(?:[ \t]+-[A-Za-z]+)?|"
+    r"set|setenv|declare[ \t]+-[A-Za-z]+)[ \t]+|\$env:)?"
+    r"(?P<name>[^\s=:]{1,128})[ \t]*(?:=|:)[ \t]*(?P<value>[^\r\n]{1,2048})$"
+)
+SHELL_SETENV_PATTERN = re.compile(
+    r"(?im)^[ \t]*setenv[ \t]+(?P<name>[^\s=:]{1,128})[ \t]+"
+    r"(?P<value>[^\r\n]{1,2048})$"
+)
 ENTROPY_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_~+/-])"
     r"([A-Za-z0-9_~-]{40,512}|[A-Za-z0-9+/]{40,510}={0,2})"
@@ -365,25 +410,163 @@ def decoded_private_key_signature(value: str) -> bool:
     )
 
 
+def _percent_decode_bounded(value: str) -> str | None:
+    current = value
+    for _ in range(2):
+        if not re.search(r"%[0-9A-Fa-f]{2}", current):
+            return current
+        try:
+            decoded = urllib.parse.unquote(current, errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if len(decoded.encode("utf-8", "strict")) > 4096:
+            return None
+        if decoded == current:
+            return current
+        current = decoded
+    if re.search(r"%[0-9A-Fa-f]{2}", current):
+        return None
+    return current
+
+
+def _credential_value_present(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate[0:1] == candidate[-1:] and candidate.startswith(("'", '"')):
+        candidate = candidate[1:-1].strip()
+    candidate = re.split(r"[ \t]+[#;]", candidate, maxsplit=1)[0].strip()
+    lowered = candidate.lower()
+    if lowered in {
+        "[]",
+        "{}",
+        "false",
+        "nil",
+        "none",
+        "null",
+        "true",
+        "undefined",
+        "<redacted>",
+        "<secret-ref>",
+    }:
+        return False
+    if re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", candidate):
+        return False
+    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", candidate):
+        return False
+    if re.fullmatch(
+        r"(?i)(?:bearer|basic)[ \t]+\$\{[A-Za-z_$][A-Za-z0-9_$.]*\}",
+        candidate,
+    ):
+        return False
+    if re.fullmatch(
+        r"\$\{\{\s*(?:secrets|vars)\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}",
+        candidate,
+    ):
+        return False
+    if re.fullmatch(
+        r"<(?:value|redacted|secret-ref|non-nil-[a-z0-9-]+|"
+        r"configured-[a-z0-9-]+|at-least-[0-9]+-decoded-bytes|"
+        r"local-[a-z0-9-]+-id)>",
+        lowered,
+    ):
+        return False
+    return True
+
+
+def _query_credential_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for url_match in URL_PATTERN.finditer(text):
+        raw_url = url_match.group(0).rstrip(".,)]}")
+        try:
+            parsed = urllib.parse.urlsplit(raw_url)
+        except ValueError:
+            continue
+        if parsed.username is not None and parsed.password not in {None, ""}:
+            spans.append((url_match.start(), url_match.start() + len(raw_url)))
+        for query_match in BARE_QUERY_CREDENTIAL_PATTERN.finditer("?" + parsed.query):
+            name = _percent_decode_bounded(query_match.group("name"))
+            value = _percent_decode_bounded(query_match.group("value"))
+            if (
+                name is not None
+                and value is not None
+                and is_secret_field_name(name)
+                and _credential_value_present(value)
+            ):
+                query_offset = raw_url.find("?")
+                if query_offset >= 0:
+                    start = (
+                        url_match.start() + query_offset + query_match.start("value")
+                    )
+                    spans.append((start, start + len(query_match.group("value"))))
+    for query_match in BARE_QUERY_CREDENTIAL_PATTERN.finditer(text):
+        # A bare ``name=value`` line is an assignment, not a URL query.  This
+        # second pass exists for query fragments beginning with a real query
+        # delimiter; complete URLs were handled above.
+        if query_match.group(0)[0] not in "?&;":
+            continue
+        name = _percent_decode_bounded(query_match.group("name"))
+        value = _percent_decode_bounded(query_match.group("value"))
+        if (
+            name is not None
+            and value is not None
+            and is_secret_field_name(name)
+            and _credential_value_present(value)
+        ):
+            spans.append((query_match.start("value"), query_match.end("value")))
+    return sorted(set(spans))
+
+
+def _nfkc_scan_view(text: str) -> tuple[str, list[int]]:
+    """Build a compatibility-normalized view with source-offset provenance."""
+
+    chunks: list[str] = []
+    offsets: list[int] = []
+    for index, char in enumerate(text):
+        normalized = unicodedata.normalize("NFKC", char)
+        chunks.append(normalized)
+        offsets.extend([index] * len(normalized))
+    return "".join(chunks), offsets
+
+
 def scan_content(
     text: str,
     maximum: int,
     *,
     authorization_context: bool = False,
+    assignment_context: bool = False,
 ) -> list[ContentHit]:
     """Return every occurrence (including same-line duplicates) up to the cap."""
 
+    normalized_text, source_offsets = _nfkc_scan_view(text)
     search_text = "".join(
         " " if char.isspace() and char not in {"\n", "\r", "\t"} else char
-        for char in text
+        for char in normalized_text
     )
     hits: list[ContentHit] = []
     occupied: list[tuple[int, int]] = []
 
     def add(code: str, start: int, end: int) -> bool:
-        hits.append(ContentHit(line_for_offset(text, start), start, end, code))
+        if not source_offsets or start >= len(source_offsets) or end <= start:
+            return False
+        source_start = source_offsets[start]
+        source_end = source_offsets[min(end - 1, len(source_offsets) - 1)] + 1
+        hits.append(
+            ContentHit(
+                line_for_offset(text, source_start),
+                source_start,
+                source_end,
+                code,
+            )
+        )
         occupied.append((start, end))
         return len(hits) >= maximum
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(
+            start < occupied_end and end > occupied_start
+            for occupied_start, occupied_end in occupied
+        )
 
     for match in PEM_PATTERN.finditer(search_text):
         if add("SCC001_PRIVATE_KEY", match.start(), match.end()):
@@ -397,6 +580,11 @@ def scan_content(
     for match in CREDENTIAL_URL_PATTERN.finditer(search_text):
         if add("SCC005_CREDENTIAL_URL", match.start(), match.end()):
             return sorted(hits)
+    for start, end in _query_credential_spans(search_text):
+        if overlaps(start, end):
+            continue
+        if add("SCC005_CREDENTIAL_URL", start, end):
+            return sorted(hits)
     for match in AUTH_PATTERN.finditer(search_text):
         line_start = search_text.rfind("\n", 0, match.start()) + 1
         contextual = authorization_context or bool(
@@ -408,6 +596,23 @@ def scan_content(
             authorization_context=contextual,
         ) and add("SCC003_AUTH_VALUE", match.start(), match.end()):
             return sorted(hits)
+    if assignment_context:
+        for pattern in (CONFIG_ASSIGNMENT_PATTERN, SHELL_SETENV_PATTERN):
+            for match in pattern.finditer(search_text):
+                name = _percent_decode_bounded(match.group("name"))
+                if (
+                    name is None
+                    or not is_secret_field_name(name)
+                    or not _credential_value_present(match.group("value"))
+                    or overlaps(match.start("value"), match.end("value"))
+                ):
+                    continue
+                if add(
+                    "SCC003_AUTH_VALUE",
+                    match.start("value"),
+                    match.end("value"),
+                ):
+                    return sorted(hits)
     for match in CREDENTIAL_HEX_ASSIGNMENT_PATTERN.finditer(search_text):
         if not is_secret_field_name(match.group("name")):
             continue
@@ -419,7 +624,7 @@ def scan_content(
         ):
             return sorted(hits)
     for match in ENTROPY_PATTERN.finditer(search_text):
-        if any(match.start() < end and match.end() > start for start, end in occupied):
+        if overlaps(match.start(), match.end()):
             continue
         value = match.group(1)
         if is_subresource_integrity_digest(value) or not looks_high_entropy(value):

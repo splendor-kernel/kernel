@@ -16,8 +16,12 @@
   and resource overflow. A separate bounded content pass covers every
   unambiguous UTF-8 tracked/non-ignored file plus magic-detected, globally
   budgeted archive members, with digest/count-bound synthetic/public-vector
-  exceptions. Every CI build/test and Docker image publication job depends on
-  the self-test and current-tree scan. This is not runtime output-leak
+  exceptions. The guard also closes low-entropy assignment/URL forms,
+  compatibility/control-character ambiguity, source-type shadowing, CommonMark/
+  MyST/OpenAPI coordinates, archive polyglots/metadata/trailing data, and
+  descriptor-relative ancestor races. Every CI build/test and Docker image
+  publication job fetches and verifies one immutable `GITHUB_SHA` and depends on
+  the exact-manifest self-test and current-tree scan. This is not runtime output-leak
   scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
   parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
 - **status/incomplete:** extended the single Gateway-owned bounded credential

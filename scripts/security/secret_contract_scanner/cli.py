@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .engine import scan_repository
-from .model import DEFAULT_POLICY_PATH, Finding
+from .io_utils import PinnedRepository
+from .model import DEFAULT_POLICY_PATH, Finding, ScanDataError
 from .policy import load_policy
 from .self_test import run_self_test
 
@@ -48,22 +49,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return run_self_test()
     try:
-        repo_root = args.repo_root.resolve(strict=True)
-    except OSError:
-        print(Finding(".", 0, "SCN002_PATH_UNAVAILABLE").render(), file=sys.stderr)
-        return 1
-    if not repo_root.is_dir():
-        print(Finding(".", 0, "SCN002_PATH_UNAVAILABLE").render(), file=sys.stderr)
-        return 1
-    policy, policy_findings = load_policy(
-        repo_root, args.policy, today=dt.datetime.now(dt.timezone.utc).date()
-    )
-    if policy is None:
-        for finding in policy_findings:
-            print(finding.render(), file=sys.stderr)
-        return 1
-    try:
-        findings, stats = scan_repository(repo_root, policy, explicit_paths=args.paths)
+        with PinnedRepository(args.repo_root) as repository:
+            policy, policy_findings = load_policy(
+                repository,
+                args.policy,
+                today=dt.datetime.now(dt.timezone.utc).date(),
+            )
+            if policy is None:
+                for finding in policy_findings:
+                    print(finding.render(), file=sys.stderr)
+                return 1
+            findings, stats = scan_repository(
+                repository, policy, explicit_paths=args.paths
+            )
+    except ScanDataError as exc:
+        findings = [Finding(".", exc.line, exc.code)]
+        stats = None
     except (
         OSError,
         ValueError,

@@ -7,12 +7,14 @@ import datetime as dt
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 from .content import (
     is_authorization_context,
     is_secret_field_name,
+    normalize_field_name,
     object_is_fake_wrapper,
     scan_content,
 )
@@ -82,13 +84,23 @@ def ensure_unicode_scalars(value: Any, code: str) -> None:
                     or utf8_size(key) is None
                     or "\x00" in key
                     or "\ufeff" in key
+                    or any(unicodedata.category(char) in {"Cc", "Cf"} for char in key)
                 ):
                     raise ScanDataError(code)
                 stack.append(child)
         elif isinstance(current, list):
             stack.extend(current)
         elif isinstance(current, str):
-            if utf8_size(current) is None or "\x00" in current or "\ufeff" in current:
+            if (
+                utf8_size(current) is None
+                or "\x00" in current
+                or "\ufeff" in current
+                or any(
+                    unicodedata.category(char) in {"Cc", "Cf"}
+                    and char not in {"\n", "\r", "\t"}
+                    for char in current
+                )
+            ):
                 raise ScanDataError(code)
 
 
@@ -702,7 +714,17 @@ def _fence_kind(info: str) -> str | None:
     if not info:
         return None
     candidates: list[str] = []
-    if info.startswith("{") and "}" in info:
+    myst = re.fullmatch(
+        r"\{(?:code-block|sourcecode)\}(?:\s+(.+))?",
+        info,
+        flags=re.IGNORECASE,
+    )
+    if myst is not None:
+        language = myst.group(1)
+        if language is None or len(language.split()) != 1:
+            return "unsupported"
+        candidates.append(language)
+    elif info.startswith("{") and "}" in info:
         annotation = info[1 : info.index("}")]
         candidates.extend(token.lstrip(".") for token in annotation.split())
     else:
@@ -731,6 +753,48 @@ def _fence_kind(info: str) -> str | None:
     return None
 
 
+def _commonmark_container_line(line: str) -> str:
+    """Remove valid list/blockquote container markers before fence parsing."""
+
+    current = line
+    for _ in range(16):
+        quote = re.match(r"^ {0,3}> ?", current)
+        if quote is not None:
+            current = current[quote.end() :]
+            continue
+        listing = re.match(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}", current)
+        if listing is not None:
+            current = current[listing.end() :]
+            continue
+        break
+    return current
+
+
+def _commonmark_container_prefixes(line: str) -> tuple[str, str, str]:
+    """Return normalized text plus opener and continuation container prefixes."""
+
+    current = line
+    opener = ""
+    continuation = ""
+    for _ in range(16):
+        quote = re.match(r"^ {0,3}> ?", current)
+        if quote is not None:
+            marker = current[: quote.end()]
+            opener += marker
+            continuation += marker
+            current = current[quote.end() :]
+            continue
+        listing = re.match(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}", current)
+        if listing is not None:
+            marker = current[: listing.end()]
+            opener += marker
+            continuation += " " * len(marker)
+            current = current[listing.end() :]
+            continue
+        break
+    return current, opener, continuation
+
+
 def parse_markdown_fences(
     data: bytes, limits: dict[str, int], budget: WorkBudget | None = None
 ) -> list[StructuredFence]:
@@ -744,22 +808,53 @@ def parse_markdown_fences(
     active_marker: str | None = None
     active_marker_length = 0
     active_kind: str | None = None
+    active_prefix = ""
+    continuation_prefix = ""
     start_line = 0
     chunks: list[str] = []
-    for number, line in enumerate(text.splitlines(), 1):
-        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,})\s*(.*?)\s*", line)
+    for number, physical_line in enumerate(text.splitlines(), 1):
         if active_marker is None:
-            if opening is None:
+            line, opening_prefix, opening_continuation = _commonmark_container_prefixes(
+                physical_line
+            )
+        elif active_prefix and physical_line.startswith(active_prefix):
+            line = physical_line[len(active_prefix) :]
+            opening_prefix = ""
+            opening_continuation = ""
+        elif continuation_prefix and physical_line.startswith(continuation_prefix):
+            line = physical_line[len(continuation_prefix) :]
+            opening_prefix = ""
+            opening_continuation = ""
+        else:
+            line = physical_line
+            opening_prefix = ""
+            opening_continuation = ""
+        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,})\s*(.*?)\s*", line)
+        colon_opening = re.fullmatch(
+            r" {0,3}(:{3,})\{(?:code-block|sourcecode)\}\s*(.*?)\s*",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if active_marker is None:
+            if opening is None and colon_opening is None:
                 continue
-            kind = _fence_kind(opening.group(2))
+            if colon_opening is not None:
+                marker_text = colon_opening.group(1)
+                info = "{code-block} " + colon_opening.group(2)
+            else:
+                assert opening is not None
+                marker_text = opening.group(1)
+                info = opening.group(2)
+            kind = _fence_kind(info)
             if kind == "unsupported":
                 raise ScanDataError("SCN008_MALFORMED_MARKDOWN", number)
             if kind is None:
                 continue
-            marker = opening.group(1)
-            active_marker = marker[0]
-            active_marker_length = len(marker)
+            active_marker = marker_text[0]
+            active_marker_length = len(marker_text)
             active_kind = kind
+            active_prefix = opening_prefix
+            continuation_prefix = opening_continuation
             start_line = number
             chunks = []
             continue
@@ -785,6 +880,8 @@ def parse_markdown_fences(
             active_marker = None
             active_marker_length = 0
             active_kind = None
+            active_prefix = ""
+            continuation_prefix = ""
             chunks = []
         else:
             chunks.append(line)
@@ -944,14 +1041,89 @@ def validate_exception_node(name: str, value: Any) -> bool:
             "no direct cloud actuator credentials; local middleware authority remains device-local and gateway-mediated",
         }
     if name == "python_acceptance_signing_material":
-        return value == ("secret", "bytes")
+        return value in {
+            SourceDeclaration("secret", "bytes", "class_field", "one", "absent"),
+            SourceDeclaration("private_key", "Path", "parameter", "one", "absent"),
+            SourceDeclaration("signing_key", "Path", "parameter", "one", "absent"),
+            SourceDeclaration("_private_key", "", "self_field", "one", "expression"),
+        }
     if name == "python_caller_auth_transport":
         return value in {
-            ("token", "str"),
-            ("default_credential", "dict[str, Any] | None"),
+            SourceDeclaration("token", "str", "class_field", "one", "absent"),
+            SourceDeclaration(
+                "default_credential",
+                "dict[str, Any] | None",
+                "class_field",
+                "one",
+                "none",
+            ),
+            SourceDeclaration(
+                "credential",
+                "dict[str, Any] | None",
+                "parameter",
+                "one",
+                "none",
+            ),
+            SourceDeclaration(
+                "credential",
+                "dict[str, Any] | None",
+                "parameter",
+                "one",
+                "absent",
+            ),
+            SourceDeclaration(
+                "header_credential",
+                "dict[str, Any] | None",
+                "parameter",
+                "one",
+                "none",
+            ),
         }
     if name == "typescript_caller_auth_transport":
-        return value in {("token", "string")}
+        return value in {
+            SourceDeclaration("token", "string", "interface_field", "one", "absent"),
+            SourceDeclaration("token", "string", "class_field", "one", "absent"),
+            SourceDeclaration("token", "", "source_field", "one", "expression"),
+            SourceDeclaration(
+                "credential",
+                "CallerCredential",
+                "source_field",
+                "one",
+                "expression",
+            ),
+            SourceDeclaration(
+                "defaultCredential", "", "source_field", "one", "expression"
+            ),
+            SourceDeclaration("credential", "", "object_field", "one", "expression"),
+            SourceDeclaration("Authorization", "", "object_field", "one", "literal"),
+        }
+    if name == "typescript_owner_safe_reference":
+        return value in {
+            SourceDeclaration(
+                "CredentialBinding", "", "source_field", "one", "expression"
+            ),
+            SourceDeclaration(
+                "CredentialAudience", "", "source_field", "one", "expression"
+            ),
+            SourceDeclaration("CallerCredential", "", "source_field", "one", "absent"),
+            SourceDeclaration(
+                "WorkOrderAuthorization", "", "source_field", "one", "absent"
+            ),
+            SourceDeclaration(
+                "credential",
+                "CallerCredential",
+                "interface_field",
+                "one",
+                "absent",
+            ),
+            SourceDeclaration(
+                "credential",
+                "CallerCredential|null",
+                "interface_field",
+                "one",
+                "absent",
+            ),
+        }
     return False
 
 
@@ -962,11 +1134,42 @@ class StructuredScan:
 
 
 def _openapi_payload_root(path: str) -> bool:
-    if re.search(r"\.(?:example|default|const)(?:\[[0-9]+\])*$", path):
+    if re.search(r"\.(?:example|default|const|enum|value)(?:\[[0-9]+\])*$", path):
         return True
     if re.search(r"\.examples\[[0-9]+\](?:\[[0-9]+\])*$", path):
         return True
     return ".examples." in path and path.endswith(".value")
+
+
+_OPENAPI_SAFE_SECURITY_KEYS = {
+    "authorization_code",
+    "authorization_url",
+    "bearer_format",
+    "client_credentials",
+    "description",
+    "flows",
+    "implicit",
+    "in",
+    "name",
+    "open_id_connect_url",
+    "password",
+    "refresh_url",
+    "scheme",
+    "scopes",
+    "token_url",
+    "type",
+}
+
+
+def _openapi_security_secret_coordinate(path: str, key: str) -> bool:
+    if not path.startswith("$.components.securitySchemes.") or ".scopes" in path:
+        return False
+    normalized = normalize_field_name(key)
+    return (
+        normalized not in _OPENAPI_SAFE_SECURITY_KEYS
+        and not normalized.startswith("x_public_")
+        and is_secret_field_name(key)
+    )
 
 
 def scan_structured_value(
@@ -975,34 +1178,72 @@ def scan_structured_value(
     file_path: str,
     doc_schema: str | None,
     exceptions: dict[tuple[str, str, str], dict[str, Any]],
-    used_exceptions: set[tuple[str, str, str]],
+    used_exceptions: dict[tuple[str, str, str], int],
     budget: WorkBudget,
     maximum_hits: int,
     owner_exact: bool = False,
+    structural_fields_enabled: bool = True,
     base_line: int = 1,
 ) -> StructuredScan:
     hits: list[ContentHit] = []
     findings: list[Finding] = []
     openapi_mode = bool(doc_schema and doc_schema.startswith("openapi:"))
 
-    def add_text(text: str, *, context: bool, line: int) -> None:
-        budget.charge_text(text)
+    def add_text(
+        text: str,
+        *,
+        context: bool,
+        line: int,
+        assignment_key: str | None = None,
+    ) -> None:
+        prefix = (
+            f"{assignment_key}="
+            if assignment_key is not None and is_secret_field_name(assignment_key)
+            else ""
+        )
+        scan_text = prefix + text
+        budget.charge_text(scan_text)
         remaining = maximum_hits - len(hits)
         if remaining <= 0:
             return
-        for hit in scan_content(text, remaining, authorization_context=context):
-            hits.append(ContentHit(line + hit.line - 1, hit.start, hit.end, hit.code))
+        for hit in scan_content(
+            scan_text,
+            remaining,
+            authorization_context=context,
+            assignment_context=bool(prefix),
+        ):
+            if hit.end <= len(prefix):
+                continue
+            hits.append(
+                ContentHit(
+                    line + hit.line - 1,
+                    max(0, hit.start - len(prefix)),
+                    max(1, hit.end - len(prefix)),
+                    hit.code,
+                )
+            )
 
     def walk(
         current: Any,
         path: str,
         *,
         structural_enabled: bool,
+        assignment_enabled: bool,
         openapi_payload: bool,
         parent_key: str | None,
     ) -> None:
         if isinstance(current, dict):
             openapi_payload = openapi_payload or _openapi_payload_root(path)
+            if (
+                openapi_mode
+                and structural_enabled
+                and not owner_exact
+                and re.fullmatch(
+                    r"\$\.components\.securitySchemes\.[A-Za-z0-9_$-]+", path
+                )
+                and current.get("type") == "apiKey"
+            ):
+                findings.append(Finding(file_path, base_line, "SCF001_SECRET_FIELD"))
             if (
                 structural_enabled
                 and not owner_exact
@@ -1013,7 +1254,9 @@ def scan_structured_value(
                 add_text(key, context=False, line=base_line)
                 child_path = json_child_path(path, key)
                 inspect_key = (
-                    not openapi_mode or path.endswith(".properties") or openapi_payload
+                    not openapi_mode
+                    or path.endswith((".properties", ".headers"))
+                    or openapi_payload
                 )
                 parameter_name = (
                     openapi_mode
@@ -1021,10 +1264,13 @@ def scan_structured_value(
                     and isinstance(child, str)
                     and "in" in current
                 )
-                is_secret_coordinate = (inspect_key and is_secret_field_name(key)) or (
-                    parameter_name and is_secret_field_name(child)
+                is_secret_coordinate = (
+                    (inspect_key and is_secret_field_name(key))
+                    or _openapi_security_secret_coordinate(path, key)
+                    or (parameter_name and is_secret_field_name(child))
                 )
                 child_structural = structural_enabled
+                child_assignment = assignment_enabled
                 if structural_enabled and not owner_exact and is_secret_coordinate:
                     identity = (file_path, doc_schema or "", child_path)
                     entry = exceptions.get(identity)
@@ -1033,9 +1279,10 @@ def scan_structured_value(
                             Finding(file_path, base_line, "SCF001_SECRET_FIELD")
                         )
                     else:
-                        used_exceptions.add(identity)
+                        used_exceptions[identity] = used_exceptions.get(identity, 0) + 1
                         if validate_exception_node(entry["validator"], child):
                             child_structural = False
+                            child_assignment = False
                         else:
                             findings.append(
                                 Finding(
@@ -1046,15 +1293,20 @@ def scan_structured_value(
                     child,
                     child_path,
                     structural_enabled=child_structural,
+                    assignment_enabled=child_assignment,
                     openapi_payload=openapi_payload,
                     parent_key=key,
                 )
         elif isinstance(current, list):
+            openapi_payload = openapi_payload or (
+                openapi_mode and _openapi_payload_root(path)
+            )
             for index, child in enumerate(current):
                 walk(
                     child,
                     f"{path}[{index}]",
                     structural_enabled=structural_enabled,
+                    assignment_enabled=assignment_enabled,
                     openapi_payload=openapi_payload,
                     parent_key=parent_key,
                 )
@@ -1062,14 +1314,21 @@ def scan_structured_value(
             add_text(
                 current,
                 context=is_authorization_context(parent_key)
-                or (openapi_mode and parent_key in {"example", "default", "const"}),
+                or openapi_payload
+                or (
+                    openapi_mode
+                    and parent_key
+                    in {"const", "default", "enum", "example", "examples", "value"}
+                ),
                 line=base_line,
+                assignment_key=parent_key if assignment_enabled else None,
             )
 
     walk(
         value,
         "$",
-        structural_enabled=True,
+        structural_enabled=structural_fields_enabled,
+        assignment_enabled=not owner_exact,
         openapi_payload=False,
         parent_key=None,
     )
@@ -1085,18 +1344,40 @@ def _annotation_text(annotation: ast.expr | None) -> str:
         return ""
 
 
-_SAFE_SOURCE_TYPES = re.compile(
-    r"\b(?:CallerCredential|Credential(?:Id|Ref)(?:V[0-9]+)?|Secret(?:Ref(?:V[0-9]+)?|UseRequirement|CredentialAuthorization)|Redacted(?:Value|Bytes|String)?|Digest(?:Ref|Value)?|PublicKey(?:Ref|Bytes)?)\b"
-)
-_RAW_SOURCE_TYPES = re.compile(
-    r"\b(?:Any|Buffer|Uint8Array|bytes|bytearray|dict|object|str|string|unknown)\b"
-)
+_SAFE_SOURCE_TYPE_NAMES = {
+    "CallerCredential",
+    "CredentialAudience",
+    "CredentialBinding",
+    "CredentialId",
+    "CredentialRef",
+    "CredentialRefV1",
+    "CredentialRefV2",
+    "DigestRef",
+    "DigestValue",
+    "PublicKeyBytes",
+    "PublicKeyRef",
+    "RedactedBytes",
+    "RedactedString",
+    "RedactedValue",
+    "SecretCredentialAuthorization",
+    "SecretCredentialAuthorizationV2",
+    "SecretRef",
+    "SecretRefV1",
+    "SecretRefV2",
+    "SecretUseRequirement",
+    "WorkOrderAuthorization",
+}
+_PYTHON_SAFE_MODULES = {"splendor", "splendor.types", "splendor.secret_refs"}
+_TYPESCRIPT_SAFE_MODULE = "@splendor/types"
 
 
-def _safe_source_type(value: str) -> bool:
-    return bool(_SAFE_SOURCE_TYPES.search(value)) and not _RAW_SOURCE_TYPES.search(
-        value
-    )
+@dataclass(frozen=True)
+class SourceDeclaration:
+    name: str
+    declared_type: str
+    declaration_kind: str
+    cardinality: str
+    default_kind: str
 
 
 def _source_exception(
@@ -1104,18 +1385,132 @@ def _source_exception(
     file_path: str,
     schema: str,
     field_path: str,
-    node: tuple[str, str],
+    node: SourceDeclaration,
     exceptions: dict[tuple[str, str, str], dict[str, Any]],
-    used_exceptions: set[tuple[str, str, str]],
+    used_exceptions: dict[tuple[str, str, str], int],
 ) -> bool:
     identity = (file_path, schema, field_path)
     entry = exceptions.get(identity)
     if entry is None:
         return False
-    used_exceptions.add(identity)
+    used_exceptions[identity] = used_exceptions.get(identity, 0) + 1
     if validate_exception_node(entry["validator"], node):
         return True
     raise ScanDataError("SCF004_INVALID_EXCEPTION")
+
+
+def _default_kind(value: ast.expr | None, *, absent: bool = False) -> str:
+    if absent:
+        return "absent"
+    if isinstance(value, ast.Constant):
+        if value.value is None:
+            return "none"
+        if value.value is Ellipsis:
+            return "required"
+        return "literal"
+    return "expression"
+
+
+def _python_safe_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, str]]:
+    names: dict[str, str] = {}
+    modules: dict[str, str] = {}
+    canonical_bindings: dict[str, int] = {}
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.ImportFrom)
+            and statement.level == 0
+            and statement.module in _PYTHON_SAFE_MODULES
+        ):
+            for alias in statement.names:
+                if alias.name in _SAFE_SOURCE_TYPE_NAMES:
+                    local = alias.asname or alias.name
+                    names[local] = alias.name
+                    canonical_bindings[local] = canonical_bindings.get(local, 0) + 1
+        elif isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name in _PYTHON_SAFE_MODULES:
+                    local = alias.asname or alias.name.split(".")[0]
+                    modules[local] = alias.name
+                    canonical_bindings[local] = canonical_bindings.get(local, 0) + 1
+
+    bound_counts: dict[str, int] = {}
+
+    def bind(name: str | None) -> None:
+        if name:
+            bound_counts[name] = bound_counts.get(name, 0) + 1
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(node.name)
+        elif isinstance(node, ast.arg):
+            bind(node.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(node.id)
+        elif isinstance(node, ast.ExceptHandler):
+            bind(node.name)
+        elif node.__class__.__name__ in {"MatchAs", "MatchStar"}:
+            bind(getattr(node, "name", None))
+        elif isinstance(node, ast.alias):
+            bind(node.asname or node.name.split(".")[0])
+
+    for name in set(names) | set(modules):
+        if canonical_bindings.get(name) != 1 or bound_counts.get(name) != 1:
+            names.pop(name, None)
+            modules.pop(name, None)
+    return names, modules
+
+
+def _flatten_python_union(annotation: ast.expr) -> list[ast.expr]:
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return _flatten_python_union(annotation.left) + _flatten_python_union(
+            annotation.right
+        )
+    if isinstance(annotation, ast.Subscript):
+        base = _annotation_text(annotation.value).replace(" ", "")
+        if base in {"Optional", "typing.Optional"}:
+            return [annotation.slice, ast.Constant(value=None)]
+        if base in {"Union", "typing.Union"}:
+            if isinstance(annotation.slice, ast.Tuple):
+                return list(annotation.slice.elts)
+            return [annotation.slice]
+    return [annotation]
+
+
+def _python_type_is_safe(
+    annotation: ast.expr | None,
+    *,
+    safe_names: dict[str, str],
+    safe_modules: dict[str, str],
+    default_kind: str,
+) -> bool:
+    if annotation is None or default_kind not in {"absent", "none", "required"}:
+        return False
+    safe_count = 0
+    for member in _flatten_python_union(annotation):
+        if isinstance(member, ast.Constant) and member.value is None:
+            continue
+        if isinstance(member, ast.Name) and member.id in safe_names:
+            safe_count += 1
+            continue
+        if isinstance(member, ast.Attribute) and isinstance(member.value, ast.Name):
+            module = safe_modules.get(member.value.id)
+            if (
+                module in _PYTHON_SAFE_MODULES
+                and member.attr in _SAFE_SOURCE_TYPE_NAMES
+            ):
+                safe_count += 1
+                continue
+        return False
+    return safe_count == 1
+
+
+def _python_source_offset(lines: list[int], node: ast.AST) -> int:
+    line = max(1, getattr(node, "lineno", 1))
+    return lines[min(line - 1, len(lines) - 1)] + getattr(node, "col_offset", 0)
+
+
+def _sensitive_parameter(name: str) -> bool:
+    return is_secret_field_name(name)
 
 
 def scan_python_source(
@@ -1123,11 +1518,10 @@ def scan_python_source(
     *,
     file_path: str,
     exceptions: dict[tuple[str, str, str], dict[str, Any]],
-    used_exceptions: set[tuple[str, str, str]],
+    used_exceptions: dict[tuple[str, str, str], int],
     budget: WorkBudget,
     maximum_hits: int,
 ) -> StructuredScan:
-    del maximum_hits
     try:
         tree = ast.parse(text, filename=file_path)
     except (SyntaxError, ValueError, RecursionError) as exc:
@@ -1136,108 +1530,708 @@ def scan_python_source(
     hits: list[ContentHit] = []
     findings: list[Finding] = []
     schema = "python:source.v1"
-    for node in ast.walk(tree):
-        budget.charge_structure()
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for statement in node.body:
-            name: str | None = None
-            annotation = ""
-            if isinstance(statement, ast.AnnAssign) and isinstance(
-                statement.target, ast.Name
+    safe_names, safe_modules = _python_safe_imports(tree)
+    line_offsets = [0]
+    for match in re.finditer("\n", text):
+        line_offsets.append(match.end())
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.classes: list[str] = []
+            self.functions: list[str] = []
+            self.scopes: list[str] = []
+            self.context_literals: set[int] = set()
+
+        def inspect(
+            self,
+            *,
+            name: str,
+            annotation: ast.expr | None,
+            default: ast.expr | None,
+            default_absent: bool,
+            kind: str,
+            path: str,
+            line: int,
+            parameter: bool = False,
+            cardinality: str = "one",
+        ) -> None:
+            budget.charge_text(name)
+            if not is_secret_field_name(name) or (
+                parameter and not _sensitive_parameter(name)
             ):
-                name = statement.target.id
-                annotation = _annotation_text(statement.annotation)
-            elif isinstance(statement, ast.Assign) and len(statement.targets) == 1:
-                target = statement.targets[0]
+                return
+            default_state = _default_kind(default, absent=default_absent)
+            if cardinality == "one" and _python_type_is_safe(
+                annotation,
+                safe_names=safe_names,
+                safe_modules=safe_modules,
+                default_kind=default_state,
+            ):
+                return
+            declaration = SourceDeclaration(
+                name,
+                _annotation_text(annotation),
+                kind,
+                cardinality,
+                default_state,
+            )
+            try:
+                allowed = _source_exception(
+                    file_path=file_path,
+                    schema=schema,
+                    field_path=path,
+                    node=declaration,
+                    exceptions=exceptions,
+                    used_exceptions=used_exceptions,
+                )
+            except ScanDataError:
+                findings.append(Finding(file_path, line, "SCF004_INVALID_EXCEPTION"))
+                return
+            if not allowed:
+                findings.append(Finding(file_path, line, "SCF005_SOURCE_FIELD"))
+
+        def scan_literal(self, value: ast.expr | None, coordinate: str | None) -> None:
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                return
+            if coordinate is None and id(value) in self.context_literals:
+                return
+            if coordinate is not None:
+                self.context_literals.add(id(value))
+            if any(
+                unicodedata.category(char) in {"Cc", "Cf"}
+                and char not in {"\n", "\r", "\t"}
+                for char in value.value
+            ):
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", value.lineno)
+            budget.charge_text(value.value)
+            remaining = maximum_hits - len(hits)
+            if remaining <= 0:
+                return
+            assignment = bool(coordinate and is_secret_field_name(coordinate))
+            prefix = f"{coordinate}=" if assignment else ""
+            literal_hits = scan_content(
+                prefix + value.value,
+                remaining,
+                authorization_context=is_authorization_context(coordinate),
+                assignment_context=assignment,
+            )
+            base = _python_source_offset(line_offsets, value)
+            for hit in literal_hits:
+                if hit.end <= len(prefix):
+                    continue
+                start = max(0, hit.start - len(prefix))
+                end = max(start + 1, hit.end - len(prefix))
+                hits.append(
+                    ContentHit(
+                        getattr(value, "lineno", 1) + hit.line - 1,
+                        base + start,
+                        base + end,
+                        hit.code,
+                    )
+                )
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.classes.append(node.name)
+            self.scopes.append("class")
+            self.generic_visit(node)
+            self.scopes.pop()
+            self.classes.pop()
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            scope = (
+                f"$.classes.{self.classes[-1]}.methods.{node.name}"
+                if self.classes
+                else f"$.functions.{node.name}"
+            )
+            positional = list(node.args.posonlyargs) + list(node.args.args)
+            defaults: list[ast.expr | None] = [None] * (
+                len(positional) - len(node.args.defaults)
+            ) + list(node.args.defaults)
+            pairs = [
+                (argument, default, "one")
+                for argument, default in zip(positional, defaults)
+            ]
+            pairs.extend(
+                (argument, default, "one")
+                for argument, default in zip(
+                    node.args.kwonlyargs, node.args.kw_defaults
+                )
+            )
+            if node.args.vararg is not None:
+                pairs.append((node.args.vararg, None, "many"))
+            if node.args.kwarg is not None:
+                pairs.append((node.args.kwarg, None, "many"))
+            self.functions.append(node.name)
+            self.scopes.append("function")
+            for argument, default, cardinality in pairs:
+                if argument.arg in {"self", "cls"}:
+                    continue
+                self.inspect(
+                    name=argument.arg,
+                    annotation=argument.annotation,
+                    default=default,
+                    default_absent=default is None,
+                    kind="parameter",
+                    path=f"{scope}.parameters.{argument.arg}",
+                    line=argument.lineno,
+                    parameter=True,
+                    cardinality=cardinality,
+                )
+                self.scan_literal(default, argument.arg)
+            self.generic_visit(node)
+            self.scopes.pop()
+            self.functions.pop()
+
+        visit_FunctionDef = _visit_function
+        visit_AsyncFunctionDef = _visit_function
+
+        def visit_Constant(self, node: ast.Constant) -> None:
+            self.scan_literal(node, None)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            name: str | None = None
+            path: str | None = None
+            kind: str | None = None
+            if isinstance(node.target, ast.Name):
+                name = node.target.id
+                if self.scopes and self.scopes[-1] == "class":
+                    path = f"$.classes.{self.classes[-1]}.fields.{name}"
+                    kind = "class_field"
+                elif not self.scopes:
+                    path = f"$.module.fields.{name}"
+                    kind = "module_field"
+                else:
+                    self.scan_literal(node.value, name)
+                    self.generic_visit(node)
+                    return
+            elif (
+                isinstance(node.target, ast.Attribute)
+                and isinstance(node.target.value, ast.Name)
+                and node.target.value.id in {"self", "cls"}
+            ):
+                name = node.target.attr
+                owner = self.classes[-1] if self.classes else "<module>"
+                path = f"$.classes.{owner}.self_fields.{name}"
+                kind = "self_field"
+            if name is not None and path is not None and kind is not None:
+                self.inspect(
+                    name=name,
+                    annotation=node.annotation,
+                    default=node.value,
+                    default_absent=node.value is None,
+                    kind=kind,
+                    path=path,
+                    line=node.lineno,
+                )
+                self.scan_literal(node.value, name)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                name: str | None = None
+                path: str | None = None
+                kind: str | None = None
+                inspect_declaration = True
                 if isinstance(target, ast.Name):
                     name = target.id
-            if name is None:
-                continue
-            budget.charge_text(name)
-            field_path = f"$.classes.{node.name}.fields.{name}"
-            if is_secret_field_name(name) and not _safe_source_type(annotation):
-                try:
-                    allowed = _source_exception(
-                        file_path=file_path,
-                        schema=schema,
-                        field_path=field_path,
-                        node=(name, annotation),
-                        exceptions=exceptions,
-                        used_exceptions=used_exceptions,
+                    if self.scopes and self.scopes[-1] == "class":
+                        path = f"$.classes.{self.classes[-1]}.fields.{name}"
+                        kind = "class_field"
+                    elif not self.scopes:
+                        path = f"$.module.fields.{name}"
+                        kind = "module_field"
+                    else:
+                        inspect_declaration = False
+                elif (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in {"self", "cls"}
+                ):
+                    name = target.attr
+                    owner = self.classes[-1] if self.classes else "<module>"
+                    path = f"$.classes.{owner}.self_fields.{name}"
+                    kind = "self_field"
+                if name is None:
+                    continue
+                if inspect_declaration and path is not None and kind is not None:
+                    self.inspect(
+                        name=name,
+                        annotation=None,
+                        default=node.value,
+                        default_absent=False,
+                        kind=kind,
+                        path=path,
+                        line=node.lineno,
                     )
-                except ScanDataError:
-                    findings.append(
-                        Finding(file_path, statement.lineno, "SCF004_INVALID_EXCEPTION")
+                self.scan_literal(node.value, name)
+            self.generic_visit(node)
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    self.scan_literal(value, key.value)
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            function = _annotation_text(node.func).split(".")[-1]
+            factory_name = "<anonymous>"
+            if (
+                node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                factory_name = node.args[0].value
+            if function == "TypedDict":
+                if len(node.args) >= 2:
+                    if not isinstance(node.args[1], ast.Dict):
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                    for key, field_annotation in zip(
+                        node.args[1].keys, node.args[1].values
+                    ):
+                        if not (
+                            isinstance(key, ast.Constant) and isinstance(key.value, str)
+                        ):
+                            raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                        self.inspect(
+                            name=key.value,
+                            annotation=field_annotation,
+                            default=None,
+                            default_absent=True,
+                            kind="typed_dict_field",
+                            path=f"$.factories.{factory_name}.fields.{key.value}",
+                            line=getattr(key, "lineno", node.lineno),
+                        )
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                    if keyword.arg in {"closed", "extra_items", "total"}:
+                        continue
+                    self.inspect(
+                        name=keyword.arg,
+                        annotation=keyword.value,
+                        default=None,
+                        default_absent=True,
+                        kind="typed_dict_field",
+                        path=f"$.factories.{factory_name}.fields.{keyword.arg}",
+                        line=keyword.value.lineno,
                     )
-                    allowed = True
-                if not allowed:
-                    findings.append(
-                        Finding(file_path, statement.lineno, "SCF005_SOURCE_FIELD")
+            elif function == "make_dataclass":
+                if len(node.args) < 2 or not isinstance(
+                    node.args[1], (ast.List, ast.Tuple)
+                ):
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                for field in node.args[1].elts:
+                    if isinstance(field, ast.Constant) and isinstance(field.value, str):
+                        self.inspect(
+                            name=field.value,
+                            annotation=None,
+                            default=None,
+                            default_absent=True,
+                            kind="dataclass_factory_field",
+                            path=f"$.factories.{factory_name}.fields.{field.value}",
+                            line=getattr(field, "lineno", node.lineno),
+                        )
+                        continue
+                    if not (
+                        isinstance(field, (ast.List, ast.Tuple))
+                        and 2 <= len(field.elts) <= 3
+                    ):
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                    name_node = field.elts[0]
+                    if not (
+                        isinstance(name_node, ast.Constant)
+                        and isinstance(name_node.value, str)
+                    ):
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                    field_default = field.elts[2] if len(field.elts) == 3 else None
+                    self.inspect(
+                        name=name_node.value,
+                        annotation=field.elts[1],
+                        default=field_default,
+                        default_absent=field_default is None,
+                        kind="dataclass_factory_field",
+                        path=f"$.factories.{factory_name}.fields.{name_node.value}",
+                        line=getattr(name_node, "lineno", node.lineno),
                     )
+            elif function == "create_model":
+                for keyword in node.keywords:
+                    model_fields: list[tuple[ast.expr | None, ast.expr]]
+                    if keyword.arg is None:
+                        if not isinstance(keyword.value, ast.Dict):
+                            raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                        model_fields = list(
+                            zip(keyword.value.keys, keyword.value.values)
+                        )
+                    else:
+                        model_fields = [
+                            (ast.Constant(value=keyword.arg), keyword.value)
+                        ]
+                    for model_name_node, field_value in model_fields:
+                        if not (
+                            isinstance(model_name_node, ast.Constant)
+                            and isinstance(model_name_node.value, str)
+                        ):
+                            raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                        model_annotation: ast.expr | None = None
+                        model_default: ast.expr | None = field_value
+                        if (
+                            isinstance(field_value, ast.Tuple)
+                            and len(field_value.elts) == 2
+                        ):
+                            model_annotation, model_default = field_value.elts
+                        self.inspect(
+                            name=model_name_node.value,
+                            annotation=model_annotation,
+                            default=model_default,
+                            default_absent=False,
+                            kind="pydantic_factory_field",
+                            path=(
+                                f"$.factories.{factory_name}.fields."
+                                f"{model_name_node.value}"
+                            ),
+                            line=getattr(model_name_node, "lineno", field_value.lineno),
+                        )
+                        self.scan_literal(model_default, model_name_node.value)
+            self.generic_visit(node)
+
+    for node in ast.walk(tree):
+        budget.charge_structure()
+    Visitor().visit(tree)
     return StructuredScan(hits, findings)
 
 
-_TS_BLOCK = re.compile(
-    r"^\s*(?:(?:export|default|declare|abstract)\s+)*"
-    r"(?:(interface|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)|"
-    r"type\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\s*<[^>{}\n]{1,512}>)?\s*=)"
-)
-_TS_FIELD_NAME = (
-    r'(?:#?[A-Za-z_$][A-Za-z0-9_$-]*|["\'][A-Za-z_$][A-Za-z0-9_$-]*["\']|'
-    r'\[\s*["\'][A-Za-z_$][A-Za-z0-9_$-]*["\']\s*\])'
-)
-_TS_FIELD = re.compile(
-    rf"^\s*(?:(?:public|private|protected|static|readonly|declare|abstract)\s+)*"
-    rf"(?P<name>{_TS_FIELD_NAME})[?!]?\s*[:=]\s*(?P<type>[^;]+)"
-)
-_TS_BARE_FIELD = re.compile(
-    rf"^\s*(?:(?:public|private|protected|static|readonly|declare|abstract)\s+)*"
-    rf"(?P<name>{_TS_FIELD_NAME})\??\s*$"
-)
-_TS_PARAMETER_FIELD = re.compile(
-    rf"(?:(?:public|private|protected|readonly)\s+)+"
-    rf"(?P<name>{_TS_FIELD_NAME})\??\s*:\s*(?P<type>[^,)=]+)"
-)
+@dataclass(frozen=True)
+class JsToken:
+    kind: str
+    value: str
+    start: int
+    end: int
+    line: int
 
 
-def _typescript_field_name(raw: str) -> str:
-    value = raw.strip()
-    if value.startswith("["):
-        value = value[1:-1].strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        value = value[1:-1]
-    return value.removeprefix("#")
-
-
-def _brace_delta(line: str) -> int:
-    result: list[str] = []
-    quote: str | None = None
-    escaped = False
+def _decode_js_string(raw: str, quote: str) -> str:
+    chars: list[str] = []
     index = 0
-    while index < len(line):
-        char = line[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            result.append(" ")
+    escapes = {
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "b": "\b",
+        "f": "\f",
+        "v": "\v",
+        "0": "\x00",
+    }
+    while index < len(raw):
+        char = raw[index]
+        index += 1
+        if char != "\\":
+            chars.append(char)
+            continue
+        if index >= len(raw):
+            raise ScanDataError("SCN011_MALFORMED_SOURCE")
+        escaped = raw[index]
+        index += 1
+        if escaped in {"x", "u"}:
+            width = 2 if escaped == "x" else 4
+            digits = raw[index : index + width]
+            if not re.fullmatch(rf"[0-9A-Fa-f]{{{width}}}", digits):
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            codepoint = int(digits, 16)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            chars.append(chr(codepoint))
+            index += width
+        elif escaped in escapes:
+            chars.append(escapes[escaped])
+        elif escaped in {"\\", "'", '"', "`", "/"}:
+            chars.append(escaped)
+        elif escaped in {"\n", "\r"}:
+            if escaped == "\r" and index < len(raw) and raw[index] == "\n":
+                index += 1
+        else:
+            raise ScanDataError("SCN011_MALFORMED_SOURCE")
+    value = "".join(chars)
+    if any(
+        unicodedata.category(char) in {"Cc", "Cf"} and char not in {"\n", "\r", "\t"}
+        for char in value
+    ):
+        raise ScanDataError("SCN011_MALFORMED_SOURCE")
+    return value
+
+
+def _tokenize_typescript(text: str, budget: WorkBudget) -> list[JsToken]:
+    tokens: list[JsToken] = []
+    index = 0
+    line = 1
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            line += char == "\n"
             index += 1
             continue
+        if text.startswith("//", index):
+            end = text.find("\n", index + 2)
+            index = len(text) if end < 0 else end
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end < 0:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", line)
+            line += text.count("\n", index, end + 2)
+            index = end + 2
+            continue
+        start = index
+        token_line = line
         if char in {'"', "'", "`"}:
             quote = char
-            result.append(" ")
+            index += 1
+            escaped = False
+            while index < len(text):
+                current = text[index]
+                if not escaped and current == quote:
+                    break
+                if not escaped and current == "\\":
+                    escaped = True
+                else:
+                    escaped = False
+                line += current == "\n"
+                index += 1
+            if index >= len(text):
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", token_line)
+            raw = text[start + 1 : index]
+            index += 1
+            value = _decode_js_string(raw, quote)
+            tokens.append(JsToken("string", value, start, index, token_line))
+        elif char.isalpha() or char in "_$":
+            index += 1
+            while index < len(text) and (text[index].isalnum() or text[index] in "_$-"):
+                index += 1
+            tokens.append(
+                JsToken("identifier", text[start:index], start, index, token_line)
+            )
+        elif char.isdigit():
+            index += 1
+            while index < len(text) and (text[index].isalnum() or text[index] in "._"):
+                index += 1
+            tokens.append(
+                JsToken("number", text[start:index], start, index, token_line)
+            )
+        else:
+            operator = text[index : index + 3]
+            matched = next(
+                (
+                    value
+                    for value in (
+                        "??=",
+                        "||=",
+                        "&&=",
+                        "=>",
+                        "?.",
+                        "...",
+                        "??",
+                        "||",
+                        "&&",
+                    )
+                    if operator.startswith(value)
+                ),
+                char,
+            )
+            index += len(matched)
+            tokens.append(JsToken("punct", matched, start, index, token_line))
+        budget.charge_structure()
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for token in tokens:
+        if token.value in {"(", "[", "{"}:
+            stack.append(token.value)
+        elif token.value in pairs:
+            if not stack or stack.pop() != pairs[token.value]:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", token.line)
+    if stack:
+        raise ScanDataError("SCN011_MALFORMED_SOURCE")
+    return tokens
+
+
+def _matching_token(
+    tokens: list[JsToken], start: int, opening: str, closing: str
+) -> int:
+    depth = 0
+    for index in range(start, len(tokens)):
+        if tokens[index].value == opening:
+            depth += 1
+        elif tokens[index].value == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ScanDataError("SCN011_MALFORMED_SOURCE", tokens[start].line)
+
+
+def _typescript_import_provenance(
+    tokens: list[JsToken],
+    file_path: str,
+    parameter_ranges: list[tuple[int, int]],
+) -> set[str]:
+    del file_path
+    safe: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        if tokens[index].value != "import":
             index += 1
             continue
-        if char == "/" and index + 1 < len(line) and line[index + 1] == "/":
-            break
-        result.append(char)
-        index += 1
-    cleaned = "".join(result)
-    return cleaned.count("{") - cleaned.count("}")
+        source_index: int | None = None
+        depth = 0
+        for position in range(index + 1, len(tokens)):
+            value = tokens[position].value
+            if value in {"{", "["}:
+                depth += 1
+            elif value in {"}", "]"} and depth:
+                depth -= 1
+            if depth == 0 and value == ";":
+                break
+            if (
+                depth == 0
+                and position > index + 1
+                and value
+                in {
+                    "class",
+                    "const",
+                    "enum",
+                    "export",
+                    "function",
+                    "import",
+                    "interface",
+                    "let",
+                    "namespace",
+                    "var",
+                }
+            ):
+                break
+            if (
+                tokens[position].kind == "string"
+                and tokens[position - 1].value == "from"
+            ):
+                source_index = position
+                break
+        if (
+            source_index is not None
+            and tokens[source_index].value == _TYPESCRIPT_SAFE_MODULE
+        ):
+            opening = next(
+                (
+                    position
+                    for position in range(index + 1, source_index)
+                    if tokens[position].value == "{"
+                ),
+                None,
+            )
+            if opening is not None:
+                closing = _matching_token(tokens, opening, "{", "}")
+                if closing < source_index:
+                    specifier: list[JsToken] = []
+
+                    def record_specifier(parts: list[JsToken]) -> None:
+                        values = list(parts)
+                        if values and values[0].value == "type":
+                            values = values[1:]
+                        if (
+                            len(values) == 1
+                            and values[0].kind == "identifier"
+                            and values[0].value in _SAFE_SOURCE_TYPE_NAMES
+                        ):
+                            safe.add(values[0].value)
+                        elif (
+                            len(values) == 3
+                            and values[0].kind == "identifier"
+                            and values[0].value in _SAFE_SOURCE_TYPE_NAMES
+                            and values[1].value == "as"
+                            and values[2].kind == "identifier"
+                        ):
+                            safe.add(values[2].value)
+
+                    for position in range(opening + 1, closing):
+                        if tokens[position].value == ",":
+                            record_specifier(specifier)
+                            specifier = []
+                        else:
+                            specifier.append(tokens[position])
+                    record_specifier(specifier)
+        index = source_index + 1 if source_index is not None else index + 1
+    for index, token in enumerate(tokens[:-1]):
+        if token.value in {
+            "interface",
+            "type",
+            "class",
+            "const",
+            "enum",
+            "let",
+            "namespace",
+            "var",
+            "function",
+        }:
+            if (
+                token.value == "type"
+                and index > 0
+                and tokens[index - 1].value == "import"
+            ):
+                continue
+            local = tokens[index + 1].value
+            if local in safe:
+                safe.discard(local)
+            if token.value in {"const", "let", "var"} and local in {"{", "["}:
+                closing = _matching_token(
+                    tokens, index + 1, local, "}" if local == "{" else "]"
+                )
+                if any(
+                    candidate.value in safe for candidate in tokens[index + 2 : closing]
+                ):
+                    safe.difference_update(
+                        candidate.value
+                        for candidate in tokens[index + 2 : closing]
+                        if candidate.value in safe
+                    )
+    for index, token in enumerate(tokens):
+        if token.value not in safe:
+            continue
+        matching_range = next(
+            ((start, end) for start, end in parameter_ranges if start < index < end),
+            None,
+        )
+        if matching_range is None:
+            continue
+        previous = tokens[index - 1].value if index else ""
+        nested_destructure = any(
+            token.value in {"{", "["} for token in tokens[matching_range[0] + 1 : index]
+        )
+        if nested_destructure or previous not in {":", "|", "&", "<"}:
+            safe.discard(token.value)
+    return safe
+
+
+def _typescript_type_is_safe(
+    tokens: list[JsToken], safe_names: set[str], default_kind: str
+) -> bool:
+    if default_kind not in {"absent", "none"}:
+        return False
+    values = [
+        token.value for token in tokens if token.value not in {"?", " ", "readonly"}
+    ]
+    if not values:
+        return False
+    members: list[list[str]] = [[]]
+    for value in values:
+        if value == "|":
+            members.append([])
+        else:
+            members[-1].append(value)
+    safe_count = 0
+    for member in members:
+        if member in (["null"], ["undefined"]):
+            continue
+        if len(member) == 1 and member[0] in safe_names:
+            safe_count += 1
+            continue
+        return False
+    return safe_count == 1
 
 
 def scan_typescript_source(
@@ -1245,35 +2239,97 @@ def scan_typescript_source(
     *,
     file_path: str,
     exceptions: dict[tuple[str, str, str], dict[str, Any]],
-    used_exceptions: set[tuple[str, str, str]],
+    used_exceptions: dict[tuple[str, str, str], int],
     budget: WorkBudget,
     maximum_hits: int,
 ) -> StructuredScan:
-    del maximum_hits
     findings: list[Finding] = []
+    hits: list[ContentHit] = []
     schema = "typescript:source.v1"
-    block_kind: str | None = None
-    block_name: str | None = None
-    depth = 0
+    tokens = _tokenize_typescript(text, budget)
+    blocks: list[tuple[int, int, str, str]] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token.value not in {"interface", "class", "type"}:
+            continue
+        name = tokens[index + 1].value
+        opening = next(
+            (
+                position
+                for position in range(index + 2, len(tokens))
+                if tokens[position].value in {"{", ";"}
+            ),
+            None,
+        )
+        if opening is None or tokens[opening].value != "{":
+            continue
+        blocks.append(
+            (opening, _matching_token(tokens, opening, "{", "}"), token.value, name)
+        )
 
-    def inspect_field(raw_name: str, declared_type: str, number: int) -> None:
-        assert block_name is not None
-        name = _typescript_field_name(raw_name)
+    def enclosing(index: int) -> tuple[str, str] | None:
+        candidates = [
+            (end - start, kind, name)
+            for start, end, kind, name in blocks
+            if start < index < end
+        ]
+        if not candidates:
+            return None
+        _width, kind, name = min(candidates)
+        return kind, name
+
+    method_blocks: list[tuple[int, int, str, str]] = []
+
+    def enclosing_method(index: int) -> tuple[str, str] | None:
+        candidates = [
+            (end - start, class_name, method_name)
+            for start, end, class_name, method_name in method_blocks
+            if start < index < end
+        ]
+        if not candidates:
+            return None
+        _width, class_name, method_name = min(candidates)
+        return class_name, method_name
+
+    def inspect_field(
+        name: str,
+        declared_tokens: list[JsToken],
+        default_kind: str,
+        number: int,
+        index: int,
+        declaration_kind: str,
+    ) -> None:
         budget.charge_text(name)
+        block = enclosing(index)
+        method = enclosing_method(index)
         collection = {
             "interface": "interfaces",
             "class": "classes",
             "type": "types",
-        }[block_kind or "type"]
-        field_path = f"$.{collection}.{block_name}.fields.{name}"
-        if not is_secret_field_name(name) or _safe_source_type(declared_type):
+        }[(block or ("type", "<module>"))[0]]
+        block_name = (block or ("type", "<module>"))[1]
+        if declaration_kind == "source_field" and method is not None:
+            declaration_kind = "object_field"
+            field_path = (
+                f"$.classes.{method[0]}.methods.{method[1]}.object_fields.{name}"
+            )
+        else:
+            field_path = f"$.{collection}.{block_name}.fields.{name}"
+        if declaration_kind == "source_field" and block is not None and method is None:
+            declaration_kind = f"{block[0]}_field"
+        declared_type = "".join(token.value for token in declared_tokens)
+        if not is_secret_field_name(name) or _typescript_type_is_safe(
+            declared_tokens, safe_names, default_kind
+        ):
             return
+        declaration = SourceDeclaration(
+            name, declared_type, declaration_kind, "one", default_kind
+        )
         try:
             allowed = _source_exception(
                 file_path=file_path,
                 schema=schema,
                 field_path=field_path,
-                node=(name, declared_type),
+                node=declaration,
                 exceptions=exceptions,
                 used_exceptions=used_exceptions,
             )
@@ -1283,48 +2339,357 @@ def scan_typescript_source(
         if not allowed:
             findings.append(Finding(file_path, number, "SCF005_SOURCE_FIELD"))
 
-    def inspect_line(line: str, number: int) -> None:
-        for segment in line.split(";"):
-            field = _TS_FIELD.match(segment)
-            if field is not None:
-                inspect_field(field.group("name"), field.group("type").strip(), number)
-                continue
-            bare_field = _TS_BARE_FIELD.match(segment)
-            if bare_field is not None:
-                inspect_field(bare_field.group("name"), "", number)
-        if "constructor" in line:
-            for parameter in _TS_PARAMETER_FIELD.finditer(line):
-                inspect_field(
-                    parameter.group("name"), parameter.group("type").strip(), number
+    def type_and_default(index: int) -> tuple[list[JsToken], str]:
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor].value in {"?", "!"}:
+            cursor += 1
+        declared: list[JsToken] = []
+        default = "absent"
+        if cursor < len(tokens) and tokens[cursor].value == ":":
+            cursor += 1
+            depth = 0
+            while cursor < len(tokens):
+                value = tokens[cursor].value
+                if depth == 0 and value in {"=", ";", ",", ")", "}"}:
+                    break
+                if value in {"<", "(", "[", "{"}:
+                    depth += 1
+                elif value in {">", ")", "]", "}"} and depth:
+                    depth -= 1
+                declared.append(tokens[cursor])
+                cursor += 1
+        if cursor < len(tokens) and tokens[cursor].value == "=":
+            next_value = tokens[cursor + 1].value if cursor + 1 < len(tokens) else ""
+            default = (
+                "none"
+                if next_value in {"null", "undefined"}
+                else "literal"
+                if cursor + 1 < len(tokens)
+                and tokens[cursor + 1].kind in {"string", "number"}
+                else "expression"
+            )
+        return declared, default
+
+    declaration_keywords = {"const", "let", "var"}
+    modifiers = {
+        "abstract",
+        "declare",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "static",
+    }
+    brace_depths: list[int] = []
+    brace_depth = 0
+    for candidate in tokens:
+        brace_depths.append(brace_depth)
+        if candidate.value == "{":
+            brace_depth += 1
+        elif candidate.value == "}":
+            brace_depth -= 1
+
+    parameter_ranges: list[tuple[int, int]] = []
+
+    def callable_name(opening: int) -> str:
+        cursor = opening - 1
+        if cursor >= 0 and tokens[cursor].value == ">":
+            depth = 1
+            cursor -= 1
+            while cursor >= 0 and depth:
+                if tokens[cursor].value == ">":
+                    depth += 1
+                elif tokens[cursor].value == "<":
+                    depth -= 1
+                cursor -= 1
+        return tokens[cursor].value if cursor >= 0 else "<anonymous>"
+
+    for opening, candidate in enumerate(tokens):
+        if candidate.value != "(":
+            continue
+        closing = _matching_token(tokens, opening, "(", ")")
+        previous = tokens[opening - 1].value if opening else ""
+        before_previous = tokens[opening - 2].value if opening >= 2 else ""
+        block = enclosing(opening)
+        class_method = bool(
+            block
+            and block[0] == "class"
+            and brace_depths[opening]
+            == brace_depths[
+                next(
+                    start
+                    for start, _end, kind, name in blocks
+                    if kind == block[0] and name == block[1]
+                )
+            ]
+            + 1
+            and previous not in {"if", "for", "while", "switch", "catch"}
+        )
+        function_declaration = (
+            before_previous in {"function", "constructor"} or previous == "constructor"
+        )
+        arrow = closing + 1 < len(tokens) and tokens[closing + 1].value == "=>"
+        if class_method or function_declaration or arrow:
+            parameter_ranges.append((opening, closing))
+        if class_method and block is not None:
+            body_opening = next(
+                (
+                    position
+                    for position in range(closing + 1, len(tokens))
+                    if tokens[position].value in {"{", ";"}
+                ),
+                None,
+            )
+            if body_opening is not None and tokens[body_opening].value == "{":
+                method_blocks.append(
+                    (
+                        body_opening,
+                        _matching_token(tokens, body_opening, "{", "}"),
+                        block[1],
+                        callable_name(opening),
+                    )
                 )
 
-    for number, line in enumerate(text.splitlines(), 1):
-        budget.charge_structure()
-        if block_name is None:
-            match = _TS_BLOCK.match(line)
-            if match is None:
-                continue
-            block_kind = match.group(1) or "type"
-            block_name = match.group(2) or match.group(3)
-            depth = _brace_delta(line)
-            opening = line.find("{", match.end())
-            if opening >= 0:
-                inspect_line(line[opening + 1 :], number)
-            if depth <= 0 and opening >= 0:
-                block_kind = None
-                block_name = None
-                depth = 0
+    def in_parameter_list(index: int) -> bool:
+        return any(start < index < end for start, end in parameter_ranges)
+
+    shadow_ranges = list(parameter_ranges)
+    for opening, candidate in enumerate(tokens):
+        if (
+            candidate.value == "("
+            and opening > 0
+            and tokens[opening - 1].value == "catch"
+        ):
+            shadow_ranges.append((opening, _matching_token(tokens, opening, "(", ")")))
+
+    safe_names = _typescript_import_provenance(tokens, file_path, shadow_ranges)
+
+    destructuring_ranges: list[tuple[int, int]] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token.value not in declaration_keywords or tokens[index + 1].value not in {
+            "{",
+            "[",
+        }:
             continue
-        if depth == 1:
-            inspect_line(line, number)
-        depth += _brace_delta(line)
-        if depth <= 0:
-            block_kind = None
-            block_name = None
-            depth = 0
-    if block_name is not None:
-        raise ScanDataError("SCN011_MALFORMED_SOURCE")
-    return StructuredScan([], findings)
+        destructuring_opening = tokens[index + 1].value
+        destructuring_ranges.append(
+            (
+                index + 1,
+                _matching_token(
+                    tokens,
+                    index + 1,
+                    destructuring_opening,
+                    "}" if destructuring_opening == "{" else "]",
+                ),
+            )
+        )
+    for start, end in parameter_ranges:
+        for position in range(start + 1, end):
+            if tokens[position].value not in {"{", "["}:
+                continue
+            previous = tokens[position - 1].value
+            if previous not in {"(", ",", "..."}:
+                continue
+            destructuring_opening = tokens[position].value
+            closing = _matching_token(
+                tokens,
+                position,
+                destructuring_opening,
+                "}" if destructuring_opening == "{" else "]",
+            )
+            if closing < end:
+                destructuring_ranges.append((position, closing))
+
+    def in_destructuring_binding(index: int) -> bool:
+        return any(start < index < end for start, end in destructuring_ranges)
+
+    class_fields: set[tuple[str, str]] = set()
+    for index, token in enumerate(tokens):
+        block = enclosing(index)
+        if block is None or block[0] != "class":
+            continue
+        class_opening = next(
+            start
+            for start, _end, kind, name in blocks
+            if kind == "class" and name == block[1]
+        )
+        if (
+            brace_depths[index] == brace_depths[class_opening] + 1
+            and not in_parameter_list(index)
+            and index + 1 < len(tokens)
+            and (
+                tokens[index + 1].value in {"?", "!", ":", "=", ";"}
+                or (
+                    tokens[index + 1].value == "("
+                    and index > 0
+                    and tokens[index - 1].value in {"get", "set"}
+                )
+            )
+        ):
+            class_fields.add((block[1], token.value.removeprefix("#")))
+
+    for index, token in enumerate(tokens):
+        if token.kind not in {"identifier", "string"}:
+            continue
+        name = token.value.removeprefix("#")
+        if not is_secret_field_name(name):
+            continue
+        previous = tokens[index - 1].value if index else ""
+        next_value = tokens[index + 1].value if index + 1 < len(tokens) else ""
+        # A sensitive-looking imported type name in ``field: SecretRefV2`` is
+        # a type use, not another field declaration.
+        if previous in {":", "|", "&", "<"} and not in_destructuring_binding(index):
+            continue
+        block = enclosing(index)
+        is_alias_name = previous in {"type", "interface", "class"}
+        is_module_variable = brace_depths[index] == 0 and (
+            previous in declaration_keywords
+            or (
+                index >= 2
+                and tokens[index - 2].value in declaration_keywords
+                and previous in modifiers
+            )
+        )
+        direct_class_member = bool(
+            block
+            and block[0] == "class"
+            and (block[1], name) in class_fields
+            and brace_depths[index]
+            == brace_depths[
+                next(
+                    start
+                    for start, _end, kind, class_name in blocks
+                    if kind == "class" and class_name == block[1]
+                )
+            ]
+            + 1
+        )
+        is_accessor = previous in {"get", "set"} and direct_class_member
+        is_object_property = (
+            next_value == ":"
+            and brace_depths[index] > 0
+            and previous not in {"?", "case", "."}
+        )
+        runtime_object_property = bool(
+            is_object_property
+            and not (
+                block and (block[0] in {"interface", "type"} or direct_class_member)
+            )
+        )
+        is_property = bool(
+            is_object_property
+            or (
+                block
+                and next_value in {"?", "!", ":", "=", ";", "("}
+                and not in_parameter_list(index)
+                and (block[0] in {"interface", "type"} or direct_class_member)
+            )
+        )
+        is_parameter = next_value in {"?", ":", "="} and in_parameter_list(index)
+        is_destructured_alias = in_destructuring_binding(index)
+        assignment_operators = {"=", "??=", "||=", "&&="}
+        is_member_assignment = bool(
+            previous == "." and index >= 2 and next_value in assignment_operators
+        )
+        is_plain_assignment = previous != "." and next_value in assignment_operators
+        is_self_assignment = bool(
+            is_member_assignment
+            and tokens[index - 2].value == "this"
+            and block is not None
+            and (block[1], name) not in class_fields
+        )
+        value_literal = (
+            (
+                is_module_variable
+                or is_property
+                or is_member_assignment
+                or is_plain_assignment
+            )
+            and next_value in {":", *assignment_operators}
+            and index + 2 < len(tokens)
+            and tokens[index + 2].kind in {"string", "number"}
+        )
+        if not (
+            is_alias_name
+            or is_module_variable
+            or is_accessor
+            or is_property
+            or is_parameter
+            or is_destructured_alias
+            or is_member_assignment
+            or is_self_assignment
+            or value_literal
+        ):
+            continue
+        declared, default = type_and_default(index)
+        if runtime_object_property:
+            declared = []
+            value_token = tokens[index + 2] if index + 2 < len(tokens) else None
+            default = (
+                "none"
+                if value_token is not None
+                and value_token.value in {"null", "undefined"}
+                else "literal"
+                if value_token is not None and value_token.kind in {"string", "number"}
+                else "expression"
+            )
+        existing_class_assignment = bool(
+            is_member_assignment
+            and block is not None
+            and (block[1], name) in class_fields
+        )
+        if not existing_class_assignment:
+            inspect_field(
+                name,
+                declared,
+                default,
+                token.line,
+                index,
+                "parameter"
+                if is_parameter and not is_property
+                else "self_field"
+                if is_self_assignment
+                else "source_field",
+            )
+        if (
+            index + 2 < len(tokens)
+            and tokens[index + 1].value in {":", *assignment_operators}
+            and tokens[index + 2].kind == "string"
+        ):
+            value_token = tokens[index + 2]
+            remaining = maximum_hits - len(hits)
+            for hit in scan_content(
+                name + "=" + value_token.value,
+                remaining,
+                authorization_context=is_authorization_context(name),
+                assignment_context=True,
+            ):
+                hits.append(
+                    ContentHit(
+                        value_token.line + hit.line - 1,
+                        value_token.start + hit.start,
+                        value_token.start + max(hit.start + 1, hit.end),
+                        hit.code,
+                    )
+                )
+
+    for token in tokens:
+        if token.kind != "string":
+            continue
+        budget.charge_text(token.value)
+        remaining = maximum_hits - len(hits)
+        if remaining <= 0:
+            break
+        for hit in scan_content(token.value, remaining):
+            hits.append(
+                ContentHit(
+                    token.line + hit.line - 1,
+                    token.start + hit.start,
+                    token.start + max(hit.start + 1, hit.end),
+                    hit.code,
+                )
+            )
+    return StructuredScan(sorted(set(hits)), findings)
 
 
 def looks_like_yaml_document(text: str) -> bool:

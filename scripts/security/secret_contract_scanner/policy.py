@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .io_utils import safe_read_file
+from .io_utils import PinnedRepository, safe_read_file
 from .model import (
     DEFAULT_POLICY_PATH,
     FORMAT_KINDS,
@@ -28,6 +28,60 @@ from .model import (
     safe_policy_path,
 )
 from .structured import parse_json_bytes
+
+
+GOVERNED_ROOT_INVENTORY: dict[str, tuple[str, dict[str, str]]] = {
+    "c03-canonical-fixtures": (
+        "crates/splendor-types/tests/fixtures/secrets",
+        {".json": "json"},
+    ),
+    "driver-credential-sink-fixture": (
+        "crates/splendor-types/tests/fixtures/driver/operation-credential-sinks-v1.json",
+        {".json": "json"},
+    ),
+    "c03-foundation-conformance": (
+        "conformance/0.2/c03-foundation/v1",
+        {".json": "json", ".md": "markdown"},
+    ),
+    "stable-adapter-manifests": (
+        "docs/spec/0.1/fixtures/adapter-manifests",
+        {".json": "json"},
+    ),
+    "runtime-daemon-openapi": (
+        "openapi/splendor-runtime-daemon.yaml",
+        {".yaml": "yaml"},
+    ),
+    "repository-examples": (
+        "examples",
+        {
+            ".gitkeep": "empty",
+            ".cjs": "typescript_source",
+            ".json": "json",
+            ".js": "typescript_source",
+            ".jsx": "typescript_source",
+            ".md": "markdown",
+            ".mjs": "typescript_source",
+            ".mts": "typescript_source",
+            ".py": "python_source",
+            ".ts": "typescript_source",
+            ".tsx": "typescript_source",
+            ".yaml": "yaml",
+            ".yml": "yaml",
+        },
+    ),
+    "python-sdk-external-surface": (
+        "python/splendor",
+        {".py": "python_source"},
+    ),
+    "typescript-types-external-surface": (
+        "typescript/packages/types/src",
+        {".ts": "typescript_source"},
+    ),
+    "typescript-client-external-surface": (
+        "typescript/packages/client/src",
+        {".ts": "typescript_source"},
+    ),
+}
 
 
 def parse_date(value: Any) -> dt.date | None:
@@ -131,6 +185,13 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
                 or kind not in FORMAT_KINDS
             ):
                 return invalid()
+    actual_roots = {
+        entry["id"]: (entry["path"], entry["formats"])
+        for entry in roots
+        if isinstance(entry, dict)
+    }
+    if actual_roots != GOVERNED_ROOT_INVENTORY:
+        return invalid()
 
     digest_entry_keys = {"owner", "path", "reason", "schema_version", "sha256"}
     owner_paths: set[str] = set()
@@ -161,7 +222,12 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         "scanner_version",
         "validator",
     }
-    exception_keys = expiring_common | {"document_schema", "field_path"}
+    exception_keys = expiring_common | {
+        "document_schema",
+        "field_path",
+        "occurrences",
+        "sha256",
+    }
     exception_identities: set[tuple[str, str, str]] = set()
     exception_validators = {
         "caller_credential_projection",
@@ -174,6 +240,7 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         "python_acceptance_signing_material",
         "python_caller_auth_transport",
         "typescript_caller_auth_transport",
+        "typescript_owner_safe_reference",
     }
     exceptions = policy["structural_exceptions"]
     if not isinstance(exceptions, list):
@@ -188,6 +255,10 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
             or expiry < today
             or entry["scanner_version"] != SCANNER_VERSION
             or entry["validator"] not in exception_validators
+            or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            or not isinstance(entry["occurrences"], int)
+            or isinstance(entry["occurrences"], bool)
+            or entry["occurrences"] != 1
             or not isinstance(entry["field_path"], str)
             or not entry["field_path"].startswith("$.")
             or "*" in entry["field_path"]
@@ -269,7 +340,7 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
 
 
 def load_policy(
-    repo_root: Path, policy_path: str, *, today: dt.date
+    repo_root: Path | PinnedRepository, policy_path: str, *, today: dt.date
 ) -> tuple[dict[str, Any] | None, list[Finding]]:
     if not safe_policy_path(policy_path):
         return None, [Finding(DEFAULT_POLICY_PATH, 0, "SCN001_POLICY_INVALID")]

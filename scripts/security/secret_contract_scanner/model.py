@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -35,6 +35,7 @@ SOURCE_SUFFIXES = {
 }
 FORMAT_KINDS = {
     "content",
+    "config",
     "empty",
     "json",
     "markdown",
@@ -94,7 +95,7 @@ def utf8_size(value: str) -> int | None:
 
 
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(?:^|[^a-z0-9])(?:auth(?:orization)?|credential|password|passwd|secret|token|api[_-]?key|client[_-]?secret|private[_-]?key)\s*[=:][^/\\\s]+"
+    r"(?i)(?:^|[^a-z0-9])(?:auth(?:orization)?s?|credentials?|passwords?|passwds?|secrets?|tokens?|api[_-]?keys?|client[_-]?secrets?|private[_-]?keys?)\s*[=:][^/\\\s]+"
 )
 _URL_USERINFO = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^/@:\s]+:[^/@\s]+@")
 _USERINFO_FRAGMENT = re.compile(r"[^/:@\s]+:[^/@\s]+@")
@@ -120,6 +121,9 @@ def _segment_variants(segment: str) -> tuple[str, ...]:
     variants: list[str] = []
     for value in raw_variants:
         variants.append(value)
+        nfkc = unicodedata.normalize("NFKC", value)
+        if nfkc != value:
+            variants.append(nfkc)
         normalized = "".join(" " if char.isspace() else char for char in value)
         if normalized != value:
             variants.append(normalized)
@@ -141,20 +145,29 @@ def _looks_like_opaque_mixed_fragment(value: str) -> bool:
 def _redact_segment(segment: str) -> str:
     if not segment:
         return segment
+    # Keep coordinate classification canonical without creating an import cycle
+    # while this module is initialized. Diagnostics are rendered only after all
+    # scanner modules have loaded.
+    from .content import is_secret_field_name
+
     variants = _segment_variants(segment)
-    unsafe = utf8_size(segment) is None or any(
-        bool(_CREDENTIAL_ASSIGNMENT.search(value))
-        or bool(_URL_USERINFO.search(value))
-        or bool(_USERINFO_FRAGMENT.search(value))
-        or bool(_AUTH_FRAGMENT.search(value))
-        or bool(_PROVIDER_FRAGMENT.search(value))
-        or _looks_like_opaque_mixed_fragment(value)
-        for value in variants
+    unsafe = (
+        utf8_size(segment) is None
+        or any(unicodedata.category(char) in {"Cc", "Cf"} for char in segment)
+        or any(
+            bool(_CREDENTIAL_ASSIGNMENT.search(value))
+            or bool(_URL_USERINFO.search(value))
+            or bool(_USERINFO_FRAGMENT.search(value))
+            or bool(_AUTH_FRAGMENT.search(value))
+            or bool(_PROVIDER_FRAGMENT.search(value))
+            or _looks_like_opaque_mixed_fragment(value)
+            or is_secret_field_name(value.rsplit(".", 1)[0])
+            for value in variants
+        )
     )
     if not unsafe:
         return segment
-    digest = hashlib.sha256(segment.encode("utf-8", "surrogatepass")).hexdigest()[:12]
-    return f"<redacted-{digest}>"
+    return "<redacted>"
 
 
 def redact_diagnostic_path(value: str) -> str:
@@ -212,6 +225,25 @@ class WorkBudget:
     def charge_file(self) -> None:
         self.files += 1
         if self.files > self.limits["max_files"]:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+    def ensure_file_capacity(self, amount: int) -> None:
+        if amount < 0 or self.files + amount > self.limits["max_files"]:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+    def ensure_archive_capacity(self, amount: int) -> None:
+        if (
+            amount < 0
+            or self.archive_members + amount > self.limits["max_archive_members"]
+            or self.files + amount > self.limits["max_files"]
+        ):
+            raise ScanDataError("SCA001_ARCHIVE_INVALID")
+
+    def remaining_work_bytes(self) -> int:
+        return max(0, self.limits["max_total_bytes"] - self.work_bytes)
+
+    def ensure_work_capacity(self, amount: int) -> None:
+        if amount < 0 or amount > self.remaining_work_bytes():
             raise ScanDataError("SCN005_BUDGET_EXCEEDED")
 
     def charge_work(self, amount: int) -> None:

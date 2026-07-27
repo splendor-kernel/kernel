@@ -13,13 +13,14 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: C03 secret contract and fixture guard
         run: |
-          python3 scripts/security/check-secret-contracts.py --self-test
-          python3 scripts/security/check-secret-contracts.py
+          /usr/bin/python3 scripts/security/check-secret-contracts.py --self-test
+          /usr/bin/python3 scripts/security/check-secret-contracts.py
 
   rust:
     needs: secret-contracts
@@ -29,8 +30,9 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: Install Rust toolchain
         run: |
@@ -61,8 +63,9 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - uses: actions/setup-python@v5
         with:
@@ -82,8 +85,9 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - uses: actions/setup-node@v4
         with:
@@ -105,8 +109,9 @@ jobs:
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: Docker deployment image smoke test
         run: bash scripts/container-tests.sh

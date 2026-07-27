@@ -1,83 +1,221 @@
-"""Race-aware repository enumeration and nonblocking regular-file reads."""
+"""Descriptor-relative repository enumeration and race-closed file reads."""
 
 from __future__ import annotations
 
 import os
+import selectors
 import stat
 import subprocess
+import time
 from pathlib import Path, PurePosixPath
+from types import TracebackType
 
 from .model import (
     HARD_GIT_TIMEOUT_SECONDS,
+    HARD_MAX_FILES,
     Finding,
     ScanDataError,
     safe_policy_path,
 )
 
 
-def ensure_no_symlink_ancestry(repo_root: Path, relative: str) -> Path:
-    if not safe_policy_path(relative):
-        raise ScanDataError("SCN003_PATH_AMBIGUOUS")
-    current = repo_root
-    for part in PurePosixPath(relative).parts:
-        current = current / part
-        try:
-            info = current.lstat()
-        except OSError as exc:
-            raise ScanDataError("SCN002_PATH_UNAVAILABLE") from exc
-        if stat.S_ISLNK(info.st_mode):
-            raise ScanDataError("SCN003_PATH_AMBIGUOUS")
-    try:
-        resolved = current.resolve(strict=True)
-        root_resolved = repo_root.resolve(strict=True)
-        resolved.relative_to(root_resolved)
-    except (OSError, ValueError) as exc:
-        raise ScanDataError("SCN003_PATH_AMBIGUOUS") from exc
-    return current
+def _identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode)
 
 
-def safe_read_file(repo_root: Path, relative: str, maximum: int) -> bytes:
-    path = ensure_no_symlink_ancestry(repo_root, relative)
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _file_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _close(descriptor: int) -> None:
     try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ScanDataError("SCN002_PATH_UNAVAILABLE") from exc
-    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+class PinnedRepository:
+    """A canonical root held through a no-follow descriptor ancestry."""
+
+    def __init__(self, repo_root: Path):
         try:
-            info = os.fstat(descriptor)
+            canonical = repo_root.resolve(strict=True)
         except OSError as exc:
             raise ScanDataError("SCN002_PATH_UNAVAILABLE") from exc
-        if not stat.S_ISREG(info.st_mode):
+        if not canonical.is_absolute():
             raise ScanDataError("SCN003_PATH_AMBIGUOUS")
-        if info.st_size > maximum:
-            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
-        chunks: list[bytes] = []
-        remaining = maximum + 1
-        while remaining > 0:
-            try:
+        self.path = canonical
+        self._chain: list[tuple[int, str, int, tuple[int, int, int]]] = []
+        self._descriptors: list[int] = []
+        try:
+            parent = os.open(os.sep, _directory_flags())
+            self._descriptors.append(parent)
+            parts = canonical.parts[1:]
+            for part in parts:
+                child = os.open(part, _directory_flags(), dir_fd=parent)
+                self._descriptors.append(child)
+                info = os.fstat(child)
+                linked = os.stat(part, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or _identity(info) != _identity(
+                    linked
+                ):
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+                self._chain.append((parent, part, child, _identity(info)))
+                parent = child
+            self.root_fd = parent
+            self.assert_identity()
+        except ScanDataError:
+            self.close()
+            raise
+        except OSError as exc:
+            self.close()
+            raise ScanDataError("SCN003_PATH_AMBIGUOUS") from exc
+
+    def __enter__(self) -> PinnedRepository:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for descriptor in reversed(getattr(self, "_descriptors", [])):
+            _close(descriptor)
+        self._descriptors = []
+
+    def assert_identity(self) -> None:
+        try:
+            for parent, part, child, expected in self._chain:
+                linked = os.stat(part, dir_fd=parent, follow_symlinks=False)
+                current = os.fstat(child)
+                if _identity(linked) != expected or _identity(current) != expected:
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+        except ScanDataError:
+            raise
+        except OSError as exc:
+            raise ScanDataError("SCN003_PATH_AMBIGUOUS") from exc
+
+    def read_file(self, relative: str, maximum: int) -> bytes:
+        if not safe_policy_path(relative):
+            raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+        self.assert_identity()
+        opened: list[tuple[int, str, int, tuple[int, int, int]]] = []
+        descriptor = -1
+        parent = self.root_fd
+        parts = PurePosixPath(relative).parts
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, _directory_flags(), dir_fd=parent)
+                info = os.fstat(child)
+                linked = os.stat(part, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or _identity(info) != _identity(
+                    linked
+                ):
+                    _close(child)
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+                opened.append((parent, part, child, _identity(info)))
+                parent = child
+
+            final_name = parts[-1]
+            linked_before = os.stat(final_name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(linked_before.st_mode):
+                raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+            descriptor = os.open(final_name, _file_flags(), dir_fd=parent)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or _identity(before) != _identity(
+                linked_before
+            ):
+                raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+            if before.st_size < 0 or before.st_size > maximum:
+                raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            while remaining > 0:
                 chunk = os.read(descriptor, min(64 * 1024, remaining))
-            except OSError as exc:
-                raise ScanDataError("SCN002_PATH_UNAVAILABLE") from exc
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        if len(data) > maximum:
-            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
-        return data
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if len(data) > maximum:
+                raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+            after = os.fstat(descriptor)
+            linked_after = os.stat(final_name, dir_fd=parent, follow_symlinks=False)
+            if (
+                _file_identity(before) != _file_identity(after)
+                or _identity(after) != _identity(linked_after)
+                or len(data) != after.st_size
+            ):
+                raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+            for ancestor_parent, part, child, expected in opened:
+                linked = os.stat(part, dir_fd=ancestor_parent, follow_symlinks=False)
+                if (
+                    _identity(linked) != expected
+                    or _identity(os.fstat(child)) != expected
+                ):
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+            self.assert_identity()
+            return data
+        except ScanDataError:
+            raise
+        except FileNotFoundError as exc:
+            raise ScanDataError("SCN002_PATH_UNAVAILABLE") from exc
+        except OSError as exc:
+            raise ScanDataError("SCN003_PATH_AMBIGUOUS") from exc
+        finally:
+            if descriptor >= 0:
+                _close(descriptor)
+            for _ancestor_parent, _part, child, _expected in reversed(opened):
+                _close(child)
 
 
-def enumerate_repository_files(repo_root: Path) -> tuple[list[str], list[Finding]]:
+def safe_read_file(
+    repo_root: Path | PinnedRepository, relative: str, maximum: int
+) -> bytes:
+    if isinstance(repo_root, PinnedRepository):
+        return repo_root.read_file(relative, maximum)
+    with PinnedRepository(repo_root) as repository:
+        return repository.read_file(relative, maximum)
+
+
+def _bounded_git_paths(
+    repository: PinnedRepository, *, max_files: int
+) -> tuple[list[str], list[Finding]]:
+    if max_files <= 0 or max_files > HARD_MAX_FILES:
+        return [], [Finding(".", 0, "SCN005_BUDGET_EXCEEDED")]
     command = [
         "git",
         "ls-files",
@@ -87,26 +225,94 @@ def enumerate_repository_files(repo_root: Path) -> tuple[list[str], list[Finding
         "-z",
         "--",
     ]
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
     try:
-        completed = subprocess.run(
+        repository.assert_identity()
+
+        def enter_pinned_root() -> None:
+            os.fchdir(repository.root_fd)
+
+        process = subprocess.Popen(
             command,
-            cwd=repo_root,
-            check=False,
-            capture_output=True,
             stdin=subprocess.DEVNULL,
-            timeout=HARD_GIT_TIMEOUT_SECONDS,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(repository.root_fd,),
+            preexec_fn=enter_pinned_root,
         )
+        if process.stdout is None:
+            raise OSError
+        os.set_blocking(process.stdout.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + HARD_GIT_TIMEOUT_SECONDS
+        pending = bytearray()
+        paths: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, HARD_GIT_TIMEOUT_SECONDS)
+            events = selector.select(min(remaining, 0.1))
+            if not events:
+                continue
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            pending.extend(chunk)
+            if len(pending) > 4097 * (max_files + 1):
+                raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+            while b"\x00" in pending:
+                raw, _, rest = pending.partition(b"\x00")
+                pending = bytearray(rest)
+                if len(raw) > 4096 or len(paths) >= max_files:
+                    raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+                try:
+                    value = raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE") from exc
+                if not value or not safe_policy_path(value):
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+                paths.append(value)
+        process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if process.returncode != 0 or pending:
+            raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+        if len(paths) != len(set(paths)):
+            raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+        repository.assert_identity()
+        return sorted(paths), []
+    except ScanDataError as exc:
+        code = exc.code
+        if code not in {"SCN005_BUDGET_EXCEEDED", "SCN010_REPOSITORY_UNAVAILABLE"}:
+            code = "SCN010_REPOSITORY_UNAVAILABLE"
+        return [], [Finding(".", 0, code)]
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return [], [Finding(".", 0, "SCN010_REPOSITORY_UNAVAILABLE")]
-    if completed.returncode != 0:
-        return [], [Finding(".", 0, "SCN010_REPOSITORY_UNAVAILABLE")]
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+
+
+def enumerate_repository_files(
+    repo_root: Path | PinnedRepository, *, max_files: int = HARD_MAX_FILES
+) -> tuple[list[str], list[Finding]]:
+    if isinstance(repo_root, PinnedRepository):
+        return _bounded_git_paths(repo_root, max_files=max_files)
     try:
-        values = completed.stdout.decode("utf-8").split("\x00")
-    except UnicodeDecodeError:
-        return [], [Finding(".", 0, "SCN010_REPOSITORY_UNAVAILABLE")]
-    files = sorted(value for value in values if value)
-    if len(files) != len(set(files)) or any(
-        not safe_policy_path(value) for value in files
-    ):
-        return [], [Finding(".", 0, "SCN010_REPOSITORY_UNAVAILABLE")]
-    return files, []
+        with PinnedRepository(repo_root) as repository:
+            return _bounded_git_paths(repository, max_files=max_files)
+    except ScanDataError as exc:
+        code = (
+            exc.code
+            if exc.code in {"SCN005_BUDGET_EXCEEDED", "SCN010_REPOSITORY_UNAVAILABLE"}
+            else "SCN010_REPOSITORY_UNAVAILABLE"
+        )
+        return [], [Finding(".", 0, code)]
