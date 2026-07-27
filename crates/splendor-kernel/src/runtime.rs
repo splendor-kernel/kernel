@@ -60,6 +60,9 @@ pub struct KernelRuntime {
     identity: TraceIdentityContext,
     /// Monotonic sequence and integrity state for successfully persisted events.
     trace_cursor: Mutex<TraceCursor>,
+    /// Sequence observed when this runtime was constructed. This distinguishes
+    /// an in-process shared fresh runtime from one reopened over persisted history.
+    initial_sequence: u64,
     /// Trace sink used to emit serialized events.
     trace_sink: Arc<dyn TraceSink>,
 }
@@ -69,6 +72,7 @@ pub struct KernelRuntime {
 struct TraceCursor {
     next_sequence: u64,
     prev_event_hash: Option<ContentHash>,
+    tick_activity_started: bool,
 }
 
 impl KernelRuntime {
@@ -76,13 +80,16 @@ impl KernelRuntime {
     pub fn new(config: KernelRuntimeConfig) -> Self {
         let run_id = config.run_id.unwrap_or_default();
         let identity = TraceIdentityContext::from_runtime(run_id.clone(), &config.identity);
+        let initial_sequence = config.initial_sequence;
         Self {
             run_id,
             identity,
             trace_cursor: Mutex::new(TraceCursor {
-                next_sequence: config.initial_sequence,
+                next_sequence: initial_sequence,
                 prev_event_hash: config.initial_prev_hash,
+                tick_activity_started: false,
             }),
+            initial_sequence,
             trace_sink: config.trace_sink,
         }
     }
@@ -144,6 +151,19 @@ impl KernelRuntime {
             .next_sequence
     }
 
+    /// Returns true when construction discovered existing persisted trace history.
+    pub(crate) fn started_with_existing_trace(&self) -> bool {
+        self.initial_sequence != 0
+    }
+
+    /// Returns true after this runtime durably records its first tick start.
+    pub(crate) fn has_started_tick(&self) -> bool {
+        self.trace_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tick_activity_started
+    }
+
     /// Records a `TraceEventKind` and returns the emitted `TraceEvent`.
     pub fn record_event(&self, kind: TraceEventKind) -> Result<TraceEvent, TraceError> {
         self.record_event_with_identity(self.trace_identity(), kind)
@@ -181,6 +201,9 @@ impl KernelRuntime {
             };
         }
         self.trace_sink.record(&event)?;
+        if matches!(event.kind, TraceEventKind::LoopTickStarted { .. }) {
+            cursor.tick_activity_started = true;
+        }
         cursor.next_sequence = next_sequence;
         cursor.prev_event_hash = Some(event_hash);
         Ok(event)

@@ -11,12 +11,17 @@
   candidates. Post-adapter suppression now carries fixed adapter-entered,
   uncertain-effect, not-retryable, and reconciliation-required facts; direct
   ticks and local scheduler/CLI cycles cannot automatically repeat that action,
-  while ordinary pre-effect failures retain their existing behavior. The
-  local-file development provider now validates trusted-root ancestors and
-  supported-platform ACLs, pins private process-keyed content-integrity tags,
-  and has a normal release dependency/binary closure gate. No public wire/trace
-  schema or material API was added, opaque custom encoding remains an explicit
-  nonclaim, and `G07`, `G08`, and `G82` remain `not_exercised`.
+  later same-tick candidates stop before Gateway submission, duplicate explicit
+  action IDs fail before submission, fresh constructors reject persisted runs,
+  and resume fails closed for incomplete action-capable ticks across post-effect
+  trace/state failures, while ordinary pre-effect failures retain their existing
+  behavior. The local-file development provider now validates trusted-root
+  ancestors and supported-platform ACLs, pins private process-keyed
+  content-integrity tags, and has a normal release dependency/binary closure gate
+  required before every exact-SHA Docker publication path and applied to
+  Docker-produced binaries. No public wire/trace schema or material API was
+  added, opaque custom encoding remains an explicit nonclaim, and `G07`, `G08`,
+  and `G82` remain `not_exercised`.
 - **status/incomplete:** extended the single Gateway-owned bounded credential
   scanner with a generic pre-persistence barrier for adapter results, percepts,
   and policy-selected state. Adapter output and satisfied-postcondition strings

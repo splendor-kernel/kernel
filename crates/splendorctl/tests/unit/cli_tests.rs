@@ -5427,6 +5427,21 @@ fn configured_cycles_and_forever_do_not_repeat_post_effect_output_suppression() 
         assert!(error.contains("tick_reconciliation_required"), "{error}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        let trace_path = dir.path().join("trace.db");
+        let records_before_fresh_retry = {
+            let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+            TraceStore::read(&store, &run_id.to_string()).expect("records before fresh retry")
+        };
+        let error = run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+            .expect_err("fresh construction must reject an existing persisted run");
+        assert!(error.contains("run_already_exists"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let records_after_fresh_retry = {
+            let store = SqliteTraceStore::open(&trace_path).expect("trace store");
+            TraceStore::read(&store, &run_id.to_string()).expect("records after fresh retry")
+        };
+        assert_eq!(records_after_fresh_retry, records_before_fresh_retry);
+
         let config = std::fs::read_to_string(&config_path)
             .expect("config")
             .replace("resume: false", "resume: true");
@@ -5436,7 +5451,7 @@ fn configured_cycles_and_forever_do_not_repeat_post_effect_output_suppression() 
         assert!(error.contains("tick_reconciliation_required"), "{error}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let store = SqliteTraceStore::open(dir.path().join("trace.db")).expect("trace store");
+        let store = SqliteTraceStore::open(trace_path).expect("trace store");
         let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
         let encoded = serde_json::to_string(&records).expect("records serialize");
         assert!(!encoded.contains("Basic dTpw"));

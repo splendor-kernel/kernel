@@ -161,6 +161,15 @@ state commits.
   required when a gateway pre-effect evidence recorder or another local agent
   emits into the same run stream. Resume rejects a runtime whose `RunId` differs
   from the requested run before restoring state.
+- Treat `with_trace_store*` and `with_shared_trace_runtime*` as fresh-run
+  constructors. They return fixed `run_already_exists` before appending lifecycle
+  metadata when their runtime was reopened over persisted trace history. Multiple
+  local agents may still share one runtime that was created over an empty stream;
+  persisted recovery must use an explicit `resume_from_*` constructor.
+- During resume, reject an action-capable tick attempt that lacks its matching
+  completed-tick event. `ActionVerificationStarted` is the durable conservative
+  boundary: loss of any later post-Gateway trace or state write cannot make the
+  run runnable again without reconciliation.
 
 `with_trace_store_and_work_order` and `resume_from_trace_store_with_work_order`
 create their own runtime and remain suitable only when that loop is the sole

@@ -1427,6 +1427,153 @@ fn loop_engine_resumes_from_trace_store() {
 }
 
 #[test]
+fn fresh_persisted_constructor_rejects_existing_run_without_appending_trace() {
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let first_graph = StateGraph::new(state_store.clone(), SnapshotPolicy::default());
+    let first_agent = AgentContext::new(
+        AgentId::new(),
+        TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+
+    let _first = LoopEngine::with_trace_store(
+        first_agent,
+        first_graph,
+        StateData {
+            bytes: vec![1],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("first fresh engine");
+    let before = trace_store
+        .read(&run_id.to_string())
+        .expect("first run trace");
+    assert_eq!(before.len(), 1);
+
+    let second_graph = StateGraph::new(state_store, SnapshotPolicy::default());
+    let second_agent = AgentContext::new(
+        AgentId::new(),
+        TenantId::new(),
+        crate::AgentRuntimeConfig::default(),
+    );
+    let result = LoopEngine::with_trace_store(
+        second_agent,
+        second_graph,
+        StateData {
+            bytes: vec![2],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Resume(message)) if message == "run_already_exists"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("unchanged run trace"),
+        before
+    );
+}
+
+#[test]
+fn shared_fresh_runtime_allows_initial_assembly_but_rejects_construction_after_tick_start() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared runtime"),
+    );
+    let tenant_id = TenantId::new();
+    let gateway = Arc::new(StubGateway);
+
+    let mut first = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![1],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway.clone(),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("first agent assembly");
+    let _second = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![2],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway.clone(),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("second agent initial assembly");
+
+    first.tick(1).expect("first tick");
+    let before = trace_store.read(&run_id.to_string()).expect("tick trace");
+    let third = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            AgentId::new(),
+            tenant_id,
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![3],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        gateway,
+        runtime,
+        RunTraceContext::new(Some(run_id.clone())),
+    );
+
+    assert!(matches!(
+        third,
+        Err(LoopError::Resume(message)) if message == "run_already_exists"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("unchanged trace"),
+        before
+    );
+}
+
+#[test]
 fn shared_trace_runtime_resume_rejects_mismatched_run() {
     let trace_store = Arc::new(InMemoryTraceStore::default());
     let runtime_run_id = RunId::new();

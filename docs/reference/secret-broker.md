@@ -111,11 +111,13 @@ and adapter-result envelopes:
   does not claim rollback, no effect, or safe retry. Fixed structured artifacts
   record adapter entry, uncertain effect certainty, a not-retryable class, and
   required reconciliation; local scheduler/CLI loops park the engine instead of
-  automatically proposing the action again. The block is latched before any
-  later trace, escalation, outcome, or state operation can fail, so those
-  failures cannot requeue the entered action. Same-run persisted resume rejects
-  a recorded suppression until a replacement run is explicitly constructed
-  after reconciliation.
+  automatically proposing the action again or submitting a later same-tick
+  candidate. The block is latched before any later trace, escalation, outcome,
+  or state operation can fail, so those failures cannot requeue the entered
+  action. Same-run persisted resume rejects both a recorded suppression and an
+  action-capable tick whose completion was not durably recorded. Fresh
+  construction also rejects any existing persisted run; a replacement run must
+  be explicitly constructed after reconciliation.
 
 Persisted JSON scanning covers strings/object keys plus root numeric byte arrays
 and selected `bytes`, `body`, and `contents` byte-envelope coordinates, including

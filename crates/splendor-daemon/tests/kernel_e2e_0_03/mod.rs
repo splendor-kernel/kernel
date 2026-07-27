@@ -2803,24 +2803,19 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::OutcomeRecorded { .. })));
 
-    let mut retry_engine = LoopEngine::with_trace_store(
+    let mut retry_engine = LoopEngine::resume_from_trace_store(
         AgentContext::new(
             agent_id.clone(),
             tenant_id.clone(),
             AgentRuntimeConfig::default(),
         ),
-        StateGraph::with_head(
+        StateGraph::new(
             state_store.clone(),
-            Some(failure_tick.state_commit.node_id.clone()),
             SnapshotPolicy {
                 interval: Some(1),
                 important_labels: Vec::new(),
             },
         ),
-        StateData {
-            bytes: b"retry-after-failure".to_vec(),
-            content_type: None,
-        },
         Box::new(StaticPolicy {
             name: "kernel-e2e-idempotent-retry",
             actions: vec![ActionCandidate::new(action(
@@ -2834,30 +2829,25 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         }),
         gateway.clone(),
         trace_store.clone(),
-        Some(run_id.clone()),
+        run_id.clone(),
     )?;
     let retry_tick = retry_engine.tick(2)?;
     assert_eq!(retry_tick.action_outcomes.len(), 1);
     assert_eq!(retry_tick.action_outcomes[0].status, ActionStatus::Executed);
 
-    let mut denied_retry_engine = LoopEngine::with_trace_store(
+    let mut denied_retry_engine = LoopEngine::resume_from_trace_store(
         AgentContext::new(
             agent_id.clone(),
             tenant_id.clone(),
             AgentRuntimeConfig::default(),
         ),
-        StateGraph::with_head(
+        StateGraph::new(
             state_store.clone(),
-            Some(retry_tick.state_commit.node_id.clone()),
             SnapshotPolicy {
                 interval: Some(1),
                 important_labels: Vec::new(),
             },
         ),
-        StateData {
-            bytes: b"non-idempotent-denied".to_vec(),
-            content_type: None,
-        },
         Box::new(StaticPolicy {
             name: "kernel-e2e-non-idempotent-retry-denial",
             actions: vec![ActionCandidate::new(action(
@@ -2871,7 +2861,7 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         }),
         gateway.clone(),
         trace_store.clone(),
-        Some(run_id.clone()),
+        run_id.clone(),
     )?;
     let denied_retry_tick = denied_retry_engine.tick(3)?;
     assert_eq!(denied_retry_tick.action_outcomes.len(), 1);
@@ -2880,24 +2870,19 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         ActionStatus::Denied
     );
     let unknown_tenant = TenantId::parse("00000000-0000-0000-0000-000000001407")?;
-    let mut verifier_uncertainty_engine = LoopEngine::with_trace_store(
+    let mut verifier_uncertainty_engine = LoopEngine::resume_from_trace_store(
         AgentContext::new(
             agent_id.clone(),
             unknown_tenant,
             AgentRuntimeConfig::default(),
         ),
-        StateGraph::with_head(
+        StateGraph::new(
             state_store.clone(),
-            Some(denied_retry_tick.state_commit.node_id.clone()),
             SnapshotPolicy {
                 interval: Some(1),
                 important_labels: Vec::new(),
             },
         ),
-        StateData {
-            bytes: b"retry-verifier-uncertain".to_vec(),
-            content_type: None,
-        },
         Box::new(StaticPolicy {
             name: "kernel-e2e-retry-verifier-uncertainty",
             actions: vec![ActionCandidate::new(action(
@@ -2911,7 +2896,7 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         }),
         gateway.clone(),
         trace_store.clone(),
-        Some(run_id.clone()),
+        run_id.clone(),
     )?;
     let verifier_uncertainty_tick = verifier_uncertainty_engine.tick(4)?;
     assert_eq!(verifier_uncertainty_tick.action_outcomes.len(), 1);

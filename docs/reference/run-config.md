@@ -51,7 +51,12 @@ agents, policies, and adapter settings.
 - `run_id` (string, optional): UUID for the agent run (overrides top-level).
 - `snapshot_interval` (number, optional): snapshot every N ticks.
 - `initial_state` (string, optional): initial state bytes (UTF-8 string).
-- `resume` (bool, optional): resume from last snapshot in trace store.
+- `resume` (bool, optional): resume from the last safe snapshot in the trace
+  store. The default/`false` mode is fresh-only and fails with
+  `run_already_exists` when the configured `run_id` already has persisted trace
+  history; it never silently restarts that run. Resume also fails closed with
+  `tick_reconciliation_required` when history contains an incomplete
+  action-capable tick.
 - `percepts` (array, optional): static percept list.
 - `policy` (object, required): policy configuration.
 

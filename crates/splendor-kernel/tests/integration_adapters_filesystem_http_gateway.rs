@@ -654,7 +654,7 @@ fn filesystem_adapter_harness_preserves_opaque_binary_read_output() {
 }
 
 #[test]
-fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_persistence() {
+fn real_filesystem_credential_output_stops_later_http_adapter_without_persistence() {
     const CANARY: &str = "C03_REAL_ADAPTER_OUTPUT_CANARY";
     const BODY: &str = "password=C03_REAL_ADAPTER_OUTPUT_CANARY";
 
@@ -669,7 +669,6 @@ fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_pers
             ..FilesystemAdapterConfig::default()
         },
     )));
-    let server = TestServer::start(BODY);
     let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
         allowed_domains: vec!["127.0.0.1".to_string()],
         ..HttpAdapterConfig::default()
@@ -693,7 +692,7 @@ fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_pers
                 action_candidate(
                     action(
                         "http_get",
-                        serde_json::json!({"url": server.url}),
+                        serde_json::json!({"url": "http://127.0.0.1:1/"}),
                         SideEffectClass::Network,
                     ),
                     "http",
@@ -706,10 +705,10 @@ fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_pers
         )
         .with_tenant_id(tenant_id),
     );
-    server.join();
 
     assert_eq!(filesystem.executions(), 1);
-    assert_eq!(http.executions(), 1);
+    assert_eq!(http.executions(), 0);
+    assert_eq!(run.outcome.action_outcomes.len(), 1);
     for outcome in &run.outcome.action_outcomes {
         assert_eq!(outcome.status, ActionStatus::Failed);
         assert_eq!(
@@ -733,7 +732,7 @@ fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_pers
             .iter()
             .filter(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. }))
             .count(),
-        2
+        1
     );
     assert!(!run
         .events
@@ -752,6 +751,76 @@ fn real_filesystem_and_http_credential_outputs_fail_after_one_entry_without_pers
     assert!(!serde_json::to_string(&snapshot)
         .expect("state serializes")
         .contains(CANARY));
+    assert_current_runtime_commits_state_after_action_results(&run);
+}
+
+#[test]
+fn real_http_credential_output_stops_later_filesystem_adapter_without_persistence() {
+    const CANARY: &str = "C03_REAL_HTTP_OUTPUT_CANARY";
+    const BODY: &str = "password=C03_REAL_HTTP_OUTPUT_CANARY";
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let filesystem = Arc::new(CountingAdapter::new(FilesystemAdapter::new(
+        FilesystemAdapterConfig {
+            base_dir: temp.path().to_path_buf(),
+            ..FilesystemAdapterConfig::default()
+        },
+    )));
+    let server = TestServer::start(BODY);
+    let http = Arc::new(CountingAdapter::new(HttpAdapter::new(HttpAdapterConfig {
+        allowed_domains: vec!["127.0.0.1".to_string()],
+        ..HttpAdapterConfig::default()
+    })));
+    let run = run_adapter_case(AdapterHarnessCase::new(
+        "real-http-output-screen",
+        vec![
+            HarnessRegistration::new("http_get", "http", http.clone()),
+            HarnessRegistration::new("read_file", "filesystem", filesystem.clone()),
+        ],
+        vec![
+            action_candidate(
+                action(
+                    "http_get",
+                    serde_json::json!({"url": server.url}),
+                    SideEffectClass::Network,
+                ),
+                "http",
+            )
+            .with_usage(QuotaUsage {
+                http_requests: 1,
+                ..QuotaUsage::default()
+            }),
+            action_candidate(
+                action(
+                    "read_file",
+                    serde_json::json!({"path": "must-not-be-read.txt"}),
+                    SideEffectClass::Filesystem,
+                ),
+                "filesystem",
+            ),
+        ],
+    ));
+    server.join();
+
+    assert_eq!(http.executions(), 1);
+    assert_eq!(filesystem.executions(), 0);
+    assert_eq!(run.outcome.action_outcomes.len(), 1);
+    let outcome = &run.outcome.action_outcomes[0];
+    assert_eq!(outcome.status, ActionStatus::Failed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+    );
+    assert!(outcome.output.is_none());
+    let encoded_events = serde_json::to_string(&run.events).expect("events serialize");
+    assert!(!encoded_events.contains(CANARY));
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. }))
+            .count(),
+        1
+    );
     assert_current_runtime_commits_state_after_action_results(&run);
 }
 

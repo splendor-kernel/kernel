@@ -101,13 +101,18 @@ documented in [`identity.md`](identity.md).
   effect and must not be blindly retried. The local scheduler parks that engine;
   fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
   The block is latched immediately when the gateway returns the suppression, so
-  a later trace, outcome, or state failure cannot put the engine back on the
-  runnable queue. Persisted resume of the same run rejects a recorded
-  suppression.
+  later same-tick candidates are not submitted and a later trace, outcome, or
+  state failure cannot put the engine back on the runnable queue. Persisted
+  resume of the same run rejects either a recorded suppression or an
+  action-capable tick attempt without its matching `LoopTickCompleted`, including
+  when the first post-Gateway trace append was lost.
   Recovery requires explicit operator/provider reconciliation and construction
   of a replacement run/engine; no scheduler path automatically requeues the
-  parked action. Ordinary pre-effect loop failures retain their existing requeue
-  behavior.
+  parked action. A fresh persisted constructor rejects an already-existing run
+  with `run_already_exists`; only the explicit resume constructors may inspect
+  persisted history. Duplicate policy-supplied explicit action IDs are rejected
+  with `duplicate_action_id` before Gateway submission. Ordinary pre-effect loop
+  failures retain their existing requeue behavior.
 - State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
   being emitted for that tick.
 - Trace store failure fails the tick before side-effectful work can proceed when

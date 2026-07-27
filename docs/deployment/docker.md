@@ -123,6 +123,14 @@ Release image manifests are published for both `linux/amd64` and `linux/arm64` s
 Docker can select the native image on supported Intel/AMD and Apple Silicon/Linux
 ARM64 machines.
 
+Every branch, tag, and manual publication job is transitively gated by the
+`release-closure` job for the same `GITHUB_SHA`. That job checks normal daemon/CLI
+dependency features, builds the production Docker target, verifies its OCI
+`org.opencontainers.image.revision` label against the exact SHA, extracts the
+Docker-produced `splendorctl`, `splendor-daemon`, and `splendor-manager` binaries,
+and rejects development Secret Provider/test-support markers. Registry login,
+platform digest pushes, and manifest publication cannot run when this gate fails.
+
 ## GHCR package visibility
 
 The publish workflow builds and pushes with GitHub's default `GITHUB_TOKEN`, but

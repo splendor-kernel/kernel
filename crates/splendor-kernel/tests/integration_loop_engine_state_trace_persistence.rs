@@ -1,17 +1,17 @@
 use splendor_gateway::{
-    raw_credential_denied_action, ActionAdapter, ActionOutcome, ActionStatus, AdapterError,
-    AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
+    raw_credential_denied_action, ActionAdapter, ActionGateway, ActionId, ActionOutcome,
+    ActionStatus, AdapterError, AdapterResult, VerifiedActionGateway, RAW_CREDENTIAL_INPUT_DENIED,
     RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentRuntimeConfig, ConstraintEngine, ConstraintEvaluation,
-    LoopEngine, OutcomeEvaluator, OutcomeSignal, Perceptor, Policy, PolicyDecision, QuotaPolicy,
-    RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
-    TenantRegistry, TraceEvent, TraceEventKind,
+    KernelRuntime, LoopEngine, LoopError, OutcomeEvaluator, OutcomeSignal, Perceptor, Policy,
+    PolicyDecision, QuotaPolicy, RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext,
+    TenantPolicy, TenantRegistry, TraceEvent, TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
-    StateSnapshot, StateStore, StateStoreError, TraceStore,
+    StateSnapshot, StateStore, StateStoreError, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{
     Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
@@ -20,7 +20,7 @@ use splendor_types::{
     PerceptProvenance, PrincipalId, RetryClass, RevocationStatus, SnapshotId, StateNodeId,
     VerificationResult,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -338,6 +338,251 @@ struct ForbiddenRawEffectAdapter {
 
 struct FailIfWrittenStateStore {
     writes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TraceFailurePoint {
+    ActionVerificationCompleted,
+    ActionFailed,
+    OutcomeRecorded,
+    StateCommitted,
+    LoopTickCompleted,
+}
+
+impl TraceFailurePoint {
+    fn matches(self, kind: &TraceEventKind) -> bool {
+        matches!(
+            (self, kind),
+            (
+                Self::ActionVerificationCompleted,
+                TraceEventKind::ActionVerificationCompleted { .. }
+            ) | (Self::ActionFailed, TraceEventKind::ActionFailed { .. })
+                | (
+                    Self::OutcomeRecorded,
+                    TraceEventKind::OutcomeRecorded { .. }
+                )
+                | (Self::StateCommitted, TraceEventKind::StateCommitted { .. })
+                | (
+                    Self::LoopTickCompleted,
+                    TraceEventKind::LoopTickCompleted { .. }
+                )
+        )
+    }
+}
+
+struct ArmableTraceStore {
+    inner: InMemoryTraceStore,
+    failure: TraceFailurePoint,
+    armed: AtomicBool,
+}
+
+impl ArmableTraceStore {
+    fn new(failure: TraceFailurePoint) -> Self {
+        Self {
+            inner: InMemoryTraceStore::default(),
+            failure,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl TraceStore for ArmableTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone())?;
+        if self.failure.matches(&event.kind) && self.armed.swap(false, Ordering::SeqCst) {
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner.append(run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read(run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.inner.read_range(run_id, start, end)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateFailurePoint {
+    PutState,
+    CommitNode,
+    Snapshot,
+}
+
+struct ArmableStateStore {
+    inner: InMemoryStateStore,
+    failure: StateFailurePoint,
+    armed: AtomicBool,
+}
+
+impl ArmableStateStore {
+    fn new(failure: StateFailurePoint) -> Self {
+        Self {
+            inner: InMemoryStateStore::default(),
+            failure,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn fail(&self, point: StateFailurePoint) -> bool {
+        self.failure == point && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl StateStore for ArmableStateStore {
+    fn put_state(&self, state: StateData) -> Result<StateDataRef, StateStoreError> {
+        if self.fail(StateFailurePoint::PutState) {
+            return Err(StateStoreError::Poisoned);
+        }
+        self.inner.put_state(state)
+    }
+
+    fn get_state(&self, data_ref: &StateDataRef) -> Result<StateData, StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<StateNodeId>,
+        data_ref: StateDataRef,
+        metadata: StateMetadata,
+    ) -> Result<StateNodeId, StateStoreError> {
+        if self.fail(StateFailurePoint::CommitNode) {
+            return Err(StateStoreError::Poisoned);
+        }
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(&self, node_id: &StateNodeId) -> Result<StateNode, StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(&self, node_id: &StateNodeId) -> Result<SnapshotId, StateStoreError> {
+        if self.fail(StateFailurePoint::Snapshot) {
+            return Err(StateStoreError::Poisoned);
+        }
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(&self, snapshot_id: &SnapshotId) -> Result<StateSnapshot, StateStoreError> {
+        self.inner.load_snapshot(snapshot_id)
+    }
+}
+
+#[derive(Clone)]
+struct CandidateListPolicy {
+    actions: Vec<ActionCandidate>,
+}
+
+impl Policy for CandidateListPolicy {
+    fn name(&self) -> &str {
+        "candidate-list-policy"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, splendor_kernel::LoopError> {
+        Ok(PolicyDecision::new(
+            self.actions.clone(),
+            StateData {
+                bytes: vec![9],
+                content_type: None,
+            },
+            None,
+        ))
+    }
+}
+
+struct RecordingSuppressionAdapter {
+    calls: Arc<Mutex<Vec<String>>>,
+    suppress_action: Option<String>,
+    suppress_on_call: Option<usize>,
+}
+
+impl ActionAdapter for RecordingSuppressionAdapter {
+    fn execute(
+        &self,
+        request: &splendor_gateway::ActionRequest,
+    ) -> Result<AdapterResult, AdapterError> {
+        let mut calls = self.calls.lock().expect("adapter calls");
+        calls.push(request.action.name.clone());
+        let call_number = calls.len();
+        let suppress = self
+            .suppress_action
+            .as_deref()
+            .is_some_and(|name| name == request.action.name)
+            || self.suppress_on_call == Some(call_number);
+        drop(calls);
+        Ok(AdapterResult {
+            output: if suppress {
+                serde_json::json!({"body": "password=C03_RESTART_SUPPRESSION_CANARY"})
+            } else {
+                serde_json::json!({"ok": true})
+            },
+            satisfied_postconditions: Vec::new(),
+        })
+    }
+}
+
+fn external_candidate(name: &str, action_id: Option<ActionId>) -> ActionCandidate {
+    let candidate = ActionCandidate::new(Action {
+        name: name.to_string(),
+        params: serde_json::json!({"target": "fixture"}),
+        side_effect_class: SideEffectClass::External,
+        cost_estimate: None,
+        required_permissions: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+    })
+    .with_adapter("stub");
+    match action_id {
+        Some(action_id) => candidate.with_action_id(action_id),
+        None => candidate,
+    }
+}
+
+fn recording_gateway(
+    tenant_id: &splendor_kernel::TenantId,
+    action_names: &[String],
+    adapter: Arc<RecordingSuppressionAdapter>,
+) -> (TenantRegistry, Arc<dyn ActionGateway>) {
+    let registry = TenantRegistry::new();
+    registry.insert(TenantContext::new(
+        tenant_id.clone(),
+        TenantPolicy {
+            allowed_actions: action_names.to_vec(),
+            allowed_adapters: vec!["stub".to_string()],
+            allowed_permissions: Vec::new(),
+        },
+        QuotaPolicy::default(),
+    ));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    let mut registered = Vec::new();
+    for action_name in action_names {
+        if registered.contains(action_name) {
+            continue;
+        }
+        registered.push(action_name.clone());
+        gateway.register_adapter(action_name.clone(), "stub", adapter.clone());
+    }
+    (registry, Arc::new(gateway))
 }
 
 impl StateStore for FailIfWrittenStateStore {
@@ -1037,4 +1282,343 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
     assert!(!serde_json::to_string(&replayed)
         .expect("replay serializes")
         .contains(RECEIPT_CANARY));
+}
+
+fn assert_uncertain_effect_restart_is_blocked(
+    trace_store: Arc<dyn TraceStore>,
+    state_store: Arc<dyn StateStore>,
+    arm_failure: impl FnOnce(),
+) {
+    let tenant_id = splendor_kernel::TenantId::new();
+    let agent_id = splendor_kernel::AgentId::new();
+    let run_id = RunId::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(RecordingSuppressionAdapter {
+        calls: Arc::clone(&calls),
+        suppress_action: None,
+        suppress_on_call: Some(2),
+    });
+    let action_names = vec!["external-effect".to_string()];
+    let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let graph = StateGraph::new(state_store.clone(), snapshot_policy.clone());
+    let policy = CandidateListPolicy {
+        actions: vec![external_candidate("external-effect", None)],
+    };
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            AgentRuntimeConfig::default(),
+        ),
+        graph,
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(policy.clone()),
+        gateway.clone(),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("fresh engine");
+
+    engine.tick(1).expect("completed snapshot tick");
+    registry.begin_tick(2, OffsetDateTime::now_utc());
+    arm_failure();
+    engine
+        .tick(2)
+        .expect_err("the injected post-entry persistence failure must fail the tick");
+    drop(engine);
+
+    assert_eq!(
+        *calls.lock().expect("adapter calls"),
+        vec!["external-effect".to_string(), "external-effect".to_string()]
+    );
+    let trace_before_resume = trace_store
+        .read(&run_id.to_string())
+        .expect("trace before resume");
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        Box::new(policy.clone()),
+        gateway.clone(),
+        trace_store.clone(),
+        run_id.clone(),
+    );
+    assert!(matches!(
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
+    ));
+    let shared_runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared resume runtime"),
+    );
+    let shared_resumed = LoopEngine::resume_from_shared_trace_runtime_and_work_order(
+        AgentContext::new(agent_id, tenant_id, AgentRuntimeConfig::default()),
+        StateGraph::new(state_store, snapshot_policy),
+        Box::new(policy),
+        gateway,
+        trace_store.clone(),
+        shared_runtime,
+        run_id.clone(),
+        None,
+    );
+    assert!(matches!(
+        shared_resumed,
+        Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(
+        trace_store
+            .read(&run_id.to_string())
+            .expect("trace after rejected resume"),
+        trace_before_resume
+    );
+    assert_eq!(calls.lock().expect("adapter calls").len(), 2);
+}
+
+#[test]
+fn every_post_gateway_trace_failure_blocks_process_restart_reexecution() {
+    for failure in [
+        TraceFailurePoint::ActionVerificationCompleted,
+        TraceFailurePoint::ActionFailed,
+        TraceFailurePoint::OutcomeRecorded,
+        TraceFailurePoint::StateCommitted,
+        TraceFailurePoint::LoopTickCompleted,
+    ] {
+        let trace_store = Arc::new(ArmableTraceStore::new(failure));
+        let state_store = Arc::new(InMemoryStateStore::default());
+        assert_uncertain_effect_restart_is_blocked(trace_store.clone(), state_store, || {
+            trace_store.arm()
+        });
+    }
+}
+
+#[test]
+fn every_post_gateway_state_failure_blocks_process_restart_reexecution() {
+    for failure in [
+        StateFailurePoint::PutState,
+        StateFailurePoint::CommitNode,
+        StateFailurePoint::Snapshot,
+    ] {
+        let trace_store = Arc::new(InMemoryTraceStore::default());
+        let state_store = Arc::new(ArmableStateStore::new(failure));
+        assert_uncertain_effect_restart_is_blocked(trace_store, state_store.clone(), || {
+            state_store.arm()
+        });
+    }
+}
+
+#[test]
+fn duplicate_explicit_action_ids_do_not_enter_verified_gateway_adapter() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(RecordingSuppressionAdapter {
+        calls: Arc::clone(&calls),
+        suppress_action: None,
+        suppress_on_call: None,
+    });
+    let tenant_id = splendor_kernel::TenantId::new();
+    let action_names = vec!["duplicate-effect".to_string()];
+    let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    let action_id = ActionId::new();
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CandidateListPolicy {
+            actions: vec![
+                external_candidate("duplicate-effect", Some(action_id.clone())),
+                external_candidate("duplicate-effect", Some(action_id)),
+            ],
+        }),
+        gateway,
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+
+    let error = engine
+        .tick(1)
+        .expect_err("duplicate explicit action IDs must fail closed");
+    assert!(matches!(
+        error,
+        LoopError::Policy(reason) if reason == "duplicate_action_id"
+    ));
+    assert!(calls.lock().expect("adapter calls").is_empty());
+    let events = trace_store
+        .read(&run_id.to_string())
+        .expect("trace records")
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })));
+}
+
+#[test]
+fn suppression_stops_all_later_candidates_for_first_middle_and_last_positions() {
+    for suppression_index in 0..3 {
+        let action_names = (0..3)
+            .map(|index| {
+                if index == suppression_index {
+                    "suppress".to_string()
+                } else {
+                    format!("safe-{index}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(RecordingSuppressionAdapter {
+            calls: Arc::clone(&calls),
+            suppress_action: Some("suppress".to_string()),
+            suppress_on_call: None,
+        });
+        let tenant_id = splendor_kernel::TenantId::new();
+        let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+        registry.begin_tick(1, OffsetDateTime::now_utc());
+        let trace_store = Arc::new(InMemoryTraceStore::default());
+        let run_id = RunId::new();
+        let mut engine = LoopEngine::with_trace_store(
+            AgentContext::new(
+                splendor_kernel::AgentId::new(),
+                tenant_id,
+                AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(
+                Arc::new(InMemoryStateStore::default()),
+                SnapshotPolicy::default(),
+            ),
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(CandidateListPolicy {
+                actions: action_names
+                    .iter()
+                    .map(|name| external_candidate(name, Some(ActionId::new())))
+                    .collect(),
+            }),
+            gateway,
+            trace_store.clone(),
+            Some(run_id.clone()),
+        )
+        .expect("engine");
+
+        let outcome = engine.tick(1).expect("suppression tick is recorded");
+        assert_eq!(
+            *calls.lock().expect("adapter calls"),
+            action_names[..=suppression_index].to_vec(),
+            "suppression_index={suppression_index}"
+        );
+        assert_eq!(
+            outcome.action_outcomes.len(),
+            suppression_index + 1,
+            "suppression_index={suppression_index}"
+        );
+        assert_eq!(
+            outcome.action_outcomes.last().map(|item| &item.status),
+            Some(&ActionStatus::Failed)
+        );
+        assert_eq!(
+            outcome
+                .action_outcomes
+                .last()
+                .and_then(|item| item.error.as_deref()),
+            Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
+        );
+        let events = trace_store
+            .read(&run_id.to_string())
+            .expect("trace records")
+            .into_iter()
+            .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    TraceEventKind::ActionVerificationStarted { .. }
+                ))
+                .count(),
+            suppression_index + 1
+        );
+        assert!(!serde_json::to_string(&events)
+            .expect("events serialize")
+            .contains("C03_RESTART_SUPPRESSION_CANARY"));
+        let retry = engine
+            .tick(2)
+            .expect_err("suppression must park the engine");
+        assert!(matches!(
+            retry,
+            LoopError::Policy(reason) if reason == "tick_reconciliation_required"
+        ));
+    }
+}
+
+#[test]
+fn equivalent_candidates_with_distinct_ids_enter_the_gateway_only_once_after_suppression() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(RecordingSuppressionAdapter {
+        calls: Arc::clone(&calls),
+        suppress_action: Some("equivalent-effect".to_string()),
+        suppress_on_call: None,
+    });
+    let tenant_id = splendor_kernel::TenantId::new();
+    let action_names = vec!["equivalent-effect".to_string()];
+    let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CandidateListPolicy {
+            actions: vec![
+                external_candidate("equivalent-effect", Some(ActionId::new())),
+                external_candidate("equivalent-effect", Some(ActionId::new())),
+            ],
+        }),
+        gateway,
+        Arc::new(InMemoryTraceStore::default()),
+        Some(RunId::new()),
+    )
+    .expect("engine");
+
+    let outcome = engine.tick(1).expect("suppression tick");
+    assert_eq!(
+        *calls.lock().expect("adapter calls"),
+        vec!["equivalent-effect".to_string()]
+    );
+    assert_eq!(outcome.action_outcomes.len(), 1);
 }
