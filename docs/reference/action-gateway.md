@@ -241,12 +241,15 @@ A match or uncertainty after adapter entry is not a pre-effect denial. The
 Gateway returns `ActionStatus::Failed`, keeps the already-safe pre-verification
 result, sets `post_verification` to a denial whose only reason is
 `raw_credential_output_suppressed`, sets `error` to that same code, and omits
-output. The denial's fixed artifacts record `adapter_entered: true`,
+output. Its fixed operational artifacts record `adapter_entered: true`,
 `effect_certainty: uncertain`, `retry_class: not_retryable`, and
-`reconciliation_required: true`. This does not claim that the adapter effect was
-rolled back or never happened and does not authorize blind retry. Adapter errors
-continue to use their existing fixed `adapter failed` projection and never expose
-provider-controlled text.
+`reconciliation_required: true`. The same existing artifact channel now records
+operational facts for every adapter-entered result: an unclassified adapter error
+uses uncertain/not-retryable/reconciliation-required; a returned result uses
+known/not-retryable and requires reconciliation when post-verification fails;
+successful post-verification records reconciliation as false. Adapter errors keep
+the bounded `adapter failed` projection and never expose provider-controlled
+text. None of these facts claims rollback or authorizes blind retry.
 
 The companion pure percept/state guards share this scanner owner. Percepts are
 screened before trace/policy/queue retention. Policy-selected state declared as

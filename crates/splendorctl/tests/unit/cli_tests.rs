@@ -4118,11 +4118,9 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
 }
 
 #[test]
-fn replay_errors_on_corrupted_trace_sequence() {
+fn trace_store_rejects_corrupted_trace_sequence_before_replay() {
     let trace_temp = NamedTempFile::new().expect("trace db");
-    let state_temp = NamedTempFile::new().expect("state db");
     let trace_store = SqliteTraceStore::open(trace_temp.path()).expect("trace store");
-    let _state_store = SqliteStateStore::open(state_temp.path()).expect("state store");
 
     let run_id = RunId::new();
     let event = TraceEvent::new(
@@ -4131,22 +4129,23 @@ fn replay_errors_on_corrupted_trace_sequence() {
         OffsetDateTime::now_utc(),
         TraceEventKind::LoopTickStarted { tick_id: 1 },
     );
-    TraceStore::append(
+    let error = TraceStore::append(
         &trace_store,
         &run_id.to_string(),
         serde_json::to_value(event).unwrap(),
     )
-    .expect("append");
-
-    let error = replay_run(
-        &trace_temp.path().to_path_buf(),
-        &state_temp.path().to_path_buf(),
-        &run_id.to_string(),
-        None,
-        false,
-    )
-    .expect_err("corruption error");
-    assert!(error.contains("Trace event sequence mismatch"));
+    .expect_err("corrupted embedded sequence must not enter the trace store");
+    assert!(matches!(
+        error,
+        splendor_store::TraceStoreError::SequenceMismatch {
+            expected: 9,
+            actual: 0
+        }
+    ));
+    assert!(matches!(
+        trace_store.read(&run_id.to_string()),
+        Err(splendor_store::TraceStoreError::RunNotFound)
+    ));
 }
 
 #[test]

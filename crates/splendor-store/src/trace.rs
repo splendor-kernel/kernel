@@ -43,7 +43,9 @@ pub struct TraceRecord {
 
 /// Synchronous interface for append-only trace storage.
 pub trait TraceStore: Send + Sync {
-    /// Appends a trace payload and returns the assigned sequence number.
+    /// Appends a trace payload and returns the assigned sequence number. When
+    /// the payload declares a numeric `sequence`, it must match the next atomic
+    /// append position or the store rejects it without mutation.
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError>;
     /// Reads all `TraceRecord` entries for a run.
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError>;
@@ -71,7 +73,8 @@ pub trait AsyncTraceStore: Send + Sync {
     where
         Self: 'a;
 
-    /// Appends a trace payload and returns the assigned sequence number.
+    /// Appends a trace payload and returns the assigned sequence number, with
+    /// the same embedded-sequence conflict semantics as `TraceStore::append`.
     fn append<'a>(&'a self, run_id: &'a str, payload: serde_json::Value) -> Self::AppendFuture<'a>;
     /// Reads all `TraceRecord` entries for a run.
     fn read<'a>(&'a self, run_id: &'a str) -> Self::ReadFuture<'a>;
@@ -93,8 +96,9 @@ impl TraceStore for InMemoryTraceStore {
         let mut inner = self.inner.lock().map_err(|_| TraceStoreError::Poisoned)?;
         let records = inner.entry(run_id.to_string()).or_default();
         let prev_hash = records.last().map(|record| record.event_hash.clone());
-        let event_hash = compute_trace_event_hash(prev_hash.as_ref(), &payload)?;
         let sequence = records.len() as u64;
+        validate_payload_sequence(&payload, sequence)?;
+        let event_hash = compute_trace_event_hash(prev_hash.as_ref(), &payload)?;
         records.push(TraceRecord {
             run_id: run_id.to_string(),
             sequence,
@@ -321,6 +325,7 @@ impl TraceStore for SqliteTraceStore {
             ),
             None => (0, None),
         };
+        validate_payload_sequence(&payload, sequence)?;
         let event_hash = compute_event_hash(prev_hash.as_ref(), &payload)?;
         let payload_bytes = serde_json::to_vec(&payload).map_err(TraceStoreError::Serialization)?;
         let recorded_at = OffsetDateTime::now_utc();
@@ -453,6 +458,22 @@ pub(crate) fn compute_event_hash(
     compute_trace_event_hash(prev_hash, payload)
 }
 
+/// Rejects a trace event whose embedded sequence disagrees with the store's
+/// atomic append position. Generic payloads without a numeric `sequence` field
+/// remain supported for compatibility.
+fn validate_payload_sequence(
+    payload: &serde_json::Value,
+    actual: u64,
+) -> Result<(), TraceStoreError> {
+    let Some(expected) = payload.get("sequence").and_then(serde_json::Value::as_u64) else {
+        return Ok(());
+    };
+    if expected != actual {
+        return Err(TraceStoreError::SequenceMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 fn normalize_payload_for_hash(payload: &serde_json::Value) -> serde_json::Value {
     let mut normalized = payload.clone();
     if let Some(kind) = normalized.get_mut("kind") {
@@ -527,6 +548,14 @@ pub enum TraceStoreError {
     /// Sequence overflow occurred when storing a value.
     #[error("sequence overflow for value: {0}")]
     SequenceOverflow(u64),
+    /// An embedded trace sequence did not match the next atomic append position.
+    #[error("trace sequence mismatch: expected {expected}, actual {actual}")]
+    SequenceMismatch {
+        /// Sequence declared by the trace event payload.
+        expected: u64,
+        /// Next sequence atomically assigned by the store.
+        actual: u64,
+    },
     /// SQLite storage error.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),

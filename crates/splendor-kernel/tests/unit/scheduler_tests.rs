@@ -153,6 +153,33 @@ struct CredentialOutputAdapter {
     calls: Arc<AtomicUsize>,
 }
 
+struct CountingSuccessAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for CountingSuccessAdapter {
+    fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AdapterResult {
+            output: serde_json::json!({"ok": true}),
+            satisfied_postconditions: action.action.postconditions.clone(),
+        })
+    }
+}
+
+struct CountingFailedAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for CountingFailedAdapter {
+    fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(AdapterError::Failed(
+            "untrusted provider detail".to_string(),
+        ))
+    }
+}
+
 impl ActionAdapter for CredentialOutputAdapter {
     fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -526,7 +553,7 @@ fn post_effect_trace_failure_still_parks_without_repeating_adapter() {
     gateway.register_adapter(
         "noop",
         "adapter",
-        Arc::new(CredentialOutputAdapter {
+        Arc::new(CountingSuccessAdapter {
             calls: Arc::clone(&calls),
         }),
     );
@@ -548,6 +575,49 @@ fn post_effect_trace_failure_still_parks_without_repeating_adapter() {
             TraceStoreError::Poisoned
         ))))
     ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+            if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn generic_adapter_failure_parks_after_completed_scheduler_tick() {
+    let tenant_id = TenantId::new();
+    let tenant = crate::TenantContext::new(
+        tenant_id.clone(),
+        crate::TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["adapter".to_string()],
+            ..crate::TenantPolicy::default()
+        },
+        crate::QuotaPolicy::default(),
+    );
+    let registry = TenantRegistry::new();
+    registry.insert(tenant);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    gateway.register_adapter(
+        "noop",
+        "adapter",
+        Arc::new(CountingFailedAdapter {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let engine = build_engine(tenant_id, "noop", &[1], Arc::new(gateway));
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
+
+    let first = scheduler
+        .run_once()
+        .expect("failed outcome is durably recorded");
+    assert_eq!(
+        first.outcome.action_outcomes[0].status,
+        ActionStatus::Failed
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
         scheduler.run_once(),

@@ -343,6 +343,7 @@ struct FailIfWrittenStateStore {
 #[derive(Clone, Copy, Debug)]
 enum TraceFailurePoint {
     ActionVerificationCompleted,
+    ActionExecuted,
     ActionFailed,
     OutcomeRecorded,
     StateCommitted,
@@ -357,6 +358,7 @@ impl TraceFailurePoint {
                 Self::ActionVerificationCompleted,
                 TraceEventKind::ActionVerificationCompleted { .. }
             ) | (Self::ActionFailed, TraceEventKind::ActionFailed { .. })
+                | (Self::ActionExecuted, TraceEventKind::ActionExecuted { .. })
                 | (
                     Self::OutcomeRecorded,
                     TraceEventKind::OutcomeRecorded { .. }
@@ -516,6 +518,79 @@ struct RecordingSuppressionAdapter {
     suppress_on_call: Option<usize>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EnteredAdapterOutcome {
+    Success,
+    GenericFailure,
+    PostconditionFailure,
+}
+
+struct RecordingEnteredAdapter {
+    calls: Arc<Mutex<Vec<String>>>,
+    outcome: EnteredAdapterOutcome,
+}
+
+impl ActionAdapter for RecordingEnteredAdapter {
+    fn execute(
+        &self,
+        request: &splendor_gateway::ActionRequest,
+    ) -> Result<AdapterResult, AdapterError> {
+        self.calls
+            .lock()
+            .expect("adapter calls")
+            .push(request.action.name.clone());
+        match self.outcome {
+            EnteredAdapterOutcome::Success => Ok(AdapterResult {
+                output: serde_json::json!({"ok": true}),
+                satisfied_postconditions: request.action.postconditions.clone(),
+            }),
+            EnteredAdapterOutcome::GenericFailure => Err(AdapterError::Failed(
+                "provider detail must not escape".to_string(),
+            )),
+            EnteredAdapterOutcome::PostconditionFailure => Ok(AdapterResult {
+                output: serde_json::json!({"effect_receipt": "fixture"}),
+                satisfied_postconditions: Vec::new(),
+            }),
+        }
+    }
+}
+
+struct SequencedEnteredAdapter {
+    calls: Arc<Mutex<Vec<String>>>,
+    second_outcome: EnteredAdapterOutcome,
+}
+
+impl ActionAdapter for SequencedEnteredAdapter {
+    fn execute(
+        &self,
+        request: &splendor_gateway::ActionRequest,
+    ) -> Result<AdapterResult, AdapterError> {
+        let call_number = {
+            let mut calls = self.calls.lock().expect("adapter calls");
+            calls.push(request.action.name.clone());
+            calls.len()
+        };
+        let outcome = if call_number == 1 {
+            EnteredAdapterOutcome::Success
+        } else {
+            self.second_outcome
+        };
+        match outcome {
+            EnteredAdapterOutcome::Success => Ok(AdapterResult {
+                output: serde_json::json!({"ok": true}),
+                satisfied_postconditions: request.action.postconditions.clone(),
+            }),
+            EnteredAdapterOutcome::GenericFailure => Err(AdapterError::Failed(
+                "untrusted provider detail".to_string(),
+            )),
+            EnteredAdapterOutcome::PostconditionFailure => Ok(AdapterResult {
+                output: serde_json::json!({"effect_receipt": "fixture"}),
+                satisfied_postconditions: Vec::new(),
+            }),
+        }
+    }
+}
+
 impl ActionAdapter for RecordingSuppressionAdapter {
     fn execute(
         &self,
@@ -561,7 +636,7 @@ fn external_candidate(name: &str, action_id: Option<ActionId>) -> ActionCandidat
 fn recording_gateway(
     tenant_id: &splendor_kernel::TenantId,
     action_names: &[String],
-    adapter: Arc<RecordingSuppressionAdapter>,
+    adapter: Arc<dyn ActionAdapter>,
 ) -> (TenantRegistry, Arc<dyn ActionGateway>) {
     let registry = TenantRegistry::new();
     registry.insert(TenantContext::new(
@@ -1287,16 +1362,16 @@ fn loop_engine_denies_raw_credentials_before_constraint_gateway_trace_state_and_
 fn assert_uncertain_effect_restart_is_blocked(
     trace_store: Arc<dyn TraceStore>,
     state_store: Arc<dyn StateStore>,
+    second_outcome: EnteredAdapterOutcome,
     arm_failure: impl FnOnce(),
 ) {
     let tenant_id = splendor_kernel::TenantId::new();
     let agent_id = splendor_kernel::AgentId::new();
     let run_id = RunId::new();
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let adapter = Arc::new(RecordingSuppressionAdapter {
+    let adapter = Arc::new(SequencedEnteredAdapter {
         calls: Arc::clone(&calls),
-        suppress_action: None,
-        suppress_on_call: Some(2),
+        second_outcome,
     });
     let action_names = vec!["external-effect".to_string()];
     let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
@@ -1306,8 +1381,12 @@ fn assert_uncertain_effect_restart_is_blocked(
         important_labels: Vec::new(),
     };
     let graph = StateGraph::new(state_store.clone(), snapshot_policy.clone());
+    let mut candidate = external_candidate("external-effect", Some(ActionId::new()));
+    if second_outcome == EnteredAdapterOutcome::PostconditionFailure {
+        candidate.action.postconditions = vec!["effect-confirmed".to_string()];
+    }
     let policy = CandidateListPolicy {
-        actions: vec![external_candidate("external-effect", None)],
+        actions: vec![candidate],
     };
     let mut engine = LoopEngine::with_trace_store(
         AgentContext::new(
@@ -1333,6 +1412,10 @@ fn assert_uncertain_effect_restart_is_blocked(
     engine
         .tick(2)
         .expect_err("the injected post-entry persistence failure must fail the tick");
+    assert!(matches!(
+        engine.tick(3),
+        Err(LoopError::Policy(reason)) if reason == "tick_reconciliation_required"
+    ));
     drop(engine);
 
     assert_eq!(
@@ -1387,33 +1470,151 @@ fn assert_uncertain_effect_restart_is_blocked(
 
 #[test]
 fn every_post_gateway_trace_failure_blocks_process_restart_reexecution() {
-    for failure in [
-        TraceFailurePoint::ActionVerificationCompleted,
-        TraceFailurePoint::ActionFailed,
-        TraceFailurePoint::OutcomeRecorded,
-        TraceFailurePoint::StateCommitted,
-        TraceFailurePoint::LoopTickCompleted,
+    for adapter_outcome in [
+        EnteredAdapterOutcome::Success,
+        EnteredAdapterOutcome::GenericFailure,
+        EnteredAdapterOutcome::PostconditionFailure,
     ] {
-        let trace_store = Arc::new(ArmableTraceStore::new(failure));
-        let state_store = Arc::new(InMemoryStateStore::default());
-        assert_uncertain_effect_restart_is_blocked(trace_store.clone(), state_store, || {
-            trace_store.arm()
-        });
+        let terminal_event = if adapter_outcome == EnteredAdapterOutcome::Success {
+            TraceFailurePoint::ActionExecuted
+        } else {
+            TraceFailurePoint::ActionFailed
+        };
+        for failure in [
+            TraceFailurePoint::ActionVerificationCompleted,
+            terminal_event,
+            TraceFailurePoint::OutcomeRecorded,
+            TraceFailurePoint::StateCommitted,
+            TraceFailurePoint::LoopTickCompleted,
+        ] {
+            let trace_store = Arc::new(ArmableTraceStore::new(failure));
+            let state_store = Arc::new(InMemoryStateStore::default());
+            assert_uncertain_effect_restart_is_blocked(
+                trace_store.clone(),
+                state_store,
+                adapter_outcome,
+                || trace_store.arm(),
+            );
+        }
     }
 }
 
 #[test]
 fn every_post_gateway_state_failure_blocks_process_restart_reexecution() {
-    for failure in [
-        StateFailurePoint::PutState,
-        StateFailurePoint::CommitNode,
-        StateFailurePoint::Snapshot,
+    for adapter_outcome in [
+        EnteredAdapterOutcome::Success,
+        EnteredAdapterOutcome::GenericFailure,
+        EnteredAdapterOutcome::PostconditionFailure,
     ] {
-        let trace_store = Arc::new(InMemoryTraceStore::default());
-        let state_store = Arc::new(ArmableStateStore::new(failure));
-        assert_uncertain_effect_restart_is_blocked(trace_store, state_store.clone(), || {
-            state_store.arm()
+        for failure in [
+            StateFailurePoint::PutState,
+            StateFailurePoint::CommitNode,
+            StateFailurePoint::Snapshot,
+        ] {
+            let trace_store = Arc::new(InMemoryTraceStore::default());
+            let state_store = Arc::new(ArmableStateStore::new(failure));
+            assert_uncertain_effect_restart_is_blocked(
+                trace_store,
+                state_store.clone(),
+                adapter_outcome,
+                || state_store.arm(),
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_and_postcondition_failures_remain_parked_after_durable_tick_completion() {
+    for (adapter_outcome, expected_certainty) in [
+        (EnteredAdapterOutcome::GenericFailure, "uncertain"),
+        (EnteredAdapterOutcome::PostconditionFailure, "known"),
+    ] {
+        let tenant_id = splendor_kernel::TenantId::new();
+        let agent_id = splendor_kernel::AgentId::new();
+        let run_id = RunId::new();
+        let action_id = ActionId::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(RecordingEnteredAdapter {
+            calls: Arc::clone(&calls),
+            outcome: adapter_outcome,
         });
+        let action_names = vec!["nonretryable-effect".to_string()];
+        let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+        registry.begin_tick(1, OffsetDateTime::now_utc());
+        let trace_store = Arc::new(InMemoryTraceStore::default());
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let snapshot_policy = SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        };
+        let mut candidate = external_candidate("nonretryable-effect", Some(action_id));
+        if adapter_outcome == EnteredAdapterOutcome::PostconditionFailure {
+            candidate.action.postconditions = vec!["effect-confirmed".to_string()];
+        }
+        let policy = CandidateListPolicy {
+            actions: vec![candidate],
+        };
+        let mut engine = LoopEngine::with_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(policy.clone()),
+            gateway.clone(),
+            trace_store.clone(),
+            Some(run_id.clone()),
+        )
+        .expect("engine");
+
+        let tick = engine.tick(1).expect("failed effect outcome is durable");
+        let outcome = tick.action_outcomes.first().expect("action outcome");
+        assert_eq!(outcome.status, ActionStatus::Failed);
+        let facts = outcome
+            .post_verification
+            .as_ref()
+            .expect("effect boundary facts");
+        assert_eq!(facts.artifacts["adapter_entered"], true);
+        assert_eq!(facts.artifacts["effect_certainty"], expected_certainty);
+        assert_eq!(facts.artifacts["retry_class"], "not_retryable");
+        assert_eq!(facts.artifacts["reconciliation_required"], true);
+        assert!(!serde_json::to_string(outcome)
+            .expect("outcome serializes")
+            .contains("provider detail must not escape"));
+
+        assert!(matches!(
+            engine.tick(2),
+            Err(LoopError::Policy(reason)) if reason == "tick_reconciliation_required"
+        ));
+        assert_eq!(calls.lock().expect("adapter calls").len(), 1);
+        drop(engine);
+
+        let records = trace_store
+            .read(&run_id.to_string())
+            .expect("trace records");
+        let encoded = serde_json::to_string(&records).expect("records serialize");
+        assert!(encoded.contains("adapter_entered"));
+        assert!(encoded.contains("reconciliation_required"));
+        assert!(!encoded.contains("provider detail must not escape"));
+
+        let resumed = LoopEngine::resume_from_trace_store(
+            AgentContext::new(agent_id, tenant_id, AgentRuntimeConfig::default()),
+            StateGraph::new(state_store, snapshot_policy),
+            Box::new(policy),
+            gateway,
+            trace_store,
+            run_id,
+        );
+        assert!(matches!(
+            resumed,
+            Err(LoopError::Resume(reason)) if reason == "tick_reconciliation_required"
+        ));
+        assert_eq!(calls.lock().expect("adapter calls").len(), 1);
     }
 }
 

@@ -669,27 +669,34 @@ FR-0.02-08, FR-0.03-10, FR-0.03-11
 replay, telemetry
 
 **Use case:** A work order allows an idempotent fixture action and a non-idempotent
-fixture action. The idempotent action fails once and is retried only when marked
-safe; the non-idempotent action fails and must not be retried blindly.
+fixture action. The first adapter call returns an unclassified failure, which does
+not prove no effect. The runtime therefore records uncertain effect evidence and
+parks even though the action payload called itself idempotent; caller metadata is
+not retry authority.
 
 **Required positive evidence:**
 
-- both actions reach adapters only after gateway verification;
+- the attempted action reaches its adapter only after gateway verification;
 - adapter failure creates `action.failed` and `outcome.recorded` trace evidence;
-- state behavior is explicit for failure and retry outcomes;
-- idempotent retry consumes quota predictably and is trace-linked;
+- state behavior is explicit for the failure and blocked retry;
+- adapter entry, uncertain effect, not-retryable class, and required
+  reconciliation are trace-linked through fixed operational facts;
+- the single attempted action consumes quota predictably;
 - telemetry reports failure category, run status, quota/denial signals, and trace
   sync status.
 
 **Required negative/failure evidence:**
 
-- non-idempotent retry is denied unless a new scoped work-order/action request marks
-  it safe;
-- verifier uncertainty during retry fails closed;
-- replay explains failure/retry decisions without executing adapters.
+- a later same-tick action is not submitted after uncertain adapter failure;
+- same-process and process-restart retries fail with
+  `tick_reconciliation_required`, including when the original payload claimed
+  idempotency;
+- replay explains the failure/reconciliation decision without executing adapters.
 
-**Why this is complete:** It proves realistic runtime failure recovery without
-unsafe side-effect repetition.
+**Why this is complete:** It proves generic failure uncertainty cannot be
+laundered into safe retry or unsafe side-effect repetition. A future typed
+provider receipt may prove a narrower retry contract separately; a generic error
+string cannot.
 
 ---
 

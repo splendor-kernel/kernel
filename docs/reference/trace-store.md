@@ -36,6 +36,13 @@ read(run_id) -> Vec<TraceRecord>
 read_range(run_id, start, end) -> Vec<TraceRecord>
 ```
 
+Runtime trace payloads carry their proposed `sequence`. Both built-in stores
+compare that embedded value with the next append position while holding their
+append lock/transaction. A competing stale writer receives
+`TraceStoreError::SequenceMismatch` and appends nothing; it cannot silently
+acquire a later sequence. Generic compatibility payloads without a numeric
+`sequence` field continue to receive a store-assigned sequence.
+
 ## AsyncTraceStore
 
 Async wrapper with the same semantics, returning futures for each operation.
@@ -43,7 +50,8 @@ Async wrapper with the same semantics, returning futures for each operation.
 ## InMemoryTraceStore
 
 Holds trace records in memory keyed by `run_id`. The `sequence` is derived from
-vector length at append time.
+vector length and validated against an embedded runtime sequence while the map
+lock is held.
 
 ## SqliteTraceStore
 
@@ -51,6 +59,10 @@ SQLite-backed store that persists trace records on disk. The schema includes:
 
 - `trace_events`: `run_id`, `sequence`, `payload`, `recorded_at`, `event_hash_*`,
   and `prev_hash_*` columns.
+
+SQLite selects the next sequence, validates the embedded runtime sequence,
+inserts the event, and commits under one transaction. Its `(run_id, sequence)`
+primary key remains the durable final conflict guard across store instances.
 
 ## Trace Export Tool
 

@@ -2204,12 +2204,20 @@ impl ActionGateway for VerifiedActionGateway {
 
         let adapter_result = match registration.adapter.execute(&action) {
             Ok(result) => result,
-            Err(_error) => {
+            Err(error) => {
+                let taxonomy = error.taxonomy_for_adapter(adapter_id);
+                let mut post_verification = VerificationResult::deny("adapter failed");
+                attach_adapter_effect_facts(
+                    &mut post_verification,
+                    taxonomy.effect_certainty,
+                    taxonomy.retry_class,
+                    true,
+                );
                 return Ok(ActionOutcome {
                     action_id: action.action_id,
                     status: ActionStatus::Failed,
                     verification,
-                    post_verification: None,
+                    post_verification: Some(post_verification),
                     output: None,
                     // AdapterError::Failed contains provider-controlled human text.
                     // Keep public outcomes bounded and non-authorizing; the stable
@@ -2237,7 +2245,14 @@ impl ActionGateway for VerifiedActionGateway {
             Some(adapter_id),
             &adapter_result,
         );
-        let post_verification = combine_post_verifications(post_verification, post_safety);
+        let mut post_verification = combine_post_verifications(post_verification, post_safety);
+        let reconciliation_required = !post_verification.allowed;
+        attach_adapter_effect_facts(
+            &mut post_verification,
+            EffectCertainty::Known,
+            RetryClass::NotRetryable,
+            reconciliation_required,
+        );
         let status = if post_verification.allowed {
             ActionStatus::Executed
         } else {
@@ -2807,6 +2822,33 @@ impl GatewayError {
             }
         }
     }
+}
+
+fn attach_adapter_effect_facts(
+    result: &mut VerificationResult,
+    effect_certainty: EffectCertainty,
+    retry_class: RetryClass,
+    reconciliation_required: bool,
+) {
+    if !result.artifacts.is_object() {
+        result.artifacts = serde_json::json!({});
+    }
+    let Some(artifacts) = result.artifacts.as_object_mut() else {
+        return;
+    };
+    artifacts.insert("adapter_entered".to_string(), serde_json::Value::Bool(true));
+    artifacts.insert(
+        "effect_certainty".to_string(),
+        serde_json::Value::String(effect_certainty.as_str().to_string()),
+    );
+    artifacts.insert(
+        "retry_class".to_string(),
+        serde_json::Value::String(retry_class.as_str().to_string()),
+    );
+    artifacts.insert(
+        "reconciliation_required".to_string(),
+        serde_json::Value::Bool(reconciliation_required),
+    );
 }
 
 fn check_conditions(reason: &str, expected: &[String], satisfied: &[String]) -> VerificationResult {

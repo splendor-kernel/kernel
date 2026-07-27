@@ -73,6 +73,7 @@ struct TraceCursor {
     next_sequence: u64,
     prev_event_hash: Option<ContentHash>,
     tick_activity_started: bool,
+    fresh_run_claimed: bool,
 }
 
 impl KernelRuntime {
@@ -88,6 +89,7 @@ impl KernelRuntime {
                 next_sequence: initial_sequence,
                 prev_event_hash: config.initial_prev_hash,
                 tick_activity_started: false,
+                fresh_run_claimed: false,
             }),
             initial_sequence,
             trace_sink: config.trace_sink,
@@ -151,17 +153,31 @@ impl KernelRuntime {
             .next_sequence
     }
 
-    /// Returns true when construction discovered existing persisted trace history.
-    pub(crate) fn started_with_existing_trace(&self) -> bool {
-        self.initial_sequence != 0
-    }
-
-    /// Returns true after this runtime durably records its first tick start.
-    pub(crate) fn has_started_tick(&self) -> bool {
-        self.trace_cursor
+    /// Atomically admits one fresh persisted run owner while allowing additional
+    /// agents to assemble on that exact shared runtime before its first tick.
+    /// A runtime reopened over history or used for any unclaimed event is denied.
+    pub(crate) fn admit_fresh_engine(&self) -> Result<bool, TraceError> {
+        let mut cursor = self
+            .trace_cursor
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .tick_activity_started
+            .map_err(|_| TraceError::IntegrityLock)?;
+        if self.initial_sequence != 0 || cursor.tick_activity_started {
+            return Ok(false);
+        }
+        if cursor.fresh_run_claimed {
+            return Ok(true);
+        }
+        if cursor.next_sequence != 0 {
+            return Ok(false);
+        }
+
+        self.record_event_with_cursor(
+            &mut cursor,
+            self.trace_identity(),
+            TraceEventKind::RunStarted,
+        )?;
+        cursor.fresh_run_claimed = true;
+        Ok(true)
     }
 
     /// Records a `TraceEventKind` and returns the emitted `TraceEvent`.
@@ -179,11 +195,20 @@ impl KernelRuntime {
         identity: TraceIdentityContext,
         kind: TraceEventKind,
     ) -> Result<TraceEvent, TraceError> {
-        identity.ensure_run(&self.run_id)?;
         let mut cursor = self
             .trace_cursor
             .lock()
             .map_err(|_| TraceError::IntegrityLock)?;
+        self.record_event_with_cursor(&mut cursor, identity, kind)
+    }
+
+    fn record_event_with_cursor(
+        &self,
+        cursor: &mut TraceCursor,
+        identity: TraceIdentityContext,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, TraceError> {
+        identity.ensure_run(&self.run_id)?;
         let sequence = cursor.next_sequence;
         let next_sequence = sequence
             .checked_add(1)

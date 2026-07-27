@@ -55,6 +55,33 @@ fn trace_store_chains_hashes() {
 }
 
 #[test]
+fn in_memory_trace_store_rejects_stale_embedded_sequence_without_append() {
+    let store = InMemoryTraceStore::default();
+    TraceStore::append(
+        &store,
+        "run-1",
+        serde_json::json!({"sequence": 0, "event": 1}),
+    )
+    .expect("first append");
+
+    let error = TraceStore::append(
+        &store,
+        "run-1",
+        serde_json::json!({"sequence": 0, "event": 2}),
+    )
+    .expect_err("stale sequence must fail before append");
+
+    assert!(matches!(
+        error,
+        TraceStoreError::SequenceMismatch {
+            expected: 0,
+            actual: 1
+        }
+    ));
+    assert_eq!(TraceStore::read(&store, "run-1").expect("read").len(), 1);
+}
+
+#[test]
 fn trace_store_missing_run() {
     let store = InMemoryTraceStore::default();
     assert!(matches!(
@@ -79,6 +106,34 @@ fn sqlite_trace_store_persists_records() {
         records[1].prev_event_hash,
         Some(records[0].event_hash.clone())
     );
+}
+
+#[test]
+fn sqlite_trace_store_rejects_stale_embedded_sequence_without_append() {
+    let temp = NamedTempFile::new().expect("temp");
+    let store = SqliteTraceStore::open(temp.path()).expect("open");
+    TraceStore::append(
+        &store,
+        "run-1",
+        serde_json::json!({"sequence": 0, "event": 1}),
+    )
+    .expect("first append");
+
+    let error = TraceStore::append(
+        &store,
+        "run-1",
+        serde_json::json!({"sequence": 0, "event": 2}),
+    )
+    .expect_err("stale sequence must fail before transaction commit");
+
+    assert!(matches!(
+        error,
+        TraceStoreError::SequenceMismatch {
+            expected: 0,
+            actual: 1
+        }
+    ));
+    assert_eq!(TraceStore::read(&store, "run-1").expect("read").len(), 1);
 }
 
 #[test]

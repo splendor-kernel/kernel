@@ -9732,7 +9732,17 @@ mod tests {
                 failed_trace.0,
                 failed.error.as_ref().expect("adapter error")
             );
-            assert_eq!(failed_trace.1, &failed.verification);
+            assert!(failed.verification.allowed);
+            let post = failed
+                .post_verification
+                .as_ref()
+                .expect("adapter effect facts");
+            assert_eq!(failed_trace.1, post);
+            assert!(!post.allowed);
+            assert_eq!(post.artifacts["adapter_entered"], true);
+            assert_eq!(post.artifacts["effect_certainty"], "uncertain");
+            assert_eq!(post.artifacts["retry_class"], "not_retryable");
+            assert_eq!(post.artifacts["reconciliation_required"], true);
         }
 
         let executions_before_replay = unit_adapter_execution_count(&state, &run_id);

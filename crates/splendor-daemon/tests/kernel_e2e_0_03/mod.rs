@@ -23,8 +23,8 @@ use splendor_kernel::{
     AgentRuntimeConfig, FleetTelemetryCollector, InMemoryNodeRegistry,
     InMemoryRemoteMessageTransport, InMemoryRemoteTransportFault, KernelRuntime,
     KernelRuntimeConfig, LocalDelegationManager, LocalDelegationRequest, LocalRunStatus,
-    LoopEngine, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision, QuotaPolicy,
-    RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
+    LoopEngine, LoopError, MessageRouter, NodeRegistry, Perceptor, Policy, PolicyDecision,
+    QuotaPolicy, RemoteMessageReceiver, SnapshotPolicy, StateGraph, StateHandoffExportRequest,
     StateHandoffScope, TelemetryThresholds, TenantContext, TenantPolicy, TenantRegistry,
     TraceError, TraceEvent, TraceEventKind, TraceSink,
 };
@@ -2792,9 +2792,17 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         Some(run_id.clone()),
     )?;
     let failure_tick = engine.tick(1)?;
-    assert_eq!(failure_tick.action_outcomes.len(), 2);
+    assert_eq!(failure_tick.action_outcomes.len(), 1);
     assert_eq!(failure_tick.action_outcomes[0].status, ActionStatus::Failed);
-    assert_eq!(failure_tick.action_outcomes[1].status, ActionStatus::Failed);
+    let failure_post = failure_tick.action_outcomes[0]
+        .post_verification
+        .as_ref()
+        .expect("generic adapter effect facts");
+    assert_eq!(failure_post.artifacts["adapter_entered"], true);
+    assert_eq!(failure_post.artifacts["effect_certainty"], "uncertain");
+    assert_eq!(failure_post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(failure_post.artifacts["reconciliation_required"], true);
+    assert_eq!(adapter.calls(), vec!["idempotent.fixture"]);
     let events = read_trace_events(&trace_store, &run_id)?;
     assert!(events
         .iter()
@@ -2802,8 +2810,20 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
     assert!(events
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::OutcomeRecorded { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, TraceEventKind::LoopTickCompleted { .. })));
 
-    let mut retry_engine = LoopEngine::resume_from_trace_store(
+    let live_retry_error = engine
+        .tick(2)
+        .expect_err("generic adapter uncertainty must park the live engine");
+    assert!(matches!(
+        live_retry_error,
+        LoopError::Policy(ref reason) if reason == "tick_reconciliation_required"
+    ));
+    drop(engine);
+
+    let persisted_retry = LoopEngine::resume_from_trace_store(
         AgentContext::new(
             agent_id.clone(),
             tenant_id.clone(),
@@ -2817,109 +2837,34 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
             },
         ),
         Box::new(StaticPolicy {
-            name: "kernel-e2e-idempotent-retry",
+            name: "kernel-e2e-uncertain-effect-retry-denied",
             actions: vec![ActionCandidate::new(action(
                 "idempotent.fixture",
                 SideEffectClass::External,
                 &["retry.safe"],
             ))
             .with_adapter("fixture")],
-            state_payload: json!({"retry": "idempotent_success"}),
-            label: "idempotent_retry_state",
+            state_payload: json!({"retry": "must_not_execute"}),
+            label: "uncertain_retry_denied_state",
         }),
         gateway.clone(),
         trace_store.clone(),
         run_id.clone(),
-    )?;
-    let retry_tick = retry_engine.tick(2)?;
-    assert_eq!(retry_tick.action_outcomes.len(), 1);
-    assert_eq!(retry_tick.action_outcomes[0].status, ActionStatus::Executed);
-
-    let mut denied_retry_engine = LoopEngine::resume_from_trace_store(
-        AgentContext::new(
-            agent_id.clone(),
-            tenant_id.clone(),
-            AgentRuntimeConfig::default(),
-        ),
-        StateGraph::new(
-            state_store.clone(),
-            SnapshotPolicy {
-                interval: Some(1),
-                important_labels: Vec::new(),
-            },
-        ),
-        Box::new(StaticPolicy {
-            name: "kernel-e2e-non-idempotent-retry-denial",
-            actions: vec![ActionCandidate::new(action(
-                "non_idempotent.fixture",
-                SideEffectClass::External,
-                &["retry.non_idempotent.new_authority"],
-            ))
-            .with_adapter("fixture")],
-            state_payload: json!({"retry": "non_idempotent_denied"}),
-            label: "non_idempotent_retry_denied_state",
-        }),
-        gateway.clone(),
-        trace_store.clone(),
-        run_id.clone(),
-    )?;
-    let denied_retry_tick = denied_retry_engine.tick(3)?;
-    assert_eq!(denied_retry_tick.action_outcomes.len(), 1);
-    assert_eq!(
-        denied_retry_tick.action_outcomes[0].status,
-        ActionStatus::Denied
     );
-    let unknown_tenant = TenantId::parse("00000000-0000-0000-0000-000000001407")?;
-    let mut verifier_uncertainty_engine = LoopEngine::resume_from_trace_store(
-        AgentContext::new(
-            agent_id.clone(),
-            unknown_tenant,
-            AgentRuntimeConfig::default(),
-        ),
-        StateGraph::new(
-            state_store.clone(),
-            SnapshotPolicy {
-                interval: Some(1),
-                important_labels: Vec::new(),
-            },
-        ),
-        Box::new(StaticPolicy {
-            name: "kernel-e2e-retry-verifier-uncertainty",
-            actions: vec![ActionCandidate::new(action(
-                "idempotent.fixture",
-                SideEffectClass::External,
-                &["retry.safe"],
-            ))
-            .with_adapter("fixture")],
-            state_payload: json!({"retry": "verifier_uncertainty_denied"}),
-            label: "retry_verifier_uncertainty_state",
-        }),
-        gateway.clone(),
-        trace_store.clone(),
-        run_id.clone(),
-    )?;
-    let verifier_uncertainty_tick = verifier_uncertainty_engine.tick(4)?;
-    assert_eq!(verifier_uncertainty_tick.action_outcomes.len(), 1);
-    assert_eq!(
-        verifier_uncertainty_tick.action_outcomes[0].status,
-        ActionStatus::Denied
-    );
-    assert!(verifier_uncertainty_tick.action_outcomes[0]
-        .verification
-        .reasons
-        .contains(&"tenant_not_found".to_string()));
-    assert_eq!(adapter.call_count(), 3);
+    let persisted_retry_error = match persisted_retry {
+        Ok(_) => panic!("persisted generic adapter uncertainty must not resume"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        persisted_retry_error,
+        LoopError::Resume(ref reason) if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(adapter.call_count(), 1);
     let events = read_trace_events(&trace_store, &run_id)?;
-    assert!(events
-        .iter()
-        .any(|event| matches!(event.kind, TraceEventKind::ActionExecuted { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event.kind, TraceEventKind::ActionDenied { .. })));
     let retry_quota_usage = registry
         .with_tenant(&tenant_id, |tenant| tenant.tick_usage())
         .expect("tenant quota usage");
-    assert_eq!(retry_quota_usage.actions, 3);
+    assert_eq!(retry_quota_usage.actions, 1);
     let before_replay_adapter_calls = adapter.call_count();
     let replay_events = read_trace_events(&trace_store, &run_id)?;
     assert_eq!(
@@ -2948,7 +2893,7 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         agent_id: Some(agent_id.clone()),
         run_id: Some(run_id.clone()),
         verifier: Some("adapter".to_string()),
-        message: "fixture adapter failure before retry".to_string(),
+        message: "fixture adapter failure requires reconciliation".to_string(),
         trace_id: events
             .first()
             .map(|event| TraceId::from_run_sequence(&run_id, event.sequence)),
@@ -2958,9 +2903,9 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
         tenant_id.clone(),
         agent_id.clone(),
         run_id.clone(),
-        Some("permission".to_string()),
-        Some("non_idempotent.fixture".to_string()),
-        &denied_retry_tick.action_outcomes[0].verification,
+        Some("adapter_effect".to_string()),
+        Some("idempotent.fixture".to_string()),
+        failure_post,
         fixed_time(),
     ));
     retry_telemetry.record_quota_signal(QuotaSignal::from_verification(
@@ -2991,25 +2936,12 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
                 "tick_id": failure_tick.tick_id,
                 "state_node_id": failure_tick.state_commit.node_id.to_string(),
                 "state_hash": failure_tick.state_commit.node_id.hash().to_string(),
-                "action_statuses": failure_tick.action_outcomes.iter().map(|outcome| format!("{:?}", outcome.status)).collect::<Vec<_>>()
+                "action_statuses": failure_tick.action_outcomes.iter().map(|outcome| format!("{:?}", outcome.status)).collect::<Vec<_>>(),
+                "operational_facts": failure_post.artifacts.clone()
             },
-            "idempotent_retry_tick": {
-                "tick_id": retry_tick.tick_id,
-                "state_node_id": retry_tick.state_commit.node_id.to_string(),
-                "action_statuses": retry_tick.action_outcomes.iter().map(|outcome| format!("{:?}", outcome.status)).collect::<Vec<_>>()
-            },
-            "non_idempotent_denied_tick": {
-                "tick_id": denied_retry_tick.tick_id,
-                "state_node_id": denied_retry_tick.state_commit.node_id.to_string(),
-                "action_statuses": denied_retry_tick.action_outcomes.iter().map(|outcome| format!("{:?}", outcome.status)).collect::<Vec<_>>(),
-                "denial_reasons": denied_retry_tick.action_outcomes[0].verification.reasons.clone()
-            },
-            "verifier_uncertainty_tick": {
-                "tick_id": verifier_uncertainty_tick.tick_id,
-                "state_node_id": verifier_uncertainty_tick.state_commit.node_id.to_string(),
-                "action_statuses": verifier_uncertainty_tick.action_outcomes.iter().map(|outcome| format!("{:?}", outcome.status)).collect::<Vec<_>>(),
-                "denial_reasons": verifier_uncertainty_tick.action_outcomes[0].verification.reasons.clone()
-            },
+            "same_process_retry": "tick_reconciliation_required",
+            "process_restart_retry": "tick_reconciliation_required",
+            "later_same_tick_candidate_submitted": false,
             "adapter_calls": adapter.calls(),
             "quota_usage_after_retry": retry_quota_usage,
             "replay": {
@@ -3026,23 +2958,13 @@ fn run_retry_boundaries(artifacts: &Path) -> TestResult<DomainEvidence> {
     Ok(DomainEvidence {
         run_id: run_id.clone(),
         trace_event_ids: trace_ids(&events),
-        final_state_node_id: verifier_uncertainty_tick.state_commit.node_id.to_string(),
-        state_hash: verifier_uncertainty_tick
-            .state_commit
-            .node_id
-            .hash()
-            .to_string(),
-        denial_reasons: denied_retry_tick.action_outcomes[0]
-            .verification
+        final_state_node_id: failure_tick.state_commit.node_id.to_string(),
+        state_hash: failure_tick.state_commit.node_id.hash().to_string(),
+        denial_reasons: failure_post
             .reasons
             .clone()
             .into_iter()
-            .chain(
-                verifier_uncertainty_tick.action_outcomes[0]
-                    .verification
-                    .reasons
-                    .clone(),
-            )
+            .chain(["tick_reconciliation_required".to_string()])
             .collect(),
         artifact,
     })
@@ -4438,7 +4360,7 @@ async fn write_aggregate_report_to(out: PathBuf) -> TestResult<EvidenceReport> {
         ],
         vec![
             "adapter failure produces action.failed and outcome.recorded",
-            "idempotent retry requires fresh gateway verification",
+            "generic adapter uncertainty records fixed operational facts",
             "failure telemetry emitted",
         ],
         retry
@@ -4447,7 +4369,7 @@ async fn write_aggregate_report_to(out: PathBuf) -> TestResult<EvidenceReport> {
             .into_iter()
             .chain([
                 "requested adapter failure".to_string(),
-                "verifier_uncertainty_fails_closed".to_string(),
+                "same_process_and_restart_retry_fail_closed".to_string(),
             ])
             .collect(),
         retry.trace_event_ids.clone(),

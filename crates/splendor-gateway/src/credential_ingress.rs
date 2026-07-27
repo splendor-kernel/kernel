@@ -232,12 +232,12 @@ pub(crate) fn raw_credential_output_suppressed_outcome(
     verification: VerificationResult,
 ) -> ActionOutcome {
     let mut post_verification = VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED);
-    post_verification.artifacts = serde_json::json!({
-        "adapter_entered": true,
-        "effect_certainty": EffectCertainty::Uncertain.as_str(),
-        "retry_class": RetryClass::NotRetryable.as_str(),
-        "reconciliation_required": true,
-    });
+    super::attach_adapter_effect_facts(
+        &mut post_verification,
+        EffectCertainty::Uncertain,
+        RetryClass::NotRetryable,
+        true,
+    );
     ActionOutcome {
         action_id,
         status: ActionStatus::Failed,

@@ -39,10 +39,13 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 13. If constraints allowed the tick, `VerifiedActionGateway` checks tenant policy,
     adapter allowlists, permissions, quotas, invariants, and action preconditions.
 14. Only verified credential-free actions reach registered adapters.
-15. Immediately after adapter return, output and satisfied-postcondition strings
+15. Every adapter-entered Gateway result records fixed operational facts in its
+    existing post-verification artifacts: adapter entry, effect certainty, retry
+    class, and whether reconciliation is required. Immediately after a successful
+    adapter return, output and satisfied-postcondition strings
     pass the Gateway-owned persistence barrier before post-verifiers. Unsafe or
     ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
-    with no output and fixed adapter-entered/effect-uncertain/not-retryable/
+    with no output and adapter-entered/effect-uncertain/not-retryable/
     reconciliation-required facts; adapter entry means no rollback or no-effect
     claim is made.
 16. If an optional 0.04-S3 escalation policy is configured, explicit
@@ -96,16 +99,20 @@ documented in [`identity.md`](identity.md).
   escalation does not execute adapters, contact ticket systems, or install
   circuit breakers.
 - Adapter failure records a failed/denied outcome.
-- Credential-bearing or ambiguous adapter output records a fixed failed outcome
-  with no output. It does not imply that the already-entered adapter had no
-  effect and must not be blindly retried. The local scheduler parks that engine;
-  fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
-  The block is latched immediately when the gateway returns the suppression, so
-  later same-tick candidates are not submitted and a later trace, outcome, or
-  state failure cannot put the engine back on the runnable queue. Persisted
-  resume of the same run rejects either a recorded suppression or an
+- Any adapter entry latches the live engine until the tick reaches its durable
+  `LoopTickCompleted`. A successful completed tick clears that transient latch.
+  Generic adapter failure, postcondition failure, or credential-bearing or
+  ambiguous adapter output remains not retryable and reconciliation-required;
+  later same-tick candidates are not submitted, and the local scheduler parks
+  the engine after the outcome is recorded. A trace, outcome, or state failure
+  after adapter entry also leaves the engine parked rather than runnable.
+  Fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
+  Persisted resume rejects a recorded reconciliation-required result or an
   action-capable tick attempt without its matching `LoopTickCompleted`, including
-  when the first post-Gateway trace append was lost.
+  when the first post-Gateway trace append was lost. Resume selects state only
+  from completed ticks whose snapshot metadata and state node bind the exact
+  `run_id`, `tenant_id`, and `agent_id`; mismatched or incomplete metadata fails
+  closed rather than restoring a sibling agent's state.
   Recovery requires explicit operator/provider reconciliation and construction
   of a replacement run/engine; no scheduler path automatically requeues the
   parked action. A fresh persisted constructor rejects an already-existing run

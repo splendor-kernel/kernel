@@ -73,6 +73,16 @@ pub struct StateCommit {
     pub snapshot_id: Option<SnapshotId>,
 }
 
+/// Expected store-owned identity and integrity facts for one runtime resume.
+pub(crate) struct RuntimeSnapshotExpectation<'a> {
+    pub(crate) state_node_id: &'a StateNodeId,
+    pub(crate) state_hash: &'a ContentHash,
+    pub(crate) trace_event_id: &'a TraceEventId,
+    pub(crate) tenant_id: &'a TenantId,
+    pub(crate) agent_id: &'a AgentId,
+    pub(crate) run_id: &'a RunId,
+}
+
 /// Authority scope expected by a receiver importing or referencing handed-off state.
 #[derive(Clone, Debug)]
 pub struct StateHandoffScope {
@@ -168,6 +178,30 @@ impl StateGraph {
         let snapshot = self.store.load_snapshot(snapshot_id)?;
         self.head = Some(snapshot.node_id.clone());
         Ok(snapshot)
+    }
+
+    /// Restores a persisted runtime snapshot only when its trace linkage and
+    /// store-owned node metadata exactly match the resuming identity.
+    pub(crate) fn restore_snapshot_for_runtime_identity(
+        &mut self,
+        snapshot_id: &SnapshotId,
+        expected: RuntimeSnapshotExpectation<'_>,
+    ) -> Result<Option<splendor_store::StateSnapshot>, StateGraphError> {
+        let snapshot = self.store.load_snapshot(snapshot_id)?;
+        let node = self.store.get_node(&snapshot.node_id)?;
+        let matches_identity = &snapshot.node_id == expected.state_node_id
+            && &node.id == expected.state_node_id
+            && expected.state_node_id.hash() == expected.state_hash
+            && node.data_hash == ContentHash::blake3(&snapshot.state.bytes)
+            && node.metadata.tenant_id.as_ref() == Some(expected.tenant_id)
+            && node.metadata.agent_id.as_ref() == Some(expected.agent_id)
+            && node.metadata.run_id.as_ref() == Some(expected.run_id)
+            && node.metadata.trace_event_id.as_ref() == Some(expected.trace_event_id);
+        if !matches_identity {
+            return Ok(None);
+        }
+        self.head = Some(snapshot.node_id.clone());
+        Ok(Some(snapshot))
     }
 
     /// Builds a state handoff envelope from an existing local snapshot.

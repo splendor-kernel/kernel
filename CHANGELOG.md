@@ -4,6 +4,18 @@
 
 ### Added
 
+- **status/incomplete correction:** generalized the local runtime's post-Gateway
+  effect latch beyond credential-output suppression. Gateway outcomes now carry
+  fixed adapter-entry, effect-certainty, retry-class, and reconciliation facts in
+  the existing verification artifact channel; generic adapter and postcondition
+  failures park rather than retry, while successful effects become runnable only
+  after durable tick completion. Fresh shared-runtime admission is atomic, resume
+  restores only exact run/tenant/agent state from completed ticks, and built-in
+  trace stores reject stale embedded sequences atomically. Docker publication now
+  builds each platform candidate once, validates and smoke-tests that exact
+  archive, and later publishes only its checksum-matched bytes with registry write
+  authority isolated to post-validation jobs. No public schema was added and no
+  Gold or task-completion status changed.
 - **status/incomplete correction:** hardened the C03 persistence barrier so a
   recognized root/`bytes`/`body`/`contents` numeric-byte profile denies every
   malformed member instead of abandoning reconstruction, and bounded complete

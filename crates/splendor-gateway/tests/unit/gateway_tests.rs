@@ -3299,8 +3299,12 @@ fn verified_gateway_reports_postcondition_failure() {
 
     let outcome = gateway.submit(request).expect("outcome");
     assert!(matches!(outcome.status, ActionStatus::Failed));
-    assert!(outcome.post_verification.is_some());
-    assert!(!outcome.post_verification.expect("post").allowed);
+    let post = outcome.post_verification.expect("post");
+    assert!(!post.allowed);
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "known");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], true);
 }
 
 #[test]
@@ -3650,6 +3654,11 @@ fn verified_gateway_executes_when_checks_pass() {
     assert!(matches!(outcome.status, ActionStatus::Executed));
     assert_eq!(*adapter.calls.lock().expect("calls lock"), 1);
     assert!(outcome.output.is_some());
+    let post = outcome.post_verification.expect("post verification");
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "known");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], false);
 }
 
 #[test]
@@ -4965,7 +4974,12 @@ fn verified_gateway_reports_adapter_failure() {
     assert!(!encoded.contains("X-Api-Key"));
     assert!(!encoded.contains("secret"));
     assert!(outcome.output.is_none());
-    assert!(outcome.post_verification.is_none());
+    let post = outcome.post_verification.expect("effect facts");
+    assert!(!post.allowed);
+    assert_eq!(post.artifacts["adapter_entered"], true);
+    assert_eq!(post.artifacts["effect_certainty"], "uncertain");
+    assert_eq!(post.artifacts["retry_class"], "not_retryable");
+    assert_eq!(post.artifacts["reconciliation_required"], true);
 }
 
 #[test]

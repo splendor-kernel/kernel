@@ -88,23 +88,206 @@ def workflow_job_needs(block: str) -> set[str]:
     return {item.strip().strip("'\"") for item in value.split(",") if item.strip()}
 
 
+def workflow_named_step(block: str, name: str) -> str | None:
+    lines = block.splitlines()
+    marker = f"      - name: {name}"
+    start = next((index for index, line in enumerate(lines) if line == marker), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("      - "):
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
+def job_has_packages_write(block: str) -> bool:
+    return bool(re.search(r"^      packages:\s*write\s*$", block, re.MULTILINE))
+
+
+def action_refs_are_immutable(workflow: str) -> list[str]:
+    violations: list[str] = []
+    for action, reference in re.findall(
+        r"^\s+uses:\s*([^@\s]+)@([^\s#]+)", workflow, flags=re.MULTILINE
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", reference):
+            violations.append(
+                f"Docker publication workflow action {action!r} is not pinned to a full commit SHA"
+            )
+    return violations
+
+
 def check_publish_workflow_text(workflow: str) -> list[str]:
     violations: list[str] = []
     jobs = workflow_job_blocks(workflow)
+    top_level = workflow.split("\njobs:\n", 1)[0]
+    if re.search(r"^  packages:\s*write\s*$", top_level, re.MULTILINE):
+        violations.append("Docker publication workflow grants packages:write before job validation")
+
+    violations.extend(action_refs_are_immutable(workflow))
+    if workflow.count("docker/build-push-action@") != 1:
+        violations.append(
+            "Docker publication workflow must contain exactly one matrixed image build step"
+        )
+    build = jobs.get("build-platform")
     closure = jobs.get("release-closure")
-    if closure is None:
-        return ["Docker publication workflow is missing the release-closure job"]
-    for required in (
-        "check-secret-provider-release-closure.py",
-        "--image",
-        "--expected-revision",
-        "${GITHUB_SHA}",
-        'git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"',
+    publish_platform = jobs.get("publish-platform")
+    publish_manifest = jobs.get("publish-manifest")
+    for name, block in (
+        ("build-platform", build),
+        ("release-closure", closure),
+        ("publish-platform", publish_platform),
+        ("publish-manifest", publish_manifest),
     ):
-        if required not in closure:
+        if block is None:
+            violations.append(f"Docker publication workflow is missing the {name} job")
+
+    if build is not None:
+        build_step = workflow_named_step(build, "Build platform image exactly once")
+        if build_step is None:
+            violations.append("Docker build-platform job is missing its one-time build step")
+        else:
+            if (
+                "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"
+                not in build_step
+            ):
+                violations.append(
+                    "Docker one-time platform build is missing the immutable build action"
+                )
+            build_lines = set(build_step.splitlines())
+            for required_line in (
+                "          context: .",
+                "          platforms: ${{ matrix.platform }}",
+                "          outputs: type=docker,dest=${{ runner.temp }}/splendor-${{ matrix.artifact }}.tar",
+                "            VCS_REF=${{ github.sha }}",
+                "            BUILD_DATE=${{ steps.build-date.outputs.created }}",
+            ):
+                if required_line not in build_lines:
+                    violations.append(
+                        f"Docker one-time platform build is missing immutable line {required_line!r}"
+                    )
+            if re.search(r"^        if:", build_step, re.MULTILINE):
+                violations.append("Docker one-time platform build must not be conditional")
+        if job_has_packages_write(build):
+            violations.append("Docker build-platform job must remain registry read-only")
+        if "name: candidate-${{ matrix.artifact }}-${{ github.run_attempt }}" not in build:
+            violations.append("Docker platform candidate artifact is not run-attempt scoped")
+
+    if closure is not None:
+        if re.search(r"^    if:", closure, re.MULTILINE):
+            violations.append("Docker release-closure job must not be conditional")
+        verify_step = workflow_named_step(
+            closure, "Verify exact candidate dependency and binary release closure"
+        )
+        if verify_step is None:
+            violations.append("Docker release-closure job is missing exact candidate verification")
+        else:
+            for required in (
+                "check-secret-provider-release-closure.py",
+                '--image "${CANDIDATE_IMAGE}"',
+                '--expected-revision "${GITHUB_SHA}"',
+            ):
+                if required not in verify_step:
+                    violations.append(
+                        f"Docker release-closure verification is missing {required!r}"
+                    )
+            if re.search(r"^        if:", verify_step, re.MULTILINE):
+                violations.append("Docker release-closure verification must not be conditional")
+        for required in (
+            "needs: build-platform",
+            "Download immutable platform candidate",
+            'sha256sum --check "splendor-${{ matrix.artifact }}.tar.sha256"',
+            'docker load --input "${RUNNER_TEMP}/candidate/splendor-${{ matrix.artifact }}.tar"',
+            "Smoke test the exact candidate image",
+            "validated-${{ matrix.artifact }}.sha256",
+            "Upload release-closure receipt",
+            "name: candidate-${{ matrix.artifact }}-${{ github.run_attempt }}",
+            "name: validated-${{ matrix.artifact }}-${{ github.run_attempt }}",
+        ):
+            if required not in closure:
+                violations.append(
+                    f"Docker release-closure job is missing exact-artifact fragment {required!r}"
+                )
+        if (
+            "docker/build-push-action@" in closure
+            or "          context:" in closure
+            or re.search(r"\bdocker\s+(?:build|buildx\s+build)\b", closure)
+        ):
+            violations.append("Docker release-closure job must validate, not rebuild, candidates")
+        if job_has_packages_write(closure):
+            violations.append("Docker release-closure job must remain registry read-only")
+
+    if publish_platform is not None:
+        for required in (
+            "needs: release-closure",
+            "Download exact validated platform candidate",
+            "Download release-closure receipt",
+            'sha256sum --check "validated-${{ matrix.artifact }}.sha256"',
+            "Load exact validated platform image",
+            "Recheck exact revision before registry authority",
+            "Log in to GitHub Container Registry after validation",
+            'docker push "${CANDIDATE_IMAGE}"',
+            "name: candidate-${{ matrix.artifact }}-${{ github.run_attempt }}",
+            "name: validated-${{ matrix.artifact }}-${{ github.run_attempt }}",
+            "name: digests-${{ github.run_attempt }}-${{ matrix.artifact }}",
+        ):
+            if required not in publish_platform:
+                violations.append(
+                    f"Docker publish-platform job is missing exact-artifact fragment {required!r}"
+                )
+        if (
+            "docker/build-push-action@" in publish_platform
+            or "          context:" in publish_platform
+            or re.search(r"\bdocker\s+(?:build|buildx\s+build)\b", publish_platform)
+        ):
+            violations.append("Docker publish-platform job must publish, not rebuild, candidates")
+        if not job_has_packages_write(publish_platform):
+            violations.append("Docker publish-platform job lacks scoped packages:write")
+        checksum_step = workflow_named_step(
+            publish_platform, "Verify exact validated archive before registry authority"
+        )
+        if checksum_step is None or "sha256sum --check" not in checksum_step:
             violations.append(
-                f"Docker release-closure job is missing exact-artifact gate fragment {required!r}"
+                "Docker publish-platform job lacks exact validated archive checksum enforcement"
             )
+        elif re.search(r"^        if:", checksum_step, re.MULTILINE):
+            violations.append("Docker publish-platform checksum enforcement must not be conditional")
+        validation_index = publish_platform.find(
+            "Verify exact validated archive before registry authority"
+        )
+        login_index = publish_platform.find("Log in to GitHub Container Registry after validation")
+        if validation_index < 0 or login_index < 0 or validation_index > login_index:
+            violations.append("Docker registry login occurs before exact archive validation")
+
+    if publish_manifest is not None:
+        if "needs: publish-platform" not in publish_manifest:
+            violations.append("Docker publish-manifest job does not depend on platform publication")
+        if not job_has_packages_write(publish_manifest):
+            violations.append("Docker publish-manifest job lacks scoped packages:write")
+        if "pattern: digests-${{ github.run_attempt }}-*" not in publish_manifest:
+            violations.append("Docker manifest digest selection is not run-attempt scoped")
+        manifest_validation = workflow_named_step(
+            publish_manifest, "Validate exact published digest set before registry login"
+        )
+        if (
+            manifest_validation is None
+            or '"${#digests[@]}" -ne 2' not in manifest_validation
+            or "^[0-9a-f]{64}$" not in manifest_validation
+        ):
+            violations.append("Docker manifest publication lacks exact two-digest validation")
+        elif re.search(r"^        if:", manifest_validation, re.MULTILINE):
+            violations.append("Docker manifest digest validation must not be conditional")
+        manifest_validation_index = publish_manifest.find(
+            "Validate exact published digest set before registry login"
+        )
+        manifest_login_index = publish_manifest.find("Log in to GitHub Container Registry")
+        if (
+            manifest_validation_index < 0
+            or manifest_login_index < 0
+            or manifest_validation_index > manifest_login_index
+        ):
+            violations.append("Docker manifest registry login occurs before digest validation")
 
     dependencies = {name: workflow_job_needs(block) for name, block in jobs.items()}
 
@@ -131,6 +314,13 @@ def check_publish_workflow_text(workflow: str) -> list[str]:
         if any(marker in block for marker in publication_markers) and not depends_on_closure(name):
             violations.append(
                 f"Docker publication job {name!r} does not depend on release-closure"
+            )
+        if job_has_packages_write(block) and name not in {
+            "publish-platform",
+            "publish-manifest",
+        }:
+            violations.append(
+                f"Docker pre-validation job {name!r} unexpectedly has packages:write"
             )
     return violations
 
@@ -281,32 +471,66 @@ def main() -> int:
             "splendor-adapter-secrets-local-file",
             "secret-provider-test-support",
         ]
-        safe_workflow = """jobs:
-  release-closure:
-    steps:
-      - run: git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
-      - run: python3 scripts/architecture/check-secret-provider-release-closure.py --image fixture --expected-revision "${GITHUB_SHA}"
-  smoke:
-    steps:
-      - run: smoke
-  publish-platform:
-    needs: [smoke, release-closure]
-    steps:
-      - uses: docker/login-action@v3
-      - run: publish push=true
-  publish-manifest:
-    needs: publish-platform
-    steps:
-      - run: docker buildx imagetools create fixture
-"""
-        assert check_publish_workflow_text(safe_workflow) == []
-        unsafe_workflow = safe_workflow.replace(
-            "    needs: [smoke, release-closure]\n", "    needs: smoke\n"
-        )
-        assert check_publish_workflow_text(unsafe_workflow) == [
-            "Docker publication job 'publish-platform' does not depend on release-closure",
-            "Docker publication job 'publish-manifest' does not depend on release-closure",
-        ]
+        workflow_path = args.repo_root.resolve() / PUBLISH_WORKFLOW
+        workflow = workflow_path.read_text()
+        assert check_publish_workflow_text(workflow) == []
+
+        mutations = {
+            "conditional_verification": workflow.replace(
+                "      - name: Verify exact candidate dependency and binary release closure\n        env:",
+                "      - name: Verify exact candidate dependency and binary release closure\n        if: ${{ false }}\n        env:",
+                1,
+            ),
+            "disabled_verification": workflow.replace(
+                "          python3 scripts/architecture/check-secret-provider-release-closure.py \\",
+                "          true # exact candidate verification disabled \\",
+                1,
+            ),
+            "changed_build_context": workflow.replace(
+                "          context: .", "          context: ./unvalidated", 1
+            ),
+            "changed_revision_arg": workflow.replace(
+                "            VCS_REF=${{ github.sha }}", "            VCS_REF=untrusted", 1
+            ),
+            "publish_rebuild": workflow.replace(
+                "      - name: Download exact validated platform candidate",
+                "      - name: Rebuild unchecked candidate\n        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8\n        with:\n          context: ./unvalidated\n      - name: Download exact validated platform candidate",
+                1,
+            ),
+            "pre_gate_registry_authority": workflow.replace(
+                "  release-closure:\n    needs: build-platform\n    permissions:\n      contents: read",
+                "  release-closure:\n    needs: build-platform\n    permissions:\n      contents: read\n      packages: write",
+                1,
+            ),
+            "mutable_action_ref": workflow.replace(
+                "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+                "docker/setup-buildx-action@v3",
+                1,
+            ),
+            "publish_without_validated_checksum": workflow.replace(
+                'sha256sum --check "validated-${{ matrix.artifact }}.sha256"',
+                'true # checksum deliberately bypassed',
+                1,
+            ),
+            "cross_attempt_candidate_artifact": workflow.replace(
+                "name: candidate-${{ matrix.artifact }}-${{ github.run_attempt }}",
+                "name: candidate-${{ matrix.artifact }}",
+                1,
+            ),
+            "cross_attempt_manifest_digest_selection": workflow.replace(
+                "pattern: digests-${{ github.run_attempt }}-*",
+                "pattern: digests-*",
+                1,
+            ),
+            "manifest_without_exact_digest_validation": workflow.replace(
+                '          if [ "${#digests[@]}" -ne 2 ]; then',
+                '          if false; then',
+                1,
+            ),
+        }
+        for name, mutated in mutations.items():
+            assert mutated != workflow, name
+            assert check_publish_workflow_text(mutated), name
         print("Secret Provider release closure self-test: PASS")
         return 0
     try:
