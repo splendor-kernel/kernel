@@ -228,17 +228,24 @@ scan occurs before invariant or safety post-verification and before any output
 can enter `ActionOutcome`, traces, daemon responses, state, export, or replay.
 Persisted JSON screening includes strings and keys, root numeric byte arrays, and
 selected `bytes`, `body`, and `contents` numeric-byte envelopes, including the
-current filesystem and HTTP result shapes. Declared JSON bodies must parse,
-textual bodies must be unambiguous UTF-8, and scanner/parser/resource uncertainty
-fails closed.
+current filesystem and HTTP result shapes. Once a root/selected array has a
+numeric-byte profile, every member must be an integer in `0..=255`; floats,
+negative/out-of-range values, booleans, nulls, strings, objects, or mixed forms
+deny instead of abandoning reconstruction. Invalid UTF-8 opaque envelopes are
+still inspected, within the same byte budget, for complete recognizable textual
+spans before genuinely opaque benign binary is allowed. No lossy candidate is
+retained or reflected. Declared JSON bodies must parse, textual bodies must be
+unambiguous UTF-8, and scanner/parser/resource uncertainty fails closed.
 
 A match or uncertainty after adapter entry is not a pre-effect denial. The
 Gateway returns `ActionStatus::Failed`, keeps the already-safe pre-verification
 result, sets `post_verification` to a denial whose only reason is
 `raw_credential_output_suppressed`, sets `error` to that same code, and omits
-output. This does not claim that the adapter effect was rolled back or never
-happened and does not authorize blind retry. Adapter errors continue to use
-their existing fixed `adapter failed` projection and never expose
+output. The denial's fixed artifacts record `adapter_entered: true`,
+`effect_certainty: uncertain`, `retry_class: not_retryable`, and
+`reconciliation_required: true`. This does not claim that the adapter effect was
+rolled back or never happened and does not authorize blind retry. Adapter errors
+continue to use their existing fixed `adapter failed` projection and never expose
 provider-controlled text.
 
 The companion pure percept/state guards share this scanner owner. Percepts are

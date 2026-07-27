@@ -37,7 +37,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MATERIAL_BYTES: usize = 65_536;
 const MAX_CONFIGURED_ENTRIES: usize = 4_096;
@@ -145,6 +145,7 @@ pub struct LocalFileSecretProvider {
     provider_id: SecretProviderId,
     trusted_root: File,
     expected_uid: u32,
+    integrity_key: Zeroizing<[u8; 32]>,
     entries: HashMap<EntryKey, RegisteredFile>,
     state: Mutex<ProviderState>,
     fetch_calls: AtomicU64,
@@ -162,6 +163,7 @@ struct EntryKey {
 struct RegisteredFile {
     relative_path: PathBuf,
     fingerprint: FileFingerprint,
+    integrity_tag: Zeroizing<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -202,6 +204,12 @@ impl TransientMaterial {
 
     fn bytes_mut(&mut self) -> &mut Vec<u8> {
         self.bytes.as_mut().expect("transient material is present")
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.bytes
+            .as_deref()
+            .expect("transient material is present")
     }
 
     fn into_bytes(mut self) -> Vec<u8> {
@@ -264,18 +272,23 @@ impl LocalFileSecretProvider {
 
         let expected_uid = effective_uid();
         let trusted_root = open_trusted_root(&trusted_root, expected_uid)?;
+        let integrity_key = generate_integrity_key()?;
         let mut entries = HashMap::with_capacity(validated_entries.len());
         let mut unique_backing_sources = HashSet::with_capacity(validated_entries.len());
         for (key, relative_path) in validated_entries {
-            let (_file, fingerprint) =
+            let (mut file, fingerprint) =
                 open_relative_secret_file(&trusted_root, &relative_path, expected_uid)
                     .map_err(config_error_from_open_failure)?;
+            let material = read_open_material(&mut file, &fingerprint, expected_uid)
+                .map_err(config_error_from_open_failure)?;
+            let integrity_tag = keyed_integrity_tag(&integrity_key, material.bytes());
             register_unique_backing_source(&mut unique_backing_sources, &fingerprint)?;
             entries.insert(
                 key,
                 RegisteredFile {
                     relative_path,
                     fingerprint,
+                    integrity_tag,
                 },
             );
         }
@@ -284,6 +297,7 @@ impl LocalFileSecretProvider {
             provider_id,
             trusted_root,
             expected_uid,
+            integrity_key,
             entries,
             state: Mutex::new(ProviderState { available: true }),
             fetch_calls: AtomicU64::new(0),
@@ -359,26 +373,10 @@ impl LocalFileSecretProvider {
             return Err(provider_error(SecretProviderErrorCode::IntegrityFailure));
         }
 
-        let expected_length = usize::try_from(before.size)
-            .map_err(|_| provider_error(SecretProviderErrorCode::IntegrityFailure))?;
-        let mut material = TransientMaterial::with_len(expected_length);
-        file.read_exact(material.bytes_mut())
-            .map_err(|_| provider_error(SecretProviderErrorCode::Unavailable))?;
-        let mut extra = [0u8; 1];
-        let extra_length = match file.read(&mut extra) {
-            Ok(length) => length,
-            Err(_) => {
-                extra.zeroize();
-                return Err(provider_error(SecretProviderErrorCode::Unavailable));
-            }
-        };
-        extra.zeroize();
-        if extra_length != 0 {
-            return Err(provider_error(SecretProviderErrorCode::IntegrityFailure));
-        }
-        let after = fingerprint_for_open_file(&file, self.expected_uid)
+        let material = read_open_material(&mut file, &before, self.expected_uid)
             .map_err(provider_error_from_open_failure)?;
-        if after != registered.fingerprint {
+        let integrity_tag = keyed_integrity_tag(&self.integrity_key, material.bytes());
+        if !integrity_tags_match(&integrity_tag, &registered.integrity_tag) {
             return Err(provider_error(SecretProviderErrorCode::IntegrityFailure));
         }
         Ok(material.into_bytes())
@@ -454,13 +452,19 @@ impl LocalFileSecretProvider {
         &self,
         registered: &RegisteredFile,
     ) -> Result<(), SecretProviderError> {
-        let (_file, current) = open_relative_secret_file(
+        let (mut file, current) = open_relative_secret_file(
             &self.trusted_root,
             &registered.relative_path,
             self.expected_uid,
         )
         .map_err(provider_error_from_open_failure)?;
         if current != registered.fingerprint {
+            return Err(provider_error(SecretProviderErrorCode::IntegrityFailure));
+        }
+        let material = read_open_material(&mut file, &current, self.expected_uid)
+            .map_err(provider_error_from_open_failure)?;
+        let integrity_tag = keyed_integrity_tag(&self.integrity_key, material.bytes());
+        if !integrity_tags_match(&integrity_tag, &registered.integrity_tag) {
             return Err(provider_error(SecretProviderErrorCode::IntegrityFailure));
         }
         Ok(())
@@ -608,12 +612,19 @@ fn open_trusted_root(
 ) -> Result<File, LocalFileSecretProviderConfigError> {
     let mut current = open_at(libc::AT_FDCWD, OsStr::new("/"), DIRECTORY_OPEN_FLAGS)
         .map_err(config_open_error)?;
-    for component in root.components().skip(1) {
+    validate_path_selection_directory(&current, expected_uid)
+        .map_err(|_| LocalFileSecretProviderConfigError::FilesystemPolicyDenied)?;
+    let mut components = root.components().skip(1).peekable();
+    while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             return Err(LocalFileSecretProviderConfigError::InvalidTrustedRoot);
         };
         current =
             open_at(current.as_raw_fd(), name, DIRECTORY_OPEN_FLAGS).map_err(config_open_error)?;
+        if components.peek().is_some() {
+            validate_path_selection_directory(&current, expected_uid)
+                .map_err(|_| LocalFileSecretProviderConfigError::FilesystemPolicyDenied)?;
+        }
     }
     validate_directory(&current, expected_uid)
         .map_err(|_| LocalFileSecretProviderConfigError::FilesystemPolicyDenied)?;
@@ -675,7 +686,26 @@ fn validate_directory(directory: &File, expected_uid: u32) -> Result<(), OpenFai
     {
         return Err(OpenFailure::PolicyDenied);
     }
-    Ok(())
+    validate_no_extended_acl(directory)
+}
+
+fn validate_path_selection_directory(
+    directory: &File,
+    expected_uid: u32,
+) -> Result<(), OpenFailure> {
+    let metadata = directory.metadata().map_err(|_| OpenFailure::Unavailable)?;
+    let mode = metadata.mode();
+    let trusted_owner = metadata.uid() == 0 || metadata.uid() == expected_uid;
+    let group_or_other_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if !metadata.file_type().is_dir()
+        || !trusted_owner
+        || mode & 0o6000 != 0
+        || group_or_other_writable && !sticky
+    {
+        return Err(OpenFailure::PolicyDenied);
+    }
+    validate_no_extended_acl(directory)
 }
 
 fn fingerprint_for_open_file(
@@ -684,6 +714,7 @@ fn fingerprint_for_open_file(
 ) -> Result<FileFingerprint, OpenFailure> {
     let metadata = file.metadata().map_err(|_| OpenFailure::Unavailable)?;
     validate_secret_file_metadata(&metadata, expected_uid)?;
+    validate_no_extended_acl(file)?;
     Ok(FileFingerprint {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -716,6 +747,121 @@ fn validate_secret_file_metadata(
         return Err(OpenFailure::InvalidMaterial);
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_no_extended_acl(file: &File) -> Result<(), OpenFailure> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type Acl = *mut c_void;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut Acl) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the descriptor remains live; returned ACL ownership is released
+    // exactly once with `acl_free` below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::ENOENT => Ok(()),
+            _ => Err(OpenFailure::Unavailable),
+        };
+    }
+    let mut entry: Acl = ptr::null_mut();
+    // SAFETY: `acl` is live and `entry` is a valid out pointer.
+    let entry_result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let entry_errno = io::Error::last_os_error().raw_os_error();
+    // SAFETY: `acl` was returned by `acl_get_fd_np` and has not been freed.
+    let free_result = unsafe { acl_free(acl) };
+    if entry_result == 0 {
+        return Err(OpenFailure::PolicyDenied);
+    }
+    if entry_result != -1 || entry_errno != Some(libc::EINVAL) || free_result != 0 {
+        return Err(OpenFailure::Unavailable);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_no_extended_acl(file: &File) -> Result<(), OpenFailure> {
+    const POSIX_ACCESS_ACL: &[u8] = b"system.posix_acl_access\0";
+    // SAFETY: the descriptor remains live and the attribute name is
+    // NUL-terminated; a null buffer with size zero requests only its size.
+    let length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            POSIX_ACCESS_ACL.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if length >= 0 {
+        return Err(OpenFailure::PolicyDenied);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ENODATA => Ok(()),
+        _ => Err(OpenFailure::Unavailable),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_no_extended_acl(_file: &File) -> Result<(), OpenFailure> {
+    Err(OpenFailure::Unavailable)
+}
+
+fn read_open_material(
+    file: &mut File,
+    fingerprint: &FileFingerprint,
+    expected_uid: u32,
+) -> Result<TransientMaterial, OpenFailure> {
+    let expected_length =
+        usize::try_from(fingerprint.size).map_err(|_| OpenFailure::InvalidMaterial)?;
+    let mut material = TransientMaterial::with_len(expected_length);
+    file.read_exact(material.bytes_mut())
+        .map_err(|_| OpenFailure::Unavailable)?;
+    let mut extra = [0u8; 1];
+    let extra_length = match file.read(&mut extra) {
+        Ok(length) => length,
+        Err(_) => {
+            extra.zeroize();
+            return Err(OpenFailure::Unavailable);
+        }
+    };
+    extra.zeroize();
+    if extra_length != 0 {
+        return Err(OpenFailure::InvalidMaterial);
+    }
+    let after = fingerprint_for_open_file(file, expected_uid)?;
+    if &after != fingerprint {
+        return Err(OpenFailure::PolicyDenied);
+    }
+    Ok(material)
+}
+
+fn generate_integrity_key() -> Result<Zeroizing<[u8; 32]>, LocalFileSecretProviderConfigError> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    // SAFETY: `key` points to 32 writable bytes for the duration of the call.
+    let result = unsafe { libc::getentropy(key.as_mut_ptr().cast(), key.len()) };
+    if result == 0 {
+        Ok(key)
+    } else {
+        Err(LocalFileSecretProviderConfigError::FilesystemPolicyDenied)
+    }
+}
+
+fn keyed_integrity_tag(key: &[u8; 32], bytes: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(*blake3::keyed_hash(key, bytes).as_bytes())
+}
+
+fn integrity_tags_match(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    // `blake3::Hash` equality uses the crate's constant-time 32-byte compare.
+    blake3::Hash::from_bytes(*left) == *right
 }
 
 fn effective_uid() -> u32 {

@@ -4,6 +4,19 @@
 
 ### Added
 
+- **status/incomplete correction:** hardened the C03 persistence barrier so a
+  recognized root/`bytes`/`body`/`contents` numeric-byte profile denies every
+  malformed member instead of abandoning reconstruction, and bounded complete
+  textual spans around invalid UTF-8 are screened without retaining lossy
+  candidates. Post-adapter suppression now carries fixed adapter-entered,
+  uncertain-effect, not-retryable, and reconciliation-required facts; direct
+  ticks and local scheduler/CLI cycles cannot automatically repeat that action,
+  while ordinary pre-effect failures retain their existing behavior. The
+  local-file development provider now validates trusted-root ancestors and
+  supported-platform ACLs, pins private process-keyed content-integrity tags,
+  and has a normal release dependency/binary closure gate. No public wire/trace
+  schema or material API was added, opaque custom encoding remains an explicit
+  nonclaim, and `G07`, `G08`, and `G82` remain `not_exercised`.
 - **status/incomplete:** extended the single Gateway-owned bounded credential
   scanner with a generic pre-persistence barrier for adapter results, percepts,
   and policy-selected state. Adapter output and satisfied-postcondition strings

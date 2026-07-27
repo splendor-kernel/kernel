@@ -108,15 +108,26 @@ and adapter-result envelopes:
   state. A detection returns stable `ActionStatus::Failed`, absent output, and
   a post-verification denial plus error containing only
   `raw_credential_output_suppressed`. This means the adapter was entered and
-  does not claim rollback, no effect, or safe retry.
+  does not claim rollback, no effect, or safe retry. Fixed structured artifacts
+  record adapter entry, uncertain effect certainty, a not-retryable class, and
+  required reconciliation; local scheduler/CLI loops park the engine instead of
+  automatically proposing the action again. The block is latched before any
+  later trace, escalation, outcome, or state operation can fail, so those
+  failures cannot requeue the entered action. Same-run persisted resume rejects
+  a recorded suppression until a replacement run is explicitly constructed
+  after reconciliation.
 
 Persisted JSON scanning covers strings/object keys plus root numeric byte arrays
 and selected `bytes`, `body`, and `contents` byte-envelope coordinates, including
-current filesystem/HTTP result shapes. Bounded benign JSON, text,
-filesystem/HTTP results, and genuinely opaque binary state remain compatible.
-Explicit text/JSON ambiguity fails closed. Invalid non-text binary bytes may
-remain opaque; the barrier does not claim visibility inside encrypted,
-compressed, custom-encoded, or otherwise opaque state.
+current filesystem/HTTP result shapes. A numeric profile fails closed if any
+member is non-integer, negative, out of `u8` range, null, string, boolean, object,
+or otherwise mixed; malformed members cannot make the scanner abandon the
+envelope. Invalid UTF-8 envelopes are boundedly split around invalid sequences
+and complete recognizable textual spans are screened without retaining or
+reflecting a lossy candidate. Bounded benign JSON, text, filesystem/HTTP results,
+and genuinely opaque binary state remain compatible. Explicit text/JSON
+ambiguity fails closed. Encrypted, compressed, custom-encoded, split, or
+otherwise opaque state remains an explicit nonclaim.
 
 This barrier is intentionally not the complete RFC 0012
 `CredentialIngressProfile`: it has no operation-specific owner-schema registry,
@@ -272,28 +283,42 @@ The Unix implementation opens the trusted root one component at a time and
 retains its descriptor. Every configured fetch is descriptor-relative with
 `O_NOFOLLOW`, `O_CLOEXEC`, and nonblocking final-file open. The root and mapped
 intermediate directories must belong to the effective user and expose no
-group/other access. Final descriptors must be effective-user-owned regular
-single-link files with no group/other access and a size from 1 through 65,536
-bytes. Device, inode, size, mode, owner, link count, modification time, and
-change time are pinned at construction and rechecked before and after a bounded
-read. Missing, replaced, relinked, permission-changed, empty, oversized,
-non-regular, symlinked, or poisoned state returns only fixed provider/config
-codes. OS diagnostics, roots, relative paths, coordinates, and material are not
-rendered by adapter `Debug` or errors. Transient failed-read buffers are
-zeroized; this reduces exposure and is not a perfect-erasure claim.
+group/other access. Every absolute-path ancestor must be root- or effective-user
+owned; group/other-write is accepted only on a sticky ancestor, while nonsticky
+writable ancestors fail closed. Linux POSIX access ACLs and macOS extended ACLs
+are conservatively rejected rather than interpreted on ancestors, the root,
+mapped intermediates, and final files, so a non-owner grant cannot pass; other
+Unix targets fail closed when that policy cannot be established.
+Final descriptors must be effective-user-owned regular single-link files with no
+group/other access and a size from 1 through 65,536 bytes. Device, inode, size,
+mode, owner, link count, modification time, and change time are pinned at
+construction and rechecked before and after a bounded read. A process-random
+private BLAKE3 keyed tag is also pinned and checked on fetch, audit, and health,
+so same-size content changes remain detectable even if mutable filesystem
+metadata appears unchanged. Neither key nor tag is exposed. Missing, replaced,
+relinked, permission/ACL-changed, empty, oversized, non-regular, symlinked, or
+poisoned state returns only fixed provider/config codes. OS diagnostics, roots,
+relative paths, coordinates, material, and integrity tags are not rendered by
+adapter `Debug` or errors. Transient material, integrity keys, and tags use
+zeroizing storage; this reduces exposure and is not a perfect-erasure claim.
 
 Fetch is available only through the existing private-construction Authority
 provider port and returns the existing request-borrowed result with only length
-and audit access. Sanitized `audit` validates the exact registered descriptor
-identity without reading bytes. `active_probe` reports a passive boolean for the
-exact mapping; provider-side `renew` and `revoke` return
+and audit access. Sanitized `audit` and `active_probe` perform the same bounded
+descriptor and private keyed-integrity validation; the probe reports only a
+passive boolean for the exact mapping. Provider-side `renew` and `revoke` return
 `unsupported_operation` and never modify or delete the file. A separate
 default-off Authority test-support feature constructs legitimate requests only
 inside Authority and returns safe length/audit/health observations, never a
 request object or material bytes. The dependency guard pins that feature to
 dev-only use, pins the adapter's empty default feature and narrow dependency
 closure, and rejects every normal release-graph consumer. The normal daemon
-dependency graph contains no development secret provider.
+dependency graph contains no development secret provider. CI additionally
+builds the normal daemon/CLI binaries, checks their normal/build dependency
+trees, and scans the binaries for fixed local-file/test-support markers. Cargo
+workspace `--all-features` still enables the explicit Authority test-support
+surface for tests because Cargo features are additive; that is a retained
+test-only limitation, not a production/release graph claim.
 
 This development adapter is not daemon- or Gateway-composed and does not claim
 the durable bootstrap-backing-source registry, route enrollment, provider
@@ -305,7 +330,7 @@ The dependency guard recognizes `adapters/secrets-*` before the ordinary adapter
 rule and permits only `splendor-authority` plus `splendor-types` as direct
 internal dependencies. It rejects direct dependencies on Gateway, kernel, store,
 daemon, node, or another adapter; the local-file provider additionally has a
-closed `libc`/`zeroize` external production dependency set.
+closed `blake3`/`libc`/`zeroize` external production dependency set.
 
 ## Canonical identity contract
 

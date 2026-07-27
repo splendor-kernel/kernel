@@ -14,7 +14,7 @@ use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_routing_and_receipts,
     guard_persisted_percept, guard_persisted_state, raw_credential_denied_action,
     raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
-    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED,
+    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_store::{StateData, StateMetadata, TraceStore, TraceStoreError};
 use splendor_types::{
@@ -27,6 +27,10 @@ use splendor_types::{
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
+
+/// Fixed local compatibility reason returned when another tick cannot be
+/// attempted until rejected persistence or an uncertain effect is reconciled.
+pub(crate) const TICK_RECONCILIATION_REQUIRED: &str = "tick_reconciliation_required";
 
 /// Collects percepts for a tick.
 pub trait Perceptor: Send + Sync {
@@ -330,6 +334,12 @@ pub enum LoopError {
     EscalationPolicy(#[from] EscalationPolicyError),
 }
 
+#[derive(Clone, Copy)]
+enum TickReconciliationBlock {
+    PersistenceDenied,
+    PostEffectSuppression,
+}
+
 /// Kernel loop engine for a single agent.
 pub struct LoopEngine {
     agent: AgentContext,
@@ -343,6 +353,7 @@ pub struct LoopEngine {
     outcome_evaluator: Box<dyn OutcomeEvaluator>,
     escalation_evaluator: Option<EscalationEvaluator>,
     policy_authority: Option<Arc<dyn PolicyRuntimeAuthority>>,
+    reconciliation_block: Option<TickReconciliationBlock>,
 }
 
 impl LoopEngine {
@@ -408,6 +419,7 @@ impl LoopEngine {
             outcome_evaluator: Box::new(NoopOutcomeEvaluator),
             escalation_evaluator: None,
             policy_authority: None,
+            reconciliation_block: None,
         }
     }
 
@@ -613,6 +625,10 @@ impl LoopEngine {
         &self.agent.tenant_id
     }
 
+    pub(crate) fn requires_reconciliation(&self) -> bool {
+        self.reconciliation_block.is_some()
+    }
+
     fn trace_identity(&self, tick_id: u64) -> TraceIdentityContext {
         self.runtime
             .trace_identity()
@@ -761,10 +777,20 @@ impl LoopEngine {
 
     /// Executes a single tick of the loop engine.
     pub fn tick(&mut self, tick_id: u64) -> Result<TickOutcome, LoopError> {
+        if self.reconciliation_block.is_some() {
+            return Err(LoopError::Policy(TICK_RECONCILIATION_REQUIRED.to_string()));
+        }
         let start = Instant::now();
         self.record_tick_event(tick_id, TraceEventKind::LoopTickStarted { tick_id })?;
 
-        let percepts = self.collect_percepts()?;
+        let percepts = match self.collect_percepts() {
+            Ok(percepts) => percepts,
+            Err(LoopError::Perceptor(reason)) if reason == RAW_CREDENTIAL_INPUT_DENIED => {
+                self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
+                return Err(LoopError::Perceptor(reason));
+            }
+            Err(error) => return Err(error),
+        };
         self.record_tick_event(
             tick_id,
             TraceEventKind::PerceptsReceived {
@@ -810,6 +836,7 @@ impl LoopEngine {
         )
         .is_err()
         {
+            self.reconciliation_block = Some(TickReconciliationBlock::PersistenceDenied);
             return Err(LoopError::Policy(RAW_CREDENTIAL_INPUT_DENIED.to_string()));
         }
         self.record_tick_event(
@@ -957,6 +984,14 @@ impl LoopEngine {
                     }
                 }
             };
+
+            // Set the absorbing local block immediately after gateway return.
+            // Every following trace, escalation, outcome, and state operation is
+            // fallible; none may make an already-entered uncertain effect
+            // eligible for scheduler requeue.
+            if output_suppression_requires_reconciliation(&outcome) {
+                self.reconciliation_block = Some(TickReconciliationBlock::PostEffectSuppression);
+            }
 
             let action_escalations = if screened.raw_credential_denied {
                 Vec::new()
@@ -1257,6 +1292,11 @@ impl LoopEngine {
         let mut tick_id = None;
         for record in records {
             let event: TraceEvent = serde_json::from_value(record.payload)?;
+            if let TraceEventKind::ActionFailed { error, result, .. } = &event.kind {
+                if output_suppression_denial_requires_reconciliation(error, result) {
+                    return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
+                }
+            }
             if let TraceEventKind::StateCommitted {
                 snapshot_id: Some(snapshot),
                 ..
@@ -1293,6 +1333,26 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
         approval_challenge: None,
         completed_at: OffsetDateTime::now_utc(),
     }
+}
+
+fn output_suppression_requires_reconciliation(outcome: &ActionOutcome) -> bool {
+    let Some(post_verification) = outcome.post_verification.as_ref() else {
+        return false;
+    };
+    outcome.status == ActionStatus::Failed
+        && outcome.error.as_deref().is_some_and(|error| {
+            output_suppression_denial_requires_reconciliation(error, post_verification)
+        })
+}
+
+fn output_suppression_denial_requires_reconciliation(
+    error: &str,
+    result: &VerificationResult,
+) -> bool {
+    error == RAW_CREDENTIAL_OUTPUT_SUPPRESSED
+        && !result.allowed
+        && result.reasons.len() == 1
+        && result.reasons.first().map(String::as_str) == Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
 }
 
 fn action_policy_expired_trace_kind(

@@ -98,6 +98,65 @@ fn write_secure(root: &Path, relative: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+fn grant_everyone_read_acl(path: &Path) {
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone allow read")
+        .arg(path)
+        .status()
+        .expect("chmod ACL command");
+    assert!(status.success(), "test ACL must be installed");
+}
+
+#[cfg(target_os = "linux")]
+fn grant_everyone_read_acl(path: &Path) {
+    const ACL_XATTR_VERSION: u32 = 2;
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+
+    fn append_entry(bytes: &mut Vec<u8>, tag: u16, permissions: u16, id: u32) {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&permissions.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+
+    let owner_permissions = ((fs::metadata(path)
+        .expect("test ACL target metadata")
+        .permissions()
+        .mode()
+        >> 6)
+        & 0o7) as u16;
+    let mut acl = ACL_XATTR_VERSION.to_le_bytes().to_vec();
+    append_entry(&mut acl, ACL_USER_OBJ, owner_permissions, u32::MAX);
+    append_entry(&mut acl, ACL_USER, 0o4, effective_uid().wrapping_add(1));
+    append_entry(&mut acl, ACL_GROUP_OBJ, 0, u32::MAX);
+    append_entry(&mut acl, ACL_MASK, 0o4, u32::MAX);
+    append_entry(&mut acl, ACL_OTHER, 0, u32::MAX);
+
+    let path = CString::new(path.as_os_str().as_bytes()).expect("test path has no NUL");
+    let name = b"system.posix_acl_access\0";
+    // SAFETY: path/name are NUL-terminated and ACL bytes remain live for the call.
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr().cast(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "test ACL must be installed: {}",
+        io::Error::last_os_error()
+    );
+}
+
 fn entry(
     tenant_id: TenantId,
     secret_ref_id: SecretRefId,
@@ -626,6 +685,138 @@ fn root_intermediate_owner_and_hard_link_policies_are_enforced() {
         Err(LocalFileSecretProviderConfigError::AmbiguousPath),
         "distinct configured paths may not alias one device/inode backing source"
     );
+
+    fs::hard_link(source_root.join("source"), source_root.join("alias")).unwrap();
+    assert_eq!(
+        LocalFileSecretProvider::try_new(
+            provider_id_for(229),
+            LocalFileSecretProviderRuntimeMode::Test,
+            source_root,
+            vec![
+                entry(tenant(221), ref_id(223), 1, version("v1"), "source"),
+                entry(tenant(221), ref_id(224), 1, version("v1"), "alias"),
+            ],
+        )
+        .unwrap_err(),
+        LocalFileSecretProviderConfigError::FilesystemPolicyDenied,
+        "constructor must reject two configured paths to one backing inode"
+    );
+}
+
+#[test]
+fn trusted_root_ancestors_require_trusted_ownership_and_safe_sticky_writes() {
+    let (_directory, outer) = secure_root();
+    let owner_probe = if effective_uid() == 0 {
+        let path = outer.join("untrusted-owner");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let descriptor = File::open(path).expect("owner probe descriptor");
+        // SAFETY: the descriptor is live and tests running as root may assign
+        // this otherwise unused directory to a fixed non-root UID. A GID of
+        // `-1` leaves the current group unchanged.
+        assert_eq!(
+            unsafe { libc::fchown(descriptor.as_raw_fd(), 1, u32::MAX) },
+            0,
+            "root test must create an untrusted-owner directory"
+        );
+        descriptor
+    } else {
+        File::open(&outer).expect("outer descriptor")
+    };
+    let expected_uid = if effective_uid() == 0 {
+        0
+    } else {
+        effective_uid().wrapping_add(1)
+    };
+    assert!(matches!(
+        validate_path_selection_directory(&owner_probe, expected_uid),
+        Err(OpenFailure::PolicyDenied)
+    ));
+    let writable = outer.join("writable-ancestor");
+    let trusted = writable.join("trusted");
+    fs::create_dir(&writable).unwrap();
+    fs::create_dir(&trusted).unwrap();
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+    write_secure(&trusted, Path::new("material"), b"synthetic");
+
+    assert_eq!(
+        LocalFileSecretProvider::try_new(
+            provider_id_for(233),
+            LocalFileSecretProviderRuntimeMode::Test,
+            trusted.clone(),
+            vec![entry(
+                tenant(234),
+                ref_id(235),
+                1,
+                version("v1"),
+                "material"
+            )],
+        )
+        .unwrap_err(),
+        LocalFileSecretProviderConfigError::FilesystemPolicyDenied,
+        "group/other-writable nonsticky ancestors permit unsafe path selection"
+    );
+
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o1777)).unwrap();
+    LocalFileSecretProvider::try_new(
+        provider_id_for(236),
+        LocalFileSecretProviderRuntimeMode::Test,
+        trusted,
+        vec![entry(
+            tenant(237),
+            ref_id(238),
+            1,
+            version("v1"),
+            "material",
+        )],
+    )
+    .expect("trusted-owner sticky ancestor has safe path-selection semantics");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn non_owner_extended_acl_access_is_rejected_at_every_path_layer() {
+    for layer in ["ancestor", "root", "intermediate", "file"] {
+        let (_directory, outer) = secure_root();
+        let ancestor = outer.join("ancestor");
+        let root = ancestor.join("trusted");
+        let intermediate = root.join("nested");
+        fs::create_dir(&ancestor).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&intermediate).unwrap();
+        for directory in [&ancestor, &root, &intermediate] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_secure(&root, Path::new("nested/material"), b"synthetic");
+        match layer {
+            "ancestor" => grant_everyone_read_acl(&ancestor),
+            "root" => grant_everyone_read_acl(&root),
+            "intermediate" => grant_everyone_read_acl(&intermediate),
+            "file" => grant_everyone_read_acl(&root.join("nested/material")),
+            _ => unreachable!("closed ACL layer matrix"),
+        }
+
+        let result = LocalFileSecretProvider::try_new(
+            provider_id_for(239),
+            LocalFileSecretProviderRuntimeMode::Test,
+            root,
+            vec![entry(
+                tenant(240),
+                ref_id(241),
+                1,
+                version("v1"),
+                "nested/material",
+            )],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LocalFileSecretProviderConfigError::FilesystemPolicyDenied)
+            ),
+            "non-owner ACL at {layer} must fail closed: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -802,6 +993,58 @@ fn changed_and_missing_registered_files_fail_on_fetch() {
             .unwrap_err()
             .code(),
         SecretProviderErrorCode::Unavailable
+    );
+}
+
+#[test]
+fn private_keyed_integrity_rejects_same_size_content_when_metadata_appears_unchanged() {
+    let (_directory, root) = secure_root();
+    write_secure(&root, Path::new("material"), b"original");
+    let provider_id = provider_id_for(290);
+    let tenant_id = tenant(291);
+    let secret_ref_id = ref_id(292);
+    let provider_version = version("v1");
+    let mut provider = configured_provider(
+        root.clone(),
+        provider_id.clone(),
+        tenant_id.clone(),
+        secret_ref_id.clone(),
+        provider_version.clone(),
+        "material",
+    );
+    fs::write(root.join("material"), b"replaced").unwrap();
+
+    let current_file = File::open(root.join("material")).unwrap();
+    let current_fingerprint = match fingerprint_for_open_file(&current_file, effective_uid()) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => panic!("current fingerprint must be available"),
+    };
+    let key = EntryKey {
+        tenant_id: tenant_id.clone(),
+        secret_ref_id: secret_ref_id.clone(),
+        secret_ref_revision: 1,
+        provider_version_ref: provider_version.clone(),
+    };
+    provider
+        .entries
+        .get_mut(&key)
+        .expect("registered entry")
+        .fingerprint = current_fingerprint;
+
+    let request = invocation(
+        provider_id,
+        tenant_id,
+        secret_ref_id,
+        1,
+        provider_version,
+        293,
+    );
+    assert_eq!(
+        exercise_secret_provider_fetch(&provider, &request)
+            .unwrap_err()
+            .code(),
+        SecretProviderErrorCode::IntegrityFailure,
+        "a private keyed tag must catch content changes even when metadata matches"
     );
 }
 

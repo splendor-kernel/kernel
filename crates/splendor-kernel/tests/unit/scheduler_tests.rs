@@ -10,8 +10,9 @@ use splendor_gateway::{
     ActionAdapter, ActionGateway, ActionRequest, ActionStatus, AdapterError, AdapterResult,
     VerifiedActionGateway,
 };
-use splendor_store::{InMemoryStateStore, StateData};
-use splendor_types::{Action, TraceEvent};
+use splendor_store::{InMemoryStateStore, StateData, TraceStoreError};
+use splendor_types::{Action, TraceEvent, TraceEventKind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -100,6 +101,42 @@ impl Policy for FailPolicy {
     }
 }
 
+struct FailOncePolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for FailOncePolicy {
+    fn name(&self) -> &str {
+        "fail-once"
+    }
+
+    fn decide(
+        &self,
+        _state: &StateData,
+        _percepts: &[splendor_types::Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(LoopError::Policy("failed-before-effect".to_string()));
+        }
+        Ok(PolicyDecision::new(
+            vec![ActionCandidate::new(Action {
+                name: "noop".to_string(),
+                params: serde_json::json!({}),
+                side_effect_class: splendor_types::SideEffectClass::ReadOnly,
+                cost_estimate: None,
+                required_permissions: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+            })],
+            StateData {
+                bytes: vec![1],
+                content_type: None,
+            },
+            None,
+        ))
+    }
+}
+
 #[derive(Default)]
 struct TestAdapter;
 
@@ -112,11 +149,39 @@ impl ActionAdapter for TestAdapter {
     }
 }
 
+struct CredentialOutputAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for CredentialOutputAdapter {
+    fn execute(&self, _action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AdapterResult {
+            output: serde_json::json!({"body": "Basic dTpw"}),
+            satisfied_postconditions: Vec::new(),
+        })
+    }
+}
+
 #[derive(Default)]
 struct NullTraceSink;
 
 impl TraceSink for NullTraceSink {
     fn record(&self, _event: &TraceEvent) -> Result<(), TraceError> {
+        Ok(())
+    }
+}
+
+struct FailAfterAdapterReturnTraceSink;
+
+impl TraceSink for FailAfterAdapterReturnTraceSink {
+    fn record(&self, event: &TraceEvent) -> Result<(), TraceError> {
+        if matches!(
+            &event.kind,
+            TraceEventKind::ActionVerificationCompleted { .. }
+        ) {
+            return Err(TraceError::Store(TraceStoreError::Poisoned));
+        }
         Ok(())
     }
 }
@@ -139,6 +204,15 @@ fn build_engine_with_policy(
     policy: Box<dyn Policy>,
     gateway: Arc<dyn ActionGateway>,
 ) -> LoopEngine {
+    build_engine_with_policy_and_trace_sink(tenant_id, policy, gateway, Arc::new(NullTraceSink))
+}
+
+fn build_engine_with_policy_and_trace_sink(
+    tenant_id: TenantId,
+    policy: Box<dyn Policy>,
+    gateway: Arc<dyn ActionGateway>,
+    trace_sink: Arc<dyn TraceSink>,
+) -> LoopEngine {
     let store = Arc::new(InMemoryStateStore::default());
     let graph = crate::StateGraph::new(store, SnapshotPolicy::default());
     let initial_state = StateData {
@@ -151,7 +225,7 @@ fn build_engine_with_policy(
         crate::AgentRuntimeConfig::default(),
     );
     let runtime = KernelRuntime::new(KernelRuntimeConfig {
-        trace_sink: Arc::new(NullTraceSink),
+        trace_sink,
         ..KernelRuntimeConfig::default()
     });
     let mut engine =
@@ -393,6 +467,136 @@ fn scheduler_run_forever_returns_error_on_empty_queue() {
     let mut scheduler = Scheduler::new(SchedulerConfig::default());
     let error = scheduler.run_forever().expect_err("no agents");
     assert!(matches!(error, SchedulerError::NoAgents));
+}
+
+#[test]
+fn scheduler_parks_post_effect_intervention_until_explicit_reconciliation() {
+    let tenant_id = TenantId::new();
+    let tenant = crate::TenantContext::new(
+        tenant_id.clone(),
+        crate::TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["adapter".to_string()],
+            ..crate::TenantPolicy::default()
+        },
+        crate::QuotaPolicy::default(),
+    );
+    let registry = TenantRegistry::new();
+    registry.insert(tenant);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    gateway.register_adapter(
+        "noop",
+        "adapter",
+        Arc::new(CredentialOutputAdapter {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let engine = build_engine(tenant_id, "noop", &[1], Arc::new(gateway));
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
+
+    let first = scheduler.run_once().expect("suppression outcome");
+    assert!(first.outcome.needs_intervention);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+            if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn post_effect_trace_failure_still_parks_without_repeating_adapter() {
+    let tenant_id = TenantId::new();
+    let tenant = crate::TenantContext::new(
+        tenant_id.clone(),
+        crate::TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["adapter".to_string()],
+            ..crate::TenantPolicy::default()
+        },
+        crate::QuotaPolicy::default(),
+    );
+    let registry = TenantRegistry::new();
+    registry.insert(tenant);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    gateway.register_adapter(
+        "noop",
+        "adapter",
+        Arc::new(CredentialOutputAdapter {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let engine = build_engine_with_policy_and_trace_sink(
+        tenant_id,
+        Box::new(StaticPolicy {
+            action_name: "noop".to_string(),
+            next_state: vec![1],
+        }),
+        Arc::new(gateway),
+        Arc::new(FailAfterAdapterReturnTraceSink),
+    );
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
+
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Trace(TraceError::Store(
+            TraceStoreError::Poisoned
+        ))))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+            if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn scheduler_requeues_an_ordinary_pre_effect_loop_failure() {
+    let tenant_id = TenantId::new();
+    let tenant = crate::TenantContext::new(
+        tenant_id.clone(),
+        crate::TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["adapter".to_string()],
+            ..crate::TenantPolicy::default()
+        },
+        crate::QuotaPolicy::default(),
+    );
+    let registry = TenantRegistry::new();
+    registry.insert(tenant);
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    gateway.register_adapter("noop", "adapter", Arc::new(TestAdapter));
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let engine = build_engine_with_policy(
+        tenant_id,
+        Box::new(FailOncePolicy {
+            calls: Arc::clone(&policy_calls),
+        }),
+        Arc::new(gateway),
+    );
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
+
+    assert!(matches!(
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(ref reason)))
+            if reason == "failed-before-effect"
+    ));
+    let recovered = scheduler
+        .run_once()
+        .expect("ordinary retry remains available");
+    assert_eq!(
+        recovered.outcome.action_outcomes[0].status,
+        ActionStatus::Executed
+    );
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

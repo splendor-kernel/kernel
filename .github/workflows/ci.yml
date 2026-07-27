@@ -23,6 +23,8 @@ jobs:
         run: |
           python3 scripts/architecture/check-dependency-policy.py --self-test
           python3 scripts/architecture/check-dependency-policy.py
+          python3 scripts/architecture/check-secret-provider-release-closure.py --self-test
+          python3 scripts/architecture/check-secret-provider-release-closure.py
       - name: Rust fmt
         run: cargo fmt --all -- --check
       - name: Rust clippy

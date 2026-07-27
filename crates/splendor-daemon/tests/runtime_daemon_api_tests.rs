@@ -24,12 +24,12 @@ use splendor_types::{
     AuditAttribution, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
     AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
     AuthorityObligationReceiptValidationKind, CallerCredential, CircuitBreaker, CircuitBreakerId,
-    CircuitBreakerScope, ClientPrincipal, CredentialAudience, CredentialBinding, EndpointScope,
-    NodeId, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope, PolicyBundleId,
-    PolicyDegradedMode, PrincipalId, QuotaUsage, RevocationStatus, RunId, SideEffectClass,
-    TenantId, TraceEvent, TraceEventId, TraceEventKind, TraceId, WorkOrder, WorkOrderEnvelope,
-    WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy, APPROVAL_EVIDENCE_SCHEMA_VERSION,
-    POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
+    CircuitBreakerScope, ClientPrincipal, CredentialAudience, CredentialBinding, EffectCertainty,
+    EndpointScope, NodeId, Percept, PerceptProvenance, PolicyBundle, PolicyBundleEnvelope,
+    PolicyBundleId, PolicyDegradedMode, PrincipalId, QuotaUsage, RetryClass, RevocationStatus,
+    RunId, SideEffectClass, TenantId, TraceEvent, TraceEventId, TraceEventKind, TraceId, WorkOrder,
+    WorkOrderEnvelope, WorkOrderId, WorkOrderPlacement, WorkOrderQuotaPolicy,
+    APPROVAL_EVIDENCE_SCHEMA_VERSION, POLICY_BUNDLE_SCHEMA_VERSION, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +48,13 @@ impl ActionAdapter for CredentialOutputAdapter {
     fn execute(&self, action: &ActionRequest) -> Result<AdapterResult, AdapterError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let output = if action.action.name == "allowed_action" {
-            json!({"body": "password=C03_DAEMON_OUTPUT_CANARY"})
+            let mut body = b"password=C03_DAEMON_OUTPUT_CANARY"
+                .iter()
+                .copied()
+                .map(serde_json::Value::from)
+                .collect::<Vec<_>>();
+            body.push(json!(300));
+            json!({"body": body})
         } else {
             json!({"status": "ready"})
         };
@@ -1456,6 +1462,20 @@ async fn daemon_direct_adapter_output_is_suppressed_before_raw_store_api_export_
         Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
     );
     assert!(outcome.output.is_none());
+    let post_verification = outcome
+        .post_verification
+        .as_ref()
+        .expect("fixed suppression facts");
+    assert_eq!(post_verification.artifacts["adapter_entered"], true);
+    assert_eq!(
+        post_verification.artifacts["effect_certainty"],
+        EffectCertainty::Uncertain.as_str()
+    );
+    assert_eq!(
+        post_verification.artifacts["retry_class"],
+        RetryClass::NotRetryable.as_str()
+    );
+    assert_eq!(post_verification.artifacts["reconciliation_required"], true);
     let encoded_outcome = serde_json::to_string(&outcome).expect("outcome serializes");
     assert!(!encoded_outcome.contains(CANARY));
 

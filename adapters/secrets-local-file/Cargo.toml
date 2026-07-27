@@ -9,6 +9,7 @@ default = []
 local-file-secret-provider = []
 
 [dependencies]
+blake3 = "1.5"
 libc = "0.2"
 splendor-authority = { path = "../../crates/splendor-authority" }
 splendor-types = { path = "../../crates/splendor-types" }

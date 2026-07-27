@@ -11,6 +11,7 @@ use splendor_types::{
     TenantId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceId, TraceIdentityContext,
     VerificationResult,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -202,6 +203,25 @@ impl ActionAdapter for CountingActionAdapter {
         Ok(splendor_gateway::AdapterResult {
             output: serde_json::json!({"counted": action.action.name}),
             satisfied_postconditions: action.action.postconditions.clone(),
+        })
+    }
+}
+
+struct SuppressedOutputAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ActionAdapter for SuppressedOutputAdapter {
+    fn execute(
+        &self,
+        _action: &splendor_gateway::ActionRequest,
+    ) -> Result<splendor_gateway::AdapterResult, splendor_gateway::AdapterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(splendor_gateway::AdapterResult {
+            output: serde_json::json!({
+                "body": ([vec![0xff], b"Basic dTpw".to_vec(), vec![0xfe]].concat())
+            }),
+            satisfied_postconditions: Vec::new(),
         })
     }
 }
@@ -5352,6 +5372,83 @@ fn signed_run_authority_allows_counted_filesystem_and_http_effects_with_pre_effe
         replay_outputs_from_stores(&trace_path, &state_path, &run_id.to_string(), None, false)
             .expect("inspect-only replay");
         assert_eq!(counter.total_calls(), before_replay);
+    }
+}
+
+#[test]
+fn configured_cycles_and_forever_do_not_repeat_post_effect_output_suppression() {
+    for (cycles, forever) in [(Some(2), false), (None, true)] {
+        let dir = tempfile::TempDir::new().expect("dir");
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let run_id = RunId::new();
+        let work_order = signed_work_order_block_with_authority(
+            tenant_id.clone(),
+            agent_id.clone(),
+            run_id.clone(),
+            vec!["write_file".to_string()],
+            vec!["filesystem".to_string()],
+            vec!["fs.write".to_string()],
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            splendor_types::RevocationStatus::Active,
+        );
+        let config_path = write_counted_run_config(
+            &dir,
+            &tenant_id,
+            &agent_id,
+            &run_id,
+            &work_order,
+            "write_file",
+            "filesystem",
+            &["fs.write"],
+            &["fs.write"],
+            None,
+        );
+        let config = std::fs::read_to_string(&config_path)
+            .expect("config")
+            .replace(
+                "    policy:\n",
+                "    snapshot_interval: 1\n    resume: false\n    policy:\n",
+            );
+        std::fs::write(&config_path, config).expect("initial config");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut adapters = std::collections::HashMap::new();
+        let adapter: Arc<dyn ActionAdapter> = Arc::new(SuppressedOutputAdapter {
+            calls: Arc::clone(&calls),
+        });
+        adapters.insert("filesystem".to_string(), adapter);
+        let overrides = RunTestOverrides {
+            adapters,
+            authority_transition: None,
+        };
+
+        let error = run_from_config_with_test_overrides(&config_path, cycles, forever, &overrides)
+            .expect_err("post-effect suppression must halt configured execution");
+        assert!(error.contains("tick_reconciliation_required"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let config = std::fs::read_to_string(&config_path)
+            .expect("config")
+            .replace("resume: false", "resume: true");
+        std::fs::write(&config_path, config).expect("resume config");
+        let error = run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
+            .expect_err("same-run resume must remain blocked pending reconciliation");
+        assert!(error.contains("tick_reconciliation_required"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let store = SqliteTraceStore::open(dir.path().join("trace.db")).expect("trace store");
+        let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
+        let encoded = serde_json::to_string(&records).expect("records serialize");
+        assert!(!encoded.contains("Basic dTpw"));
+        let events = decode_and_validate_trace_records(&records, &run_id.to_string())
+            .expect("suppression trace");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, TraceEventKind::ActionFailed { .. }))
+                .count(),
+            1
+        );
     }
 }
 

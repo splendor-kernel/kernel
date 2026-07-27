@@ -101,6 +101,7 @@ LOCAL_FILE_SECRET_PROVIDER_EXPECTED_FEATURES = {
     LOCAL_FILE_SECRET_PROVIDER_FEATURE: [],
 }
 LOCAL_FILE_SECRET_PROVIDER_EXPECTED_PRODUCTION_DEPS = {
+    "blake3",
     "libc",
     "splendor-authority",
     "splendor-types",
@@ -1344,9 +1345,9 @@ def run_self_test() -> int:
             get_policy_packages(local_provider_dependency_widening)
         ),
         [
-            "splendor-adapter-secrets-local-file production dependency closure changed; expected=['libc', "
-            "'splendor-authority', 'splendor-types', 'zeroize'] actual=['libc', 'reqwest', "
-            "'splendor-authority', 'splendor-types', 'zeroize']."
+            "splendor-adapter-secrets-local-file production dependency closure changed; expected=['blake3', "
+            "'libc', 'splendor-authority', 'splendor-types', 'zeroize'] actual=['blake3', 'libc', "
+            "'reqwest', 'splendor-authority', 'splendor-types', 'zeroize']."
         ],
     )
 
@@ -2348,6 +2349,7 @@ def accepted_metadata_fixture() -> dict[str, Any]:
             )
             package["dependencies"].extend(
                 [
+                    dependency_fixture("blake3", repository_local=False),
                     dependency_fixture("libc", repository_local=False),
                     dependency_fixture("zeroize", repository_local=False),
                     {

@@ -42,7 +42,9 @@ Percepts -> Policy -> Constraints -> Gateway -> Adapter -> Outcome -> State Comm
 15. Immediately after adapter return, output and satisfied-postcondition strings
     pass the Gateway-owned persistence barrier before post-verifiers. Unsafe or
     ambiguous output becomes fixed `Failed` / `raw_credential_output_suppressed`
-    with no output; adapter entry means no rollback or no-effect claim is made.
+    with no output and fixed adapter-entered/effect-uncertain/not-retryable/
+    reconciliation-required facts; adapter entry means no rollback or no-effect
+    claim is made.
 16. If an optional 0.04-S3 escalation policy is configured, explicit
     verifier/runtime facts can produce `EscalationTriggered` and
     `ActionNeedsIntervention` trace events before final outcome recording.
@@ -74,7 +76,11 @@ documented in [`identity.md`](identity.md).
 - Credential-bearing percepts return fixed `raw_credential_input_denied` before
   `PerceptsReceived`; credential-bearing/ambiguous policy state returns the same
   fixed error before `PolicyCompleted`, action execution, outcome recording, or
-  state commit.
+  state commit. The engine then rejects another direct tick with fixed
+  `tick_reconciliation_required`; it does not repeatedly recollect the denied
+  percept or reinvoke the rejected policy state. No synthetic run lifecycle or
+  completed-tick event is emitted because the current trace taxonomy has no
+  compatible tick-abort fact.
 - Raw credential-bearing candidates return the fixed
   `raw_credential_input_denied` outcome. They skip constraints, delegated
   authority, gateway/adapters, escalation, and outcome evaluation. Their
@@ -92,7 +98,16 @@ documented in [`identity.md`](identity.md).
 - Adapter failure records a failed/denied outcome.
 - Credential-bearing or ambiguous adapter output records a fixed failed outcome
   with no output. It does not imply that the already-entered adapter had no
-  effect and must not be blindly retried.
+  effect and must not be blindly retried. The local scheduler parks that engine;
+  fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
+  The block is latched immediately when the gateway returns the suppression, so
+  a later trace, outcome, or state failure cannot put the engine back on the
+  runnable queue. Persisted resume of the same run rejects a recorded
+  suppression.
+  Recovery requires explicit operator/provider reconciliation and construction
+  of a replacement run/engine; no scheduler path automatically requeues the
+  parked action. Ordinary pre-effect loop failures retain their existing requeue
+  behavior.
 - State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
   being emitted for that tick.
 - Trace store failure fails the tick before side-effectful work can proceed when

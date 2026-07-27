@@ -1420,6 +1420,7 @@ dependencies = [
 name = "splendor-adapter-secrets-local-file"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "libc",
  "splendor-authority",
  "splendor-types",

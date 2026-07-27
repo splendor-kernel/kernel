@@ -3695,7 +3695,7 @@ fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
 
     const CANARY: &str = "C03_ADAPTER_OUTPUT_CANARY";
     let oversized = "x".repeat(CREDENTIAL_INGRESS_MAX_STRING_BYTES + 1);
-    let vectors = [
+    let vectors = vec![
         (
             "plain",
             serde_json::json!({"message": format!("password={CANARY}")}),
@@ -3716,6 +3716,21 @@ fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
             "numeric_body",
             serde_json::json!({
                 "body": format!("password={CANARY}").into_bytes()
+            }),
+        ),
+        ("numeric_root_malformed", serde_json::json!([1, 2, 300])),
+        (
+            "numeric_body_malformed",
+            serde_json::json!({"body": [1, null]}),
+        ),
+        (
+            "numeric_contents_malformed",
+            serde_json::json!({"contents": [1, "2"]}),
+        ),
+        (
+            "invalid_utf8_credential_span",
+            serde_json::json!({
+                "body": ([vec![0xff], b"Basic dTpw".to_vec(), vec![0xfe]].concat())
             }),
         ),
         (
@@ -3769,9 +3784,32 @@ fn adapter_output_is_screened_before_post_verification_and_never_reflected() {
 
         assert_eq!(outcome.status, ActionStatus::Failed, "{case}");
         assert!(outcome.verification.allowed, "{case}");
+        let post_verification = outcome
+            .post_verification
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case}: post-verification"));
         assert_eq!(
-            outcome.post_verification,
-            Some(VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)),
+            post_verification.reasons,
+            vec![RAW_CREDENTIAL_OUTPUT_SUPPRESSED.to_string()],
+            "{case}"
+        );
+        assert!(!post_verification.allowed, "{case}");
+        assert_eq!(
+            post_verification.artifacts["adapter_entered"], true,
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["effect_certainty"],
+            EffectCertainty::Uncertain.as_str(),
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["retry_class"],
+            RetryClass::NotRetryable.as_str(),
+            "{case}"
+        );
+        assert_eq!(
+            post_verification.artifacts["reconciliation_required"], true,
             "{case}"
         );
         assert_eq!(
@@ -3859,7 +3897,7 @@ fn benign_json_text_and_opaque_binary_adapter_outputs_remain_compatible() {
         (
             "ordinary_named_collections",
             serde_json::json!({
-                "body": [1, 2, 300],
+                "body": [{"value": 1}, {"value": 2}],
                 "contents": ["section one", "section two"]
             }),
         ),

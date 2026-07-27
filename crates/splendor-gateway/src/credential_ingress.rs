@@ -6,8 +6,8 @@
 
 use crate::{ActionOutcome, ActionRequest, ActionStatus, AdapterResult};
 use splendor_types::{
-    Action, ApprovalEvidence, AuthorityObligationReceipt, Percept, RevocationStatus,
-    SideEffectClass, VerificationResult,
+    Action, ApprovalEvidence, AuthorityObligationReceipt, EffectCertainty, Percept, RetryClass,
+    RevocationStatus, SideEffectClass, VerificationResult,
 };
 use std::{fmt, net::Ipv6Addr, str};
 use time::OffsetDateTime;
@@ -231,11 +231,18 @@ pub(crate) fn raw_credential_output_suppressed_outcome(
     action_id: crate::ActionId,
     verification: VerificationResult,
 ) -> ActionOutcome {
+    let mut post_verification = VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED);
+    post_verification.artifacts = serde_json::json!({
+        "adapter_entered": true,
+        "effect_certainty": EffectCertainty::Uncertain.as_str(),
+        "retry_class": RetryClass::NotRetryable.as_str(),
+        "reconciliation_required": true,
+    });
     ActionOutcome {
         action_id,
         status: ActionStatus::Failed,
         verification,
-        post_verification: Some(VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)),
+        post_verification: Some(post_verification),
         output: None,
         error: Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED.to_string()),
         approval_challenge: None,
@@ -386,7 +393,7 @@ impl CredentialIngressScanner {
     ) -> Result<(), RawCredentialInputDenied> {
         match value {
             serde_json::Value::Array(values) => {
-                if root {
+                if root && numeric_byte_profile(values) {
                     self.scan_numeric_byte_array(values, None)?;
                 }
                 for value in values {
@@ -398,8 +405,10 @@ impl CredentialIngressScanner {
                     if persisted_byte_coordinate(key) {
                         match value {
                             serde_json::Value::Array(bytes) => {
-                                let content_type = persisted_content_type(values)?;
-                                self.scan_numeric_byte_array(bytes, content_type)?;
+                                if numeric_byte_profile(bytes) {
+                                    let content_type = persisted_content_type(values)?;
+                                    self.scan_numeric_byte_array(bytes, content_type)?;
+                                }
                             }
                             serde_json::Value::String(text) => {
                                 let content_type = persisted_content_type(values)?;
@@ -426,12 +435,8 @@ impl CredentialIngressScanner {
     ) -> Result<(), RawCredentialInputDenied> {
         let mut reconstructed = Vec::with_capacity(values.len());
         for value in values {
-            let Some(value) = value.as_u64() else {
-                return Ok(());
-            };
-            let Ok(byte) = u8::try_from(value) else {
-                return Ok(());
-            };
+            let value = value.as_u64().ok_or(RawCredentialInputDenied)?;
+            let byte = u8::try_from(value).map_err(|_| RawCredentialInputDenied)?;
             reconstructed.push(byte);
         }
         self.scan_persisted_bytes(&reconstructed, content_type)
@@ -457,11 +462,12 @@ impl CredentialIngressScanner {
             }
             PersistedContentKind::OpaqueOrUnspecified => {
                 let Some(text) = unambiguous_utf8_body(bytes) else {
-                    return if ambiguous_textual_bytes(bytes) {
-                        Err(RawCredentialInputDenied)
-                    } else {
-                        Ok(())
-                    };
+                    if bytes.len() > CREDENTIAL_INGRESS_MAX_TOTAL_BYTES
+                        || ambiguous_textual_bytes(bytes)
+                    {
+                        return Err(RawCredentialInputDenied);
+                    }
+                    return self.scan_recognizable_textual_spans(bytes);
                 };
                 self.scan_string(text)?;
                 let trimmed = text.trim();
@@ -494,6 +500,50 @@ impl CredentialIngressScanner {
         ensure_unambiguous_text(value)?;
         if credential_content(value)? {
             return Err(RawCredentialInputDenied);
+        }
+        Ok(())
+    }
+
+    fn scan_recognizable_textual_spans(
+        &mut self,
+        mut bytes: &[u8],
+    ) -> Result<(), RawCredentialInputDenied> {
+        while !bytes.is_empty() {
+            match str::from_utf8(bytes) {
+                Ok(text) => {
+                    self.scan_textual_runs(text)?;
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let text = str::from_utf8(&bytes[..valid_up_to])
+                            .map_err(|_| RawCredentialInputDenied)?;
+                        self.scan_textual_runs(text)?;
+                    }
+                    let invalid_length = error
+                        .error_len()
+                        .unwrap_or_else(|| bytes.len().saturating_sub(valid_up_to));
+                    let consumed = valid_up_to
+                        .checked_add(invalid_length)
+                        .ok_or(RawCredentialInputDenied)?;
+                    if consumed == 0 || consumed > bytes.len() {
+                        return Err(RawCredentialInputDenied);
+                    }
+                    bytes = &bytes[consumed..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_textual_runs(&mut self, text: &str) -> Result<(), RawCredentialInputDenied> {
+        for span in text.split(|character: char| {
+            character.is_control() && !matches!(character, '\t' | '\n' | '\r')
+        }) {
+            if !span.is_empty() {
+                self.scan_string(span)?;
+            }
         }
         Ok(())
     }
@@ -1845,6 +1895,15 @@ fn persisted_byte_coordinate(key: &str) -> bool {
     matches!(compact_ascii(key).as_str(), "body" | "bytes" | "contents")
 }
 
+fn numeric_byte_profile(values: &[serde_json::Value]) -> bool {
+    values.iter().any(|value| {
+        value.is_number()
+            || value
+                .as_str()
+                .is_some_and(|text| text.parse::<f64>().is_ok())
+    })
+}
+
 fn ambiguous_textual_bytes(bytes: &[u8]) -> bool {
     const BYTE_ORDER_MARKS: &[&[u8]] = &[
         &[0xef, 0xbb, 0xbf],
@@ -1853,10 +1912,11 @@ fn ambiguous_textual_bytes(bytes: &[u8]) -> bool {
         &[0xff, 0xfe, 0x00, 0x00],
         &[0x00, 0x00, 0xfe, 0xff],
     ];
-    if BYTE_ORDER_MARKS
-        .iter()
-        .any(|marker| bytes.starts_with(marker))
-    {
+    if BYTE_ORDER_MARKS.iter().any(|marker| {
+        bytes
+            .windows(marker.len())
+            .any(|candidate| candidate == *marker)
+    }) {
         return true;
     }
     str::from_utf8(bytes).is_ok_and(|text| {
@@ -2537,6 +2597,9 @@ mod tests {
                 serde_json::json!([256]),
                 serde_json::json!([-1]),
                 serde_json::json!([1.5]),
+                serde_json::json!([1, null]),
+                serde_json::json!([1, "2"]),
+                serde_json::json!([1, true]),
                 serde_json::json!({"nested": true}),
             ] {
                 assert_eq!(
@@ -2714,6 +2777,116 @@ mod tests {
             Err(RawCredentialInputDenied),
             "policy-selected state metadata must share the pre-persistence guard"
         );
+    }
+
+    #[test]
+    fn persisted_numeric_byte_profiles_reject_every_malformed_member() {
+        let malformed = [
+            serde_json::json!([1, 256]),
+            serde_json::json!([1, -1]),
+            serde_json::json!([1, 1.5]),
+            serde_json::json!([1, null]),
+            serde_json::json!([1, "2"]),
+            serde_json::json!([1, true]),
+            serde_json::json!(["66", "97"]),
+            serde_json::json!([1, {"not": "a byte"}]),
+        ];
+
+        for coordinate in ["bytes", "body", "contents"] {
+            for values in &malformed {
+                let payload = serde_json::json!({coordinate: values});
+                let percept = Percept {
+                    schema: "splendor.percept.fixture.v1".to_string(),
+                    payload: payload.clone(),
+                    provenance: PerceptProvenance {
+                        source: "fixture-sensor".to_string(),
+                        detail: None,
+                    },
+                    timestamp: OffsetDateTime::now_utc(),
+                };
+                assert_eq!(
+                    guard_persisted_percept(&percept),
+                    Err(RawCredentialInputDenied),
+                    "selected {coordinate} profile must deny {values}"
+                );
+
+                let encoded = serde_json::to_vec(&payload).expect("fixture serializes");
+                assert_eq!(
+                    guard_persisted_state(&encoded, Some("application/json"), None),
+                    Err(RawCredentialInputDenied),
+                    "state {coordinate} profile must deny {values}"
+                );
+            }
+        }
+
+        for values in malformed {
+            let encoded = serde_json::to_vec(&values).expect("fixture serializes");
+            assert_eq!(
+                guard_persisted_state(&encoded, Some("application/json"), None),
+                Err(RawCredentialInputDenied),
+                "root numeric profile must deny {values}"
+            );
+        }
+
+        let ordinary = serde_json::json!({
+            "contents": ["section one", "section two"],
+            "body": [{"value": 1}, {"value": 2}]
+        });
+        let encoded = serde_json::to_vec(&ordinary).expect("fixture serializes");
+        assert_eq!(
+            guard_persisted_state(&encoded, Some("application/json"), None),
+            Ok(()),
+            "non-numeric collections retain their ordinary JSON semantics"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_scans_bounded_textual_spans_but_preserves_opaque_binary() {
+        let credential = b"Basic dTpw";
+        for bytes in [
+            [vec![0xff], credential.to_vec()].concat(),
+            [credential.to_vec(), vec![0xff]].concat(),
+            [
+                b"ordinary".to_vec(),
+                vec![0xff],
+                credential.to_vec(),
+                vec![0xfe],
+            ]
+            .concat(),
+        ] {
+            assert_eq!(
+                guard_persisted_state(&bytes, Some("application/octet-stream"), None),
+                Err(RawCredentialInputDenied),
+                "recognizable credential text inside invalid UTF-8 must deny"
+            );
+
+            let percept = Percept {
+                schema: "splendor.percept.fixture.v1".to_string(),
+                payload: serde_json::json!({"body": bytes}),
+                provenance: PerceptProvenance {
+                    source: "fixture-sensor".to_string(),
+                    detail: None,
+                },
+                timestamp: OffsetDateTime::now_utc(),
+            };
+            assert_eq!(
+                guard_persisted_percept(&percept),
+                Err(RawCredentialInputDenied),
+                "selected invalid UTF-8 envelope must deny"
+            );
+        }
+
+        for bytes in [
+            vec![0, 1, 0xff],
+            vec![0xff, 0xfd, 0xfc],
+            vec![0x89, b'P', b'N', b'G', 0, 1, 0xff],
+        ] {
+            assert_eq!(
+                guard_persisted_state(&bytes, Some("application/octet-stream"), None),
+                Ok(()),
+                "genuinely opaque benign binary remains compatible"
+            );
+        }
     }
 
     #[test]

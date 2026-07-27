@@ -4,7 +4,7 @@
 //! enforces a per-tick time budget. Each scheduler cycle resets tenant quota
 //! ledgers so limits apply across all agents in the tenant.
 
-use crate::loop_engine::{LoopEngine, LoopError, TickOutcome};
+use crate::loop_engine::{LoopEngine, LoopError, TickOutcome, TICK_RECONCILIATION_REQUIRED};
 use crate::tenancy::TenantRegistry;
 use crate::{StateCommit, StateHandoffExportRequest, StateHandoffScope};
 use splendor_store::StateMetadata;
@@ -70,6 +70,7 @@ pub struct Scheduler {
     config: SchedulerConfig,
     tenants: TenantRegistry,
     queue: VecDeque<LoopEngine>,
+    reconciliation_queue: Vec<LoopEngine>,
     tick_id: u64,
     cycle_remaining: usize,
 }
@@ -86,6 +87,7 @@ impl Scheduler {
             config,
             tenants: registry,
             queue: VecDeque::new(),
+            reconciliation_queue: Vec::new(),
             tick_id: 0,
             cycle_remaining: 0,
         }
@@ -121,6 +123,7 @@ impl Scheduler {
         let engine = self
             .queue
             .iter()
+            .chain(self.reconciliation_queue.iter())
             .find(|engine| engine.agent_id() == agent_id)
             .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
         engine
@@ -139,6 +142,7 @@ impl Scheduler {
         let engine = self
             .queue
             .iter()
+            .chain(self.reconciliation_queue.iter())
             .find(|engine| engine.agent_id() == agent_id)
             .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
         engine
@@ -155,6 +159,7 @@ impl Scheduler {
         let engine = self
             .queue
             .iter()
+            .chain(self.reconciliation_queue.iter())
             .find(|engine| engine.agent_id() == agent_id)
             .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
         engine
@@ -177,6 +182,7 @@ impl Scheduler {
         let engine = self
             .queue
             .iter_mut()
+            .chain(self.reconciliation_queue.iter_mut())
             .find(|engine| engine.agent_id() == agent_id)
             .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
         engine
@@ -187,7 +193,7 @@ impl Scheduler {
     /// Runs a single agent tick.
     pub fn run_once(&mut self) -> Result<SchedulerStep, SchedulerError> {
         if self.queue.is_empty() {
-            return Err(SchedulerError::NoAgents);
+            return Err(self.empty_queue_error());
         }
         self.ensure_cycle();
 
@@ -203,7 +209,11 @@ impl Scheduler {
         let outcome = match engine.tick(self.tick_id) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.queue.push_back(engine);
+                if engine.requires_reconciliation() {
+                    self.reconciliation_queue.push(engine);
+                } else {
+                    self.queue.push_back(engine);
+                }
                 self.cycle_remaining = self.cycle_remaining.saturating_sub(1);
                 return Err(SchedulerError::Loop(error));
             }
@@ -217,7 +227,11 @@ impl Scheduler {
             elapsed,
         };
 
-        self.queue.push_back(engine);
+        if engine.requires_reconciliation() {
+            self.reconciliation_queue.push(engine);
+        } else {
+            self.queue.push_back(engine);
+        }
         self.cycle_remaining = self.cycle_remaining.saturating_sub(1);
 
         if let Some(budget) = self.config.tick_budget {
@@ -236,7 +250,7 @@ impl Scheduler {
     /// Runs a full scheduler cycle (each agent once).
     pub fn run_cycle(&mut self) -> Result<Vec<SchedulerStep>, SchedulerError> {
         if self.queue.is_empty() {
-            return Err(SchedulerError::NoAgents);
+            return Err(self.empty_queue_error());
         }
         let cycle_start = Instant::now();
         let remaining = self.queue.len();
@@ -252,7 +266,13 @@ impl Scheduler {
     pub fn run_cycles(&mut self, cycles: u64) -> Result<Vec<SchedulerStep>, SchedulerError> {
         let mut steps = Vec::new();
         for _ in 0..cycles {
-            steps.extend(self.run_cycle()?);
+            let cycle = self.run_cycle()?;
+            steps.extend(cycle);
+            if !self.reconciliation_queue.is_empty() {
+                return Err(SchedulerError::Loop(LoopError::Policy(
+                    TICK_RECONCILIATION_REQUIRED.to_string(),
+                )));
+            }
         }
         Ok(steps)
     }
@@ -261,6 +281,11 @@ impl Scheduler {
     pub fn run_forever(&mut self) -> Result<(), SchedulerError> {
         loop {
             self.run_cycle()?;
+            if !self.reconciliation_queue.is_empty() {
+                return Err(SchedulerError::Loop(LoopError::Policy(
+                    TICK_RECONCILIATION_REQUIRED.to_string(),
+                )));
+            }
         }
     }
 
@@ -280,6 +305,14 @@ impl Scheduler {
             if elapsed < interval {
                 std::thread::sleep(interval - elapsed);
             }
+        }
+    }
+
+    fn empty_queue_error(&self) -> SchedulerError {
+        if self.reconciliation_queue.is_empty() {
+            SchedulerError::NoAgents
+        } else {
+            SchedulerError::Loop(LoopError::Policy(TICK_RECONCILIATION_REQUIRED.to_string()))
         }
     }
 }

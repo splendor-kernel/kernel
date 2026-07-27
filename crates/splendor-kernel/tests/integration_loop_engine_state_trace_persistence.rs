@@ -16,8 +16,9 @@ use splendor_store::{
 use splendor_types::{
     Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
     AuthorityObligationReceipt, AuthorityObligationReceiptId, AuthorityObligationReceiptValidation,
-    AuthorityObligationReceiptValidationKind, Feedback, Percept, PerceptProvenance, PrincipalId,
-    RevocationStatus, SnapshotId, StateNodeId, VerificationResult,
+    AuthorityObligationReceiptValidationKind, EffectCertainty, Feedback, Percept,
+    PerceptProvenance, PrincipalId, RetryClass, RevocationStatus, SnapshotId, StateNodeId,
+    VerificationResult,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,11 +83,14 @@ struct CredentialPerceptor;
 
 impl Perceptor for CredentialPerceptor {
     fn collect(&self, _agent: &AgentContext) -> Result<Vec<Percept>, splendor_kernel::LoopError> {
+        let mut body = format!("password={PERCEPT_CANARY}")
+            .bytes()
+            .map(serde_json::Value::from)
+            .collect::<Vec<_>>();
+        body.push(serde_json::json!(300));
         Ok(vec![Percept {
             schema: "splendor.percept.fixture.v1".to_string(),
-            payload: serde_json::json!({
-                "body": format!("password={PERCEPT_CANARY}")
-            }),
+            payload: serde_json::json!({"body": body}),
             provenance: PerceptProvenance {
                 source: "integration".to_string(),
                 detail: None,
@@ -150,11 +154,17 @@ impl Policy for CredentialStatePolicy {
             postconditions: Vec::new(),
         })
         .with_adapter("stub");
+        let mut bytes = format!("password={STATE_CANARY}")
+            .bytes()
+            .map(serde_json::Value::from)
+            .collect::<Vec<_>>();
+        bytes.push(serde_json::json!(300));
         Ok(PolicyDecision::new(
             vec![candidate],
             StateData {
-                bytes: format!("password={STATE_CANARY}").into_bytes(),
-                content_type: Some("text/plain".to_string()),
+                bytes: serde_json::to_vec(&serde_json::json!({"bytes": bytes}))
+                    .expect("fixture state serializes"),
+                content_type: Some("application/json".to_string()),
             },
             Some("unsafe-state".to_string()),
         ))
@@ -522,6 +532,14 @@ fn credential_percept_never_reaches_trace_policy_or_state_store() {
         splendor_kernel::LoopError::Perceptor(ref reason)
             if reason == RAW_CREDENTIAL_INPUT_DENIED
     ));
+    let retry_error = engine
+        .tick(2)
+        .expect_err("a rejected percept requires explicit reconciliation");
+    assert!(matches!(
+        retry_error,
+        splendor_kernel::LoopError::Policy(ref reason)
+            if reason == "tick_reconciliation_required"
+    ));
     assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state_writes.load(Ordering::SeqCst), 0);
     let records = trace_store.read(&run_id.to_string()).expect("safe traces");
@@ -531,6 +549,14 @@ fn credential_percept_never_reaches_trace_policy_or_state_store() {
         .into_iter()
         .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
         .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickStarted { .. }))
+            .count(),
+        1,
+        "the reconciliation block must reject a later direct tick before a second trace prefix"
+    );
     assert!(!events.iter().any(|event| matches!(
         event.kind,
         TraceEventKind::PerceptsReceived { .. }
@@ -607,22 +633,16 @@ fn credential_policy_state_stops_before_actions_outcome_and_state_commit() {
     assert!(matches!(
         retry_error,
         splendor_kernel::LoopError::Policy(ref reason)
-            if reason == RAW_CREDENTIAL_INPUT_DENIED
+            if reason == "tick_reconciliation_required"
     ));
     assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state_writes.load(Ordering::SeqCst), 0);
     assert_eq!(
         *observed_states.lock().expect("observed states"),
-        vec![
-            StateData {
-                bytes: vec![0],
-                content_type: None,
-            },
-            StateData {
-                bytes: vec![0],
-                content_type: None,
-            },
-        ]
+        vec![StateData {
+            bytes: vec![0],
+            content_type: None,
+        }]
     );
     let records = trace_store.read(&run_id.to_string()).expect("safe traces");
     let encoded = serde_json::to_string(&records).expect("traces serialize");
@@ -631,6 +651,14 @@ fn credential_policy_state_stops_before_actions_outcome_and_state_commit() {
         .into_iter()
         .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
         .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, TraceEventKind::LoopTickStarted { .. }))
+            .count(),
+        1,
+        "the reconciliation block must reject a later direct tick before a second trace prefix"
+    );
     assert!(events
         .iter()
         .any(|event| matches!(event.kind, TraceEventKind::PolicyInvoked { .. })));
@@ -729,11 +757,35 @@ fn credential_adapter_output_is_absent_from_outcome_trace_and_committed_state() 
         outcome.error.as_deref(),
         Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED)
     );
+    let post_verification = outcome
+        .post_verification
+        .as_ref()
+        .expect("suppression facts");
     assert_eq!(
-        outcome.post_verification,
-        Some(VerificationResult::deny(RAW_CREDENTIAL_OUTPUT_SUPPRESSED))
+        post_verification.reasons,
+        vec![RAW_CREDENTIAL_OUTPUT_SUPPRESSED.to_string()]
     );
+    assert_eq!(post_verification.artifacts["adapter_entered"], true);
+    assert_eq!(
+        post_verification.artifacts["effect_certainty"],
+        EffectCertainty::Uncertain.as_str()
+    );
+    assert_eq!(
+        post_verification.artifacts["retry_class"],
+        RetryClass::NotRetryable.as_str()
+    );
+    assert_eq!(post_verification.artifacts["reconciliation_required"], true);
     assert!(outcome.output.is_none());
+
+    let retry_error = engine
+        .tick(2)
+        .expect_err("post-effect suppression must block a direct retry");
+    assert!(matches!(
+        retry_error,
+        splendor_kernel::LoopError::Policy(ref reason)
+            if reason == "tick_reconciliation_required"
+    ));
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
 
     let records = trace_store.read(&run_id.to_string()).expect("raw traces");
     let encoded = serde_json::to_string(&records).expect("traces serialize");
