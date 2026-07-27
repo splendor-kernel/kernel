@@ -131,18 +131,24 @@ Typed secret delivery remains unavailable.
 
 `scripts/security/check-secret-contracts.py` is a standard-library-only,
 network-independent CI guard with an internal negative self-test. Its strict
-`splendor.secret_field_scan.v1` policy binds exact governed roots, closed C03
-safe-record validators, caller-auth/bootstrap field exceptions, symbolic fixture
-validators, resource caps, and digest/count-bound content exceptions.
+`splendor.secret_field_scan.v1` policy binds exact governed roots,
+path/schema/digest-pinned canonical C03 owner fixtures, exact
+caller-auth/bootstrap field exceptions, digest-pinned symbolic fixtures,
+cumulative resource caps, and digest/count-bound content exceptions.
 
-The guard structurally parses JSON, the current closed OpenAPI/example YAML
-subset, and JSON/YAML Markdown fences. It rejects normalized secret/value field
-families, fake schema wrappers, malformed/duplicate documents, path/symlink or
-format ambiguity, stale/expired exceptions, and budget overflow. A separate
-bounded content pass checks tracked and non-ignored candidate source, fixtures,
-generated text, docs, manifests, and supported archives for known private-key,
-provider-token, authorization, credential-URL, encoded-key, and high-entropy
-forms. Diagnostics never print candidate material. Every CI build/test job
+The guard structurally parses JSON, the closed bounded YAML subset used by
+OpenAPI/workflows/examples, and JSON/YAML Markdown fences. Decoded keys and string
+scalars are recursively content-scanned; recognized source suffixes also receive
+bounded authorizing-field declaration checks. It rejects normalized secret/value
+field families, fake schema wrappers, malformed/duplicate/non-finite documents,
+path/symlink or format ambiguity, stale/expired exceptions, and budget overflow.
+A separate bounded content pass checks every unambiguous UTF-8 tracked or
+non-ignored source, fixture, generated text, doc, manifest, and supported archive
+member for known private-key, provider-token, authorization, credential-URL,
+encoded-key, context-bound hexadecimal credential, and high-entropy forms.
+Archive recognition is magic-based and archive resource accounting is
+repository-global. Diagnostics redact credential-capable path segments and never
+print candidate material. Every CI build/test and Docker image publication job
 depends on this guard succeeding.
 
 The exact developer policy, rule families, allowlist process, commands, and

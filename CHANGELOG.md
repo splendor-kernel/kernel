@@ -7,15 +7,17 @@
 - **status/incomplete:** added the offline, deterministic C03 contract/fixture
   repository guard required by QA-089 and partial `SECR-006`. The
   standard-library Python command structurally parses exact registered JSON,
-  bounded OpenAPI/example YAML, and structured Markdown fences; recognizes only
-  closed path/schema-bound C03 refs, requirements, authorizations, Driver sink
-  declarations, and expiring caller-auth/bootstrap exceptions; and rejects
+  bounded OpenAPI/example YAML, structured Markdown fences, and governed source
+  declarations; recognizes only path/schema/digest-pinned canonical C03 refs,
+  requirements, authorizations, Driver sink declarations, and expiring exact
+  caller-auth/bootstrap exceptions; and rejects
   secret-like value fields, fake wrappers, malformed/duplicate contracts,
   path/symlink ambiguity, unsupported governed formats, stale policy entries,
-  and resource overflow. A separate bounded content pass covers candidate source,
-  fixtures, generated text, docs, manifests, and supported archives with
-  digest/count-bound synthetic/public-vector exceptions. Every CI build/test job
-  depends on the self-test and current-tree scan. This is not runtime output-leak
+  and resource overflow. A separate bounded content pass covers every
+  unambiguous UTF-8 tracked/non-ignored file plus magic-detected, globally
+  budgeted archive members, with digest/count-bound synthetic/public-vector
+  exceptions. Every CI build/test and Docker image publication job depends on
+  the self-test and current-tree scan. This is not runtime output-leak
   scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
   parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
 - **status/incomplete:** extended the single Gateway-owned bounded credential

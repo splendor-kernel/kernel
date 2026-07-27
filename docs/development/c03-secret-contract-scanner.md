@@ -28,9 +28,15 @@ python3 scripts/security/check-secret-contracts.py
 ```
 
 The self-test uses only temporary synthetic fragments. Normal mode enumerates
-tracked plus non-ignored candidate files with local `git ls-files`; it performs
-no network access. CI runs these commands in a dedicated prerequisite job; Rust,
-Python, TypeScript, and Docker jobs do not start unless both pass.
+tracked plus non-ignored files with local `git ls-files`; every regular file is
+read under the cumulative budget and every unambiguous UTF-8 file is
+content-scanned regardless of suffix. The scanner performs no network access. CI
+and the Docker image workflow run these commands in a dedicated prerequisite
+job; build, test, image, and publication jobs do not start unless both pass.
+Recognized JSON, YAML, and Markdown files are additionally decoded so escaped,
+folded, keyed, and scalar content is scanned recursively. Recognized Python,
+JavaScript, and TypeScript suffixes receive bounded declaration checks in normal
+repository mode, not only when explicitly selected.
 
 To check one new repository-relative fixture before placing it under a governed
 root:
@@ -54,37 +60,54 @@ The exact registry is
 - stable adapter-manifest JSON;
 - the runtime daemon OpenAPI YAML;
 - repository examples and their JSON/YAML fences;
-- current Python SDK and TypeScript type/client source in content-only mode.
+- current Python SDK and TypeScript type/client source with bounded declaration
+  checks in addition to content scanning.
 
-JSON is parsed with duplicate-key rejection. OpenAPI and example YAML use the
-scanner's closed bounded YAML subset: mappings, sequences, quoted/plain scalars,
-flow maps/lists, and literal/folded blocks. Anchors, aliases, tags, merge keys,
-multiple documents, tabs in indentation, and ambiguous indentation are rejected.
-Recognized JSON/YAML fences in governed Markdown must close and parse.
+JSON is parsed with duplicate-key and non-finite-number rejection. YAML uses the
+scanner's closed bounded subset: mappings, normal and indentless sequences,
+single-line and folded multiline quoted/plain scalars, flow maps/lists, and
+literal/folded blocks (including sequence block scalars). Anchors, aliases, tags,
+merge keys, multiple documents, tabs in indentation, and ambiguous indentation
+are rejected. Standard YAML quoted scalar escapes are decoded under the same
+Unicode and work budgets. Recognized JSON/YAML fences in Markdown must close and
+parse; JSONC/JSON5/JSON-lines-like fences fail closed instead of being skipped. Structural
+forbidden-field enforcement remains limited to registered governed roots,
+explicit paths, and sniffed archive manifests; decoded content signatures cover
+all recognized repository text.
 
 Repository content scanning covers bounded UTF-8 source, fixtures, generated
-text, docs, manifests, and supported ZIP/TAR/TAR.GZ archives. Archive traversal,
-links, encryption, malformed members, excessive expansion, or resource overflow
-fails closed. Nested archives are rejected instead of being silently skipped.
-Every archive member that decodes as unambiguous UTF-8 is content-scanned
-regardless of filename suffix. UTF-8 BOM/NUL ambiguity fails closed; opaque
-non-UTF-8 members remain outside the absence claim. Structured JSON/YAML/Markdown
-members are also structurally checked.
+text, docs, manifests, and ZIP/TAR/GZIP containers recognized by magic rather
+than filename. Standalone gzip text and gzip-wrapped TAR are supported; every
+other nested archive is rejected. Archive traversal, links, encryption,
+malformed members, excessive expansion, or cumulative file/member/unpacked/work
+budget overflow fails closed. Every archive member that decodes as unambiguous
+UTF-8 is content-scanned regardless of filename suffix. UTF-8 BOM/NUL ambiguity
+fails closed; opaque non-UTF-8 members remain outside the absence claim.
+JSON/YAML-looking members are structurally sniffed before scanning; Markdown
+members are parsed when their member name identifies Markdown.
 
 ## Safe records and exceptions
 
-Safe C03 recognition is structural, not substring based. Each canonical
+Safe C03 recognition is exact, not substring based. Each canonical
 `SecretUseRequirement`, `SecretCredentialAuthorization`, `SecretRef`, and Driver
-credential-sink fixture is bound to an exact path, schema version, and closed
-validator. Copying a schema string into another path, adding an unknown field, or
-wrapping a generic value does not make the object safe.
+credential-sink fixture is bound to an exact path, schema version, and SHA-256
+digest owned by its canonical Rust implementation. Independent scanner tests pin
+the complete owner/symbolic path-schema-digest inventory plus nonempty
+conformance case counts and identities. This avoids maintaining a second,
+drifting Python copy of owner semantics. Any mutation—including legal field names
+with invalid bounds or relationships—invalidates the fixture.
+Copying a schema string into another path or wrapping a generic value does not
+make the object safe.
 
 The only structural exceptions are exact path + document schema + field path
 entries. Current entries cover:
 
-- closed daemon `CallerCredential` references and correlation IDs;
+- four exact daemon Python/TypeScript caller-auth transport declarations;
+- two exact process-local synthetic HMAC-key declarations in the containerized
+  acceptance provider (declarations only; no committed value);
+- the deprecated daemon caller-credential header name and closed OpenAPI
+  `CallerCredential` references;
 - exact caller-auth projections in two Markdown examples;
-- three descriptive adapter `credential_scope` fields; and
 - one exact local-only symbolic `verification_secret` placeholder.
 
 Every exception has an owner, reason, expiry, validator, and scanner version.
@@ -106,8 +129,12 @@ structural findings.
 | `SCC` | private key, provider token, authorization value, entropy candidate, credential URL, or encoded key |
 | `SCA` | malformed, unsafe, encrypted, or over-budget archive |
 
-Diagnostics contain only repository path, optional line, and a fixed rule
-message. Candidate material and matched substrings are never printed.
+Diagnostics contain only a safe repository location, optional line, and a fixed
+rule message. Credential-capable path/archive-member segments are
+digest-redacted, including percent-encoded and opaque mixed-token segments;
+candidate material and matched substrings are never printed.
+Malformed Unicode, non-finite values, archives, and filesystem objects map to
+fixed rule codes.
 
 ## Negative smoke check
 
@@ -135,12 +162,20 @@ fi
 
 ## Limits and nonclaims
 
-The policy caps files, bytes, structure depth/nodes/members, strings, fences, and
-archive expansion. Raising a cap beyond the scanner's hard ceiling is invalid.
+The policy caps cumulative files/work bytes/structure nodes/archive members and
+unpacked bytes, plus per-document depth/members/strings/fences. Raising a cap
+beyond the scanner's hard ceiling is invalid. Both CI workflows impose a
+five-minute scanner-job timeout as an outer resource bound.
+
+The repository has no configured root Python typing policy or scanner-specific
+type-check CI job. Correction validation therefore runs the explicit default-tool
+checks `ruff format --check`, `ruff check`, `mypy`, and `pyright` over the entry
+point, package, and independent tests; none is required at scanner runtime.
 
 The content scan is deterministic defense in depth, not proof that arbitrary
 binary, encrypted, compressed-inside-an-unknown-container, steganographic,
-custom-encoded, or split runtime material is absent. TypeScript source is
-content-scanned rather than parsed as a complete TypeScript grammar. Gitleaks or
-another approved general secret scanner remains complementary; neither replaces
-the structural C03 contract checks.
+custom-encoded, or split runtime material is absent. Python source checks use the
+standard AST; JavaScript/TypeScript checks intentionally recognize a bounded
+class/interface/type field grammar rather than a complete language grammar.
+Gitleaks or another approved general secret scanner remains complementary;
+neither replaces the structural C03 contract checks.

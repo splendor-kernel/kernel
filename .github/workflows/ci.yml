@@ -7,6 +7,7 @@ on:
 jobs:
   secret-contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository without default token
         run: |

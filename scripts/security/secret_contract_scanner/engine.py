@@ -1,0 +1,522 @@
+"""Repository traversal and deterministic composition of scanner concerns."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+from .archives import archive_members, detect_archive_kind
+from .content import scan_content
+from .io_utils import enumerate_repository_files, safe_read_file
+from .model import (
+    ARCHIVE_SUFFIXES,
+    SOURCE_SUFFIXES,
+    ContentHit,
+    Finding,
+    ScanDataError,
+    ScanStats,
+    WorkBudget,
+    path_under,
+    safe_policy_path,
+    suffix_for,
+)
+from .structured import (
+    StructuredScan,
+    document_schema,
+    looks_like_yaml_document,
+    markdown_outside_fences,
+    parse_markdown_fences,
+    parse_structured_data,
+    parse_yaml_document,
+    scan_python_source,
+    scan_structured_value,
+    scan_typescript_source,
+    scan_yaml_comments,
+)
+from .workflows import REQUIRED_WORKFLOWS, validate_workflow_text
+
+
+@dataclass
+class BlobScan:
+    hits: list[ContentHit]
+    findings: list[Finding]
+
+
+def governed_formats(
+    policy: dict[str, Any], files: Sequence[str]
+) -> tuple[dict[str, str], list[Finding]]:
+    formats: dict[str, str] = {}
+    findings: list[Finding] = []
+    file_set = set(files)
+    for root in policy["governed_roots"]:
+        root_path = root["path"]
+        candidates = [path for path in files if path_under(path, root_path)]
+        if root_path in file_set:
+            candidates = [root_path]
+        if not candidates:
+            findings.append(Finding(root_path, 0, "SCN002_PATH_UNAVAILABLE"))
+            continue
+        for path in candidates:
+            kind = root["formats"].get(suffix_for(path))
+            if kind is None:
+                findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+                continue
+            previous = formats.get(path)
+            if previous is not None and previous != kind:
+                findings.append(Finding(path, 0, "SCN001_POLICY_INVALID"))
+            formats[path] = kind
+    return formats, findings
+
+
+def _decode_unambiguous(data: bytes) -> str | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if "\ufeff" in text or "\x00" in text:
+        raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+    return text
+
+
+def _looks_like_json_text(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        return True
+    if not stripped.startswith("["):
+        return False
+    remainder = stripped[1:].lstrip()
+    if not remainder or remainder[0] in '[{"-0123456789]':
+        return True
+    for literal in ("true", "false", "null"):
+        if remainder.startswith(literal) and (
+            len(remainder) == len(literal)
+            or remainder[len(literal)].isspace()
+            or remainder[len(literal)] in ",]"
+        ):
+            return True
+    return False
+
+
+def _selected_kind(
+    path: str,
+    text: str,
+    governed_kind: str | None,
+    *,
+    rich_surface: bool,
+    prefer_structured_sniff: bool = False,
+) -> str:
+    if governed_kind:
+        return governed_kind
+    if _looks_like_json_text(text):
+        return "json"
+    if prefer_structured_sniff and looks_like_yaml_document(text):
+        return "yaml"
+    suffix = suffix_for(path)
+    if suffix == ".py" and rich_surface:
+        return "python_source"
+    if suffix in SOURCE_SUFFIXES and rich_surface:
+        return "typescript_source"
+    if suffix == ".json":
+        return "json"
+    if suffix in {".yaml", ".yml"} and rich_surface:
+        return "yaml"
+    if suffix == ".md" and rich_surface:
+        return "markdown"
+    if not rich_surface:
+        return "content"
+    if looks_like_yaml_document(text):
+        return "yaml"
+    return "content"
+
+
+def _content_allowlist_map(policy: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {entry["path"]: entry for entry in policy["content_allowlist"]}
+
+
+def apply_content_allowlist(
+    path: str,
+    data: bytes,
+    hits: list[ContentHit],
+    allowlists: dict[str, dict[str, Any]],
+    *,
+    enforce_stale: bool,
+) -> tuple[list[ContentHit], bool, list[Finding]]:
+    entry = allowlists.get(path)
+    if entry is None:
+        return hits, False, []
+    counts: dict[str, int] = {}
+    for hit in hits:
+        counts[hit.code] = counts.get(hit.code, 0) + 1
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != entry["sha256"] or counts != entry["matches"]:
+        if enforce_stale:
+            return hits, False, [Finding(path, 0, "SCN009_STALE_ALLOWLIST")]
+        return hits, False, []
+    return [], True, []
+
+
+def _scan_raw_text(
+    text: str,
+    *,
+    budget: WorkBudget,
+    maximum_hits: int,
+) -> list[ContentHit]:
+    budget.charge_text(text)
+    return scan_content(text, maximum_hits)
+
+
+def _exact_owner_status(
+    path: str,
+    data: bytes,
+    value: Any,
+    owner_documents: dict[str, dict[str, Any]],
+    symbolic_fixtures: dict[str, dict[str, Any]],
+    used_owner: set[str],
+    used_symbolic: set[str],
+) -> tuple[bool, list[Finding]]:
+    owner = owner_documents.get(path)
+    symbolic = symbolic_fixtures.get(path)
+    if owner is None and symbolic is None:
+        return False, []
+    entry = owner or symbolic
+    assert entry is not None
+    if owner is not None:
+        used_owner.add(path)
+    else:
+        used_symbolic.add(path)
+    valid = hashlib.sha256(data).hexdigest() == entry["sha256"]
+    if owner is not None:
+        valid = valid and document_schema(value) == entry["schema_version"]
+    return True, ([] if valid else [Finding(path, 0, "SCF003_INVALID_SAFE_RECORD")])
+
+
+def _scan_structured_document(
+    *,
+    path: str,
+    data: bytes,
+    kind: str,
+    policy: dict[str, Any],
+    budget: WorkBudget,
+    owner_documents: dict[str, dict[str, Any]],
+    symbolic_fixtures: dict[str, dict[str, Any]],
+    exceptions: dict[tuple[str, str, str], dict[str, Any]],
+    used_owner: set[str],
+    used_symbolic: set[str],
+    used_exceptions: set[tuple[str, str, str]],
+    schema_hint: str | None = None,
+    base_line: int = 1,
+    structural_fields: bool = True,
+) -> BlobScan:
+    comments: list[tuple[int, str]] = []
+    if kind == "yaml":
+        value, comments = parse_yaml_document(data, policy["limits"], budget)
+    else:
+        value = parse_structured_data(kind, data, policy["limits"], budget)
+    owner_exact, owner_findings = _exact_owner_status(
+        path,
+        data,
+        value,
+        owner_documents,
+        symbolic_fixtures,
+        used_owner,
+        used_symbolic,
+    )
+    schema = document_schema(value) or schema_hint
+    scanned = scan_structured_value(
+        value,
+        file_path=path,
+        doc_schema=schema,
+        exceptions=exceptions,
+        used_exceptions=used_exceptions,
+        budget=budget,
+        maximum_hits=policy["limits"]["max_findings"] + 1,
+        owner_exact=owner_exact or not structural_fields,
+        base_line=base_line,
+    )
+    comment_hits = scan_yaml_comments(
+        comments,
+        budget=budget,
+        maximum_hits=policy["limits"]["max_findings"] + 1 - len(scanned.hits),
+    )
+    if base_line != 1:
+        comment_hits = [
+            ContentHit(
+                base_line + hit.line - 1,
+                hit.start,
+                hit.end,
+                hit.code,
+            )
+            for hit in comment_hits
+        ]
+    return BlobScan(
+        scanned.hits + comment_hits,
+        owner_findings + scanned.findings,
+    )
+
+
+def _merge_scans(scans: Iterable[StructuredScan | BlobScan]) -> BlobScan:
+    hits: list[ContentHit] = []
+    findings: list[Finding] = []
+    for scan in scans:
+        hits.extend(scan.hits)
+        findings.extend(scan.findings)
+    return BlobScan(hits, findings)
+
+
+def _scan_text_blob(
+    *,
+    path: str,
+    data: bytes,
+    text: str,
+    kind: str,
+    policy: dict[str, Any],
+    budget: WorkBudget,
+    owner_documents: dict[str, dict[str, Any]],
+    symbolic_fixtures: dict[str, dict[str, Any]],
+    exceptions: dict[tuple[str, str, str], dict[str, Any]],
+    used_owner: set[str],
+    used_symbolic: set[str],
+    used_exceptions: set[tuple[str, str, str]],
+    structural_fields: bool,
+) -> BlobScan:
+    maximum = policy["limits"]["max_findings"] + 1
+    if kind in {"json", "yaml"}:
+        return _scan_structured_document(
+            path=path,
+            data=data,
+            kind=kind,
+            policy=policy,
+            budget=budget,
+            owner_documents=owner_documents,
+            symbolic_fixtures=symbolic_fixtures,
+            exceptions=exceptions,
+            used_owner=used_owner,
+            used_symbolic=used_symbolic,
+            used_exceptions=used_exceptions,
+            structural_fields=structural_fields,
+        )
+    if kind == "markdown":
+        fences = parse_markdown_fences(data, policy["limits"], budget)
+        outside = markdown_outside_fences(text, fences)
+        scans: list[BlobScan] = [
+            BlobScan(_scan_raw_text(outside, budget=budget, maximum_hits=maximum), [])
+        ]
+        for fence in fences:
+            fence_path = f"{path}#fence-{fence.start_line}"
+            scans.append(
+                _scan_structured_document(
+                    path=fence_path,
+                    data=fence.data,
+                    kind=fence.kind,
+                    policy=policy,
+                    budget=budget,
+                    owner_documents=owner_documents,
+                    symbolic_fixtures=symbolic_fixtures,
+                    exceptions=exceptions,
+                    used_owner=used_owner,
+                    used_symbolic=used_symbolic,
+                    used_exceptions=used_exceptions,
+                    schema_hint=f"markdown:{fence.kind}",
+                    base_line=fence.start_line + 1,
+                    structural_fields=structural_fields,
+                )
+            )
+        return _merge_scans(scans)
+    raw_hits = _scan_raw_text(text, budget=budget, maximum_hits=maximum)
+    if kind == "python_source":
+        source = scan_python_source(
+            text,
+            file_path=path,
+            exceptions=exceptions,
+            used_exceptions=used_exceptions,
+            budget=budget,
+            maximum_hits=maximum,
+        )
+        return BlobScan(raw_hits + source.hits, source.findings)
+    if kind == "typescript_source":
+        source = scan_typescript_source(
+            text,
+            file_path=path,
+            exceptions=exceptions,
+            used_exceptions=used_exceptions,
+            budget=budget,
+            maximum_hits=maximum,
+        )
+        return BlobScan(raw_hits + source.hits, source.findings)
+    if kind == "empty" and data:
+        raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+    return BlobScan(raw_hits, [])
+
+
+def _bounded_findings(findings: Iterable[Finding], maximum: int) -> list[Finding]:
+    ordered = sorted(findings)
+    if len(ordered) <= maximum:
+        return ordered
+    return ordered[:maximum] + [Finding(".", 0, "SCN005_BUDGET_EXCEEDED")]
+
+
+def scan_repository(
+    repo_root: Path,
+    policy: dict[str, Any],
+    *,
+    explicit_paths: Sequence[str] | None = None,
+) -> tuple[list[Finding], ScanStats]:
+    findings: list[Finding] = []
+    stats = ScanStats()
+    limits = policy["limits"]
+    budget = WorkBudget(limits)
+    if explicit_paths:
+        files = sorted(set(explicit_paths))
+        if len(files) != len(explicit_paths) or any(
+            not safe_policy_path(path) for path in files
+        ):
+            return [Finding(".", 0, "SCN003_PATH_AMBIGUOUS")], stats
+        formats: dict[str, str] = {}
+    else:
+        files, enum_findings = enumerate_repository_files(repo_root)
+        findings.extend(enum_findings)
+        if enum_findings:
+            return findings, stats
+        formats, format_findings = governed_formats(policy, files)
+        findings.extend(format_findings)
+
+    owner_documents = {
+        entry["path"]: entry for entry in policy["owner_schema_documents"]
+    }
+    symbolic_fixtures = {entry["path"]: entry for entry in policy["symbolic_fixtures"]}
+    exceptions = {
+        (entry["path"], entry["document_schema"], entry["field_path"]): entry
+        for entry in policy["structural_exceptions"]
+    }
+    allowlists = _content_allowlist_map(policy)
+    used_owner: set[str] = set()
+    used_symbolic: set[str] = set()
+    used_exceptions: set[tuple[str, str, str]] = set()
+    used_allowlists: set[str] = set()
+    workflow_text: dict[str, str] = {}
+
+    def record_blob(path: str, data: bytes, scan: BlobScan) -> None:
+        nonlocal findings
+        findings.extend(scan.findings)
+        hits, allowed, allow_findings = apply_content_allowlist(
+            path,
+            data,
+            scan.hits,
+            allowlists,
+            enforce_stale=explicit_paths is None,
+        )
+        findings.extend(allow_findings)
+        if allowed:
+            used_allowlists.add(path)
+            stats.content_allowlists += 1
+        findings.extend(Finding(path, hit.line, hit.code) for hit in hits)
+
+    for path in files:
+        try:
+            budget.charge_file()
+            data = safe_read_file(repo_root, path, limits["max_file_bytes"])
+            budget.charge_work(len(data))
+            archive_kind = detect_archive_kind(data)
+            archive_named = suffix_for(path) in ARCHIVE_SUFFIXES
+            if archive_kind is not None or archive_named:
+                if archive_kind is None:
+                    raise ScanDataError("SCA001_ARCHIVE_INVALID")
+                for member in archive_members(data, limits, budget):
+                    stats.archive_members += 1
+                    display = f"{path}!{member.name}"
+                    if detect_archive_kind(member.data) is not None:
+                        raise ScanDataError("SCA001_ARCHIVE_INVALID")
+                    member_text = _decode_unambiguous(member.data)
+                    if member_text is None:
+                        continue
+                    stats.content_files += 1
+                    member_kind = _selected_kind(
+                        display,
+                        member_text,
+                        None,
+                        rich_surface=True,
+                        prefer_structured_sniff=True,
+                    )
+                    member_scan = _scan_text_blob(
+                        path=display,
+                        data=member.data,
+                        text=member_text,
+                        kind=member_kind,
+                        policy=policy,
+                        budget=budget,
+                        owner_documents=owner_documents,
+                        symbolic_fixtures=symbolic_fixtures,
+                        exceptions=exceptions,
+                        used_owner=used_owner,
+                        used_symbolic=used_symbolic,
+                        used_exceptions=used_exceptions,
+                        structural_fields=True,
+                    )
+                    record_blob(display, member.data, member_scan)
+                    if len(findings) > limits["max_findings"]:
+                        raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+                continue
+
+            text = _decode_unambiguous(data)
+            governed_kind = formats.get(path)
+            if text is None:
+                if governed_kind:
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+                continue
+            stats.content_files += 1
+            suffix = suffix_for(path)
+            rich_surface = (
+                governed_kind is not None
+                or explicit_paths is not None
+                or suffix in SOURCE_SUFFIXES
+                or suffix in {".json", ".md", ".yaml", ".yml"}
+            )
+            structural_fields = governed_kind is not None or explicit_paths is not None
+            kind = _selected_kind(path, text, governed_kind, rich_surface=rich_surface)
+            if governed_kind:
+                stats.governed_files += 1
+            blob_scan = _scan_text_blob(
+                path=path,
+                data=data,
+                text=text,
+                kind=kind,
+                policy=policy,
+                budget=budget,
+                owner_documents=owner_documents,
+                symbolic_fixtures=symbolic_fixtures,
+                exceptions=exceptions,
+                used_owner=used_owner,
+                used_symbolic=used_symbolic,
+                used_exceptions=used_exceptions,
+                structural_fields=structural_fields,
+            )
+            record_blob(path, data, blob_scan)
+            if path in REQUIRED_WORKFLOWS:
+                workflow_text[path] = text
+        except ScanDataError as exc:
+            findings.append(Finding(path, exc.line, exc.code))
+            if exc.code == "SCN005_BUDGET_EXCEEDED":
+                break
+        except (OSError, ValueError, TypeError, UnicodeError, OverflowError):
+            findings.append(Finding(path, 0, "SCN003_PATH_AMBIGUOUS"))
+        if len(findings) > limits["max_findings"]:
+            break
+
+    if explicit_paths is None:
+        for path in REQUIRED_WORKFLOWS:
+            text = workflow_text.get(path)
+            if text is None or not validate_workflow_text(path, text):
+                findings.append(Finding(path, 0, "SCN012_WORKFLOW_UNGATED"))
+        for path in sorted(set(owner_documents) - used_owner):
+            findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
+        for path in sorted(set(symbolic_fixtures) - used_symbolic):
+            findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
+        for identity in sorted(set(exceptions) - used_exceptions):
+            findings.append(Finding(identity[0], 0, "SCN009_STALE_ALLOWLIST"))
+        for path in sorted(set(allowlists) - used_allowlists):
+            findings.append(Finding(path, 0, "SCN009_STALE_ALLOWLIST"))
+    stats.structural_exceptions = len(used_exceptions)
+    stats.bytes_worked = budget.work_bytes
+    return _bounded_findings(findings, limits["max_findings"]), stats

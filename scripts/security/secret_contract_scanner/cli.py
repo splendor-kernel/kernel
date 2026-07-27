@@ -1,0 +1,93 @@
+"""Command-line boundary for the C03 repository scanner."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import sys
+from pathlib import Path
+from typing import Sequence
+
+from .engine import scan_repository
+from .model import DEFAULT_POLICY_PATH, Finding
+from .policy import load_policy
+from .self_test import run_self_test
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Check C03 contracts/fixtures and repository content for raw secret material."
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3],
+        help="Repository root (default: inferred from this script).",
+    )
+    parser.add_argument(
+        "--policy",
+        default=DEFAULT_POLICY_PATH,
+        help=f"Repository-relative policy path (default: {DEFAULT_POLICY_PATH}).",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        dest="paths",
+        help="Scan one repository-relative path instead of normal repository mode; repeatable.",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run deterministic independent positive and negative tests.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.self_test:
+        return run_self_test()
+    try:
+        repo_root = args.repo_root.resolve(strict=True)
+    except OSError:
+        print(Finding(".", 0, "SCN002_PATH_UNAVAILABLE").render(), file=sys.stderr)
+        return 1
+    if not repo_root.is_dir():
+        print(Finding(".", 0, "SCN002_PATH_UNAVAILABLE").render(), file=sys.stderr)
+        return 1
+    policy, policy_findings = load_policy(
+        repo_root, args.policy, today=dt.datetime.now(dt.timezone.utc).date()
+    )
+    if policy is None:
+        for finding in policy_findings:
+            print(finding.render(), file=sys.stderr)
+        return 1
+    try:
+        findings, stats = scan_repository(repo_root, policy, explicit_paths=args.paths)
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        UnicodeError,
+        OverflowError,
+        RecursionError,
+    ):
+        findings = [Finding(".", 0, "SCN003_PATH_AMBIGUOUS")]
+        stats = None
+    if findings:
+        print(
+            f"C03 secret contract scan: FAIL ({len(findings)} finding(s))",
+            file=sys.stderr,
+        )
+        for finding in findings:
+            print(finding.render(), file=sys.stderr)
+        return 1
+    assert stats is not None
+    print(
+        "C03 secret contract scan: PASS "
+        f"(governed_files={stats.governed_files}, content_files={stats.content_files}, "
+        f"archive_members={stats.archive_members}, bytes_worked={stats.bytes_worked}, "
+        f"structural_exceptions={stats.structural_exceptions}, "
+        f"content_allowlists={stats.content_allowlists})"
+    )
+    return 0
