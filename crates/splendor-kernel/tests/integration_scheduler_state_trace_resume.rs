@@ -379,6 +379,7 @@ fn scheduler_resumes_from_trace_store_and_continues_state() {
     let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
     scheduler.add_agent(engine);
     scheduler.run_cycle().expect("first cycle");
+    drop(scheduler);
 
     let registry = build_registry(&tenant_id, &actions);
     let gateway = build_gateway(&registry, &actions);

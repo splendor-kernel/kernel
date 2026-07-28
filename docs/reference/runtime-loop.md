@@ -109,8 +109,12 @@ documented in [`identity.md`](identity.md).
   Fixed-cycle and forever CLI paths stop with `tick_reconciliation_required`.
   Persisted resume rejects a recorded reconciliation-required result or an
   action-capable tick attempt without its matching `LoopTickCompleted`, including
-  when the first post-Gateway trace append was lost. Resume selects state only
-  only from the latest completed tick when its snapshot metadata and state node
+  when the first post-Gateway trace append was lost. Before deriving either fact,
+  resume validates the complete storage-owned run sequence and hash chain from
+  genesis. Payload/hash/prior-hash mutation, deletion, reorder, insertion, or a
+  mismatched event envelope fails before snapshot loading, policy, scheduler, or
+  adapter entry. Resume selects state only from the latest completed tick when
+  its snapshot metadata and state node
   bind the exact `run_id`, `tenant_id`, and `agent_id`. If that tick has no
   snapshot, or identity metadata is mismatched or incomplete, resume fails closed
   rather than relabeling an older snapshot or restoring a sibling agent's state.
@@ -118,9 +122,15 @@ documented in [`identity.md`](identity.md).
   of a replacement run/engine; no scheduler path automatically requeues the
   parked action. A fresh persisted constructor rejects an already-existing run
   with `run_already_exists`; only the explicit resume constructors may inspect
-  persisted history. Duplicate policy-supplied explicit action IDs are rejected
-  with `duplicate_action_id` before Gateway submission. Ordinary pre-effect loop
-  failures retain their existing requeue behavior.
+  persisted history. Fresh and resumed persisted engines hold one exact
+  `run_id + tenant_id + agent_id` live-owner claim, so an independent constructor
+  or duplicate scheduler admission fails closed and appends no competing event.
+  Recovery retains the highest validated attempted tick even when that tick did
+  not complete; direct ticks and resumed schedulers advance beyond it rather than
+  resetting or reusing the ID. Duplicate policy-supplied explicit action IDs in
+  one decision are rejected with `duplicate_action_id` before Gateway submission;
+  re-evaluation of one stable `ActionId` on a later distinct tick remains valid.
+  Ordinary pre-effect loop failures retain their existing requeue behavior.
 - State commit failure prevents `StateCommitted` and `LoopTickCompleted` from
   being emitted for that tick.
 - Trace store failure fails the tick before side-effectful work can proceed when

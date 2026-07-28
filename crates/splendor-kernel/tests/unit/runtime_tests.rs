@@ -1,5 +1,5 @@
 use super::*;
-use splendor_store::{InMemoryTraceStore, TraceStore, TraceStoreError};
+use splendor_store::{InMemoryTraceStore, SqliteTraceStore, TraceStore, TraceStoreError};
 use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
     StateReferenceMode, TenantId,
@@ -302,6 +302,72 @@ fn concurrent_record_event_calls_keep_contiguous_sequence_and_integrity_cursor()
         prev_hash = Some(event_hash);
     }
     assert_eq!(runtime_prev_event_hash(runtime.as_ref()), prev_hash);
+}
+
+#[test]
+fn independent_sqlite_runtime_writers_have_one_success_and_one_typed_conflict() {
+    const RACE_COUNT: usize = 32;
+
+    for race in 0..RACE_COUNT {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let path = directory.path().join("trace.sqlite3");
+        let run_id = RunId::new();
+        let left = KernelRuntime::with_trace_store(
+            Arc::new(SqliteTraceStore::open(&path).expect("left trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("left runtime");
+        let right = KernelRuntime::with_trace_store(
+            Arc::new(SqliteTraceStore::open(&path).expect("right trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("right runtime");
+        let start = Arc::new(Barrier::new(3));
+
+        let handles = [left, right]
+            .into_iter()
+            .map(|runtime| {
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    runtime.record_event(TraceEventKind::RunStarted)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer thread"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "race {race}: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(TraceError::Store(TraceStoreError::SequenceMismatch {
+                            expected: 0,
+                            actual: 1
+                        }))
+                    )
+                })
+                .count(),
+            1,
+            "race {race}: {results:?}"
+        );
+        let records = SqliteTraceStore::open(&path)
+            .expect("inspection store")
+            .read(&run_id.to_string())
+            .expect("single trace record");
+        assert_eq!(records.len(), 1, "race {race}");
+        assert_eq!(records[0].sequence, 0, "race {race}");
+    }
 }
 
 #[test]

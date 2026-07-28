@@ -402,6 +402,20 @@ impl TraceStore for ArmableTraceStore {
         self.inner.append(run_id, payload)
     }
 
+    fn append_if_sequence(
+        &self,
+        run_id: &str,
+        expected_sequence: u64,
+        payload: serde_json::Value,
+    ) -> Result<u64, TraceStoreError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone())?;
+        if self.failure.matches(&event.kind) && self.armed.swap(false, Ordering::SeqCst) {
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner
+            .append_if_sequence(run_id, expected_sequence, payload)
+    }
+
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -413,6 +427,23 @@ impl TraceStore for ArmableTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn claim_runtime_identity(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
+        self.inner
+            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    }
+
+    fn release_runtime_identity(
+        &self,
+        claim: &splendor_store::RuntimeIdentityClaim,
+    ) -> Result<(), TraceStoreError> {
+        self.inner.release_runtime_identity(claim)
     }
 }
 
@@ -1682,6 +1713,63 @@ fn duplicate_explicit_action_ids_do_not_enter_verified_gateway_adapter() {
     assert!(events
         .iter()
         .all(|event| !matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })));
+}
+
+#[test]
+fn one_explicit_action_id_can_be_re_evaluated_on_distinct_durable_ticks() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(RecordingSuppressionAdapter {
+        calls: Arc::clone(&calls),
+        suppress_action: None,
+        suppress_on_call: None,
+    });
+    let tenant_id = splendor_kernel::TenantId::new();
+    let action_names = vec!["stable-effect".to_string()];
+    let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
+    let action_id = ActionId::new();
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            splendor_kernel::AgentId::new(),
+            tenant_id,
+            AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(CandidateListPolicy {
+            actions: vec![external_candidate("stable-effect", Some(action_id.clone()))],
+        }),
+        gateway,
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+
+    registry.begin_tick(1, OffsetDateTime::now_utc());
+    engine.tick(1).expect("first action evaluation");
+    registry.begin_tick(2, OffsetDateTime::now_utc());
+    engine.tick(2).expect("second action evaluation");
+
+    assert_eq!(calls.lock().expect("adapter calls").len(), 2);
+    let action_ticks = trace_store
+        .read(&run_id.to_string())
+        .expect("trace records")
+        .into_iter()
+        .map(|record| serde_json::from_value::<TraceEvent>(record.payload).expect("event"))
+        .filter(|event| {
+            matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+                && event.identity.action_id.as_ref() == Some(&action_id)
+        })
+        .filter_map(|event| event.identity.tick_id.map(|tick_id| tick_id.get()))
+        .collect::<Vec<_>>();
+    assert_eq!(action_ticks, vec![1, 2]);
 }
 
 #[test]

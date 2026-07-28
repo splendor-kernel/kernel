@@ -4,6 +4,18 @@
 
 ### Added
 
+- **status/incomplete correction:** runtime recovery now validates the complete
+  canonical trace record sequence, previous-hash links, and event hashes before
+  parsing recovery facts or restoring state. Built-in stores expose explicit
+  atomic conditional append while keeping arbitrary payload JSON opaque, so an
+  application field named `sequence` round-trips unchanged. SQLite uses bounded
+  immediate transactions for deterministic cross-connection conflicts and
+  identity-specific local lock sidecars for one live exact
+  run/tenant/agent owner; duplicate constructor and scheduler admission fail
+  closed. Recovery and scheduler admission retain the highest persisted attempted
+  tick so partial ticks are never reset or reused. This changes no public trace
+  event or SQLite `trace_events` schema and makes no transferable-writer, fleet,
+  Gold, task-completion, or positive secret-delivery claim.
 - **status/incomplete correction:** generalized the local runtime's post-Gateway
   effect latch beyond credential-output suppression. Gateway outcomes now carry
   fixed adapter-entry, effect-certainty, retry-class, and reconciliation facts in
@@ -11,8 +23,8 @@
   failures park rather than retry, while successful effects become runnable only
   after durable tick completion. Fresh shared-runtime admission is atomic per
   exact tenant/agent identity, resume requires that identity's snapshot for its
-  latest completed tick, and built-in trace stores reject stale embedded
-  sequences atomically. Docker publication now
+  latest completed tick, and runtime emitters use explicit atomic conditional
+  append expectations. Docker publication now
   builds each platform candidate once, validates and smoke-tests that exact
   archive, and later publishes only its checksum-matched bytes with registry write
   authority isolated to post-validation jobs. No public schema was added and no

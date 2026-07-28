@@ -13,6 +13,7 @@ splendor-types = { path = "../splendor-types" }
 splendor-store = { path = "../splendor-store" }
 
 [dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { workspace = true }
 splendor-adapter-filesystem = { path = "../../adapters/filesystem" }
 splendor-adapter-http = { path = "../../adapters/http" }

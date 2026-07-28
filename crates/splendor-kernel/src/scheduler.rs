@@ -9,8 +9,8 @@ use crate::tenancy::TenantRegistry;
 use crate::{StateCommit, StateHandoffExportRequest, StateHandoffScope};
 use splendor_store::StateMetadata;
 use splendor_types::{
-    ActionId, AgentId, StateHandoff, TenantId, TraceEvent, TraceEventKind, WorkOrderEnvelope,
-    WorkOrderKeyring,
+    ActionId, AgentId, RunId, StateHandoff, TenantId, TraceEvent, TraceEventKind,
+    WorkOrderEnvelope, WorkOrderKeyring,
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -53,6 +53,15 @@ pub enum SchedulerError {
     /// A loop engine returned an error.
     #[error("loop engine failed: {0}")]
     Loop(#[from] LoopError),
+    /// The exact run/tenant/agent identity is already admitted.
+    #[error(
+        "runtime identity is already admitted: run={run_id} tenant={tenant_id} agent={agent_id}"
+    )]
+    DuplicateRuntimeIdentity {
+        run_id: RunId,
+        tenant_id: TenantId,
+        agent_id: AgentId,
+    },
     /// Tick budget exceeded for the executed step.
     #[error("tick budget exceeded ({elapsed:?} > {budget:?})")]
     TickBudgetExceeded {
@@ -109,9 +118,35 @@ impl Scheduler {
             .with_tenant(tenant_id, |tenant| tenant.tick_usage())
     }
 
-    /// Adds a loop engine to the scheduling queue.
+    /// Adds a loop engine to the scheduling queue. Duplicate exact identities
+    /// are rejected without admission; callers that need the typed conflict
+    /// should use `try_add_agent`.
     pub fn add_agent(&mut self, engine: LoopEngine) {
+        let _ = self.try_add_agent(engine);
+    }
+
+    /// Adds a loop engine unless its exact run/tenant/agent identity is already live.
+    pub fn try_add_agent(&mut self, engine: LoopEngine) -> Result<(), SchedulerError> {
+        let run_id = engine.run_id().clone();
+        let tenant_id = engine.tenant_id().clone();
+        let agent_id = engine.agent_id().clone();
+        if self
+            .queue
+            .iter()
+            .chain(self.reconciliation_queue.iter())
+            .any(|admitted| admitted.has_runtime_identity(&run_id, &tenant_id, &agent_id))
+        {
+            return Err(SchedulerError::DuplicateRuntimeIdentity {
+                run_id,
+                tenant_id,
+                agent_id,
+            });
+        }
+        if let Some(last_tick_id) = engine.last_tick_id() {
+            self.tick_id = self.tick_id.max(last_tick_id);
+        }
         self.queue.push_back(engine);
+        Ok(())
     }
 
     /// Records a non-tick runtime event through the target agent's trace runtime.

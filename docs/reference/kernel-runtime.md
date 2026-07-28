@@ -31,12 +31,14 @@ records. It owns a `RunId`, a monotonic sequence counter, and a trace sink.
   assemble against that same runtime before tick activity begins; a duplicate
   identity, reopened runtime, or already-active runtime is not fresh admission.
 - Emit integrity metadata in `LoopTickCompleted` when available.
+- Validate the complete storage-owned run/hash/previous-hash/sequence chain
+  before initializing a cursor from persisted history.
 
 **Methods**
 - `new(config)` creates a runtime without emitting events.
 - `with_trace_store(store, run_id)` initializes the cursor from the latest
-  durable sequence/hash. Call it once per resolved run in a composition, then
-  share the returned runtime.
+  durable sequence/hash only after full-chain integrity validation. Call it once
+  per resolved run in a composition, then share the returned runtime.
 - `boot(config)` creates a runtime and emits `LoopTickStarted`.
 - `record_event(kind)` serializes and emits a `TraceEvent`.
 - `record_event_with_identity(identity, kind)` uses the same cursor while
@@ -163,12 +165,16 @@ state commits.
   `with_shared_trace_runtime_and_work_order` or
   `resume_from_shared_trace_runtime_and_work_order`. These constructors are
   required when a gateway pre-effect evidence recorder or another local agent
-  emits into the same run stream. Resume rejects a runtime whose `RunId` differs
-  from the requested run before restoring state.
+  emits into the same run stream. They require a runtime created through
+  `KernelRuntime::with_trace_store`; a custom sink without the store-backed
+  ownership boundary fails closed. Resume rejects a runtime whose `RunId`
+  differs from the requested run before restoring state.
 - Treat `with_trace_store*` and `with_shared_trace_runtime*` as fresh-run
-  constructors. Fresh admission and the single `RunStarted` append occur under
-  one shared runtime lock, so competing constructors for the same tenant/agent
-  identity cannot both become emitters. The rejected constructor appends nothing.
+  constructors. Persisted construction first acquires the store's exact
+  `run_id + tenant_id + agent_id` live-owner claim. Fresh admission and the
+  single `RunStarted` append then occur under one shared runtime cursor lock, so
+  competing constructors cannot both become emitters. The rejected constructor
+  appends nothing, and dropping the admitted engine releases its local claim.
   Constructors return fixed `run_already_exists` for a duplicate identity, when
   their runtime was reopened over persisted trace history, or after tick activity
   has begun. Distinct local agents may still assemble on the same runtime before
@@ -184,11 +190,20 @@ state commits.
   `resume_latest_completed_snapshot_unavailable`; missing or mismatched identity
   metadata is a fixed resume failure, not a fallback to an older or sibling
   state.
+- Validate every record in the complete run chain before parsing recovery events
+  or loading a snapshot. Payload/hash/prior-hash mutation, deletion, reordering,
+  insertion, or a record/event envelope identity mismatch returns a structured
+  integrity error before policy, scheduler, state restoration, or adapter entry.
+- Retain the highest exact-identity tick observed in all validated events, not
+  only the latest completed tick. A partial pre-effect tick may resume from the
+  latest completed snapshot, but neither direct execution nor a new scheduler may
+  reuse that partial tick ID.
 
 `with_trace_store_and_work_order` and `resume_from_trace_store_with_work_order`
 create their own runtime and remain suitable only when that loop is the sole
 emitter for the run. Composition roots must own runtime reuse; stores persist
-records but do not arbitrate multiple stale in-process cursors.
+records and reject duplicate exact live identities, but they do not make
+independently initialized cursors for different identities in one run composable.
 
 **Key Types**
 - `ActionCandidate`: action proposal plus adapter, quota usage, and satisfied preconditions.
@@ -217,7 +232,11 @@ records but do not arbitrate multiple stale in-process cursors.
 ### Scheduler
 
 `Scheduler` executes loop engines in a fair queue and resets tenant quotas at the
-start of each scheduler cycle.
+start of each scheduler cycle. `try_add_agent` returns a typed
+`DuplicateRuntimeIdentity` conflict when the exact run/tenant/agent identity is
+already queued or parked. The compatibility `add_agent` method also fails closed
+by declining duplicate admission. Admission raises the scheduler's tick floor to
+the engine's highest validated durable tick before the next cycle begins.
 
 **SchedulerConfig**
 - `tick_budget` (`Option<Duration>`): optional per-tick time budget.

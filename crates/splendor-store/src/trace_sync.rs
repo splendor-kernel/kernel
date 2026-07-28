@@ -190,7 +190,10 @@ impl<S: TraceStore> LocalTraceBuffer<S> {
     ) -> Result<u64, LocalTraceBufferError> {
         let run_id = event.run_id.to_string();
         let payload = serde_json::to_value(event).map_err(LocalTraceBufferError::Serialization)?;
-        let sequence = self.append(&run_id, payload, mode)?;
+        self.ensure_capacity(&run_id, mode)?;
+        let sequence = self
+            .store
+            .append_if_sequence(&run_id, event.sequence, payload)?;
         if sequence != event.sequence {
             return Err(LocalTraceBufferError::SequenceMismatch {
                 expected: event.sequence,
@@ -805,27 +808,46 @@ fn validate_chain_link(
         )
     };
 
-    if record.prev_event_hash != expected_prev {
-        return Err(TraceSyncError::ChainMismatch {
-            run_id: run_id.to_string(),
-            sequence: record.sequence,
+    match crate::trace::validate_trace_record_link(
+        run_id,
+        record,
+        record.sequence,
+        expected_prev.as_ref(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(TraceStoreError::IntegrityChainMismatch {
+            run_id,
+            sequence,
             expected_prev,
-            actual_prev: record.prev_event_hash.clone(),
-        });
-    }
-
-    let expected_hash =
-        crate::trace::compute_event_hash(record.prev_event_hash.as_ref(), &record.payload)?;
-    if record.event_hash != expected_hash {
-        return Err(TraceSyncError::HashMismatch {
-            run_id: run_id.to_string(),
-            sequence: record.sequence,
+            actual_prev,
+        }) => Err(TraceSyncError::ChainMismatch {
+            run_id,
+            sequence,
+            expected_prev,
+            actual_prev,
+        }),
+        Err(TraceStoreError::IntegrityHashMismatch {
+            run_id,
+            sequence,
             expected_hash,
-            actual_hash: record.event_hash.clone(),
-        });
+            actual_hash,
+        }) => Err(TraceSyncError::HashMismatch {
+            run_id,
+            sequence,
+            expected_hash,
+            actual_hash,
+        }),
+        Err(TraceStoreError::IntegrityRunIdentityMismatch {
+            actual_run_id,
+            sequence,
+            ..
+        }) => Err(TraceSyncError::RunIdentityMismatch {
+            scope_run_id: run_id.to_string(),
+            record_run_id: actual_run_id,
+            sequence,
+        }),
+        Err(error) => Err(TraceSyncError::Store(error)),
     }
-
-    Ok(())
 }
 
 fn records_equivalent(existing: &TraceRecord, incoming: &TraceRecord) -> bool {

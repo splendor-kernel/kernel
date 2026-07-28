@@ -21,8 +21,8 @@ use splendor_kernel::{
     StateGraph, TenantContext, TenantPolicy, TenantRegistry,
 };
 use splendor_store::{
-    compute_trace_event_hash, SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord,
-    TraceStore, TraceStoreError,
+    validate_trace_chain, SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord, TraceStore,
+    TraceStoreError,
 };
 use splendor_types::{
     validate_work_order, Action, AgentId, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
@@ -3212,29 +3212,25 @@ fn decode_and_validate_trace_records(
     records: &[TraceRecord],
     run_id: &str,
 ) -> Result<Vec<TraceEvent>, String> {
+    validate_trace_chain(run_id, records).map_err(|error| match error {
+        TraceStoreError::IntegrityRunIdentityMismatch { actual_run_id, .. } => format!(
+            "Trace record run mismatch: expected '{run_id}' but found '{actual_run_id}'"
+        ),
+        TraceStoreError::IntegritySequenceMismatch {
+            expected, actual, ..
+        } => format!(
+            "Trace sequence gap or corruption for run '{run_id}': expected sequence {expected} but found {actual}"
+        ),
+        TraceStoreError::IntegrityChainMismatch { sequence, .. } => format!(
+            "Trace integrity chain mismatch at sequence {sequence} for run '{run_id}'"
+        ),
+        TraceStoreError::IntegrityHashMismatch { sequence, .. } => format!(
+            "Trace payload hash mismatch at sequence {sequence} for run '{run_id}'"
+        ),
+        error => format!("Failed to validate trace chain: {error}"),
+    })?;
     let mut events = Vec::with_capacity(records.len());
-    let mut prev_hash: Option<ContentHash> = None;
-    for (expected_sequence, record) in records.iter().enumerate() {
-        let expected_sequence = expected_sequence as u64;
-        if record.run_id != run_id {
-            return Err(format!(
-                "Trace record run mismatch: expected '{run_id}' but found '{}'",
-                record.run_id
-            ));
-        }
-        if record.sequence != expected_sequence {
-            return Err(format!(
-                "Trace sequence gap or corruption for run '{run_id}': expected sequence {expected_sequence} but found {}",
-                record.sequence
-            ));
-        }
-        if record.prev_event_hash != prev_hash {
-            return Err(format!(
-                "Trace integrity chain mismatch at sequence {} for run '{run_id}'",
-                record.sequence
-            ));
-        }
-
+    for record in records {
         let event: TraceEvent = serde_json::from_value(record.payload.clone())
             .map_err(|error| format!("Failed to decode trace record: {error}"))?;
         if event.run_id.to_string() != run_id {
@@ -3256,16 +3252,6 @@ fn decode_and_validate_trace_records(
                 event.sequence
             ));
         }
-        let expected_event_hash = compute_trace_event_hash(prev_hash.as_ref(), &record.payload)
-            .map_err(|error| format!("Failed to recompute trace hash: {error}"))?;
-        if record.event_hash != expected_event_hash {
-            return Err(format!(
-                "Trace payload hash mismatch at sequence {} for run '{run_id}'",
-                record.sequence
-            ));
-        }
-
-        prev_hash = Some(record.event_hash.clone());
         events.push(event);
     }
     Ok(events)
@@ -3897,6 +3883,40 @@ impl TraceStore for FailingTraceStore {
         self.inner.append(run_id, payload)
     }
 
+    fn append_if_sequence(
+        &self,
+        run_id: &str,
+        expected_sequence: u64,
+        payload: serde_json::Value,
+    ) -> Result<u64, TraceStoreError> {
+        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
+            let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
+            if !*failed {
+                *failed = true;
+                if self.fail_on_event != "ActionVerificationCompleted" {
+                    let side_effect_executed =
+                        side_effect_executed_before_trace_failure(&self.inner, run_id, &payload)?;
+                    append_failure_evidence_event(
+                        &self.inner,
+                        run_id,
+                        "TraceWriteFailed",
+                        serde_json::json!({
+                            "failed_event": self.fail_on_event,
+                            "side_effect_executed": side_effect_executed,
+                            "failure_injection": "splendorctl_public_run_config",
+                        }),
+                    )?;
+                }
+                return Err(TraceStoreError::InvalidTimestamp(format!(
+                    "injected_trace_write_failure:{}",
+                    self.fail_on_event
+                )));
+            }
+        }
+        self.inner
+            .append_if_sequence(run_id, expected_sequence, payload)
+    }
+
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -3908,6 +3928,23 @@ impl TraceStore for FailingTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn claim_runtime_identity(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
+        self.inner
+            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    }
+
+    fn release_runtime_identity(
+        &self,
+        claim: &splendor_store::RuntimeIdentityClaim,
+    ) -> Result<(), TraceStoreError> {
+        self.inner.release_runtime_identity(claim)
     }
 }
 

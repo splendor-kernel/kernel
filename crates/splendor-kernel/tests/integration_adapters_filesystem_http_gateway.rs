@@ -185,6 +185,22 @@ impl TraceStore for FailingActionVerificationTraceStore {
         self.inner.append(run_id, payload)
     }
 
+    fn append_if_sequence(
+        &self,
+        run_id: &str,
+        expected_sequence: u64,
+        payload: serde_json::Value,
+    ) -> Result<u64, TraceStoreError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone()).expect("trace event");
+        if matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+            && !self.failed.swap(true, Ordering::SeqCst)
+        {
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner
+            .append_if_sequence(run_id, expected_sequence, payload)
+    }
+
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -196,6 +212,23 @@ impl TraceStore for FailingActionVerificationTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn claim_runtime_identity(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
+        self.inner
+            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    }
+
+    fn release_runtime_identity(
+        &self,
+        claim: &splendor_store::RuntimeIdentityClaim,
+    ) -> Result<(), TraceStoreError> {
+        self.inner.release_runtime_identity(claim)
     }
 }
 

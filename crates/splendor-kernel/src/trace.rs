@@ -20,7 +20,7 @@
 //! sink.record(&event).expect("record");
 //! ```
 
-use splendor_store::{TraceStore, TraceStoreError};
+use splendor_store::{validate_trace_chain, TraceRecord, TraceStore, TraceStoreError};
 use splendor_types::{ContentHash, IdentityValidationError, RunId, TraceEvent};
 use std::future::{ready, Future, Ready};
 use std::sync::Arc;
@@ -87,17 +87,20 @@ impl TraceStoreSink {
 
     /// Returns the latest sequence number stored for this run.
     pub fn latest_sequence(&self) -> Result<Option<u64>, TraceError> {
-        match self.store.read(&self.run_id.to_string()) {
-            Ok(records) => Ok(records.last().map(|record| record.sequence)),
-            Err(TraceStoreError::RunNotFound) => Ok(None),
-            Err(error) => Err(TraceError::Store(error)),
-        }
+        Ok(self.latest_record()?.map(|record| record.sequence))
     }
 
     /// Returns the latest event hash stored for this run.
     pub fn latest_event_hash(&self) -> Result<Option<ContentHash>, TraceError> {
+        Ok(self.latest_record()?.map(|record| record.event_hash))
+    }
+
+    pub(crate) fn latest_record(&self) -> Result<Option<TraceRecord>, TraceError> {
         match self.store.read(&self.run_id.to_string()) {
-            Ok(records) => Ok(records.last().map(|record| record.event_hash.clone())),
+            Ok(records) => {
+                validate_trace_chain(&self.run_id.to_string(), &records)?;
+                Ok(records.last().cloned())
+            }
             Err(TraceStoreError::RunNotFound) => Ok(None),
             Err(error) => Err(TraceError::Store(error)),
         }
@@ -109,7 +112,7 @@ impl TraceSink for TraceStoreSink {
         let payload = serde_json::to_value(event)?;
         let sequence = self
             .store
-            .append(&event.run_id.to_string(), payload)
+            .append_if_sequence(&event.run_id.to_string(), event.sequence, payload)
             .map_err(TraceError::Store)?;
         if sequence != event.sequence {
             return Err(TraceError::SequenceMismatch {

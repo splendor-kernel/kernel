@@ -125,6 +125,50 @@ impl TraceStore for FailingPolicyTraceStore {
         self.inner.append(run_id, payload)
     }
 
+    fn append_if_sequence(
+        &self,
+        run_id: &str,
+        expected_sequence: u64,
+        payload: Value,
+    ) -> Result<u64, TraceStoreError> {
+        let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok();
+        let target = *self
+            .fail_next
+            .lock()
+            .map_err(|_| TraceStoreError::Poisoned)?;
+        let should_fail = matches!(
+            (target, event.as_ref().map(|event| &event.kind)),
+            (
+                Some(PolicyTraceFailureTarget::Accepted),
+                Some(TraceEventKind::PolicyBundleAccepted { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::Reconnected),
+                Some(TraceEventKind::PolicyConnectivityChanged {
+                    disconnected: false,
+                    ..
+                })
+            ) | (
+                Some(PolicyTraceFailureTarget::Rejected),
+                Some(TraceEventKind::PolicyBundleRejected { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::SyncFailed),
+                Some(TraceEventKind::PolicySyncFailed { .. })
+            ) | (
+                Some(PolicyTraceFailureTarget::Revoked),
+                Some(TraceEventKind::PolicyRevoked { .. })
+            )
+        );
+        if should_fail {
+            *self
+                .fail_next
+                .lock()
+                .map_err(|_| TraceStoreError::Poisoned)? = None;
+            return Err(TraceStoreError::Poisoned);
+        }
+        self.inner
+            .append_if_sequence(run_id, expected_sequence, payload)
+    }
+
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -136,6 +180,23 @@ impl TraceStore for FailingPolicyTraceStore {
         end: u64,
     ) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read_range(run_id, start, end)
+    }
+
+    fn claim_runtime_identity(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
+        self.inner
+            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    }
+
+    fn release_runtime_identity(
+        &self,
+        claim: &splendor_store::RuntimeIdentityClaim,
+    ) -> Result<(), TraceStoreError> {
+        self.inner.release_runtime_identity(claim)
     }
 }
 
@@ -164,6 +225,16 @@ impl TraceStore for HistoricalSensitiveTraceStore {
         self.inner.append(run_id, payload)
     }
 
+    fn append_if_sequence(
+        &self,
+        run_id: &str,
+        expected_sequence: u64,
+        payload: Value,
+    ) -> Result<u64, TraceStoreError> {
+        self.inner
+            .append_if_sequence(run_id, expected_sequence, payload)
+    }
+
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner
             .read(run_id)
@@ -179,6 +250,23 @@ impl TraceStore for HistoricalSensitiveTraceStore {
         self.inner
             .read_range(run_id, start, end)
             .map(Self::inject_historical_sensitive_payload)
+    }
+
+    fn claim_runtime_identity(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
+    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
+        self.inner
+            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    }
+
+    fn release_runtime_identity(
+        &self,
+        claim: &splendor_store::RuntimeIdentityClaim,
+    ) -> Result<(), TraceStoreError> {
+        self.inner.release_runtime_identity(claim)
     }
 }
 

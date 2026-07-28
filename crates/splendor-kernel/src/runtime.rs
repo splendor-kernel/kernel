@@ -16,7 +16,7 @@
 //! ```
 
 use crate::{StdoutTraceSink, TraceError, TraceSink, TraceStoreSink};
-use splendor_store::TraceStore;
+use splendor_store::{RuntimeIdentityClaim, TraceStore};
 use splendor_types::{
     AgentId, ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
     StateReference, TenantId, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
@@ -66,6 +66,21 @@ pub struct KernelRuntime {
     initial_sequence: u64,
     /// Trace sink used to emit serialized events.
     trace_sink: Arc<dyn TraceSink>,
+    /// Shared persistence boundary used for exact runtime identity ownership.
+    trace_store: Option<Arc<dyn TraceStore>>,
+}
+
+pub(crate) struct RuntimeIdentityOwner {
+    store: Arc<dyn TraceStore>,
+    claim: Option<RuntimeIdentityClaim>,
+}
+
+impl Drop for RuntimeIdentityOwner {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            let _ = self.store.release_runtime_identity(&claim);
+        }
+    }
 }
 
 /// Runtime trace cursor updated only after durable trace persistence succeeds.
@@ -96,6 +111,7 @@ impl KernelRuntime {
             }),
             initial_sequence,
             trace_sink: config.trace_sink,
+            trace_store: None,
         }
     }
 
@@ -114,21 +130,25 @@ impl KernelRuntime {
         identity: RuntimeIdentityContext,
     ) -> Result<Self, TraceError> {
         let run_id = run_id.unwrap_or_default();
-        let sink = TraceStoreSink::new(run_id.clone(), store);
-        let initial_sequence = match sink.latest_sequence()? {
-            Some(sequence) => sequence
+        let sink = TraceStoreSink::new(run_id.clone(), store.clone());
+        let latest = sink.latest_record()?;
+        let initial_sequence = match latest.as_ref() {
+            Some(record) => record
+                .sequence
                 .checked_add(1)
-                .ok_or(TraceError::SequenceOverflow(sequence))?,
+                .ok_or(TraceError::SequenceOverflow(record.sequence))?,
             None => 0,
         };
-        let initial_prev_hash = sink.latest_event_hash()?;
-        Ok(Self::new(KernelRuntimeConfig {
+        let initial_prev_hash = latest.map(|record| record.event_hash);
+        let mut runtime = Self::new(KernelRuntimeConfig {
             trace_sink: Arc::new(sink),
             run_id: Some(run_id),
             identity,
             initial_sequence,
             initial_prev_hash,
-        }))
+        });
+        runtime.trace_store = Some(store);
+        Ok(runtime)
     }
 
     /// Boots the runtime from `KernelRuntimeConfig` and emits `LoopTickStarted`.
@@ -190,6 +210,26 @@ impl KernelRuntime {
         }
         cursor.fresh_engine_identities.insert(engine_identity);
         Ok(true)
+    }
+
+    pub(crate) fn claim_engine_identity(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> Result<RuntimeIdentityOwner, TraceError> {
+        let store = self
+            .trace_store
+            .as_ref()
+            .ok_or(splendor_store::TraceStoreError::RuntimeIdentityOwnershipUnsupported)?;
+        let claim = store.claim_runtime_identity(
+            &self.run_id.to_string(),
+            &tenant_id.to_string(),
+            &agent_id.to_string(),
+        )?;
+        Ok(RuntimeIdentityOwner {
+            store: Arc::clone(store),
+            claim: Some(claim),
+        })
     }
 
     /// Records a `TraceEventKind` and returns the emitted `TraceEvent`.

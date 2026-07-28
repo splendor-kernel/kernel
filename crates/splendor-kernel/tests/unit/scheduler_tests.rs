@@ -307,6 +307,74 @@ fn scheduler_runs_agents_in_order_and_keeps_agent_quotas_isolated() {
 }
 
 #[test]
+fn scheduler_rejects_duplicate_exact_runtime_identity() {
+    let tenant_id = TenantId::new();
+    let agent_id = splendor_types::AgentId::new();
+    let run_id = splendor_types::RunId::new();
+    let registry = TenantRegistry::new();
+    registry.insert(crate::TenantContext::new(
+        tenant_id.clone(),
+        crate::TenantPolicy {
+            allowed_actions: vec!["noop".to_string()],
+            allowed_adapters: vec!["adapter".to_string()],
+            ..crate::TenantPolicy::default()
+        },
+        crate::QuotaPolicy::default(),
+    ));
+    let mut gateway = VerifiedActionGateway::new(Arc::new(registry.clone()));
+    gateway.register_adapter("noop", "adapter", Arc::new(TestAdapter));
+    let gateway: Arc<dyn ActionGateway> = Arc::new(gateway);
+    let build_duplicate = || {
+        let agent = AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        );
+        let graph = crate::StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        );
+        let runtime = KernelRuntime::new(KernelRuntimeConfig {
+            trace_sink: Arc::new(NullTraceSink),
+            run_id: Some(run_id.clone()),
+            ..KernelRuntimeConfig::default()
+        });
+        LoopEngine::with_runtime(
+            agent,
+            graph,
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(StaticPolicy {
+                action_name: "noop".to_string(),
+                next_state: vec![1],
+            }),
+            gateway.clone(),
+            runtime,
+        )
+    };
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+
+    scheduler
+        .try_add_agent(build_duplicate())
+        .expect("first exact identity");
+    assert!(matches!(
+        scheduler.try_add_agent(build_duplicate()),
+        Err(SchedulerError::DuplicateRuntimeIdentity {
+            run_id: duplicate_run,
+            tenant_id: duplicate_tenant,
+            agent_id: duplicate_agent,
+        }) if duplicate_run == run_id
+            && duplicate_tenant == tenant_id
+            && duplicate_agent == agent_id
+    ));
+
+    let steps = scheduler.run_cycle().expect("single admitted identity");
+    assert_eq!(steps.len(), 1);
+}
+
+#[test]
 fn scheduler_reports_tick_budget_exceeded() {
     let tenant_id = TenantId::new();
     let policy = crate::TenantPolicy {

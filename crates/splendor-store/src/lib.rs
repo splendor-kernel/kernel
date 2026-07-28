@@ -29,8 +29,8 @@ pub use state::{
     StateDataRef, StateMetadata, StateNode, StateSnapshot, StateStore, StateStoreError,
 };
 pub use trace::{
-    compute_trace_event_hash, AsyncTraceStore, InMemoryTraceStore, SqliteTraceStore, TraceRecord,
-    TraceStore, TraceStoreError,
+    compute_trace_event_hash, validate_trace_chain, AsyncTraceStore, InMemoryTraceStore,
+    RuntimeIdentityClaim, SqliteTraceStore, TraceRecord, TraceStore, TraceStoreError,
 };
 pub use trace_sync::{
     CentralTraceIndex, InMemoryCentralTraceIndex, LocalTraceBuffer, LocalTraceBufferConfig,

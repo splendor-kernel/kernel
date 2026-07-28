@@ -1,5 +1,7 @@
 use super::*;
-use splendor_store::{SqliteStateStore, StateData, StateMetadata, StateStore};
+use splendor_store::{
+    compute_trace_event_hash, SqliteStateStore, StateData, StateMetadata, StateStore,
+};
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalId, ApprovalTraceContext,
     CircuitBreakerId, CircuitBreakerState, ContentHash, EscalationContext, EscalationDecision,
@@ -91,6 +93,16 @@ fn valid_trace_records_for(run_id: &RunId) -> Vec<splendor_store::TraceRecord> {
         .expect("append");
     }
     TraceStore::read(&store, &run_id.to_string()).expect("records")
+}
+
+fn rehash_trace_records(records: &mut [splendor_store::TraceRecord]) {
+    let mut previous = None;
+    for record in records {
+        record.prev_event_hash = previous.clone();
+        record.event_hash = compute_trace_event_hash(previous.as_ref(), &record.payload)
+            .expect("recompute trace hash");
+        previous = Some(record.event_hash.clone());
+    }
 }
 
 fn signed_work_order_block(
@@ -4118,7 +4130,7 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
 }
 
 #[test]
-fn trace_store_rejects_corrupted_trace_sequence_before_replay() {
+fn trace_store_preserves_payload_sequence_and_replay_rejects_envelope_mismatch() {
     let trace_temp = NamedTempFile::new().expect("trace db");
     let trace_store = SqliteTraceStore::open(trace_temp.path()).expect("trace store");
 
@@ -4129,23 +4141,21 @@ fn trace_store_rejects_corrupted_trace_sequence_before_replay() {
         OffsetDateTime::now_utc(),
         TraceEventKind::LoopTickStarted { tick_id: 1 },
     );
-    let error = TraceStore::append(
+    let sequence = TraceStore::append(
         &trace_store,
         &run_id.to_string(),
         serde_json::to_value(event).unwrap(),
     )
-    .expect_err("corrupted embedded sequence must not enter the trace store");
-    assert!(matches!(
-        error,
-        splendor_store::TraceStoreError::SequenceMismatch {
-            expected: 9,
-            actual: 0
-        }
-    ));
-    assert!(matches!(
-        trace_store.read(&run_id.to_string()),
-        Err(splendor_store::TraceStoreError::RunNotFound)
-    ));
+    .expect("generic store must not reserve application payload keys");
+    assert_eq!(sequence, 0);
+    let records = trace_store
+        .read(&run_id.to_string())
+        .expect("opaque trace payload");
+    assert_eq!(records[0].payload["sequence"], 9);
+
+    let error = decode_and_validate_trace_records(&records, &run_id.to_string())
+        .expect_err("replay must reject the mismatched trace envelope");
+    assert!(error.contains("Trace event sequence mismatch"));
 }
 
 #[test]
@@ -4211,6 +4221,7 @@ fn decode_trace_records_rejects_event_run_mismatch() {
         TraceEventKind::LoopTickStarted { tick_id: 1 },
     );
     records[0].payload = serde_json::to_value(event).expect("event");
+    rehash_trace_records(&mut records);
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("event run mismatch");
@@ -4224,6 +4235,7 @@ fn decode_trace_records_rejects_trace_id_mismatch() {
     let mut event: TraceEvent = serde_json::from_value(records[0].payload.clone()).unwrap();
     event.trace_event_id = TraceEventId::new();
     records[0].payload = serde_json::to_value(event).expect("event");
+    rehash_trace_records(&mut records);
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("trace id mismatch");
