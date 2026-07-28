@@ -11,8 +11,11 @@ use splendor_kernel::{
     TraceEvent, TraceEventKind,
 };
 use splendor_store::{
-    InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
-    StateSnapshot, StateStore, StateStoreError, TraceRecord, TraceStore, TraceStoreError,
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle,
+    RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle,
+    RuntimeTraceWriterRequest, StateData, StateDataRef, StateMetadata, StateNode, StateSnapshot,
+    StateStore, StateStoreError, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{
     Action, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
@@ -376,7 +379,7 @@ impl TraceFailurePoint {
 struct ArmableTraceStore {
     inner: InMemoryTraceStore,
     failure: TraceFailurePoint,
-    armed: AtomicBool,
+    armed: Arc<AtomicBool>,
 }
 
 impl ArmableTraceStore {
@@ -384,7 +387,7 @@ impl ArmableTraceStore {
         Self {
             inner: InMemoryTraceStore::default(),
             failure,
-            armed: AtomicBool::new(false),
+            armed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -402,20 +405,6 @@ impl TraceStore for ArmableTraceStore {
         self.inner.append(run_id, payload)
     }
 
-    fn append_if_sequence(
-        &self,
-        run_id: &str,
-        expected_sequence: u64,
-        payload: serde_json::Value,
-    ) -> Result<u64, TraceStoreError> {
-        let event: TraceEvent = serde_json::from_value(payload.clone())?;
-        if self.failure.matches(&event.kind) && self.armed.swap(false, Ordering::SeqCst) {
-            return Err(TraceStoreError::Poisoned);
-        }
-        self.inner
-            .append_if_sequence(run_id, expected_sequence, payload)
-    }
-
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -429,21 +418,78 @@ impl TraceStore for ArmableTraceStore {
         self.inner.read_range(run_id, start, end)
     }
 
-    fn claim_runtime_identity(
-        &self,
-        run_id: &str,
-        tenant_id: &str,
-        agent_id: &str,
-    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
-        self.inner
-            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
     }
 
-    fn release_runtime_identity(
+    fn open_runtime_reader(
         &self,
-        claim: &splendor_store::RuntimeIdentityClaim,
-    ) -> Result<(), TraceStoreError> {
-        self.inner.release_runtime_identity(claim)
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(ArmableRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            failure: self.failure,
+            armed: Arc::clone(&self.armed),
+        }))
+    }
+}
+
+struct ArmableRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    failure: TraceFailurePoint,
+    armed: Arc<AtomicBool>,
+}
+
+impl RuntimeTraceReader for ArmableRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for ArmableRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone())
+            .map_err(|_| RuntimeTracePortError::BackendContract)?;
+        if self.failure.matches(&event.kind) && self.armed.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 

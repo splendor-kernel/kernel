@@ -18,7 +18,12 @@ use splendor_gateway::{
     RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
 };
 use splendor_kernel::LocalAuthorityObligationReceiptConfig;
-use splendor_store::{InMemoryTraceStore, TraceRecord, TraceStore, TraceStoreError};
+use splendor_store::{
+    compute_trace_envelope_hash, compute_trace_event_hash, InMemoryTraceStore, RuntimeTraceAppend,
+    RuntimeTraceLimits, RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader,
+    RuntimeTraceReaderHandle, RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter,
+    RuntimeTraceWriterHandle, RuntimeTraceWriterRequest, TraceRecord, TraceStore, TraceStoreError,
+};
 use splendor_types::{
     Action, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId, ApprovalPolicy,
     AuditAttribution, AuthorityDecisionId, AuthorityObligationId, AuthorityObligationKind,
@@ -77,7 +82,7 @@ enum PolicyTraceFailureTarget {
 #[derive(Default)]
 struct FailingPolicyTraceStore {
     inner: InMemoryTraceStore,
-    fail_next: Mutex<Option<PolicyTraceFailureTarget>>,
+    fail_next: Arc<Mutex<Option<PolicyTraceFailureTarget>>>,
 }
 
 impl FailingPolicyTraceStore {
@@ -93,28 +98,7 @@ impl TraceStore for FailingPolicyTraceStore {
             .fail_next
             .lock()
             .map_err(|_| TraceStoreError::Poisoned)?;
-        let should_fail = matches!(
-            (target, event.as_ref().map(|event| &event.kind)),
-            (
-                Some(PolicyTraceFailureTarget::Accepted),
-                Some(TraceEventKind::PolicyBundleAccepted { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::Reconnected),
-                Some(TraceEventKind::PolicyConnectivityChanged {
-                    disconnected: false,
-                    ..
-                })
-            ) | (
-                Some(PolicyTraceFailureTarget::Rejected),
-                Some(TraceEventKind::PolicyBundleRejected { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::SyncFailed),
-                Some(TraceEventKind::PolicySyncFailed { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::Revoked),
-                Some(TraceEventKind::PolicyRevoked { .. })
-            )
-        );
+        let should_fail = policy_trace_failure_matches(target, event.as_ref());
         if should_fail {
             *self
                 .fail_next
@@ -123,50 +107,6 @@ impl TraceStore for FailingPolicyTraceStore {
             return Err(TraceStoreError::Poisoned);
         }
         self.inner.append(run_id, payload)
-    }
-
-    fn append_if_sequence(
-        &self,
-        run_id: &str,
-        expected_sequence: u64,
-        payload: Value,
-    ) -> Result<u64, TraceStoreError> {
-        let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok();
-        let target = *self
-            .fail_next
-            .lock()
-            .map_err(|_| TraceStoreError::Poisoned)?;
-        let should_fail = matches!(
-            (target, event.as_ref().map(|event| &event.kind)),
-            (
-                Some(PolicyTraceFailureTarget::Accepted),
-                Some(TraceEventKind::PolicyBundleAccepted { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::Reconnected),
-                Some(TraceEventKind::PolicyConnectivityChanged {
-                    disconnected: false,
-                    ..
-                })
-            ) | (
-                Some(PolicyTraceFailureTarget::Rejected),
-                Some(TraceEventKind::PolicyBundleRejected { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::SyncFailed),
-                Some(TraceEventKind::PolicySyncFailed { .. })
-            ) | (
-                Some(PolicyTraceFailureTarget::Revoked),
-                Some(TraceEventKind::PolicyRevoked { .. })
-            )
-        );
-        if should_fail {
-            *self
-                .fail_next
-                .lock()
-                .map_err(|_| TraceStoreError::Poisoned)? = None;
-            return Err(TraceStoreError::Poisoned);
-        }
-        self.inner
-            .append_if_sequence(run_id, expected_sequence, payload)
     }
 
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
@@ -182,21 +122,160 @@ impl TraceStore for FailingPolicyTraceStore {
         self.inner.read_range(run_id, start, end)
     }
 
-    fn claim_runtime_identity(
-        &self,
-        run_id: &str,
-        tenant_id: &str,
-        agent_id: &str,
-    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
-        self.inner
-            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
     }
 
-    fn release_runtime_identity(
+    fn open_runtime_reader(
         &self,
-        claim: &splendor_store::RuntimeIdentityClaim,
-    ) -> Result<(), TraceStoreError> {
-        self.inner.release_runtime_identity(claim)
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(FailingPolicyRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            fail_next: Arc::clone(&self.fail_next),
+        }))
+    }
+}
+
+struct HistoricalSensitiveRuntimeReader {
+    source: RuntimeTraceReaderHandle,
+    source_tail: RuntimeTraceTail,
+    records: Vec<TraceRecord>,
+    tail: RuntimeTraceTail,
+    limits: RuntimeTraceLimits,
+    run_id: String,
+}
+
+impl RuntimeTraceReader for HistoricalSensitiveRuntimeReader {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.tail.store_identity().clone()
+    }
+
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.limits
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        Ok(self.tail.clone())
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        let start = usize::try_from(start).map_err(|_| RuntimeTracePortError::LimitExceeded)?;
+        if start > self.records.len() {
+            return Err(RuntimeTracePortError::BackendContract);
+        }
+        let end = start
+            .saturating_add(self.limits.page_records)
+            .min(self.records.len());
+        Ok(RuntimeTracePage::new(
+            self.records[start..end].to_vec(),
+            u64::try_from(end).map_err(|_| RuntimeTracePortError::LimitExceeded)?,
+            end == self.records.len(),
+        ))
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        if expected != &self.tail {
+            return Err(RuntimeTracePortError::FenceRejected);
+        }
+        self.source.confirm_tail(&self.source_tail)
+    }
+}
+
+fn policy_trace_failure_matches(
+    target: Option<PolicyTraceFailureTarget>,
+    event: Option<&TraceEvent>,
+) -> bool {
+    matches!(
+        (target, event.map(|event| &event.kind)),
+        (
+            Some(PolicyTraceFailureTarget::Accepted),
+            Some(TraceEventKind::PolicyBundleAccepted { .. })
+        ) | (
+            Some(PolicyTraceFailureTarget::Reconnected),
+            Some(TraceEventKind::PolicyConnectivityChanged {
+                disconnected: false,
+                ..
+            })
+        ) | (
+            Some(PolicyTraceFailureTarget::Rejected),
+            Some(TraceEventKind::PolicyBundleRejected { .. })
+        ) | (
+            Some(PolicyTraceFailureTarget::SyncFailed),
+            Some(TraceEventKind::PolicySyncFailed { .. })
+        ) | (
+            Some(PolicyTraceFailureTarget::Revoked),
+            Some(TraceEventKind::PolicyRevoked { .. })
+        )
+    )
+}
+
+struct FailingPolicyRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    fail_next: Arc<Mutex<Option<PolicyTraceFailureTarget>>>,
+}
+
+impl RuntimeTraceReader for FailingPolicyRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for FailingPolicyRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok();
+        let target = *self
+            .fail_next
+            .lock()
+            .map_err(|_| RuntimeTracePortError::Unavailable)?;
+        if policy_trace_failure_matches(target, event.as_ref()) {
+            *self
+                .fail_next
+                .lock()
+                .map_err(|_| RuntimeTracePortError::Unavailable)? = None;
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -225,16 +304,6 @@ impl TraceStore for HistoricalSensitiveTraceStore {
         self.inner.append(run_id, payload)
     }
 
-    fn append_if_sequence(
-        &self,
-        run_id: &str,
-        expected_sequence: u64,
-        payload: Value,
-    ) -> Result<u64, TraceStoreError> {
-        self.inner
-            .append_if_sequence(run_id, expected_sequence, payload)
-    }
-
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner
             .read(run_id)
@@ -252,22 +321,82 @@ impl TraceStore for HistoricalSensitiveTraceStore {
             .map(Self::inject_historical_sensitive_payload)
     }
 
-    fn claim_runtime_identity(
-        &self,
-        run_id: &str,
-        tenant_id: &str,
-        agent_id: &str,
-    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
-        self.inner
-            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
     }
 
-    fn release_runtime_identity(
+    fn open_runtime_reader(
         &self,
-        claim: &splendor_store::RuntimeIdentityClaim,
-    ) -> Result<(), TraceStoreError> {
-        self.inner.release_runtime_identity(claim)
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        historical_sensitive_runtime_reader(&self.inner, run_id, limits)
     }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        self.inner.acquire_runtime_writer(request)
+    }
+}
+
+fn historical_sensitive_runtime_reader(
+    store: &InMemoryTraceStore,
+    run_id: &str,
+    limits: RuntimeTraceLimits,
+) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+    let source = store.open_runtime_reader(run_id, limits)?;
+    let source_tail = source.tail()?;
+    let mut records = Vec::new();
+    let mut next = 0u64;
+    while next < source_tail.next_sequence() {
+        let page = source.read_page(next)?;
+        if page.records().is_empty() || records.len() + page.records().len() > limits.max_records {
+            return Err(RuntimeTracePortError::BackendContract);
+        }
+        next = page.next_sequence();
+        records.extend(page.into_records());
+    }
+    source.confirm_tail(&source_tail)?;
+    let mut records = HistoricalSensitiveTraceStore::inject_historical_sensitive_payload(records);
+    let mut stable_tail = None;
+    let mut envelope_tail = None;
+    for record in &mut records {
+        record.prev_event_hash = stable_tail.clone();
+        let stable_hash = compute_trace_event_hash(stable_tail.as_ref(), &record.payload)
+            .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+        let mut event: TraceEvent = serde_json::from_value(record.payload.clone())
+            .map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+        if let TraceEventKind::LoopTickCompleted { tick_id, .. } = event.kind {
+            event.kind = TraceEventKind::LoopTickCompleted {
+                tick_id,
+                integrity: Some(splendor_types::TraceIntegrity {
+                    prev_event_hash: stable_tail.clone(),
+                    event_hash: stable_hash.clone(),
+                }),
+            };
+            record.payload =
+                serde_json::to_value(event).map_err(|_| RuntimeTracePortError::IntegrityFailure)?;
+        }
+        record.event_hash = stable_hash.clone();
+        envelope_tail = Some(compute_trace_envelope_hash(envelope_tail.as_ref(), record)?);
+        stable_tail = Some(stable_hash);
+    }
+    let tail = RuntimeTraceTail::legacy(
+        source.store_identity(),
+        u64::try_from(records.len()).map_err(|_| RuntimeTracePortError::LimitExceeded)?,
+        stable_tail,
+        envelope_tail,
+    )?;
+    Ok(Arc::new(HistoricalSensitiveRuntimeReader {
+        source,
+        source_tail,
+        records,
+        tail,
+        limits,
+        run_id: run_id.to_string(),
+    }))
 }
 
 fn principal() -> ClientPrincipal {

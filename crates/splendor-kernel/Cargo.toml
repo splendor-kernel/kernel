@@ -11,6 +11,7 @@ splendor-authority = { path = "../splendor-authority" }
 splendor-gateway = { path = "../splendor-gateway" }
 splendor-types = { path = "../splendor-types" }
 splendor-store = { path = "../splendor-store" }
+splendor-evidence = { path = "../splendor-evidence" }
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }

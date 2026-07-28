@@ -93,15 +93,6 @@ fn trace_store_sink_reports_sequence_mismatch() {
             Ok(7)
         }
 
-        fn append_if_sequence(
-            &self,
-            _run_id: &str,
-            _expected_sequence: u64,
-            _payload: serde_json::Value,
-        ) -> Result<u64, TraceStoreError> {
-            Ok(7)
-        }
-
         fn read(&self, _run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
             Err(TraceStoreError::RunNotFound)
         }

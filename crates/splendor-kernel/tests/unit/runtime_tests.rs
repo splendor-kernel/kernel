@@ -1,4 +1,5 @@
 use super::*;
+use splendor_evidence::{inspect_trace, TraceCompatibilityError};
 use splendor_store::{InMemoryTraceStore, SqliteTraceStore, TraceStore, TraceStoreError};
 use splendor_types::{
     AgentId, SnapshotId, StateHandoffAuthority, StateHandoffSnapshot, StateReference,
@@ -7,6 +8,21 @@ use splendor_types::{
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use time::OffsetDateTime;
+
+fn activate_runtime_writer(
+    runtime: &KernelRuntime,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+) -> RuntimeWriterLease {
+    let writer = runtime
+        .acquire_engine_writer(tenant_id, agent_id)
+        .expect("runtime writer");
+    let inspected = inspect_trace(writer.reader(), runtime.run_id()).expect("validated trace");
+    runtime
+        .activate_engine_writer(&writer, inspected.tail)
+        .expect("activate runtime writer");
+    writer
+}
 
 #[derive(Default)]
 struct CapturingSink {
@@ -323,18 +339,30 @@ fn independent_sqlite_runtime_writers_have_one_success_and_one_typed_conflict() 
         )
         .expect("right runtime");
         let start = Arc::new(Barrier::new(3));
+        let acquired = Arc::new(Barrier::new(3));
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
 
         let handles = [left, right]
             .into_iter()
             .map(|runtime| {
                 let start = Arc::clone(&start);
+                let acquired = Arc::clone(&acquired);
+                let tenant_id = tenant_id.clone();
+                let agent_id = agent_id.clone();
                 thread::spawn(move || {
                     start.wait();
+                    let writer = runtime.acquire_engine_writer(&tenant_id, &agent_id);
+                    acquired.wait();
+                    let writer = writer?;
+                    let inspected = inspect_trace(writer.reader(), runtime.run_id())?;
+                    runtime.activate_engine_writer(&writer, inspected.tail)?;
                     runtime.record_event(TraceEventKind::RunStarted)
                 })
             })
             .collect::<Vec<_>>();
         start.wait();
+        acquired.wait();
         let results = handles
             .into_iter()
             .map(|handle| handle.join().expect("writer thread"))
@@ -351,10 +379,9 @@ fn independent_sqlite_runtime_writers_have_one_success_and_one_typed_conflict() 
                 .filter(|result| {
                     matches!(
                         result,
-                        Err(TraceError::Store(TraceStoreError::SequenceMismatch {
-                            expected: 0,
-                            actual: 1
-                        }))
+                        Err(TraceError::Compatibility(
+                            TraceCompatibilityError::WriterConflict
+                        ))
                     )
                 })
                 .count(),
@@ -374,18 +401,20 @@ fn independent_sqlite_runtime_writers_have_one_success_and_one_typed_conflict() 
 fn runtime_resumes_sequence_with_trace_store() {
     let store = Arc::new(InMemoryTraceStore::default());
     let run_id = RunId::new();
-    let event = TraceEvent::new(
-        run_id.clone(),
-        0,
-        OffsetDateTime::now_utc(),
-        TraceEventKind::LoopTickStarted { tick_id: 1 },
-    );
-    let payload = serde_json::to_value(&event).expect("payload");
-    let sequence =
-        TraceStore::append(store.as_ref(), &run_id.to_string(), payload).expect("append");
-    assert_eq!(sequence, 0);
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let first = KernelRuntime::with_trace_store(store.clone(), Some(run_id.clone()))
+        .expect("first runtime");
+    let first_writer = activate_runtime_writer(&first, &tenant_id, &agent_id);
+    let first_event = first
+        .record_event(TraceEventKind::LoopTickStarted { tick_id: 1 })
+        .expect("first event");
+    assert_eq!(first_event.sequence, 0);
+    drop(first_writer);
+    drop(first);
 
     let runtime = KernelRuntime::with_trace_store(store, Some(run_id.clone())).expect("runtime");
+    let _writer = activate_runtime_writer(&runtime, &tenant_id, &agent_id);
     let next = runtime
         .record_event(TraceEventKind::LoopTickCompleted {
             tick_id: 1,
@@ -407,6 +436,7 @@ fn loop_tick_completed_integrity_matches_trace_store_record() {
     let run_id = RunId::new();
     let runtime =
         KernelRuntime::with_trace_store(store.clone(), Some(run_id.clone())).expect("runtime");
+    let _writer = activate_runtime_writer(&runtime, &TenantId::new(), &AgentId::new());
     runtime
         .record_event(TraceEventKind::PolicyInvoked {
             policy: "unit".to_string(),

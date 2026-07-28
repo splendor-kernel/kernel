@@ -1476,6 +1476,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "splendor-authority",
+ "splendor-evidence",
  "splendor-gateway",
  "splendor-kernel",
  "splendor-store",
@@ -1485,6 +1486,18 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "splendor-evidence"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "splendor-store",
+ "splendor-types",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
 ]
 
 [[package]]
@@ -1511,6 +1524,7 @@ dependencies = [
  "splendor-adapter-http",
  "splendor-adapter-robotics",
  "splendor-authority",
+ "splendor-evidence",
  "splendor-gateway",
  "splendor-store",
  "splendor-types",
@@ -1524,6 +1538,7 @@ name = "splendor-store"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "splendor-types",
@@ -1550,11 +1565,13 @@ name = "splendorctl"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
  "splendor-adapter-filesystem",
  "splendor-adapter-http",
+ "splendor-evidence",
  "splendor-gateway",
  "splendor-kernel",
  "splendor-store",

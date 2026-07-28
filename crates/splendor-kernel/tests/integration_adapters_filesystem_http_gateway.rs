@@ -11,8 +11,10 @@ use splendor_kernel::{
     TenantPolicy, TenantRegistry, TraceEvent, TraceEventKind,
 };
 use splendor_store::{
-    InMemoryStateStore, InMemoryTraceStore, StateData, StateStore, TraceRecord, TraceStore,
-    TraceStoreError,
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle,
+    RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle,
+    RuntimeTraceWriterRequest, StateData, StateStore, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{Action, Percept, PerceptProvenance, QuotaUsage, SideEffectClass, TenantId};
 use std::io::{Read, Write};
@@ -162,14 +164,14 @@ impl ActionAdapter for FaultyAdapter {
 
 struct FailingActionVerificationTraceStore {
     inner: InMemoryTraceStore,
-    failed: AtomicBool,
+    failed: Arc<AtomicBool>,
 }
 
 impl Default for FailingActionVerificationTraceStore {
     fn default() -> Self {
         Self {
             inner: InMemoryTraceStore::default(),
-            failed: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -185,22 +187,6 @@ impl TraceStore for FailingActionVerificationTraceStore {
         self.inner.append(run_id, payload)
     }
 
-    fn append_if_sequence(
-        &self,
-        run_id: &str,
-        expected_sequence: u64,
-        payload: serde_json::Value,
-    ) -> Result<u64, TraceStoreError> {
-        let event: TraceEvent = serde_json::from_value(payload.clone()).expect("trace event");
-        if matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
-            && !self.failed.swap(true, Ordering::SeqCst)
-        {
-            return Err(TraceStoreError::Poisoned);
-        }
-        self.inner
-            .append_if_sequence(run_id, expected_sequence, payload)
-    }
-
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
         self.inner.read(run_id)
     }
@@ -214,21 +200,78 @@ impl TraceStore for FailingActionVerificationTraceStore {
         self.inner.read_range(run_id, start, end)
     }
 
-    fn claim_runtime_identity(
-        &self,
-        run_id: &str,
-        tenant_id: &str,
-        agent_id: &str,
-    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
-        self.inner
-            .claim_runtime_identity(run_id, tenant_id, agent_id)
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
     }
 
-    fn release_runtime_identity(
+    fn open_runtime_reader(
         &self,
-        claim: &splendor_store::RuntimeIdentityClaim,
-    ) -> Result<(), TraceStoreError> {
-        self.inner.release_runtime_identity(claim)
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(FailingActionVerificationRuntimeWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            failed: Arc::clone(&self.failed),
+        }))
+    }
+}
+
+struct FailingActionVerificationRuntimeWriter {
+    inner: RuntimeTraceWriterHandle,
+    failed: Arc<AtomicBool>,
+}
+
+impl RuntimeTraceReader for FailingActionVerificationRuntimeWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for FailingActionVerificationRuntimeWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        let event: TraceEvent = serde_json::from_value(payload.clone())
+            .map_err(|_| RuntimeTracePortError::BackendContract)?;
+        if matches!(event.kind, TraceEventKind::ActionVerificationStarted { .. })
+            && !self.failed.swap(true, Ordering::SeqCst)
+        {
+            return Err(RuntimeTracePortError::Unavailable);
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -1368,8 +1411,8 @@ fn trace_store_failure_before_adapter_dispatch_does_not_execute_or_commit() {
         .expect_err("trace failure should fail tick");
     assert!(matches!(
         error,
-        LoopError::Trace(splendor_kernel::TraceError::Store(
-            TraceStoreError::Poisoned
+        LoopError::Trace(splendor_kernel::TraceError::Compatibility(
+            splendor_evidence::TraceCompatibilityError::Store
         ))
     ));
     assert_eq!(counting.executions(), 0);

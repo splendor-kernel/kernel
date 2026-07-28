@@ -4,6 +4,21 @@
 
 ### Added
 
+- **status/incomplete correction:** replaced the advisory persisted-run owner
+  shim with default-deny, externally implementable runtime trace reader/writer
+  capabilities. Recovery now acquires one append-fenced writer before bounded
+  history validation or state access and retains it through tail reconfirmation,
+  cursor initialization, and every append; close/drop revokes retained runtime
+  emitters. SQLite adds transactional, idempotent store/run anchor metadata,
+  full-envelope tail integrity, immutable anchored-history guards, and a bounded
+  private lock-shard namespace bound to verified opened-file identity. Non-empty
+  unanchored history remains inspect-only, current completions require integrity,
+  scheduler event/action/state-handoff operations target exact run/tenant/agent,
+  and trace/state/audit/replay output validates and spools before stdout with
+  fixed diagnostics. Stable trace event bytes/hashes and legacy custom-store
+  source compatibility are preserved; no transferable writer, live legacy
+  migration, catalog-task/Gold completion, or positive secret delivery is
+  claimed.
 - **status/incomplete correction:** runtime recovery now validates the complete
   canonical trace record sequence, previous-hash links, and event hashes before
   parsing recovery facts or restoring state. Built-in stores expose explicit

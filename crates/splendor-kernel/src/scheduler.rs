@@ -16,6 +16,48 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
+/// Exact scheduler address for one admitted runtime context.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RuntimeTarget {
+    run_id: RunId,
+    tenant_id: TenantId,
+    agent_id: AgentId,
+}
+
+impl RuntimeTarget {
+    /// Creates an exact run/tenant/agent scheduler target.
+    pub fn new(run_id: RunId, tenant_id: TenantId, agent_id: AgentId) -> Self {
+        Self {
+            run_id,
+            tenant_id,
+            agent_id,
+        }
+    }
+
+    /// Run identity of the admitted runtime.
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// Tenant identity of the admitted runtime.
+    pub fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+
+    /// Agent identity of the admitted runtime.
+    pub fn agent_id(&self) -> &AgentId {
+        &self.agent_id
+    }
+}
+
+impl std::fmt::Debug for RuntimeTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeTarget")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Scheduler configuration options.
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerConfig {
@@ -30,6 +72,10 @@ pub struct SchedulerConfig {
 pub struct SchedulerStep {
     /// Tick identifier assigned by the scheduler.
     pub tick_id: u64,
+    /// Exact run identifier that was executed.
+    pub run_id: RunId,
+    /// Exact tenant identifier that was executed.
+    pub tenant_id: TenantId,
     /// Agent identifier that was executed.
     pub agent_id: AgentId,
     /// Outcome produced by the loop engine.
@@ -39,24 +85,25 @@ pub struct SchedulerStep {
 }
 
 /// Scheduler errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SchedulerError {
     /// No agents are registered with the scheduler.
     #[error("no agents registered")]
     NoAgents,
     /// No tenant context was found for the agent.
-    #[error("tenant context was not found for tenant {0}")]
+    #[error("scheduler_tenant_unavailable")]
     MissingTenant(TenantId),
     /// No agent was found in the scheduler queue.
-    #[error("agent context was not found for agent {0}")]
+    #[error("scheduler_agent_unavailable")]
     MissingAgent(AgentId),
+    /// Agent-only lookup had zero or multiple matches, or an exact target was absent.
+    #[error("scheduler_runtime_target_unavailable")]
+    RuntimeTargetUnavailable,
     /// A loop engine returned an error.
     #[error("loop engine failed: {0}")]
     Loop(#[from] LoopError),
     /// The exact run/tenant/agent identity is already admitted.
-    #[error(
-        "runtime identity is already admitted: run={run_id} tenant={tenant_id} agent={agent_id}"
-    )]
+    #[error("scheduler_runtime_identity_conflict")]
     DuplicateRuntimeIdentity {
         run_id: RunId,
         tenant_id: TenantId,
@@ -72,6 +119,12 @@ pub enum SchedulerError {
         /// Observed elapsed duration.
         elapsed: Duration,
     },
+}
+
+impl std::fmt::Debug for SchedulerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
 }
 
 /// Cooperative scheduler for agent loop engines.
@@ -155,12 +208,17 @@ impl Scheduler {
         agent_id: &AgentId,
         kind: TraceEventKind,
     ) -> Result<TraceEvent, SchedulerError> {
-        let engine = self
-            .queue
-            .iter()
-            .chain(self.reconciliation_queue.iter())
-            .find(|engine| engine.agent_id() == agent_id)
-            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        let target = self.unique_target_for_agent(agent_id)?;
+        self.record_event_for_target(&target, kind)
+    }
+
+    /// Records a non-tick runtime event through one exact runtime target.
+    pub fn record_event_for_target(
+        &self,
+        target: &RuntimeTarget,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, SchedulerError> {
+        let engine = self.engine_for_target(target)?;
         engine
             .record_runtime_event(kind)
             .map_err(SchedulerError::Loop)
@@ -174,12 +232,18 @@ impl Scheduler {
         action_id: &ActionId,
         kind: TraceEventKind,
     ) -> Result<TraceEvent, SchedulerError> {
-        let engine = self
-            .queue
-            .iter()
-            .chain(self.reconciliation_queue.iter())
-            .find(|engine| engine.agent_id() == agent_id)
-            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        let target = self.unique_target_for_agent(agent_id)?;
+        self.record_action_event_for_target(&target, action_id, kind)
+    }
+
+    /// Records an action event through one exact runtime target.
+    pub fn record_action_event_for_target(
+        &self,
+        target: &RuntimeTarget,
+        action_id: &ActionId,
+        kind: TraceEventKind,
+    ) -> Result<TraceEvent, SchedulerError> {
+        let engine = self.engine_for_target(target)?;
         engine
             .record_runtime_action_event(action_id, kind)
             .map_err(SchedulerError::Loop)
@@ -191,12 +255,17 @@ impl Scheduler {
         agent_id: &AgentId,
         request: StateHandoffExportRequest,
     ) -> Result<(StateHandoff, TraceEvent), SchedulerError> {
-        let engine = self
-            .queue
-            .iter()
-            .chain(self.reconciliation_queue.iter())
-            .find(|engine| engine.agent_id() == agent_id)
-            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        let target = self.unique_target_for_agent(agent_id)?;
+        self.export_state_handoff_for_target(&target, request)
+    }
+
+    /// Exports current state through one exact runtime target.
+    pub fn export_state_handoff_for_target(
+        &self,
+        target: &RuntimeTarget,
+        request: StateHandoffExportRequest,
+    ) -> Result<(StateHandoff, TraceEvent), SchedulerError> {
+        let engine = self.engine_for_target(target)?;
         engine
             .export_state_handoff(request)
             .map_err(SchedulerError::Loop)
@@ -214,12 +283,25 @@ impl Scheduler {
         now: OffsetDateTime,
         metadata: StateMetadata,
     ) -> Result<(StateCommit, TraceEvent), SchedulerError> {
-        let engine = self
-            .queue
-            .iter_mut()
-            .chain(self.reconciliation_queue.iter_mut())
-            .find(|engine| engine.agent_id() == agent_id)
-            .ok_or_else(|| SchedulerError::MissingAgent(agent_id.clone()))?;
+        let target = self.unique_target_for_agent(agent_id)?;
+        self.import_state_handoff_for_target(
+            &target, handoff, work_order, keyring, scope, now, metadata,
+        )
+    }
+
+    /// Imports a handoff through one exact runtime target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_state_handoff_for_target(
+        &mut self,
+        target: &RuntimeTarget,
+        handoff: &StateHandoff,
+        work_order: &WorkOrderEnvelope,
+        keyring: &WorkOrderKeyring,
+        scope: &StateHandoffScope,
+        now: OffsetDateTime,
+        metadata: StateMetadata,
+    ) -> Result<(StateCommit, TraceEvent), SchedulerError> {
+        let engine = self.engine_for_target_mut(target)?;
         engine
             .import_state_handoff(handoff, work_order, keyring, scope, now, metadata)
             .map_err(SchedulerError::Loop)
@@ -257,6 +339,8 @@ impl Scheduler {
 
         let step = SchedulerStep {
             tick_id: self.tick_id,
+            run_id: engine.run_id().clone(),
+            tenant_id: engine.tenant_id().clone(),
             agent_id: engine.agent_id().clone(),
             outcome,
             elapsed,
@@ -341,6 +425,48 @@ impl Scheduler {
                 std::thread::sleep(interval - elapsed);
             }
         }
+    }
+
+    fn unique_target_for_agent(&self, agent_id: &AgentId) -> Result<RuntimeTarget, SchedulerError> {
+        let mut matches = self
+            .queue
+            .iter()
+            .chain(self.reconciliation_queue.iter())
+            .filter(|engine| engine.agent_id() == agent_id);
+        let engine = matches
+            .next()
+            .ok_or(SchedulerError::RuntimeTargetUnavailable)?;
+        if matches.next().is_some() {
+            return Err(SchedulerError::RuntimeTargetUnavailable);
+        }
+        Ok(RuntimeTarget::new(
+            engine.run_id().clone(),
+            engine.tenant_id().clone(),
+            engine.agent_id().clone(),
+        ))
+    }
+
+    fn engine_for_target(&self, target: &RuntimeTarget) -> Result<&LoopEngine, SchedulerError> {
+        self.queue
+            .iter()
+            .chain(self.reconciliation_queue.iter())
+            .find(|engine| {
+                engine.has_runtime_identity(target.run_id(), target.tenant_id(), target.agent_id())
+            })
+            .ok_or(SchedulerError::RuntimeTargetUnavailable)
+    }
+
+    fn engine_for_target_mut(
+        &mut self,
+        target: &RuntimeTarget,
+    ) -> Result<&mut LoopEngine, SchedulerError> {
+        self.queue
+            .iter_mut()
+            .chain(self.reconciliation_queue.iter_mut())
+            .find(|engine| {
+                engine.has_runtime_identity(target.run_id(), target.tenant_id(), target.agent_id())
+            })
+            .ok_or(SchedulerError::RuntimeTargetUnavailable)
     }
 
     fn empty_queue_error(&self) -> SchedulerError {

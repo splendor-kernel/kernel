@@ -35,6 +35,7 @@ EXPECTED_WORKSPACE_PACKAGE_MANIFESTS: dict[str, str] = {
     "splendor-kernel": "crates/splendor-kernel/Cargo.toml",
     "splendor-gateway": "crates/splendor-gateway/Cargo.toml",
     "splendor-store": "crates/splendor-store/Cargo.toml",
+    "splendor-evidence": "crates/splendor-evidence/Cargo.toml",
     "splendor-daemon": "crates/splendor-daemon/Cargo.toml",
     "splendorctl": "crates/splendorctl/Cargo.toml",
     "splendor-adapter-filesystem": "adapters/filesystem/Cargo.toml",
@@ -55,12 +56,13 @@ EXPECTED_PACKAGE_BY_MANIFEST = {
 
 
 # Direct non-dev workspace package dependencies allowed for the current 0.1
-# compatibility baseline.  These entries deliberately cover existing packages
-# only; proposed v2 plane crates are RFC-gated and are not required by this
+# compatibility baseline plus explicitly accepted compatibility-owner packages.
+# Other proposed v2 plane crates remain RFC-gated and are not required by this
 # guard.
 ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
     "splendor-types": set(),
     "splendor-store": {"splendor-types"},
+    "splendor-evidence": {"splendor-types", "splendor-store"},
     "splendor-authority": {"splendor-types", "splendor-store"},
     "splendor-gateway": {"splendor-types", "splendor-authority"},
     "splendor-kernel": {
@@ -68,18 +70,21 @@ ALLOWED_INTERNAL_DEPS: dict[str, set[str]] = {
         "splendor-store",
         "splendor-gateway",
         "splendor-authority",
+        "splendor-evidence",
     },
     "splendor-daemon": {
         "splendor-types",
         "splendor-store",
         "splendor-gateway",
         "splendor-kernel",
+        "splendor-evidence",
     },
     "splendorctl": {
         "splendor-types",
         "splendor-store",
         "splendor-gateway",
         "splendor-kernel",
+        "splendor-evidence",
         "splendor-adapter-filesystem",
         "splendor-adapter-http",
     },
@@ -210,6 +215,7 @@ DAEMON_EXPECTED_PRODUCTION_DEPENDENCIES = {
         daemon_registry_dependency("ring", "^0.17"),
         daemon_registry_dependency("serde", "^1.0", features=("derive",)),
         daemon_registry_dependency("serde_json", "^1.0"),
+        daemon_path_dependency("splendor-evidence", "crates/splendor-evidence"),
         daemon_path_dependency("splendor-gateway", "crates/splendor-gateway"),
         daemon_path_dependency("splendor-kernel", "crates/splendor-kernel"),
         daemon_path_dependency("splendor-store", "crates/splendor-store"),
@@ -230,11 +236,12 @@ DAEMON_EXPECTED_PRODUCTION_DEPENDENCIES = {
 RULE_NOTES: dict[str, str] = {
     "splendor-types": "splendor-types is behavior-free canonical IDs/schemas; it must not depend on other internal packages.",
     "splendor-store": "splendor-store is persistence-only; current baseline allows only splendor-types directly.",
+    "splendor-evidence": "RFC 0015 permits the bounded compatibility owner to depend only on behavior-free splendor-types and persistence-only splendor-store.",
     "splendor-authority": "RFC 0009 / IDR-001 allows splendor-authority to own identity lifecycle decisions over types and storage-only registry persistence.",
     "splendor-gateway": "splendor-gateway is the action/driver boundary; AUTH-004b allows the narrow splendor-authority edge to validate obligation receipts before adapter invocation.",
-    "splendor-kernel": "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local delegation authority bridge in addition to types/store/gateway.",
-    "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> kernel/store/gateway/types composition seam only.",
-    "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL allows existing embedded-local CLI edges to kernel/store/gateway/types and filesystem/http adapters only.",
+    "splendor-kernel": "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local delegation authority bridge and RFC 0015 allows delegation to evidence semantics.",
+    "splendor-daemon": "MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition seam to kernel/store/gateway/types/evidence only.",
+    "splendorctl": "MIG-137-CLI-EMBEDDED-LOCAL and RFC 0015 allow embedded-local CLI edges to kernel/store/gateway/types/evidence and filesystem/http adapters only.",
     "splendor-bindings": "Python bindings may bind the kernel facade directly; transitive core deps must remain Cargo transitive, not direct.",
     "splendor-acceptance-action-host": "CORR-001 permits this exact unpublished non-production outer host to compose the daemon with its controlled acceptance adapter; it must not become a production dependency.",
     "adapter": "Adapter crates may directly depend only on splendor-types and splendor-gateway; no adapter -> kernel/store/daemon/adapter core edge.",
@@ -1188,7 +1195,7 @@ def print_result(violations: list[Violation], stats: dict[str, int]) -> None:
         print(
             "Note: this guard enforces exact current 0.1 Cargo workspace/dependency identities, governed package-record uniqueness, "
             "repository-local path membership, non-dev Rust package allowlists, and internal cycle checks; "
-            "it does not inspect Rust source, enforce the proposed v2 JSON dependency policy, require RFC-gated plane crates, "
+            "it does not inspect Rust source, enforce the proposed v2 JSON dependency policy, require other RFC-gated plane crates, "
             "or detect universal duplicate semantic ownership."
         )
         return
@@ -1209,7 +1216,7 @@ def print_result(violations: list[Violation], stats: dict[str, int]) -> None:
     print(
         "Scope: current 0.1 Cargo package/provider metadata only; governed Cargo package-record duplicates are rejected, but "
         "source-wide effect scanning and universal duplicate semantic-owner detection remain out of scope; "
-        "proposed v2 plane crates and dependency_policy.proposed.json are not implemented by this guard."
+        "other proposed v2 plane crates and dependency_policy.proposed.json are not implemented by this guard."
     )
 
 
@@ -1625,9 +1632,9 @@ def run_self_test() -> int:
         check_metadata(forbidden_alias)[0],
         [
             "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. Allowed direct internal "
-            "deps: splendor-authority, splendor-gateway, splendor-store, splendor-types. Rule/exception note: "
+            "deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, splendor-types. Rule/exception note: "
             "splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b allows the bounded local "
-            "delegation authority bridge in addition to types/store/gateway."
+            "delegation authority bridge and RFC 0015 allows delegation to evidence semantics."
         ],
     )
 
@@ -1687,6 +1694,19 @@ def run_self_test() -> int:
             }
         ),
         cycle_order_expected,
+    )
+
+    evidence_reverse_edge = fixture_with_dependency(
+        "splendor-evidence", "splendor-gateway"
+    )
+    failures += report_exact_self_test(
+        "evidence_reverse_edge_to_gateway_rejected",
+        check_metadata(evidence_reverse_edge)[0],
+        [
+            "splendor-evidence -> splendor-gateway (normal dependency) is forbidden. Allowed direct internal "
+            "deps: splendor-store, splendor-types. Rule/exception note: RFC 0015 permits the bounded "
+            "compatibility owner to depend only on behavior-free splendor-types and persistence-only splendor-store."
+        ],
     )
 
     metadata_order_a = fixture_with_dependency(
@@ -1845,9 +1865,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-authority, splendor-gateway, splendor-store, splendor-types. "
+                "Allowed direct internal deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, splendor-types. "
                 "Rule/exception note: splendor-kernel is the compatibility composition root; RFC 0010 AUTH-003b "
-                "allows the bounded local delegation authority bridge in addition to types/store/gateway."
+                "allows the bounded local delegation authority bridge and RFC 0015 allows delegation to evidence semantics."
             ],
         ),
         (
@@ -1951,9 +1971,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-authority (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-authority (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
             ],
@@ -1965,9 +1985,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-adapter-http (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
             ],
@@ -1979,9 +1999,9 @@ def run_self_test() -> int:
             ),
             [
                 "splendor-daemon -> splendor-acceptance-action-host (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
-                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY allows the existing daemon -> "
-                "kernel/store/gateway/types composition seam only.",
+                "Allowed direct internal deps: splendor-evidence, splendor-gateway, splendor-kernel, splendor-store, splendor-types. "
+                "Rule/exception note: MIG-137-DAEMON-STORES-GATEWAY and RFC 0015 allow the daemon composition "
+                "seam to kernel/store/gateway/types/evidence only.",
                 "splendor-daemon -> splendor-acceptance-action-host (normal dependency) is forbidden by the exact "
                 "production dependency closure.",
                 "Dependency cycle detected among internal workspace packages: "
@@ -2266,6 +2286,10 @@ def accepted_metadata_fixture() -> dict[str, Any]:
     internal_dependencies: dict[str, list[tuple[str, str | None]]] = {
         "splendor-types": [],
         "splendor-store": [("splendor-types", None)],
+        "splendor-evidence": [
+            ("splendor-store", None),
+            ("splendor-types", None),
+        ],
         "splendor-authority": [
             ("splendor-store", None),
             ("splendor-types", None),
@@ -2276,6 +2300,7 @@ def accepted_metadata_fixture() -> dict[str, Any]:
         ],
         "splendor-kernel": [
             ("splendor-authority", None),
+            ("splendor-evidence", None),
             ("splendor-gateway", None),
             ("splendor-store", None),
             ("splendor-types", None),
@@ -2287,6 +2312,7 @@ def accepted_metadata_fixture() -> dict[str, Any]:
         "splendorctl": [
             ("splendor-adapter-filesystem", None),
             ("splendor-adapter-http", None),
+            ("splendor-evidence", None),
             ("splendor-gateway", None),
             ("splendor-kernel", None),
             ("splendor-store", None),
@@ -2522,10 +2548,10 @@ def excluded_http_adapter_expected_messages(
                 "'splendor-adapter-http' at 'adapters/http/Cargo.toml'. All repository-local Rust path "
                 "dependencies must remain governed workspace members.",
                 "splendor-kernel -> splendor-adapter-http (normal dependency) is forbidden. "
-                "Allowed direct internal deps: splendor-authority, splendor-gateway, splendor-store, "
+                "Allowed direct internal deps: splendor-authority, splendor-evidence, splendor-gateway, splendor-store, "
                 "splendor-types. Rule/exception note: splendor-kernel is the compatibility composition root; "
-                "RFC 0010 AUTH-003b allows the bounded local delegation authority bridge in addition to "
-                "types/store/gateway.",
+                "RFC 0010 AUTH-003b allows the bounded local delegation authority bridge and RFC 0015 allows "
+                "delegation to evidence semantics.",
             ]
         )
     if include_cycle:

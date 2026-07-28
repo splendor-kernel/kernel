@@ -10,6 +10,9 @@
 use serde::{Deserialize, Serialize};
 use splendor_adapter_filesystem::{FilesystemAdapter, FilesystemAdapterConfig};
 use splendor_adapter_http::{HttpAdapter, HttpAdapterConfig, HttpMethod};
+#[cfg(test)]
+use splendor_evidence::inspect_trace;
+use splendor_evidence::{open_trace_reader, project_trace, TraceProjection};
 use splendor_gateway::{
     ActionAdapter, ActionGateway, CircuitBreakerEvaluator, ResourceBoundaryVerifier,
     StaticCircuitBreakerEvaluator, TrustedActionProfile, VerifiedActionGateway,
@@ -20,9 +23,13 @@ use splendor_kernel::{
     QuotaPolicy, RunAuthorityHandle, RunTraceContext, Scheduler, SchedulerConfig, SnapshotPolicy,
     StateGraph, TenantContext, TenantPolicy, TenantRegistry,
 };
+#[cfg(test)]
+use splendor_store::{compute_trace_envelope_hash, RuntimeTraceScope};
 use splendor_store::{
-    validate_trace_chain, SqliteStateStore, SqliteTraceStore, StateStore, TraceRecord, TraceStore,
-    TraceStoreError,
+    RuntimeTraceAppend, RuntimeTraceLimits, RuntimeTracePage, RuntimeTracePortError,
+    RuntimeTraceReader, RuntimeTraceReaderHandle, RuntimeTraceStoreIdentity, RuntimeTraceTail,
+    RuntimeTraceWriter, RuntimeTraceWriterHandle, RuntimeTraceWriterRequest, SqliteStateStore,
+    SqliteTraceStore, StateStore, TraceRecord, TraceStore, TraceStoreError,
 };
 use splendor_types::{
     validate_work_order, Action, AgentId, CircuitBreaker, CircuitBreakerId, CircuitBreakerScope,
@@ -793,17 +800,30 @@ where
 /// Emits trace records as JSON lines on stdout.
 fn export_trace(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
     if !db_path.exists() {
-        return Err(format!("Trace database not found: {}", db_path.display()));
+        return Err("trace_database_not_found".to_string());
     }
     let store = SqliteTraceStore::open_read_only(db_path)
-        .map_err(|error| format!("Failed to open trace store: {error}"))?;
-    let records = TraceStore::read(&store, run_id)
-        .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
+        .map_err(|_| "trace_store_open_failed".to_string())?;
+    let records = validated_trace_records(&store, run_id, TraceProjection::Redacted)?;
+    let mut spool = Vec::new();
     for record in records {
-        let line = serde_json::to_string(&record)
-            .map_err(|error| format!("Failed to encode trace record: {error}"))?;
-        println!("{line}");
+        append_json_line(&mut spool, &record, "trace_export_encode_failed")?;
     }
+    std::io::stdout()
+        .lock()
+        .write_all(&spool)
+        .map_err(|_| "trace_export_write_failed".to_string())?;
+    Ok(())
+}
+
+fn append_json_line<T: Serialize>(
+    spool: &mut Vec<u8>,
+    value: &T,
+    failure_code: &'static str,
+) -> Result<(), String> {
+    let mut line = serde_json::to_vec(value).map_err(|_| failure_code.to_string())?;
+    line.push(b'\n');
+    spool.extend_from_slice(&line);
     Ok(())
 }
 
@@ -827,13 +847,12 @@ struct StateHeadOutput {
 /// Emits the latest state head recorded by the run's StateCommitted trace event.
 fn state_head(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
     if !db_path.exists() {
-        return Err(format!("Trace database not found: {}", db_path.display()));
+        return Err("trace_database_not_found".to_string());
     }
     let store = SqliteTraceStore::open_read_only(db_path)
-        .map_err(|error| format!("Failed to open trace store: {error}"))?;
-    let records = TraceStore::read(&store, run_id)
-        .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
-    let events = decode_and_validate_trace_records(&records, run_id)?;
+        .map_err(|_| "trace_store_open_failed".to_string())?;
+    let records = validated_trace_records(&store, run_id, TraceProjection::Trusted)?;
+    let events = decode_validated_trace_records(&records)?;
 
     let mut latest: Option<StateHeadOutput> = None;
     for event in events {
@@ -850,12 +869,13 @@ fn state_head(db_path: &PathBuf, run_id: &str) -> Result<(), String> {
             });
         }
     }
-    let latest = latest.ok_or_else(|| {
-        format!("No StateCommitted event found in trace history for run '{run_id}'")
-    })?;
-    let line = serde_json::to_string(&latest)
-        .map_err(|error| format!("Failed to encode state head output: {error}"))?;
-    println!("{line}");
+    let latest = latest.ok_or_else(|| "state_head_not_found".to_string())?;
+    let mut output = Vec::new();
+    append_json_line(&mut output, &latest, "state_head_encode_failed")?;
+    std::io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|_| "state_head_write_failed".to_string())?;
     Ok(())
 }
 
@@ -1637,9 +1657,12 @@ fn audit_export(
     filters: AuditFilters,
 ) -> Result<(), String> {
     let export = audit_export_from_stores(trace_db_path, state_db_path, run_id, filters)?;
-    let line = serde_json::to_string(&export)
-        .map_err(|error| format!("Failed to encode audit export: {error}"))?;
-    println!("{line}");
+    let mut output = Vec::new();
+    append_json_line(&mut output, &export, "audit_export_encode_failed")?;
+    std::io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|_| "audit_export_write_failed".to_string())?;
     Ok(())
 }
 
@@ -1650,25 +1673,19 @@ fn audit_export_from_stores(
     filters: AuditFilters,
 ) -> Result<AuditExport, String> {
     if !trace_db_path.exists() {
-        return Err(format!(
-            "Trace database not found: {}",
-            trace_db_path.display()
-        ));
+        return Err("trace_database_not_found".to_string());
     }
     if !state_db_path.exists() {
-        return Err(format!(
-            "State database not found: {}",
-            state_db_path.display()
-        ));
+        return Err("state_database_not_found".to_string());
     }
     let trace_store = SqliteTraceStore::open_read_only(trace_db_path)
-        .map_err(|error| format!("Failed to open trace store: {error}"))?;
+        .map_err(|_| "trace_store_open_failed".to_string())?;
     let state_store = SqliteStateStore::open_read_only(state_db_path)
-        .map_err(|error| format!("Failed to open state store: {error}"))?;
-    let records = TraceStore::read(&trace_store, run_id)
-        .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
-    let events = decode_and_validate_trace_records(&records, run_id)?;
+        .map_err(|_| "state_store_open_failed".to_string())?;
+    let records = validated_trace_records(&trace_store, run_id, TraceProjection::Trusted)?;
+    let events = decode_validated_trace_records(&records)?;
     collect_audit_export(&events, &state_store, run_id, filters)
+        .map_err(|_| "audit_projection_failed".to_string())
 }
 
 fn collect_audit_export(
@@ -2079,8 +2096,8 @@ fn audit_governance_record(
             event.identity.action_id.as_ref().map(ToString::to_string),
             None,
             serde_json::json!({
-                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
-                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+                "action": redact_value(serde_json::to_value(action).map_err(|_| "audit_action_encode_failed".to_string())?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|_| "audit_result_encode_failed".to_string())?, redaction),
             }),
         ),
         TraceEventKind::ActionNeedsApproval { action, result } => (
@@ -2089,8 +2106,8 @@ fn audit_governance_record(
             event.identity.action_id.as_ref().map(ToString::to_string),
             None,
             serde_json::json!({
-                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
-                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+                "action": redact_value(serde_json::to_value(action).map_err(|_| "audit_action_encode_failed".to_string())?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|_| "audit_result_encode_failed".to_string())?, redaction),
             }),
         ),
         TraceEventKind::ActionNeedsIntervention { action, result } => (
@@ -2099,8 +2116,8 @@ fn audit_governance_record(
             event.identity.action_id.as_ref().map(ToString::to_string),
             None,
             serde_json::json!({
-                "action": redact_value(serde_json::to_value(action).map_err(|error| format!("Failed to encode audit action: {error}"))?, redaction),
-                "result": redact_value(serde_json::to_value(result).map_err(|error| format!("Failed to encode audit result: {error}"))?, redaction),
+                "action": redact_value(serde_json::to_value(action).map_err(|_| "audit_action_encode_failed".to_string())?, redaction),
+                "result": redact_value(serde_json::to_value(result).map_err(|_| "audit_result_encode_failed".to_string())?, redaction),
             }),
         ),
         TraceEventKind::EscalationTriggered { escalation } => {
@@ -2262,21 +2279,16 @@ fn load_verified_state_snapshot(
 ) -> Result<splendor_store::StateSnapshot, String> {
     let snapshot = state_store
         .load_snapshot(snapshot_id)
-        .map_err(|error| format!("Failed to load state snapshot: {error}"))?;
+        .map_err(|_| "state_snapshot_load_failed".to_string())?;
     let recomputed_snapshot_id = SnapshotId::from_bytes(&snapshot.state.bytes);
     if recomputed_snapshot_id != *snapshot_id {
-        return Err(format!(
-            "State snapshot integrity mismatch: expected '{snapshot_id}' but loaded bytes hash to '{recomputed_snapshot_id}'"
-        ));
+        return Err("state_snapshot_integrity_mismatch".to_string());
     }
 
     let node = load_verified_state_node(state_store, &snapshot.node_id, expected_state_hash)?;
     let data_hash = ContentHash::blake3(&snapshot.state.bytes);
     if node.data_hash != data_hash {
-        return Err(format!(
-            "State snapshot node data hash mismatch for node '{}'",
-            snapshot.node_id
-        ));
+        return Err("state_snapshot_node_integrity_mismatch".to_string());
     }
     Ok(snapshot)
 }
@@ -2288,29 +2300,21 @@ fn load_verified_state_node(
 ) -> Result<splendor_store::StateNode, String> {
     let node = state_store
         .get_node(state_node_id)
-        .map_err(|error| format!("Failed to load state node: {error}"))?;
+        .map_err(|_| "state_node_load_failed".to_string())?;
     if node.id != *state_node_id {
-        return Err(format!(
-            "State node identity mismatch: requested '{state_node_id}' but loaded '{}'",
-            node.id
-        ));
+        return Err("state_node_identity_mismatch".to_string());
     }
     if let Some(expected_state_hash) = expected_state_hash {
         if node.id.hash() != expected_state_hash {
-            return Err(format!(
-                "State commit hash mismatch for node '{state_node_id}': expected '{expected_state_hash}' but node hash is '{}'",
-                node.id.hash()
-            ));
+            return Err("state_commit_hash_mismatch".to_string());
         }
     }
     let state = state_store
         .get_state(&node.data_ref)
-        .map_err(|error| format!("Failed to load state data: {error}"))?;
+        .map_err(|_| "state_data_load_failed".to_string())?;
     let data_hash = ContentHash::blake3(&state.bytes);
     if node.data_hash != data_hash {
-        return Err(format!(
-            "State node data hash mismatch for node '{state_node_id}'"
-        ));
+        return Err("state_node_data_integrity_mismatch".to_string());
     }
     Ok(node)
 }
@@ -2322,28 +2326,19 @@ fn validate_approval_trace_context(
     validate_run_match(event, &approval.run_id, "Approval")?;
     if let Some(tenant_id) = &event.identity.tenant_id {
         if tenant_id != &approval.tenant_id {
-            return Err(format!(
-                "Approval trace tenant mismatch at sequence {}: event tenant '{}' but approval tenant '{}'",
-                event.sequence, tenant_id, approval.tenant_id
-            ));
+            return Err("audit_approval_tenant_mismatch".to_string());
         }
     }
     if let Some(agent_id) = &event.identity.agent_id {
         if agent_id != &approval.agent_id {
-            return Err(format!(
-                "Approval trace agent mismatch at sequence {}: event agent '{}' but approval agent '{}'",
-                event.sequence, agent_id, approval.agent_id
-            ));
+            return Err("audit_approval_agent_mismatch".to_string());
         }
     }
     if let (Some(event_action_id), Some(approval_action_id)) =
         (&event.identity.action_id, &approval.action_id)
     {
         if event_action_id != approval_action_id {
-            return Err(format!(
-                "Approval trace action mismatch at sequence {}: event action '{}' but approval action '{}'",
-                event.sequence, event_action_id, approval_action_id
-            ));
+            return Err("audit_approval_action_mismatch".to_string());
         }
     }
     Ok(())
@@ -2405,30 +2400,21 @@ fn validate_governance_scope_context(
         (&event.identity.tenant_id, scope.tenant_id())
     {
         if event_tenant_id != scope_tenant_id {
-            return Err(format!(
-                "{label} tenant mismatch at sequence {}: event tenant '{}' but scope tenant '{}'",
-                event.sequence, event_tenant_id, scope_tenant_id
-            ));
+            return Err("audit_governance_tenant_mismatch".to_string());
         }
     }
     if let (Some(event_agent_id), Some(scope_agent_id)) =
         (&event.identity.agent_id, scope.agent_id())
     {
         if event_agent_id != scope_agent_id {
-            return Err(format!(
-                "{label} agent mismatch at sequence {}: event agent '{}' but scope agent '{}'",
-                event.sequence, event_agent_id, scope_agent_id
-            ));
+            return Err("audit_governance_agent_mismatch".to_string());
         }
     }
     if let (Some(event_action_id), Some(scope_action_id)) =
         (&event.identity.action_id, scope.action_id())
     {
         if event_action_id != scope_action_id {
-            return Err(format!(
-                "{label} action mismatch at sequence {}: event action '{}' but scope action '{}'",
-                event.sequence, event_action_id, scope_action_id
-            ));
+            return Err("audit_governance_action_mismatch".to_string());
         }
     }
     Ok(())
@@ -2437,13 +2423,10 @@ fn validate_governance_scope_context(
 fn validate_run_match(
     event: &TraceEvent,
     actual_run_id: &RunId,
-    label: &str,
+    _label: &str,
 ) -> Result<(), String> {
     if actual_run_id != &event.run_id {
-        return Err(format!(
-            "{label} trace run mismatch at sequence {}: event run '{}' but embedded run '{}'",
-            event.sequence, event.run_id, actual_run_id
-        ));
+        return Err("audit_trace_run_mismatch".to_string());
     }
     Ok(())
 }
@@ -2452,8 +2435,7 @@ fn sanitized_value<T: Serialize>(
     value: &T,
     redaction: &mut RedactionTracker,
 ) -> Result<serde_json::Value, String> {
-    let value = serde_json::to_value(value)
-        .map_err(|error| format!("Failed to encode audit value: {error}"))?;
+    let value = serde_json::to_value(value).map_err(|_| "audit_value_encode_failed".to_string())?;
     Ok(redact_value(value, redaction))
 }
 
@@ -2970,15 +2952,22 @@ fn replay_run(
     from_snapshot: Option<&str>,
     include_state: bool,
 ) -> Result<(), String> {
-    for output in replay_outputs_from_stores(
+    let outputs = replay_outputs_from_stores(
         trace_db_path,
         state_db_path,
         run_id,
         from_snapshot,
         include_state,
-    )? {
-        emit_replay_output(output)?;
+    )?;
+    let mut spool = Vec::new();
+    for output in outputs {
+        let value = redacted_replay_output_value(&output)?;
+        append_json_line(&mut spool, &value, "replay_output_encode_failed")?;
     }
+    std::io::stdout()
+        .lock()
+        .write_all(&spool)
+        .map_err(|_| "replay_output_write_failed".to_string())?;
     Ok(())
 }
 
@@ -2990,33 +2979,27 @@ fn replay_outputs_from_stores(
     include_state: bool,
 ) -> Result<Vec<ReplayOutput>, String> {
     if !trace_db_path.exists() {
-        return Err(format!(
-            "Trace database not found: {}",
-            trace_db_path.display()
-        ));
+        return Err("trace_database_not_found".to_string());
     }
     if !state_db_path.exists() {
-        return Err(format!(
-            "State database not found: {}",
-            state_db_path.display()
-        ));
+        return Err("state_database_not_found".to_string());
     }
     let trace_store = SqliteTraceStore::open_read_only(trace_db_path)
-        .map_err(|error| format!("Failed to open trace store: {error}"))?;
+        .map_err(|_| "trace_store_open_failed".to_string())?;
     let state_store = SqliteStateStore::open_read_only(state_db_path)
-        .map_err(|error| format!("Failed to open state store: {error}"))?;
-    let records = TraceStore::read(&trace_store, run_id)
-        .map_err(|error| format!("Failed to read run '{run_id}': {error}"))?;
-    let events = decode_and_validate_trace_records(&records, run_id)?;
+        .map_err(|_| "state_store_open_failed".to_string())?;
+    let records = validated_trace_records(&trace_store, run_id, TraceProjection::Trusted)?;
+    let events = decode_validated_trace_records(&records)?;
 
     let from_snapshot_id = match from_snapshot {
         Some(value) => Some(parse_snapshot_id(value)?),
         None => None,
     };
     let start_tick = if let Some(snapshot_id) = &from_snapshot_id {
-        Some(find_tick_for_snapshot(&events, snapshot_id).ok_or_else(|| {
-            format!("Snapshot '{snapshot_id}' not found in trace history for run '{run_id}'")
-        })?)
+        Some(
+            find_tick_for_snapshot(&events, snapshot_id)
+                .ok_or_else(|| "replay_snapshot_not_found".to_string())?,
+        )
     } else {
         None
     };
@@ -3037,6 +3020,7 @@ fn replay_outputs_from_stores(
         start_tick,
         include_state,
     )
+    .map_err(|_| "replay_projection_failed".to_string())
 }
 
 fn collect_replay_outputs(
@@ -3051,8 +3035,7 @@ fn collect_replay_outputs(
     let replay_run_id = if let Some(event) = events.first() {
         event.run_id.clone()
     } else {
-        RunId::parse(run_id)
-            .map_err(|error| format!("Invalid replay run_id '{run_id}': {error}"))?
+        RunId::parse(run_id).map_err(|_| "trace_run_id_invalid".to_string())?
     };
     let next_replay_sequence = events
         .iter()
@@ -3076,21 +3059,36 @@ fn collect_replay_outputs(
     for event in events {
         match &event.kind {
             TraceEventKind::StateHandoffExported { handoff } => {
-                emit_handoff_replay_output("state.handoff.exported", handoff, None, event)?;
+                outputs.push(handoff_replay_output(
+                    "state.handoff.exported",
+                    handoff,
+                    None,
+                    event,
+                ));
             }
             TraceEventKind::StateHandoffImported { handoff } => {
-                emit_handoff_replay_output("state.handoff.imported", handoff, None, event)?;
+                outputs.push(handoff_replay_output(
+                    "state.handoff.imported",
+                    handoff,
+                    None,
+                    event,
+                ));
             }
             TraceEventKind::StateHandoffImportFailed { handoff, reason } => {
-                emit_handoff_replay_output(
+                outputs.push(handoff_replay_output(
                     "state.handoff.import_failed",
                     handoff,
                     Some(reason.clone()),
                     event,
-                )?;
+                ));
             }
             TraceEventKind::ReadOnlyStateReferenced { handoff } => {
-                emit_handoff_replay_output("state.reference.read_only", handoff, None, event)?;
+                outputs.push(handoff_replay_output(
+                    "state.reference.read_only",
+                    handoff,
+                    None,
+                    event,
+                ));
             }
             TraceEventKind::LoopTickStarted { tick_id } => {
                 current_tick_id = *tick_id;
@@ -3208,53 +3206,107 @@ fn collect_replay_outputs(
     Ok(outputs)
 }
 
+fn validated_trace_records(
+    store: &dyn TraceStore,
+    run_id: &str,
+    projection: TraceProjection,
+) -> Result<Vec<TraceRecord>, String> {
+    let run_id = RunId::parse(run_id).map_err(|_| "trace_run_id_invalid".to_string())?;
+    let reader = open_trace_reader(store, &run_id, RuntimeTraceLimits::default())
+        .map_err(|error| error.to_string())?;
+    project_trace(reader.as_ref(), &run_id, projection).map_err(|error| error.to_string())
+}
+
+fn decode_validated_trace_records(records: &[TraceRecord]) -> Result<Vec<TraceEvent>, String> {
+    let mut events = Vec::with_capacity(records.len());
+    for record in records {
+        let event: TraceEvent = serde_json::from_value(record.payload.clone())
+            .map_err(|_| "trace_event_decode_failed".to_string())?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+#[cfg(test)]
 fn decode_and_validate_trace_records(
     records: &[TraceRecord],
     run_id: &str,
 ) -> Result<Vec<TraceEvent>, String> {
-    validate_trace_chain(run_id, records).map_err(|error| match error {
-        TraceStoreError::IntegrityRunIdentityMismatch { actual_run_id, .. } => format!(
-            "Trace record run mismatch: expected '{run_id}' but found '{actual_run_id}'"
-        ),
-        TraceStoreError::IntegritySequenceMismatch {
-            expected, actual, ..
-        } => format!(
-            "Trace sequence gap or corruption for run '{run_id}': expected sequence {expected} but found {actual}"
-        ),
-        TraceStoreError::IntegrityChainMismatch { sequence, .. } => format!(
-            "Trace integrity chain mismatch at sequence {sequence} for run '{run_id}'"
-        ),
-        TraceStoreError::IntegrityHashMismatch { sequence, .. } => format!(
-            "Trace payload hash mismatch at sequence {sequence} for run '{run_id}'"
-        ),
-        error => format!("Failed to validate trace chain: {error}"),
-    })?;
-    let mut events = Vec::with_capacity(records.len());
+    let run_id = RunId::parse(run_id).map_err(|_| "trace_run_id_invalid".to_string())?;
+    let store_identity = RuntimeTraceStoreIdentity::from_opaque_material(b"cli-test-reader");
+    let mut envelope_tail = None;
     for record in records {
-        let event: TraceEvent = serde_json::from_value(record.payload.clone())
-            .map_err(|error| format!("Failed to decode trace record: {error}"))?;
-        if event.run_id.to_string() != run_id {
-            return Err(format!(
-                "Trace event run mismatch at sequence {}: expected '{run_id}' but found '{}'",
-                record.sequence, event.run_id
-            ));
-        }
-        if event.sequence != record.sequence {
-            return Err(format!(
-                "Trace event sequence mismatch for run '{run_id}': record sequence {} but event sequence {}",
-                record.sequence, event.sequence
-            ));
-        }
-        let expected_trace_id = TraceEventId::from_run_sequence(&event.run_id, event.sequence);
-        if event.trace_event_id != expected_trace_id {
-            return Err(format!(
-                "Trace id mismatch at sequence {} for run '{run_id}'",
-                event.sequence
-            ));
-        }
-        events.push(event);
+        envelope_tail = Some(
+            compute_trace_envelope_hash(envelope_tail.as_ref(), record)
+                .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(events)
+    let tail = RuntimeTraceTail::legacy(
+        store_identity.clone(),
+        u64::try_from(records.len()).map_err(|_| "runtime_trace_limit_exceeded".to_string())?,
+        records.last().map(|record| record.event_hash.clone()),
+        envelope_tail,
+    )
+    .map_err(|error| error.to_string())?;
+    let reader = TestTraceReader {
+        records: records.to_vec(),
+        run_id: run_id.to_string(),
+        store_identity,
+        tail,
+    };
+    inspect_trace(&reader, &run_id)
+        .map(|inspected| inspected.events)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+struct TestTraceReader {
+    records: Vec<TraceRecord>,
+    run_id: String,
+    store_identity: RuntimeTraceStoreIdentity,
+    tail: RuntimeTraceTail,
+}
+
+#[cfg(test)]
+impl RuntimeTraceReader for TestTraceReader {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.store_identity.clone()
+    }
+
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        RuntimeTraceLimits::default()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        Ok(self.tail.clone())
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        let start = usize::try_from(start).map_err(|_| RuntimeTracePortError::LimitExceeded)?;
+        if start > self.records.len() {
+            return Err(RuntimeTracePortError::BackendContract);
+        }
+        let end = start
+            .saturating_add(RuntimeTraceLimits::default().page_records)
+            .min(self.records.len());
+        Ok(RuntimeTracePage::new(
+            self.records[start..end].to_vec(),
+            u64::try_from(end).map_err(|_| RuntimeTracePortError::LimitExceeded)?,
+            end == self.records.len(),
+        ))
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        if expected == &self.tail {
+            Ok(())
+        } else {
+            Err(RuntimeTracePortError::FenceRejected)
+        }
+    }
 }
 
 fn replay_message_event(event: &TraceEvent) -> Result<Option<ReplayMessageEvent>, String> {
@@ -3269,10 +3321,7 @@ fn replay_message_event(event: &TraceEvent) -> Result<Option<ReplayMessageEvent>
         _ => return Ok(None),
     };
     if message.run_id != event.run_id {
-        return Err(format!(
-            "Message trace run mismatch at sequence {}: event run '{}' but message run '{}'",
-            event.sequence, event.run_id, message.run_id
-        ));
+        return Err("replay_message_run_mismatch".to_string());
     }
 
     Ok(Some(ReplayMessageEvent {
@@ -3295,10 +3344,7 @@ fn replay_parent_child_run(event: &TraceEvent) -> Result<Option<ReplayParentChil
         | TraceEventKind::ChildRunFailed { delegation, .. }
         | TraceEventKind::DelegationRejected { delegation, .. } => {
             if delegation.parent_run_id != event.run_id {
-                return Err(format!(
-                    "Local delegation parent run mismatch at sequence {}: event run '{}' but parent run '{}'",
-                    event.sequence, event.run_id, delegation.parent_run_id
-                ));
+                return Err("replay_delegation_run_mismatch".to_string());
             }
             return Ok(Some(ReplayParentChildRun {
                 trace_event_id: event.trace_event_id.clone(),
@@ -3335,10 +3381,7 @@ fn replay_parent_child_run(event: &TraceEvent) -> Result<Option<ReplayParentChil
     } = &event.kind
     {
         if parent_run_id != &event.run_id {
-            return Err(format!(
-                "Child run link parent run mismatch at sequence {}: event run '{}' but parent run '{}'",
-                event.sequence, event.run_id, parent_run_id
-            ));
+            return Err("replay_child_run_mismatch".to_string());
         }
         return Ok(Some(ReplayParentChildRun {
             trace_event_id: event.trace_event_id.clone(),
@@ -3508,10 +3551,7 @@ fn apply_event_to_tick(
         }
         TraceEventKind::EscalationTriggered { escalation } => {
             if escalation.run_id != event.run_id {
-                return Err(format!(
-                    "Escalation trace run mismatch at sequence {}: event run '{}' but escalation run '{}'",
-                    event.sequence, event.run_id, escalation.run_id
-                ));
+                return Err("replay_escalation_run_mismatch".to_string());
             }
             tick.escalations.push(ReplayEscalation {
                 trace_event_id: event.trace_event_id.clone(),
@@ -3557,33 +3597,25 @@ fn apply_event_to_tick(
     Ok(())
 }
 
-fn emit_handoff_replay_output(
+fn handoff_replay_output(
     event_kind: &str,
     handoff: &StateHandoffTraceContext,
     reason: Option<String>,
     event: &TraceEvent,
-) -> Result<(), String> {
-    emit_replay_output(ReplayOutput::HandoffBoundary {
+) -> ReplayOutput {
+    ReplayOutput::HandoffBoundary {
         event_kind: event_kind.to_string(),
         handoff: Box::new(handoff.clone()),
         previous_state_node_id: handoff.previous_state_node_id.clone(),
         receiver_state_node_id: handoff.receiver_state_node_id.clone(),
         reason,
         trace_sequence: event.sequence,
-    })
-}
-
-fn emit_replay_output(output: ReplayOutput) -> Result<(), String> {
-    let value = redacted_replay_output_value(&output)?;
-    let line = serde_json::to_string(&value)
-        .map_err(|error| format!("Failed to encode replay output: {error}"))?;
-    println!("{line}");
-    Ok(())
+    }
 }
 
 fn redacted_replay_output_value(output: &ReplayOutput) -> Result<serde_json::Value, String> {
-    let value = serde_json::to_value(output)
-        .map_err(|error| format!("Failed to encode replay output: {error}"))?;
+    let value =
+        serde_json::to_value(output).map_err(|_| "replay_output_encode_failed".to_string())?;
     let mut redaction = RedactionTracker::default();
     Ok(redact_value(value, &mut redaction))
 }
@@ -3591,9 +3623,9 @@ fn redacted_replay_output_value(output: &ReplayOutput) -> Result<serde_json::Val
 fn parse_snapshot_id(value: &str) -> Result<SnapshotId, String> {
     let (algorithm, hash) = value
         .split_once(':')
-        .ok_or_else(|| "Snapshot id must be formatted as <algorithm>:<hash>".to_string())?;
-    let algorithm = HashAlgorithm::parse(algorithm)
-        .ok_or_else(|| format!("Unknown hash algorithm: {algorithm}"))?;
+        .ok_or_else(|| "replay_snapshot_id_invalid".to_string())?;
+    let algorithm =
+        HashAlgorithm::parse(algorithm).ok_or_else(|| "replay_snapshot_id_invalid".to_string())?;
     Ok(SnapshotId::from_hash(ContentHash::new(algorithm, hash)))
 }
 
@@ -3767,154 +3799,16 @@ struct HttpConfig {
 struct FailingTraceStore {
     inner: SqliteTraceStore,
     fail_on_event: String,
-    failed: Mutex<bool>,
-}
-
-fn append_failure_evidence_event(
-    store: &dyn TraceStore,
-    run_id: &str,
-    failure_kind: &str,
-    details: serde_json::Value,
-) -> Result<(), TraceStoreError> {
-    let next_sequence = match store.read(run_id) {
-        Ok(records) => records.len() as u64,
-        Err(TraceStoreError::RunNotFound) => 0,
-        Err(error) => return Err(error),
-    };
-    let parsed_run_id = RunId::parse(run_id).map_err(|_| {
-        TraceStoreError::InvalidTimestamp(format!("invalid_run_id_for_failure_evidence:{run_id}"))
-    })?;
-    let trace_event_id = TraceEventId::from_run_sequence(&parsed_run_id, next_sequence).to_string();
-    store.append(
-        run_id,
-        serde_json::json!({
-            "kind": {
-                failure_kind: details,
-            },
-            "trace_event_id": trace_event_id,
-            "identity": {
-                "run_id": run_id,
-            },
-            "timestamp": OffsetDateTime::now_utc().to_string(),
-        }),
-    )?;
-    Ok(())
-}
-
-fn side_effect_executed_before_trace_failure(
-    store: &dyn TraceStore,
-    run_id: &str,
-    failed_payload: &serde_json::Value,
-) -> Result<bool, TraceStoreError> {
-    let failed_identity: TraceIdentityContext = serde_json::from_value(
-        failed_payload
-            .get("identity")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-    )?;
-    let Some(failed_tick_id) = failed_identity.tick_id else {
-        return Ok(false);
-    };
-    if non_read_only_action_executed_for_tick(failed_payload, failed_tick_id)? {
-        return Ok(true);
-    }
-
-    match store.read(run_id) {
-        Ok(records) => {
-            for record in records {
-                if non_read_only_action_executed_for_tick(&record.payload, failed_tick_id)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        Err(TraceStoreError::RunNotFound) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn non_read_only_action_executed_for_tick(
-    payload: &serde_json::Value,
-    expected_tick_id: splendor_types::TickId,
-) -> Result<bool, TraceStoreError> {
-    if trace_payload_kind(payload).as_deref() != Some("ActionExecuted") {
-        return Ok(false);
-    }
-
-    let event: TraceEvent = serde_json::from_value(payload.clone())?;
-    Ok(event.identity.tick_id == Some(expected_tick_id)
-        && matches!(
-            event.kind,
-            TraceEventKind::ActionExecuted { action, .. }
-                if action.side_effect_class != SideEffectClass::ReadOnly
-        ))
+    failed: Arc<Mutex<bool>>,
 }
 
 impl TraceStore for FailingTraceStore {
     fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
-        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
-            let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
-            if !*failed {
-                *failed = true;
-                // A failed mandatory pre-effect append must leave the runtime
-                // cursor unchanged so the normal fail-closed completion record
-                // can use that sequence. Other injected failures terminate the
-                // loop immediately and retain the existing standalone evidence.
-                if self.fail_on_event != "ActionVerificationCompleted" {
-                    let side_effect_executed =
-                        side_effect_executed_before_trace_failure(&self.inner, run_id, &payload)?;
-                    append_failure_evidence_event(
-                        &self.inner,
-                        run_id,
-                        "TraceWriteFailed",
-                        serde_json::json!({
-                            "failed_event": self.fail_on_event,
-                            "side_effect_executed": side_effect_executed,
-                            "failure_injection": "splendorctl_public_run_config",
-                        }),
-                    )?;
-                }
-                return Err(TraceStoreError::InvalidTimestamp(format!(
-                    "injected_trace_write_failure:{}",
-                    self.fail_on_event
-                )));
-            }
-        }
         self.inner.append(run_id, payload)
     }
 
-    fn append_if_sequence(
-        &self,
-        run_id: &str,
-        expected_sequence: u64,
-        payload: serde_json::Value,
-    ) -> Result<u64, TraceStoreError> {
-        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
-            let mut failed = self.failed.lock().map_err(|_| TraceStoreError::Poisoned)?;
-            if !*failed {
-                *failed = true;
-                if self.fail_on_event != "ActionVerificationCompleted" {
-                    let side_effect_executed =
-                        side_effect_executed_before_trace_failure(&self.inner, run_id, &payload)?;
-                    append_failure_evidence_event(
-                        &self.inner,
-                        run_id,
-                        "TraceWriteFailed",
-                        serde_json::json!({
-                            "failed_event": self.fail_on_event,
-                            "side_effect_executed": side_effect_executed,
-                            "failure_injection": "splendorctl_public_run_config",
-                        }),
-                    )?;
-                }
-                return Err(TraceStoreError::InvalidTimestamp(format!(
-                    "injected_trace_write_failure:{}",
-                    self.fail_on_event
-                )));
-            }
-        }
-        self.inner
-            .append_if_sequence(run_id, expected_sequence, payload)
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
     }
 
     fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
@@ -3930,21 +3824,79 @@ impl TraceStore for FailingTraceStore {
         self.inner.read_range(run_id, start, end)
     }
 
-    fn claim_runtime_identity(
+    fn open_runtime_reader(
         &self,
         run_id: &str,
-        tenant_id: &str,
-        agent_id: &str,
-    ) -> Result<splendor_store::RuntimeIdentityClaim, TraceStoreError> {
-        self.inner
-            .claim_runtime_identity(run_id, tenant_id, agent_id)
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.inner.open_runtime_reader(run_id, limits)
     }
 
-    fn release_runtime_identity(
+    fn acquire_runtime_writer(
         &self,
-        claim: &splendor_store::RuntimeIdentityClaim,
-    ) -> Result<(), TraceStoreError> {
-        self.inner.release_runtime_identity(claim)
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        Ok(Arc::new(FailingRuntimeTraceWriter {
+            inner: self.inner.acquire_runtime_writer(request)?,
+            fail_on_event: self.fail_on_event.clone(),
+            failed: Arc::clone(&self.failed),
+        }))
+    }
+}
+
+struct FailingRuntimeTraceWriter {
+    inner: RuntimeTraceWriterHandle,
+    fail_on_event: String,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl RuntimeTraceReader for FailingRuntimeTraceWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for FailingRuntimeTraceWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        if trace_payload_kind(&payload).as_deref() == Some(self.fail_on_event.as_str()) {
+            let mut failed = self
+                .failed
+                .lock()
+                .map_err(|_| RuntimeTracePortError::Unavailable)?;
+            if !*failed {
+                *failed = true;
+                return Err(RuntimeTracePortError::Unavailable);
+            }
+        }
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
     }
 }
 
@@ -4168,7 +4120,7 @@ fn run_loaded_config(
         Arc::new(FailingTraceStore {
             inner: sqlite_trace_store,
             fail_on_event: event,
-            failed: Mutex::new(false),
+            failed: Arc::new(Mutex::new(false)),
         })
     } else {
         Arc::new(sqlite_trace_store)
@@ -4364,32 +4316,6 @@ fn run_loaded_config(
 
     let cycles = cycles_override.or(config.cycles).unwrap_or(1);
     if let Err(error) = scheduler.run_cycles(cycles) {
-        if config
-            .failure_injection
-            .as_ref()
-            .and_then(|injection| injection.state_commit_fail)
-            .unwrap_or(false)
-        {
-            for agent_config in &config.agents {
-                let run_id = resolve_run_id(&config, agent_config, work_order)?;
-                let run_id_string = run_id.to_string();
-                append_failure_evidence_event(
-                    trace_store.as_ref(),
-                    &run_id_string,
-                    "StateCommitFailed",
-                    serde_json::json!({
-                        "reason": "injected_state_commit_failure",
-                        "next_tick_advanced": false,
-                        "failure_injection": "splendorctl_public_run_config",
-                    }),
-                )
-                .map_err(|trace_error| {
-                    format!(
-                        "Scheduler failed: {error}; failed to record state commit failure evidence: {trace_error}"
-                    )
-                })?;
-            }
-        }
         return Err(format!("Scheduler failed: {error}"));
     }
     Ok(())

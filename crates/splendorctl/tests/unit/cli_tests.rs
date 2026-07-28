@@ -95,6 +95,12 @@ fn valid_trace_records_for(run_id: &RunId) -> Vec<splendor_store::TraceRecord> {
     TraceStore::read(&store, &run_id.to_string()).expect("records")
 }
 
+fn append_valid_trace_records(store: &impl TraceStore, run_id: &RunId) {
+    for record in valid_trace_records_for(run_id) {
+        TraceStore::append(store, &run_id.to_string(), record.payload).expect("append trace event");
+    }
+}
+
 fn rehash_trace_records(records: &mut [splendor_store::TraceRecord]) {
     let mut previous = None;
     for record in records {
@@ -1318,15 +1324,42 @@ fn parse_args_requires_run_for_replay() {
 fn export_trace_errors_when_missing_db() {
     let missing = PathBuf::from("/tmp/missing-trace.db");
     let error = export_trace(&missing, "run-1").expect_err("error");
-    assert!(error.contains("Trace database not found"));
+    assert_eq!(error, "trace_database_not_found");
 }
 
 #[test]
 fn export_trace_succeeds_with_records() {
     let temp = NamedTempFile::new().expect("temp file");
     let store = SqliteTraceStore::open(temp.path()).expect("open store");
-    TraceStore::append(&store, "run-1", serde_json::json!({"event": 1})).expect("append");
-    export_trace(&temp.path().to_path_buf(), "run-1").expect("export");
+    let run_id = RunId::new();
+    append_valid_trace_records(&store, &run_id);
+    export_trace(&temp.path().to_path_buf(), &run_id.to_string()).expect("export");
+}
+
+#[test]
+fn json_line_serialization_failure_never_partially_mutates_the_output_spool() {
+    struct FailsAfterOneField;
+
+    impl Serialize for FailsAfterOneField {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::{Error as _, SerializeMap};
+
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("already_serialized", "CANARY")?;
+            Err(S::Error::custom("injected serialization failure"))
+        }
+    }
+
+    let mut spool = b"existing-output\n".to_vec();
+    let before = spool.clone();
+    let error = append_json_line(&mut spool, &FailsAfterOneField, "fixed_encode_failure")
+        .expect_err("serialization failure");
+    assert_eq!(error, "fixed_encode_failure");
+    assert_eq!(spool, before);
+    assert!(!String::from_utf8_lossy(&spool).contains("CANARY"));
 }
 
 #[test]
@@ -1334,7 +1367,7 @@ fn replay_errors_when_missing_db() {
     let trace_db = PathBuf::from("/tmp/missing-trace.db");
     let state_db = PathBuf::from("/tmp/missing-state.db");
     let error = replay_run(&trace_db, &state_db, "run-1", None, false).expect_err("error");
-    assert!(error.contains("Trace database not found"));
+    assert_eq!(error, "trace_database_not_found");
 }
 
 #[test]
@@ -1377,7 +1410,7 @@ fn replay_errors_when_state_store_or_requested_snapshot_is_missing() {
         false,
     )
     .expect_err("missing state db");
-    assert!(error.contains("State database not found"));
+    assert_eq!(error, "state_database_not_found");
 
     let state_path = dir.path().join("state.db");
     SqliteStateStore::open(&state_path).expect("state store");
@@ -1390,7 +1423,7 @@ fn replay_errors_when_state_store_or_requested_snapshot_is_missing() {
         false,
     )
     .expect_err("missing snapshot");
-    assert!(error.contains("not found in trace history"));
+    assert_eq!(error, "replay_snapshot_not_found");
 }
 
 #[test]
@@ -1400,12 +1433,12 @@ fn audit_export_errors_when_required_stores_are_missing() {
     let state_db = dir.path().join("missing-state.db");
     let error = audit_export_from_stores(&trace_db, &state_db, "run-1", AuditFilters::default())
         .expect_err("missing trace db");
-    assert!(error.contains("Trace database not found"));
+    assert_eq!(error, "trace_database_not_found");
 
     SqliteTraceStore::open(&trace_db).expect("trace store");
     let error = audit_export_from_stores(&trace_db, &state_db, "run-1", AuditFilters::default())
         .expect_err("missing state db");
-    assert!(error.contains("State database not found"));
+    assert_eq!(error, "state_database_not_found");
 }
 
 #[test]
@@ -3479,7 +3512,7 @@ fn replay_rejects_message_context_run_mismatch() {
         false,
     )
     .expect_err("run mismatch should fail");
-    assert!(error.contains("Message trace run mismatch"));
+    assert_eq!(error, "replay_message_run_mismatch");
 }
 
 #[test]
@@ -3668,7 +3701,7 @@ fn replay_rejects_child_run_parent_mismatch() {
         false,
     )
     .expect_err("parent mismatch should fail");
-    assert!(error.contains("Child run link parent run mismatch"));
+    assert_eq!(error, "replay_child_run_mismatch");
 }
 
 #[test]
@@ -3710,7 +3743,7 @@ fn replay_rejects_approval_context_run_mismatch() {
         false,
     )
     .expect_err("approval run mismatch should fail");
-    assert!(error.contains("Approval trace run mismatch"));
+    assert_eq!(error, "audit_trace_run_mismatch");
 }
 
 #[test]
@@ -3749,7 +3782,7 @@ fn audit_export_rejects_approval_context_run_mismatch() {
         AuditFilters::default(),
     )
     .expect_err("approval run mismatch should fail");
-    assert!(error.contains("Approval trace run mismatch"));
+    assert_eq!(error, "audit_trace_run_mismatch");
 }
 
 #[test]
@@ -3810,7 +3843,7 @@ fn replay_and_audit_reject_state_snapshot_hash_mismatch() {
         false,
     )
     .expect_err("state hash mismatch should fail replay");
-    assert!(replay_error.contains("State commit hash mismatch"));
+    assert_eq!(replay_error, "state_commit_hash_mismatch");
 
     let audit_error = collect_audit_export(
         &events,
@@ -3819,7 +3852,7 @@ fn replay_and_audit_reject_state_snapshot_hash_mismatch() {
         AuditFilters::default(),
     )
     .expect_err("state hash mismatch should fail audit");
-    assert!(audit_error.contains("State commit hash mismatch"));
+    assert_eq!(audit_error, "state_commit_hash_mismatch");
 }
 
 #[test]
@@ -3861,17 +3894,17 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         state_node_id
     );
     let missing_snapshot_id = SnapshotId::from_bytes(b"missing-snapshot");
-    assert!(
+    assert_eq!(
         load_verified_state_snapshot(&state_store, &missing_snapshot_id, None)
-            .expect_err("missing snapshot")
-            .contains("Failed to load state snapshot")
+            .expect_err("missing snapshot"),
+        "state_snapshot_load_failed"
     );
     let missing_state_node =
         splendor_types::StateNodeId::from_hash(ContentHash::blake3(b"missing"));
-    assert!(
+    assert_eq!(
         load_verified_state_node(&state_store, &missing_state_node, None)
-            .expect_err("missing state node")
-            .contains("Failed to load state node")
+            .expect_err("missing state node"),
+        "state_node_load_failed"
     );
 
     let approval = ApprovalTraceContext {
@@ -3904,9 +3937,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
     .expect("approval event");
     validate_approval_trace_context(&event, &approval).expect("approval identity matches");
     validate_run_match(&event, &run_id, "Approval").expect("run matches");
-    assert!(validate_run_match(&event, &other_run_id, "Approval")
-        .expect_err("run mismatch")
-        .contains("Approval trace run mismatch"));
+    assert_eq!(
+        validate_run_match(&event, &other_run_id, "Approval").expect_err("run mismatch"),
+        "audit_trace_run_mismatch"
+    );
 
     let tenant_mismatch = TraceEvent::try_new_with_identity(
         TraceIdentityContext::new(run_id.clone())
@@ -3918,9 +3952,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("tenant mismatch event");
-    assert!(validate_approval_trace_context(&tenant_mismatch, &approval)
-        .expect_err("tenant mismatch")
-        .contains("Approval trace tenant mismatch"));
+    assert_eq!(
+        validate_approval_trace_context(&tenant_mismatch, &approval).expect_err("tenant mismatch"),
+        "audit_approval_tenant_mismatch"
+    );
 
     let agent_mismatch = TraceEvent::try_new_with_identity(
         TraceIdentityContext::new(run_id.clone())
@@ -3932,9 +3967,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("agent mismatch event");
-    assert!(validate_approval_trace_context(&agent_mismatch, &approval)
-        .expect_err("agent mismatch")
-        .contains("Approval trace agent mismatch"));
+    assert_eq!(
+        validate_approval_trace_context(&agent_mismatch, &approval).expect_err("agent mismatch"),
+        "audit_approval_agent_mismatch"
+    );
 
     let action_mismatch = TraceEvent::try_new_with_identity(
         TraceIdentityContext::new(run_id.clone())
@@ -3947,9 +3983,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("action mismatch event");
-    assert!(validate_approval_trace_context(&action_mismatch, &approval)
-        .expect_err("action mismatch")
-        .contains("Approval trace action mismatch"));
+    assert_eq!(
+        validate_approval_trace_context(&action_mismatch, &approval).expect_err("action mismatch"),
+        "audit_approval_action_mismatch"
+    );
 
     let transition = governance_transition(
         GovernanceObjectRef::Approval {
@@ -3971,9 +4008,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         timestamp,
         TraceEventKind::GovernanceApprovalRequested { transition },
     );
-    assert!(validate_governance_trace_context(&transition_event)
-        .expect_err("transition run mismatch")
-        .contains("Governance transition trace run mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&transition_event).expect_err("transition run mismatch"),
+        "audit_trace_run_mismatch"
+    );
 
     let scope_only_transition = splendor_types::GovernanceTransition {
         schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
@@ -4001,9 +4039,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
             transition: scope_only_transition,
         },
     );
-    assert!(validate_governance_trace_context(&scope_only_event)
-        .expect_err("scope run mismatch")
-        .contains("Governance transition trace run mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&scope_only_event).expect_err("scope run mismatch"),
+        "audit_trace_run_mismatch"
+    );
 
     let tenant_scope_mismatch = splendor_types::GovernanceTransition {
         schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
@@ -4031,9 +4070,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("tenant scope event");
-    assert!(validate_governance_trace_context(&tenant_scope_event)
-        .expect_err("scope tenant mismatch")
-        .contains("Governance transition tenant mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&tenant_scope_event).expect_err("scope tenant mismatch"),
+        "audit_governance_tenant_mismatch"
+    );
 
     let agent_scope_mismatch = splendor_types::GovernanceTransition {
         schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
@@ -4062,9 +4102,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("agent scope event");
-    assert!(validate_governance_trace_context(&agent_scope_event)
-        .expect_err("scope agent mismatch")
-        .contains("Governance transition agent mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&agent_scope_event).expect_err("scope agent mismatch"),
+        "audit_governance_agent_mismatch"
+    );
 
     let action_scope_mismatch = splendor_types::GovernanceTransition {
         schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
@@ -4097,9 +4138,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         },
     )
     .expect("action scope event");
-    assert!(validate_governance_trace_context(&action_scope_event)
-        .expect_err("scope action mismatch")
-        .contains("Governance transition action mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&action_scope_event).expect_err("scope action mismatch"),
+        "audit_governance_action_mismatch"
+    );
 
     let rejection = GovernanceTransitionRejection {
         schema_version: splendor_types::GOVERNANCE_STATE_SCHEMA_VERSION.to_string(),
@@ -4124,9 +4166,10 @@ fn governance_replay_validation_helpers_cover_identity_and_state_paths() {
         timestamp,
         TraceEventKind::GovernanceTransitionRejected { rejection },
     );
-    assert!(validate_governance_trace_context(&rejection_event)
-        .expect_err("rejection run mismatch")
-        .contains("Governance transition rejection trace run mismatch"));
+    assert_eq!(
+        validate_governance_trace_context(&rejection_event).expect_err("rejection run mismatch"),
+        "audit_trace_run_mismatch"
+    );
 }
 
 #[test]
@@ -4155,7 +4198,7 @@ fn trace_store_preserves_payload_sequence_and_replay_rejects_envelope_mismatch()
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("replay must reject the mismatched trace envelope");
-    assert!(error.contains("Trace event sequence mismatch"));
+    assert_eq!(error, "trace_compatibility_envelope_failure");
 }
 
 #[test]
@@ -4166,7 +4209,7 @@ fn decode_trace_records_rejects_record_run_mismatch() {
 
     let error =
         decode_and_validate_trace_records(&records, &run_id.to_string()).expect_err("run mismatch");
-    assert!(error.contains("Trace record run mismatch"));
+    assert_eq!(error, "trace_compatibility_integrity_failure");
 }
 
 #[test]
@@ -4177,7 +4220,7 @@ fn decode_trace_records_rejects_record_sequence_gap() {
 
     let error =
         decode_and_validate_trace_records(&records, &run_id.to_string()).expect_err("sequence gap");
-    assert!(error.contains("Trace sequence gap"));
+    assert_eq!(error, "trace_compatibility_integrity_failure");
 }
 
 #[test]
@@ -4188,7 +4231,7 @@ fn decode_trace_records_rejects_prev_hash_mismatch() {
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("prev hash mismatch");
-    assert!(error.contains("Trace integrity chain mismatch"));
+    assert_eq!(error, "trace_compatibility_integrity_failure");
 }
 
 #[test]
@@ -4207,7 +4250,7 @@ fn decode_trace_records_rejects_payload_hash_mismatch() {
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("payload hash mismatch");
-    assert!(error.contains("Trace payload hash mismatch"));
+    assert_eq!(error, "trace_compatibility_integrity_failure");
 }
 
 #[test]
@@ -4225,7 +4268,7 @@ fn decode_trace_records_rejects_event_run_mismatch() {
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("event run mismatch");
-    assert!(error.contains("Trace event run mismatch"));
+    assert_eq!(error, "trace_compatibility_envelope_failure");
 }
 
 #[test]
@@ -4239,7 +4282,7 @@ fn decode_trace_records_rejects_trace_id_mismatch() {
 
     let error = decode_and_validate_trace_records(&records, &run_id.to_string())
         .expect_err("trace id mismatch");
-    assert!(error.contains("Trace id mismatch"));
+    assert_eq!(error, "trace_compatibility_envelope_failure");
 }
 
 #[test]
@@ -4301,7 +4344,7 @@ fn state_head_errors_when_trace_db_missing() {
     let dir = tempfile::TempDir::new().expect("dir");
     let missing = dir.path().join("missing-trace.db");
     let error = state_head(&missing, "run-1").expect_err("missing db");
-    assert!(error.contains("Trace database not found"));
+    assert_eq!(error, "trace_database_not_found");
 }
 
 #[test]
@@ -4338,7 +4381,7 @@ fn state_head_errors_without_state_commit() {
 
     let error = state_head(&trace_temp.path().to_path_buf(), &run_id.to_string())
         .expect_err("missing state commit");
-    assert!(error.contains("No StateCommitted event"));
+    assert_eq!(error, "state_head_not_found");
 }
 
 #[test]
@@ -5879,9 +5922,9 @@ fn signed_run_authority_rejects_action_adapter_permission_and_identity_mismatche
                 },
             ..
         }] if work_order_id.as_str() == "wo_cli"
-            && event_tenant_id == &tenant_id
-            && event_agent_id == &agent_id
-            && event_run_id == &run_id
+            && *event_tenant_id == tenant_id
+            && *event_agent_id == agent_id
+            && *event_run_id == run_id
             && reason == "ambiguous_work_order_action_adapter_profile"
     ));
     let encoded = serde_json::to_string(&events).expect("encoded audit evidence");
@@ -5942,7 +5985,7 @@ fn signed_run_authority_evidence_append_failure_blocks_counted_effect() {
 }
 
 #[test]
-fn run_from_config_trace_failure_injection_records_runtime_evidence_and_blocks_side_effect() {
+fn run_from_config_trace_failure_injection_blocks_side_effect_without_forged_evidence() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");
     let state_path = dir.path().join("state.db");
@@ -5974,7 +6017,7 @@ fn run_from_config_trace_failure_injection_records_runtime_evidence_and_blocks_s
 
     let error = run_from_config(&config_path, Some(1), false)
         .expect_err("trace failure injection must fail closed");
-    assert!(error.contains("injected_trace_write_failure:ActionVerificationStarted"));
+    assert!(error.contains("trace_compatibility_store_failure"));
     assert!(!fs_base
         .join(tenant_uuid.to_string())
         .join("blocked.txt")
@@ -5982,119 +6025,13 @@ fn run_from_config_trace_failure_injection_records_runtime_evidence_and_blocks_s
 
     let store = SqliteTraceStore::open(&trace_path).expect("trace store");
     let records = TraceStore::read(&store, &run_id.to_string()).expect("records");
-    let evidence = records
-        .iter()
-        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
-        .expect("trace-write failure evidence");
-    assert_eq!(
-        evidence.payload["kind"]["TraceWriteFailed"]["failed_event"],
-        "ActionVerificationStarted"
-    );
-    assert_eq!(
-        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
-        serde_json::json!(false)
-    );
+    assert!(records.iter().all(|record| {
+        trace_payload_kind(&record.payload).as_deref() != Some("TraceWriteFailed")
+    }));
 }
 
 #[test]
-fn trace_failure_side_effect_evidence_is_tick_scoped_and_requires_action_executed() {
-    let store = splendor_store::InMemoryTraceStore::default();
-    let run_id = fixed_run_id(0x7101);
-    let action = Action {
-        name: "write_file".to_string(),
-        params: serde_json::json!({"path": "executed.txt"}),
-        side_effect_class: SideEffectClass::Filesystem,
-        cost_estimate: None,
-        required_permissions: vec!["fs.write".to_string()],
-        preconditions: Vec::new(),
-        postconditions: Vec::new(),
-    };
-    let prior_tick_event = TraceEvent::try_new_with_identity(
-        TraceIdentityContext::new(run_id.clone())
-            .with_tick_id(TickId::from(1))
-            .with_action_id(fixed_action_id(0x7102)),
-        0,
-        OffsetDateTime::now_utc(),
-        TraceEventKind::ActionExecuted {
-            action: action.clone(),
-            outcome: serde_json::json!({"bytes_written": 1}),
-        },
-    )
-    .expect("prior tick execution event");
-    TraceStore::append(
-        &store,
-        &run_id.to_string(),
-        serde_json::to_value(prior_tick_event).expect("prior tick execution payload"),
-    )
-    .expect("persist prior tick execution");
-
-    let failed_action_event = TraceEvent::try_new_with_identity(
-        TraceIdentityContext::new(run_id.clone())
-            .with_tick_id(TickId::from(2))
-            .with_action_id(fixed_action_id(0x7103)),
-        1,
-        OffsetDateTime::now_utc(),
-        TraceEventKind::ActionFailed {
-            action: action.clone(),
-            error: "adapter failed before execution was established".to_string(),
-            result: VerificationResult::deny("adapter_failed"),
-        },
-    )
-    .expect("current tick action failure event");
-    TraceStore::append(
-        &store,
-        &run_id.to_string(),
-        serde_json::to_value(failed_action_event).expect("current tick action failure payload"),
-    )
-    .expect("persist current tick action failure");
-
-    let failed_payload = serde_json::to_value(
-        TraceEvent::try_new_with_identity(
-            TraceIdentityContext::new(run_id.clone()).with_tick_id(TickId::from(2)),
-            2,
-            OffsetDateTime::now_utc(),
-            TraceEventKind::OutcomeRecorded {
-                outcome: serde_json::json!({"tick_id": 2, "status": "failed"}),
-                feedback: None,
-                reward: None,
-            },
-        )
-        .expect("current tick outcome event"),
-    )
-    .expect("current tick outcome payload");
-
-    assert!(!side_effect_executed_before_trace_failure(
-        &store,
-        &run_id.to_string(),
-        &failed_payload,
-    )
-    .expect("tick-scoped execution evidence"));
-
-    let current_execution_payload = serde_json::to_value(
-        TraceEvent::try_new_with_identity(
-            TraceIdentityContext::new(run_id.clone())
-                .with_tick_id(TickId::from(2))
-                .with_action_id(fixed_action_id(0x7103)),
-            2,
-            OffsetDateTime::now_utc(),
-            TraceEventKind::ActionExecuted {
-                action,
-                outcome: serde_json::json!({"bytes_written": 1}),
-            },
-        )
-        .expect("current failing execution event"),
-    )
-    .expect("current failing execution payload");
-    assert!(side_effect_executed_before_trace_failure(
-        &store,
-        &run_id.to_string(),
-        &current_execution_payload,
-    )
-    .expect("current failing event evidence"));
-}
-
-#[test]
-fn run_from_config_outcome_trace_failure_records_executed_effect_and_stops_run() {
+fn run_from_config_outcome_trace_failure_preserves_effect_fact_and_stops_run() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");
     let state_path = dir.path().join("state.db");
@@ -6126,7 +6063,7 @@ fn run_from_config_outcome_trace_failure_records_executed_effect_and_stops_run()
 
     let error = run_from_config(&config_path, Some(2), false)
         .expect_err("post-effect trace failure must fail the tick");
-    assert!(error.contains("injected_trace_write_failure:OutcomeRecorded"));
+    assert!(error.contains("trace_compatibility_store_failure"));
 
     let effect_path = fs_base.join(tenant_uuid.to_string()).join("executed.txt");
     assert_eq!(
@@ -6154,18 +6091,9 @@ fn run_from_config_outcome_trace_failure_records_executed_effect_and_stops_run()
             .count(),
         1
     );
-    let evidence = records
-        .iter()
-        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
-        .expect("trace-write failure evidence");
-    assert_eq!(
-        evidence.payload["kind"]["TraceWriteFailed"]["failed_event"],
-        "OutcomeRecorded"
-    );
-    assert_eq!(
-        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
-        serde_json::json!(true)
-    );
+    assert!(records.iter().all(|record| {
+        trace_payload_kind(&record.payload).as_deref() != Some("TraceWriteFailed")
+    }));
     for forbidden_event in ["OutcomeRecorded", "StateCommitted", "LoopTickCompleted"] {
         assert!(records.iter().all(|record| {
             trace_payload_kind(&record.payload).as_deref() != Some(forbidden_event)
@@ -6208,7 +6136,7 @@ fn run_from_config_read_only_outcome_trace_failure_does_not_report_side_effect()
 
     let error = run_from_config_with_test_overrides(&config_path, Some(1), false, &overrides)
         .expect_err("post-read trace failure must fail the tick");
-    assert!(error.contains("injected_trace_write_failure:OutcomeRecorded"));
+    assert!(error.contains("trace_compatibility_store_failure"));
     assert_eq!(counter.calls_for("inspect"), 1);
 
     let store = SqliteTraceStore::open(&trace_path).expect("trace store");
@@ -6221,18 +6149,13 @@ fn run_from_config_read_only_outcome_trace_failure_does_not_report_side_effect()
         serde_json::from_value(executed.payload["kind"]["ActionExecuted"]["action"].clone())
             .expect("executed read-only action");
     assert_eq!(executed_action.side_effect_class, SideEffectClass::ReadOnly);
-    let evidence = records
-        .iter()
-        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("TraceWriteFailed"))
-        .expect("trace-write failure evidence");
-    assert_eq!(
-        evidence.payload["kind"]["TraceWriteFailed"]["side_effect_executed"],
-        serde_json::json!(false)
-    );
+    assert!(records.iter().all(|record| {
+        trace_payload_kind(&record.payload).as_deref() != Some("TraceWriteFailed")
+    }));
 }
 
 #[test]
-fn run_from_config_state_failure_injection_records_evidence_and_prevents_next_tick() {
+fn run_from_config_state_failure_injection_prevents_next_tick_without_forged_evidence() {
     let dir = tempfile::TempDir::new().expect("dir");
     let trace_path = dir.path().join("trace.db");
     let state_path = dir.path().join("state.db");
@@ -6271,18 +6194,9 @@ fn run_from_config_state_failure_injection_records_evidence_and_prevents_next_ti
         .filter(|record| trace_payload_kind(&record.payload).as_deref() == Some("LoopTickStarted"))
         .count();
     assert_eq!(tick_starts, 1);
-    let evidence = records
-        .iter()
-        .find(|record| trace_payload_kind(&record.payload).as_deref() == Some("StateCommitFailed"))
-        .expect("state commit failure evidence");
-    assert_eq!(
-        evidence.payload["kind"]["StateCommitFailed"]["next_tick_advanced"],
-        serde_json::json!(false)
-    );
-    assert_eq!(
-        evidence.payload["kind"]["StateCommitFailed"]["failure_injection"],
-        "splendorctl_public_run_config"
-    );
+    assert!(records.iter().all(|record| {
+        trace_payload_kind(&record.payload).as_deref() != Some("StateCommitFailed")
+    }));
 }
 
 #[test]
@@ -6531,7 +6445,8 @@ fn main_returns_failure_on_error() {
 fn main_returns_success_on_export() {
     let temp = NamedTempFile::new().expect("temp file");
     let store = SqliteTraceStore::open(temp.path()).expect("open store");
-    TraceStore::append(&store, "run-1", serde_json::json!({"event": 1})).expect("append");
+    let run_id = RunId::new();
+    append_valid_trace_records(&store, &run_id);
     let args = vec![
         "splendorctl".to_string(),
         "trace".to_string(),
@@ -6539,7 +6454,7 @@ fn main_returns_success_on_export() {
         "--db".to_string(),
         temp.path().to_string_lossy().to_string(),
         "--run".to_string(),
-        "run-1".to_string(),
+        run_id.to_string(),
     ];
     let exit = with_test_args(args, main);
     assert_eq!(exit, ExitCode::SUCCESS);
@@ -6877,12 +6792,12 @@ fn local_resource_boundary_verifier_covers_http_and_filesystem_paths() {
 }
 
 #[test]
-fn failure_injection_trace_store_fails_once_then_delegates() {
+fn failure_injection_runtime_writer_fails_once_then_delegates() {
     let db = NamedTempFile::new().expect("trace db");
     let store = FailingTraceStore {
         inner: SqliteTraceStore::open(db.path()).expect("trace store"),
         fail_on_event: "tick.started".to_string(),
-        failed: Mutex::new(false),
+        failed: Arc::new(Mutex::new(false)),
     };
     let typed_run_id = RunId::new();
     let run_id = typed_run_id.to_string();
@@ -6896,38 +6811,30 @@ fn failure_injection_trace_store_fails_once_then_delegates() {
         trace_payload_kind(&payload),
         Some("tick.started".to_string())
     );
-    let error =
-        TraceStore::append(&store, &run_id, payload.clone()).expect_err("first append fails");
-    assert!(error
-        .to_string()
-        .contains("injected_trace_write_failure:tick.started"));
-
-    let records = TraceStore::read(&store, &run_id).expect("failure evidence record");
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        trace_payload_kind(&records[0].payload),
-        Some("TraceWriteFailed".to_string())
-    );
-    assert_eq!(
-        records[0].payload["kind"]["TraceWriteFailed"]["failed_event"],
-        "tick.started"
-    );
-
-    let sequence = TraceStore::append(&store, &run_id, payload).expect("second append succeeds");
-    assert_eq!(sequence, 1);
-    let object_kind_payload = serde_json::json!({"kind": {"tick.completed": {"tick_id": 1}}});
-    assert_eq!(
-        trace_payload_kind(&object_kind_payload),
-        Some("tick.completed".to_string())
-    );
-    let second_sequence =
-        TraceStore::append(&store, &run_id, object_kind_payload).expect("append object kind");
-    assert_eq!(second_sequence, 2);
-
+    let writer = store
+        .acquire_runtime_writer(RuntimeTraceWriterRequest::current(
+            RuntimeTraceScope::new(&run_id, "tenant", "agent"),
+            RuntimeTraceLimits::default(),
+        ))
+        .expect("runtime writer");
+    let tail = writer.tail().expect("tail");
+    assert!(matches!(
+        writer.append(&tail, payload.clone()),
+        Err(RuntimeTracePortError::Unavailable)
+    ));
+    let append = writer
+        .append(&tail, payload.clone())
+        .expect("second append succeeds");
+    assert_eq!(append.sequence(), 0);
+    writer.close().expect("close writer");
+    assert!(matches!(
+        TraceStore::append(&store, &run_id, payload),
+        Err(TraceStoreError::SequenceMismatch { .. })
+    ));
     let records = TraceStore::read(&store, &run_id).expect("records");
-    assert_eq!(records.len(), 3);
-    let range = TraceStore::read_range(&store, &run_id, 0, 3).expect("range");
-    assert_eq!(range.len(), 3);
+    assert_eq!(records.len(), 1);
+    let range = TraceStore::read_range(&store, &run_id, 0, 1).expect("range");
+    assert_eq!(range.len(), 1);
 }
 
 #[test]
@@ -6985,13 +6892,13 @@ fn substitute_counter_updates_nested_values() {
 #[test]
 fn parse_snapshot_id_rejects_invalid_format() {
     let error = parse_snapshot_id("invalid").expect_err("error");
-    assert!(error.contains("Snapshot id must be formatted"));
+    assert_eq!(error, "replay_snapshot_id_invalid");
 }
 
 #[test]
 fn parse_snapshot_id_rejects_unknown_algorithm() {
     let error = parse_snapshot_id("nope:abc").expect_err("error");
-    assert!(error.contains("Unknown hash algorithm"));
+    assert_eq!(error, "replay_snapshot_id_invalid");
 }
 
 #[test]
@@ -7405,7 +7312,8 @@ fn parse_args_run_cycles_missing_value() {
 fn run_with_args_trace_export_succeeds() {
     let trace_temp = NamedTempFile::new().expect("trace db");
     let trace_store = SqliteTraceStore::open(trace_temp.path()).expect("trace store");
-    TraceStore::append(&trace_store, "run-1", serde_json::json!({"event": 1})).expect("append");
+    let run_id = RunId::new();
+    append_valid_trace_records(&trace_store, &run_id);
 
     run_with_args(vec![
         "trace".to_string(),
@@ -7413,7 +7321,7 @@ fn run_with_args_trace_export_succeeds() {
         "--db".to_string(),
         trace_temp.path().display().to_string(),
         "--run".to_string(),
-        "run-1".to_string(),
+        run_id.to_string(),
     ])
     .expect("run with args");
 }

@@ -27,6 +27,9 @@ hash is computed from payload bytes alone. For `LoopTickCompleted`, the payload
 is normalized with `integrity` removed so the hash does not include itself.
 Runtime recovery separately verifies that present completion-integrity values
 match the storage-owned previous/event hashes before consuming the completion.
+The current anchored runtime profile requires this integrity value; historical
+unanchored traces may omit it only for inspect/export/replay compatibility and
+cannot resume live.
 
 ## TraceStore
 
@@ -34,11 +37,11 @@ Synchronous storage interface:
 
 ```
 append(run_id, payload) -> sequence
-append_if_sequence(run_id, expected_sequence, payload) -> sequence
 read(run_id) -> Vec<TraceRecord>
 read_range(run_id, start, end) -> Vec<TraceRecord>
-claim_runtime_identity(run_id, tenant_id, agent_id) -> RuntimeIdentityClaim
-release_runtime_identity(claim) -> ()
+runtime_store_identity() -> RuntimeTraceStoreIdentity
+open_runtime_reader(run_id, limits) -> RuntimeTraceReader
+acquire_runtime_writer(request) -> RuntimeTraceWriter
 ```
 
 `append` treats the entire JSON value as opaque application payload. A top-level
@@ -46,24 +49,23 @@ field named `sequence` is never storage metadata, regardless of whether its valu
 is numeric, textual, nested, null, or malformed-looking. Ordering lives only in
 `TraceRecord.sequence`, so existing generic payloads round-trip unchanged.
 
-Runtime emitters use `append_if_sequence`. Both built-in stores compare the
-explicit expected value with the next storage-owned position while holding the
-same append lock/transaction. A stale writer receives
-`TraceStoreError::SequenceMismatch` and appends nothing; it cannot silently
-acquire a later sequence. Custom stores that do not implement atomic conditional
-append fail closed with `ConditionalAppendUnsupported`. Exhausting SQLite's
-bounded writer-lock wait returns `ConditionalAppendContended`, never an
-unclassified raw busy/locked error.
+The three runtime methods are additive default-deny compatibility methods.
+Existing custom `TraceStore` implementations continue to compile and return the
+fixed `RuntimeTracePortError::Unsupported` until they implement the capability.
+The legacy exhaustive `TraceStoreError` enum is unchanged.
 
-`validate_trace_chain(run_id, records)` is the canonical full-chain validator
-used before runtime recovery and by replay/export validation. It checks exact
-record run identity, a contiguous sequence beginning at zero, every previous-hash
-link, and every recomputed event hash before a consumer interprets payloads.
+`RuntimeTraceReader` exposes only a bounded page read, a mechanically confirmed
+tail, and tail reconfirmation. `RuntimeTraceWriter` adds atomic fenced append and
+synchronous `close`. Every append supplies the exact previously confirmed tail;
+a stale sequence, hash, anchor revision, or fence fails closed. Closing or
+dropping the writer revokes future appends, and append/close are linearized.
 
-Persisted loop construction also obtains an opaque exact
-`run_id + tenant_id + agent_id` live-owner claim. Duplicate fresh or resumed
-owners fail closed before emitting a competing runtime event. Custom stores that
-cannot coordinate ownership return `RuntimeIdentityOwnershipUnsupported`.
+`splendor-evidence` owns the stable event-profile semantics above this mechanical
+port. It validates exact run identity, contiguous storage sequence, previous-hash
+links, stable event hashes, full storage-envelope hashes, event envelopes, tick
+lifecycle, current completion integrity, and conservative record/page/payload/
+byte limits before state restore, replay, audit, or export. Store implementations
+do not interpret policy, tick, state, replay, or evidence meaning.
 
 ## AsyncTraceStore
 
@@ -71,9 +73,9 @@ Async wrapper with the same semantics, returning futures for each operation.
 
 ## InMemoryTraceStore
 
-Holds trace records in memory keyed by `run_id`. The store assigns sequence from
-vector length; conditional append and process-local exact-identity claims are
-serialized under their owning mutexes.
+Holds trace records in memory keyed by `run_id`. Runtime writer acquisition,
+anchored tail comparison, append, and close are serialized under store-owned
+mutexes. An anchored run rejects the legacy `append` path.
 
 ## SqliteTraceStore
 
@@ -81,29 +83,53 @@ SQLite-backed store that persists trace records on disk. The schema includes:
 
 - `trace_events`: `run_id`, `sequence`, `payload`, `recorded_at`, `event_hash_*`,
   and `prev_hash_*` columns.
+- `trace_store_metadata`: a stable random store ID.
+- `trace_run_anchor_registry`: immutable run/profile ownership.
+- `trace_run_anchors`: next/high-water sequence, stable and full-envelope tail
+  hashes, monotonic anchor revision, and active fence digest.
+- `trace_append_permits`: transaction-local authorization used by trigger-guarded
+  anchored inserts.
 
-SQLite selects the next sequence, compares an explicit conditional expectation
-when supplied, inserts the opaque payload, and commits under one `IMMEDIATE`
-transaction. Connections use a bounded busy policy, and the
-`(run_id, sequence)` primary key remains the durable final conflict guard across
-store instances. Concurrent conditional writers therefore produce one append
-and one typed sequence conflict rather than leaking normal race contention as a
-`database is locked` result.
+Runtime append inserts the opaque event and compare-and-swaps the anchor in one
+bounded `IMMEDIATE` transaction. Trigger guards deny direct legacy insert,
+update, or delete against anchored history. Existing `trace_events` rows and
+stable event bytes/hashes are not rewritten.
 
-Writable SQLite stores derive a hashed, identity-specific lock database adjacent
-to the trace database. A short bounded `BEGIN IMMEDIATE` acquires the claim and
-the connection remains open only for the live engine lifetime; process death or
-claim release drops the lock automatically. These sidecar files contain no trace
-payload or raw identity and do not change the `trace_events` schema. They are not
-durable lease or fleet-writer records, and this local mechanism makes no
-transferable-writer or distributed-fencing claim.
+Writable SQLite stores bind ownership to the verified opened database identity
+plus persisted store ID and run partition, not a pathname. The default private
+`.splendor-runtime-locks` directory is owner-only (`0700`) and contains at most
+256 owner-only (`0600`) no-follow shard files. A nonblocking OS lock plus a
+same-process shard guard safely denies aliases and shard collisions; process
+death releases the OS lock. Writable databases must be owner-only regular
+single-link files and are revalidated before append, so hard links, symlinks,
+renames, and replacements fail closed. Lock paths and public runtime errors do
+not expose run, tenant, agent, database identity, fence, or hash material.
 
-Read-only SQLite stores cannot acquire runtime ownership or append conditionally.
+Schema initialization is additive, idempotent, and transactional. Empty legacy
+databases may initialize the current profile. Non-empty unanchored history is
+never auto-anchored: it remains byte-stable and inspect/export/replay-only.
+Read-only SQLite stores can inspect bounded history but cannot acquire a writer.
+This local capability is not a transferable or distributed writer lease.
 
 ## Trace Export Tool
 
 Use `splendorctl trace export --db <path> --run <id>` to emit JSON Lines for a
-run. Each line is a serialized `TraceRecord`.
+run. The CLI validates the complete bounded history, applies the redacted
+projection, and securely spools all records before writing stdout. A late
+integrity, serialization, or output failure returns nonzero without emitting a
+partial record set. State-head, audit, and replay consumers use the same semantic
+validator; replay remains inspect-only and does not execute adapters.
+
+## Failure and compatibility behavior
+
+- Runtime capability errors are fixed, non-reflecting codes and are
+  `#[non_exhaustive]` for compatible extension.
+- Unsupported custom stores, stale fences, unavailable verification, limit
+  overflow, and uncertain ownership deny rather than fall back to legacy append.
+- Stable `TraceEvent` serialization and event hashes remain unchanged; the
+  full-envelope hash is additive anchor metadata.
+- Current-profile corruption or missing completion integrity blocks state load,
+  policy, Gateway, and adapter work.
 
 ## Example
 

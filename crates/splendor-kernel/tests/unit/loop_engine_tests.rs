@@ -1,9 +1,11 @@
 use super::*;
 use crate::SnapshotPolicy;
 use splendor_store::{
-    InMemoryStateStore, InMemoryTraceStore, SqliteTraceStore, StateData, StateDataRef,
-    StateMetadata, StateNode, StateNodeId, StateSnapshot, StateStore, StateStoreError,
-    TraceStoreError,
+    InMemoryStateStore, InMemoryTraceStore, RuntimeTraceAppend, RuntimeTraceLimits,
+    RuntimeTracePage, RuntimeTracePortError, RuntimeTraceReader, RuntimeTraceReaderHandle,
+    RuntimeTraceStoreIdentity, RuntimeTraceTail, RuntimeTraceWriter, RuntimeTraceWriterHandle,
+    RuntimeTraceWriterRequest, SqliteTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
+    StateNodeId, StateSnapshot, StateStore, StateStoreError, TraceRecord, TraceStoreError,
 };
 use splendor_types::{
     validate_policy_bundle, ActionId, AgentId, ApprovalDecision, ApprovalEvidence, ApprovalId,
@@ -15,8 +17,328 @@ use splendor_types::{
     WorkOrderQuotaPolicy, WORK_ORDER_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
+
+fn activate_test_runtime_writer(
+    runtime: &KernelRuntime,
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+) -> RuntimeWriterLease {
+    let writer = runtime
+        .acquire_engine_writer(tenant_id, agent_id)
+        .expect("runtime writer");
+    let inspected = inspect_trace(writer.reader(), runtime.run_id()).expect("validated trace");
+    runtime
+        .activate_engine_writer(&writer, inspected.tail)
+        .expect("activate runtime writer");
+    writer
+}
+
+#[derive(Clone)]
+struct CountingRuntimeTraceStore {
+    inner: InMemoryTraceStore,
+    history_reads: Arc<AtomicUsize>,
+    writer_acquisitions: Arc<AtomicUsize>,
+}
+
+impl CountingRuntimeTraceStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryTraceStore::default(),
+            history_reads: Arc::new(AtomicUsize::new(0)),
+            writer_acquisitions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl TraceStore for CountingRuntimeTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        TraceStore::append(&self.inner, run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read(&self.inner, run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read_range(&self.inner, run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        self.writer_acquisitions.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire_runtime_writer(request)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPausePhase {
+    InitialTail,
+    HistoryPage,
+    ValidationTailConfirmation,
+    StateRestore,
+    RestoredTailConfirmation,
+    CursorActivation,
+}
+
+struct RecoveryPauseGate {
+    phase: RecoveryPausePhase,
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    paused: AtomicBool,
+}
+
+impl RecoveryPauseGate {
+    fn new(phase: RecoveryPausePhase) -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered_sender, entered_receiver) = sync_channel(0);
+        let (release_sender, release_receiver) = sync_channel(0);
+        (
+            Arc::new(Self {
+                phase,
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                paused: AtomicBool::new(false),
+            }),
+            entered_receiver,
+            release_sender,
+        )
+    }
+
+    fn pause(&self, phase: RecoveryPausePhase) {
+        if self.phase != phase || self.paused.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.entered.send(()).expect("announce recovery phase");
+        self.release
+            .lock()
+            .expect("recovery release lock")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("release recovery phase");
+    }
+}
+
+#[derive(Clone)]
+struct RecoveryControlledTraceStore {
+    inner: Arc<SqliteTraceStore>,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    history_calls: Arc<AtomicUsize>,
+    writer_acquisitions: Arc<AtomicUsize>,
+}
+
+impl RecoveryControlledTraceStore {
+    fn new(inner: Arc<SqliteTraceStore>, gate: Option<Arc<RecoveryPauseGate>>) -> Self {
+        Self {
+            inner,
+            gate,
+            history_calls: Arc::new(AtomicUsize::new(0)),
+            writer_acquisitions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl TraceStore for RecoveryControlledTraceStore {
+    fn append(&self, run_id: &str, payload: serde_json::Value) -> Result<u64, TraceStoreError> {
+        TraceStore::append(self.inner.as_ref(), run_id, payload)
+    }
+
+    fn read(&self, run_id: &str) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read(self.inner.as_ref(), run_id)
+    }
+
+    fn read_range(
+        &self,
+        run_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<TraceRecord>, TraceStoreError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        TraceStore::read_range(self.inner.as_ref(), run_id, start, end)
+    }
+
+    fn runtime_store_identity(&self) -> Result<RuntimeTraceStoreIdentity, RuntimeTracePortError> {
+        self.inner.runtime_store_identity()
+    }
+
+    fn open_runtime_reader(
+        &self,
+        run_id: &str,
+        limits: RuntimeTraceLimits,
+    ) -> Result<RuntimeTraceReaderHandle, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.open_runtime_reader(run_id, limits)
+    }
+
+    fn acquire_runtime_writer(
+        &self,
+        request: RuntimeTraceWriterRequest,
+    ) -> Result<RuntimeTraceWriterHandle, RuntimeTracePortError> {
+        self.writer_acquisitions.fetch_add(1, Ordering::SeqCst);
+        let writer = self.inner.acquire_runtime_writer(request)?;
+        Ok(Arc::new(RecoveryControlledWriter {
+            inner: writer,
+            gate: self.gate.clone(),
+            history_calls: Arc::clone(&self.history_calls),
+            confirm_calls: AtomicUsize::new(0),
+            identity_calls: AtomicUsize::new(0),
+        }))
+    }
+}
+
+struct RecoveryControlledWriter {
+    inner: RuntimeTraceWriterHandle,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    history_calls: Arc<AtomicUsize>,
+    confirm_calls: AtomicUsize,
+    identity_calls: AtomicUsize,
+}
+
+impl RecoveryControlledWriter {
+    fn pause(&self, phase: RecoveryPausePhase) {
+        if let Some(gate) = self.gate.as_ref() {
+            gate.pause(phase);
+        }
+    }
+}
+
+impl RuntimeTraceReader for RecoveryControlledWriter {
+    fn store_identity(&self) -> RuntimeTraceStoreIdentity {
+        let call = self.identity_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 2 {
+            self.pause(RecoveryPausePhase::CursorActivation);
+        }
+        self.inner.store_identity()
+    }
+
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    fn limits(&self) -> RuntimeTraceLimits {
+        self.inner.limits()
+    }
+
+    fn tail(&self) -> Result<RuntimeTraceTail, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.pause(RecoveryPausePhase::InitialTail);
+        self.inner.tail()
+    }
+
+    fn read_page(&self, start: u64) -> Result<RuntimeTracePage, RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        self.pause(RecoveryPausePhase::HistoryPage);
+        self.inner.read_page(start)
+    }
+
+    fn confirm_tail(&self, expected: &RuntimeTraceTail) -> Result<(), RuntimeTracePortError> {
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.confirm_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            self.pause(RecoveryPausePhase::ValidationTailConfirmation);
+        } else if call == 2 {
+            self.pause(RecoveryPausePhase::RestoredTailConfirmation);
+        }
+        self.inner.confirm_tail(expected)
+    }
+}
+
+impl RuntimeTraceWriter for RecoveryControlledWriter {
+    fn append(
+        &self,
+        expected: &RuntimeTraceTail,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTraceAppend, RuntimeTracePortError> {
+        self.inner.append(expected, payload)
+    }
+
+    fn close(&self) -> Result<(), RuntimeTracePortError> {
+        self.inner.close()
+    }
+}
+
+struct RecoveryControlledStateStore {
+    inner: Arc<InMemoryStateStore>,
+    gate: Option<Arc<RecoveryPauseGate>>,
+    snapshot_loads: Arc<AtomicUsize>,
+}
+
+impl StateStore for RecoveryControlledStateStore {
+    fn put_state(&self, state: StateData) -> Result<StateDataRef, StateStoreError> {
+        self.inner.put_state(state)
+    }
+
+    fn get_state(&self, data_ref: &StateDataRef) -> Result<StateData, StateStoreError> {
+        self.inner.get_state(data_ref)
+    }
+
+    fn commit_node(
+        &self,
+        parent_ids: Vec<StateNodeId>,
+        data_ref: StateDataRef,
+        metadata: StateMetadata,
+    ) -> Result<StateNodeId, StateStoreError> {
+        self.inner.commit_node(parent_ids, data_ref, metadata)
+    }
+
+    fn get_node(&self, node_id: &StateNodeId) -> Result<StateNode, StateStoreError> {
+        self.inner.get_node(node_id)
+    }
+
+    fn snapshot(&self, node_id: &StateNodeId) -> Result<SnapshotId, StateStoreError> {
+        self.inner.snapshot(node_id)
+    }
+
+    fn load_snapshot(&self, snapshot_id: &SnapshotId) -> Result<StateSnapshot, StateStoreError> {
+        self.snapshot_loads.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.gate.as_ref() {
+            gate.pause(RecoveryPausePhase::StateRestore);
+        }
+        self.inner.load_snapshot(snapshot_id)
+    }
+}
+
+struct RecoveryCountingPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Policy for RecoveryCountingPolicy {
+    fn name(&self) -> &str {
+        "recovery-counting"
+    }
+
+    fn decide(
+        &self,
+        state: &StateData,
+        _percepts: &[Percept],
+    ) -> Result<PolicyDecision, LoopError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyDecision::new(Vec::new(), state.clone(), None))
+    }
+}
 
 struct LoopPolicyTraceRecorder;
 
@@ -1483,6 +1805,13 @@ fn corrupt_persisted_trace(
     corruption: PersistedTraceCorruption,
 ) {
     let connection = rusqlite::Connection::open(path).expect("corruption connection");
+    connection
+        .execute_batch(
+            "DROP TRIGGER trace_anchored_insert_guard;\
+             DROP TRIGGER trace_anchored_update_guard;\
+             DROP TRIGGER trace_anchored_delete_guard;",
+        )
+        .expect("disable mutation guards for corruption fixture");
     let run_id = run_id.to_string();
     match corruption {
         PersistedTraceCorruption::Payload => {
@@ -1655,12 +1984,11 @@ fn resume_rejects_every_persisted_trace_corruption_before_state_restore() {
         assert!(
             matches!(
                 result,
-                Err(LoopError::TraceStore(
-                    TraceStoreError::IntegrityRunIdentityMismatch { .. }
-                        | TraceStoreError::IntegritySequenceMismatch { .. }
-                        | TraceStoreError::IntegrityChainMismatch { .. }
-                        | TraceStoreError::IntegrityHashMismatch { .. }
-                ) | LoopError::TraceEnvelopeIntegrity { .. })
+                Err(LoopError::Trace(TraceError::Compatibility(
+                    TraceCompatibilityError::Integrity
+                        | TraceCompatibilityError::Envelope
+                        | TraceCompatibilityError::CompletionIntegrity
+                )))
             ),
             "{corruption:?} did not return a structured integrity error"
         );
@@ -1898,6 +2226,7 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
         let target_agent = AgentId::new();
         let runtime = KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
             .expect("runtime");
+        let runtime_writer = activate_test_runtime_writer(&runtime, &target_tenant, &target_agent);
         assert!(runtime
             .admit_fresh_engine(&target_tenant, &target_agent)
             .expect("fresh admission"));
@@ -1962,6 +2291,7 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
                 },
             )
             .expect("tick completion");
+        drop(runtime_writer);
         let before = trace_store.read(&run_id.to_string()).expect("trace before");
         let policy_calls = Arc::new(AtomicUsize::new(0));
 
@@ -2173,8 +2503,8 @@ fn persisted_shared_constructor_requires_a_store_backed_ownership_boundary() {
 
     assert!(matches!(
         result,
-        Err(LoopError::Trace(TraceError::Store(
-            TraceStoreError::RuntimeIdentityOwnershipUnsupported
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::Store
         )))
     ));
     assert!(events.lock().expect("events lock").is_empty());
@@ -2267,15 +2597,9 @@ fn concurrent_resumed_sqlite_constructors_admit_one_exact_live_owner() {
                 .filter(|result| {
                     matches!(
                         result,
-                        Err(LoopError::Trace(TraceError::Store(
-                            TraceStoreError::RuntimeIdentityAlreadyOwned {
-                                run_id: conflict_run,
-                                tenant_id: conflict_tenant,
-                                agent_id: conflict_agent,
-                            }
-                        ))) if conflict_run == &run_id.to_string()
-                            && conflict_tenant == &tenant_id.to_string()
-                            && conflict_agent == &agent_id.to_string()
+                        Err(LoopError::Trace(TraceError::Compatibility(
+                            TraceCompatibilityError::WriterConflict
+                        )))
                     )
                 })
                 .count(),
@@ -2290,6 +2614,263 @@ fn concurrent_resumed_sqlite_constructors_admit_one_exact_live_owner() {
             "race {race} appended a competing owner event"
         );
         drop(results);
+    }
+}
+
+#[test]
+fn resume_acquires_live_writer_before_snapshot_access_and_reloads_after_owner_exit() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let path = directory.path().join("trace.sqlite3");
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(1),
+        important_labels: Vec::new(),
+    };
+    let mut seed = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("seed trace store")),
+        Some(run_id.clone()),
+    )
+    .expect("seed engine");
+    seed.tick(1).expect("seed tick");
+    drop(seed);
+
+    let owner = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("owner trace store")),
+        run_id.clone(),
+    )
+    .expect("live owner");
+    let snapshot_loads = Arc::new(AtomicUsize::new(0));
+    let contender_state: Arc<dyn StateStore> = Arc::new(RestoreCountingStateStore {
+        inner: state_store,
+        snapshot_loads: Arc::clone(&snapshot_loads),
+    });
+
+    let contender = LoopEngine::resume_from_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(contender_state.clone(), snapshot_policy.clone()),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("contender trace store")),
+        run_id.clone(),
+    );
+    assert!(matches!(
+        contender,
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::WriterConflict
+        )))
+    ));
+    assert_eq!(snapshot_loads.load(Ordering::SeqCst), 0);
+
+    drop(owner);
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(contender_state, snapshot_policy),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        Arc::new(SqliteTraceStore::open(&path).expect("reclaimed trace store")),
+        run_id,
+    )
+    .expect("recovery after owner exit");
+    assert_eq!(snapshot_loads.load(Ordering::SeqCst), 1);
+    assert_eq!(resumed.last_tick_id(), Some(1));
+}
+
+#[test]
+fn recovery_writer_excludes_contenders_through_every_recovery_phase() {
+    for phase in [
+        RecoveryPausePhase::InitialTail,
+        RecoveryPausePhase::HistoryPage,
+        RecoveryPausePhase::ValidationTailConfirmation,
+        RecoveryPausePhase::StateRestore,
+        RecoveryPausePhase::RestoredTailConfirmation,
+        RecoveryPausePhase::CursorActivation,
+    ] {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let path = directory.path().join("trace.sqlite3");
+        let state_store = Arc::new(InMemoryStateStore::default());
+        let run_id = RunId::new();
+        let tenant_id = TenantId::new();
+        let agent_id = AgentId::new();
+        let snapshot_policy = SnapshotPolicy {
+            interval: Some(1),
+            important_labels: Vec::new(),
+        };
+        let mut seed = LoopEngine::with_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+            StateData {
+                bytes: vec![0],
+                content_type: None,
+            },
+            Box::new(StaticPolicy),
+            Arc::new(StubGateway),
+            Arc::new(SqliteTraceStore::open(&path).expect("seed trace store")),
+            Some(run_id.clone()),
+        )
+        .expect("seed engine");
+        seed.tick(1).expect("seed tick");
+        drop(seed);
+
+        let (gate, entered, release) = RecoveryPauseGate::new(phase);
+        let owner_store = Arc::new(RecoveryControlledTraceStore::new(
+            Arc::new(SqliteTraceStore::open(&path).expect("owner trace store")),
+            Some(Arc::clone(&gate)),
+        ));
+        let owner_snapshot_loads = Arc::new(AtomicUsize::new(0));
+        let owner_state: Arc<dyn StateStore> = Arc::new(RecoveryControlledStateStore {
+            inner: state_store.clone(),
+            gate: Some(gate),
+            snapshot_loads: Arc::clone(&owner_snapshot_loads),
+        });
+        let owner_policy_calls = Arc::new(AtomicUsize::new(0));
+        let owner_gateway = Arc::new(CountingGateway::default());
+        let owner_gateway_calls = Arc::clone(&owner_gateway.calls);
+        let owner_run_id = run_id.clone();
+        let owner_tenant_id = tenant_id.clone();
+        let owner_agent_id = agent_id.clone();
+        let owner_snapshot_policy = snapshot_policy.clone();
+        let owner_policy_counter = Arc::clone(&owner_policy_calls);
+        let owner = std::thread::spawn(move || {
+            LoopEngine::resume_from_trace_store(
+                AgentContext::new(
+                    owner_agent_id,
+                    owner_tenant_id,
+                    crate::AgentRuntimeConfig::default(),
+                ),
+                StateGraph::new(owner_state, owner_snapshot_policy),
+                Box::new(RecoveryCountingPolicy {
+                    calls: owner_policy_counter,
+                }),
+                owner_gateway,
+                owner_store,
+                owner_run_id,
+            )
+        });
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("owner did not reach {phase:?}"));
+
+        let expected_owner_snapshot_loads = match phase {
+            RecoveryPausePhase::InitialTail
+            | RecoveryPausePhase::HistoryPage
+            | RecoveryPausePhase::ValidationTailConfirmation => 0,
+            RecoveryPausePhase::StateRestore
+            | RecoveryPausePhase::RestoredTailConfirmation
+            | RecoveryPausePhase::CursorActivation => 1,
+        };
+        assert_eq!(
+            owner_snapshot_loads.load(Ordering::SeqCst),
+            expected_owner_snapshot_loads,
+            "unexpected state access at {phase:?}"
+        );
+        assert_eq!(owner_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*owner_gateway_calls.lock().expect("owner gateway calls"), 0);
+
+        let contender_store = Arc::new(RecoveryControlledTraceStore::new(
+            Arc::new(SqliteTraceStore::open(&path).expect("contender trace store")),
+            None,
+        ));
+        let contender_snapshot_loads = Arc::new(AtomicUsize::new(0));
+        let contender_policy_calls = Arc::new(AtomicUsize::new(0));
+        let contender_gateway = Arc::new(CountingGateway::default());
+        let contender_gateway_calls = Arc::clone(&contender_gateway.calls);
+        let contender = LoopEngine::resume_from_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(
+                Arc::new(RecoveryControlledStateStore {
+                    inner: state_store.clone(),
+                    gate: None,
+                    snapshot_loads: Arc::clone(&contender_snapshot_loads),
+                }),
+                snapshot_policy.clone(),
+            ),
+            Box::new(RecoveryCountingPolicy {
+                calls: Arc::clone(&contender_policy_calls),
+            }),
+            contender_gateway,
+            contender_store.clone(),
+            run_id.clone(),
+        );
+        assert!(matches!(
+            contender,
+            Err(LoopError::Trace(TraceError::Compatibility(
+                TraceCompatibilityError::WriterConflict
+            )))
+        ));
+        assert_eq!(contender_store.history_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            contender_store.writer_acquisitions.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(contender_snapshot_loads.load(Ordering::SeqCst), 0);
+        assert_eq!(contender_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *contender_gateway_calls
+                .lock()
+                .expect("contender gateway calls"),
+            0
+        );
+
+        release.send(()).expect("release owner recovery");
+        let owner = owner
+            .join()
+            .expect("owner recovery thread")
+            .unwrap_or_else(|error| panic!("owner failed at {phase:?}: {error}"));
+        assert_eq!(owner.last_tick_id(), Some(1));
+        assert_eq!(owner_policy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*owner_gateway_calls.lock().expect("owner gateway calls"), 0);
+        drop(owner);
+
+        let reclaimed = LoopEngine::resume_from_trace_store(
+            AgentContext::new(
+                agent_id.clone(),
+                tenant_id.clone(),
+                crate::AgentRuntimeConfig::default(),
+            ),
+            StateGraph::new(state_store, snapshot_policy),
+            Box::new(StaticPolicy),
+            Arc::new(StubGateway),
+            Arc::new(SqliteTraceStore::open(&path).expect("reclaimed trace store")),
+            run_id,
+        )
+        .unwrap_or_else(|error| panic!("owner was not reclaimable after {phase:?}: {error}"));
+        assert_eq!(reclaimed.last_tick_id(), Some(1));
     }
 }
 
@@ -2327,6 +2908,7 @@ fn resumed_scheduler_advances_past_an_incomplete_persisted_tick() {
     let partial_runtime =
         KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
             .expect("partial tick runtime");
+    let partial_writer = activate_test_runtime_writer(&partial_runtime, &tenant_id, &agent_id);
     partial_runtime
         .record_event_with_identity(
             partial_runtime
@@ -2336,6 +2918,7 @@ fn resumed_scheduler_advances_past_an_incomplete_persisted_tick() {
             TraceEventKind::LoopTickStarted { tick_id: 2 },
         )
         .expect("persist partial tick identity");
+    drop(partial_writer);
     drop(partial_runtime);
 
     let mut resumed = LoopEngine::resume_from_trace_store(
@@ -2636,6 +3219,101 @@ fn shared_trace_runtime_resume_rejects_mismatched_run() {
         Err(LoopError::Resume(message))
             if message == "shared trace runtime run_id does not match resumed run"
     ));
+}
+
+#[test]
+fn shared_resume_rejects_split_trace_stores_before_history_or_writer_access() {
+    let supplied_store = Arc::new(CountingRuntimeTraceStore::new());
+    let runtime_store = Arc::new(CountingRuntimeTraceStore::new());
+    let run_id = RunId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(runtime_store.clone(), Some(run_id.clone()))
+            .expect("runtime"),
+    );
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+
+    let result = LoopEngine::resume_from_shared_trace_runtime_and_work_order(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        supplied_store.clone(),
+        runtime,
+        run_id,
+        None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(LoopError::Trace(TraceError::Compatibility(
+            TraceCompatibilityError::Integrity
+        )))
+    ));
+    assert_eq!(supplied_store.history_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime_store.history_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(supplied_store.writer_acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime_store.writer_acquisitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn retained_runtime_cannot_append_after_last_engine_drop_and_store_lock_is_released() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("runtime"),
+    );
+    let engine = LoopEngine::with_shared_trace_runtime_and_work_order(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(
+            Arc::new(InMemoryStateStore::default()),
+            SnapshotPolicy::default(),
+        ),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(StaticPolicy),
+        Arc::new(StubGateway),
+        runtime.clone(),
+        RunTraceContext::new(Some(run_id.clone())),
+    )
+    .expect("engine");
+    let before = TraceStore::read(trace_store.as_ref(), &run_id.to_string()).expect("run start");
+    drop(engine);
+
+    assert!(matches!(
+        runtime.record_event(TraceEventKind::RunPaused {
+            reason: Some("retained-runtime".to_string()),
+        }),
+        Err(TraceError::Compatibility(TraceCompatibilityError::Store))
+    ));
+    assert_eq!(
+        TraceStore::read(trace_store.as_ref(), &run_id.to_string()).expect("unchanged trace"),
+        before
+    );
+
+    let reclaimed = trace_store
+        .acquire_runtime_writer(RuntimeTraceWriterRequest::current(
+            splendor_store::RuntimeTraceScope::new(
+                run_id.to_string(),
+                tenant_id.to_string(),
+                agent_id.to_string(),
+            ),
+            RuntimeTraceLimits::default(),
+        ))
+        .expect("store ownership released synchronously");
+    reclaimed.close().expect("close reclaimed writer");
 }
 
 #[test]

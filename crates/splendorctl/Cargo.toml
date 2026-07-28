@@ -13,9 +13,11 @@ splendor-adapter-http = { path = "../../adapters/http" }
 splendor-gateway = { path = "../splendor-gateway" }
 splendor-kernel = { path = "../splendor-kernel" }
 splendor-store = { path = "../splendor-store" }
+splendor-evidence = { path = "../splendor-evidence" }
 splendor-types = { path = "../splendor-types" }
 uuid = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+rusqlite = { version = "0.31", features = ["bundled"] }

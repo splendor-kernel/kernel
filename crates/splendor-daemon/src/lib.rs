@@ -18,6 +18,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use splendor_evidence::{
+    open_trace_reader, project_trace, TraceCompatibilityError, TraceProjection,
+};
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_request,
     guard_action_routing_and_receipts, guard_credential_capable_strings,
@@ -35,13 +38,15 @@ use splendor_kernel::{
     LoopEngine, LoopError, Percept, Perceptor, Policy, PolicyCache, PolicyCacheConfig,
     PolicyCacheInstallError, PolicyCacheMutationError, PolicyCacheMutationRecorder,
     PolicyCacheOwner, PolicyCacheTraceError, PolicyDecision, PolicyDistributionGateway,
-    QuotaPolicy, RunActionAdmissionState, RunAuthorityHandle, RunId, RunTraceContext, Scheduler,
-    SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy,
-    TenantRegistry, TraceEventKind,
+    QuotaPolicy, RunActionAdmissionState, RunAuthorityHandle, RunId, RunTraceContext,
+    RuntimeTarget, Scheduler, SchedulerConfig, SchedulerError, SnapshotPolicy, StateGraph,
+    TenantContext, TenantPolicy, TenantRegistry, TraceEventKind,
 };
+#[cfg(test)]
+use splendor_store::TraceStoreError;
 use splendor_store::{
-    compute_trace_event_hash, InMemoryStateStore, InMemoryTraceStore, StateData, StateNodeId,
-    StateStore, TraceRecord, TraceStore, TraceStoreError,
+    compute_trace_event_hash, InMemoryStateStore, InMemoryTraceStore, RuntimeTraceLimits,
+    StateData, StateNodeId, StateStore, TraceRecord, TraceStore,
 };
 use splendor_types::{
     is_allowed_physical_action, validate_policy_bundle, validate_policy_bundle_candidate,
@@ -2981,6 +2986,7 @@ async fn state_head(
         None,
         None,
     )?;
+    validated_trace_records(&slot, &run_id, TraceProjection::Trusted)?;
     let head = slot.state_head.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_FOUND,
@@ -2988,11 +2994,11 @@ async fn state_head(
             "run has not committed state yet",
         )
     })?;
-    let node = slot.state_store.get_node(head).map_err(|error| {
+    let node = slot.state_store.get_node(head).map_err(|_| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "state_store_error",
-            error.to_string(),
+            "state_store_unavailable",
         )
     })?;
     Ok(Json(StateHeadResponse {
@@ -3079,7 +3085,7 @@ async fn export_state_snapshot(
     };
     let (handoff, event) = slot
         .scheduler
-        .export_state_handoff_for_agent(&slot.agent_id, export)
+        .export_state_handoff_for_target(&run_slot_target(&slot), export)
         .map_err(ApiError::from)?;
     Ok(Json(StateSnapshotExportResponse {
         run_id: request.run_id,
@@ -3237,9 +3243,9 @@ async fn import_state_snapshot(
         run_id: run_id.clone(),
         receiver_instance_id,
     };
-    let agent_id = slot.agent_id.clone();
-    let (imported, event) = match slot.scheduler.import_state_handoff_for_agent(
-        &agent_id,
+    let target = run_slot_target(&slot);
+    let (imported, event) = match slot.scheduler.import_state_handoff_for_target(
+        &target,
         &request.handoff,
         &request.work_order,
         &state.inner.work_order_keyring,
@@ -3328,12 +3334,8 @@ async fn traces(
         None,
         None,
     )?;
-    let records = match (query.start, query.end) {
-        (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
-        _ => slot.trace_store.read(&run_id.to_string()),
-    }
-    .map_err(trace_error)?;
-    let records = redact_trace_records(records);
+    let records = validated_trace_records(&slot, &run_id, TraceProjection::Redacted)?;
+    let records = select_trace_range(records, query.start, query.end);
     Ok(Json(TracePageResponse { run_id, records }))
 }
 
@@ -3365,13 +3367,11 @@ async fn export_traces(
         "splendor.traces.export.redacted",
         security.audit_attribution,
     )?;
-    let records = match (request.start, request.end) {
-        (Some(start), Some(end)) => slot.trace_store.read_range(&run_id.to_string(), start, end),
-        _ => slot.trace_store.read(&run_id.to_string()),
-    }
-    .map_err(trace_error)?;
-    let integrity_hash = trace_export_integrity_hash(&records);
-    let records = redact_trace_records(records);
+    let trusted = validated_trace_records(&slot, &run_id, TraceProjection::Trusted)?;
+    let trusted = select_trace_range(trusted, request.start, request.end);
+    let integrity_hash = trace_export_integrity_hash(&trusted);
+    let records = validated_trace_records(&slot, &run_id, TraceProjection::Redacted)?;
+    let records = select_trace_range(records, request.start, request.end);
     Ok(Json(TraceExportResponse {
         run_id,
         record_count: records.len(),
@@ -3421,11 +3421,7 @@ async fn replay_run(
         "splendor.replay.explained",
         security.audit_attribution,
     )?;
-    let records = slot
-        .trace_store
-        .read(&run_id.to_string())
-        .map_err(trace_error)?;
-    validate_trace_order(&records, &run_id)?;
+    let records = validated_trace_records(&slot, &run_id, TraceProjection::Trusted)?;
     let action_event_count = records
         .iter()
         .filter(|record| {
@@ -3467,6 +3463,42 @@ async fn replay_run(
         approval_events,
         authority_decisions,
     }))
+}
+
+fn validated_trace_records(
+    slot: &RunSlot,
+    run_id: &RunId,
+    projection: TraceProjection,
+) -> Result<Vec<TraceRecord>, ApiError> {
+    let reader = open_trace_reader(
+        slot.trace_store.as_ref(),
+        run_id,
+        RuntimeTraceLimits::default(),
+    )
+    .map_err(trace_compatibility_error)?;
+    project_trace(reader.as_ref(), run_id, projection).map_err(trace_compatibility_error)
+}
+
+fn select_trace_range(
+    records: Vec<TraceRecord>,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Vec<TraceRecord> {
+    match (start, end) {
+        (Some(start), Some(end)) => records
+            .into_iter()
+            .filter(|record| record.sequence >= start && record.sequence < end)
+            .collect(),
+        _ => records,
+    }
+}
+
+fn trace_compatibility_error(_error: TraceCompatibilityError) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "trace_evidence_unavailable",
+        "trace evidence could not be validated",
+    )
 }
 
 async fn submit_action(
@@ -5879,9 +5911,17 @@ fn policy_cache_response(cache: &PolicyCache) -> PolicyCacheStatusResponse {
     }
 }
 
+fn run_slot_target(slot: &RunSlot) -> RuntimeTarget {
+    RuntimeTarget::new(
+        slot.run_id.clone(),
+        slot.tenant_id.clone(),
+        slot.agent_id.clone(),
+    )
+}
+
 fn record_run_event(slot: &RunSlot, kind: TraceEventKind) -> Result<(), ApiError> {
     slot.scheduler
-        .record_event_for_agent(&slot.agent_id, kind)
+        .record_event_for_target(&run_slot_target(slot), kind)
         .map(|_| ())
         .map_err(|error| {
             ApiError::new(
@@ -5898,7 +5938,7 @@ fn record_run_action_event(
     kind: TraceEventKind,
 ) -> Result<(), ApiError> {
     slot.scheduler
-        .record_action_event_for_agent(&slot.agent_id, action_id, kind)
+        .record_action_event_for_target(&run_slot_target(slot), action_id, kind)
         .map(|_| ())
         .map_err(|error| {
             ApiError::new(
@@ -5972,7 +6012,7 @@ fn record_run_event_returning_id(
     kind: TraceEventKind,
 ) -> Result<TraceEventId, ApiError> {
     slot.scheduler
-        .record_event_for_agent(&slot.agent_id, kind)
+        .record_event_for_target(&run_slot_target(slot), kind)
         .map(|event| event.trace_event_id)
         .map_err(|error| {
             ApiError::new(
@@ -6198,6 +6238,7 @@ fn record_daemon_audit(
     )
 }
 
+#[cfg(test)]
 fn validate_trace_order(records: &[TraceRecord], run_id: &RunId) -> Result<(), ApiError> {
     for (expected, record) in records.iter().enumerate() {
         if record.run_id != run_id.to_string() || record.sequence != expected as u64 {
@@ -6219,6 +6260,7 @@ fn trace_export_integrity_hash(records: &[TraceRecord]) -> String {
     format!("trace-chain:v1:{}:{last_event_hash}", records.len())
 }
 
+#[cfg(test)]
 fn redact_trace_records(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
     records
         .into_iter()
@@ -6238,6 +6280,7 @@ fn redact_trace_records(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
         .collect()
 }
 
+#[cfg(test)]
 fn bounded_daemon_audit_correlation(payload: &serde_json::Value) -> Option<String> {
     let event = serde_json::from_value::<TraceEvent>(payload.clone()).ok()?;
     let TraceEventKind::DaemonAudit { audit, .. } = event.kind else {
@@ -6248,6 +6291,7 @@ fn bounded_daemon_audit_correlation(payload: &serde_json::Value) -> Option<Strin
         .filter(|credential_id| is_bounded_sha256_correlation(credential_id))
 }
 
+#[cfg(test)]
 fn is_bounded_sha256_correlation(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
         digest.len() == 64
@@ -6257,10 +6301,12 @@ fn is_bounded_sha256_correlation(value: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn redact_trace_value(value: serde_json::Value) -> serde_json::Value {
     redact_trace_value_inner(value)
 }
 
+#[cfg(test)]
 fn redact_trace_value_inner(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
@@ -6291,6 +6337,7 @@ fn redact_trace_value_inner(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+#[cfg(test)]
 fn redact_sensitive_trace_field_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -6313,6 +6360,7 @@ fn redact_sensitive_trace_field_value(value: serde_json::Value) -> serde_json::V
     }
 }
 
+#[cfg(test)]
 fn is_trace_sensitive_key(key: &str) -> bool {
     if is_trace_identity_reason_or_status_key(key) {
         return false;
@@ -6391,6 +6439,7 @@ fn is_trace_sensitive_key(key: &str) -> bool {
         .any(|needle| compact.contains(needle))
 }
 
+#[cfg(test)]
 fn is_trace_identity_reason_or_status_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
     matches!(
@@ -6428,6 +6477,7 @@ fn is_trace_identity_reason_or_status_key(key: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_trace_sensitive_text(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     let compact = compact_trace_match_text(&normalized);
@@ -6524,6 +6574,7 @@ fn is_trace_sensitive_text(value: &str) -> bool {
         || looks_like_trace_jwt(value)
 }
 
+#[cfg(test)]
 fn has_sensitive_plaintext_marker(value: &str) -> bool {
     let words = value
         .split_whitespace()
@@ -6566,6 +6617,7 @@ fn has_sensitive_plaintext_marker(value: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn protected_visibility_label(value: &str) -> Option<&'static str> {
     let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
@@ -6578,6 +6630,7 @@ fn protected_visibility_label(value: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn looks_like_trace_jwt(value: &str) -> bool {
     let token = value.trim();
     let mut parts = token.split('.');
@@ -6601,6 +6654,7 @@ fn looks_like_trace_jwt(value: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn compact_trace_match_text(value: &str) -> String {
     value
         .chars()
@@ -6615,6 +6669,7 @@ fn stable_json_fingerprint(domain: &[u8], value: &serde_json::Value) -> String {
     ContentHash::blake3(input).to_string()
 }
 
+#[cfg(test)]
 fn trace_error(error: TraceStoreError) -> ApiError {
     match error {
         TraceStoreError::RunNotFound => ApiError::new(

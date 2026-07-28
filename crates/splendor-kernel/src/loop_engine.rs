@@ -4,7 +4,7 @@
 //! policy, evaluate constraints, verify/execute actions, record outcomes, and
 //! commit state. It emits the ordered trace events required for auditability.
 
-use crate::runtime::RuntimeIdentityOwner;
+use crate::runtime::RuntimeWriterLease;
 use crate::state::RuntimeSnapshotExpectation;
 use crate::{
     apply_escalation_to_outcome, escalations_require_intervention, AgentContext,
@@ -12,14 +12,15 @@ use crate::{
     PolicyRuntimeAuthority, StateCommit, StateGraph, StateGraphError, StateHandoffExportRequest,
     StateHandoffScope, TraceError,
 };
+use splendor_evidence::{inspect_trace, resume_trace, TraceCompatibilityError};
 use splendor_gateway::{
     authority_pre_effect_evidence_recorded, guard_action_routing_and_receipts,
     guard_persisted_percept, guard_persisted_state, raw_credential_denied_action,
     raw_credential_denied_outcome, ActionGateway, ActionId, ActionOutcome, ActionRequest,
-    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED, RAW_CREDENTIAL_OUTPUT_SUPPRESSED,
+    ActionStatus, GatewayError, RAW_CREDENTIAL_INPUT_DENIED,
 };
 use splendor_store::{
-    validate_trace_chain, StateData, StateMetadata, TraceRecord, TraceStore, TraceStoreError,
+    RuntimeTraceReader, RuntimeTraceTail, StateData, StateMetadata, TraceStore, TraceStoreError,
 };
 use splendor_types::{
     Action, ApprovalTraceContext, CapabilityGrantId, Constraint, ContentHash, EffectCertainty,
@@ -28,7 +29,7 @@ use splendor_types::{
     StateNodeId, TickId, TraceEvent, TraceEventId, TraceEventKind, TraceIdentityContext,
     VerificationResult, WorkOrder, WorkOrderEnvelope, WorkOrderKeyring,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -265,6 +266,7 @@ struct ResumeSelection {
     state_hash: ContentHash,
     trace_event_id: TraceEventId,
     max_tick_id: u64,
+    tail: RuntimeTraceTail,
 }
 
 /// Optional trace/run metadata supplied when constructing a persisted loop
@@ -382,12 +384,6 @@ struct EffectBoundary {
     reconciliation_required_after_tick: bool,
 }
 
-#[derive(Clone, Copy)]
-enum PersistedConstructionMode {
-    Fresh,
-    Resume { max_tick_id: u64 },
-}
-
 /// Kernel loop engine for a single agent.
 pub struct LoopEngine {
     agent: AgentContext,
@@ -402,7 +398,7 @@ pub struct LoopEngine {
     escalation_evaluator: Option<EscalationEvaluator>,
     policy_authority: Option<Arc<dyn PolicyRuntimeAuthority>>,
     reconciliation_block: Option<TickReconciliationBlock>,
-    _runtime_owner: Option<RuntimeIdentityOwner>,
+    _runtime_writer: Option<RuntimeWriterLease>,
     last_tick_id: Option<u64>,
 }
 
@@ -470,7 +466,7 @@ impl LoopEngine {
             escalation_evaluator: None,
             policy_authority: None,
             reconciliation_block: None,
-            _runtime_owner: None,
+            _runtime_writer: None,
             last_tick_id: None,
         }
     }
@@ -537,7 +533,32 @@ impl LoopEngine {
         runtime: Arc<KernelRuntime>,
         context: RunTraceContext,
     ) -> Result<Self, LoopError> {
-        Self::with_shared_trace_runtime_and_work_order_mode(
+        if context
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| run_id != runtime.run_id())
+        {
+            return Err(LoopError::Resume(
+                "shared trace runtime run_id does not match requested run".to_string(),
+            ));
+        }
+        let runtime_writer = match runtime.acquire_engine_writer(&agent.tenant_id, &agent.agent_id)
+        {
+            Ok(writer) => writer,
+            Err(error) if trace_error_is_fresh_admission_conflict(&error) => {
+                return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if runtime_writer.is_primary() {
+            let inspected = inspect_trace(runtime_writer.reader(), runtime.run_id())
+                .map_err(TraceError::from)?;
+            if !inspected.records.is_empty() {
+                return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
+            }
+            runtime.activate_engine_writer(&runtime_writer, inspected.tail)?;
+        }
+        Self::finish_persisted_construction(
             agent,
             state_graph,
             state,
@@ -545,12 +566,14 @@ impl LoopEngine {
             gateway,
             runtime,
             context,
-            PersistedConstructionMode::Fresh,
+            runtime_writer,
+            None,
+            true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn with_shared_trace_runtime_and_work_order_mode(
+    fn finish_persisted_construction(
         mut agent: AgentContext,
         state_graph: StateGraph,
         state: StateData,
@@ -558,18 +581,11 @@ impl LoopEngine {
         gateway: Arc<dyn ActionGateway>,
         runtime: Arc<KernelRuntime>,
         context: RunTraceContext,
-        mode: PersistedConstructionMode,
+        runtime_writer: RuntimeWriterLease,
+        last_tick_id: Option<u64>,
+        fresh: bool,
     ) -> Result<Self, LoopError> {
-        let runtime_owner = match runtime.claim_engine_identity(&agent.tenant_id, &agent.agent_id) {
-            Ok(owner) => owner,
-            Err(TraceError::Store(TraceStoreError::RuntimeIdentityAlreadyOwned { .. }))
-                if matches!(mode, PersistedConstructionMode::Fresh) =>
-            {
-                return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if matches!(mode, PersistedConstructionMode::Fresh) {
+        if fresh {
             match runtime.admit_fresh_engine(&agent.tenant_id, &agent.agent_id) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -608,10 +624,8 @@ impl LoopEngine {
         }
         let mut engine =
             Self::with_shared_runtime(agent, state_graph, state, policy, gateway, runtime);
-        engine._runtime_owner = Some(runtime_owner);
-        if let PersistedConstructionMode::Resume { max_tick_id } = mode {
-            engine.last_tick_id = Some(max_tick_id);
-        }
+        engine._runtime_writer = Some(runtime_writer);
+        engine.last_tick_id = last_tick_id;
         Ok(engine)
     }
 
@@ -639,50 +653,26 @@ impl LoopEngine {
     /// boundary. The work-order event is appended to the existing trace stream.
     pub fn resume_from_trace_store_with_work_order(
         agent: AgentContext,
-        mut state_graph: StateGraph,
+        state_graph: StateGraph,
         policy: Box<dyn Policy>,
         gateway: Arc<dyn ActionGateway>,
         trace_store: Arc<dyn TraceStore>,
         run_id: RunId,
         work_order: Option<&WorkOrder>,
     ) -> Result<Self, LoopError> {
-        let context = RunTraceContext::new(Some(run_id.clone()));
-        let context = match work_order {
-            Some(work_order) => context.with_work_order(work_order.clone()),
-            None => context,
-        };
-        let resume = Self::resume_info(
-            trace_store.as_ref(),
-            &run_id,
-            &agent.tenant_id,
-            &agent.agent_id,
-        )?;
-        let snapshot = state_graph
-            .restore_snapshot_for_runtime_identity(
-                &resume.info.snapshot_id,
-                RuntimeSnapshotExpectation {
-                    state_node_id: &resume.state_node_id,
-                    state_hash: &resume.state_hash,
-                    trace_event_id: &resume.trace_event_id,
-                    tenant_id: &agent.tenant_id,
-                    agent_id: &agent.agent_id,
-                    run_id: &run_id,
-                },
-            )?
-            .ok_or_else(|| LoopError::Resume(RESUME_STATE_IDENTITY_MISMATCH.to_string()))?;
-        state_graph.set_tick(resume.info.tick_id);
-        let runtime = Arc::new(KernelRuntime::with_trace_store(trace_store, Some(run_id))?);
-        Self::with_shared_trace_runtime_and_work_order_mode(
+        let runtime = Arc::new(KernelRuntime::with_trace_store(
+            trace_store.clone(),
+            Some(run_id.clone()),
+        )?);
+        Self::resume_from_shared_trace_runtime_and_work_order(
             agent,
             state_graph,
-            snapshot.state,
             policy,
             gateway,
+            trace_store,
             runtime,
-            context,
-            PersistedConstructionMode::Resume {
-                max_tick_id: resume.max_tick_id,
-            },
+            run_id,
+            work_order,
         )
     }
 
@@ -704,13 +694,21 @@ impl LoopEngine {
                 "shared trace runtime run_id does not match resumed run".to_string(),
             ));
         }
+        let supplied_store_identity = trace_store
+            .runtime_store_identity()
+            .map_err(TraceCompatibilityError::from)
+            .map_err(TraceError::from)?;
+        if supplied_store_identity != runtime.store_identity()? {
+            return Err(TraceError::from(TraceCompatibilityError::Integrity).into());
+        }
         let context = RunTraceContext::new(Some(run_id.clone()));
         let context = match work_order {
             Some(work_order) => context.with_work_order(work_order.clone()),
             None => context,
         };
+        let runtime_writer = runtime.acquire_engine_writer(&agent.tenant_id, &agent.agent_id)?;
         let resume = Self::resume_info(
-            trace_store.as_ref(),
+            runtime_writer.reader(),
             &run_id,
             &agent.tenant_id,
             &agent.agent_id,
@@ -729,7 +727,17 @@ impl LoopEngine {
             )?
             .ok_or_else(|| LoopError::Resume(RESUME_STATE_IDENTITY_MISMATCH.to_string()))?;
         state_graph.set_tick(resume.info.tick_id);
-        Self::with_shared_trace_runtime_and_work_order_mode(
+        runtime_writer
+            .reader()
+            .confirm_tail(&resume.tail)
+            .map_err(TraceCompatibilityError::from)
+            .map_err(TraceError::from)?;
+        if runtime_writer.is_primary() {
+            runtime.activate_engine_writer(&runtime_writer, resume.tail)?;
+        } else if runtime.next_sequence() != resume.tail.next_sequence() {
+            return Err(TraceError::from(TraceCompatibilityError::Integrity).into());
+        }
+        Self::finish_persisted_construction(
             agent,
             state_graph,
             snapshot.state,
@@ -737,9 +745,9 @@ impl LoopEngine {
             gateway,
             runtime,
             context,
-            PersistedConstructionMode::Resume {
-                max_tick_id: resume.max_tick_id,
-            },
+            runtime_writer,
+            Some(resume.max_tick_id),
+            false,
         )
     }
 
@@ -903,7 +911,13 @@ impl LoopEngine {
 
     /// Records a non-tick runtime event through this loop's trace runtime.
     pub fn record_runtime_event(&self, kind: TraceEventKind) -> Result<TraceEvent, LoopError> {
-        self.runtime.record_event(kind).map_err(LoopError::Trace)
+        let identity = self
+            .runtime
+            .trace_identity()
+            .with_tenant_agent(self.agent.tenant_id.clone(), self.agent.agent_id.clone());
+        self.runtime
+            .record_event_with_identity(identity, kind)
+            .map_err(LoopError::Trace)
     }
 
     /// Records a non-tick action event with the run's tenant/agent/action scope
@@ -1484,99 +1498,24 @@ impl LoopEngine {
     }
 
     fn resume_info(
-        trace_store: &dyn TraceStore,
+        reader: &(dyn RuntimeTraceReader + '_),
         run_id: &RunId,
         tenant_id: &splendor_types::TenantId,
         agent_id: &splendor_types::AgentId,
     ) -> Result<ResumeSelection, LoopError> {
-        let records = trace_store.read(&run_id.to_string())?;
-        validate_trace_chain(&run_id.to_string(), &records)?;
-        let mut snapshot = None;
-        let mut tick_id = None;
-        let mut max_tick_id: Option<u64> = None;
-        let mut open_tick_attempts = HashMap::<u64, bool>::new();
-        let mut pending_snapshots = HashMap::<u64, ResumeSelection>::new();
-        for record in records {
-            let event: TraceEvent = serde_json::from_value(record.payload.clone())?;
-            validate_recovery_event_envelope(&event, run_id, &record)?;
-            if !trace_event_matches_runtime_identity(&event, run_id, tenant_id, agent_id) {
-                continue;
-            }
-            if let Some(event_tick_id) = event.identity.tick_id.as_ref() {
-                max_tick_id = Some(max_tick_id.unwrap_or_default().max(event_tick_id.get()));
-            }
-            if let TraceEventKind::ActionFailed { error, result, .. } = &event.kind {
-                if action_failure_requires_reconciliation(error, result) {
-                    return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
-                }
-            }
-            match &event.kind {
-                TraceEventKind::LoopTickStarted { tick_id: started } => {
-                    max_tick_id = Some(max_tick_id.unwrap_or_default().max(*started));
-                    if open_tick_attempts.contains_key(started) {
-                        return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
-                    }
-                    open_tick_attempts.insert(*started, false);
-                }
-                TraceEventKind::ActionVerificationStarted { .. } => {
-                    let Some(action_tick_id) = event.identity.tick_id else {
-                        return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
-                    };
-                    open_tick_attempts.insert(action_tick_id.get(), true);
-                }
-                TraceEventKind::LoopTickCompleted {
-                    tick_id: completed, ..
-                } => {
-                    open_tick_attempts.remove(completed);
-                    tick_id = Some(*completed);
-                    snapshot = pending_snapshots.remove(completed);
-                }
-                TraceEventKind::StateCommitted {
-                    state_hash,
-                    snapshot_id: Some(snapshot_id),
-                } => {
-                    let (Some(state_tick_id), Some(state_node_id)) = (
-                        event.identity.tick_id.as_ref(),
-                        event.identity.state_node_id.as_ref(),
-                    ) else {
-                        return Err(LoopError::Resume(
-                            RESUME_STATE_IDENTITY_MISMATCH.to_string(),
-                        ));
-                    };
-                    pending_snapshots.insert(
-                        state_tick_id.get(),
-                        ResumeSelection {
-                            info: ResumeInfo {
-                                snapshot_id: snapshot_id.clone(),
-                                tick_id: state_tick_id.get(),
-                            },
-                            state_node_id: state_node_id.clone(),
-                            state_hash: state_hash.clone(),
-                            trace_event_id: event.trace_event_id.clone(),
-                            max_tick_id: state_tick_id.get(),
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        if open_tick_attempts
-            .values()
-            .any(|action_started| *action_started)
-        {
-            return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
-        }
-
-        let mut snapshot = snapshot.ok_or_else(|| {
-            LoopError::Resume(if tick_id.is_some() {
-                RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE.to_string()
-            } else {
-                "no snapshot found in trace history".to_string()
-            })
-        })?;
-        snapshot.max_tick_id = max_tick_id.unwrap_or(snapshot.info.tick_id);
-        Ok(snapshot)
+        let resume = resume_trace(reader, run_id, tenant_id, agent_id)
+            .map_err(map_resume_compatibility_error)?;
+        Ok(ResumeSelection {
+            info: ResumeInfo {
+                snapshot_id: resume.snapshot_id,
+                tick_id: resume.tick_id,
+            },
+            state_node_id: resume.state_node_id,
+            state_hash: resume.state_hash,
+            trace_event_id: resume.trace_event_id,
+            max_tick_id: resume.max_tick_id,
+            tail: resume.tail,
+        })
     }
 }
 
@@ -1597,77 +1536,27 @@ fn outcome_from_gateway_error(action_id: ActionId, error: GatewayError) -> Actio
 fn trace_error_is_fresh_admission_conflict(error: &TraceError) -> bool {
     matches!(
         error,
-        TraceError::Store(TraceStoreError::SequenceMismatch {
-            expected: 0,
-            actual: _
-        })
+        TraceError::Compatibility(TraceCompatibilityError::WriterConflict)
+            | TraceError::Store(TraceStoreError::SequenceMismatch {
+                expected: 0,
+                actual: _
+            })
     )
 }
 
-fn validate_recovery_event_envelope(
-    event: &TraceEvent,
-    run_id: &RunId,
-    record: &TraceRecord,
-) -> Result<(), LoopError> {
-    let record_sequence = record.sequence;
-    if &event.run_id != run_id || &event.identity.run_id != run_id {
-        return Err(LoopError::TraceEnvelopeIntegrity {
-            sequence: record_sequence,
-            reason: "run_identity_mismatch",
-        });
-    }
-    if event.sequence != record_sequence {
-        return Err(LoopError::TraceEnvelopeIntegrity {
-            sequence: record_sequence,
-            reason: "sequence_mismatch",
-        });
-    }
-    if event.trace_event_id != TraceEventId::from_run_sequence(run_id, record_sequence) {
-        return Err(LoopError::TraceEnvelopeIntegrity {
-            sequence: record_sequence,
-            reason: "trace_event_id_mismatch",
-        });
-    }
-    let kind_tick_id = match &event.kind {
-        TraceEventKind::LoopTickStarted { tick_id }
-        | TraceEventKind::LoopTickCompleted { tick_id, .. } => Some(*tick_id),
-        _ => None,
-    };
-    if kind_tick_id.is_some()
-        && event.identity.tick_id.as_ref().map(|tick_id| tick_id.get()) != kind_tick_id
-    {
-        return Err(LoopError::TraceEnvelopeIntegrity {
-            sequence: record_sequence,
-            reason: "tick_identity_mismatch",
-        });
-    }
-    if let TraceEventKind::LoopTickCompleted {
-        integrity: Some(integrity),
-        ..
-    } = &event.kind
-    {
-        if integrity.prev_event_hash != record.prev_event_hash
-            || integrity.event_hash != record.event_hash
-        {
-            return Err(LoopError::TraceEnvelopeIntegrity {
-                sequence: record_sequence,
-                reason: "completion_integrity_mismatch",
-            });
+fn map_resume_compatibility_error(error: TraceCompatibilityError) -> LoopError {
+    match error {
+        TraceCompatibilityError::ReconciliationRequired => {
+            LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string())
         }
+        TraceCompatibilityError::LatestSnapshotUnavailable => {
+            LoopError::Resume(RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE.to_string())
+        }
+        TraceCompatibilityError::SnapshotUnavailable => {
+            LoopError::Resume("no snapshot found in trace history".to_string())
+        }
+        other => LoopError::Trace(TraceError::from(other)),
     }
-    Ok(())
-}
-
-fn trace_event_matches_runtime_identity(
-    event: &TraceEvent,
-    run_id: &RunId,
-    tenant_id: &splendor_types::TenantId,
-    agent_id: &splendor_types::AgentId,
-) -> bool {
-    &event.run_id == run_id
-        && &event.identity.run_id == run_id
-        && event.identity.tenant_id.as_ref() == Some(tenant_id)
-        && event.identity.agent_id.as_ref() == Some(agent_id)
 }
 
 fn effect_boundary_from_gateway_error(error: &GatewayError) -> Option<EffectBoundary> {
@@ -1774,15 +1663,6 @@ fn attach_effect_boundary(outcome: &mut ActionOutcome, boundary: EffectBoundary)
         "reconciliation_required".to_string(),
         serde_json::Value::Bool(boundary.reconciliation_required_after_tick),
     );
-}
-
-fn action_failure_requires_reconciliation(error: &str, result: &VerificationResult) -> bool {
-    effect_boundary_from_verification(result)
-        .is_some_and(|boundary| boundary.reconciliation_required_after_tick)
-        || (error == RAW_CREDENTIAL_OUTPUT_SUPPRESSED
-            && !result.allowed
-            && result.reasons.len() == 1
-            && result.reasons.first().map(String::as_str) == Some(RAW_CREDENTIAL_OUTPUT_SUPPRESSED))
 }
 
 fn action_policy_expired_trace_kind(
