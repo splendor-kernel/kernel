@@ -11,4 +11,6 @@ security-secret-contracts:
 	trap 'rm -rf "$${sandbox}"' EXIT; \
 	git archive "$${sha}" | tar -x -C "$${sandbox}"; \
 	cd "$${sandbox}"; \
+	git init -q; \
+	git add --all; \
 	env -i HOME="$${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test

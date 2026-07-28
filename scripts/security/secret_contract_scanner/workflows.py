@@ -13,6 +13,8 @@ SCANNER_COMMANDS = (
     'git archive "${GITHUB_SHA}" | tar -x -C "${sandbox}"',
     "(",
     'cd "${sandbox}"',
+    "git init -q",
+    "git add --all",
     'env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test',
     ")",
 )
@@ -31,10 +33,10 @@ REQUIRED_WORKFLOWS = (
 EXPECTED_WORKFLOW_SHA256 = {
     REQUIRED_WORKFLOWS[
         0
-    ]: "c6f8e847ed014e8fecc69f0cbb876da075658ffc827a7b40eecb8dc88ea5c07b",
+    ]: "365a3835364bfb790814c8290bb3875e641dca3291e747c2ca67231c5401c353",
     REQUIRED_WORKFLOWS[
         1
-    ]: "7b1de900391bebe8ca66e0588d33486718d6ab722dcf233ccc181ce3ee93fea4",
+    ]: "bb9ea5a2e26221b04e8769135fea6bcb4b57aaaac32cf7d3620a361eae4df30f",
 }
 EXPECTED_JOBS = {
     REQUIRED_WORKFLOWS[0]: {
