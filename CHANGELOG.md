@@ -62,6 +62,32 @@
   Docker-produced binaries. No public wire/trace schema or material API was
   added, opaque custom encoding remains an explicit nonclaim, and `G07`, `G08`,
   and `G82` remain `not_exercised`.
+- **status/incomplete:** added the offline, deterministic C03 contract/fixture
+  repository guard required by QA-089 and partial `SECR-006`. The
+  standard-library Python command structurally parses exact registered JSON,
+  bounded OpenAPI/example YAML, structured Markdown fences, and governed source
+  declarations; recognizes only path/schema/digest-pinned canonical C03 refs,
+  requirements, authorizations, Driver sink declarations, and expiring exact
+  caller-auth/bootstrap exceptions; and rejects
+  secret-like value fields, fake wrappers, malformed/duplicate contracts,
+  path/symlink ambiguity, unsupported governed formats, stale policy entries,
+  and resource overflow. A separate bounded content pass covers every
+  unambiguous UTF-8 tracked/non-ignored file plus magic-detected, globally
+  budgeted archive members, with digest/count-bound synthetic/public-vector
+  exceptions. The guard also closes low-entropy assignment/URL forms,
+  compatibility/control-character ambiguity, suffix-independent low-entropy and
+  ancestor-scoped config fields, digest-pinned source types and rebinding/record
+  forms, depth-bounded CommonMark/MyST/source fences, newly introduced OpenAPI/
+  SDK/package/Gold roots, all-offset V7 TAR polyglots, archive metadata/trailing
+  data, recursively normalized diagnostics, parser-operation budgets, and
+  descriptor-relative ancestor races. The self-test discovers and pins every
+  scanner test module. Both scanner commands use isolated `/usr/bin/python3 -I`;
+  every tracked workflow is enumerated and unknown workflows are rejected. Every
+  accepted CI build/test and Docker image
+  publication job fetches and verifies one immutable `GITHUB_SHA` and depends on
+  the exact-manifest self-test and current-tree scan. This is not runtime output-leak
+  scanning, arbitrary encrypted/binary absence proof, external C03 API/SDK
+  parity, QA-090 release-provider evidence, issue closure, or a Gold pass.
 - **status/incomplete:** extended the single Gateway-owned bounded credential
   scanner with a generic pre-persistence barrier for adapter results, percepts,
   and policy-selected state. Adapter output and satisfied-postcondition strings
@@ -139,8 +165,8 @@
   now fail closed until an owner-versioned ingress profile exists.
   This is only a denial slice of `SECR-004`/`SECR-006`: it adds no typed secret
   delivery, broker/provider Gateway session, operation-specific
-  `CredentialIngressProfile`, exhaustive entropy/encoded/split detection,
-  repository scanner, quarantine/incident workflow, issue closure, or gold pass.
+  `CredentialIngressProfile`, exhaustive runtime entropy/encoded/split detection,
+  quarantine/incident workflow, issue closure, or gold pass.
 - **status/incomplete:** added the first process-local C03 Secret Broker owner
   slice for `SECR-001`, with bounded `SECR-003` renewal/revocation and
   `SECR-005` provider-port progress. Additive ref-safe contracts are exported

@@ -20,12 +20,13 @@ crate-private. There is no callable production lease API or complete live secret
 permit in this slice.
 
 This is bounded progress for `SECR-001`, `SECR-003`, and `SECR-005`, plus a
-denial/failure-only pre-persistence slice of `SECR-004`/`SECR-006`. It does not
+denial/failure-only pre-persistence slice of `SECR-004`/`SECR-006` and the
+repository contract/fixture scanner required by QA-089. It does not
 implement RFC 0012's complete durable lease, exposure-lineage, delivery,
 provider-control, node-control, outer-submission, or terminal publication
 records. It adds no provider invocation from the broker, material-returning
 broker API, Gateway session, resident delivery, persistence, daemon/API/SDK
-secret surface, complete profile/repository/leak scanner, production provider,
+secret surface, complete live profile/output-leak scanner, production provider,
 issue closure, or gold pass. The reduced
 wire-safe records use explicit `*.local.v1` schema names and do not masquerade as
 the complete RFC 0012 wire schemas. `G07`, `G08`, and `G82` remain
@@ -138,6 +139,44 @@ entropy/encoded/split or per-lease live detector, repository CI scanner,
 quarantine/incident workflow, or live broker/provider/material path.
 Generic `SecretRef`-looking data is denied rather than upgraded into authority.
 Typed secret delivery remains unavailable.
+
+## Implemented repository contract and fixture scanner
+
+`scripts/security/check-secret-contracts.py` is a standard-library-only,
+network-independent CI guard invoked through `/usr/bin/python3 -I` with an
+internal negative and hostile-module-shadow self-test. Its strict
+`splendor.secret_field_scan.v1` policy binds exact governed roots,
+path/schema/digest-pinned canonical C03 owner fixtures, exact
+caller-auth/bootstrap field exceptions, digest-pinned symbolic fixtures,
+cumulative resource caps, and digest/count-bound content exceptions.
+
+The guard structurally parses JSON, the closed bounded YAML subset used by
+OpenAPI/workflows/examples, and governed JSON/YAML/source Markdown fences. Decoded
+keys and string scalars are recursively content-scanned; recognized source
+suffixes also receive bounded authorizing-field declaration checks. Low-entropy
+assignment checks are suffix-independent, nested structured values inherit
+credential-bearing ancestor context, and unregistered OpenAPI/SDK/client/package/
+Gold authorizing surfaces fail closed. It rejects normalized secret/value
+field families, fake schema wrappers, malformed/duplicate/non-finite documents,
+path/symlink or format ambiguity, stale/expired exceptions, and budget overflow.
+A separate bounded content pass checks every unambiguous UTF-8 tracked or
+non-ignored source, fixture, generated text, doc, manifest, and supported archive
+member for known private-key, provider-token, authorization, credential-URL,
+encoded-key, context-bound hexadecimal credential, and high-entropy forms.
+Archive recognition is magic-based, includes a bounded linear all-offset V7 TAR
+header scan, and archive resource accounting is repository-global. Diagnostics
+recursively normalize and redact credential-capable path segments and never print
+candidate material. Every tracked workflow is enumerated; unknown workflows are
+rejected, and every accepted CI build/test and Docker image publication job
+depends on this guard succeeding.
+
+The exact developer policy, rule families, allowlist process, commands, and
+nonclaims are documented in
+[`docs/development/c03-secret-contract-scanner.md`](../development/c03-secret-contract-scanner.md).
+This scanner is static QA-089/partial `SECR-006` evidence only. It is not the
+runtime pre-persistence output barrier, an encrypted/arbitrary-binary absence
+proof, external API/SDK C03 parity, QA-090 release-provider exclusion, or Gold
+execution evidence.
 
 ## Implemented process-local owner slice
 

@@ -4,16 +4,46 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  secret-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository without default token
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+      - name: C03 secret contract and fixture guard
+        run: |
+          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf "${sandbox}"' EXIT
+          git archive "${GITHUB_SHA}" | tar -x -C "${sandbox}"
+          (
+            cd "${sandbox}"
+            git init -q
+            git add --all
+            env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
+          )
+
   rust:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: Install Rust toolchain
         run: |
@@ -39,16 +69,18 @@ jobs:
         run: cargo llvm-cov --workspace --all-targets --fail-under-lines 95
 
   python:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.11"
       - name: Install Python deps
@@ -59,16 +91,18 @@ jobs:
         run: pytest python/tests --cov=splendor --cov-fail-under=95
 
   typescript:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "24"
           cache: npm
@@ -81,14 +115,16 @@ jobs:
         run: npm run coverage
 
   docker:
+    needs: secret-contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository without default token
         run: |
           git init .
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "${GITHUB_REF}"
-          git checkout --detach "${GITHUB_SHA}" || git checkout --detach FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: Docker deployment image smoke test
         run: bash scripts/container-tests.sh
