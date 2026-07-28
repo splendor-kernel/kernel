@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .archives import archive_members, detect_archive_kind
-from .content import scan_content
-from .io_utils import PinnedRepository, enumerate_repository_files
+from .content import is_secret_field_name, scan_content
+from .io_utils import PinnedRepository, RepositoryReader, enumerate_repository_files
 from .model import (
     ARCHIVE_SUFFIXES,
     SOURCE_SUFFIXES,
@@ -57,7 +57,50 @@ KNOWN_UNGOVERNED_PACKAGE_MANIFESTS = {
     "package.json",
     "python/bindings/pyproject.toml",
 }
+KNOWN_UNGOVERNED_TSCONFIGS = {"typescript/tests/tsconfig.json"}
 EXTERNAL_SOURCE_ROOT_NAMES = {"client", "clients", "sdk", "sdks"}
+KNOWN_ADAPTER_ROOTS = {
+    "filesystem",
+    "http",
+    "robotics",
+    "secrets-local-file",
+    "secrets-memory",
+}
+KNOWN_SPLENDOR_TYPES_MODULES = {
+    "approval.rs",
+    "authority.rs",
+    "capabilities.rs",
+    "cloud_helper.rs",
+    "daemon_security.rs",
+    "determinism.rs",
+    "device_profile.rs",
+    "driver.rs",
+    "escalation.rs",
+    "external_governance.rs",
+    "failure_taxonomy.rs",
+    "fleet_telemetry.rs",
+    "foundation_grammar.rs",
+    "governance.rs",
+    "hash.rs",
+    "identity.rs",
+    "ids.rs",
+    "lib.rs",
+    "message.rs",
+    "node_registry.rs",
+    "performance_budgets.rs",
+    "placement.rs",
+    "policy_distribution.rs",
+    "primitives.rs",
+    "schema_extensions.rs",
+    "secret_lease.rs",
+    "secret_ref.rs",
+    "secret_use_requirement.rs",
+    "secrets.rs",
+    "security_invariants.rs",
+    "state_handoff.rs",
+    "trace.rs",
+    "work_order.rs",
+}
 
 
 @dataclass
@@ -108,9 +151,46 @@ def _unregistered_surface_findings(
         lowered_parts = tuple(part.lower() for part in path.split("/"))
         manifest_name = lowered_parts[-1] if lowered_parts else ""
         if (
+            len(lowered_parts) >= 3
+            and lowered_parts[0] == "adapters"
+            and lowered_parts[1] not in KNOWN_ADAPTER_ROOTS
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            path.startswith("crates/splendor-types/src/")
+            and path.endswith(".rs")
+            and path.rsplit("/", 1)[-1] not in KNOWN_SPLENDOR_TYPES_MODULES
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            suffix_for(path) in SOURCE_SUFFIXES | {".py", ".rs"}
+            and path not in formats
+            and any(
+                part in {"control-plane", "control_plane", "contracts", "specs"}
+                for part in lowered_parts[:-1]
+            )
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
             manifest_name in {"package.json", "pyproject.toml"}
             and path not in formats
             and path not in KNOWN_UNGOVERNED_PACKAGE_MANIFESTS
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            re.fullmatch(r"tsconfig(?:\.[A-Za-z0-9_-]+)?\.json", manifest_name)
+            and path not in formats
+            and path not in KNOWN_UNGOVERNED_TSCONFIGS
+        ):
+            findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
+        if (
+            len(lowered_parts) >= 3
+            and lowered_parts[0] == "crates"
+            and lowered_parts[1] != "splendor-types"
+            and any(
+                marker in lowered_parts[1] for marker in ("contract", "schema", "type")
+            )
+            and path.endswith(".rs")
         ):
             findings.append(Finding(path, 0, "SCN004_UNSUPPORTED_FORMAT"))
         if (
@@ -178,15 +258,30 @@ def _selected_kind(
     if governed_kind:
         return governed_kind
     suffix = suffix_for(path)
+    basename = path.rsplit("/", 1)[-1].lower()
     # INI/TOML table syntax may begin with ``[`` or ``[[``. Preserve the exact
     # config grammar before suffix-independent JSON sniffing so credential
     # section ancestry is evaluated rather than misclassified as malformed JSON.
-    if suffix in CONFIG_SUFFIXES:
+    if (
+        suffix in CONFIG_SUFFIXES
+        or basename == "makefile"
+        or basename.startswith("dockerfile")
+    ):
         return "config"
-    if _looks_like_json_text(text):
+    if prefer_structured_sniff and _looks_like_json_text(text):
         return "json"
     if prefer_structured_sniff and looks_like_yaml_document(text):
         return "yaml"
+    if suffix == ".py":
+        return "python_source"
+    if suffix in SOURCE_SUFFIXES:
+        return "typescript_source"
+    if suffix == ".json":
+        return "json"
+    if suffix in {".yaml", ".yml"} and rich_surface:
+        return "yaml"
+    if suffix == ".md" and rich_surface:
+        return "markdown"
     first_line = text.splitlines()[0] if text.splitlines() else ""
     if first_line.startswith("#!"):
         lowered = first_line.lower()
@@ -196,16 +291,6 @@ def _selected_kind(
             return "typescript_source"
         if any(shell in lowered for shell in ("/sh", "bash", "zsh", "ksh", "dash")):
             return "config"
-    if suffix == ".py" and rich_surface:
-        return "python_source"
-    if suffix in SOURCE_SUFFIXES and rich_surface:
-        return "typescript_source"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".yaml", ".yml"} and rich_surface:
-        return "yaml"
-    if suffix == ".md" and rich_surface:
-        return "markdown"
     if not suffix and re.search(
         r"(?m)^\s*(?:async\s+)?(?:class|def|from|import)\s+", text
     ):
@@ -215,6 +300,16 @@ def _selected_kind(
         text,
     ):
         return "typescript_source"
+    if _looks_like_json_text(text):
+        return "json"
+    if re.search(r"(?m)^\s*\[\[?[^\]\r\n]+\]\]?\s*$", text) and re.search(
+        r"(?m)^\s*[A-Za-z_$][A-Za-z0-9_.$%+-]{0,127}\s*[=:]", text
+    ):
+        return "config"
+    if suffix not in SOURCE_SUFFIXES | {".py", ".rs"} and looks_like_yaml_document(
+        text
+    ):
+        return "yaml"
     if not suffix and re.search(
         r"(?m)^\s*(?:(?:export|set|setenv|declare\s+-[A-Za-z]+)\s+)?[^\s=:]{1,128}\s*[=:]",
         text,
@@ -225,6 +320,106 @@ def _selected_kind(
     if looks_like_yaml_document(text):
         return "yaml"
     return "content"
+
+
+def _normalized_config_text(text: str) -> str:
+    """Build one conservative logical-line view for build/config grammars."""
+
+    # Shell continuations are logical, not independent physical assignments.
+    logical = re.sub(r"\\\r?\n[ \t]*", "", text)
+    logical = re.sub(r"\$'([^'\r\n]*)'", r"'\1'", logical)
+    physical = logical.splitlines()
+    indirect_names: dict[str, str] = {}
+    for line in physical:
+        binding = re.fullmatch(
+            r"[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*="
+            r"[ \t]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[ \t]*",
+            line,
+        )
+        if binding is not None and is_secret_field_name(binding.group(2)):
+            indirect_names[binding.group(1)] = binding.group(2)
+    joined: list[str] = []
+    index = 0
+    while index < len(physical):
+        line = physical[index]
+        for variable, coordinate in indirect_names.items():
+            line = re.sub(
+                rf"(?<![A-Za-z0-9_])(?:\$\{{{re.escape(variable)}\}}|\${re.escape(variable)})(?=\s*[=:])",
+                coordinate,
+                line,
+            )
+        stripped = line.lstrip(" \t")
+        docker_env = re.match(r"(?i)^ENV[ \t]+(.+)$", stripped)
+        if docker_env is not None:
+            tokens = docker_env.group(1).split()
+            if tokens and all("=" in token for token in tokens):
+                joined.extend(tokens)
+                index += 1
+                continue
+        docker = re.match(
+            r"(?i)^(?:ENV|ARG)[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+            r"(?:[ \t]*=[ \t]*|[ \t]+)(.*)$",
+            stripped,
+        )
+        run_assignment = re.match(
+            r"(?i)^RUN[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$",
+            stripped,
+        )
+        make_assignment = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?::=|\?=|\+=|!=)[ \t]*(.*)$",
+            stripped,
+        )
+        normalized = docker or run_assignment or make_assignment
+        if normalized is not None:
+            joined.append(f"{normalized.group(1)}={normalized.group(2)}")
+            index += 1
+            continue
+
+        command = re.match(r"(?i)^(?:RUN[ \t]+|env[ \t]+)(.*)$", stripped)
+        if command is not None:
+            command_text = command.group(1)
+            leading = re.match(
+                r"(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*([^ \t]+)",
+                command_text,
+            )
+            joined.append(
+                f"{leading.group(1)}={leading.group(2)}"
+                if leading is not None
+                else command_text
+            )
+            index += 1
+            continue
+
+        assignment = re.match(
+            r"^([A-Za-z_$][A-Za-z0-9_.$%+-]{0,127})[ \t]*([=:])[ \t]*(.*)$",
+            stripped,
+        )
+        if assignment is not None:
+            value_parts = [assignment.group(3)]
+            bracket_depth = sum(value_parts[0].count(char) for char in "[{") - sum(
+                value_parts[0].count(char) for char in "]}"
+            )
+            cursor = index + 1
+            while cursor < len(physical):
+                continuation = physical[cursor]
+                if bracket_depth <= 0 and not continuation.startswith((" ", "\t")):
+                    break
+                part = continuation.strip()
+                value_parts.append(part)
+                bracket_depth += sum(part.count(char) for char in "[{") - sum(
+                    part.count(char) for char in "]}"
+                )
+                cursor += 1
+                if bracket_depth <= 0:
+                    break
+            joined.append(
+                f"{assignment.group(1)}{assignment.group(2)}{' '.join(value_parts)}"
+            )
+            index = cursor
+            continue
+        joined.append(line)
+        index += 1
+    return "\n".join(joined) + ("\n" if text.endswith(("\n", "\r")) else "")
 
 
 def _content_allowlist_map(policy: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -418,6 +613,7 @@ def _scan_text_blob(
                     budget=budget,
                     maximum_hits=maximum,
                     assignment_context=True,
+                    colon_assignment_context=True,
                 ),
                 [],
             )
@@ -467,9 +663,56 @@ def _scan_text_blob(
                     structural_fields=structural_fields,
                 )
             )
+        # CommonMark indented blocks (including tab-expanded and container
+        # continuations) do not carry an info string.  Sniff closed, balanced
+        # single-line JSON values so they receive the same structural checks as
+        # fenced JSON without interpreting arbitrary prose as a document.
+        for number, physical_line in enumerate(text.expandtabs(4).splitlines(), 1):
+            candidate = physical_line
+            while True:
+                quote = re.match(r"^ {0,3}> ?", candidate)
+                if quote is None:
+                    break
+                candidate = candidate[quote.end() :]
+            stripped = candidate.strip()
+            if not (
+                len(stripped) >= 2 and stripped[0] in "[{" and stripped[-1] in "]}"
+            ):
+                continue
+            snippet = (stripped + "\n").encode("utf-8")
+            try:
+                parse_structured_data("json", snippet, policy["limits"], budget)
+            except ScanDataError as exc:
+                if exc.code == "SCN006_MALFORMED_JSON":
+                    continue
+                raise
+            scans.append(
+                _scan_structured_document(
+                    path=f"{path}#indented-{number}",
+                    data=snippet,
+                    kind="json",
+                    policy=policy,
+                    budget=budget,
+                    owner_documents=owner_documents,
+                    symbolic_fixtures=symbolic_fixtures,
+                    exceptions=exceptions,
+                    used_owner=used_owner,
+                    used_symbolic=used_symbolic,
+                    used_exceptions=used_exceptions,
+                    unit_digests=unit_digests,
+                    schema_hint="markdown:json",
+                    base_line=number,
+                    structural_fields=structural_fields,
+                )
+            )
         return _merge_scans(scans)
+    scan_text = _normalized_config_text(text) if kind == "config" else text
+    if scan_text != text:
+        encoded_size = len(scan_text.encode("utf-8"))
+        budget.ensure_work_capacity(encoded_size)
+        budget.charge_work(encoded_size)
     raw_hits = _scan_raw_text(
-        text,
+        scan_text,
         budget=budget,
         maximum_hits=maximum,
         # Low-entropy assignment grammar is suffix-independent for every
@@ -532,7 +775,7 @@ def _bounded_findings(findings: Iterable[Finding], maximum: int) -> list[Finding
 
 
 def _scan_repository_pinned(
-    repository: PinnedRepository,
+    repository: RepositoryReader,
     policy: dict[str, Any],
     *,
     explicit_paths: Sequence[str] | None = None,
@@ -633,7 +876,7 @@ def _scan_repository_pinned(
                 used_source_owner_files.add(path)
                 if hashlib.sha256(data).hexdigest() != expected_source_digest:
                     findings.append(Finding(path, 0, "SCF003_INVALID_SAFE_RECORD"))
-            archive_kind = detect_archive_kind(data)
+            archive_kind = detect_archive_kind(data, budget=budget)
             archive_named = suffix_for(path) in ARCHIVE_SUFFIXES
             if archive_kind is not None or archive_named:
                 if archive_kind is None:
@@ -641,7 +884,7 @@ def _scan_repository_pinned(
                 for member in archive_members(data, limits, budget):
                     stats.archive_members += 1
                     display = f"{path}!{member.name}"
-                    if detect_archive_kind(member.data) is not None:
+                    if detect_archive_kind(member.data, budget=budget) is not None:
                         raise ScanDataError("SCA001_ARCHIVE_INVALID")
                     member_text = _decode_unambiguous(member.data)
                     if member_text is None:
@@ -683,6 +926,11 @@ def _scan_repository_pinned(
                     raise ScanDataError("SCN012_WORKFLOW_UNGATED")
                 if governed_kind:
                     raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+                if suffix_for(path) in CONFIG_SUFFIXES | SOURCE_SUFFIXES | {
+                    ".py",
+                    ".rs",
+                }:
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE")
                 continue
             stats.content_files += 1
             suffix = suffix_for(path)
@@ -692,12 +940,19 @@ def _scan_repository_pinned(
                 or suffix in SOURCE_SUFFIXES
                 or suffix in {".json", ".md", ".yaml", ".yml"}
             )
+            kind = _selected_kind(path, text, governed_kind, rich_surface=rich_surface)
             structural_fields = (
                 governed_kind is not None
                 or explicit_paths is not None
                 or path in exception_files
+                or bool(
+                    kind in {"json", "yaml"}
+                    and re.search(
+                        r"(?m)^\s*(?:\{\s*)?[\"']?openapi[\"']?\s*[:=]",
+                        text,
+                    )
+                )
             )
-            kind = _selected_kind(path, text, governed_kind, rich_surface=rich_surface)
             if governed_kind:
                 stats.governed_files += 1
             blob_scan = _scan_text_blob(
@@ -766,12 +1021,12 @@ def _scan_repository_pinned(
 
 
 def scan_repository(
-    repo_root: Path | PinnedRepository,
+    repo_root: Path | RepositoryReader,
     policy: dict[str, Any],
     *,
     explicit_paths: Sequence[str] | None = None,
 ) -> tuple[list[Finding], ScanStats]:
-    if isinstance(repo_root, PinnedRepository):
+    if isinstance(repo_root, RepositoryReader):
         try:
             return _scan_repository_pinned(
                 repo_root, policy, explicit_paths=explicit_paths

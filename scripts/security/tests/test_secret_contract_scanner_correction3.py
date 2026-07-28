@@ -752,8 +752,8 @@ class BootstrapInventoryDiagnosticWorkflowCorrection3Tests(unittest.TestCase):
             validate_workflow_text(
                 docker_path,
                 docker.replace(
-                    "  publish-platform:\n    needs: [secret-contracts, smoke]\n    permissions:\n      contents: read\n      packages: write\n",
-                    "  publish-platform:\n    needs: [secret-contracts, smoke]\n",
+                    "  publish-platform:\n    needs: [secret-contracts, smoke, verify-smoke]\n    if: github.ref_protected == true\n    environment: ghcr-release\n    permissions:\n      contents: read\n      packages: write\n",
+                    "  publish-platform:\n    needs: [secret-contracts, smoke, verify-smoke]\n",
                     1,
                 ),
             )
@@ -782,7 +782,7 @@ class BootstrapInventoryDiagnosticWorkflowCorrection3Tests(unittest.TestCase):
             ),
             "checkout": text.replace("          git init .\n", "", 1),
             "scanner-command": text.replace(
-                "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n",
+                '          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"\n',
                 "",
                 1,
             ),

@@ -1878,6 +1878,7 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             ".github/workflows/docker-image.yml": {
                 "secret-contracts",
                 "smoke",
+                "verify-smoke",
                 "publish-platform",
                 "publish-manifest",
             },
@@ -1893,7 +1894,7 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(jobs, expected_jobs[path])
-                self.assertNotIn("GITHUB_REF", text)
+                self.assertIsNone(re.search(r"\bGITHUB_REF\b", text))
                 self.assertNotIn("FETCH_HEAD", text)
                 checkout_count = text.count(
                     'git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"'
@@ -1948,8 +1949,8 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
             validate_workflow_text(
                 ci_path,
                 ci.replace(
-                    "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n",
-                    "          set +e\n          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n",
+                    '          env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n',
+                    '          set +e\n          env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test\n',
                     1,
                 ),
             )
@@ -1995,8 +1996,8 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
                 1,
             ),
             ci.replace(
-                "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py\n",
-                "          /usr/bin/python3 -I scripts/security/check-secret-contracts.py || true\n",
+                '          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"\n',
+                '          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}" || true\n',
                 1,
             ),
         )
@@ -2039,7 +2040,7 @@ class WorkflowAndPolicyContractTests(unittest.TestCase):
         docker_path = REQUIRED_WORKFLOWS[1]
         docker = (REPO_ROOT / docker_path).read_text()
         self.assertTrue(validate_workflow_text(docker_path, docker))
-        for job in ("smoke", "publish-platform", "publish-manifest"):
+        for job in ("smoke", "verify-smoke", "publish-platform", "publish-manifest"):
             block = re.search(
                 rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
                 docker,

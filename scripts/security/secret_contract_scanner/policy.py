@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
 
-from .io_utils import PinnedRepository, safe_read_file
+from .io_utils import RepositoryReader, safe_read_file
 from .model import (
     DEFAULT_POLICY_PATH,
     FORMAT_KINDS,
@@ -126,6 +128,9 @@ SOURCE_OWNER_EXPORT_INVENTORY: tuple[
             "WorkOrderAuthorization",
         ),
     ),
+)
+CONTENT_ALLOWLIST_INVENTORY_SHA256 = (
+    "a3496ee8db23ee8aa48766b3906c126ce1f624aaf022f34807af84c21c9bc78c"
 )
 
 
@@ -437,11 +442,19 @@ def validate_policy(policy: Any, *, today: dt.date) -> list[Finding]:
         ):
             return invalid()
         content_paths.add(entry["path"])
+    encoded_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    if (
+        hashlib.sha256(encoded_content).hexdigest()
+        != CONTENT_ALLOWLIST_INVENTORY_SHA256
+    ):
+        return invalid()
     return []
 
 
 def load_policy(
-    repo_root: Path | PinnedRepository, policy_path: str, *, today: dt.date
+    repo_root: Path | RepositoryReader, policy_path: str, *, today: dt.date
 ) -> tuple[dict[str, Any] | None, list[Finding]]:
     if not safe_policy_path(policy_path):
         return None, [Finding(DEFAULT_POLICY_PATH, 0, "SCN001_POLICY_INVALID")]

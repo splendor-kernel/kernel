@@ -7,8 +7,14 @@ import re
 from collections import Counter
 
 SCANNER_COMMANDS = (
-    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test",
-    "/usr/bin/python3 -I scripts/security/check-secret-contracts.py",
+    '/usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"',
+    'sandbox="$(mktemp -d)"',
+    "trap 'rm -rf \"${sandbox}\"' EXIT",
+    'git archive "${GITHUB_SHA}" | tar -x -C "${sandbox}"',
+    "(",
+    'cd "${sandbox}"',
+    'env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test',
+    ")",
 )
 CHECKOUT_COMMANDS = (
     "git init .",
@@ -25,10 +31,10 @@ REQUIRED_WORKFLOWS = (
 EXPECTED_WORKFLOW_SHA256 = {
     REQUIRED_WORKFLOWS[
         0
-    ]: "6b8b69bd670ff9290a485e39ab7cc8c508299b1db6bd15d69bbf956afd9a3ab8",
+    ]: "c6f8e847ed014e8fecc69f0cbb876da075658ffc827a7b40eecb8dc88ea5c07b",
     REQUIRED_WORKFLOWS[
         1
-    ]: "728733b443f5bd0bf42d9a94e03d5b1f042cb3e16ee53cf2c9a96a59433ad652",
+    ]: "7b1de900391bebe8ca66e0588d33486718d6ab722dcf233ccc181ce3ee93fea4",
 }
 EXPECTED_JOBS = {
     REQUIRED_WORKFLOWS[0]: {
@@ -41,7 +47,8 @@ EXPECTED_JOBS = {
     REQUIRED_WORKFLOWS[1]: {
         "secret-contracts": set(),
         "smoke": {"secret-contracts"},
-        "publish-platform": {"secret-contracts", "smoke"},
+        "verify-smoke": {"secret-contracts", "smoke"},
+        "publish-platform": {"secret-contracts", "smoke", "verify-smoke"},
         "publish-manifest": {"secret-contracts", "publish-platform"},
     },
 }
@@ -54,12 +61,12 @@ EXPECTED_ACTIONS = {
     ),
     REQUIRED_WORKFLOWS[1]: Counter(
         {
-            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": 1,
-            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": 1,
-            "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8": 2,
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": 3,
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": 2,
+            "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8": 1,
             "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9": 2,
-            "docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051": 3,
-            "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f": 3,
+            "docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051": 1,
+            "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f": 2,
         }
     ),
 }
@@ -188,6 +195,8 @@ def validate_workflow_text(path: str, text: str) -> bool:
         return False
     if "\t" in text or "\r" in text:
         return False
+    if _top_level_section(text, "permissions") != "permissions:\n  contents: read":
+        return False
     forbidden = (
         r"(?m)^defaults:",
         r"(?m)^\s+defaults:",
@@ -216,13 +225,43 @@ def validate_workflow_text(path: str, text: str) -> bool:
         return False
     if any(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action) is None for action in actions):
         return False
+    if path == REQUIRED_WORKFLOWS[1] and (
+        text.count("GITHUB_REF_PROTECTED") != 4
+        or text.count("sha256sum --check") != 2
+        or text.count("docker load --input image.tar") != 3
+        or text.count("    environment: ghcr-release\n") != 2
+        or text.count("outputs: type=docker,dest=") != 1
+        or text.count("bash scripts/container-tests.sh") != 1
+        or "published manifest children differ from tested digests" not in text
+        or "docker/build-push-action@" in blocks["publish-platform"]
+        or "bash scripts/container-tests.sh" in blocks["smoke"]
+        or "bash scripts/container-tests.sh" not in blocks["verify-smoke"]
+        or "actions/upload-artifact@" not in blocks["smoke"]
+        or "actions/upload-artifact@" in blocks["verify-smoke"]
+    ):
+        return False
     for job, block in blocks.items():
         dependencies = _needs(block)
         if dependencies is None or dependencies != expected[job]:
             return False
         if job != "secret-contracts" and "secret-contracts" not in dependencies:
             return False
-        if re.search(r"(?m)^    if:", block):
+        if_lines = re.findall(r"(?m)^    if:\s*(.*?)\s*$", block)
+        required_release_guard = path == REQUIRED_WORKFLOWS[1] and job in {
+            "publish-platform",
+            "publish-manifest",
+        }
+        if if_lines != (
+            ["github.ref_protected == true"] if required_release_guard else []
+        ):
+            return False
+        if required_release_guard and (
+            "    environment: ghcr-release\n" not in block
+            or "      packages: write\n" not in block
+            or "GITHUB_REF_PROTECTED" not in block
+        ):
+            return False
+        if not required_release_guard and "      packages: write\n" in block:
             return False
         run_blocks = _run_blocks(block)
         if any(
@@ -250,6 +289,8 @@ def validate_workflow_text(path: str, text: str) -> bool:
     if sum(commands == list(SCANNER_COMMANDS) for commands in _run_blocks(secret)) != 1:
         return False
     if re.search(r"(?m)^\s+(?:-\s+)?uses:", secret):
+        return False
+    if secret.index(SCANNER_COMMANDS[0]) > secret.index("--self-test"):
         return False
     timeout = re.search(r"(?m)^    timeout-minutes:\s*([0-9]+)\s*$", secret)
     return timeout is not None and int(timeout.group(1)) == 5

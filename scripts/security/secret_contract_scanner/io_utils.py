@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 import selectors
 import stat
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
 from types import TracebackType
+from typing import Protocol, runtime_checkable
 
 from .model import (
     HARD_GIT_TIMEOUT_SECONDS,
@@ -59,6 +61,17 @@ def _close(descriptor: int) -> None:
         os.close(descriptor)
     except OSError:
         pass
+
+
+@runtime_checkable
+class RepositoryReader(Protocol):
+    """Minimal immutable-or-pinned repository view used by the scanner."""
+
+    path: Path
+
+    def assert_identity(self) -> None: ...
+
+    def read_file(self, relative: str, maximum: int) -> bytes: ...
 
 
 class PinnedRepository:
@@ -202,10 +215,171 @@ class PinnedRepository:
                 _close(child)
 
 
+class GitObjectRepository:
+    """Read one exact commit tree from immutable Git blob identities.
+
+    Candidate self-tests never participate in this view.  Paths and blob object
+    IDs are captured from one full commit before any blob is read, and symlinks,
+    submodules, sparse worktree state, and untracked checkout bytes are excluded.
+    """
+
+    def __init__(self, repo_root: Path, revision: str):
+        if re.fullmatch(r"[0-9a-f]{40,64}", revision) is None:
+            raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+        self._repository = PinnedRepository(repo_root)
+        self.path = self._repository.path
+        self.revision = revision
+        self._blobs: dict[str, tuple[str, int]] = {}
+        try:
+            resolved = (
+                self._git_output(
+                    ["rev-parse", "--verify", f"{revision}^{{commit}}"],
+                    maximum=128,
+                )
+                .decode("ascii")
+                .strip()
+            )
+            if resolved != revision:
+                raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+            tree = self._git_output(
+                ["ls-tree", "-r", "-z", "-l", "--full-tree", revision],
+                maximum=4097 * (HARD_MAX_FILES + 1),
+            )
+            records = tree.split(b"\x00")
+            if records[-1:] != [b""]:
+                raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+            for record in records[:-1]:
+                metadata, separator, raw_path = record.partition(b"\t")
+                fields = metadata.split()
+                if separator != b"\t" or len(fields) != 4:
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+                mode, object_type, raw_oid, raw_size = fields
+                if mode not in {b"100644", b"100755"} or object_type != b"blob":
+                    raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+                try:
+                    path = raw_path.decode("utf-8")
+                    oid = raw_oid.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE") from exc
+                if (
+                    not safe_policy_path(path)
+                    or re.fullmatch(r"[0-9a-f]{40,64}", oid) is None
+                    or path in self._blobs
+                    or len(self._blobs) >= HARD_MAX_FILES
+                ):
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+                try:
+                    size = int(raw_size.decode("ascii"))
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE") from exc
+                if size < 0:
+                    raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+                self._blobs[path] = (oid, size)
+            if not self._blobs:
+                raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+            self.assert_identity()
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self) -> GitObjectRepository:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        repository = getattr(self, "_repository", None)
+        if repository is not None:
+            repository.close()
+
+    def assert_identity(self) -> None:
+        self._repository.assert_identity()
+
+    def list_files(self, *, max_files: int) -> tuple[list[str], list[Finding]]:
+        if max_files <= 0 or max_files > HARD_MAX_FILES or len(self._blobs) > max_files:
+            return [], [Finding(".", 0, "SCN005_BUDGET_EXCEEDED")]
+        self.assert_identity()
+        return sorted(self._blobs), []
+
+    def read_file(self, relative: str, maximum: int) -> bytes:
+        if not safe_policy_path(relative):
+            raise ScanDataError("SCN003_PATH_AMBIGUOUS")
+        entry = self._blobs.get(relative)
+        if entry is None:
+            raise ScanDataError("SCN002_PATH_UNAVAILABLE")
+        oid, size = entry
+        if size > maximum:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+        data = self._git_output(["cat-file", "blob", oid], maximum=maximum + 1)
+        if len(data) != size or len(data) > maximum:
+            raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+        self.assert_identity()
+        return data
+
+    def _git_output(self, arguments: list[str], *, maximum: int) -> bytes:
+        if maximum < 0:
+            raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+
+        def enter_pinned_root() -> None:
+            os.fchdir(self._repository.root_fd)
+
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            self._repository.assert_identity()
+            process = subprocess.Popen(
+                ["git", *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(self._repository.root_fd,),
+                preexec_fn=enter_pinned_root,
+            )
+            if process.stdout is None:
+                raise OSError
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            deadline = time.monotonic() + HARD_GIT_TIMEOUT_SECONDS
+            while remaining > 0:
+                if time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(arguments, HARD_GIT_TIMEOUT_SECONDS)
+                chunk = process.stdout.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if len(data) > maximum:
+                raise ScanDataError("SCN005_BUDGET_EXCEEDED")
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+            if process.returncode != 0:
+                raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE")
+            self._repository.assert_identity()
+            return data
+        except ScanDataError:
+            raise
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise ScanDataError("SCN010_REPOSITORY_UNAVAILABLE") from exc
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
+
+
 def safe_read_file(
-    repo_root: Path | PinnedRepository, relative: str, maximum: int
+    repo_root: Path | RepositoryReader, relative: str, maximum: int
 ) -> bytes:
-    if isinstance(repo_root, PinnedRepository):
+    if isinstance(repo_root, RepositoryReader):
         return repo_root.read_file(relative, maximum)
     with PinnedRepository(repo_root) as repository:
         return repository.read_file(relative, maximum)
@@ -302,10 +476,14 @@ def _bounded_git_paths(
 
 
 def enumerate_repository_files(
-    repo_root: Path | PinnedRepository, *, max_files: int = HARD_MAX_FILES
+    repo_root: Path | RepositoryReader, *, max_files: int = HARD_MAX_FILES
 ) -> tuple[list[str], list[Finding]]:
+    if isinstance(repo_root, GitObjectRepository):
+        return repo_root.list_files(max_files=max_files)
     if isinstance(repo_root, PinnedRepository):
         return _bounded_git_paths(repo_root, max_files=max_files)
+    if not isinstance(repo_root, Path):
+        return [], [Finding(".", 0, "SCN010_REPOSITORY_UNAVAILABLE")]
     try:
         with PinnedRepository(repo_root) as repository:
             return _bounded_git_paths(repository, max_files=max_files)

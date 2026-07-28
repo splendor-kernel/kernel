@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import io
 import json
 import math
 import re
 import unicodedata
+import tokenize
 from dataclasses import dataclass
 from typing import Any
 
@@ -183,6 +185,50 @@ def split_yaml_comment_text(text: str) -> tuple[str, str | None]:
 
 def strip_yaml_comment(text: str) -> str:
     return split_yaml_comment_text(text)[0]
+
+
+def _yaml_fragment_state(
+    text: str,
+    quote: str | None,
+    escaped: bool,
+    depth: int,
+) -> tuple[str | None, bool, int]:
+    """Advance multiline quote/flow state in one character pass."""
+
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if char in {'"', "'"}:
+            previous = text[index - 1] if index else " "
+            if index == 0 or previous.isspace() or previous in "[{,:-":
+                quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ScanDataError("SCN007_MALFORMED_YAML")
+        elif char == "#" and depth == 0 and (index == 0 or text[index - 1].isspace()):
+            break
+        index += 1
+    return quote, escaped, depth
 
 
 def split_yaml_mapping(text: str) -> tuple[str, str] | None:
@@ -460,9 +506,10 @@ class YamlSubsetParser:
             try:
                 stripped, comment = split_yaml_comment_text(raw[indent:])
             except ScanDataError as exc:
-                combined = raw[indent:]
+                parts = [raw[indent:]]
                 recovered: str | None = None
                 continuation = position
+                quote, escaped, depth = _yaml_fragment_state(parts[0], None, False, 0)
                 while continuation < len(raw_lines):
                     next_raw = raw_lines[continuation]
                     next_number = continuation + 1
@@ -471,13 +518,24 @@ class YamlSubsetParser:
                     next_indent = len(next_raw) - len(next_raw.lstrip(" "))
                     if next_raw.strip() and next_indent <= indent:
                         break
-                    combined += " " + next_raw.strip()
+                    part = next_raw.strip()
+                    parts.append(part)
                     continuation += 1
-                    try:
-                        recovered, comment = split_yaml_comment_text(combined)
-                    except ScanDataError:
+                    quote, escaped, depth = _yaml_fragment_state(
+                        part, quote, escaped, depth
+                    )
+                    if quote is not None or depth != 0:
                         continue
                     break
+                combined_size = sum(len(part) for part in parts) + len(parts) - 1
+                if budget is not None:
+                    budget.ensure_work_capacity(combined_size)
+                    budget.charge_work(combined_size)
+                combined = " ".join(parts)
+                try:
+                    recovered, comment = split_yaml_comment_text(combined)
+                except ScanDataError:
+                    recovered = None
                 if recovered is None:
                     raise ScanDataError(exc.code, number) from exc
                 stripped = recovered
@@ -809,6 +867,61 @@ def _commonmark_container_prefixes(
     return current, opener, continuation, residual
 
 
+def _commonmark_logical_lines(text: str) -> list[str]:
+    """Expand tabs and normalize only the enclosing list continuation.
+
+    Once a fence opens, list-looking lines belong to the fenced language.  Keep
+    them byte-for-byte after removal of the already-established outer list
+    indent so YAML sequences and similar content cannot alter Markdown state.
+    """
+
+    result: list[str] = []
+    continuation_width = 0
+    active_marker: str | None = None
+    active_marker_length = 0
+
+    def fence_probe(line: str) -> str:
+        current = line
+        for _ in range(128):
+            quote = re.match(r"^ {0,3}> ?", current)
+            if quote is None:
+                break
+            current = current[quote.end() :]
+        return current
+
+    for raw in text.expandtabs(4).splitlines():
+        normalized = (
+            raw[continuation_width:]
+            if continuation_width and raw.startswith(" " * continuation_width)
+            else raw
+        )
+        if active_marker is not None:
+            result.append(normalized)
+            closing = re.fullmatch(
+                rf" {{0,3}}{re.escape(active_marker)}"
+                rf"{{{active_marker_length},}}\s*",
+                fence_probe(normalized),
+            )
+            if closing is not None:
+                active_marker = None
+                active_marker_length = 0
+            continue
+        if not raw.strip():
+            result.append(raw)
+            continue
+        continued = continuation_width > 0 and normalized != raw
+        if not continued:
+            listing = re.match(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)]) {1,4}", raw)
+            continuation_width = listing.end() if listing is not None else 0
+            normalized = raw
+        result.append(normalized)
+        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,}|:{3,}).*", fence_probe(normalized))
+        if opening is not None:
+            active_marker = opening.group(1)[0]
+            active_marker_length = len(opening.group(1))
+    return result
+
+
 def parse_markdown_fences(
     data: bytes, limits: dict[str, int], budget: WorkBudget | None = None
 ) -> list[StructuredFence]:
@@ -831,7 +944,7 @@ def parse_markdown_fences(
     active_myst = False
     myst_options_open = False
     myst_option_count = 0
-    for number, physical_line in enumerate(text.splitlines(), 1):
+    for number, physical_line in enumerate(_commonmark_logical_lines(text), 1):
         if active_marker is None:
             (
                 line,
@@ -1319,7 +1432,7 @@ def _mapping_keys_are_identifiers(path: str) -> bool:
         path in _IDENTIFIER_MAP_PATHS
         or re.fullmatch(r"\$\.paths(?:\[.*?\]|\.[^.]+)?", path)
         or re.search(r"\.security\[[0-9]+\]$", path)
-        or path.endswith((".$defs", ".definitions"))
+        or path.endswith((".$defs", ".definitions", ".flows", ".matches", ".scopes"))
     )
 
 
@@ -1355,7 +1468,12 @@ def scan_structured_value(
             if assignment_key is not None and is_secret_field_name(assignment_key)
             else ""
         )
-        scan_text = prefix + text
+        scan_value = (
+            json.dumps(text)
+            if prefix and any(char.isspace() for char in text)
+            else text
+        )
+        scan_text = prefix + scan_value
         budget.charge_text(scan_text)
         remaining = maximum_hits - len(hits)
         if remaining <= 0:
@@ -1412,7 +1530,7 @@ def scan_structured_value(
                 child_path = json_child_path(path, key)
                 inspect_key = (
                     not openapi_mode
-                    or path.endswith((".properties", ".headers"))
+                    or path.endswith((".properties", ".patternProperties", ".headers"))
                     or openapi_payload
                 )
                 parameter_name = (
@@ -1426,11 +1544,60 @@ def scan_structured_value(
                     or _openapi_security_secret_coordinate(path, key)
                     or (parameter_name and is_secret_field_name(child))
                 )
+                metadata_container = bool(
+                    doc_schema is None
+                    and normalize_field_name(key) in {"credential", "credentials"}
+                    and isinstance(child, dict)
+                    and child
+                    and all(
+                        normalize_field_name(name)
+                        in {
+                            "algorithm",
+                            "backend",
+                            "format",
+                            "kind",
+                            "policy",
+                            "provider",
+                            "state",
+                            "type",
+                        }
+                        for name in child
+                    )
+                )
+                safe_reference = bool(
+                    isinstance(child, str)
+                    and re.fullmatch(
+                        r"(?:\$[A-Za-z_][A-Za-z0-9_]*|"
+                        r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|"
+                        r"\$\{\{\s*(?:secrets|vars)\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}|"
+                        r"<(?:redacted|secret-ref|value)>)",
+                        child.strip(),
+                    )
+                )
+                is_secret_coordinate = is_secret_coordinate and not (
+                    metadata_container or safe_reference
+                )
                 child_structural = structural_enabled
                 child_assignment = assignment_enabled
                 child_credential_ancestor = credential_ancestor or (
-                    not identifier_keys and is_secret_field_name(key)
+                    not identifier_keys
+                    and not metadata_container
+                    and not safe_reference
+                    and is_secret_field_name(key)
                 )
+                if (
+                    assignment_enabled
+                    and not identifier_keys
+                    and is_secret_field_name(key)
+                    and not isinstance(child, (dict, list, str))
+                    and child is not None
+                ):
+                    add_text(
+                        str(child),
+                        context=True,
+                        line=base_line,
+                        assignment_key=key,
+                    )
                 if structural_enabled and not owner_exact and is_secret_coordinate:
                     identity = (file_path, doc_schema or "", child_path)
                     entry = exceptions.get(identity)
@@ -1847,6 +2014,25 @@ def scan_python_source(
     allowed_safe_types = safe_type_names or set()
     safe_names, safe_modules = _python_safe_imports(tree, allowed_safe_types)
     static_strings = _python_static_string_bindings(tree)
+    factory_aliases: dict[str, str] = {
+        "NamedTuple": "NamedTuple",
+        "TypedDict": "TypedDict",
+        "make_dataclass": "make_dataclass",
+        "namedtuple": "namedtuple",
+        "create_model": "create_model",
+    }
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom) or statement.module not in {
+            "collections",
+            "dataclasses",
+            "pydantic",
+            "typing",
+            "typing_extensions",
+        }:
+            continue
+        for alias in statement.names:
+            if alias.name in set(factory_aliases.values()):
+                factory_aliases[alias.asname or alias.name] = alias.name
     line_offsets = [0]
     for match in re.finditer("\n", text):
         line_offsets.append(match.end())
@@ -2132,6 +2318,16 @@ def scan_python_source(
                         raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
                 elif isinstance(target, ast.Attribute):
                     self.inspect_object_field(target.attr, node.value, node.lineno)
+                elif isinstance(target, (ast.List, ast.Tuple, ast.Starred)):
+                    for binding in ast.walk(target):
+                        if isinstance(binding, ast.Name) and isinstance(
+                            binding.ctx, ast.Store
+                        ):
+                            self.inspect_object_field(
+                                binding.id,
+                                node.value,
+                                getattr(binding, "lineno", node.lineno),
+                            )
                 if name is None:
                     continue
                 if inspect_declaration and path is not None and kind is not None:
@@ -2178,6 +2374,20 @@ def scan_python_source(
 
         def visit_Call(self, node: ast.Call) -> None:
             function = _annotation_text(node.func).split(".")[-1]
+            function = factory_aliases.get(function, function)
+            for keyword in node.keywords:
+                if keyword.arg not in {
+                    "alias",
+                    "serialization_alias",
+                    "validation_alias",
+                }:
+                    continue
+                alias_name = _python_static_string(
+                    keyword.value, bindings=static_strings
+                )
+                if alias_name is None:
+                    raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
+                self.inspect_object_field(alias_name, None, keyword.value.lineno)
             factory_name = "<anonymous>"
             if (
                 node.args
@@ -2189,6 +2399,11 @@ def scan_python_source(
                 for keyword in node.keywords:
                     if keyword.arg is None:
                         continue
+                    self.inspect_object_field(keyword.arg, keyword.value, node.lineno)
+            elif function == "update":
+                for keyword in node.keywords:
+                    if keyword.arg is None:
+                        raise ScanDataError("SCN011_MALFORMED_SOURCE", node.lineno)
                     self.inspect_object_field(keyword.arg, keyword.value, node.lineno)
             elif function == "setattr":
                 if len(node.args) < 3:
@@ -2358,6 +2573,33 @@ def scan_python_source(
                         self.scan_literal(model_default, model_name_node.value)
             self.generic_visit(node)
 
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            comment = token.string.lstrip("# ")
+            budget.charge_text(comment)
+            remaining = maximum_hits - len(hits)
+            for hit in scan_content(
+                comment,
+                remaining,
+                assignment_context=True,
+                colon_assignment_context=True,
+                budget=budget,
+            ):
+                hits.append(
+                    ContentHit(
+                        token.start[0] + hit.line - 1,
+                        line_offsets[token.start[0] - 1] + token.start[1] + hit.start,
+                        line_offsets[token.start[0] - 1]
+                        + token.start[1]
+                        + max(hit.start + 1, hit.end),
+                        hit.code,
+                    )
+                )
+    except (tokenize.TokenError, IndentationError) as exc:
+        raise ScanDataError("SCN011_MALFORMED_SOURCE") from exc
+
     Visitor().visit(tree)
     return StructuredScan(hits, findings)
 
@@ -2421,6 +2663,143 @@ def _decode_js_string(raw: str, quote: str) -> str:
     return value
 
 
+def _js_identifier_start(char: str) -> bool:
+    return (
+        char in "_$"
+        or char.isalpha()
+        or unicodedata.category(char)
+        in {
+            "Ll",
+            "Lm",
+            "Lo",
+            "Lt",
+            "Lu",
+            "Nl",
+        }
+    )
+
+
+def _js_identifier_continue(char: str) -> bool:
+    return (
+        _js_identifier_start(char)
+        or char.isdigit()
+        or unicodedata.category(char)
+        in {
+            "Mn",
+            "Mc",
+            "Nd",
+            "Pc",
+            "Cf",
+        }
+    )
+
+
+def _decode_js_identifier(text: str, start: int) -> tuple[str, int]:
+    chars: list[str] = []
+    index = start
+    while index < len(text):
+        if text.startswith("\\u{", index):
+            closing = text.find("}", index + 3, min(len(text), index + 11))
+            if closing < 0:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            digits = text[index + 3 : closing]
+            if not re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            codepoint = int(digits, 16)
+            index = closing + 1
+            if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            char = chr(codepoint)
+        elif text.startswith("\\u", index):
+            digits = text[index + 2 : index + 6]
+            if not re.fullmatch(r"[0-9A-Fa-f]{4}", digits):
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+            char = chr(int(digits, 16))
+            index += 6
+            if 0xD800 <= ord(char) <= 0xDFFF:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE")
+        else:
+            char = text[index]
+            index += 1
+        valid = (
+            _js_identifier_start(char) if not chars else _js_identifier_continue(char)
+        )
+        if not valid:
+            # A literal non-identifier character belongs to the next token;
+            # an escape that decodes outside IdentifierName is malformed.
+            if text[index - 1] == char:
+                index -= 1
+                break
+            raise ScanDataError("SCN011_MALFORMED_SOURCE")
+        chars.append(char)
+    if not chars:
+        raise ScanDataError("SCN011_MALFORMED_SOURCE")
+    return "".join(chars), index
+
+
+def _static_template_value(raw: str) -> str | None:
+    """Resolve a template only when every interpolation is a string literal."""
+
+    chunks: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"\$\{\s*(['\"])((?:\\.|(?!\1).)*)\1\s*\}", raw):
+        if "${" in raw[cursor : match.start()]:
+            return None
+        literal = raw[cursor : match.start()]
+        try:
+            chunks.append(_decode_js_string(literal, "`"))
+            chunks.append(_decode_js_string(match.group(2), match.group(1)))
+        except ScanDataError:
+            return None
+        cursor = match.end()
+    if "${" in raw[cursor:]:
+        return None
+    try:
+        chunks.append(_decode_js_string(raw[cursor:], "`"))
+    except ScanDataError:
+        return None
+    return "".join(chunks)
+
+
+def _slash_can_start_regex(tokens: list[JsToken]) -> bool:
+    if not tokens:
+        return True
+    previous = tokens[-1]
+    return previous.value in {
+        "(",
+        "[",
+        "{",
+        ",",
+        ":",
+        ";",
+        "=",
+        "=>",
+        "!",
+        "?",
+        "??",
+        "||",
+        "&&",
+        "+",
+        "-",
+        "*",
+        "%",
+        "&",
+        "|",
+        "^",
+        "~",
+        "<",
+        ">",
+        "return",
+        "throw",
+        "case",
+        "delete",
+        "typeof",
+        "void",
+        "yield",
+        "await",
+    }
+
+
 def _tokenize_typescript(
     text: str, budget: WorkBudget
 ) -> tuple[list[JsToken], dict[int, int]]:
@@ -2436,12 +2815,17 @@ def _tokenize_typescript(
             continue
         if text.startswith("//", index):
             end = text.find("\n", index + 2)
-            index = len(text) if end < 0 else end
+            end = len(text) if end < 0 else end
+            tokens.append(JsToken("comment", text[index + 2 : end], index, end, line))
+            index = end
             continue
         if text.startswith("/*", index):
             end = text.find("*/", index + 2)
             if end < 0:
                 raise ScanDataError("SCN011_MALFORMED_SOURCE", line)
+            tokens.append(
+                JsToken("comment", text[index + 2 : end], index, end + 2, line)
+            )
             line += text.count("\n", index, end + 2)
             index = end + 2
             continue
@@ -2469,22 +2853,21 @@ def _tokenize_typescript(
             dynamic_template = quote == "`" and bool(
                 re.search(r"(?<!\\)(?:\\\\)*\$\{", raw)
             )
+            static_template = _static_template_value(raw) if dynamic_template else None
             tokens.append(
                 JsToken(
-                    "template" if dynamic_template else "string",
-                    value,
+                    "template"
+                    if dynamic_template and static_template is None
+                    else "string",
+                    static_template if static_template is not None else value,
                     start,
                     index,
                     token_line,
                 )
             )
-        elif char.isalpha() or char in "_$":
-            index += 1
-            while index < len(text) and (text[index].isalnum() or text[index] in "_$-"):
-                index += 1
-            tokens.append(
-                JsToken("identifier", text[start:index], start, index, token_line)
-            )
+        elif _js_identifier_start(char) or text.startswith("\\u", index):
+            value, index = _decode_js_identifier(text, index)
+            tokens.append(JsToken("identifier", value, start, index, token_line))
         elif char.isdigit():
             index += 1
             while index < len(text) and (text[index].isalnum() or text[index] in "._"):
@@ -2492,6 +2875,33 @@ def _tokenize_typescript(
             tokens.append(
                 JsToken("number", text[start:index], start, index, token_line)
             )
+        elif char == "/" and _slash_can_start_regex(tokens):
+            index += 1
+            escaped = False
+            character_class = False
+            closed = False
+            while index < len(text):
+                current = text[index]
+                if current in {"\n", "\r"}:
+                    break
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == "[":
+                    character_class = True
+                elif current == "]" and character_class:
+                    character_class = False
+                elif current == "/" and not character_class:
+                    index += 1
+                    closed = True
+                    break
+                index += 1
+            if not closed:
+                raise ScanDataError("SCN011_MALFORMED_SOURCE", token_line)
+            while index < len(text) and text[index].isalpha():
+                index += 1
+            tokens.append(JsToken("regex", text[start:index], start, index, token_line))
         else:
             operator = text[index : index + 3]
             matched = next(
@@ -2996,6 +3406,25 @@ def scan_typescript_source(
         safe_type_names or set(),
         budget,
     )
+    # A local generic parameter shadows an imported owner type.  It cannot
+    # inherit safe provenance merely because it reuses the same identifier.
+    for index, token in enumerate(tokens[:-2]):
+        if token.value not in {"class", "function", "interface", "type"}:
+            continue
+        opening = index + 2
+        if tokens[opening].value != "<":
+            continue
+        depth = 0
+        for candidate in tokens[opening:]:
+            budget.charge_parser_operations()
+            if candidate.value == "<":
+                depth += 1
+            elif candidate.value == ">":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1 and candidate.kind == "identifier":
+                safe_names.discard(candidate.value)
     assignment_values = {"=", "??=", "||=", "&&="}
     for index, token in enumerate(tokens[:-1]):
         if token.value in safe_names and tokens[index + 1].value in assignment_values:
@@ -3097,6 +3526,60 @@ def scan_typescript_source(
             for token in alias
         )
 
+    # Utility types select externally declared keys into the local contract.
+    # Resolve the key argument rather than treating it as harmless type syntax.
+    for index, token in enumerate(tokens[:-1]):
+        if token.value not in {"Pick", "Omit"} or tokens[index + 1].value != "<":
+            continue
+        depth = 0
+        argument = 0
+        key_tokens: list[JsToken] = []
+        closed = False
+        for candidate in tokens[index + 1 :]:
+            budget.charge_parser_operations()
+            if candidate.value == "<":
+                depth += 1
+                if depth > 1 and argument == 1:
+                    key_tokens.append(candidate)
+                continue
+            if candidate.value == ">":
+                depth -= 1
+                if depth == 0:
+                    closed = True
+                    break
+                if argument == 1:
+                    key_tokens.append(candidate)
+                continue
+            if depth == 1 and candidate.value == "," and argument == 0:
+                argument = 1
+                continue
+            if argument == 1:
+                key_tokens.append(candidate)
+        if not closed or not key_tokens:
+            raise ScanDataError("SCN011_MALFORMED_SOURCE", token.line)
+        resolved = closed_key_values(key_tokens)
+        if resolved is None:
+            inspect_field(
+                key_tokens[0].value,
+                key_tokens,
+                "absent",
+                key_tokens[0].line,
+                index,
+                "utility_key",
+                force=True,
+                cardinality="many",
+            )
+        for key in sorted(resolved or set()):
+            if is_secret_field_name(key):
+                inspect_field(
+                    key,
+                    [],
+                    "absent",
+                    key_tokens[0].line,
+                    index,
+                    "utility_key",
+                )
+
     # Closed handling for generic Record keys. Concrete credential-capable keys
     # are declarations even though they occur in a type-argument position.
     for index, token in enumerate(tokens[:-1]):
@@ -3171,6 +3654,42 @@ def scan_typescript_source(
         if tokens[opening].value != "[":
             continue
         cursor = closing + 1
+        if cursor < len(tokens) and tokens[cursor].value in assignment_values:
+            key_tokens = tokens[opening + 1 : closing]
+            resolved_values = closed_key_values(key_tokens)
+            sensitive_values = sorted(
+                value
+                for value in resolved_values or set()
+                if is_secret_field_name(value)
+            )
+            for key_value in sensitive_values:
+                inspect_field(
+                    key_value,
+                    [],
+                    "expression",
+                    tokens[opening].line,
+                    opening,
+                    "computed_write",
+                )
+            if resolved_values is None:
+                key_token = next(
+                    (
+                        candidate
+                        for candidate in key_tokens
+                        if candidate.kind in {"identifier", "string", "template"}
+                    ),
+                    tokens[opening],
+                )
+                inspect_field(
+                    key_token.value,
+                    key_tokens,
+                    "expression",
+                    key_token.line,
+                    opening,
+                    "computed_write",
+                    force=True,
+                )
+            continue
         if cursor < len(tokens) and tokens[cursor].value == "?":
             cursor += 1
         if cursor >= len(tokens) or tokens[cursor].value != ":":
@@ -3246,6 +3765,27 @@ def scan_typescript_source(
         if token.value != "export":
             continue
         opening = index + 1
+        if (
+            opening + 2 < len(tokens)
+            and tokens[opening].value == "*"
+            and tokens[opening + 1].value == "from"
+            and tokens[opening + 2].kind == "string"
+        ):
+            source = tokens[opening + 2]
+            # A star export has no closed local field inventory.  Even a
+            # neutral-looking module name may add an authorizing field later,
+            # so governed external surfaces must use explicit re-exports.
+            inspect_field(
+                source.value,
+                [],
+                "absent",
+                source.line,
+                index,
+                "star_reexport",
+                force=True,
+                cardinality="many",
+            )
+            continue
         if opening < len(tokens) and tokens[opening].value == "type":
             opening += 1
         if opening >= len(tokens) or tokens[opening].value != "{":
@@ -3484,8 +4024,14 @@ def scan_typescript_source(
                 )
 
     for token in tokens:
-        if token.kind not in {"string", "template"}:
+        if token.kind not in {"comment", "string", "template"}:
             continue
+        if token.kind == "template" and re.search(
+            r"(?i)(?:auth(?:orization)?|credential|password|private[_-]?key|secret|token)"
+            r"\s*(?:[.\]}'\"]*\s*)?(?:=|:)",
+            token.value,
+        ):
+            findings.append(Finding(file_path, token.line, "SCF005_SOURCE_FIELD"))
         budget.charge_text(token.value)
         remaining = maximum_hits - len(hits)
         if remaining <= 0:

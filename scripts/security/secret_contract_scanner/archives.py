@@ -98,8 +98,14 @@ def _tar_header_checksum(data: bytes) -> bool:
         expected = int(raw_checksum, 8)
     except ValueError:
         return False
-    actual = sum(header[:148]) + (8 * 0x20) + sum(header[156:])
-    return expected == actual
+    unsigned = sum(header[:148]) + (8 * 0x20) + sum(header[156:])
+    # POSIX readers historically accept both unsigned-byte and signed-byte
+    # checksum producers.  Recognize both before deciding that an opaque file
+    # is not a TAR; strict metadata/member validation still runs afterwards.
+    signed = sum(byte if byte < 128 else byte - 256 for byte in header[:148])
+    signed += 8 * 0x20
+    signed += sum(byte if byte < 128 else byte - 256 for byte in header[156:])
+    return expected in {unsigned, signed}
 
 
 def _plausible_tar_checksum_field(data: bytes, offset: int) -> bool:
@@ -110,8 +116,15 @@ def _plausible_tar_checksum_field(data: bytes, offset: int) -> bool:
     return bool(stripped) and all(byte in b"01234567" for byte in stripped)
 
 
-def detect_archive_kind(data: bytes) -> str | None:
+def detect_archive_kind(data: bytes, *, budget: WorkBudget | None = None) -> str | None:
     """Recognize supported containers structurally, independent of suffix/prefix."""
+
+    # Reserve one bounded linear recognition pass before any suffix-independent
+    # probing.  This makes exact-limit and limit+1 behavior deterministic and
+    # accounts for every candidate byte even when optimized C searches return
+    # early.  Header/decompression work is separately charged by extractors.
+    if budget is not None:
+        budget.charge_parser_operations(len(data))
 
     if _zip_layout(data) is not None:
         return "zip"
@@ -130,14 +143,22 @@ def detect_archive_kind(data: bytes) -> str | None:
     # Repository file-size limits bound this O(n) pass.
     last_header = len(data) - 512
     window_sum = sum(data[:512])
+    signed_window_sum = sum(byte if byte < 128 else byte - 256 for byte in data[:512])
     for offset in range(1, last_header + 1):
         window_sum += data[offset + 511] - data[offset - 1]
+        incoming = data[offset + 511]
+        outgoing = data[offset - 1]
+        signed_window_sum += (incoming if incoming < 128 else incoming - 256) - (
+            outgoing if outgoing < 128 else outgoing - 256
+        )
         if not _plausible_tar_checksum_field(data, offset):
             continue
         checksum = data[offset + 148 : offset + 156]
         expected = int(checksum.strip(b"\x00 "), 8)
-        actual = window_sum - sum(checksum) + (8 * 0x20)
-        if expected == actual:
+        unsigned = window_sum - sum(checksum) + (8 * 0x20)
+        signed_checksum = sum(byte if byte < 128 else byte - 256 for byte in checksum)
+        signed = signed_window_sum - signed_checksum + (8 * 0x20)
+        if expected in {unsigned, signed}:
             return "tar"
     plausible_markers = 0
     marker_start = 0
@@ -590,7 +611,7 @@ def archive_members(
 ) -> Iterator[ArchiveMember]:
     """Yield one archive's members and reject every nested supported container."""
 
-    kind = detect_archive_kind(data)
+    kind = detect_archive_kind(data, budget=budget)
     if kind is None:
         raise ScanDataError("SCA001_ARCHIVE_INVALID")
     try:
@@ -601,7 +622,7 @@ def archive_members(
             yield from _tar_members(data, limits, budget)
             return
         payload = _gzip_payload(data, limits, budget)
-        payload_kind = detect_archive_kind(payload)
+        payload_kind = detect_archive_kind(payload, budget=budget)
         if payload_kind == "tar":
             yield from _tar_members(payload, limits, budget, count_unpacked=False)
             return

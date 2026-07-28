@@ -14,18 +14,28 @@ live pre-persistence credential guard.
 
 ## Developer command
 
-Run the same two commands used by CI:
+Run the same immutable-tree sequence used by CI after committing the candidate:
 
 ```bash
 make security-secret-contracts
 ```
 
-Or run them directly:
+For pre-commit development, these commands inspect current checkout bytes and
+run the test inventory, but they are not release evidence:
 
 ```bash
 /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
 /usr/bin/python3 -I scripts/security/check-secret-contracts.py
 ```
+
+CI first runs
+`check-secret-contracts.py --git-tree "${GITHUB_SHA}"`. This enumerates one
+full commit tree and reads exact Git blob object IDs, so untracked,
+sparse-checkout, symlink, submodule, and rewritten workspace bytes cannot replace
+the candidate being scanned. Only after that scan passes does CI extract
+`git archive "${GITHUB_SHA}"` into a disposable directory and run the self-test
+there under a separate `env -i` process. Candidate test imports therefore never
+execute in the workspace used as scan input.
 
 The absolute interpreter and isolated-mode flag are part of the security
 contract: repository files such as `scripts/security/hashlib.py` cannot shadow
@@ -39,12 +49,14 @@ and the Docker image workflow run these commands in a dedicated prerequisite
 job; build, test, image, and publication jobs do not start unless both pass.
 Every job fetches, detaches, and verifies the same immutable `GITHUB_SHA`; there
 is no mutable-ref or `FETCH_HEAD` fallback.
-Recognized JSON, YAML, INI/TOML-style configuration, and Markdown files are
+Recognized JSON, YAML, INI/TOML-style configuration, Dockerfile/Make/shell, and
+Markdown files are
 additionally decoded so escaped, folded, keyed, ancestor-scoped, and scalar
 content is scanned recursively. Registered governed Python, JavaScript, and
 TypeScript roots, sniffed archive members, and explicitly selected source files
 receive bounded declaration checks. Normal mode rejects unregistered OpenAPI,
-external SDK/client/package, conformance, and Gold authorizing surfaces instead
+external SDK/client/package, adapter, Rust type/contract, control-plane,
+conformance, and Gold authorizing surfaces instead
 of treating a new root as ordinary text.
 
 To check one new repository-relative fixture before placing it under a governed
@@ -85,9 +97,11 @@ parse; governed Python/JavaScript/TypeScript fences use the bounded source
 grammar, and bounded MyST options such as captions are normalized before parsing.
 JSONC/JSON5/JSON-lines-like fences and residual container/fence syntax beyond the
 configured structural depth fail closed instead of being skipped. Structural
-forbidden-field enforcement remains limited to registered governed roots,
-explicit paths, and sniffed archive manifests; decoded content signatures and
-low-entropy assignment checks cover every unambiguous repository text file.
+forbidden-field enforcement covers registered governed roots, explicit paths,
+sniffed archive manifests, and content-discovered OpenAPI documents. Decoded
+scalar credential coordinates and low-entropy assignment checks cover every
+unambiguous repository text file, including numeric JSON and suffixless
+YAML/config content.
 
 Repository content scanning covers bounded UTF-8 source, fixtures, generated
 text, docs, manifests, and ZIP/TAR/GZIP containers recognized by magic rather
@@ -98,8 +112,9 @@ compression methods fail closed. Archive traversal, links, encryption,
 prefixes/polyglots, trailing data, ZIP comments, credential-capable
 member/metadata names, concatenated GZIP streams, malformed members, excessive
 expansion, or cumulative file/member/unpacked/work budget overflow fail closed.
-Supported V7 and USTAR TAR headers are detected by a bounded linear scan at every
-possible offset, including inside an otherwise opaque nested member.
+Supported signed- or unsigned-checksum V7 and USTAR TAR headers are detected by
+a bounded linear scan at every possible offset, including inside an otherwise
+opaque nested member.
 Global member capacity is checked before archive-library enumeration. Every
 archive member that decodes as unambiguous UTF-8 is content-scanned regardless
 of filename suffix. UTF-8 BOM/NUL/control/format ambiguity fails closed; opaque
@@ -142,7 +157,15 @@ Intentional synthetic canaries and public protocol vectors use the separate
 content allowlist. Each entry pins an exact path, SHA-256 file digest, exact rule
 code/count map, owner, reason, expiry, and scanner version. A file change, new or
 removed match, expiry, or unused entry fails; content exceptions never suppress
-structural findings.
+structural findings. The complete ordered inventory is itself pinned by a closed
+digest in scanner code, so appending a schema-valid candidate-authored
+suppression fails policy validation.
+
+This repository pin is not independent approval. CODEOWNERS/security-owner
+review and a branch or repository ruleset must protect changes to the scanner,
+policy, tests, workflows, and Dockerfile. Those GitHub controls, hosted secret
+scanning/push protection, and organization action policy are external controls;
+candidate code can reference or report them but cannot prove they are enabled.
 
 ## Rule families
 
@@ -197,8 +220,24 @@ unbounded allocation. Raising a cap beyond the scanner's hard ceiling is invalid
 Both CI workflows impose a five-minute scanner-job timeout as an outer resource
 bound.
 
-The mandatory self-test discovers and digest-pins every
-`scripts/security/tests/test_*.py` module, currently exactly 159 unique test
+The Docker publication workflow builds each amd64/arm64 image once in the smoke
+matrix, checksums and smoke-tests the loaded archive, and uploads that exact
+archive. Publication jobs run only for `github.ref_protected`, require the
+`ghcr-release` environment, verify the artifact checksum and image ID, load and
+push rather than rebuild, then compare the published manifest's child digests
+with the promoted digests. `packages: write` exists only in those protected
+publication jobs. GitHub must separately configure protected release refs and
+environment reviewers; the YAML reference alone does not establish either
+control, so release remains blocked when hosted evidence is absent.
+The Docker frontend and multi-platform Rust/Python bases are pinned by digest;
+Debian installs use a fixed signed snapshot and exact direct package versions;
+and Python build requirements use exact versions and wheel hashes without build
+isolation. Dependency refreshes therefore require a reviewed pin update rather
+than silently changing between validation and publication.
+
+The mandatory self-test recursively discovers and digest-pins every
+`scripts/security/tests/**/test_*.py` module, rejects nested test modules, and
+currently pins exactly 176 unique test
 identities. Zero discovery, an added/removed/renamed test module or case,
 governed-root inventory drift, or owner/symbolic fixture digest drift fails
 closed.

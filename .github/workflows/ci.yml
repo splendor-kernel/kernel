@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   secret-contracts:
     runs-on: ubuntu-latest
@@ -19,8 +22,14 @@ jobs:
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
       - name: C03 secret contract and fixture guard
         run: |
-          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
-          /usr/bin/python3 -I scripts/security/check-secret-contracts.py
+          /usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "${GITHUB_SHA}"
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf "${sandbox}"' EXIT
+          git archive "${GITHUB_SHA}" | tar -x -C "${sandbox}"
+          (
+            cd "${sandbox}"
+            env -i HOME="${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
+          )
 
   rust:
     needs: secret-contracts

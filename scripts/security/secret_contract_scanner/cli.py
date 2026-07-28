@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .engine import scan_repository
-from .io_utils import PinnedRepository
+from .io_utils import GitObjectRepository, PinnedRepository
 from .model import DEFAULT_POLICY_PATH, Finding, ScanDataError
 from .policy import load_policy
 from .self_test import run_self_test
@@ -24,6 +24,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parents[3],
         help="Repository root (default: inferred from this script).",
+    )
+    parser.add_argument(
+        "--git-tree",
+        metavar="COMMIT_SHA",
+        help="Scan immutable blobs from one exact full Git commit instead of checkout bytes.",
     )
     parser.add_argument(
         "--policy",
@@ -48,8 +53,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
+    if args.git_tree and args.paths:
+        print(Finding(".", 0, "SCN003_PATH_AMBIGUOUS").render(), file=sys.stderr)
+        return 1
     try:
-        with PinnedRepository(args.repo_root) as repository:
+        repository_context: GitObjectRepository | PinnedRepository
+        repository_context = (
+            GitObjectRepository(args.repo_root, args.git_tree)
+            if args.git_tree
+            else PinnedRepository(args.repo_root)
+        )
+        with repository_context as repository:
             policy, policy_findings = load_policy(
                 repository,
                 args.policy,

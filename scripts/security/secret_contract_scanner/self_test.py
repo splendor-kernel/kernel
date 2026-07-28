@@ -9,15 +9,16 @@ import unittest
 from pathlib import Path
 
 
-EXPECTED_TEST_COUNT = 159
+EXPECTED_TEST_COUNT = 176
 EXPECTED_TEST_MANIFEST_SHA256 = (
-    "2e52983060e78f03f47cff6f9418445bb4030429e3cc37aef4803f21213925bf"
+    "c479f9f96bb7dd4b233ef6da92b937cb759a16ba47147f44f1e57b03832a61b3"
 )
 EXPECTED_TEST_MODULE_SHA256 = {
     "test_secret_contract_scanner.py": (
-        "b9f28f220d1229c44858beb829f4781b5" "e4cacbb03e2850e54e874fcb186433b"
+        "22eddebbc667bf6f1fff8283feb092eeb" "17929daa4b855f2cc23cd3ea5b7ac13"
     ),
-    "test_secret_contract_scanner_correction3.py": "98080757cee9c9722da86223573d36432260145e972a86974c33646fd9d7d19b",
+    "test_secret_contract_scanner_correction3.py": "fd190bd2601a58c4522d2d299c40d7af6def9fbf5386ab9b9cfd2c47296a7afb",
+    "test_secret_contract_scanner_correction4.py": "d5e0f8c0062862be5a7426922806bc728a8ade58b1de1ab6e421332e1c4542dc",
 }
 
 
@@ -32,11 +33,10 @@ def _test_ids(suite: unittest.TestSuite) -> list[str]:
 
 
 def _test_module_inventory_valid(test_root: Path) -> bool:
-    test_modules = sorted(
-        entry.name
-        for entry in test_root.iterdir()
-        if entry.name.startswith("test_") and entry.suffix == ".py"
-    )
+    discovered = sorted(test_root.rglob("test_*.py"))
+    if any(path.parent != test_root for path in discovered):
+        return False
+    test_modules = [entry.name for entry in discovered]
     return test_modules == sorted(EXPECTED_TEST_MODULE_SHA256) and not any(
         (test_root / name).is_symlink()
         or not (test_root / name).is_file()

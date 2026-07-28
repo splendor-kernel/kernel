@@ -4,5 +4,11 @@ e2e-acceptance:
 	bash scripts/e2e/verify-use-case-acceptance.sh --all
 
 security-secret-contracts:
-	/usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test
-	/usr/bin/python3 -I scripts/security/check-secret-contracts.py
+	@set -eu; \
+	sha="$$(git rev-parse HEAD)"; \
+	/usr/bin/python3 -I scripts/security/check-secret-contracts.py --git-tree "$${sha}"; \
+	sandbox="$$(mktemp -d)"; \
+	trap 'rm -rf "$${sandbox}"' EXIT; \
+	git archive "$${sha}" | tar -x -C "$${sandbox}"; \
+	cd "$${sandbox}"; \
+	env -i HOME="$${sandbox}" PATH="/usr/bin:/bin" /usr/bin/python3 -I scripts/security/check-secret-contracts.py --self-test

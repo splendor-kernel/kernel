@@ -512,7 +512,9 @@ def _credential_value_present(value: str, coordinate: str | None = None) -> bool
     quoted = candidate[0:1] == candidate[-1:] and candidate.startswith(("'", '"'))
     if quoted:
         candidate = candidate[1:-1].strip()
-    elif "'" in candidate or '"' in candidate:
+    elif ("'" in candidate or '"' in candidate) and not (
+        coordinate is not None and is_secret_field_name(coordinate)
+    ):
         return False
     lowered = candidate.lower()
     if lowered in {
@@ -560,6 +562,13 @@ def _credential_value_present(value: str, coordinate: str | None = None) -> bool
         return False
     if candidate in {"self", "this"}:
         return False
+    if (
+        coordinate is not None
+        and is_secret_field_name(coordinate)
+        and candidate.startswith(("[", "{"))
+        and candidate.endswith(("]", "}"))
+    ):
+        return candidate not in {"[]", "{}"}
     if quoted:
         return True
     return bool(
