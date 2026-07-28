@@ -137,7 +137,9 @@ run when exact-artifact validation fails. Candidate, receipt, and digest artifac
 names are scoped to the workflow run attempt so a partial rerun cannot mix prior
 attempt bytes into a manifest; the manifest job also requires exactly two valid
 platform digest filenames before registry login. Rerun all publication jobs to
-produce a new attempt.
+produce a new attempt. The executable workflow guard rejects conditional or
+failure-ignored release verification and any changed or additional one-time image
+build input/build argument.
 
 ## GHCR package visibility
 

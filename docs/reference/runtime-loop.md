@@ -110,9 +110,10 @@ documented in [`identity.md`](identity.md).
   Persisted resume rejects a recorded reconciliation-required result or an
   action-capable tick attempt without its matching `LoopTickCompleted`, including
   when the first post-Gateway trace append was lost. Resume selects state only
-  from completed ticks whose snapshot metadata and state node bind the exact
-  `run_id`, `tenant_id`, and `agent_id`; mismatched or incomplete metadata fails
-  closed rather than restoring a sibling agent's state.
+  only from the latest completed tick when its snapshot metadata and state node
+  bind the exact `run_id`, `tenant_id`, and `agent_id`. If that tick has no
+  snapshot, or identity metadata is mismatched or incomplete, resume fails closed
+  rather than relabeling an older snapshot or restoring a sibling agent's state.
   Recovery requires explicit operator/provider reconciliation and construction
   of a replacement run/engine; no scheduler path automatically requeues the
   parked action. A fresh persisted constructor rejects an already-existing run

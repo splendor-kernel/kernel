@@ -30,6 +30,37 @@ FORBIDDEN_BINARY_MARKERS = (
     b"secret_provider_test_support",
     b"splendor_adapter_secrets_local_file",
 )
+IMAGE_VERSION_EXPRESSION = (
+    "${{ (inputs.publish_0_05_dev == true || inputs.publish_0_05_dev == 'true') "
+    "&& 'v0.05-dev' || (inputs.publish_0_04_dev == true || "
+    "inputs.publish_0_04_dev == 'true') && 'v0.04-dev' || "
+    "(inputs.publish_0_02_dev == true || inputs.publish_0_02_dev == 'true') "
+    "&& 'v0.02-dev' || github.ref_name }}"
+)
+EXPECTED_BUILD_INPUTS = {
+    "context",
+    "platforms",
+    "tags",
+    "labels",
+    "outputs",
+    "build-args",
+}
+EXPECTED_BUILD_ARGS = (
+    f"SPLENDOR_IMAGE_VERSION={IMAGE_VERSION_EXPRESSION}",
+    "VCS_REF=${{ github.sha }}",
+    "BUILD_DATE=${{ steps.build-date.outputs.created }}",
+)
+EXPECTED_RELEASE_VERIFICATION_STEP = "\n".join(
+    (
+        "      - name: Verify exact candidate dependency and binary release closure",
+        "        env:",
+        "          CANDIDATE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CANDIDATE_TAG }}-${{ matrix.artifact }}",
+        "        run: |",
+        "          python3 scripts/architecture/check-secret-provider-release-closure.py \\",
+        '            --image "${CANDIDATE_IMAGE}" \\',
+        '            --expected-revision "${GITHUB_SHA}"',
+    )
+)
 
 
 def run(command: list[str], root: Path) -> str:
@@ -99,7 +130,34 @@ def workflow_named_step(block: str, name: str) -> str | None:
         if lines[index].startswith("      - "):
             end = index
             break
-    return "\n".join(lines[start:end])
+    return "\n".join(lines[start:end]).rstrip()
+
+
+def workflow_step_input_names(step: str) -> list[str]:
+    return re.findall(r"^          ([A-Za-z0-9_-]+):(?:\s|$)", step, re.MULTILINE)
+
+
+def workflow_step_scalar_inputs(step: str, name: str) -> list[str]:
+    return re.findall(
+        rf"^          {re.escape(name)}:\s*(.*?)\s*$", step, re.MULTILINE
+    )
+
+
+def workflow_step_multiline_input(step: str, name: str) -> tuple[str, ...] | None:
+    lines = step.splitlines()
+    markers = [
+        index
+        for index, line in enumerate(lines)
+        if line == f"          {name}: |"
+    ]
+    if len(markers) != 1:
+        return None
+    values: list[str] = []
+    for line in lines[markers[0] + 1 :]:
+        if not line.startswith("            "):
+            break
+        values.append(line[12:])
+    return tuple(values)
 
 
 def job_has_packages_write(block: str) -> bool:
@@ -142,6 +200,10 @@ def check_publish_workflow_text(workflow: str) -> list[str]:
     ):
         if block is None:
             violations.append(f"Docker publication workflow is missing the {name} job")
+        elif re.search(r"^\s+continue-on-error:", block, re.MULTILINE):
+            violations.append(
+                f"Docker publication job {name!r} must not ignore step or job failures"
+            )
 
     if build is not None:
         build_step = workflow_named_step(build, "Build platform image exactly once")
@@ -155,18 +217,33 @@ def check_publish_workflow_text(workflow: str) -> list[str]:
                 violations.append(
                     "Docker one-time platform build is missing the immutable build action"
                 )
-            build_lines = set(build_step.splitlines())
-            for required_line in (
-                "          context: .",
-                "          platforms: ${{ matrix.platform }}",
-                "          outputs: type=docker,dest=${{ runner.temp }}/splendor-${{ matrix.artifact }}.tar",
-                "            VCS_REF=${{ github.sha }}",
-                "            BUILD_DATE=${{ steps.build-date.outputs.created }}",
+            input_names = workflow_step_input_names(build_step)
+            if len(input_names) != len(EXPECTED_BUILD_INPUTS) or set(
+                input_names
+            ) != EXPECTED_BUILD_INPUTS:
+                violations.append(
+                    "Docker one-time platform build inputs differ from the reviewed exact set"
+                )
+            for name, expected in (
+                ("context", "."),
+                ("platforms", "${{ matrix.platform }}"),
+                (
+                    "tags",
+                    "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CANDIDATE_TAG }}-${{ matrix.artifact }}",
+                ),
+                (
+                    "outputs",
+                    "type=docker,dest=${{ runner.temp }}/splendor-${{ matrix.artifact }}.tar",
+                ),
             ):
-                if required_line not in build_lines:
+                if workflow_step_scalar_inputs(build_step, name) != [expected]:
                     violations.append(
-                        f"Docker one-time platform build is missing immutable line {required_line!r}"
+                        f"Docker one-time platform build has unexpected {name!r} input"
                     )
+            if workflow_step_multiline_input(build_step, "build-args") != EXPECTED_BUILD_ARGS:
+                violations.append(
+                    "Docker one-time platform build arguments differ from the reviewed exact set"
+                )
             if re.search(r"^        if:", build_step, re.MULTILINE):
                 violations.append("Docker one-time platform build must not be conditional")
         if job_has_packages_write(build):
@@ -183,6 +260,10 @@ def check_publish_workflow_text(workflow: str) -> list[str]:
         if verify_step is None:
             violations.append("Docker release-closure job is missing exact candidate verification")
         else:
+            if verify_step != EXPECTED_RELEASE_VERIFICATION_STEP:
+                violations.append(
+                    "Docker release-closure verification differs from the reviewed exact command"
+                )
             for required in (
                 "check-secret-provider-release-closure.py",
                 '--image "${CANDIDATE_IMAGE}"',
@@ -486,11 +567,31 @@ def main() -> int:
                 "          true # exact candidate verification disabled \\",
                 1,
             ),
+            "ignored_verification_failure": workflow.replace(
+                "      - name: Verify exact candidate dependency and binary release closure\n        env:",
+                "      - name: Verify exact candidate dependency and binary release closure\n        continue-on-error: true\n        env:",
+                1,
+            ),
+            "verification_shell_bypass": workflow.replace(
+                '            --expected-revision "${GITHUB_SHA}"',
+                '            --expected-revision "${GITHUB_SHA}" || true',
+                1,
+            ),
             "changed_build_context": workflow.replace(
                 "          context: .", "          context: ./unvalidated", 1
             ),
             "changed_revision_arg": workflow.replace(
                 "            VCS_REF=${{ github.sha }}", "            VCS_REF=untrusted", 1
+            ),
+            "changed_image_version_arg": workflow.replace(
+                f"            SPLENDOR_IMAGE_VERSION={IMAGE_VERSION_EXPRESSION}",
+                "            SPLENDOR_IMAGE_VERSION=unvalidated",
+                1,
+            ),
+            "extra_build_arg": workflow.replace(
+                "            BUILD_DATE=${{ steps.build-date.outputs.created }}",
+                "            BUILD_DATE=${{ steps.build-date.outputs.created }}\n            UNVALIDATED_BUILD_INPUT=true",
+                1,
             ),
             "publish_rebuild": workflow.replace(
                 "      - name: Download exact validated platform candidate",

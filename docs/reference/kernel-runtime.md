@@ -26,10 +26,10 @@ records. It owns a `RunId`, a monotonic sequence counter, and a trace sink.
 - Emit `TraceEvent` payloads via the configured sink.
 - Expose the next trace sequence so new persisted runs can emit `RunStarted`
   exactly once before the first tick.
-- Atomically admit one fresh persisted run owner and emit `RunStarted` under the
-  shared cursor lock. Additional local agents may assemble against that same
-  runtime before tick activity begins; a reopened or already-active runtime is
-  not fresh admission.
+- Atomically admit one fresh engine for each exact tenant/agent identity and emit
+  `RunStarted` once under the shared cursor lock. Distinct local agents may
+  assemble against that same runtime before tick activity begins; a duplicate
+  identity, reopened runtime, or already-active runtime is not fresh admission.
 - Emit integrity metadata in `LoopTickCompleted` when available.
 
 **Methods**
@@ -167,19 +167,23 @@ state commits.
   from the requested run before restoring state.
 - Treat `with_trace_store*` and `with_shared_trace_runtime*` as fresh-run
   constructors. Fresh admission and the single `RunStarted` append occur under
-  one shared runtime lock, so competing constructors cannot both become fresh
-  owners. They return fixed `run_already_exists` when their runtime was reopened
-  over persisted trace history or tick activity has begun. Multiple local agents
-  may still assemble on the same runtime before its first tick; persisted recovery
-  must use an explicit `resume_from_*` constructor.
+  one shared runtime lock, so competing constructors for the same tenant/agent
+  identity cannot both become emitters. The rejected constructor appends nothing.
+  Constructors return fixed `run_already_exists` for a duplicate identity, when
+  their runtime was reopened over persisted trace history, or after tick activity
+  has begun. Distinct local agents may still assemble on the same runtime before
+  its first tick; persisted recovery must use an explicit `resume_from_*`
+  constructor.
 - During resume, reject an action-capable tick attempt that lacks its matching
   completed-tick event. `ActionVerificationStarted` is the durable conservative
   boundary: loss of any later post-Gateway trace or state write cannot make the
   run runnable again without reconciliation.
-- Restore only the latest completed state whose state node, snapshot metadata,
-  and trace linkage bind the requested run, tenant, and agent. Missing or
-  mismatched identity metadata is a fixed resume failure, not a fallback to a
-  shared run's latest sibling state.
+- Restore only a snapshot for the latest completed tick whose state node,
+  snapshot metadata, and trace linkage bind the requested run, tenant, and agent.
+  A latest completed tick without its own snapshot fails with
+  `resume_latest_completed_snapshot_unavailable`; missing or mismatched identity
+  metadata is a fixed resume failure, not a fallback to an older or sibling
+  state.
 
 `with_trace_store_and_work_order` and `resume_from_trace_store_with_work_order`
 create their own runtime and remain suitable only when that loop is the sole

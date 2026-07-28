@@ -18,9 +18,10 @@
 use crate::{StdoutTraceSink, TraceError, TraceSink, TraceStoreSink};
 use splendor_store::TraceStore;
 use splendor_types::{
-    ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
-    StateReference, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
+    AgentId, ContentHash, RunId, RuntimeIdentityContext, StateHandoff, StateHandoffTraceContext,
+    StateReference, TenantId, TraceEvent, TraceEventKind, TraceIdentityContext, TraceIntegrity,
 };
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -74,6 +75,7 @@ struct TraceCursor {
     prev_event_hash: Option<ContentHash>,
     tick_activity_started: bool,
     fresh_run_claimed: bool,
+    fresh_engine_identities: HashSet<(TenantId, AgentId)>,
 }
 
 impl KernelRuntime {
@@ -90,6 +92,7 @@ impl KernelRuntime {
                 prev_event_hash: config.initial_prev_hash,
                 tick_activity_started: false,
                 fresh_run_claimed: false,
+                fresh_engine_identities: HashSet::new(),
             }),
             initial_sequence,
             trace_sink: config.trace_sink,
@@ -153,10 +156,15 @@ impl KernelRuntime {
             .next_sequence
     }
 
-    /// Atomically admits one fresh persisted run owner while allowing additional
-    /// agents to assemble on that exact shared runtime before its first tick.
-    /// A runtime reopened over history or used for any unclaimed event is denied.
-    pub(crate) fn admit_fresh_engine(&self) -> Result<bool, TraceError> {
+    /// Atomically admits one fresh engine per exact tenant/agent identity while
+    /// allowing distinct agents to assemble on the shared runtime before its
+    /// first tick. A runtime reopened over history or reused after tick activity
+    /// begins is denied.
+    pub(crate) fn admit_fresh_engine(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> Result<bool, TraceError> {
         let mut cursor = self
             .trace_cursor
             .lock()
@@ -164,19 +172,23 @@ impl KernelRuntime {
         if self.initial_sequence != 0 || cursor.tick_activity_started {
             return Ok(false);
         }
-        if cursor.fresh_run_claimed {
-            return Ok(true);
-        }
-        if cursor.next_sequence != 0 {
+        let engine_identity = (tenant_id.clone(), agent_id.clone());
+        if cursor.fresh_engine_identities.contains(&engine_identity) {
             return Ok(false);
         }
+        if !cursor.fresh_run_claimed {
+            if cursor.next_sequence != 0 {
+                return Ok(false);
+            }
 
-        self.record_event_with_cursor(
-            &mut cursor,
-            self.trace_identity(),
-            TraceEventKind::RunStarted,
-        )?;
-        cursor.fresh_run_claimed = true;
+            self.record_event_with_cursor(
+                &mut cursor,
+                self.trace_identity(),
+                TraceEventKind::RunStarted,
+            )?;
+            cursor.fresh_run_claimed = true;
+        }
+        cursor.fresh_engine_identities.insert(engine_identity);
         Ok(true)
     }
 

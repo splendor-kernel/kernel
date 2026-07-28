@@ -1607,6 +1607,16 @@ fn shared_run_resume_restores_only_exact_tenant_agent_state_and_parent() {
 
 #[test]
 fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_policy() {
+    #[derive(Clone, Copy)]
+    enum SnapshotMismatch {
+        MissingTenantAgent,
+        Tenant,
+        Agent,
+        Run,
+        TraceEvent,
+        StateHash,
+    }
+
     struct NeverInvokedPolicy {
         calls: Arc<AtomicUsize>,
     }
@@ -1633,7 +1643,14 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
         }
     }
 
-    for mismatched_metadata in [false, true] {
+    for mismatch in [
+        SnapshotMismatch::MissingTenantAgent,
+        SnapshotMismatch::Tenant,
+        SnapshotMismatch::Agent,
+        SnapshotMismatch::Run,
+        SnapshotMismatch::TraceEvent,
+        SnapshotMismatch::StateHash,
+    ] {
         let trace_store = Arc::new(InMemoryTraceStore::default());
         let state_store = Arc::new(InMemoryStateStore::default());
         let run_id = RunId::new();
@@ -1641,7 +1658,9 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
         let target_agent = AgentId::new();
         let runtime = KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
             .expect("runtime");
-        assert!(runtime.admit_fresh_engine().expect("fresh admission"));
+        assert!(runtime
+            .admit_fresh_engine(&target_tenant, &target_agent)
+            .expect("fresh admission"));
         let state_event_id = TraceEventId::from_run_sequence(&run_id, 2);
         let data_ref = state_store
             .put_state(StateData {
@@ -1650,12 +1669,23 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
             })
             .expect("state data");
         let mut metadata = StateMetadata::new(OffsetDateTime::now_utc(), None);
-        if mismatched_metadata {
-            metadata.tenant_id = Some(TenantId::new());
-            metadata.agent_id = Some(AgentId::new());
-        }
+        metadata.tenant_id = Some(target_tenant.clone());
+        metadata.agent_id = Some(target_agent.clone());
         metadata.run_id = Some(run_id.clone());
         metadata.trace_event_id = Some(state_event_id.clone());
+        match mismatch {
+            SnapshotMismatch::MissingTenantAgent => {
+                metadata.tenant_id = None;
+                metadata.agent_id = None;
+            }
+            SnapshotMismatch::Tenant => metadata.tenant_id = Some(TenantId::new()),
+            SnapshotMismatch::Agent => metadata.agent_id = Some(AgentId::new()),
+            SnapshotMismatch::Run => metadata.run_id = Some(RunId::new()),
+            SnapshotMismatch::TraceEvent => {
+                metadata.trace_event_id = Some(TraceEventId::from_run_sequence(&run_id, 99));
+            }
+            SnapshotMismatch::StateHash => {}
+        }
         let node_id = state_store
             .commit_node(Vec::new(), data_ref, metadata)
             .expect("state node");
@@ -1674,7 +1704,11 @@ fn resume_rejects_snapshot_with_missing_or_mismatched_store_identity_before_poli
             .record_event_with_identity(
                 tick_identity.clone().with_state_node_id(node_id.clone()),
                 TraceEventKind::StateCommitted {
-                    state_hash: node_id.hash().clone(),
+                    state_hash: if matches!(mismatch, SnapshotMismatch::StateHash) {
+                        ContentHash::blake3(b"mismatched-state-hash")
+                    } else {
+                        node_id.hash().clone()
+                    },
                     snapshot_id: Some(snapshot_id),
                 },
             )
@@ -1788,6 +1822,156 @@ fn concurrent_fresh_sqlite_constructors_have_one_atomic_owner_and_one_no_append_
     let event: TraceEvent =
         serde_json::from_value(records[0].payload.clone()).expect("run start event");
     assert!(matches!(event.kind, TraceEventKind::RunStarted));
+}
+
+#[test]
+fn concurrent_shared_fresh_constructors_admit_one_engine_per_exact_identity() {
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let runtime = Arc::new(
+        KernelRuntime::with_trace_store(trace_store.clone(), Some(run_id.clone()))
+            .expect("shared runtime"),
+    );
+    let start = Arc::new(Barrier::new(3));
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let trace_store = trace_store.clone();
+        let state_store = state_store.clone();
+        let run_id = run_id.clone();
+        let tenant_id = tenant_id.clone();
+        let agent_id = agent_id.clone();
+        let runtime = runtime.clone();
+        let start = start.clone();
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            let result = LoopEngine::with_shared_trace_runtime_and_work_order(
+                AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+                StateGraph::new(state_store, SnapshotPolicy::default()),
+                StateData {
+                    bytes: vec![1],
+                    content_type: None,
+                },
+                Box::new(StaticPolicy),
+                Arc::new(StubGateway),
+                runtime,
+                RunTraceContext::new(Some(run_id)),
+            );
+            drop(trace_store);
+            result
+                .map(|_| "owner".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        }));
+    }
+    start.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("constructor thread"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_str() == "owner")
+            .count(),
+        1,
+        "results={results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_str() == "resume error: run_already_exists")
+            .count(),
+        1,
+        "results={results:?}"
+    );
+    let records = trace_store
+        .read(&run_id.to_string())
+        .expect("single run start");
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn resume_rejects_an_older_snapshot_for_a_newer_completed_tick() {
+    struct IncrementingStatePolicy {
+        calls: AtomicUsize,
+    }
+
+    impl Policy for IncrementingStatePolicy {
+        fn name(&self) -> &str {
+            "incrementing-state"
+        }
+
+        fn decide(
+            &self,
+            _state: &StateData,
+            _percepts: &[Percept],
+        ) -> Result<PolicyDecision, LoopError> {
+            let next = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(PolicyDecision::new(
+                Vec::new(),
+                StateData {
+                    bytes: vec![u8::try_from(next).expect("small test state")],
+                    content_type: None,
+                },
+                None,
+            ))
+        }
+    }
+
+    let trace_store = Arc::new(InMemoryTraceStore::default());
+    let state_store = Arc::new(InMemoryStateStore::default());
+    let run_id = RunId::new();
+    let tenant_id = TenantId::new();
+    let agent_id = AgentId::new();
+    let snapshot_policy = SnapshotPolicy {
+        interval: Some(2),
+        important_labels: Vec::new(),
+    };
+    let mut engine = LoopEngine::with_trace_store(
+        AgentContext::new(
+            agent_id.clone(),
+            tenant_id.clone(),
+            crate::AgentRuntimeConfig::default(),
+        ),
+        StateGraph::new(state_store.clone(), snapshot_policy.clone()),
+        StateData {
+            bytes: vec![0],
+            content_type: None,
+        },
+        Box::new(IncrementingStatePolicy {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        Some(run_id.clone()),
+    )
+    .expect("engine");
+    engine.tick(1).expect("first tick without snapshot");
+    engine.tick(2).expect("second tick with snapshot");
+    engine.tick(3).expect("third tick without snapshot");
+    drop(engine);
+    let before = trace_store.read(&run_id.to_string()).expect("trace before");
+
+    let resumed = LoopEngine::resume_from_trace_store(
+        AgentContext::new(agent_id, tenant_id, crate::AgentRuntimeConfig::default()),
+        StateGraph::new(state_store, snapshot_policy),
+        Box::new(StaticPolicy),
+        Arc::new(splendor_gateway::UnimplementedGateway),
+        trace_store.clone(),
+        run_id.clone(),
+    );
+
+    assert!(matches!(
+        resumed,
+        Err(LoopError::Resume(reason)) if reason == "resume_latest_completed_snapshot_unavailable"
+    ));
+    assert_eq!(
+        trace_store.read(&run_id.to_string()).expect("trace after"),
+        before
+    );
 }
 
 #[test]

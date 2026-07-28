@@ -6,8 +6,9 @@ use splendor_gateway::{
 use splendor_kernel::{
     ActionCandidate, AgentContext, AgentRuntimeConfig, ConstraintEngine, ConstraintEvaluation,
     KernelRuntime, LoopEngine, LoopError, OutcomeEvaluator, OutcomeSignal, Perceptor, Policy,
-    PolicyDecision, QuotaPolicy, RunId, SideEffectClass, SnapshotPolicy, StateGraph, TenantContext,
-    TenantPolicy, TenantRegistry, TraceEvent, TraceEventKind,
+    PolicyDecision, QuotaPolicy, RunId, Scheduler, SchedulerConfig, SchedulerError,
+    SideEffectClass, SnapshotPolicy, StateGraph, TenantContext, TenantPolicy, TenantRegistry,
+    TraceEvent, TraceEventKind,
 };
 use splendor_store::{
     InMemoryStateStore, InMemoryTraceStore, StateData, StateDataRef, StateMetadata, StateNode,
@@ -1375,7 +1376,6 @@ fn assert_uncertain_effect_restart_is_blocked(
     });
     let action_names = vec!["external-effect".to_string()];
     let (registry, gateway) = recording_gateway(&tenant_id, &action_names, adapter);
-    registry.begin_tick(1, OffsetDateTime::now_utc());
     let snapshot_policy = SnapshotPolicy {
         interval: Some(1),
         important_labels: Vec::new(),
@@ -1388,7 +1388,7 @@ fn assert_uncertain_effect_restart_is_blocked(
     let policy = CandidateListPolicy {
         actions: vec![candidate],
     };
-    let mut engine = LoopEngine::with_trace_store(
+    let engine = LoopEngine::with_trace_store(
         AgentContext::new(
             agent_id.clone(),
             tenant_id.clone(),
@@ -1405,18 +1405,20 @@ fn assert_uncertain_effect_restart_is_blocked(
         Some(run_id.clone()),
     )
     .expect("fresh engine");
+    let mut scheduler = Scheduler::with_registry(SchedulerConfig::default(), registry);
+    scheduler.add_agent(engine);
 
-    engine.tick(1).expect("completed snapshot tick");
-    registry.begin_tick(2, OffsetDateTime::now_utc());
+    scheduler.run_once().expect("completed snapshot tick");
     arm_failure();
-    engine
-        .tick(2)
+    scheduler
+        .run_once()
         .expect_err("the injected post-entry persistence failure must fail the tick");
     assert!(matches!(
-        engine.tick(3),
-        Err(LoopError::Policy(reason)) if reason == "tick_reconciliation_required"
+        scheduler.run_once(),
+        Err(SchedulerError::Loop(LoopError::Policy(reason)))
+            if reason == "tick_reconciliation_required"
     ));
-    drop(engine);
+    drop(scheduler);
 
     assert_eq!(
         *calls.lock().expect("adapter calls"),
@@ -1475,18 +1477,22 @@ fn every_post_gateway_trace_failure_blocks_process_restart_reexecution() {
         EnteredAdapterOutcome::GenericFailure,
         EnteredAdapterOutcome::PostconditionFailure,
     ] {
-        let terminal_event = if adapter_outcome == EnteredAdapterOutcome::Success {
-            TraceFailurePoint::ActionExecuted
-        } else {
-            TraceFailurePoint::ActionFailed
+        let terminal_events = match adapter_outcome {
+            EnteredAdapterOutcome::Success => vec![TraceFailurePoint::ActionExecuted],
+            EnteredAdapterOutcome::GenericFailure => vec![TraceFailurePoint::ActionFailed],
+            EnteredAdapterOutcome::PostconditionFailure => vec![
+                TraceFailurePoint::ActionExecuted,
+                TraceFailurePoint::ActionFailed,
+            ],
         };
-        for failure in [
-            TraceFailurePoint::ActionVerificationCompleted,
-            terminal_event,
-            TraceFailurePoint::OutcomeRecorded,
-            TraceFailurePoint::StateCommitted,
-            TraceFailurePoint::LoopTickCompleted,
-        ] {
+        let failures = std::iter::once(TraceFailurePoint::ActionVerificationCompleted)
+            .chain(terminal_events)
+            .chain([
+                TraceFailurePoint::OutcomeRecorded,
+                TraceFailurePoint::StateCommitted,
+                TraceFailurePoint::LoopTickCompleted,
+            ]);
+        for failure in failures {
             let trace_store = Arc::new(ArmableTraceStore::new(failure));
             let state_store = Arc::new(InMemoryStateStore::default());
             assert_uncertain_effect_restart_is_blocked(

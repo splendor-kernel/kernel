@@ -44,6 +44,11 @@ pub(crate) const DUPLICATE_ACTION_ID: &str = "duplicate_action_id";
 /// tenant/agent/run identity selected for resume.
 pub(crate) const RESUME_STATE_IDENTITY_MISMATCH: &str = "resume_state_identity_mismatch";
 
+/// Fixed reason returned when the latest completed tick has no matching durable
+/// snapshot and therefore cannot be resumed without skipping committed state.
+pub(crate) const RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE: &str =
+    "resume_latest_completed_snapshot_unavailable";
+
 /// Collects percepts for a tick.
 pub trait Perceptor: Send + Sync {
     /// Collects percepts for the provided agent context.
@@ -542,7 +547,7 @@ impl LoopEngine {
         mode: PersistedConstructionMode,
     ) -> Result<Self, LoopError> {
         if matches!(mode, PersistedConstructionMode::Fresh) {
-            match runtime.admit_fresh_engine() {
+            match runtime.admit_fresh_engine(&agent.tenant_id, &agent.agent_id) {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(LoopError::Resume(RUN_ALREADY_EXISTS.to_string()));
@@ -1461,9 +1466,7 @@ impl LoopEngine {
                 } => {
                     open_tick_attempts.remove(completed);
                     tick_id = Some(*completed);
-                    if let Some(completed_snapshot) = pending_snapshots.remove(completed) {
-                        snapshot = Some(completed_snapshot);
-                    }
+                    snapshot = pending_snapshots.remove(completed);
                 }
                 TraceEventKind::StateCommitted {
                     state_hash,
@@ -1501,9 +1504,13 @@ impl LoopEngine {
             return Err(LoopError::Resume(TICK_RECONCILIATION_REQUIRED.to_string()));
         }
 
-        let mut snapshot = snapshot
-            .ok_or_else(|| LoopError::Resume("no snapshot found in trace history".to_string()))?;
-        snapshot.info.tick_id = tick_id.unwrap_or(snapshot.info.tick_id);
+        let snapshot = snapshot.ok_or_else(|| {
+            LoopError::Resume(if tick_id.is_some() {
+                RESUME_LATEST_COMPLETED_SNAPSHOT_UNAVAILABLE.to_string()
+            } else {
+                "no snapshot found in trace history".to_string()
+            })
+        })?;
         Ok(snapshot)
     }
 }
