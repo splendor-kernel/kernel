@@ -1705,12 +1705,12 @@ fn open_secure_database(path: &Path) -> Result<File, TraceStoreError> {
 
 fn verify_secure_directory(
     file: &File,
-    expected_mode: u32,
+    expected_mode: RawMode,
 ) -> Result<FileIdentity, TraceStoreError> {
     let stat = fstat(file).map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_uid != getuid().as_raw()
-        || (u32::from(stat.st_mode) & 0o777) != expected_mode
+        || (stat.st_mode & 0o777) != expected_mode
     {
         return Err(TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery));
     }
@@ -1722,7 +1722,7 @@ fn verify_secure_directory(
 
 fn verify_secure_regular_file(
     file: &File,
-    expected_mode: u32,
+    expected_mode: RawMode,
 ) -> Result<FileIdentity, TraceStoreError> {
     verify_secure_regular_file_port(file, expected_mode)
         .map_err(|_| TraceStoreError::Sqlite(rusqlite::Error::InvalidQuery))
@@ -1730,13 +1730,13 @@ fn verify_secure_regular_file(
 
 fn verify_secure_regular_file_port(
     file: &File,
-    expected_mode: u32,
+    expected_mode: RawMode,
 ) -> Result<FileIdentity, RuntimeTracePortError> {
     let stat = fstat(file).map_err(|_| RuntimeTracePortError::Unavailable)?;
     if !secure_regular_file_attributes(
         stat.st_mode,
         stat.st_uid,
-        u64::from(stat.st_nlink),
+        stat.st_nlink == 1,
         expected_mode,
         getuid().as_raw(),
     ) {
@@ -1751,14 +1751,14 @@ fn verify_secure_regular_file_port(
 fn secure_regular_file_attributes(
     mode: RawMode,
     owner_uid: u32,
-    link_count: u64,
-    expected_mode: u32,
+    has_single_link: bool,
+    expected_mode: RawMode,
     current_uid: u32,
 ) -> bool {
     FileType::from_raw_mode(mode).is_file()
         && owner_uid == current_uid
-        && link_count == 1
-        && (u32::from(mode) & 0o777) == expected_mode
+        && has_single_link
+        && (mode & 0o777) == expected_mode
 }
 
 fn verify_writable_database_if_present(

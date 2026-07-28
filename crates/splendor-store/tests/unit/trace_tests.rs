@@ -871,35 +871,35 @@ fn secure_runtime_lock_attributes_reject_foreign_owner_type_mode_and_links() {
     assert!(secure_regular_file_attributes(
         regular_mode,
         current_uid,
-        1,
+        true,
         0o600,
         current_uid,
     ));
     assert!(!secure_regular_file_attributes(
         regular_mode,
         current_uid.wrapping_add(1),
-        1,
+        true,
         0o600,
         current_uid,
     ));
     assert!(!secure_regular_file_attributes(
         regular_mode,
         current_uid,
-        2,
+        false,
         0o600,
         current_uid,
     ));
     assert!(!secure_regular_file_attributes(
         0o040000 | 0o600,
         current_uid,
-        1,
+        true,
         0o600,
         current_uid,
     ));
     assert!(!secure_regular_file_attributes(
         0o100000 | 0o644,
         current_uid,
-        1,
+        true,
         0o600,
         current_uid,
     ));
